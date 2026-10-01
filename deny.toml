@@ -25,7 +25,16 @@ allow = [
     "Unicode-3.0",
     "BSL-1.0",
     "CC0-1.0",
+    # Weak copyleft, file-level only; used by the matrix-sdk tree (eyeball, eyeball-im, imbl,
+    # as_variant, async-rx, readlock). We use them unmodified as dependencies. Approved Phase 1 Q2.
+    "MPL-2.0",
 ]
+
+# CDLA-Permissive-2.0 covers only the webpki-root-certs data (via reqwest ->
+# rustls-platform-verifier in the matrix-sdk tree); scoped to that crate. Approved Phase 1 Q2.
+[[licenses.exceptions]]
+allow = ["CDLA-Permissive-2.0"]
+crate = "webpki-root-certs"
 
 [licenses.private]
 ignore = true
