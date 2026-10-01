@@ -324,15 +324,13 @@ impl App {
         Subscription::batch([
             bridge::events_subscription(self.events.clone()),
             window::close_requests().map(|_| Message::CloseRequested),
+            system::theme_changes().map(Message::ThemeMode),
         ])
     }
 
-    /// The theme for the current system mode (palettes come in a later step).
-    pub fn theme(&self) -> Theme {
-        match self.theme_mode {
-            theme::Mode::Dark => Theme::Dark,
-            theme::Mode::Light | theme::Mode::None => Theme::Light,
-        }
+    /// The theme for the current system mode (plan Q13).
+    pub fn theme(&self) -> Option<Theme> {
+        Some(crate::theme::theme_for(self.theme_mode))
     }
 }
 
@@ -480,9 +478,14 @@ mod tests {
     #[test]
     fn theme_follows_the_mode() {
         let (mut app, _rx) = app_with(8);
+        let name = |app: &App| app.theme().expect("always themed").to_string();
+        assert_eq!(name(&app), crate::theme::LIGHT_NAME);
         let _ = app.update(Message::ThemeMode(theme::Mode::Dark));
-        assert_eq!(app.theme(), Theme::Dark);
+        assert_eq!(name(&app), crate::theme::DARK_NAME);
+        assert!(app.theme().expect("themed").extended_palette().is_dark);
+        let _ = app.update(Message::ThemeMode(theme::Mode::Light));
+        assert_eq!(name(&app), crate::theme::LIGHT_NAME);
         let _ = app.update(Message::ThemeMode(theme::Mode::None));
-        assert_eq!(app.theme(), Theme::Light);
+        assert_eq!(name(&app), crate::theme::LIGHT_NAME);
     }
 }

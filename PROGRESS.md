@@ -38,7 +38,7 @@ Phase 0 agent work is done; the Phase 0 human checkpoint is fully signed off (20
 - [x] 5. Avatar thumbnails through the SDK media API (roadmap step 6, core side) (phase2.5)
 - [x] 6. App library split and the core bridge (roadmap step 1) (phase2.6)
 - [x] 7. Room list and timeline state from diffs, 2,000-room timing test (roadmap step 2)
-- [ ] 8. Light and dark theme following the system (roadmap step 7)
+- [x] 8. Light and dark theme following the system (roadmap step 7) (phase2.8)
 - [ ] 9. Screens: login with OIDC, loading/sync, two-pane layout (roadmap step 4)
 - [ ] 10. Room list pane: tabs, search, windowed rows, badges, paging (roadmap step 5, UI side)
 - [ ] 11. Avatars in the UI, Phase 2 wrap-up (roadmap step 6, UI side)
@@ -355,6 +355,20 @@ Phase 0 agent work is done; the Phase 0 human checkpoint is fully signed off (20
 - Open issues: none new.
 - New human items: none.
 
+## Phase 2 / Task 8 notes
+- Checks: `cargo fmt --all --check`, clippy (`--workspace --all-targets --all-features --locked -D warnings`), `cargo test --workspace --locked` (app: 42 lib tests), `scripts/check-app-deps.sh`, `scripts/check-core-api.sh` and `cargo deny check` all pass. The bridge and core are untouched, so the homeserver integration run was not needed. The keyring test was not run.
+- TDD: `theme_for` was a `todo!()` stub first; 3 tests failed (`theme_for_names_and_darkness`, `semantic_colours_follow_the_theme`, `state::theme_follows_the_mode`), then the real code was added. The contrast tests passed on first run (the palette values were checked by hand against the 4.5 bound beforehand).
+- App: new `theme.rs` with `LIGHT`/`DARK` `Palette` constants, `theme_for(Mode) -> Theme` ("Tessera Dark" for `Dark`; "Tessera Light" for `Light` and `None`), `Semantic` (badge, badge text, highlight, highlight text, muted, selection) with `LIGHT_SEMANTIC`/`DARK_SEMANTIC`, `semantic(&Theme)` (picks by `extended_palette().is_dark`), and a pure `contrast(a, b)` (WCAG 2.1). `App::theme` now returns `Option<Theme>` = `Some(theme_for(self.theme_mode))` (the field is `theme_mode`, from Task 6). `system::theme_changes()` is now in the subscription batch; boot already used `system::theme()`.
+- Tests: names and `is_dark` for all 3 modes; `update(ThemeMode(..))` changes `App::theme` (Light, Dark, Light, None); contrast of 21.0 for black/white and 4.54 for #767676 on white (reference values); contrast >= 4.5 for text/background, badge text/badge, highlight text/highlight, muted/background and text/selection in both palettes.
+- Note: `ICED_THEME` only changes iced's `Base::default`, which the app does not use (it always returns `Some(theme)`), so it has no effect on the app.
+- APIs used, confirmed in `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/` (iced 0.14.0):
+  - `Theme::custom` iced_core-0.14.0 theme.rs:91; `Theme::extended_palette` :138; `impl Display for Theme` (name via `Base::name`) :169-173; `theme::Mode` :212; `palette::Palette` fields palette.rs:9-22; `Extended::is_dark` palette.rs:302.
+  - `iced::color!` / `Color::from_rgb8` iced_core color.rs:84 and :285 (const-usable); `Color` fields `r/g/b`.
+  - `ThemeFn` application.rs:648-672 (a `Fn(&State) -> impl Into<Option<Theme>>` is accepted, so `App::theme` returning `Option<Theme>` works with `.theme(App::theme)`); `Application::theme` :377.
+  - `iced::system::theme_changes` iced_runtime-0.14.0 system.rs:63 (re-exported iced lib.rs:604); `iced::theme` re-export lib.rs:533.
+- Open issues: none.
+- New human items (rule 9, not ticked by the agent): below.
+
 ## Phase 2 human checkpoint
 - [ ] CI green on Linux, Windows and macOS with the new dependencies (iced `image-without-codecs`, image, open, tokio in the app).
 - [ ] Don't run tessera-cli and the app on the same data dir at once (SQLite store lock; plan Q20).
@@ -362,3 +376,5 @@ Phase 0 agent work is done; the Phase 0 human checkpoint is fully signed off (20
 - [ ] Revisit plan decisions Q1-Q22 (adopted under the standing pre-authorization).
 - [ ] Revisit Q11 deviation (Task 5 security follow-up): avatars of rooms whose avatar cannot be thumbnailed by the server now show initials instead of falling back to the original file.
 - [ ] Run `cargo run -p tessera-app -- --ephemeral --homeserver http://127.0.0.1:8008` against the local homeserver: a window opens titled "Tessera" (it shows only a text label for now), closing it exits within a few seconds, and `--help` prints the Q20 note (rendering and window close cannot be checked headlessly; Task 6).
+- [ ] Theme (Task 8): the app follows the OS light/dark setting at start and when it is switched while running, on Linux (GNOME/KDE portal), macOS and Windows (rendering and live system changes cannot be checked headlessly).
+- [ ] Theme (Task 8): both palettes ("Tessera Light", "Tessera Dark") look readable by eye (the contrast ratios are unit-tested, the look is not).
