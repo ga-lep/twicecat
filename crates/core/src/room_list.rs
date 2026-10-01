@@ -5,11 +5,18 @@ use std::collections::HashSet;
 use matrix_sdk::ruma::OwnedMxcUri;
 use matrix_sdk::{Room, RoomState};
 use matrix_sdk_ui::eyeball_im::VectorDiff;
+use matrix_sdk_ui::room_list_service::filters::{
+    BoxedFilterFn, RoomCategory, new_filter_all, new_filter_category, new_filter_non_left,
+    new_filter_normalized_match_room_name, new_filter_not, new_filter_space,
+};
 use matrix_sdk_ui::room_list_service::{RoomListItem, RoomListLoadingState};
 use matrix_sdk_ui::timeline::{LatestEventValue, RoomExt, TimelineDetails};
 use tracing::warn;
 
-use crate::api::{AvatarId, CoreEvent, ListDiff, MessagePreview, RoomId, RoomSummary, UserId};
+use crate::api::{
+    AvatarId, CoreEvent, ListDiff, MessagePreview, RoomId, RoomListQuery, RoomListTab, RoomSummary,
+    UserId,
+};
 
 /// Maps one SDK diff, converting each carried item with `f`.
 pub(crate) fn map_diff<T: Clone, U>(diff: VectorDiff<T>, mut f: impl FnMut(T) -> U) -> ListDiff<U> {
@@ -36,6 +43,62 @@ pub(crate) fn map_diff<T: Clone, U>(diff: VectorDiff<T>, mut f: impl FnMut(T) ->
             values: values.into_iter().map(f).collect(),
         },
     }
+}
+
+/// One building block of a room list filter. The filter of a query is the
+/// conjunction of its parts, in order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FilterPart {
+    /// Rooms that were not left.
+    NonLeft,
+    /// Direct messages (`RoomCategory::People`).
+    People,
+    /// Group rooms (`RoomCategory::Group`).
+    Group,
+    /// Spaces.
+    Space,
+    /// Anything but spaces.
+    NotSpace,
+    /// Case- and diacritic-insensitive substring of the room name. Holds the
+    /// trimmed, non-empty search text.
+    NameMatch(String),
+}
+
+/// The filter parts of `query`: its tab, then a name match if the trimmed
+/// search is not empty.
+pub(crate) fn filter_spec(query: &RoomListQuery) -> Vec<FilterPart> {
+    let mut parts = vec![FilterPart::NonLeft];
+    match query.tab {
+        RoomListTab::All => {}
+        RoomListTab::People => parts.extend([FilterPart::People, FilterPart::NotSpace]),
+        RoomListTab::Rooms => parts.extend([FilterPart::Group, FilterPart::NotSpace]),
+        RoomListTab::Spaces => parts.push(FilterPart::Space),
+    }
+    let search = query.search.trim();
+    if !search.is_empty() {
+        parts.push(FilterPart::NameMatch(search.to_owned()));
+    }
+    parts
+}
+
+/// Builds the SDK filter for `query` from the SDK's own filters.
+pub(crate) fn build_filter(query: &RoomListQuery) -> BoxedFilterFn {
+    let filters = filter_spec(query)
+        .into_iter()
+        .map(|part| -> BoxedFilterFn {
+            match part {
+                FilterPart::NonLeft => Box::new(new_filter_non_left()),
+                FilterPart::People => Box::new(new_filter_category(RoomCategory::People)),
+                FilterPart::Group => Box::new(new_filter_category(RoomCategory::Group)),
+                FilterPart::Space => Box::new(new_filter_space()),
+                FilterPart::NotSpace => Box::new(new_filter_not(Box::new(new_filter_space()))),
+                FilterPart::NameMatch(text) => {
+                    Box::new(new_filter_normalized_match_room_name(&text))
+                }
+            }
+        })
+        .collect();
+    Box::new(new_filter_all(filters))
 }
 
 /// Longest preview body, in characters.
@@ -255,6 +318,57 @@ mod tests {
     use matrix_sdk_ui::eyeball_im::VectorDiff as V;
 
     use super::*;
+
+    use crate::api::{RoomListQuery, RoomListTab};
+
+    fn q(tab: RoomListTab, search: &str) -> RoomListQuery {
+        RoomListQuery {
+            tab,
+            search: search.to_owned(),
+        }
+    }
+
+    #[test]
+    fn filter_spec_follows_the_tab_table() {
+        use FilterPart::*;
+        assert_eq!(filter_spec(&q(RoomListTab::All, "")), vec![NonLeft]);
+        assert_eq!(
+            filter_spec(&q(RoomListTab::People, "")),
+            vec![NonLeft, People, NotSpace]
+        );
+        assert_eq!(
+            filter_spec(&q(RoomListTab::Rooms, "")),
+            vec![NonLeft, Group, NotSpace]
+        );
+        assert_eq!(
+            filter_spec(&q(RoomListTab::Spaces, "")),
+            vec![NonLeft, Space]
+        );
+    }
+
+    #[test]
+    fn filter_spec_adds_a_trimmed_name_match_last() {
+        use FilterPart::*;
+        for tab in [
+            RoomListTab::All,
+            RoomListTab::People,
+            RoomListTab::Rooms,
+            RoomListTab::Spaces,
+        ] {
+            let plain = filter_spec(&q(tab, ""));
+            let mut expected = plain.clone();
+            expected.push(NameMatch("caf\u{e9}".to_owned()));
+            assert_eq!(filter_spec(&q(tab, "  caf\u{e9} \t")), expected);
+        }
+    }
+
+    #[test]
+    fn whitespace_only_search_adds_no_name_filter() {
+        for search in ["", " ", " \t\n", "\u{a0}"] {
+            let spec = filter_spec(&q(RoomListTab::All, search));
+            assert!(!spec.iter().any(|p| matches!(p, FilterPart::NameMatch(_))));
+        }
+    }
 
     fn vec_of(items: &[u32]) -> matrix_sdk_ui::eyeball_im::Vector<u32> {
         items.iter().copied().collect()

@@ -34,7 +34,7 @@ Phase 0 agent work is done; the Phase 0 human checkpoint is fully signed off (20
 - [x] 1. App dependencies, boundary check hardening, Phase 2 ledger (phase2.1)
 - [x] 2. Additive core API for Phase 2 (phase2.2)
 - [x] 3. Room view models in the core (roadmap step 3) (phase2.3)
-- [ ] 4. Room list query (tabs, search) and paging in the core (roadmap step 5, core side)
+- [x] 4. Room list query (tabs, search) and paging in the core (roadmap step 5, core side) (phase2.4)
 - [ ] 5. Avatar thumbnails through the SDK media API (roadmap step 6, core side)
 - [ ] 6. App library split and the core bridge (roadmap step 1)
 - [ ] 7. Room list and timeline state from diffs, 2,000-room timing test (roadmap step 2)
@@ -288,6 +288,18 @@ Phase 0 agent work is done; the Phase 0 human checkpoint is fully signed off (20
   - eyeball: `Subscriber<T>: Stream` eyeball-*/src/subscriber.rs:197.
 - Not exercised by a test: a Local (unsent) latest event preview, and the DM-hero avatar fallback against a real server (pure `pick_avatar` is unit-tested).
 - Open issues: a room's first preview arrives one `Set` diff after the room first appears (latest events are lazy, per plan Q10). No new human items.
+
+## Phase 2 / Task 4 notes
+- Checks: `cargo fmt --all --check`, clippy (`--workspace --all-targets --all-features --locked -D warnings`), `cargo test --workspace --locked`, `scripts/check-app-deps.sh`, `scripts/check-core-api.sh`, `cargo deny check` and the ignored run (`cargo test -p tessera-core --locked -- --ignored --skip keyring`) all pass (ignored run: all suites ok, room_list 8 passed in 705 s). The keyring test was not run.
+- TDD: the `filter_spec` unit tests (Q7 table for each tab, trimmed search last, whitespace-only search adds no name filter) were written first and failed to compile (`FilterPart` missing), then the code was added. The engine test (query stored in the watch channel, unchanged query does not wake the list, `LoadMoreRooms` without sync is a no-op) replaces the Task 2 "commands are no-ops" test.
+- Core: `room_list::{FilterPart, filter_spec, build_filter}`; `Engine.room_list_query` is a `watch::Sender<RoomListQuery>` that outlives sessions, so a query set before login applies when the list starts. `forward_room_list` owns the controller, applies the current query at start, and on each change calls `set_filter(build_filter(..))` then `reset_to_one_page()`. `LoadMoreRooms` goes through `Syncing.more_rooms` (`mpsc` of 8, `try_send`; full means requests are already pending) to `add_one_page()`; with no sync it does nothing.
+- APIs used, confirmed in `~/.cargo/registry/src/*/` (pinned 0.19.1):
+  - matrix-sdk-ui `room_list_service/room_list.rs`: `entries_with_dynamic_adapters` :139, `RoomListDynamicEntriesController::set_filter` :342, `add_one_page` :356 (needs `maximum_number_of_rooms`, so it does nothing before `RoomListLoaded`), `reset_to_one_page` :375.
+  - `room_list_service/filters/mod.rs`: re-exports :87-104 (`new_filter_all`, `new_filter_not`, `new_filter_non_left`, `new_filter_category`, `RoomCategory`, `new_filter_space`, `new_filter_normalized_match_room_name`), `BoxedFilterFn` :115; `category.rs:30-46` (`RoomCategory::{People, Group}` from `is_dm()`); `all.rs:19`, `not.rs:21`, `space.rs:23`, `non_left.rs:27`, `normalized_match_room_name.rs:48`.
+  - tokio `sync/watch.rs`: `Sender::send_if_modified` :1171, `Sender::subscribe` :1387, `Receiver::borrow_and_update` :676, `Receiver::changed` :818.
+- Integration tests (tests/room_list.rs, verbatim ignore reason): `search_query_filters_the_list`, `tab_queries_split_dms_rooms_and_spaces` (adds a plain room so the Rooms tab is non-empty), `load_more_rooms_adds_a_page` (page size 2 through the new `common::start_core_with_page_size`; waits for `RoomListLoaded` before `LoadMoreRooms`).
+- Open issues: the local Synapse became very slow for room creation as test data piled up (one `create_dm` + `create_space` + `create_room` took about 3 minutes; the whole `room_list` file took 220 s, then 790 s). The tab test failed once with a 30 s timeout in a full-file run, then passed alone and in the next full run (not twice in a row). If it recurs, reset the Synapse volume (`docker compose down -v`).
+- No new human items.
 
 ## Phase 2 human checkpoint
 - [ ] CI green on Linux, Windows and macOS with the new dependencies (iced `image-without-codecs`, image, open, tokio in the app).

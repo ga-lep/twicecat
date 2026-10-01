@@ -74,12 +74,21 @@ pub fn parse_env(text: &str) -> HashMap<String, String> {
 
 /// Starts a core on `dir` against the local homeserver.
 pub fn start_core(dir: &Path, secrets: Arc<InMemorySecretStore>) -> CoreHandle {
+    start_core_with_page_size(dir, secrets, tessera_core::DEFAULT_ROOM_LIST_PAGE_SIZE)
+}
+
+/// Like [`start_core`] with an explicit room list page size.
+pub fn start_core_with_page_size(
+    dir: &Path,
+    secrets: Arc<InMemorySecretStore>,
+    room_list_page_size: usize,
+) -> CoreHandle {
     let env = TestEnv::load();
     Core::start(
         CoreConfig {
             data: DataPaths::at(dir),
             homeserver_override: Some(env.homeserver_url().to_owned()),
-            room_list_page_size: tessera_core::DEFAULT_ROOM_LIST_PAGE_SIZE,
+            room_list_page_size,
         },
         secrets,
     )

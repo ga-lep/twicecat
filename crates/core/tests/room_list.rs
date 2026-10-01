@@ -7,11 +7,13 @@ use std::sync::Arc;
 
 use common::{
     TestEnv, create_dm, create_room, create_space, expect_event, raw_login, start_core,
-    unique_room_name,
+    start_core_with_page_size, unique_room_name,
 };
 use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
 use tessera_core::CoreHandle;
-use tessera_core::api::{Command, CoreEvent, ListDiff, Password, RoomSummary, SyncState};
+use tessera_core::api::{
+    Command, CoreEvent, ListDiff, Password, RoomListQuery, RoomListTab, RoomSummary, SyncState,
+};
 use tessera_core::secrets::InMemorySecretStore;
 
 async fn login_and_run(core: &mut CoreHandle, env: &TestEnv, n: u8) {
@@ -201,6 +203,149 @@ async fn room_list_loaded_is_signalled() {
             total_rooms: Some(_)
         }
     ));
+
+    core.commands.send(Command::Logout).await.unwrap();
+    expect_event(&mut core, |e| matches!(e, CoreEvent::LoggedOut)).await;
+}
+
+fn has(rooms: &[RoomSummary], id: &matrix_sdk::ruma::OwnedRoomId) -> bool {
+    rooms.iter().any(|s| s.id.as_str() == id.as_str())
+}
+
+#[tokio::test]
+#[ignore = "needs local homeserver: docker compose up -d --wait"]
+async fn search_query_filters_the_list() {
+    let env = TestEnv::load();
+    let dir = tempfile::tempdir().unwrap();
+    let mut core = start_core(dir.path(), Arc::new(InMemorySecretStore::new()));
+    login_and_run(&mut core, &env, 1).await;
+
+    let alice = raw_login(1).await;
+    let suffix = unique_room_name();
+    let name_a = format!("tessera-a-{suffix}");
+    let name_b = format!("tessera-b-{suffix}");
+    create_room(&alice, &name_a, None).await;
+    create_room(&alice, &name_b, None).await;
+
+    let mut rooms = Vec::new();
+    apply_until(&mut core, &mut rooms, |r| {
+        r.iter().any(|s| s.name == name_a) && r.iter().any(|s| s.name == name_b)
+    })
+    .await;
+
+    core.commands
+        .send(Command::SetRoomListQuery(RoomListQuery {
+            tab: RoomListTab::All,
+            search: name_a.clone(),
+        }))
+        .await
+        .unwrap();
+    // The new filter arrives as a `Reset`, so the list ends up with only the
+    // first room.
+    apply_until(&mut core, &mut rooms, |r| {
+        r.len() == 1 && r[0].name == name_a
+    })
+    .await;
+
+    core.commands.send(Command::Logout).await.unwrap();
+    expect_event(&mut core, |e| matches!(e, CoreEvent::LoggedOut)).await;
+}
+
+#[tokio::test]
+#[ignore = "needs local homeserver: docker compose up -d --wait"]
+async fn tab_queries_split_dms_rooms_and_spaces() {
+    let env = TestEnv::load();
+    let dir = tempfile::tempdir().unwrap();
+    let mut core = start_core(dir.path(), Arc::new(InMemorySecretStore::new()));
+    login_and_run(&mut core, &env, 1).await;
+
+    let alice = raw_login(1).await;
+    let dm = create_dm(&alice, &env.user_id(2)).await;
+    let space = create_space(&alice, &unique_room_name()).await;
+    let room = create_room(&alice, &unique_room_name(), None).await;
+
+    let mut rooms = Vec::new();
+    apply_until(&mut core, &mut rooms, |r| {
+        has(r, &dm) && has(r, &space) && has(r, &room)
+    })
+    .await;
+
+    // The old state still holds everything until the new filter's `Reset`
+    // arrives, so each wait names a state the previous tab cannot satisfy.
+    let set_tab = |tab| {
+        Command::SetRoomListQuery(RoomListQuery {
+            tab,
+            search: String::new(),
+        })
+    };
+    core.commands
+        .send(set_tab(RoomListTab::People))
+        .await
+        .unwrap();
+    apply_until(&mut core, &mut rooms, |r| {
+        has(r, &dm) && !has(r, &space) && !has(r, &room)
+    })
+    .await;
+
+    core.commands
+        .send(set_tab(RoomListTab::Rooms))
+        .await
+        .unwrap();
+    apply_until(&mut core, &mut rooms, |r| {
+        has(r, &room) && !has(r, &dm) && !has(r, &space)
+    })
+    .await;
+
+    core.commands
+        .send(set_tab(RoomListTab::Spaces))
+        .await
+        .unwrap();
+    apply_until(&mut core, &mut rooms, |r| {
+        has(r, &space) && !has(r, &dm) && !has(r, &room)
+    })
+    .await;
+
+    core.commands.send(Command::Logout).await.unwrap();
+    expect_event(&mut core, |e| matches!(e, CoreEvent::LoggedOut)).await;
+}
+
+#[tokio::test]
+#[ignore = "needs local homeserver: docker compose up -d --wait"]
+async fn load_more_rooms_adds_a_page() {
+    let env = TestEnv::load();
+    let dir = tempfile::tempdir().unwrap();
+    let alice = raw_login(1).await;
+    for _ in 0..3 {
+        create_room(&alice, &unique_room_name(), None).await;
+    }
+
+    let mut core = start_core_with_page_size(dir.path(), Arc::new(InMemorySecretStore::new()), 2);
+    login_and_run(&mut core, &env, 1).await;
+
+    // Paging needs the total, so wait for the page and for the signal.
+    let mut rooms: Vec<RoomSummary> = Vec::new();
+    let mut loaded = false;
+    let wait = async {
+        while !(loaded && rooms.len() == 2) {
+            match core.events.recv().await {
+                Some(CoreEvent::RoomListChanged(diffs)) => {
+                    for diff in diffs {
+                        ListDiff::apply(&diff, &mut rooms);
+                    }
+                }
+                Some(CoreEvent::RoomListLoaded { .. }) => loaded = true,
+                Some(_) => {}
+                None => panic!("event channel closed"),
+            }
+        }
+    };
+    tokio::time::timeout(common::DEFAULT_TIMEOUT, wait)
+        .await
+        .expect("timed out waiting for the first page");
+    assert_eq!(rooms.len(), 2, "only one page is listed");
+
+    core.commands.send(Command::LoadMoreRooms).await.unwrap();
+    apply_until(&mut core, &mut rooms, |r| r.len() >= 3).await;
 
     core.commands.send(Command::Logout).await.unwrap();
     expect_event(&mut core, |e| matches!(e, CoreEvent::LoggedOut)).await;
