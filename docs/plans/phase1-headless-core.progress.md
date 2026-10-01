@@ -1,3 +1,4 @@
 Task 1: started
 Task 1: complete (35a5826..8e4cba8, gate ok, security PASS, review PASS)
   notes: [sec Medium] paths.rs session_id denylist misses Windows drive-prefix/ADS/reserved names (e.g. "C:evil" escapes root) — switch to allowlist [A-Za-z0-9_-]{1,128} + Windows cases in tests; carried to Task 4; [sec Low] data dir/session dirs not 0o700, last_account not 0o600 — apply when created in Task 4; [sec Info] use OS-seeded CSPRNG for store passphrase; local-server OAuth listener must bind 127.0.0.1 (Task 9); [review Sugg] Linux ProjectDirs lowercases to ~/.local/share/tessera — note in docs/--data-dir help
+Task 2: started
