@@ -6,6 +6,10 @@ repository.workspace = true
 license.workspace = true
 publish = false
 
+[[bin]]
+name = "tessera-cli"
+path = "src/bin/tessera-cli.rs"
+
 [dependencies]
 matrix-sdk = { version = "=0.19.1", features = ["bundled-sqlite", "local-server"] }
 matrix-sdk-ui = "=0.19.1"

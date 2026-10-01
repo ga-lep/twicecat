@@ -27,7 +27,7 @@ Phase 0 agent work is done; the Phase 0 human checkpoint is fully signed off (20
 - [x] 7. Timeline, select room, send message (roadmap step 6)
 - [x] 8. Sync supervision, reconnection, tracing (roadmap step 7; the agent-run reconnection check is deferred to Task 10)
 - [x] 9. OAuth 2.0 / MAS login (roadmap step 3b; the browser flow itself is on the human list)
-- [ ] 10. tessera-cli binary
+- [x] 10. tessera-cli binary (roadmap steps 5-7, user-facing; agent work for Phase 1 is done, the human checkpoint stays open)
 
 ## Step 2 notes
 - Checks run: cargo fmt --all --check, cargo clippy --workspace --all-targets --all-features -- -D warnings, cargo test --workspace, cargo build --workspace (all pass).
@@ -183,11 +183,32 @@ Phase 0 agent work is done; the Phase 0 human checkpoint is fully signed off (20
 - Open issues: the SDK validates the authorization server's metadata URLs itself (`validate_urls`), but Tessera does not re-check them beyond the auth URL. A cancel during client build or registration drops that future (the network call is abandoned, not awaited); `finish_login` is deliberately not raced against cancel, so a cancel in that window waits for it (bounded by the 5 s shutdown timeout) and a login that still succeeds is logged out and discarded. A stray local GET to the redirect port makes that login fail (state check), by design of the SDK listener (one request). Local MAS does not exist, so the real flow and token refresh are unverified.
 - New human items (also in the Phase 1 checklist): OIDC login on matrix.org through the CLI; the session survives a CLI restart; CLI kept running over 10 minutes so MAS refreshes the access token, then restart and confirm restore works.
 
+## Phase 1 / Task 10 notes
+- Checks run (all pass): `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo test --workspace` (bin unit tests for args, REPL parsing, room resolution, status lines, terminal-control sanitising, help text), `scripts/check-app-deps.sh`, `scripts/check-core-api.sh`; ignored run `cargo test --workspace -- --ignored --skip keyring` against the local Synapse (includes `tests/cli.rs::ephemeral_password_login_and_quit`), then `docker compose stop`.
+- TDD: `tests/cli.rs` was seen failing to compile (no `CARGO_BIN_EXE_tessera-cli`) and the bin unit tests were seen failing against `todo!()` stubs before the implementation.
+- Design: `crates/core/src/bin/tessera-cli.rs` uses only `Core::start`, `Command`, `CoreEvent` and API types (a test greps the source for `matrix_sdk`, `ruma`, `eyeball`, `imbl`). One stdin reader task feeds lines to the loop; stdin is not read while a password login is in flight, so `/rooms` queued behind a login runs after it. `--password-stdin` reads the password from the next stdin line, otherwise `rpassword::prompt_password`. `--ephemeral` uses `InMemorySecretStore` and `<tmp>/tessera-cli-<128-bit random hex>`, removed at exit; it cannot be combined with `--data-dir`. Room names, senders, and bodies are printed with control characters replaced by `?` (terminal escape injection). Room indices are 0-based. Own sent messages are echoed back through the timeline as `[room] sender: body`.
+- APIs used: only tessera-core's own (`Core::start` engine.rs:72, `CoreConfig`, `CoreHandle`, `Command`, `CoreEvent`, `ListDiff::apply`), `rpassword` 7.5.4 `prompt_password` (`~/.cargo/registry/src/*/rpassword-7.5.4/src/lib.rs:270`), `rand::fill` (already used in session.rs), `tokio::io::{stdin, AsyncBufReadExt::lines}`. No matrix-sdk or iced API was added.
+- Deferred Task 8 reconnection check, run with this CLI (alice, `--ephemeral`, local Synapse; times local):
+  - 11:42:05 `Logged in as @alice:localhost`, `[sync] idle`, `[sync] running`
+  - 11:42:13 `docker compose stop synapse`; 11:42:15 `[sync] offline` (2 s later; it stayed Offline for the 35 s outage, no Reconnecting)
+  - 11:42:49 `docker compose start synapse`; 11:42:53 `[sync] running` (4 s, limit 90 s)
+  - then `/select` and `/send` of a unique text: echoed in the timeline, and a REST read of the room's messages as alice found it, so it was delivered. stderr during the outage had the SDK's `ERROR ... matrix_sdk::http_client: Error while sending request` line about every 7.6 s (the SDK's own error lines, as documented below).
+  - The unstable-Offline-loop provocation (a server that answers `/versions` while sync fails) was not reproduced: the local Synapse is either fully up or down. That path stays covered by the supervisor unit tests only.
+- CLI help warns that `RUST_LOG=debug` or `trace` can make the SDK and HTTP crates log sensitive request data, and that the SDK's own error lines (request URLs) show at the default filter so stderr should not be shared unreviewed. The same help text carries the orphaned-OAuth-session note.
+- Open issues:
+  - A cancelled or shutdown-aborted OAuth login may leave an orphaned server-side session (device) that the user must revoke from the account settings of their homeserver/MAS.
+  - Task 9 follow-up: a shutdown abort during `finish_login` (over 5 s) can also leave such a session, and a failed best-effort logout of a cancelled login leaves it valid server-side.
+  - The password prompt blocks the CLI loop while waiting (events queue in the engine's bounded channel, 256); fine for interactive use.
+  - `/rooms` prints every room; no paging.
+- New human items: see the Phase 1 checklist below (CLI real-account run, restart without prompt, keychain viewer entry `io.github.ga_lep.Tessera` and no token in the data dir).
+
 ## Phase 1 human checkpoint
 - [ ] Push the branch and confirm the new `integration` job is green (Task 5).
 - [ ] CI green on Linux, Windows, and macOS with the new SDK tree (aws-lc-sys and bundled sqlite builds), and the `integration` job green (Task 5).
 - [ ] Real-keychain test `cargo test -p tessera-core --locked -- --ignored keyring` passes on each OS you use, and no `io.github.ga_lep.Tessera.test` entry is left in the keychain.
-- [ ] CLI against your real account: password login, room list with unread counts, open a room, send and receive, restart restores without a prompt.
+- [ ] CLI against your real account (`cargo run -p tessera-core --bin tessera-cli`): password login, room list with unread counts, open a room, send and receive, restart restores without a prompt.
+- [ ] OS keychain viewer shows the `io.github.ga_lep.Tessera` entry, and no token sits in the CLI data dir (`~/.local/share/tessera` on Linux).
+- [ ] A cancelled or aborted OAuth login can leave an orphaned session; check your account settings for stray devices after the OIDC test.
 - [ ] OIDC login on matrix.org in a browser via the CLI (Task 9 code is done; unverifiable locally).
 - [ ] The OIDC session survives a CLI restart.
 - [ ] Keep the CLI running for over 10 minutes so MAS refreshes the access token, then restart and confirm restore still works (refresh persistence cannot be verified locally).
