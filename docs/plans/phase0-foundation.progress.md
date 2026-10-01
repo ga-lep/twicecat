@@ -19,3 +19,5 @@ Fix (final-review follow-up: boundary check + CI hardening): started
 Fix: complete (2a5aedc..49a48dd, gate ok, security PASS, review PASS; actionlint + shellcheck re-run by controller: clean)
   notes: commits 3998cf8 (fail-closed boundary check, --all-features --target all, ci permissions/persist-credentials/--locked), 0b66c0d (stale PROGRESS notes, space() citation), 49a48dd (step 4/5 tags). [sec Low] actions still tag-pinned (human decision); [sec Low] check only covers direct deps — core re-exporting matrix-sdk would bypass it (revisit in Phase 1); [sec Low] tail/awk failure inside if still fails open; [review Sugg] step 4 hardening bullet sits below "Open issues: none"
 Fix 2 (tail/awk fail-open in check-app-deps.sh): started
+Fix 2: complete (d814081..aa754c0, gate ok, security PASS, review PASS; shellcheck re-run by controller: clean)
+  notes: [sec Low] printf|grep pipe could theoretically mask a match under pipefail — use grep <<<"$names" if desired; [review Sugg] grep echoes matching lines on violation (pre-existing)
