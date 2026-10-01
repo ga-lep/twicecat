@@ -13,3 +13,5 @@ Task 4: complete (a8cafe2..fefc04c, gate ok, security PASS, review PASS)
 Task 5: started
 Task 5: complete (d5221c9..a9cea0f, gate ok, security PASS, review PASS)
   notes: [review Warn] trailer model name flagged — dismissed, trailer matches the session's attribution instruction; [review Sugg] external name-check claims not re-verified by reviewer
+Final review: VERDICT: PASS
+  notes: stale "Linux may fail until step 5" line in PROGRESS.md; check-app-deps.sh fails open + misses optional/target deps; space() confirmation not cited in PROGRESS.md; ci.yml lacks permissions/persist-credentials:false/SHA pins/--locked
