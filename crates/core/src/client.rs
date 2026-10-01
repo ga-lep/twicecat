@@ -124,6 +124,35 @@ where
     }
 }
 
+/// Whether the user ID in a login response (`returned`) may be adopted.
+///
+/// It must match what the user typed (`username`, password login only) and
+/// its server name must be bound to the homeserver used. An OAuth login has no
+/// `username`, so there the only account binding is [`server_name_bound`]: a
+/// user ID from a server name that neither equals the typed name nor
+/// delegates to the homeserver used is refused.
+pub(crate) async fn account_bound<F, Fut>(
+    returned: Option<&str>,
+    username: Option<&str>,
+    typed_server: Option<&str>,
+    homeserver: &url::Url,
+    discover: F,
+) -> bool
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Option<url::Url>>,
+{
+    match returned {
+        Some(r) if username.is_none_or(|u| login_account_matches(u, r)) => {
+            match server_name_of(r) {
+                Some(name) => server_name_bound(typed_server, homeserver, name, discover).await,
+                None => false,
+            }
+        }
+        _ => false,
+    }
+}
+
 /// Resolves the homeserver of `server_name` by `.well-known` discovery, using
 /// a throwaway client with the SDK's default in-memory store (nothing is
 /// persisted). `ClientBuilder::server_name` (matrix-sdk-0.19.1
@@ -292,6 +321,62 @@ mod tests {
             found
         })
         .await
+    }
+
+    /// OAuth has no typed username: the account binding rests on
+    /// `server_name_bound` alone, so a user ID from another server name must be
+    /// refused unless that name delegates to the homeserver used.
+    #[tokio::test]
+    async fn oauth_account_from_another_server_name_is_refused() {
+        let no_discovery = |_| async {
+            unreachable!("discovery must not run");
+            #[allow(unreachable_code)] // gives the async block its output type
+            None
+        };
+        // Bare name typed, but the server returned another server's account.
+        assert!(
+            !account_bound(
+                Some("@alice:matrix.org"),
+                None,
+                Some("evil.example"),
+                &u("https://evil.example"),
+                |_| async { Some(u("https://matrix-client.matrix.org")) },
+            )
+            .await
+        );
+        // Same with a URL typed (no bare name) and failing discovery.
+        assert!(
+            !account_bound(
+                Some("@alice:matrix.org"),
+                None,
+                None,
+                &u("https://evil.example"),
+                |_| async { None },
+            )
+            .await
+        );
+        // The matching server name is accepted without discovery.
+        assert!(
+            account_bound(
+                Some("@alice:example.org"),
+                None,
+                Some("example.org"),
+                &u("https://matrix-client.example.org"),
+                no_discovery,
+            )
+            .await
+        );
+        // No user ID at all is refused.
+        assert!(
+            !account_bound(
+                None,
+                None,
+                Some("example.org"),
+                &u("https://h.org"),
+                |_| async { None }
+            )
+            .await
+        );
     }
 
     #[tokio::test]

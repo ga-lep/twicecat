@@ -3,6 +3,7 @@
 //! Only plain API types cross the public boundary. SDK types stay in here.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures_util::{Stream, StreamExt as _, pin_mut};
 use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
@@ -20,9 +21,8 @@ use crate::api::{
     Command, CoreError, CoreEvent, DeviceId, ListDiff, MessageText, Password, RoomId, UserId,
 };
 use crate::client::{
-    ServerSpec, WRONG_ACCOUNT, build_client, discover_homeserver_url,
-    ensure_homeserver_after_login, login_account_matches, map_login_error, same_origin,
-    server_name_bound, server_name_of,
+    ServerSpec, WRONG_ACCOUNT, account_bound, build_client, discover_homeserver_url,
+    ensure_homeserver_after_login, map_login_error, same_origin,
 };
 use crate::oauth::authorize;
 use crate::paths::DataPaths;
@@ -257,6 +257,10 @@ async fn forward_timeline(
     }
 }
 
+/// How long shutdown waits for a pending OAuth task (and a logout) before
+/// giving up on it.
+const OAUTH_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
 struct Engine {
     config: CoreConfig,
     secrets: Arc<dyn SecretStore>,
@@ -272,6 +276,9 @@ struct Engine {
 struct PendingOAuth {
     /// Fires the cancellation; taken by `CancelOAuth`.
     cancel: Option<oneshot::Sender<()>>,
+    /// A cancel (or shutdown) was requested. A login that still succeeds is
+    /// then discarded, not adopted.
+    cancelled: bool,
     task: JoinHandle<Result<Client, CoreError>>,
     /// What the user asked for; a bare name binds the returned account.
     server: String,
@@ -384,8 +391,11 @@ impl Engine {
             Command::LoginOAuth { server } => self.login_oauth(server).await,
             // The task ends with `Cancelled`, which `on_oauth_done` reports.
             Command::CancelOAuth => {
-                if let Some(cancel) = self.oauth.as_mut().and_then(|p| p.cancel.take()) {
-                    let _ = cancel.send(());
+                if let Some(pending) = self.oauth.as_mut() {
+                    pending.cancelled = true;
+                    if let Some(cancel) = pending.cancel.take() {
+                        let _ = cancel.send(());
+                    }
                 }
             }
             Command::SelectRoom(room_id) => {
@@ -437,13 +447,18 @@ impl Engine {
         let task_server = server.clone();
         let task_passphrase = passphrase.clone();
         let task = tokio::spawn(async move {
-            let client =
-                build_client(&dir, &task_passphrase, ServerSpec::NameOrUrl(&task_server)).await?;
+            let mut cancelled = cancelled;
+            // Dropping the build future on cancel abandons the network call.
+            let client = tokio::select! {
+                c = build_client(&dir, &task_passphrase, ServerSpec::NameOrUrl(&task_server)) => c?,
+                _ = &mut cancelled => return Err(CoreError::Cancelled),
+            };
             authorize(&client, &events, cancelled).await?;
             Ok(client)
         });
         self.oauth = Some(PendingOAuth {
             cancel: Some(cancel),
+            cancelled: false,
             task,
             server,
             session_id,
@@ -463,6 +478,11 @@ impl Engine {
         let result =
             joined.unwrap_or_else(|_| Err(CoreError::Internal("background task failed".into())));
         let outcome = match result {
+            // Cancelled after the login had already succeeded: undo it.
+            Ok(client) if pending.cancelled => {
+                self.discard_client(client).await;
+                Err(CoreError::Cancelled)
+            }
             Ok(client) => {
                 self.adopt_login(
                     client,
@@ -491,20 +511,44 @@ impl Engine {
         }
     }
 
-    /// On shutdown: cancels a pending OAuth login, waits for its task to
-    /// release the client, and removes its store directory.
+    /// On shutdown: cancels a pending OAuth login, waits (bounded) for its
+    /// task to release the client, and removes its store directory.
     async fn cancel_oauth_and_wait(&mut self) {
+        self.cancel_oauth_and_wait_within(OAUTH_STOP_TIMEOUT).await;
+    }
+
+    async fn cancel_oauth_and_wait_within(&mut self, limit: Duration) {
         let Some(mut pending) = self.oauth.take() else {
             return;
         };
+        pending.cancelled = true;
         if let Some(cancel) = pending.cancel.take() {
             let _ = cancel.send(());
         }
-        // The task drops the client when it ends.
-        let _ = pending.task.await;
+        // The task drops the client when it ends. If it does not end in time
+        // (stuck network call or a front end that stopped draining events),
+        // abort it and wait for the abort, so the store is released.
+        match tokio::time::timeout(limit, &mut pending.task).await {
+            Ok(Ok(Ok(client))) => self.discard_client(client).await,
+            Ok(_) => {}
+            Err(_) => {
+                pending.task.abort();
+                let _ = (&mut pending.task).await;
+            }
+        }
         let paths = self.config.data.clone();
         let sid = pending.session_id;
         let _ = blocking(move || paths.remove_session_store_dir(&sid)).await;
+    }
+
+    /// Logs out a client whose login was cancelled after it succeeded (best
+    /// effort, bounded) and drops it, which releases its store. Nothing is
+    /// persisted.
+    async fn discard_client(&self, client: Client) {
+        match tokio::time::timeout(OAUTH_STOP_TIMEOUT, client.logout()).await {
+            Ok(Ok(())) => {}
+            _ => warn!("best-effort logout of a cancelled login did not succeed"),
+        }
     }
 
     /// Opens the timeline of `room_id`, replacing any previous selection.
@@ -648,18 +692,14 @@ impl Engine {
         let typed_server = (!server.contains("://")).then_some(server);
         let returned = client.user_id().map(ToString::to_string);
         let homeserver = client.homeserver();
-        let bound = match returned.as_deref() {
-            Some(r) if username.is_none_or(|u| login_account_matches(u, r)) => {
-                match server_name_of(r) {
-                    Some(name) => {
-                        server_name_bound(typed_server, &homeserver, name, discover_homeserver_url)
-                            .await
-                    }
-                    None => false,
-                }
-            }
-            _ => false,
-        };
+        let bound = account_bound(
+            returned.as_deref(),
+            username,
+            typed_server,
+            &homeserver,
+            discover_homeserver_url,
+        )
+        .await;
         if !bound {
             return Err(CoreError::Login(WRONG_ACCOUNT.into()));
         }
@@ -1045,5 +1085,90 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(none, None);
+    }
+
+    fn oauth_engine(dir: &std::path::Path) -> (Engine, mpsc::Receiver<CoreEvent>) {
+        let (events, rx) = mpsc::channel(8);
+        let engine = Engine {
+            config: CoreConfig {
+                data: DataPaths::at(dir),
+                homeserver_override: None,
+                room_list_page_size: DEFAULT_ROOM_LIST_PAGE_SIZE,
+            },
+            secrets: Arc::new(InMemorySecretStore::new()),
+            events,
+            active: None,
+            oauth: None,
+        };
+        (engine, rx)
+    }
+
+    fn pending(
+        engine: &mut Engine,
+        task: JoinHandle<Result<Client, CoreError>>,
+        cancelled: bool,
+    ) -> std::path::PathBuf {
+        let dir = engine
+            .config
+            .data
+            .create_session_store_dir("s1")
+            .expect("create store dir");
+        engine.oauth = Some(PendingOAuth {
+            cancel: None,
+            cancelled,
+            task,
+            server: "example.org".to_owned(),
+            session_id: "s1".to_owned(),
+            passphrase: Zeroizing::new("p".to_owned()),
+        });
+        dir
+    }
+
+    #[tokio::test]
+    async fn a_cancel_after_success_discards_the_login() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut engine, mut rx) = oauth_engine(tmp.path());
+        let client = Client::builder()
+            .homeserver_url("http://127.0.0.1:1")
+            .build()
+            .await
+            .unwrap();
+        let task = tokio::spawn(async { std::future::pending().await });
+        let dir = pending(&mut engine, task, true);
+        engine.on_oauth_done(Ok(Ok(client))).await;
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(CoreEvent::LoginFailed(CoreError::Cancelled))
+        ));
+        assert!(engine.active.is_none());
+        assert!(!dir.exists(), "store dir must be removed");
+        assert!(!tmp.path().join("last_account").exists());
+    }
+
+    #[tokio::test]
+    async fn shutdown_does_not_wait_for_a_stuck_oauth_task() {
+        struct Flag(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Flag {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut engine, _rx) = oauth_engine(tmp.path());
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Flag(dropped.clone());
+        let task = tokio::spawn(async move {
+            let _flag = flag;
+            std::future::pending().await
+        });
+        let dir = pending(&mut engine, task, false);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            engine.cancel_oauth_and_wait_within(Duration::from_millis(100)),
+        )
+        .await
+        .expect("shutdown must not hang");
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!dir.exists(), "store dir must be removed");
     }
 }

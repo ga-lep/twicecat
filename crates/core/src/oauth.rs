@@ -99,6 +99,19 @@ pub(crate) async fn spawn_redirect_listener()
         .map_err(|_| CoreError::Login("could not start the local redirect listener".into()))
 }
 
+/// Sends `event`, giving up with `Cancelled` when `cancel` fires (or its
+/// sender drops) or the receiver is gone, so a full channel cannot block.
+async fn send_or_cancel(
+    events: &mpsc::Sender<CoreEvent>,
+    event: CoreEvent,
+    cancel: &mut oneshot::Receiver<()>,
+) -> Result<(), CoreError> {
+    tokio::select! {
+        sent = events.send(event) => sent.map_err(|_| CoreError::Cancelled),
+        _ = cancel => Err(CoreError::Cancelled),
+    }
+}
+
 /// Runs the browser part of an OAuth login on `client`: registers, emits
 /// `OAuthUrl`, waits for the redirect, and finishes the login.
 ///
@@ -134,9 +147,10 @@ pub(crate) async fn authorize(
             return Err(e);
         }
     };
-    if events.send(CoreEvent::OAuthUrl(url)).await.is_err() {
+    // A front end that stopped draining events must not block cancel.
+    if let Err(e) = send_or_cancel(events, CoreEvent::OAuthUrl(url), &mut cancel).await {
         oauth.abort_login(&data.state).await;
-        return Err(CoreError::Cancelled);
+        return Err(e);
     }
 
     let query = tokio::select! {
@@ -147,6 +161,9 @@ pub(crate) async fn authorize(
         }
     };
     match query {
+        // Not raced against `cancel`: dropping it could leave a device logged
+        // in on the server. A cancel in this window is handled by the caller,
+        // which logs the finished login out; shutdown bounds the wait.
         Ok(Some(query)) => oauth.finish_login(query.into()).await.map_err(|e| match e {
             matrix_sdk::Error::OAuth(e) => map_oauth_error(&e),
             _ => CoreError::Login("OAuth login failed".into()),
@@ -246,5 +263,30 @@ mod tests {
             uri.host(),
             Some(url::Host::Ipv4(std::net::Ipv4Addr::LOCALHOST))
         );
+    }
+
+    #[tokio::test]
+    async fn send_or_cancel_gives_up_when_the_consumer_stalls() {
+        let (tx, _rx) = mpsc::channel(1);
+        tx.send(CoreEvent::LoggedOut).await.unwrap(); // the channel is now full
+        let (cancel_tx, mut cancel_rx) = oneshot::channel();
+        cancel_tx.send(()).unwrap();
+        let sent = tokio::time::timeout(
+            Duration::from_secs(5),
+            send_or_cancel(&tx, CoreEvent::LoggedOut, &mut cancel_rx),
+        )
+        .await
+        .expect("must not block on a full channel once cancelled");
+        assert_eq!(sent, Err(CoreError::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn send_or_cancel_sends_when_there_is_room() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let (_cancel_tx, mut cancel_rx) = oneshot::channel();
+        send_or_cancel(&tx, CoreEvent::LoggedOut, &mut cancel_rx)
+            .await
+            .unwrap();
+        assert!(matches!(rx.recv().await, Some(CoreEvent::LoggedOut)));
     }
 }
