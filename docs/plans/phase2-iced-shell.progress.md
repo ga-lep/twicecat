@@ -10,3 +10,4 @@ Task 2: complete (cba8b4a..51cd5e7, gate ok, security PASS, review PASS)
 Task 3: started
 Task 3: complete (add455c..373d3da, gate ok, security PASS, review PASS)
   notes: security Low — preview sender_name (and pre-existing room names) not sanitized (bidi/newline spoofing); preview_body misses U+2028/2029, U+200B-200D, U+FEFF, U+00AD. Info/review — map_batch does sequential local store work per room inside the forwarder (delays batch delivery, not the UI thread); if checkpoint shows lag, emit first then fill previews via buffer_unordered. review suggestions — first_sight allocs on every Set; leading blank line gives empty preview, tabs dropped; loaded test waits from LoggedIn not Running; Registered only cleared on task end.
+Task 4: started
