@@ -145,6 +145,14 @@ impl SyncControl for ServiceControl {
         self.0.start().await;
     }
 
+    async fn stop(&self) {
+        self.0.stop().await;
+    }
+
+    fn now(&self) -> std::time::Instant {
+        std::time::Instant::now()
+    }
+
     async fn sleep(&self, delay: std::time::Duration) {
         tokio::time::sleep(delay).await;
     }

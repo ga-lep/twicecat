@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Fails if the public core API leaks SDK types: crates/core/src/api/ must not
-# mention matrix_sdk, ruma, eyeball or imbl, and crates/core/src/lib.rs must not
+# Fails if the public core API leaks SDK types: crates/core/src/api/ and the
+# other public modules (paths, secrets, logging) must not mention matrix_sdk,
+# ruma, eyeball or imbl, and crates/core/src/lib.rs must not
 # `pub use` any of them. Fails closed: a missing path or grep error is an error.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -48,8 +49,8 @@ fi
 
 # lib.rs may declare only these public modules. The engine is private and
 # exported item by item, so no SDK type can leak through a module path.
-# `logging` exposes only `init` (tracing-subscriber setup, no SDK types) for the
-# CLI and the app.
+# `logging` exposes DEFAULT_FILTER, LogInitError and init (tracing-subscriber
+# setup, no SDK types) for the CLI and the app.
 allowed='(api|paths|secrets|logging)'
 rc=0
 bad=$(grep -Pzo "pub\s*(\(\s*[a-z]+\s*\)\s*)?mod\s+(?!${allowed}\s*[;{])\w+" "$lib_rs" | tr '\0' '\n') || rc=$?
@@ -61,4 +62,25 @@ elif [ "$rc" -ne 1 ]; then
     echo "error: grep failed (status ${rc})" >&2
     exit "$rc"
 fi
+
+# Every allow-listed public module must be free of SDK crate names too, whether
+# it is a file (`name.rs`) or a directory (`name/`). `api` is scanned above.
+# Fails closed: each module must exist as a file or a directory.
+for mod in paths secrets logging; do
+    found=0
+    for path in "crates/core/src/${mod}.rs" "crates/core/src/${mod}"; do
+        [ -e "$path" ] || continue
+        found=1
+        rc=0
+        grep -rnE "${crates}" "$path" || rc=$?
+        if [ "$rc" -eq 0 ]; then
+            echo "error: $path must not mention SDK crates" >&2
+            status=1
+        elif [ "$rc" -ne 1 ]; then
+            echo "error: grep failed (status ${rc})" >&2
+            exit "$rc"
+        fi
+    done
+    [ "$found" -eq 1 ] || { echo "error: public module ${mod} not found" >&2; exit 2; }
+done
 exit "$status"
