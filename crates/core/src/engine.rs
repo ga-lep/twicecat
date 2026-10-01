@@ -4,16 +4,21 @@
 
 use std::sync::Arc;
 
-use futures_util::{StreamExt as _, pin_mut};
+use futures_util::{Stream, StreamExt as _, pin_mut};
+use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
 use matrix_sdk::{Client, SessionChange};
+use matrix_sdk_ui::eyeball_im::{Vector, VectorDiff};
 use matrix_sdk_ui::room_list_service::filters::new_filter_non_left;
 use matrix_sdk_ui::sync_service::SyncService;
+use matrix_sdk_ui::timeline::{RoomExt as _, Timeline, TimelineItem as SdkTimelineItem};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 use zeroize::Zeroizing;
 
-use crate::api::{Command, CoreError, CoreEvent, DeviceId, Password, UserId};
+use crate::api::{
+    Command, CoreError, CoreEvent, DeviceId, ListDiff, MessageText, Password, RoomId, UserId,
+};
 use crate::client::{ServerSpec, build_client, ensure_homeserver_after_login, map_login_error};
 use crate::paths::DataPaths;
 use crate::room_list::{map_diff, summarize};
@@ -22,6 +27,7 @@ use crate::session::{
     RECORD_VERSION, SessionAuth, SessionRecord, generate_session_id, generate_store_passphrase,
 };
 use crate::sync::map_state;
+use crate::timeline::{map_item, parse_room_id};
 
 /// Default number of rooms the room list loads per page.
 pub const DEFAULT_ROOM_LIST_PAGE_SIZE: usize = 500;
@@ -81,17 +87,38 @@ struct Syncing {
     tasks: Vec<JoinHandle<()>>,
 }
 
+/// The room whose timeline is open, and the task forwarding its diffs.
+struct Selected {
+    room_id: RoomId,
+    timeline: Timeline,
+    task: JoinHandle<()>,
+}
+
+impl Selected {
+    /// Ends the forwarder; the timeline is dropped with `self`.
+    async fn stop(self) {
+        self.task.abort();
+        // An aborted task ends with a cancellation error; that is expected.
+        let _ = self.task.await;
+    }
+}
+
 struct Active {
     client: Client,
     record: SessionRecord,
     changes: broadcast::Receiver<SessionChange>,
     sync: Option<Syncing>,
+    selected: Option<Selected>,
 }
 
 impl Active {
-    /// Stops forwarding, then stops the sync service, so that nothing holds
-    /// the client or its store afterwards (the tasks own clones of it).
-    async fn stop_sync(&mut self) {
+    /// Stops the timeline forwarder, then the sync forwarders, then the sync
+    /// service, so that nothing holds the client or its store afterwards (the
+    /// tasks own clones of it).
+    async fn stop_tasks(&mut self) {
+        if let Some(selected) = self.selected.take() {
+            selected.stop().await;
+        }
         let Some(sync) = self.sync.take() else {
             return;
         };
@@ -157,6 +184,39 @@ async fn forward_room_list(
             .await
             .is_err()
         {
+            return;
+        }
+    }
+}
+
+/// Forwards the initial timeline items as one `Reset`, then every diff batch.
+async fn forward_timeline(
+    room_id: RoomId,
+    items: Vector<Arc<SdkTimelineItem>>,
+    stream: impl Stream<Item = Vec<VectorDiff<Arc<SdkTimelineItem>>>>,
+    events: mpsc::Sender<CoreEvent>,
+) {
+    let initial = ListDiff::Reset {
+        values: items.iter().map(|i| map_item(i)).collect(),
+    };
+    let first = CoreEvent::TimelineDiff {
+        room_id: room_id.clone(),
+        diffs: vec![initial],
+    };
+    if events.send(first).await.is_err() {
+        return;
+    }
+    pin_mut!(stream);
+    while let Some(diffs) = stream.next().await {
+        let diffs = diffs
+            .into_iter()
+            .map(|d| map_diff(d, |item| map_item(&item)))
+            .collect();
+        let event = CoreEvent::TimelineDiff {
+            room_id: room_id.clone(),
+            diffs,
+        };
+        if events.send(event).await.is_err() {
             return;
         }
     }
@@ -228,7 +288,7 @@ impl Engine {
         // Stop sync and drop the client before the events sender so that, once
         // the channel closes, the store is already released.
         if let Some(mut active) = self.active.take() {
-            active.stop_sync().await;
+            active.stop_tasks().await;
         }
     }
 
@@ -264,16 +324,63 @@ impl Engine {
                 self.emit(CoreEvent::LoginFailed(e)).await;
             }
             Command::CancelOAuth => {}
-            Command::SelectRoom(_) | Command::SendMessage { .. } => {
-                let e = if self.active.is_some() {
-                    CoreError::Internal("not implemented yet".into())
-                } else {
-                    CoreError::NotLoggedIn
-                };
-                self.emit(CoreEvent::Error(e)).await;
+            Command::SelectRoom(room_id) => {
+                if let Err(e) = self.select_room(room_id).await {
+                    self.emit(CoreEvent::Error(e)).await;
+                }
             }
+            Command::SendMessage { text } => self.send_message(&text).await,
             // Handled in `run`.
             Command::Shutdown => {}
+        }
+    }
+
+    /// Opens the timeline of `room_id`, replacing any previous selection.
+    async fn select_room(&mut self, room_id: RoomId) -> Result<(), CoreError> {
+        let active = self.active.as_mut().ok_or(CoreError::NotLoggedIn)?;
+        let sdk_id = parse_room_id(&room_id)?;
+        let room = active
+            .client
+            .get_room(&sdk_id)
+            .ok_or_else(|| CoreError::UnknownRoom(room_id.clone()))?;
+        if let Some(previous) = active.selected.take() {
+            previous.stop().await;
+        }
+        let timeline = room
+            .timeline()
+            .await
+            .map_err(|_| CoreError::Internal("could not open the room timeline".into()))?;
+        let (items, stream) = timeline.subscribe().await;
+        let task = tokio::spawn(forward_timeline(
+            room_id.clone(),
+            items,
+            stream,
+            self.events.clone(),
+        ));
+        active.selected = Some(Selected {
+            room_id,
+            timeline,
+            task,
+        });
+        Ok(())
+    }
+
+    /// Sends a text message to the selected room.
+    async fn send_message(&self, text: &MessageText) {
+        let Some(active) = self.active.as_ref() else {
+            self.emit(CoreEvent::Error(CoreError::NotLoggedIn)).await;
+            return;
+        };
+        let Some(selected) = active.selected.as_ref() else {
+            self.emit(CoreEvent::Error(CoreError::NoRoomSelected)).await;
+            return;
+        };
+        // The text is exposed only here, where the SDK needs it.
+        let content = RoomMessageEventContent::text_plain(text.expose());
+        if selected.timeline.send(content.into()).await.is_err() {
+            let error = CoreError::Internal("the message could not be queued".into());
+            let room_id = selected.room_id.clone();
+            self.emit(CoreEvent::SendFailed { room_id, error }).await;
         }
     }
 
@@ -355,6 +462,7 @@ impl Engine {
                         record,
                         changes,
                         sync: None,
+                        selected: None,
                     },
                     event,
                 ))
@@ -493,6 +601,7 @@ impl Engine {
                 record,
                 changes,
                 sync: None,
+                selected: None,
             },
             event,
         )))
@@ -533,7 +642,7 @@ impl Engine {
         match change {
             Some(SessionChange::UnknownToken(_)) => {
                 if let Some(mut active) = self.active.take() {
-                    active.stop_sync().await;
+                    active.stop_tasks().await;
                     let record = active.record.clone();
                     drop(active);
                     self.delete_local(&record).await;
@@ -584,7 +693,7 @@ impl Engine {
             self.emit(CoreEvent::Error(CoreError::NotLoggedIn)).await;
             return;
         };
-        active.stop_sync().await;
+        active.stop_tasks().await;
         if active.client.logout().await.is_err() {
             warn!("server logout failed; deleting local session anyway");
         }

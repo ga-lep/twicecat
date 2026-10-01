@@ -12,5 +12,6 @@ mod room_list;
 pub mod secrets;
 mod session;
 mod sync;
+mod timeline;
 
 pub use engine::{Core, CoreConfig, CoreHandle, DEFAULT_ROOM_LIST_PAGE_SIZE};
