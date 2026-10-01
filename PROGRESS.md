@@ -9,7 +9,7 @@
 ## Phase 0 steps
 - [x] 2. Cargo workspace with core, app, ptt crates (phase0.2)
 - [x] 3. Local Synapse homeserver and test users (phase0.3)
-- [ ] 4. GitHub Actions CI, cargo-deny, boundary check
+- [x] 4. GitHub Actions CI, cargo-deny, boundary check
 - [ ] 5. Linux build dependencies in CI
 - [ ] 6. License and name check
 
@@ -25,6 +25,14 @@
 - Containers stopped with `docker compose down`; data lives in the named volume only.
 - Open issues: none.
 
+## Step 4 notes
+- Checks run: `scripts/check-app-deps.sh` exits 0; negative self-check `scripts/check-app-deps.sh iced` exits 1 (prints `iced`); before the script existed, running it failed (no such file). `cargo deny check` (cargo-deny 0.20.2, installed with --locked) passes: advisories, bans, licenses, sources ok. actionlint 1.7.7 (docker) reports no errors on ci.yml. Full gate passes.
+- Licenses: allowlist is the plan's list minus MPL-2.0 (unused by the tree); nothing added beyond the list. Crates offering GPL-2.0-only / LGPL / Unlicense do so as OR alternatives with allowed licenses.
+- Advisories: RUSTSEC-2024-0436 (paste) and RUSTSEC-2026-0192 (ttf-parser) are "unmaintained" notices on transitive deps of the pinned iced 0.14.0; ignored in deny.toml with reasons. Revisit when iced is bumped.
+- `multiple-versions = "warn"` yields many duplicate warnings from iced's tree; expected.
+- Open issues: none.
+
 ## Human checkpoint
+- [ ] Push the branch and confirm CI is green on Linux, Windows, and macOS (Linux apt deps arrive in step 5, so Linux may fail until then).
 - [ ] Run `cargo run -p tessera-app` and confirm an empty window titled "Tessera" opens (rendering is unverified by the agent).
 - [ ] Approve the workspace layout and AGENTS.md.

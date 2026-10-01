@@ -1,0 +1,31 @@
+[advisories]
+# Unmaintained notices for transitive deps of the pinned iced 0.14.0; no fix available from us.
+ignore = [
+    { id = "RUSTSEC-2024-0436", reason = "paste unmaintained, transitive via iced/wgpu" },
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser unmaintained, transitive via iced text stack" },
+]
+
+[bans]
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "BSL-1.0",
+    "CC0-1.0",
+]
+
+[licenses.private]
+ignore = true
