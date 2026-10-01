@@ -1,0 +1,9 @@
+1. **One step at a time, in order.** Don't start a phase until the previous phase's acceptance checks pass and the human has signed off its checkpoint.
+2. **Never code from remembered APIs.** Before using any `matrix-sdk`, `matrix-sdk-ui`, `iced`, or `livekit` API, confirm it exists in the pinned version: read the crate source in the Cargo registry, `cargo doc` output, and the SDK's `examples/`. These crates change between releases.
+3. **Never change pinned dependency versions** without asking.
+4. **Gate every step** on `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace`. All must pass before committing.
+5. **One commit per step**, message `phaseN.step: summary`. Keep `PROGRESS.md` updated: step done, checks run, open issues, anything left for the human.
+6. **Test only against the local homeserver** from `docker-compose.yml`, with test accounts from `.env.test`. Never use real accounts or credentials; never log tokens, keys, or message bodies.
+7. **Keep the architecture boundary.** `crates/app` talks to `crates/core` only through its command and event API and never depends on `matrix-sdk` directly; a CI check enforces this.
+8. **Stop and ask the human** when a step needs credentials, certificates, or a real account; when an API the roadmap names doesn't exist in the pinned version; when an MSC is ambiguous; when a test is flaky twice in a row; or when a fix would substantially rewrite another phase's code.
+9. **Don't mark unverifiable work done.** Rendering, audio, Wayland hotkeys, and OS permission dialogs go on the human checkpoint list in `PROGRESS.md`.
