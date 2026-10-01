@@ -8,8 +8,8 @@ mod types;
 
 pub use diff::ListDiff;
 pub use types::{
-    CoreError, DeviceId, Password, RoomId, RoomSummary, SendStatus, SyncState, TimelineItem,
-    TimelineItemKind, UserId,
+    AuthUrl, CoreError, DeviceId, MessageText, Password, RoomId, RoomSummary, SendStatus,
+    SyncState, TimelineItem, TimelineItemKind, UserId,
 };
 
 /// A request from the front end to the engine.
@@ -38,7 +38,7 @@ pub enum Command {
     /// Send a text message to the selected room.
     SendMessage {
         /// Message text.
-        text: String,
+        text: MessageText,
     },
     /// Log out and delete the local session.
     Logout,
@@ -63,7 +63,7 @@ pub enum CoreEvent {
     /// Login failed.
     LoginFailed(CoreError),
     /// Open this URL in a browser to continue OAuth login.
-    OAuthUrl(String),
+    OAuthUrl(AuthUrl),
     /// The session was ended by logout.
     LoggedOut,
     /// The server rejected the session token.
@@ -118,6 +118,26 @@ mod tests {
             diffs: vec![ListDiff::Reset { values: vec![item] }],
         };
         assert!(!format!("{ev:?}").contains("secret-body-x"));
+    }
+
+    #[test]
+    fn send_message_debug_hides_text() {
+        let cmd = Command::SendMessage {
+            text: MessageText::from("secret-body-x"),
+        };
+        let dbg = format!("{cmd:?}");
+        assert!(!dbg.contains("secret-body-x"), "{dbg}");
+    }
+
+    #[test]
+    fn oauth_url_debug_hides_query() {
+        let ev = CoreEvent::OAuthUrl(AuthUrl::from(
+            "https://auth.example.org/authorize?state=secret-state-x&code_challenge=c",
+        ));
+        let dbg = format!("{ev:?}");
+        assert!(!dbg.contains("secret-state-x"), "{dbg}");
+        assert!(!dbg.contains("code_challenge"), "{dbg}");
+        assert!(dbg.contains("auth.example.org"), "{dbg}");
     }
 
     #[test]

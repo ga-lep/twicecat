@@ -81,6 +81,7 @@ Phase 0 agent work is done; the Phase 0 human checkpoint is fully signed off (20
 - Design: `ListDiff::apply` ignores out-of-range indices instead of panicking. `TimelineItemKind` has a manual redacted `Debug` (body shown only as byte length), so any event holding a timeline item is safe to log. `SendStatus` is `Sending | Sent | Failed`.
 - Negative self-check of `scripts/check-core-api.sh`: with a temporary `use matrix_sdk::Client;` as the first line of `api/mod.rs` it exits 1 (reports the line); a temporary `pub use matrix_sdk::Client;` in `lib.rs` also exits 1; reverted, it exits 0. A missing `api/` dir exits 2 (fail closed).
 - CI: `lint` job runs `scripts/check-core-api.sh` after `check-app-deps.sh`.
+- Review fix: `Command::SendMessage.text` is now `MessageText` and `CoreEvent::OAuthUrl` holds `AuthUrl`; both have redacted `Debug` (text shows byte length, URL shows scheme+host only) with `expose()` accessors. Tests added for both, plus `ListDiff::Insert` at `index == len`.
 - Open issues: none. New human items: none (the `api` approval is already on the checkpoint list).
 
 ## Phase 1 human checkpoint

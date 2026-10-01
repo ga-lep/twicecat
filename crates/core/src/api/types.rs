@@ -86,6 +86,83 @@ impl fmt::Debug for Password {
     }
 }
 
+/// Text of an outgoing message. `Debug` shows only its byte length.
+///
+/// ```
+/// use tessera_core::api::MessageText;
+/// let t = MessageText::from("hello");
+/// assert!(!format!("{t:?}").contains("hello"));
+/// assert_eq!(t.expose(), "hello");
+/// ```
+#[derive(Clone, PartialEq, Eq)]
+pub struct MessageText(String);
+
+impl MessageText {
+    /// Returns the text. Call only where the message is actually sent.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for MessageText {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for MessageText {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+
+impl fmt::Debug for MessageText {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "MessageText(<{} bytes>)", self.0.len())
+    }
+}
+
+/// An OAuth authorization URL. It carries `state` and the PKCE challenge in
+/// its query, so `Debug` shows only scheme and host.
+///
+/// ```
+/// use tessera_core::api::AuthUrl;
+/// let u = AuthUrl::from("https://auth.example.org/a?state=s");
+/// assert!(!format!("{u:?}").contains("state"));
+/// assert_eq!(u.expose(), "https://auth.example.org/a?state=s");
+/// ```
+#[derive(Clone, PartialEq, Eq)]
+pub struct AuthUrl(String);
+
+impl AuthUrl {
+    /// Returns the full URL, to be opened in a browser.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for AuthUrl {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for AuthUrl {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+
+impl fmt::Debug for AuthUrl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Keep "scheme://host" only; drop userinfo, path, query, fragment.
+        let (scheme, rest) = self.0.split_once("://").unwrap_or(("?", ""));
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+        let host = authority.rsplit('@').next().unwrap_or("");
+        write!(f, "AuthUrl({scheme}://{host}/<redacted>)")
+    }
+}
+
 /// Connection state of the sync loop.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SyncState {

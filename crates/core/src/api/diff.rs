@@ -124,6 +124,10 @@ mod tests {
         assert_eq!(run(&[1, 2], Clear), Vec::<i32>::new());
     }
     #[test]
+    fn insert_at_end() {
+        assert_eq!(run(&[1, 2], Insert { index: 2, value: 3 }), [1, 2, 3]);
+    }
+    #[test]
     fn push_front() {
         assert_eq!(run(&[2, 3], PushFront { value: 1 }), [1, 2, 3]);
     }
