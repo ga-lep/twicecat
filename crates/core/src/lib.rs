@@ -7,6 +7,7 @@
 pub mod api;
 mod client;
 mod engine;
+pub mod logging;
 pub mod paths;
 mod room_list;
 pub mod secrets;

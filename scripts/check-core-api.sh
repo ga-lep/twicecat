@@ -48,11 +48,13 @@ fi
 
 # lib.rs may declare only these public modules. The engine is private and
 # exported item by item, so no SDK type can leak through a module path.
-allowed='(api|paths|secrets)'
+# `logging` exposes only `init` (tracing-subscriber setup, no SDK types) for the
+# CLI and the app.
+allowed='(api|paths|secrets|logging)'
 rc=0
 bad=$(grep -Pzo "pub\s*(\(\s*[a-z]+\s*\)\s*)?mod\s+(?!${allowed}\s*[;{])\w+" "$lib_rs" | tr '\0' '\n') || rc=$?
 if [ "$rc" -eq 0 ]; then
-    echo "error: $lib_rs declares a pub mod outside the allow-list (api, paths, secrets):" >&2
+    echo "error: $lib_rs declares a pub mod outside the allow-list (api, paths, secrets, logging):" >&2
     echo "$bad" >&2
     status=1
 elif [ "$rc" -ne 1 ]; then

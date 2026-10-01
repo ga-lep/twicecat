@@ -30,7 +30,7 @@ use crate::secrets::{SecretError, SecretStore};
 use crate::session::{
     RECORD_VERSION, SessionAuth, SessionRecord, generate_session_id, generate_store_passphrase,
 };
-use crate::sync::map_state;
+use crate::sync::{SyncControl, supervise};
 use crate::timeline::{map_item, parse_room_id};
 
 /// Default number of rooms the room list loads per page.
@@ -137,27 +137,30 @@ impl Active {
     }
 }
 
-/// Forwards every distinct sync state change as an event.
+/// Production [`SyncControl`]: restarts the real service.
+struct ServiceControl(Arc<SyncService>);
+
+impl SyncControl for ServiceControl {
+    async fn restart(&self) {
+        self.0.start().await;
+    }
+
+    async fn sleep(&self, delay: std::time::Duration) {
+        tokio::time::sleep(delay).await;
+    }
+
+    fn jitter_unit(&self) -> f64 {
+        rand::random::<f64>()
+    }
+}
+
+/// Forwards sync state changes as events and restarts the service after a
+/// failure (see [`supervise`]).
 async fn forward_sync_state(service: Arc<SyncService>, events: mpsc::Sender<CoreEvent>) {
     // Subscribe before reading the current value so that no change is lost.
-    let mut subscriber = service.state();
-    let mut last = map_state(&subscriber.get());
-    if events
-        .send(CoreEvent::SyncState(last.clone()))
-        .await
-        .is_err()
-    {
-        return;
-    }
-    while let Some(state) = subscriber.next().await {
-        let mapped = map_state(&state);
-        if mapped != last {
-            last = mapped.clone();
-            if events.send(CoreEvent::SyncState(mapped)).await.is_err() {
-                return;
-            }
-        }
-    }
+    let subscriber = service.state();
+    let initial = subscriber.get();
+    supervise(&ServiceControl(service), initial, subscriber, &events).await;
 }
 
 /// Forwards every room list diff batch as one `RoomListChanged` event.
