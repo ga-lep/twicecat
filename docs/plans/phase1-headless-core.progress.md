@@ -17,3 +17,4 @@ Task 5: complete (e9a3a56..7a5f532, gate ok, actionlint ok, integration 4/4 --sk
 Task 6: started
 Task 6: complete (456e2e7..7b69c69, gate ok, integration 6/6 --skip keyring, security PASS, review PASS)
   notes: [sec Low] tests/login.rs files_under swallows all read_dir/entry errors (not only NotFound) — weakens no_token_on_disk; tolerate NotFound only; [sec Low + review Warn] store may still be open after event channel closes → logout/UnknownToken remove_dir_all can leave files (Windows esp.); comment in engine.rs now inaccurate — retry/await client release (Task 8); [sec Info] room names may contain bidi/zero-width spoofing chars — sanitize in app rendering (Phase 2 human checkpoint); [review Warn] bounded event channel: app must keep draining; RoomDisplayName::Empty shown as SDK label; SyncService build failure leaves logged-in without sync until Task 8; [review Sugg] unify LoggedIn+start_sync helper; stronger unread assertion
+Task 7: started
