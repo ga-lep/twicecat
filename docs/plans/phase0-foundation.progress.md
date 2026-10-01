@@ -11,3 +11,5 @@ Task 4: started
 Task 4: complete (a8cafe2..fefc04c, gate ok, security PASS, review PASS)
   notes: process deviation — controller launched security and quality reviews concurrently; quality verdict accepted only after security PASS. [sec Low] no permissions block / tag-pinned actions (pre-existing, see Task 3); [review Sugg] stale "Linux may fail until step 5" line in PROGRESS.md; apt install duplicated across jobs; --no-install-recommends optional
 Task 5: started
+Task 5: complete (d5221c9..a9cea0f, gate ok, security PASS, review PASS)
+  notes: [review Warn] trailer model name flagged — dismissed, trailer matches the session's attribution instruction; [review Sugg] external name-check claims not re-verified by reviewer
