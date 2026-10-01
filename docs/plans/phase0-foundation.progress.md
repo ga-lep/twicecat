@@ -21,3 +21,4 @@ Fix: complete (2a5aedc..49a48dd, gate ok, security PASS, review PASS; actionlint
 Fix 2 (tail/awk fail-open in check-app-deps.sh): started
 Fix 2: complete (d814081..aa754c0, gate ok, security PASS, review PASS; shellcheck re-run by controller: clean)
   notes: [sec Low] printf|grep pipe could theoretically mask a match under pipefail — use grep <<<"$names" if desired; [review Sugg] grep echoes matching lines on violation (pre-existing)
+Fix 3 (actions/checkout v4 -> v6, Node 20 deprecation; user-approved per rule 3): started
