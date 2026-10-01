@@ -1,0 +1,15 @@
+[package]
+name = "tessera-app"
+version = "0.1.0"
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "tessera"
+path = "src/main.rs"
+
+[dependencies]
+iced = "=0.14.0"
+tessera-core = { path = "../core" }
