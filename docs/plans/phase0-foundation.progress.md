@@ -25,3 +25,4 @@ Fix 3 (actions/checkout v4 -> v6, Node 20 deprecation; user-approved per rule 3)
 Fix 3: complete (36f9afa..bf0e3fc, gate ok, actionlint re-run by controller: clean, security PASS, review PASS)
   notes: actions/checkout v4 -> v6 (node24), human-approved under rule 3; [sec Low] actions still tag-pinned, not SHA (human decision)
 CI green on ubuntu/windows/macos: confirmed by human 2026-10-01 (recorded in c59f062; one-line checklist tick, diff checked by controller, no agent review)
+Human checkpoint: window opens + layout/AGENTS.md approved, confirmed by human 2026-10-01 (recorded in 937b00e; diff checked by controller). Local apt item still open.
