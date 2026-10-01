@@ -19,3 +19,4 @@ Task 5: complete (c0aada0..b3e34d0, gate ok, security PASS, review PASS)
 Task 6: started
 Task 6: complete (1a9f51a..b5df2e5, gate ok, security PASS, review PASS)
   notes: security Low — --ephemeral dir removed only on normal exit (use RAII guard / reword --help); ephemeral root created recursively without AlreadyExists check; app tests/bridge.rs honours env HOMESERVER_URL and would send test creds over plain http to any host (assert loopback, AGENTS rule 6); Info — test temp dir left on failure, ensure_one_room grows local state, worst-case close ~15 s (human checkpoint). review — accepted deviations: App::booter(Startup), Bridge::start -> io::Result, Pending::deliver test, raw HTTP/1.0 room seeding; warnings: Bridge drop blocks UI up to 5 s at exit (spec), bridge test `next` conflates end/timeout; suggestions: share try_send fallback helper, doc TITLE. actionlint not installed (CI edit unlinted).
+Task 7: started
