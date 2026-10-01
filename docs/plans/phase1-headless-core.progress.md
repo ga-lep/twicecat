@@ -7,3 +7,4 @@ Task 2: complete (db93f23..c8e35ce, gate ok, security PASS, review PASS — 1 re
 Task 3: started
 Task 3: complete (07af992..dc9d2fa, gate ok, security PASS, review PASS)
   notes: [sec Low] secrets not zeroized (InMemory HashMap, store_passphrase String, passphrase bytes on stack) — needs human OK for zeroize/secrecy dep; [sec Low] SessionRecord::from_bytes trusts keychain fields — validate session_id allowlist, homeserver_url scheme, user_id match (carried to Task 4); [sec Info] SecretStore blocking → spawn_blocking in Task 4; [review Warn] module-wide #![allow(dead_code)] in session.rs — remove in Task 4; [review Warn] SecretError doc "never contains secrets" relies on keyring to_string (verified by sec for keyring-core 1.0.0); [review Sugg] test set-overwrite; merge InMemorySecretStore impl blocks
+Task 4: started
