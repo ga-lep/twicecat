@@ -227,7 +227,7 @@ Phase 0 agent work is done; the Phase 0 human checkpoint is fully signed off (20
 - [x] The OIDC session survives a CLI restart. (confirmed by human 2026-10-01)
 - [x] Keep the CLI running for over 10 minutes so MAS refreshes the access token, then restart and confirm restore still works (refresh persistence cannot be verified locally). (confirmed by human 2026-10-01)
 - [x] CLI in a real terminal: `/login` then the password prompt does not echo, and the password never appears as a REPL line, "Unknown command", or a sent message, even if typed ahead; Ctrl-C at the REPL exits cleanly; Ctrl-C at the password prompt prints "Interrupted. Press Enter to end the password prompt", and after Enter the CLI exits with the terminal usable (echo restored; Ctrl-C is deferred until the read returns); with `--data-dir` on an empty dir and a broken keychain (e.g. no secret service) startup prints the error and a hint, then `/login` and `/quit` work; `--ephemeral` then Ctrl-C leaves no `/tmp/tessera-cli-*` dir and the device is gone from the account's session list; `--password-stdin` on a terminal prints the echo warning. (confirmed by human 2026-10-01)
-- [ ] Approve the `api` module as the Phase 2 contract.
+- [x] Approve the `api` module as the Phase 2 contract. (approved by human 2026-10-01, including `SendMessage { text: MessageText }` and `OAuthUrl(AuthUrl)` as implemented)
 
 ## Human checkpoint
 - [x] Push the branch and confirm CI is green on Linux, Windows, and macOS (confirmed by human 2026-10-01).
