@@ -10,7 +10,7 @@
 - [x] 2. Cargo workspace with core, app, ptt crates (phase0.2)
 - [x] 3. Local Synapse homeserver and test users (phase0.3)
 - [x] 4. GitHub Actions CI, cargo-deny, boundary check
-- [ ] 5. Linux build dependencies in CI
+- [x] 5. Linux build dependencies in CI
 - [ ] 6. License and name check
 
 ## Step 2 notes
@@ -32,7 +32,12 @@
 - `multiple-versions = "warn"` yields many duplicate warnings from iced's tree; expected.
 - Open issues: none.
 
+## Step 5 notes
+- Both CI jobs install the apt packages (libxkbcommon-dev libwayland-dev libx11-dev libdbus-1-dev libssl-dev pkg-config) under `if: runner.os == 'Linux'`, right after checkout and before any cargo step. Before the edit the grep for the package list found 0 matches; after, 2. actionlint 1.7.7 (docker) reports no errors. Full gate passes.
+- Open issues: none.
+
 ## Human checkpoint
 - [ ] Push the branch and confirm CI is green on Linux, Windows, and macOS (Linux apt deps arrive in step 5, so Linux may fail until then).
 - [ ] Run `cargo run -p tessera-app` and confirm an empty window titled "Tessera" opens (rendering is unverified by the agent).
 - [ ] Approve the workspace layout and AGENTS.md.
+- [ ] Run locally (needs sudo): `sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libdbus-1-dev libssl-dev pkg-config`.
