@@ -14,3 +14,4 @@ Task 4: complete (242dc97..2ea77a4, gate ok, integration 4/4 --skip keyring, sec
 Task 5: started
 Task 5: complete (e9a3a56..7a5f532, gate ok, actionlint ok, integration 4/4 --skip keyring, security PASS, review PASS)
   notes: [sec Low + review Sugg] integration job has no timeout-minutes (add ~20–30); [sec Low] actions pinned by tag not SHA (all jobs; consider Dependabot github-actions); [sec Info] synapse image tag not digest (rule 3: ask human); [review] login_policy.rs move done, login.rs ignore count 4 == tests 4; human: push and confirm `integration` green
+Task 6: started
