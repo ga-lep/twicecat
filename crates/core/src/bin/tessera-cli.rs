@@ -67,6 +67,9 @@ server; revoke stray sessions from your account settings.
 const REPL_HINT: &str =
     "Commands: /login /oauth <server> /rooms /select <n|id> /send <text> /logout /quit";
 
+const START_FAILED_HINT: &str =
+    "Could not restore or start a session. Use /login to log in, or /quit to exit.";
+
 /// How long to wait for the engine to finish after `Shutdown`.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(20);
 
@@ -323,6 +326,26 @@ enum Mode {
     OAuth,
 }
 
+/// What Ctrl-C does right now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CtrlC {
+    /// Shut down at once.
+    Quit,
+    /// Wait: a hidden password read is pending.
+    Defer,
+}
+
+/// `rpassword` turns terminal echo off and only restores it when its read
+/// returns. The runtime swallows SIGINT, so quitting while that read is
+/// blocked would leave the terminal with echo off. Defer until it returns.
+fn ctrl_c_action(hidden_password_pending: bool) -> CtrlC {
+    if hidden_password_pending {
+        CtrlC::Defer
+    } else {
+        CtrlC::Quit
+    }
+}
+
 struct Selected {
     id: RoomId,
     name: String,
@@ -332,10 +355,14 @@ struct Cli {
     core: CoreHandle,
     requests: std::sync::mpsc::Sender<Request>,
     inputs: mpsc::Receiver<Input>,
+    /// One message per Ctrl-C.
+    interrupts: mpsc::Receiver<()>,
     gate: Gate,
     password_stdin: bool,
     logged_in: bool,
     mode: Mode,
+    /// Ctrl-C arrived while a hidden password read was pending.
+    interrupted: bool,
     rooms: Vec<RoomSummary>,
     selected: Option<Selected>,
     timeline: Vec<TimelineItem>,
@@ -373,6 +400,10 @@ impl Cli {
                     Some(event) => self.on_event(event),
                     None => return,
                 },
+                Some(()) = self.interrupts.recv() => {
+                    println!("Interrupted.");
+                    return;
+                }
                 input = self.inputs.recv(), if waiting => match input {
                     Some(input) => {
                         if let Some(line) = self.gate.repl_line(input)
@@ -392,6 +423,12 @@ impl Cli {
         self.mode = Mode::Username;
     }
 
+    fn interrupt_action(&self) -> CtrlC {
+        // With --password-stdin the read is a plain line read: echo is not
+        // involved, so Ctrl-C need not wait for it.
+        ctrl_c_action(self.gate.password_pending && !self.password_stdin)
+    }
+
     async fn read_password(&mut self) -> Option<Password> {
         if !self.gate.begin_password() {
             return None;
@@ -402,12 +439,30 @@ impl Cli {
             Request::Password
         };
         let password = if self.requests.send(request).is_ok() {
-            match self.inputs.recv().await {
-                Some(Input::Line(line)) if self.password_stdin => {
-                    Some(line.trim_end_matches(['\r', '\n']).to_owned())
+            loop {
+                tokio::select! {
+                    biased;
+                    Some(()) = self.interrupts.recv() => {
+                        if self.interrupt_action() == CtrlC::Quit {
+                            self.interrupted = true;
+                            break None;
+                        }
+                        if !self.interrupted {
+                            eprintln!(
+                                "\nInterrupted. Press Enter to end the password prompt; \
+                                 the CLI then exits."
+                            );
+                        }
+                        self.interrupted = true;
+                    }
+                    input = self.inputs.recv() => break match input {
+                        Some(Input::Line(line)) if self.password_stdin => {
+                            Some(line.trim_end_matches(['\r', '\n']).to_owned())
+                        }
+                        Some(Input::Password(password)) if !self.password_stdin => password,
+                        _ => None,
+                    },
                 }
-                Some(Input::Password(password)) if !self.password_stdin => password,
-                _ => None,
             }
         } else {
             None
@@ -448,7 +503,12 @@ impl Cli {
                 self.prompt_username();
                 return Flow::Continue;
             }
-            let Some(password) = self.read_password().await else {
+            let password = self.read_password().await;
+            if self.interrupted {
+                println!("Interrupted.");
+                return Flow::Quit;
+            }
+            let Some(password) = password else {
                 println!("No password given.");
                 self.mode = Mode::Idle;
                 return Flow::Continue;
@@ -581,7 +641,16 @@ impl Cli {
             CoreEvent::SendFailed { room_id, error } => {
                 println!("Send failed in {}: {error}", sanitize(room_id.as_str()));
             }
-            CoreEvent::Error(error) => eprintln!("error: {error}"),
+            CoreEvent::Error(error) => {
+                eprintln!("error: {error}");
+                // A restore or login in flight that ends in a plain error
+                // (not LoginFailed or NoSession) must not strand the CLI in
+                // Busy, where it never reads stdin.
+                if self.mode == Mode::Busy && !self.logged_in {
+                    println!("{START_FAILED_HINT}");
+                    self.mode = Mode::Idle;
+                }
+            }
         }
     }
 
@@ -680,23 +749,32 @@ async fn main() -> ExitCode {
     // the runtime from shutting down.
     std::thread::spawn(move || reader_loop(request_rx, input_tx, TerminalSource));
 
+    // Ctrl-C is delivered to the loop as a message, so it can be deferred
+    // while a hidden password read is pending (see `ctrl_c_action`).
+    let (interrupt_tx, interrupts) = mpsc::channel(1);
+    tokio::spawn(async move {
+        while tokio::signal::ctrl_c().await.is_ok() {
+            // Full means one is already queued.
+            let _ = interrupt_tx.try_send(());
+        }
+    });
+
     let mut cli = Cli {
         core,
         requests,
         inputs,
+        interrupts,
         gate: Gate::default(),
         password_stdin: options.password_stdin,
         logged_in: false,
         mode: Mode::Busy,
+        interrupted: false,
         rooms: Vec::new(),
         selected: None,
         timeline: Vec::new(),
         printed: HashSet::new(),
     };
-    tokio::select! {
-        () = cli.run() => {}
-        _ = tokio::signal::ctrl_c() => println!("Interrupted."),
-    }
+    cli.run().await;
 
     // An ephemeral session is thrown away, so revoke it on the server too.
     if cleanup.is_some() {
@@ -937,6 +1015,120 @@ mod tests {
         assert_eq!(gate.line_request(true), None);
         gate.end_password();
         assert_eq!(gate.line_request(true), Some(Request::Line));
+    }
+
+    /// A `Cli` wired to dead channels, for state-transition tests.
+    fn test_cli(mode: Mode, logged_in: bool) -> (Cli, mpsc::Sender<()>) {
+        let (commands, _command_rx) = mpsc::channel(8);
+        let (_event_tx, events) = mpsc::channel(8);
+        let (requests, _request_rx) = std::sync::mpsc::channel();
+        let (_input_tx, inputs) = mpsc::channel(1);
+        let (interrupt_tx, interrupts) = mpsc::channel(1);
+        let cli = Cli {
+            core: CoreHandle { commands, events },
+            requests,
+            inputs,
+            interrupts,
+            gate: Gate::default(),
+            password_stdin: false,
+            logged_in,
+            mode,
+            interrupted: false,
+            rooms: Vec::new(),
+            selected: None,
+            timeline: Vec::new(),
+            printed: HashSet::new(),
+        };
+        (cli, interrupt_tx)
+    }
+
+    #[test]
+    fn error_during_restore_or_login_leaves_busy() {
+        let (mut cli, _keep) = test_cli(Mode::Busy, false);
+        cli.on_event(CoreEvent::Error(tessera_core::api::CoreError::Storage(
+            "x".into(),
+        )));
+        assert_eq!(cli.mode, Mode::Idle);
+        // Idle means stdin is read again, so /quit and /login work.
+        assert!(cli.gate.line_request(cli.mode != Mode::Busy).is_some());
+    }
+
+    #[test]
+    fn error_keeps_other_modes() {
+        let (mut cli, _keep) = test_cli(Mode::Idle, true);
+        cli.on_event(CoreEvent::Error(tessera_core::api::CoreError::NotLoggedIn));
+        assert_eq!(cli.mode, Mode::Idle);
+        let (mut cli, _keep) = test_cli(Mode::Username, false);
+        cli.on_event(CoreEvent::Error(tessera_core::api::CoreError::NotLoggedIn));
+        assert_eq!(cli.mode, Mode::Username);
+    }
+
+    #[test]
+    fn other_not_logged_in_failures_leave_busy() {
+        let (mut cli, _keep) = test_cli(Mode::Busy, false);
+        cli.on_event(CoreEvent::LoginFailed(
+            tessera_core::api::CoreError::Cancelled,
+        ));
+        assert_eq!(cli.mode, Mode::Idle);
+        let (mut cli, _keep) = test_cli(Mode::Busy, false);
+        cli.on_event(CoreEvent::NoSession);
+        assert_eq!(cli.mode, Mode::Username);
+        let (mut cli, _keep) = test_cli(Mode::Busy, false);
+        cli.on_event(CoreEvent::SessionExpired);
+        assert_eq!(cli.mode, Mode::Idle);
+    }
+
+    #[tokio::test]
+    async fn quit_works_after_a_failed_restore() {
+        let (mut cli, _keep) = test_cli(Mode::Busy, false);
+        cli.on_event(CoreEvent::Error(tessera_core::api::CoreError::Storage(
+            "x".into(),
+        )));
+        assert!(matches!(cli.on_line("/quit\n").await, Flow::Quit));
+    }
+
+    #[test]
+    fn ctrl_c_waits_for_a_hidden_password_read() {
+        assert_eq!(ctrl_c_action(true), CtrlC::Defer);
+        assert_eq!(ctrl_c_action(false), CtrlC::Quit);
+        let (mut cli, _keep) = test_cli(Mode::Idle, false);
+        assert_eq!(cli.interrupt_action(), CtrlC::Quit);
+        assert!(cli.gate.begin_password());
+        assert_eq!(cli.interrupt_action(), CtrlC::Defer);
+        // A password read from stdin does not touch terminal echo.
+        cli.password_stdin = true;
+        assert_eq!(cli.interrupt_action(), CtrlC::Quit);
+    }
+
+    struct BlockedPassword(std::sync::mpsc::Receiver<()>);
+
+    impl Source for BlockedPassword {
+        fn read_line(&mut self) -> Option<String> {
+            None
+        }
+
+        fn read_password(&mut self) -> Option<String> {
+            self.0.recv().ok();
+            Some("pw".to_owned())
+        }
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_during_a_password_read_waits_for_the_read_then_quits() {
+        let (mut cli, interrupt_tx) = test_cli(Mode::Username, false);
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        let (input_tx, inputs) = mpsc::channel(1);
+        cli.requests = request_tx;
+        cli.inputs = inputs;
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || reader_loop(request_rx, input_tx, BlockedPassword(release_rx)));
+        interrupt_tx.send(()).await.expect("queue interrupt");
+        release_tx.send(()).expect("release the read");
+        let flow = cli.on_line("bob\n").await;
+        // The read finished (so the terminal was restored), then the CLI quits.
+        assert!(cli.interrupted);
+        assert!(!cli.gate.password_pending);
+        assert!(matches!(flow, Flow::Quit));
     }
 
     #[test]
