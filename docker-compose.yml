@@ -1,0 +1,21 @@
+services:
+  synapse:
+    image: matrixdotorg/synapse:v1.151.0
+    entrypoint: ["/bin/sh", "/start-dev.sh"]
+    environment:
+      SYNAPSE_SERVER_NAME: localhost
+      SYNAPSE_REPORT_STATS: "no"
+    ports:
+      - "127.0.0.1:8008:8008"
+    volumes:
+      - synapse-data:/data
+      - ./dev/synapse/start.sh:/start-dev.sh:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fSs", "http://localhost:8008/health"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+
+volumes:
+  synapse-data:
