@@ -213,6 +213,9 @@ Phase 0 agent work is done; the Phase 0 human checkpoint is fully signed off (20
 - Terminal echo: Ctrl-C is now a message from a forwarding task to the loop instead of a `select!` arm in `main`. While a hidden password read (`rpassword`) is pending, Ctrl-C is deferred (`ctrl_c_action`, `Cli::interrupt_action`): the CLI prints a note, the read finishes on Enter (rpassword restores echo), the password is dropped, and the CLI exits through the normal shutdown path. With `--password-stdin` no echo is involved, so Ctrl-C quits at once. No new dependency. Tests: `ctrl_c_waits_for_a_hidden_password_read`, `ctrl_c_during_a_password_read_waits_for_the_read_then_quits` (the Ctrl-C tests were seen failing first as compile errors). Real-terminal behaviour is on the human list (item reworded).
 - Open issues: a stale record whose store dir is missing still yields `Error` on every restore (core behaviour, not changed here); the user must log in again, which replaces it. Ctrl-C at the password prompt needs Enter to take effect (a second Ctrl-C is deferred too). A tiny window exists between two `ctrl_c()` registrations in the forwarder where a SIGINT could be missed.
 
+### CI triggers follow-up (human-approved)
+- `ci.yml` now triggers on `push` to `main`, on `pull_request`, and on `workflow_dispatch`, so a push to a branch with an open PR no longer runs the workflow twice. Feature branches get CI through their PR; a branch without a PR can be run manually via workflow_dispatch; main runs on push after merge. Nothing else in the workflow changed.
+
 ## Phase 1 human checkpoint
 - [ ] Push the branch and confirm the new `integration` job is green (Task 5).
 - [ ] CI green on Linux, Windows, and macOS with the new SDK tree (aws-lc-sys and bundled sqlite builds), and the `integration` job green (Task 5).
