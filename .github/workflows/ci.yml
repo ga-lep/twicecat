@@ -69,7 +69,7 @@ jobs:
         run: scripts/create-test-users.sh
       # The real-keychain test needs a desktop session, hence --skip keyring.
       - name: Run homeserver integration tests
-        run: cargo test -p tessera-core --locked -- --ignored --skip keyring
+        run: cargo test -p tessera-core -p tessera-app --locked -- --ignored --skip keyring
       - name: Stop local Synapse
         if: always()
         run: docker compose down -v
