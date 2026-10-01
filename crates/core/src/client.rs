@@ -10,6 +10,19 @@ use matrix_sdk::ruma::api::error::ErrorKind;
 use matrix_sdk::{Client, ClientBuildError, Error as SdkError, HttpError};
 
 use crate::api::CoreError;
+use crate::session::is_allowed_homeserver_url;
+
+/// Fixed, non-secret message for a homeserver that fails the transport policy.
+const HTTPS_REQUIRED: &str = "the homeserver must use https";
+
+/// Applies the transport policy (see [`is_allowed_homeserver_url`]).
+fn ensure_https(url: &str) -> Result<(), CoreError> {
+    if is_allowed_homeserver_url(url) {
+        Ok(())
+    } else {
+        Err(CoreError::Login(HTTPS_REQUIRED.into()))
+    }
+}
 
 /// Where to find the homeserver.
 pub(crate) enum ServerSpec<'a> {
@@ -20,22 +33,41 @@ pub(crate) enum ServerSpec<'a> {
 }
 
 /// Builds a client with an encrypted SQLite store at `store_dir`.
+///
+/// For [`ServerSpec::NameOrUrl`] the https/loopback policy is enforced both on
+/// an explicit URL (before any request, including discovery) and on the
+/// homeserver the SDK resolved (`.well-known` may point to plain http), so no
+/// credential can be sent over cleartext. Every login path (password, and
+/// OAuth later) must go through here.
 pub(crate) async fn build_client(
     store_dir: &Path,
     passphrase: &str,
     server: ServerSpec<'_>,
 ) -> Result<Client, CoreError> {
     let builder = Client::builder();
+    let check_resolved = matches!(server, ServerSpec::NameOrUrl(_));
     let builder = match server {
-        ServerSpec::NameOrUrl(s) => builder.server_name_or_homeserver_url(s),
+        ServerSpec::NameOrUrl(s) => {
+            // An explicit http(s) URL is judged before the SDK contacts it.
+            if let Ok(url) = url::Url::parse(s)
+                && matches!(url.scheme(), "http" | "https")
+            {
+                ensure_https(s)?;
+            }
+            builder.server_name_or_homeserver_url(s)
+        }
         ServerSpec::Url(u) => builder.homeserver_url(u),
     };
-    builder
+    let client = builder
         .sqlite_store(store_dir, Some(passphrase))
         .handle_refresh_tokens()
         .build()
         .await
-        .map_err(|e| map_build_error(&e))
+        .map_err(|e| map_build_error(&e))?;
+    if check_resolved {
+        ensure_https(client.homeserver().as_str())?;
+    }
+    Ok(client)
 }
 
 /// Maps a client build failure to a fixed message.

@@ -119,14 +119,27 @@ impl SessionRecord {
 /// Accepts `https` URLs, and `http` only for loopback hosts (the local test
 /// homeserver). Errors carry no part of the URL.
 fn validate_homeserver_url(raw: &str) -> Result<(), CoreError> {
-    let invalid = || CoreError::Storage("stored session record has an invalid homeserver".into());
-    let url = url::Url::parse(raw).map_err(|_| invalid())?;
+    if is_allowed_homeserver_url(raw) {
+        Ok(())
+    } else {
+        Err(CoreError::Storage(
+            "stored session record has an invalid homeserver".into(),
+        ))
+    }
+}
+
+/// The homeserver transport policy, shared by restore and login: `https`, or
+/// `http` only for `localhost` and loopback addresses.
+pub(crate) fn is_allowed_homeserver_url(raw: &str) -> bool {
+    let Ok(url) = url::Url::parse(raw) else {
+        return false;
+    };
     match (url.scheme(), url.host()) {
-        ("https", Some(_)) => Ok(()),
-        ("http", Some(url::Host::Domain(d))) if d.eq_ignore_ascii_case("localhost") => Ok(()),
-        ("http", Some(url::Host::Ipv4(ip))) if ip.is_loopback() => Ok(()),
-        ("http", Some(url::Host::Ipv6(ip))) if ip.is_loopback() => Ok(()),
-        _ => Err(invalid()),
+        ("https", Some(_)) => true,
+        ("http", Some(url::Host::Domain(d))) => d.eq_ignore_ascii_case("localhost"),
+        ("http", Some(url::Host::Ipv4(ip))) => ip.is_loopback(),
+        ("http", Some(url::Host::Ipv6(ip))) => ip.is_loopback(),
+        _ => false,
     }
 }
 
@@ -212,6 +225,32 @@ mod tests {
                 },
             },
             ..matrix_record()
+        }
+    }
+
+    #[test]
+    fn homeserver_policy_on_resolved_urls() {
+        for ok in [
+            "https://matrix.example.org/",
+            "https://127.0.0.1:8448/",
+            "http://localhost:8008/",
+            "http://LocalHost/",
+            "http://127.0.0.1:8008/",
+            "http://127.5.5.5/",
+            "http://[::1]:8008/",
+        ] {
+            assert!(is_allowed_homeserver_url(ok), "{ok} should be allowed");
+        }
+        for bad in [
+            "http://matrix.example.invalid/",
+            "http://192.168.1.5:8008/",
+            "http://localhost.example.org/",
+            "http://[2001:db8::1]/",
+            "ftp://localhost/",
+            "not a url",
+            "",
+        ] {
+            assert!(!is_allowed_homeserver_url(bad), "{bad} should be rejected");
         }
     }
 
