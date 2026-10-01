@@ -52,7 +52,7 @@ Phase 0 agent work is done; only the human checkpoint remains.
 - Open issues: none.
 
 ## Human checkpoint
-- [ ] Push the branch and confirm CI is green on Linux, Windows, and macOS.
+- [x] Push the branch and confirm CI is green on Linux, Windows, and macOS (confirmed by human 2026-10-01).
 - [ ] Run `cargo run -p tessera-app` and confirm an empty window titled "Tessera" opens (rendering is unverified by the agent).
 - [ ] Approve the workspace layout and AGENTS.md.
 - [ ] Run locally (needs sudo): `sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libdbus-1-dev libssl-dev pkg-config`.
