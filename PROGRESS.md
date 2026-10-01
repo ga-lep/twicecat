@@ -18,6 +18,7 @@ Phase 0 agent work is done; only the human checkpoint remains.
 ## Step 2 notes
 - Checks run: cargo fmt --all --check, cargo clippy --workspace --all-targets --all-features -- -D warnings, cargo test --workspace, cargo build --workspace (all pass).
 - Entry-point API: `iced::application(boot, update, view).title("Tessera").run()`, confirmed in `~/.cargo/registry/src/*/iced-0.14.0/src/application.rs` (`application()` doc example, `Application::title` with `TitleFn for &'static str`, `Application::run`). Empty view uses `iced::widget::space()`.
+- `iced::widget::space()` confirmed in `~/.cargo/registry/src/*/iced_widget-0.14.2/src/helpers.rs:1748` (`pub fn space() -> Space`, locked version per Cargo.lock); `iced-0.14.0/src/lib.rs:634-637` has `pub mod widget` with `pub use iced_widget::*`, and `iced_widget-0.14.2/src/lib.rs:48` has `pub use helpers::*`.
 - Local Linux build succeeded; no missing system libraries.
 - Open issues: none.
 
@@ -49,7 +50,7 @@ Phase 0 agent work is done; only the human checkpoint remains.
 - Open issues: none.
 
 ## Human checkpoint
-- [ ] Push the branch and confirm CI is green on Linux, Windows, and macOS (Linux apt deps arrive in step 5, so Linux may fail until then).
+- [ ] Push the branch and confirm CI is green on Linux, Windows, and macOS.
 - [ ] Run `cargo run -p tessera-app` and confirm an empty window titled "Tessera" opens (rendering is unverified by the agent).
 - [ ] Approve the workspace layout and AGENTS.md.
 - [ ] Run locally (needs sudo): `sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libdbus-1-dev libssl-dev pkg-config`.
