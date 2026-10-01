@@ -220,7 +220,7 @@ Phase 0 agent work is done; the Phase 0 human checkpoint is fully signed off (20
 - [ ] Push the branch and confirm the new `integration` job is green (Task 5).
 - [ ] CI green on Linux, Windows, and macOS with the new SDK tree (aws-lc-sys and bundled sqlite builds), and the `integration` job green (Task 5).
 - [ ] Real-keychain test `cargo test -p tessera-core --locked -- --ignored keyring` passes on each OS you use, and no `io.github.ga_lep.Tessera.test` entry is left in the keychain.
-- [ ] CLI against your real account (`cargo run -p tessera-core --bin tessera-cli`): password login, room list with unread counts, open a room, send and receive, restart restores without a prompt.
+- [x] CLI against your real account (`cargo run -p tessera-core --bin tessera-cli`): password login, room list with unread counts, open a room, send and receive, restart restores without a prompt. (confirmed by human 2026-10-01)
 - [ ] OS keychain viewer shows the `io.github.ga_lep.Tessera` entry, and no token sits in the CLI data dir (`~/.local/share/tessera` on Linux).
 - [ ] A cancelled or aborted OAuth login can leave an orphaned session; check your account settings for stray devices after the OIDC test.
 - [ ] OIDC login on matrix.org in a browser via the CLI (Task 9 code is done; unverifiable locally).
