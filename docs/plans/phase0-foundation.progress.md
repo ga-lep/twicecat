@@ -10,3 +10,4 @@ Task 3: complete (c9d934b..0611914, gate ok, security PASS, review PASS)
 Task 4: started
 Task 4: complete (a8cafe2..fefc04c, gate ok, security PASS, review PASS)
   notes: process deviation — controller launched security and quality reviews concurrently; quality verdict accepted only after security PASS. [sec Low] no permissions block / tag-pinned actions (pre-existing, see Task 3); [review Sugg] stale "Linux may fail until step 5" line in PROGRESS.md; apt install duplicated across jobs; --no-install-recommends optional
+Task 5: started
