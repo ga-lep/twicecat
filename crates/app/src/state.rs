@@ -10,10 +10,14 @@ use std::time::Duration;
 use iced::theme;
 use iced::widget::text;
 use iced::{Element, Subscription, Task, Theme, system, window};
-use tessera_core::api::{Command, CoreError, CoreEvent, Password, RoomSummary, SyncState, UserId};
+use tessera_core::api::{
+    Command, CoreError, CoreEvent, ListDiff, Password, RoomId, RoomSummary, SyncState,
+    TimelineItem, UserId,
+};
 use tokio::sync::mpsc;
 
 use crate::bridge::{self, Bridge, EventsSlot};
+use crate::room_list;
 
 /// How long to wait for the core to close after `Shutdown` (plan Q18).
 pub const SHUTDOWN_WAIT: Duration = Duration::from_secs(10);
@@ -87,6 +91,8 @@ pub enum Message {
         /// The password; its `Debug` is redacted.
         password: Password,
     },
+    /// The user picked a room in the list.
+    SelectRoom(RoomId),
     /// The user asked to close the window.
     CloseRequested,
     /// The core did not close in time after `Shutdown`.
@@ -109,6 +115,12 @@ pub struct App {
     pub screen: Screen,
     /// The room list, kept in step with the core's diffs.
     pub rooms: Vec<RoomSummary>,
+    /// How many rooms the server reported, once the first load is done.
+    pub total_rooms: Option<u32>,
+    /// The room whose timeline is open.
+    pub selected: Option<RoomId>,
+    /// The selected room's timeline, kept in step with the core's diffs.
+    pub timeline: Vec<TimelineItem>,
     /// The signed-in account.
     pub user_id: Option<UserId>,
     /// The last sync state.
@@ -131,6 +143,9 @@ impl App {
             events,
             screen: Screen::Starting,
             rooms: Vec::new(),
+            total_rooms: None,
+            selected: None,
+            timeline: Vec::new(),
             user_id: None,
             sync_state: SyncState::Idle,
             login_error: None,
@@ -188,6 +203,14 @@ impl App {
                     server,
                 })
             }
+            Message::SelectRoom(id) => {
+                if !room_list::contains(&self.rooms, &id) {
+                    return Task::none();
+                }
+                self.selected = Some(id.clone());
+                self.timeline.clear();
+                self.send(Command::SelectRoom(id))
+            }
             Message::CloseRequested => {
                 if self.screen == Screen::ShuttingDown {
                     return Task::none();
@@ -231,31 +254,56 @@ impl App {
             CoreEvent::LoggedOut | CoreEvent::SessionExpired => {
                 self.user_id = None;
                 self.rooms.clear();
+                self.total_rooms = None;
+                self.deselect();
                 self.sync_state = SyncState::Idle;
                 self.screen = Screen::Login;
             }
             CoreEvent::SyncState(state) => self.sync_state = state,
             CoreEvent::RoomListChanged(diffs) => {
-                for diff in &diffs {
-                    diff.apply(&mut self.rooms);
+                room_list::apply_room_diffs(&mut self.rooms, &diffs);
+                let selection_gone = self
+                    .selected
+                    .as_ref()
+                    .is_some_and(|id| !room_list::contains(&self.rooms, id));
+                if selection_gone {
+                    self.deselect();
                 }
                 if self.screen == Screen::Loading {
                     self.screen = Screen::Main;
                 }
             }
-            CoreEvent::RoomListLoaded { .. } => {
+            CoreEvent::RoomListLoaded { total_rooms } => {
+                self.total_rooms = total_rooms;
                 if self.screen == Screen::Loading {
                     self.screen = Screen::Main;
                 }
             }
-            // Later steps: avatars, timeline, OAuth, errors.
+            CoreEvent::TimelineDiff { room_id, diffs } => {
+                self.apply_timeline(&room_id, &diffs);
+            }
+            // Later steps: avatars, OAuth, errors.
             CoreEvent::OAuthUrl(_)
             | CoreEvent::Avatar { .. }
-            | CoreEvent::TimelineDiff { .. }
             | CoreEvent::SendFailed { .. }
             | CoreEvent::Error(_) => {}
         }
         Task::none()
+    }
+
+    fn deselect(&mut self) {
+        self.selected = None;
+        self.timeline.clear();
+    }
+
+    /// Applies timeline diffs of the selected room; other rooms are ignored.
+    fn apply_timeline(&mut self, room_id: &RoomId, diffs: &[ListDiff<TimelineItem>]) {
+        if self.selected.as_ref() != Some(room_id) {
+            return;
+        }
+        for diff in diffs {
+            diff.apply(&mut self.timeline);
+        }
     }
 
     /// The window content.

@@ -37,7 +37,7 @@ Phase 0 agent work is done; the Phase 0 human checkpoint is fully signed off (20
 - [x] 4. Room list query (tabs, search) and paging in the core (roadmap step 5, core side) (phase2.4)
 - [x] 5. Avatar thumbnails through the SDK media API (roadmap step 6, core side) (phase2.5)
 - [x] 6. App library split and the core bridge (roadmap step 1) (phase2.6)
-- [ ] 7. Room list and timeline state from diffs, 2,000-room timing test (roadmap step 2)
+- [x] 7. Room list and timeline state from diffs, 2,000-room timing test (roadmap step 2)
 - [ ] 8. Light and dark theme following the system (roadmap step 7)
 - [ ] 9. Screens: login with OIDC, loading/sync, two-pane layout (roadmap step 4)
 - [ ] 10. Room list pane: tabs, search, windowed rows, badges, paging (roadmap step 5, UI side)
@@ -344,6 +344,16 @@ Phase 0 agent work is done; the Phase 0 human checkpoint is fully signed off (20
   - tokio: `runtime::Builder::{new_multi_thread :276, enable_all :376, thread_name :594, build :1072}`, `Runtime::{enter :419, shutdown_timeout :452}`, `Handle::spawn` (runtime/handle.rs:197), `mpsc::Sender::{try_send :924, send :816}`, `TrySendError::{Full, Closed}` (sync/mpsc/error.rs:28), `Receiver::recv` (bounded.rs:243), `time::sleep` (time/sleep.rs:123).
 - Open issues: `Message::LoginSubmitted` carries plain `server`/`username` fields; Task 9 may reshape it with the form state. Dropping the `Bridge` blocks up to 5 s on the UI thread at exit.
 - New human items (not ticked by the agent): below.
+
+## Phase 2 / Task 7 notes
+- Checks: `cargo fmt --all --check`, clippy (`--workspace --all-targets --all-features --locked -D warnings`), `cargo test --workspace --locked` (app: 38 lib tests, 5 bin tests), `scripts/check-app-deps.sh`, `scripts/check-core-api.sh`, `cargo deny check` and the ignored run (`cargo test -p tessera-core -p tessera-app --locked -- --ignored --skip keyring`) all pass; `docker compose stop` afterwards. The keyring test was not run.
+- TDD: the `room_list` tests (11 per-variant, batch, out-of-range, total, selection, timeline, logout, timing) were written first; the build failed (no `selected`, `timeline`, `total_rooms`, `Message::SelectRoom`), then the code was added. The 11 variant tests and the timing test passed on the existing `ListDiff::apply` as soon as they compiled.
+- App: new `room_list.rs` (`apply_room_diffs`, `contains`). `App` gains `total_rooms`, `selected: Option<RoomId>`, `timeline: Vec<TimelineItem>`, and `Message::SelectRoom(RoomId)` (ignored for a room not in the list; otherwise sets `selected`, clears the timeline and sends `Command::SelectRoom`). After each `RoomListChanged` batch the selection is dropped (with the timeline) if the room is no longer in the list, so a `Remove`+`Insert` reorder in one batch keeps it. `TimelineDiff` applies only when its `room_id` is the selected room. `LoggedOut`/`SessionExpired` also reset `total_rooms`, the selection and the timeline. The lists are changed in place; only `Reset`/`Clear` rebuild.
+- Timing (Q17; debug profile, this machine, `cargo test -p tessera-app --lib room_list_batches_under_16ms -- --nocapture`; median of 15 runs after a warm-up, each on a fresh app, `Instant` around `update` only; deterministic index-based rooms with name, avatar ID, 100-char preview): reset 2000: 1.84 ms; 4 x append 500: 2.06 ms; mixed (100 Set, 50 Remove+Insert, 10 PushFront) on 2000: 0.43 ms; clear then reset 2000: 0.63 ms. Budget 16 ms. `ListDiff::apply_owned` was not needed and not added; the core API is unchanged.
+- Not timed: the derived avatar and paging bookkeeping of Q17 does not exist yet (Tasks 10 and 11 add it and should extend this test to include it).
+- APIs used (all in this repo, no new iced/SDK API): `ListDiff::apply` crates/core/src/api/diff.rs:70; `Task::none` (iced_runtime task.rs, as in Task 6). No registry API beyond Task 6's.
+- Open issues: none new.
+- New human items: none.
 
 ## Phase 2 human checkpoint
 - [ ] CI green on Linux, Windows and macOS with the new dependencies (iced `image-without-codecs`, image, open, tokio in the app).

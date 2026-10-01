@@ -4,6 +4,7 @@
 //! `tessera_core::api`); it never depends on the Matrix SDK.
 
 pub mod bridge;
+pub mod room_list;
 pub mod state;
 
 pub use bridge::{Bridge, BridgeEvent, EventsSlot};
