@@ -25,6 +25,7 @@ jobs:
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - uses: EmbarkStudios/cargo-deny-action@v2
       - run: scripts/check-app-deps.sh
+      - run: scripts/check-core-api.sh
 
   test:
     strategy:

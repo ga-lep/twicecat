@@ -18,7 +18,7 @@ Phase 0 agent work is done; the Phase 0 human checkpoint is fully signed off (20
 
 ## Phase 1 steps
 - [x] 1. Core dependencies, license policy, data paths (phase1.1; roadmap step 1)
-- [ ] 2. Public command/event API and SDK boundary check (roadmap step 8)
+- [x] 2. Public command/event API and SDK boundary check (phase1.2; roadmap step 8)
 - [ ] 3. Secret store trait, keychain and in-memory backends
 - [ ] 4. Engine, client builder, password login, persistence, restore (roadmap steps 2, 3a, 4)
 - [ ] 5. Linux CI job for homeserver integration tests
@@ -73,6 +73,15 @@ Phase 0 agent work is done; the Phase 0 human checkpoint is fully signed off (20
 - `paths.rs`: `DataPaths::{from_os, at, root, session_store_dir, last_account_file}`; session ids that are empty, `.`, or contain `..`, `/`, `\` or NUL are rejected with `PathsError::InvalidSessionId`.
 - `lib.rs` starts with `#![recursion_limit = "256"]` plus a comment.
 - Open issues: none. Windows and macOS CI with the new SDK tree is on the human list below.
+
+## Phase 1 / Task 2 notes
+- Checks run (all pass): `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`, `cargo test --workspace --locked` (15 new unit tests plus 2 doctests), `scripts/check-app-deps.sh`, `scripts/check-core-api.sh` (exit 0), `cargo deny check`. shellcheck (docker koalaman/shellcheck:stable) clean on `scripts/check-core-api.sh`; actionlint 1.7.7 (docker) clean. No homeserver tests exist yet, so no ignored-test run.
+- TDD: tests were written with the types; a mutation run (Truncate made a no-op, `Password` Debug printing the value) failed 3 tests, then the real code passed.
+- APIs used: no SDK API. `api/` is SDK-free (std, `thiserror`). `ListDiff` mirrors the 11 `VectorDiff` variants named in the plan (Append, Clear, PushFront, PushBack, PopFront, PopBack, Insert, Set, Remove, Truncate, Reset); the SDK mapping is Task 6/7 and will be confirmed there.
+- Design: `ListDiff::apply` ignores out-of-range indices instead of panicking. `TimelineItemKind` has a manual redacted `Debug` (body shown only as byte length), so any event holding a timeline item is safe to log. `SendStatus` is `Sending | Sent | Failed`.
+- Negative self-check of `scripts/check-core-api.sh`: with a temporary `use matrix_sdk::Client;` as the first line of `api/mod.rs` it exits 1 (reports the line); a temporary `pub use matrix_sdk::Client;` in `lib.rs` also exits 1; reverted, it exits 0. A missing `api/` dir exits 2 (fail closed).
+- CI: `lint` job runs `scripts/check-core-api.sh` after `check-app-deps.sh`.
+- Open issues: none. New human items: none (the `api` approval is already on the checkpoint list).
 
 ## Phase 1 human checkpoint
 - [ ] CI green on Linux, Windows, and macOS with the new SDK tree (aws-lc-sys and bundled sqlite builds), and the `integration` job green (Task 5).

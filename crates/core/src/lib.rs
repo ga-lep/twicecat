@@ -4,4 +4,5 @@
 // "queries overflow the depth limit" (same as the SDK's `examples/timeline`).
 #![recursion_limit = "256"]
 
+pub mod api;
 pub mod paths;
