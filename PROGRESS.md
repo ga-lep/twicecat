@@ -9,8 +9,8 @@
 ## Phase 0 steps
 - [x] 2. Cargo workspace with core, app, ptt crates (phase0.2)
 - [x] 3. Local Synapse homeserver and test users (phase0.3)
-- [x] 4. GitHub Actions CI, cargo-deny, boundary check
-- [x] 5. Linux build dependencies in CI
+- [x] 4. GitHub Actions CI, cargo-deny, boundary check (phase0.4)
+- [x] 5. Linux build dependencies in CI (phase0.5)
 - [x] 6. License and name check (phase0.6)
 
 Phase 0 agent work is done; only the human checkpoint remains.
