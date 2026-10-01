@@ -7,6 +7,7 @@
 - Cargo.lock is committed
 - Phase 1 (core): matrix-sdk =0.19.1 (features bundled-sqlite, local-server), matrix-sdk-ui =0.19.1, keyring =4.2.0, directories =6.0.0; caret ranges (locked by Cargo.lock) for tokio, tracing, tracing-subscriber, futures-util, serde, serde_json, thiserror, url, rand, rpassword; dev-dep tempfile
 - Phase 1 Task 4 (human-approved, rule 3): zeroize 1.9.0 (`zeroize = { version = "1.9", features = ["serde"] }`, already in Cargo.lock; lock diff only adds the edge and zeroize's serde edge)
+- Phase 2 Task 1 (plan Q1, adopted under the human's standing pre-authorization 2026-10-01; revisit at checkpoint): `crates/app` gains `iced = { version = "=0.14.0", features = ["image-without-codecs"] }` (pin unchanged), `image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }`, `tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }`, `open = "5"` (5.4.4). `Cargo.lock` adds packages only (16): the 13 image crates (byteorder-lite 0.1.0, fdeflate 0.3.7, image 0.25.10, image-webp 0.2.4, kamadak-exif 0.6.1, miniz_oxide 0.8.9, moxcms 0.8.1, mutate_once 0.1.2, png 0.18.1, pxfm 0.1.30, quick-error 2.0.1, zune-core 0.5.3, zune-jpeg 0.5.15) plus open 5.4.4, is-wsl 0.4.0, is-docker 0.2.0. No existing version changed; the only edit to an existing entry is flate2's `miniz_oxide` dependency line, which becomes `miniz_oxide 0.9.1` because two versions now coexist. `deny.toml` unchanged.
 
 ## Phase 0 steps
 - [x] 2. Cargo workspace with core, app, ptt crates (phase0.2)
@@ -28,6 +29,19 @@ Phase 0 agent work is done; the Phase 0 human checkpoint is fully signed off (20
 - [x] 8. Sync supervision, reconnection, tracing (roadmap step 7; the agent-run reconnection check is deferred to Task 10)
 - [x] 9. OAuth 2.0 / MAS login (roadmap step 3b; the browser flow itself is on the human list)
 - [x] 10. tessera-cli binary (roadmap steps 5-7, user-facing; agent work for Phase 1 is done, the human checkpoint stays open)
+
+## Phase 2 steps
+- [x] 1. App dependencies, boundary check hardening, Phase 2 ledger (phase2.1)
+- [ ] 2. Additive core API for Phase 2
+- [ ] 3. Room view models in the core (roadmap step 3)
+- [ ] 4. Room list query (tabs, search) and paging in the core (roadmap step 5, core side)
+- [ ] 5. Avatar thumbnails through the SDK media API (roadmap step 6, core side)
+- [ ] 6. App library split and the core bridge (roadmap step 1)
+- [ ] 7. Room list and timeline state from diffs, 2,000-room timing test (roadmap step 2)
+- [ ] 8. Light and dark theme following the system (roadmap step 7)
+- [ ] 9. Screens: login with OIDC, loading/sync, two-pane layout (roadmap step 4)
+- [ ] 10. Room list pane: tabs, search, windowed rows, badges, paging (roadmap step 5, UI side)
+- [ ] 11. Avatars in the UI, Phase 2 wrap-up (roadmap step 6, UI side)
 
 ## Step 2 notes
 - Checks run: cargo fmt --all --check, cargo clippy --workspace --all-targets --all-features -- -D warnings, cargo test --workspace, cargo build --workspace (all pass).
@@ -245,3 +259,18 @@ Phase 0 agent work is done; the Phase 0 human checkpoint is fully signed off (20
 - Root cause (test race, not a core bug): the room list syncs with `timeline_limit` 1 and `num_unread_messages` is computed client-side from the timeline events the core receives. The test sent both messages right after joining, so if the core's sync only saw the room afterwards (slow CI), it got just the latest event and the count stayed at 1 forever. Reproduced deterministically by sending both messages before the core logs in (count stays 1 for 5 s+), and under `taskset -c 0,1` with CPU hogs (original test failed at `room_list.rs:51`).
 - Fix: the test now waits for the room to appear, then sends "first" and waits for unread >= 1, then "second" and waits for unread >= 2. No timeout or sleep change.
 - Verified: fixed test 12/12 under `taskset -c 0,1` plus 3 CPU hogs; full `--ignored --skip keyring` suite 6/6 (3 plain, 3 with `taskset -c 0,1 --test-threads 2`); gate and boundary scripts ok; compose stopped.
+
+## Phase 2 / Task 1 notes
+- Checks: `cargo fmt --all --check`, clippy (`--workspace --all-targets --all-features --locked -D warnings`), `cargo test --workspace --locked`, `scripts/check-app-deps.sh`, `scripts/check-core-api.sh`, `cargo deny check` (advisories ok, bans ok, licenses ok, sources ok; `deny.toml` unchanged) all pass. The task does not touch the core, so no integration run.
+- `cargo tree -p tessera-app --depth 1 -e normal` lists iced v0.14.0, image v0.25.10, open v5.4.4, tessera-core and tokio v1.53.1.
+- `scripts/check-app-deps.sh` default pattern is now `(matrix-sdk|matrix_sdk|ruma|eyeball|imbl)` (SDK helper crates would expose SDK types); the comment says why. The error message now names the pattern as a regex.
+- Negative self-checks (manifest reverted afterwards): with a temporary direct `ruma = "=0.17.0"` dep, the OLD script exited 0 (the failing test); the NEW script printed `ruma` and exited 1. `scripts/check-app-deps.sh iced` exits 1. On the real tree the script exits 0.
+- shellcheck is not installed in this environment, so it was not run; only `bash -n` (ok). Human item below.
+- No iced/matrix-sdk API was used in this task (dependencies only).
+- Open issues: none.
+
+## Phase 2 human checkpoint
+- [ ] CI green on Linux, Windows and macOS with the new dependencies (iced `image-without-codecs`, image, open, tokio in the app).
+- [ ] Don't run tessera-cli and the app on the same data dir at once (SQLite store lock; plan Q20).
+- [ ] Run `shellcheck scripts/check-app-deps.sh` (not installed where the agent ran; the `lint` CI job does not run it).
+- [ ] Revisit plan decisions Q1-Q22 (adopted under the standing pre-authorization).
