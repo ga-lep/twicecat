@@ -22,3 +22,4 @@ Task 6: complete (1a9f51a..b5df2e5, gate ok, security PASS, review PASS)
 Task 7: started
 Task 7: complete (bd84eff..cf91539, gate ok, security PASS, review PASS)
   notes: timing medians (debug, local) Reset 2000 1.84 ms, 4x Append 500 2.06 ms, mixed 0.43 ms, Clear+Reset 0.63 ms; timed region covers update only. Follow-up: extend timing test with avatar/paging bookkeeping in Tasks 10/11. security Low — app timeline Vec uncapped (cap in core if needed); quick A->B->A reselect can briefly apply stale same-room diffs before Reset (generation counter optional). review — Message::SelectRoom added (accepted); reselecting the same room clears timeline + resends (guard suggested); no core deselect when the selected room is removed (stale diffs ignored).
+Task 8: started
