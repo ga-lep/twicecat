@@ -86,17 +86,24 @@ async fn unread_count_reaches_two() {
     let room_id = create_room(&alice, &name, Some(&env.user_id(2))).await;
     bob.join_room_by_id(&room_id).await.expect("bob joins");
     let room = alice.get_room(&room_id).expect("alice knows the room");
-    for text in ["first", "second"] {
+
+    // The room list asks the server for one timeline event per room. A room
+    // that first reaches the core together with both messages would show only
+    // the latest of them (one unread), so on a slow machine the count could
+    // never reach two. Send each message only once the core has caught up with
+    // the previous state.
+    let mut rooms = Vec::new();
+    apply_until(&mut core, &mut rooms, |r| r.iter().any(|s| s.name == name)).await;
+    for (text, expected) in [("first", 1), ("second", 2)] {
         room.send(RoomMessageEventContent::text_plain(text))
             .await
             .expect("alice sends");
+        apply_until(&mut core, &mut rooms, |r| {
+            r.iter()
+                .any(|s| s.name == name && s.unread_messages >= expected)
+        })
+        .await;
     }
-
-    let mut rooms = Vec::new();
-    apply_until(&mut core, &mut rooms, |r| {
-        r.iter().any(|s| s.name == name && s.unread_messages >= 2)
-    })
-    .await;
 
     core.commands.send(Command::Logout).await.unwrap();
     expect_event(&mut core, |e| matches!(e, CoreEvent::LoggedOut)).await;

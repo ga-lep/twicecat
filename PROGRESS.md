@@ -240,3 +240,8 @@ Phase 0 agent work is done; the Phase 0 human checkpoint is fully signed off (20
 - `ci.yml`: workflow-level `CARGO_PROFILE_DEV_DEBUG: line-tables-only` (the Ubuntu runner ran out of disk linking ~880 MB debug test binaries). The test job drops the separate `cargo build` step, runs clippy before tests only on non-Linux (the lint job covers Linux), and has `timeout-minutes: 60` (Windows took ~35 min). No disk-freeing step was added; add one (plain shell, no new action) only if Linux still runs out of space.
 - rust-cache keys include `CARGO_*` env, so the first run after this change starts with a cold cache; that is expected.
 - Not verifiable locally: the effect on the CI runners; check the next CI run.
+
+### Flaky `unread_count_reaches_two` (human-approved)
+- Root cause (test race, not a core bug): the room list syncs with `timeline_limit` 1 and `num_unread_messages` is computed client-side from the timeline events the core receives. The test sent both messages right after joining, so if the core's sync only saw the room afterwards (slow CI), it got just the latest event and the count stayed at 1 forever. Reproduced deterministically by sending both messages before the core logs in (count stays 1 for 5 s+), and under `taskset -c 0,1` with CPU hogs (original test failed at `room_list.rs:51`).
+- Fix: the test now waits for the room to appear, then sends "first" and waits for unread >= 1, then "second" and waits for unread >= 2. No timeout or sleep change.
+- Verified: fixed test 12/12 under `taskset -c 0,1` plus 3 CPU hogs; full `--ignored --skip keyring` suite 6/6 (3 plain, 3 with `taskset -c 0,1 --test-threads 2`); gate and boundary scripts ok; compose stopped.
