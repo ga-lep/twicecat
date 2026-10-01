@@ -235,3 +235,8 @@ Phase 0 agent work is done; the Phase 0 human checkpoint is fully signed off (20
 - [x] Approve the workspace layout and AGENTS.md (confirmed by human 2026-10-01).
 - [x] Run locally (needs sudo): `sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libdbus-1-dev libssl-dev pkg-config` (confirmed by human 2026-10-01).
 - Task 9 follow-up (human-approved): shutdown can no longer hang (the `OAuthUrl` send and the client build are raced against cancel; the engine waits 5 s for the task, then aborts it, waits for the abort so the store is released, and removes the store dir). A cancel that arrives after `finish_login` succeeded now logs the client out (best effort, 5 s) and emits `LoginFailed(Cancelled)` without persisting anything. The account binding was extracted to `client::account_bound` with a test that an OAuth user ID from another server name is refused (OAuth has no typed username, so `server_name_bound` is the only binding).
+
+### CI disk and time follow-up (human-approved)
+- `ci.yml`: workflow-level `CARGO_PROFILE_DEV_DEBUG: line-tables-only` (the Ubuntu runner ran out of disk linking ~880 MB debug test binaries). The test job drops the separate `cargo build` step, runs clippy before tests only on non-Linux (the lint job covers Linux), and has `timeout-minutes: 60` (Windows took ~35 min). No disk-freeing step was added; add one (plain shell, no new action) only if Linux still runs out of space.
+- rust-cache keys include `CARGO_*` env, so the first run after this change starts with a cold cache; that is expected.
+- Not verifiable locally: the effect on the CI runners; check the next CI run.

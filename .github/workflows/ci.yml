@@ -11,6 +11,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Each debug test binary statically links matrix-sdk; full debuginfo made them
+  # ~880 MB each and filled the Linux runner disk.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
   lint:
@@ -30,6 +33,7 @@ jobs:
       - run: scripts/check-core-api.sh
 
   test:
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -43,8 +47,10 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libdbus-1-dev libssl-dev pkg-config
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --workspace --locked
-      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      # The lint job already runs clippy on Linux.
+      - name: Clippy (non-Linux only)
+        if: runner.os != 'Linux'
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: cargo test --workspace --locked
 
   integration:
