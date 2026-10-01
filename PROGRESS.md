@@ -11,7 +11,9 @@
 - [x] 3. Local Synapse homeserver and test users (phase0.3)
 - [x] 4. GitHub Actions CI, cargo-deny, boundary check
 - [x] 5. Linux build dependencies in CI
-- [ ] 6. License and name check
+- [x] 6. License and name check (phase0.6)
+
+Phase 0 agent work is done; only the human checkpoint remains.
 
 ## Step 2 notes
 - Checks run: cargo fmt --all --check, cargo clippy --workspace --all-targets --all-features -- -D warnings, cargo test --workspace, cargo build --workspace (all pass).
@@ -34,6 +36,14 @@
 
 ## Step 5 notes
 - Both CI jobs install the apt packages (libxkbcommon-dev libwayland-dev libx11-dev libdbus-1-dev libssl-dev pkg-config) under `if: runner.os == 'Linux'`, right after checkout and before any cargo step. Before the edit the grep for the package list found 0 matches; after, 2. actionlint 1.7.7 (docker) reports no errors. Full gate passes.
+- Open issues: none.
+
+## Step 6 notes
+- LICENSE is the unmodified GPL-3.0 text fetched from https://www.gnu.org/licenses/gpl-3.0.txt. `[workspace.package] license = "GPL-3.0-or-later"`, inherited by all three crates. Before the edit the `cargo metadata ... | grep -c` check printed 0; after, 3.
+- Name check (as of 2026-10-01):
+  - crates.io: `tessera` is taken (v0.1.0, a 3D Tiles geometric-error library from github.com/sensat/tessera). Mitigated by `publish = false` and the `tessera-*` crate names.
+  - Flathub: an unrelated GTK QR-mosaic app called "Tessera" (`fr.ethal.tessera`) has submission PR flathub/flathub#10239 open and awaiting review.
+  - Flathub IDs are unique by reverse-DNS, so our ID would be something like `io.github.ga_lep.Tessera`. The shared display name is left to the human to decide. Per the user's decision, we don't rename.
 - Open issues: none.
 
 ## Human checkpoint
