@@ -30,7 +30,7 @@ use crate::secrets::{SecretError, SecretStore};
 use crate::session::{
     RECORD_VERSION, SessionAuth, SessionRecord, generate_session_id, generate_store_passphrase,
 };
-use crate::sync::{SyncControl, supervise};
+use crate::sync::{CancelTrigger, SyncControl, cancel_pair, run_supervised};
 use crate::timeline::{map_item, parse_room_id};
 
 /// Default number of rooms the room list loads per page.
@@ -88,7 +88,11 @@ impl Core {
 /// A running sync service and the tasks that forward its output as events.
 struct Syncing {
     service: Arc<SyncService>,
-    tasks: Vec<JoinHandle<()>>,
+    /// Asks the supervisor to end between steps (it is never aborted: an
+    /// aborted `SyncService::stop` could leave SDK tasks running).
+    cancel: CancelTrigger,
+    supervisor: JoinHandle<()>,
+    room_list: JoinHandle<()>,
 }
 
 /// The room whose timeline is open, and the task forwarding its diffs.
@@ -126,13 +130,14 @@ impl Active {
         let Some(sync) = self.sync.take() else {
             return;
         };
-        for task in &sync.tasks {
-            task.abort();
-        }
-        for task in sync.tasks {
-            // Aborted tasks end with a cancellation error; that is expected.
-            let _ = task.await;
-        }
+        // The supervisor finishes any `stop` or `restart` it is in the middle
+        // of, then ends. Only then is the service stopped here, so the store
+        // is never deleted while SDK tasks still use it.
+        sync.cancel.cancel();
+        let _ = sync.supervisor.await;
+        sync.room_list.abort();
+        // An aborted task ends with a cancellation error; that is expected.
+        let _ = sync.room_list.await;
         sync.service.stop().await;
     }
 }
@@ -164,11 +169,24 @@ impl SyncControl for ServiceControl {
 
 /// Forwards sync state changes as events and restarts the service after a
 /// failure (see [`supervise`]).
-async fn forward_sync_state(service: Arc<SyncService>, events: mpsc::Sender<CoreEvent>) {
-    // Subscribe before reading the current value so that no change is lost.
-    let subscriber = service.state();
-    let initial = subscriber.get();
-    supervise(&ServiceControl(service), initial, subscriber, &events).await;
+async fn forward_sync_state(
+    service: Arc<SyncService>,
+    events: mpsc::Sender<CoreEvent>,
+    cancel: crate::sync::Cancel,
+) {
+    // Subscribe, then mark the current value as seen: the subscriber would
+    // otherwise yield it again, which the supervisor reads as a missed
+    // transition.
+    let mut subscriber = service.state();
+    let initial = subscriber.next_now();
+    run_supervised(
+        &ServiceControl(service),
+        initial,
+        subscriber,
+        events,
+        cancel,
+    )
+    .await;
 }
 
 /// Forwards every room list diff batch as one `RoomListChanged` event.
@@ -700,17 +718,25 @@ impl Engine {
                 return;
             }
         };
-        let tasks = vec![
-            tokio::spawn(forward_sync_state(service.clone(), self.events.clone())),
-            tokio::spawn(forward_room_list(
-                service.clone(),
-                self.config.room_list_page_size,
-                self.events.clone(),
-            )),
-        ];
+        let (cancel, cancelled) = cancel_pair();
+        let supervisor = tokio::spawn(forward_sync_state(
+            service.clone(),
+            self.events.clone(),
+            cancelled,
+        ));
+        let room_list = tokio::spawn(forward_room_list(
+            service.clone(),
+            self.config.room_list_page_size,
+            self.events.clone(),
+        ));
         service.start().await;
         if let Some(active) = self.active.as_mut() {
-            active.sync = Some(Syncing { service, tasks });
+            active.sync = Some(Syncing {
+                service,
+                cancel,
+                supervisor,
+                room_list,
+            });
         }
     }
 
