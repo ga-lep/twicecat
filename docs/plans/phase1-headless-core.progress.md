@@ -62,3 +62,4 @@ PAUSED 2026-10-01 (human request) during Fix 13
   resume at: re-dispatch debugger for unread_count_reaches_two (same brief: root cause, reproduce under taskset -c 0,1, no retries/blind timeout bump, ≥5 full ignored runs), Commit Check + gate, then security audit and code review of aba3700..<new HEAD> (CI change + test fix together), ledger "Fix 13: complete"
   then: push branch, check PR CI (disk on ubuntu, integration flake, Windows time); update PR description CI bullet (triggers + debuginfo/clippy changes)
 RESUMED 2026-10-01 during Fix 13 at debugger dispatch for unread_count_reaches_two
+Human check 2026-10-01: CLI against real account — password login, /rooms with unread counts, /select, send/receive, restart restore without prompt: confirmed by human (PROGRESS.md item to tick after Fix 13 debugger commits; keychain/no-token, OIDC, terminal-behaviour items still open)
