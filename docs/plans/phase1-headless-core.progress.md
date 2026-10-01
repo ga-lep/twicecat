@@ -4,3 +4,4 @@ Task 1: complete (35a5826..8e4cba8, gate ok, security PASS, review PASS)
 Task 2: started
 Task 2: complete (db93f23..c8e35ce, gate ok, security PASS, review PASS — 1 review FAIL round fixed: SendMessage text leaked in Debug → MessageText/AuthUrl newtypes)
   notes: [sec Medium] check-core-api.sh is line-based: multi-line `pub use {…}` in lib.rs and indirect `pub use crate::engine::X` in api/ bypass it; other pub modules unchecked — pending human choice (quick multi-line grep in Task 4 vs rustdoc-JSON/cargo-public-api check); [sec Low] CoreError/SyncState::Error free-form Strings must not carry SDK error text with URLs/tokens/bodies (Task 4+); [sec Low] Password/MessageText not zeroized, Clone — needs human OK for zeroize/secrecy dep; [sec Low] AuthUrl must be scheme-checked (https / loopback http) before opening (Task 9); [sec Note] server inputs need scheme checks at discovery (Task 4); [review] callers must use .expose() on MessageText/AuthUrl
+Task 3: started
