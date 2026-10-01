@@ -61,3 +61,4 @@ PAUSED 2026-10-01 (human request) during Fix 13
   flaky test: debugger investigating unread_count_reaches_two (room_list.rs:51 timeout in CI, 2 consecutive runs) was stopped before reporting — no commits, no uncommitted changes; compose stopped (down -v) by controller
   resume at: re-dispatch debugger for unread_count_reaches_two (same brief: root cause, reproduce under taskset -c 0,1, no retries/blind timeout bump, ≥5 full ignored runs), Commit Check + gate, then security audit and code review of aba3700..<new HEAD> (CI change + test fix together), ledger "Fix 13: complete"
   then: push branch, check PR CI (disk on ubuntu, integration flake, Windows time); update PR description CI bullet (triggers + debuginfo/clippy changes)
+RESUMED 2026-10-01 during Fix 13 at debugger dispatch for unread_count_reaches_two
