@@ -19,7 +19,7 @@ Phase 0 agent work is done; the Phase 0 human checkpoint is fully signed off (20
 ## Phase 1 steps
 - [x] 1. Core dependencies, license policy, data paths (phase1.1; roadmap step 1)
 - [x] 2. Public command/event API and SDK boundary check (phase1.2; roadmap step 8)
-- [ ] 3. Secret store trait, keychain and in-memory backends
+- [x] 3. Secret store trait, keychain and in-memory backends (phase1.3)
 - [ ] 4. Engine, client builder, password login, persistence, restore (roadmap steps 2, 3a, 4)
 - [ ] 5. Linux CI job for homeserver integration tests
 - [ ] 6. SyncService and room list events (roadmap step 5)
@@ -83,6 +83,17 @@ Phase 0 agent work is done; the Phase 0 human checkpoint is fully signed off (20
 - CI: `lint` job runs `scripts/check-core-api.sh` after `check-app-deps.sh`.
 - Review fix: `Command::SendMessage.text` is now `MessageText` and `CoreEvent::OAuthUrl` holds `AuthUrl`; both have redacted `Debug` (text shows byte length, URL shows scheme+host only) with `expose()` accessors. Tests added for both, plus `ListDiff::Insert` at `index == len`.
 - Open issues: none. New human items: none (the `api` approval is already on the checkpoint list).
+
+## Phase 1 / Task 3 notes
+- Checks run (all pass): `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`, `cargo test --workspace --locked` (34 core unit tests, 1 ignored), `scripts/check-app-deps.sh`, `scripts/check-core-api.sh`, `cargo deny check`. No homeserver tests exist yet, so no ignored-test run. The real-keychain test was NOT run (Decision 7); only `cargo test -p tessera-core -- --ignored --list` was used, which shows exactly one ignored test, `secrets::tests::keyring_real_keychain_round_trip`, and `--list` shows exactly one test name containing `keyring`.
+- TDD: tests were first run against `todo!()` stubs (4 secrets tests and 7 session tests failed), then passed after implementation.
+- APIs used: `keyring::Entry::{new (keyring-4.2.0/src/v1.rs:47), set_secret (:81), get_secret (:95), delete_credential (:102)}`, `keyring::Error` re-exported from keyring-core (v1.rs:~38; `Error::NoEntry` at keyring-core-1.0.0/src/error.rs:40). `matrix_sdk::authentication::matrix::MatrixSession` (matrix-sdk-0.19.1/src/authentication/matrix/mod.rs:844, Debug at :855), `authentication::oauth::UserSession` (oauth/mod.rs:1773), `matrix_sdk::SessionTokens` (lib.rs:71; authentication/mod.rs:35, Debug hides tokens), `matrix_sdk::SessionMeta` (lib.rs:28). `rand` 0.10.3: `rand::fill` (rand-0.10.3/src/lib.rs:314), which uses the thread-local ChaCha CSPRNG seeded from the OS (`thread_rng` is a default feature).
+- Design:
+  - `secrets.rs`: `SecretStore`, `InMemorySecretStore`, `KeyringSecretStore::new(service)`, constants `KEYCHAIN_SERVICE` and `TEST_KEYCHAIN_SERVICE`, `SecretError`. The trait is blocking; Task 4 must call it through `spawn_blocking` (not yet wired, no engine exists).
+  - `session.rs` (private module, with a module-level `#[allow(dead_code)]` until Task 4 consumes it): `SessionRecord` and `SessionAuth` have fully manual redacted `Debug` (no tokens, passphrase, or OAuth client id). `to_bytes` returns `CoreError::Storage` over 2560 bytes. Serde error text is never forwarded, because serde can quote values. `from_bytes` rejects versions other than 1. Passphrase: 32 bytes, lowercase hex (64 chars), no new dependency (no base64 crate in core).
+  - `SessionAuth::OAuth.client_id` is a `String` (the SDK's `oauth2::ClientId` is converted in Task 9).
+- Open issues: none.
+- New human item: the real-keychain test (already on the checkpoint list), now covering Linux Secret Service, macOS, and Windows.
 
 ## Phase 1 human checkpoint
 - [ ] CI green on Linux, Windows, and macOS with the new SDK tree (aws-lc-sys and bundled sqlite builds), and the `integration` job green (Task 5).
