@@ -54,3 +54,5 @@ Fix 11: complete (e35cdd9..0ebec14, gate ok, boundary scripts re-run by controll
 Fix 12 (CI: avoid duplicate push + pull_request runs — push only on main, add workflow_dispatch; human-approved): started
 Fix 12: complete (9653a57..87b879e, gate ok, actionlint 1.7.7 (docker) re-run by controller: clean, security PASS, review PASS)
   notes: [sec Low] branches without a PR get no automatic CI — protect main in repo settings (require PR + lint/test/integration checks); [sec Low/Info] actions still tag-pinned, not SHA (pre-existing, human decision)
+CI on PR (735e6ac): test(ubuntu) runner out of disk (linker SIGBUS, then "No space left on device"); test(windows) not hung — passed, ~35 min (build 16 min, clippy 6, test ~11); integration unread_count_reaches_two timed out at room_list.rs:51 in 2 consecutive runs (passes locally on fresh Synapse) — rule 8 raised, human chose to investigate in this round; superseded run 36848425667 cancelled by controller with human OK
+Fix 13 (CI disk/order/timeout + flaky unread_count_reaches_two, human-approved): started
