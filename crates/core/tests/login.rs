@@ -19,8 +19,11 @@ fn login_cmd(env: &TestEnv, n: u8, password: &str) -> Command {
 }
 
 fn files_under(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
-    for entry in std::fs::read_dir(dir).expect("read dir") {
-        let path = entry.expect("dir entry").path();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
         if path.is_dir() {
             files_under(&path, out);
         } else {
@@ -161,7 +164,13 @@ async fn no_token_on_disk() {
     files_under(dir.path(), &mut files);
     assert!(!files.is_empty());
     for file in files {
-        let bytes = std::fs::read(&file).unwrap();
+        // SQLite journal/WAL files can vanish while the SDK closes the store
+        // in the background; a file that is gone holds nothing to find.
+        let bytes = match std::fs::read(&file) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => panic!("read {}: {e}", file.display()),
+        };
         assert!(!contains(&bytes, token.as_bytes()), "token found on disk");
         assert!(
             !contains(&bytes, passphrase.as_bytes()),

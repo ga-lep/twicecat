@@ -8,7 +8,9 @@ pub mod api;
 mod client;
 mod engine;
 pub mod paths;
+mod room_list;
 pub mod secrets;
 mod session;
+mod sync;
 
-pub use engine::{Core, CoreConfig, CoreHandle};
+pub use engine::{Core, CoreConfig, CoreHandle, DEFAULT_ROOM_LIST_PAGE_SIZE};

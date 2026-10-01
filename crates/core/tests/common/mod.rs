@@ -79,6 +79,7 @@ pub fn start_core(dir: &Path, secrets: Arc<InMemorySecretStore>) -> CoreHandle {
         CoreConfig {
             data: DataPaths::at(dir),
             homeserver_override: Some(env.homeserver_url().to_owned()),
+            room_list_page_size: tessera_core::DEFAULT_ROOM_LIST_PAGE_SIZE,
         },
         secrets,
     )
@@ -127,4 +128,35 @@ pub async fn raw_login(n: u8) -> matrix_sdk::Client {
         .await
         .expect("raw login");
     client
+}
+
+/// A fresh room name that no other test (or earlier run) uses.
+pub fn unique_room_name() -> String {
+    let mut bytes = [0u8; 8];
+    rand::fill(&mut bytes);
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    format!("tessera-test-{hex}")
+}
+
+/// Creates a plain (unencrypted) room as `creator` and invites `invitee`
+/// when given.
+pub async fn create_room(
+    creator: &matrix_sdk::Client,
+    name: &str,
+    invitee: Option<&str>,
+) -> matrix_sdk::ruma::OwnedRoomId {
+    use matrix_sdk::ruma::api::client::room::create_room::v3::Request;
+    let mut request = Request::new();
+    request.name = Some(name.to_owned());
+    if let Some(user) = invitee {
+        request
+            .invite
+            .push(user.try_into().expect("valid invitee user id"));
+    }
+    creator
+        .create_room(request)
+        .await
+        .expect("create room")
+        .room_id()
+        .to_owned()
 }

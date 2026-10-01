@@ -4,18 +4,27 @@
 
 use std::sync::Arc;
 
+use futures_util::{StreamExt as _, pin_mut};
 use matrix_sdk::{Client, SessionChange};
+use matrix_sdk_ui::room_list_service::filters::new_filter_non_left;
+use matrix_sdk_ui::sync_service::SyncService;
 use tokio::sync::{broadcast, mpsc};
+use tokio::task::JoinHandle;
 use tracing::{info, warn};
 use zeroize::Zeroizing;
 
 use crate::api::{Command, CoreError, CoreEvent, DeviceId, Password, UserId};
 use crate::client::{ServerSpec, build_client, ensure_homeserver_after_login, map_login_error};
 use crate::paths::DataPaths;
+use crate::room_list::{map_diff, summarize};
 use crate::secrets::{SecretError, SecretStore};
 use crate::session::{
     RECORD_VERSION, SessionAuth, SessionRecord, generate_session_id, generate_store_passphrase,
 };
+use crate::sync::map_state;
+
+/// Default number of rooms the room list loads per page.
+pub const DEFAULT_ROOM_LIST_PAGE_SIZE: usize = 500;
 
 /// How long a password login may take, including the SDK's own retries.
 const LOGIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
@@ -28,6 +37,8 @@ pub struct CoreConfig {
     /// Server name or homeserver URL that wins over anything in a login
     /// command (tests, `--homeserver`).
     pub homeserver_override: Option<String>,
+    /// Page size of the room list (`DEFAULT_ROOM_LIST_PAGE_SIZE` is 500).
+    pub room_list_page_size: usize,
 }
 
 /// The channels to talk to a running engine.
@@ -64,10 +75,91 @@ impl Core {
     }
 }
 
+/// A running sync service and the tasks that forward its output as events.
+struct Syncing {
+    service: Arc<SyncService>,
+    tasks: Vec<JoinHandle<()>>,
+}
+
 struct Active {
     client: Client,
     record: SessionRecord,
     changes: broadcast::Receiver<SessionChange>,
+    sync: Option<Syncing>,
+}
+
+impl Active {
+    /// Stops forwarding, then stops the sync service, so that nothing holds
+    /// the client or its store afterwards (the tasks own clones of it).
+    async fn stop_sync(&mut self) {
+        let Some(sync) = self.sync.take() else {
+            return;
+        };
+        for task in &sync.tasks {
+            task.abort();
+        }
+        for task in sync.tasks {
+            // Aborted tasks end with a cancellation error; that is expected.
+            let _ = task.await;
+        }
+        sync.service.stop().await;
+    }
+}
+
+/// Forwards every distinct sync state change as an event.
+async fn forward_sync_state(service: Arc<SyncService>, events: mpsc::Sender<CoreEvent>) {
+    // Subscribe before reading the current value so that no change is lost.
+    let mut subscriber = service.state();
+    let mut last = map_state(&subscriber.get());
+    if events
+        .send(CoreEvent::SyncState(last.clone()))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    while let Some(state) = subscriber.next().await {
+        let mapped = map_state(&state);
+        if mapped != last {
+            last = mapped.clone();
+            if events.send(CoreEvent::SyncState(mapped)).await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+/// Forwards every room list diff batch as one `RoomListChanged` event.
+async fn forward_room_list(
+    service: Arc<SyncService>,
+    page_size: usize,
+    events: mpsc::Sender<CoreEvent>,
+) {
+    let room_list = match service.room_list_service().all_rooms().await {
+        Ok(list) => list,
+        Err(_) => {
+            let e = CoreError::Internal("could not open the room list".into());
+            let _ = events.send(CoreEvent::Error(e)).await;
+            return;
+        }
+    };
+    let (stream, controller) = room_list.entries_with_dynamic_adapters(page_size.max(1));
+    // The stream yields nothing until a filter is set.
+    controller.set_filter(Box::new(new_filter_non_left()));
+    pin_mut!(stream);
+    while let Some(diffs) = stream.next().await {
+        let batch = diffs
+            .into_iter()
+            .map(|d| map_diff(d, |item| summarize(&item)))
+            .collect();
+        if events
+            .send(CoreEvent::RoomListChanged(batch))
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
 }
 
 struct Engine {
@@ -133,9 +225,11 @@ impl Engine {
                 },
             }
         }
-        // Drop the client before the events sender so that, once the channel
-        // closes, the store is already released.
-        self.active = None;
+        // Stop sync and drop the client before the events sender so that, once
+        // the channel closes, the store is already released.
+        if let Some(mut active) = self.active.take() {
+            active.stop_sync().await;
+        }
     }
 
     async fn emit(&self, event: CoreEvent) {
@@ -157,7 +251,10 @@ impl Engine {
                     return;
                 }
                 match self.login_password(&username, &password, server).await {
-                    Ok(event) => self.emit(event).await,
+                    Ok(event) => {
+                        self.emit(event).await;
+                        self.start_sync().await;
+                    }
                     Err(e) => self.emit(CoreEvent::LoginFailed(e)).await,
                 }
             }
@@ -257,6 +354,7 @@ impl Engine {
                         client,
                         record,
                         changes,
+                        sync: None,
                     },
                     event,
                 ))
@@ -330,6 +428,7 @@ impl Engine {
             Ok(Some((active, event))) => {
                 self.active = Some(active);
                 self.emit(event).await;
+                self.start_sync().await;
             }
             Ok(None) => self.emit(CoreEvent::NoSession).await,
             Err(e) => self.emit(CoreEvent::Error(e)).await,
@@ -393,15 +492,48 @@ impl Engine {
                 client,
                 record,
                 changes,
+                sync: None,
             },
             event,
         )))
     }
 
+    /// Builds and starts the sync service and the event forwarders.
+    async fn start_sync(&mut self) {
+        let Some(active) = self.active.as_ref() else {
+            return;
+        };
+        let service = match SyncService::builder(active.client.clone())
+            .with_offline_mode()
+            .build()
+            .await
+        {
+            Ok(service) => Arc::new(service),
+            Err(_) => {
+                let e = CoreError::Internal("could not set up syncing".into());
+                self.emit(CoreEvent::Error(e)).await;
+                return;
+            }
+        };
+        let tasks = vec![
+            tokio::spawn(forward_sync_state(service.clone(), self.events.clone())),
+            tokio::spawn(forward_room_list(
+                service.clone(),
+                self.config.room_list_page_size,
+                self.events.clone(),
+            )),
+        ];
+        service.start().await;
+        if let Some(active) = self.active.as_mut() {
+            active.sync = Some(Syncing { service, tasks });
+        }
+    }
+
     async fn on_change(&mut self, change: Option<SessionChange>) {
         match change {
             Some(SessionChange::UnknownToken(_)) => {
-                if let Some(active) = self.active.take() {
+                if let Some(mut active) = self.active.take() {
+                    active.stop_sync().await;
                     let record = active.record.clone();
                     drop(active);
                     self.delete_local(&record).await;
@@ -448,10 +580,11 @@ impl Engine {
     }
 
     async fn logout(&mut self) {
-        let Some(active) = self.active.take() else {
+        let Some(mut active) = self.active.take() else {
             self.emit(CoreEvent::Error(CoreError::NotLoggedIn)).await;
             return;
         };
+        active.stop_sync().await;
         if active.client.logout().await.is_err() {
             warn!("server logout failed; deleting local session anyway");
         }
