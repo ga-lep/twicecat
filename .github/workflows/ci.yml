@@ -44,3 +44,23 @@ jobs:
       - run: cargo build --workspace --locked
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: cargo test --workspace --locked
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Install Linux build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libdbus-1-dev libssl-dev pkg-config
+      - uses: Swatinem/rust-cache@v2
+      - name: Start local Synapse
+        run: docker compose up -d --wait
+      - name: Register test users
+        run: scripts/create-test-users.sh
+      # The real-keychain test needs a desktop session, hence --skip keyring.
+      - name: Run homeserver integration tests
+        run: cargo test -p tessera-core --locked -- --ignored --skip keyring
+      - name: Stop local Synapse
+        if: always()
+        run: docker compose down -v

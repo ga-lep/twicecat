@@ -22,7 +22,7 @@ Phase 0 agent work is done; the Phase 0 human checkpoint is fully signed off (20
 - [x] 2. Public command/event API and SDK boundary check (phase1.2; roadmap step 8)
 - [x] 3. Secret store trait, keychain and in-memory backends (phase1.3)
 - [x] 4. Engine, client builder, password login, persistence, restore (roadmap steps 2, 3a, 4)
-- [ ] 5. Linux CI job for homeserver integration tests
+- [x] 5. Linux CI job for homeserver integration tests
 - [ ] 6. SyncService and room list events (roadmap step 5)
 - [ ] 7. Timeline, select room, send message (roadmap step 6)
 - [ ] 8. Sync supervision, reconnection, tracing (roadmap step 7)
@@ -111,7 +111,14 @@ Phase 0 agent work is done; the Phase 0 human checkpoint is fully signed off (20
 - Review fix (Security Medium, follow-up): `build_client` now calls `.respect_login_well_known(false)`. Verified in matrix-sdk 0.19.1 registry source: setter `client/builder/mod.rs:383` (default `true` at :165, passed to the client at :756); consumed in `Client::maybe_update_login_well_known` at `client/mod.rs:1576`, which otherwise calls `set_homeserver` without a scheme check. Defence in depth: `client::ensure_homeserver_after_login` re-checks `client.homeserver()` right after a successful login and before `persist_new`; on failure there is no server logout (no request over http), the client is dropped, the caller removes the store dir, and `LoginFailed(Login("the homeserver must use https"))` is emitted. Tests: `recheck_rejects_cleartext_non_loopback_homeserver`, `recheck_accepts_https_and_loopback_http` (no network; seen failing first as a compile error). No mock login-with-well_known test: the setter was verified in source instead.
 - Known limitations: (1) `LOGIN_TIMEOUT` can orphan a server-side device if the server accepted the login before the timeout. (2) The SDK/reqwest default redirect policy could resend the `/login` body on a 307/308 redirect to http (upstream behaviour; only reachable from the already trusted https endpoint).
 
+## Phase 1 / Task 5 notes
+- New `integration` job in ci.yml (ubuntu-latest only): same hardening as `lint`/`test` (top-level `permissions: contents: read`, `actions/checkout@v6` with `persist-credentials: false`, the same apt dependency line, `Swatinem/rust-cache@v2`, same tags as the existing jobs). Steps: `docker compose up -d --wait`, `scripts/create-test-users.sh`, `cargo test -p tessera-core --locked -- --ignored --skip keyring`, and `docker compose down -v` under `if: always()`. `lint` and `test` are unchanged. Action tags are not SHA-pinned, as in the existing jobs.
+- Checks run (all pass): actionlint 1.7.7 (docker) clean on ci.yml; `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`, `cargo test --workspace --locked`, `scripts/check-app-deps.sh`, `scripts/check-core-api.sh`, `cargo deny check`. Integration run from a fresh volume (`docker compose down -v`, then `up -d --wait`, `create-test-users.sh`, `cargo test -p tessera-core --locked -- --ignored --skip keyring`): 4/4 login tests passed; then `docker compose down -v`. The real-keychain test was not run (Decision 7).
+- Tidy from the Task 4 review: `http_non_loopback_homeserver_is_refused_before_login` (needs no server) moved from tests/login.rs to the new tests/login_policy.rs, so login.rs again has 4 ignore reasons = 4 `#[tokio::test]`. The un-ignored test still runs in the plain `cargo test --workspace`.
+- Open issues: none. The job itself can only be verified on GitHub (human item below).
+
 ## Phase 1 human checkpoint
+- [ ] Push the branch and confirm the new `integration` job is green (Task 5).
 - [ ] CI green on Linux, Windows, and macOS with the new SDK tree (aws-lc-sys and bundled sqlite builds), and the `integration` job green (Task 5).
 - [ ] Real-keychain test `cargo test -p tessera-core --locked -- --ignored keyring` passes on each OS you use, and no `io.github.ga_lep.Tessera.test` entry is left in the keychain.
 - [ ] CLI against your real account: password login, room list with unread counts, open a room, send and receive, restart restores without a prompt.
