@@ -217,16 +217,16 @@ Phase 0 agent work is done; the Phase 0 human checkpoint is fully signed off (20
 - `ci.yml` now triggers on `push` to `main`, on `pull_request`, and on `workflow_dispatch`, so a push to a branch with an open PR no longer runs the workflow twice. Feature branches get CI through their PR; a branch without a PR can be run manually via workflow_dispatch; main runs on push after merge. Nothing else in the workflow changed.
 
 ## Phase 1 human checkpoint
-- [ ] Push the branch and confirm the new `integration` job is green (Task 5).
-- [ ] CI green on Linux, Windows, and macOS with the new SDK tree (aws-lc-sys and bundled sqlite builds), and the `integration` job green (Task 5).
-- [ ] Real-keychain test `cargo test -p tessera-core --locked -- --ignored keyring` passes on each OS you use, and no `io.github.ga_lep.Tessera.test` entry is left in the keychain.
+- [x] Push the branch and confirm the new `integration` job is green (Task 5). (confirmed 2026-10-01, CI run 36924904524 at 76dcf25)
+- [x] CI green on Linux, Windows, and macOS with the new SDK tree (aws-lc-sys and bundled sqlite builds), and the `integration` job green (Task 5). (confirmed 2026-10-01, CI run 36924904524 at 76dcf25)
+- [x] Real-keychain test `cargo test -p tessera-core --locked -- --ignored keyring` passes on each OS you use, and no `io.github.ga_lep.Tessera.test` entry is left in the keychain. (confirmed by human 2026-10-01)
 - [x] CLI against your real account (`cargo run -p tessera-core --bin tessera-cli`): password login, room list with unread counts, open a room, send and receive, restart restores without a prompt. (confirmed by human 2026-10-01)
-- [ ] OS keychain viewer shows the `io.github.ga_lep.Tessera` entry, and no token sits in the CLI data dir (`~/.local/share/tessera` on Linux).
-- [ ] A cancelled or aborted OAuth login can leave an orphaned session; check your account settings for stray devices after the OIDC test.
-- [ ] OIDC login on matrix.org in a browser via the CLI (Task 9 code is done; unverifiable locally).
-- [ ] The OIDC session survives a CLI restart.
-- [ ] Keep the CLI running for over 10 minutes so MAS refreshes the access token, then restart and confirm restore still works (refresh persistence cannot be verified locally).
-- [ ] CLI in a real terminal: `/login` then the password prompt does not echo, and the password never appears as a REPL line, "Unknown command", or a sent message, even if typed ahead; Ctrl-C at the REPL exits cleanly; Ctrl-C at the password prompt prints "Interrupted. Press Enter to end the password prompt", and after Enter the CLI exits with the terminal usable (echo restored; Ctrl-C is deferred until the read returns); with `--data-dir` on an empty dir and a broken keychain (e.g. no secret service) startup prints the error and a hint, then `/login` and `/quit` work; `--ephemeral` then Ctrl-C leaves no `/tmp/tessera-cli-*` dir and the device is gone from the account's session list; `--password-stdin` on a terminal prints the echo warning.
+- [x] OS keychain viewer shows the `io.github.ga_lep.Tessera` entry, and no token sits in the CLI data dir (`~/.local/share/tessera` on Linux). (confirmed by human 2026-10-01)
+- [x] A cancelled or aborted OAuth login can leave an orphaned session; check your account settings for stray devices after the OIDC test. (confirmed by human 2026-10-01)
+- [x] OIDC login on matrix.org in a browser via the CLI (Task 9 code is done; unverifiable locally). (confirmed by human 2026-10-01)
+- [x] The OIDC session survives a CLI restart. (confirmed by human 2026-10-01)
+- [x] Keep the CLI running for over 10 minutes so MAS refreshes the access token, then restart and confirm restore still works (refresh persistence cannot be verified locally). (confirmed by human 2026-10-01)
+- [x] CLI in a real terminal: `/login` then the password prompt does not echo, and the password never appears as a REPL line, "Unknown command", or a sent message, even if typed ahead; Ctrl-C at the REPL exits cleanly; Ctrl-C at the password prompt prints "Interrupted. Press Enter to end the password prompt", and after Enter the CLI exits with the terminal usable (echo restored; Ctrl-C is deferred until the read returns); with `--data-dir` on an empty dir and a broken keychain (e.g. no secret service) startup prints the error and a hint, then `/login` and `/quit` work; `--ephemeral` then Ctrl-C leaves no `/tmp/tessera-cli-*` dir and the device is gone from the account's session list; `--password-stdin` on a terminal prints the echo warning. (confirmed by human 2026-10-01)
 - [ ] Approve the `api` module as the Phase 2 contract.
 
 ## Human checkpoint
