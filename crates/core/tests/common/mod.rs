@@ -170,16 +170,44 @@ pub async fn create_room(
         .to_owned()
 }
 
+/// Serializes DM creation within a test binary, see [`create_dm`].
+static DM_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Creates a DM from `creator` to `with` (a full user ID), using the SDK's
 /// own DM helper.
+///
+/// The SDK marks the room in the `m.direct` account data by reading the
+/// client's local copy and writing the whole event back. A test client never
+/// syncs, so its copy is empty and every DM it creates would replace the
+/// server's `m.direct`, dropping the DMs of tests running at the same time on
+/// the same account (those rooms then stay non-DM forever). So the create and
+/// a merge with the server's current `m.direct` happen under one lock.
 pub async fn create_dm(creator: &matrix_sdk::Client, with: &str) -> matrix_sdk::ruma::OwnedRoomId {
+    use matrix_sdk::ruma::events::direct::DirectEventContent;
     let user: matrix_sdk::ruma::OwnedUserId = with.try_into().expect("valid user id");
-    creator
+    let _guard = DM_LOCK.lock().await;
+    let account = creator.account();
+    let mut direct: DirectEventContent = account
+        .fetch_account_data_static::<DirectEventContent>()
+        .await
+        .expect("fetch m.direct")
+        .map(|raw| raw.deserialize().expect("parse m.direct"))
+        .unwrap_or_default();
+    let room_id = creator
         .create_dm(&user)
         .await
         .expect("create dm")
         .room_id()
-        .to_owned()
+        .to_owned();
+    let rooms = direct.entry(user.into()).or_default();
+    if !rooms.contains(&room_id) {
+        rooms.push(room_id.clone());
+    }
+    account
+        .set_account_data(direct)
+        .await
+        .expect("restore merged m.direct");
+    room_id
 }
 
 /// Creates a space named `name` as `creator`.
