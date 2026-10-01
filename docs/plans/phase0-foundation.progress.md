@@ -8,3 +8,5 @@ Task 3: started
 Task 3: complete (c9d934b..0611914, gate ok, security PASS, review PASS)
   notes: [sec Med] check-app-deps.sh fails open if cargo tree errors (pipeline in if-condition); [sec Med] boundary check misses optional/target-specific deps (add --all-features --target all); [sec Med] ci.yml has no `permissions: contents: read`; [sec Med] actions/checkout without persist-credentials: false; [sec Low] actions pinned by tag not SHA; [sec Low] no --locked on cargo in CI; [review Warn] pattern is a regex; [review Sugg] cargo deny --all-features; advisories RUSTSEC-2024-0436 (paste), RUSTSEC-2026-0192 (ttf-parser) ignored as unmaintained via iced 0.14.0
 Task 4: started
+Task 4: complete (a8cafe2..fefc04c, gate ok, security PASS, review PASS)
+  notes: process deviation — controller launched security and quality reviews concurrently; quality verdict accepted only after security PASS. [sec Low] no permissions block / tag-pinned actions (pre-existing, see Task 3); [review Sugg] stale "Linux may fail until step 5" line in PROGRESS.md; apt install duplicated across jobs; --no-install-recommends optional
