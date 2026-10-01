@@ -404,6 +404,14 @@ impl Engine {
                 }
             }
             Command::SendMessage { text } => self.send_message(&text).await,
+            // Applied by the room list in a later task; ignored for now.
+            Command::SetRoomListQuery(_) | Command::LoadMoreRooms => {}
+            // Fetching arrives in a later task; every ID is unavailable until then.
+            Command::FetchAvatars(ids) => {
+                for id in ids {
+                    self.emit(CoreEvent::Avatar { id, image: None }).await;
+                }
+            }
             // Handled in `run`.
             Command::Shutdown => {}
         }
@@ -1006,6 +1014,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::{AvatarId, RoomListQuery, RoomListTab};
     use crate::secrets::InMemorySecretStore;
 
     fn engine(secrets: Arc<dyn SecretStore>) -> Engine {
@@ -1170,5 +1179,37 @@ mod tests {
         .expect("shutdown must not hang");
         assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
         assert!(!dir.exists(), "store dir must be removed");
+    }
+
+    #[tokio::test]
+    async fn room_list_query_and_paging_commands_are_noops() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut engine, mut rx) = oauth_engine(tmp.path());
+        engine
+            .handle(Command::SetRoomListQuery(RoomListQuery {
+                tab: RoomListTab::Spaces,
+                search: "x".into(),
+            }))
+            .await;
+        engine.handle(Command::LoadMoreRooms).await;
+        assert!(rx.try_recv().is_err(), "no event expected");
+    }
+
+    #[tokio::test]
+    async fn fetch_avatars_answers_each_id_with_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut engine, mut rx) = oauth_engine(tmp.path());
+        let ids = [AvatarId::from("mxc://x/a"), AvatarId::from("mxc://x/b")];
+        engine.handle(Command::FetchAvatars(ids.to_vec())).await;
+        for id in ids {
+            match rx.try_recv() {
+                Ok(CoreEvent::Avatar { id: got, image }) => {
+                    assert_eq!(got, id);
+                    assert!(image.is_none());
+                }
+                other => panic!("unexpected: {other:?}"),
+            }
+        }
+        assert!(rx.try_recv().is_err());
     }
 }

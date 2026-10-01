@@ -32,7 +32,7 @@ Phase 0 agent work is done; the Phase 0 human checkpoint is fully signed off (20
 
 ## Phase 2 steps
 - [x] 1. App dependencies, boundary check hardening, Phase 2 ledger (phase2.1)
-- [ ] 2. Additive core API for Phase 2
+- [x] 2. Additive core API for Phase 2 (phase2.2)
 - [ ] 3. Room view models in the core (roadmap step 3)
 - [ ] 4. Room list query (tabs, search) and paging in the core (roadmap step 5, core side)
 - [ ] 5. Avatar thumbnails through the SDK media API (roadmap step 6, core side)
@@ -268,6 +268,13 @@ Phase 0 agent work is done; the Phase 0 human checkpoint is fully signed off (20
 - shellcheck is not installed in this environment, so it was not run; only `bash -n` (ok). Human item below.
 - No iced/matrix-sdk API was used in this task (dependencies only).
 - Open issues: none.
+
+## Phase 2 / Task 2 notes
+- Checks: `cargo fmt --all --check`, clippy (`--workspace --all-targets --all-features --locked -D warnings`), `cargo test --workspace --locked`, `scripts/check-app-deps.sh`, `scripts/check-core-api.sh`, `cargo deny check` all pass. Ignored run (`cargo test -p tessera-core --locked -- --ignored --skip keyring` against the local Synapse, then `docker compose stop`) passes.
+- Added to `api` (Q6, SDK-free, additive): `AvatarId`, `AvatarImage` (Debug shows length), `MessagePreview` (Debug redacts body), `RoomListTab`, `RoomListQuery`, the new `RoomSummary` fields plus `RoomSummary::new`, `Command::{SetRoomListQuery, LoadMoreRooms, FetchAvatars}`, `CoreEvent::{RoomListLoaded, Avatar}`.
+- Engine: `SetRoomListQuery` and `LoadMoreRooms` are no-ops until Task 4; `FetchAvatars` answers each id with `Avatar { id, image: None }` until Task 5. The CLI ignores the two new events. `summarize` uses `RoomSummary::new` with struct update syntax.
+- No iced, matrix-sdk(-ui), `open` or `image` API was used in this task (core API types and engine plumbing only).
+- Open issues: none. New human items: none.
 
 ## Phase 2 human checkpoint
 - [ ] CI green on Linux, Windows and macOS with the new dependencies (iced `image-without-codecs`, image, open, tokio in the app).

@@ -39,11 +39,10 @@ pub(crate) fn summarize(item: &RoomListItem) -> RoomSummary {
     let id = RoomId::from(item.room_id().to_string());
     let name = name_or_id(item.cached_display_name().map(|n| n.to_string()), &id);
     RoomSummary {
-        id,
-        name,
         unread_messages: item.num_unread_messages(),
         unread_mentions: item.num_unread_mentions(),
         unread_notifications: item.num_unread_notifications(),
+        ..RoomSummary::new(id, name)
     }
 }
 
