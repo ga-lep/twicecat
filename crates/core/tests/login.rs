@@ -19,10 +19,19 @@ fn login_cmd(env: &TestEnv, n: u8, password: &str) -> Command {
 }
 
 fn files_under(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+    // Only a vanished entry (SQLite WAL churn) is tolerated; anything else
+    // would hide files from the no-token scan.
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => panic!("read_dir {}: {e}", dir.display()),
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => panic!("dir entry in {}: {e}", dir.display()),
+        };
         let path = entry.path();
         if path.is_dir() {
             files_under(&path, out);

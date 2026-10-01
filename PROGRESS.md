@@ -135,6 +135,12 @@ Phase 0 agent work is done; the Phase 0 human checkpoint is fully signed off (20
 - Open issues: `SelectRoom` right after `Running` can return `UnknownRoom` if the room has not synced yet (tests wait for the room in the room list first); the front end should select from room list entries. A failed send is only reported through the item's `sent == Failed` and `SendFailed` for queueing errors; there is no retry command (out of scope). `room_list::unread_count_reaches_two` uses bob concurrently with the restore test's device count (pre-existing from Task 6; it passed 3 of 3 runs here, but is a potential flake).
 - New human items: none (timeline rendering is Phase 2).
 
+### Follow-up fixes (human-approved)
+- Security Low (Task 4): a login response's user ID is now checked against the request before anything is persisted (`client::login_account_matches`: full MXID needs exact equality; a bare localpart needs an equal localpart and, unless a homeserver override or URL is used, an equal server name; exact comparison, no case folding). On mismatch nothing is written to the secret store or `last_account`, the local session and store dir are dropped without a logout request, and `LoginFailed("the homeserver returned a different account")` is emitted. Unit-tested (3 tests, run red against a `todo!()` stub first); no integration test for a lying homeserver (none available locally).
+- Security Low (Task 6): `tests/login.rs::files_under` tolerates only `ErrorKind::NotFound` and panics on any other `read_dir` or dir-entry error.
+- Security Low (Task 5): the CI `integration` job has `timeout-minutes: 20`; actionlint clean.
+- Checks: full gate and the ignored run (see commit) pass.
+
 ## Phase 1 human checkpoint
 - [ ] Push the branch and confirm the new `integration` job is green (Task 5).
 - [ ] CI green on Linux, Windows, and macOS with the new SDK tree (aws-lc-sys and bundled sqlite builds), and the `integration` job green (Task 5).

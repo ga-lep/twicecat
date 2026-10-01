@@ -19,7 +19,10 @@ use zeroize::Zeroizing;
 use crate::api::{
     Command, CoreError, CoreEvent, DeviceId, ListDiff, MessageText, Password, RoomId, UserId,
 };
-use crate::client::{ServerSpec, build_client, ensure_homeserver_after_login, map_login_error};
+use crate::client::{
+    ServerSpec, WRONG_ACCOUNT, build_client, ensure_homeserver_after_login, login_account_matches,
+    map_login_error,
+};
 use crate::paths::DataPaths;
 use crate::room_list::{map_diff, summarize};
 use crate::secrets::{SecretError, SecretStore};
@@ -452,6 +455,20 @@ impl Engine {
         // Never talk to a homeserver that fails the policy, not even to log
         // out: drop the local session only (the caller removes the store dir).
         ensure_homeserver_after_login(&client)?;
+
+        // A homeserver must not choose which account's record we overwrite:
+        // check before anything is persisted. No logout is sent to it either.
+        // A server override or a URL gives no server name to compare.
+        let expected_server = (self.config.homeserver_override.is_none()
+            && !server.contains("://"))
+        .then_some(server);
+        let returned = client.user_id().map(ToString::to_string);
+        if !returned
+            .as_deref()
+            .is_some_and(|r| login_account_matches(username, expected_server, r))
+        {
+            return Err(CoreError::Login(WRONG_ACCOUNT.into()));
+        }
 
         match self.persist_new(&client, session_id, passphrase).await {
             Ok((record, event)) => {

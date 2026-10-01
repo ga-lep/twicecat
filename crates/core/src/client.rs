@@ -31,6 +31,33 @@ pub(crate) fn ensure_homeserver_after_login(client: &Client) -> Result<(), CoreE
     ensure_https(client.homeserver().as_str())
 }
 
+/// Fixed, non-secret message for a login that returned another account.
+pub(crate) const WRONG_ACCOUNT: &str = "the homeserver returned a different account";
+
+/// Whether the user ID in a login response is the account the user asked for.
+///
+/// A homeserver must not be able to make us store a session under another
+/// account's key. `username` is what the user typed: a full MXID needs exact
+/// equality with `returned`; a bare localpart needs an equal localpart, and,
+/// when `expected_server` is known, an equal server name. Comparison is exact
+/// on the parsed parts (no case folding).
+pub(crate) fn login_account_matches(
+    username: &str,
+    expected_server: Option<&str>,
+    returned: &str,
+) -> bool {
+    let Some((local, server)) = returned.strip_prefix('@').and_then(|r| r.split_once(':')) else {
+        return false;
+    };
+    if local.is_empty() || server.is_empty() {
+        return false;
+    }
+    if username.starts_with('@') {
+        return username == returned;
+    }
+    local == username && expected_server.is_none_or(|s| s == server)
+}
+
 /// Where to find the homeserver.
 pub(crate) enum ServerSpec<'a> {
     /// A server name (discovery via `.well-known`) or a full homeserver URL.
@@ -119,6 +146,31 @@ pub(crate) fn map_login_error(e: &SdkError) -> CoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn full_mxid_needs_exact_equality() {
+        assert!(login_account_matches("@a:x.org", None, "@a:x.org"));
+        assert!(!login_account_matches("@a:x.org", None, "@a:matrix.org"));
+        assert!(!login_account_matches("@a:x.org", None, "@b:x.org"));
+        assert!(!login_account_matches("@a:x.org", None, "@A:x.org"));
+    }
+
+    #[test]
+    fn localpart_needs_equal_localpart_and_server() {
+        assert!(login_account_matches("a", Some("x.org"), "@a:x.org"));
+        assert!(!login_account_matches("a", Some("x.org"), "@a:matrix.org"));
+        assert!(!login_account_matches("a", Some("x.org"), "@b:x.org"));
+        assert!(!login_account_matches("a", Some("x.org"), "@A:x.org"));
+        assert!(login_account_matches("a", None, "@a:anything.org"));
+        assert!(!login_account_matches("a", None, "@b:anything.org"));
+    }
+
+    #[test]
+    fn malformed_returned_ids_never_match() {
+        assert!(!login_account_matches("a", None, "a"));
+        assert!(!login_account_matches("a", None, "@a"));
+        assert!(!login_account_matches("a", Some("x.org"), ""));
+    }
 
     async fn client_for(url: &str) -> Client {
         // `homeserver_url` does no discovery, so this contacts nobody.
