@@ -160,3 +160,36 @@ pub async fn create_room(
         .room_id()
         .to_owned()
 }
+
+/// Creates a DM from `creator` to `with` (a full user ID), using the SDK's
+/// own DM helper.
+pub async fn create_dm(creator: &matrix_sdk::Client, with: &str) -> matrix_sdk::ruma::OwnedRoomId {
+    let user: matrix_sdk::ruma::OwnedUserId = with.try_into().expect("valid user id");
+    creator
+        .create_dm(&user)
+        .await
+        .expect("create dm")
+        .room_id()
+        .to_owned()
+}
+
+/// Creates a space named `name` as `creator`.
+pub async fn create_space(
+    creator: &matrix_sdk::Client,
+    name: &str,
+) -> matrix_sdk::ruma::OwnedRoomId {
+    use matrix_sdk::ruma::api::client::room::create_room::v3::{CreationContent, Request};
+    use matrix_sdk::ruma::room::RoomType;
+    use matrix_sdk::ruma::serde::Raw;
+    let mut content = CreationContent::new();
+    content.room_type = Some(RoomType::Space);
+    let mut request = Request::new();
+    request.name = Some(name.to_owned());
+    request.creation_content = Some(Raw::new(&content).expect("serialize creation content"));
+    creator
+        .create_room(request)
+        .await
+        .expect("create space")
+        .room_id()
+        .to_owned()
+}

@@ -5,7 +5,10 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{TestEnv, create_room, expect_event, raw_login, start_core, unique_room_name};
+use common::{
+    TestEnv, create_dm, create_room, create_space, expect_event, raw_login, start_core,
+    unique_room_name,
+};
 use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
 use tessera_core::CoreHandle;
 use tessera_core::api::{Command, CoreEvent, ListDiff, Password, RoomSummary, SyncState};
@@ -104,6 +107,100 @@ async fn unread_count_reaches_two() {
         })
         .await;
     }
+
+    core.commands.send(Command::Logout).await.unwrap();
+    expect_event(&mut core, |e| matches!(e, CoreEvent::LoggedOut)).await;
+}
+
+#[tokio::test]
+#[ignore = "needs local homeserver: docker compose up -d --wait"]
+async fn last_message_preview_shows_own_message() {
+    let env = TestEnv::load();
+    let dir = tempfile::tempdir().unwrap();
+    let mut core = start_core(dir.path(), Arc::new(InMemorySecretStore::new()));
+    login_and_run(&mut core, &env, 1).await;
+
+    let alice = raw_login(1).await;
+    let name = unique_room_name();
+    let room_id = create_room(&alice, &name, None).await;
+    let room = alice.get_room(&room_id).expect("alice knows the room");
+
+    // The core must know the room before the message, so the preview comes
+    // from a latest event it registered for (and so that it is not only the
+    // initial sync state).
+    let mut rooms = Vec::new();
+    apply_until(&mut core, &mut rooms, |r| r.iter().any(|s| s.name == name)).await;
+    let marker = unique_room_name();
+    room.send(RoomMessageEventContent::text_plain(marker.clone()))
+        .await
+        .expect("alice sends");
+    apply_until(&mut core, &mut rooms, |r| {
+        r.iter().any(|s| {
+            s.name == name
+                && s.last_message
+                    .as_ref()
+                    .is_some_and(|m| m.body == marker && m.is_own)
+        })
+    })
+    .await;
+
+    core.commands.send(Command::Logout).await.unwrap();
+    expect_event(&mut core, |e| matches!(e, CoreEvent::LoggedOut)).await;
+}
+
+#[tokio::test]
+#[ignore = "needs local homeserver: docker compose up -d --wait"]
+async fn dm_and_space_flags() {
+    let env = TestEnv::load();
+    let dir = tempfile::tempdir().unwrap();
+    let mut core = start_core(dir.path(), Arc::new(InMemorySecretStore::new()));
+    login_and_run(&mut core, &env, 1).await;
+
+    let alice = raw_login(1).await;
+    let dm_id = create_dm(&alice, &env.user_id(2)).await;
+    let space_name = unique_room_name();
+    let space_id = create_space(&alice, &space_name).await;
+
+    let mut rooms = Vec::new();
+    apply_until(&mut core, &mut rooms, |r| {
+        r.iter().any(|s| s.id.as_str() == dm_id.as_str() && s.is_dm)
+            && r.iter()
+                .any(|s| s.id.as_str() == space_id.as_str() && s.is_space)
+    })
+    .await;
+    let dm = rooms.iter().find(|s| s.id.as_str() == dm_id.as_str());
+    assert!(!dm.expect("dm listed").is_space);
+    let space = rooms.iter().find(|s| s.id.as_str() == space_id.as_str());
+    assert!(!space.expect("space listed").is_dm);
+
+    core.commands.send(Command::Logout).await.unwrap();
+    expect_event(&mut core, |e| matches!(e, CoreEvent::LoggedOut)).await;
+}
+
+#[tokio::test]
+#[ignore = "needs local homeserver: docker compose up -d --wait"]
+async fn room_list_loaded_is_signalled() {
+    let env = TestEnv::load();
+    let dir = tempfile::tempdir().unwrap();
+    let mut core = start_core(dir.path(), Arc::new(InMemorySecretStore::new()));
+    core.commands
+        .send(Command::LoginPassword {
+            username: env.user(1).to_owned(),
+            password: Password::from(env.password(1)),
+            server: None,
+        })
+        .await
+        .unwrap();
+    expect_event(&mut core, |e| matches!(e, CoreEvent::LoggedIn { .. })).await;
+    // The signal is not ordered against `Running`, so wait for it from the
+    // moment sync starts; the 30 s default timeout bounds the wait.
+    let event = expect_event(&mut core, |e| matches!(e, CoreEvent::RoomListLoaded { .. })).await;
+    assert!(matches!(
+        event,
+        CoreEvent::RoomListLoaded {
+            total_rooms: Some(_)
+        }
+    ));
 
     core.commands.send(Command::Logout).await.unwrap();
     expect_event(&mut core, |e| matches!(e, CoreEvent::LoggedOut)).await;

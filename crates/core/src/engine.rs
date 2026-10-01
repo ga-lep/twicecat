@@ -26,7 +26,7 @@ use crate::client::{
 };
 use crate::oauth::authorize;
 use crate::paths::DataPaths;
-use crate::room_list::{map_diff, summarize};
+use crate::room_list::{Registered, loaded_event, map_batch, map_diff};
 use crate::secrets::{SecretError, SecretStore};
 use crate::session::{
     RECORD_VERSION, SessionAuth, SessionRecord, generate_session_id, generate_store_passphrase,
@@ -205,20 +205,33 @@ async fn forward_room_list(
             return;
         }
     };
+    let mut loading = room_list.loading_state();
     let (stream, controller) = room_list.entries_with_dynamic_adapters(page_size.max(1));
     // The stream yields nothing until a filter is set.
     controller.set_filter(Box::new(new_filter_non_left()));
     pin_mut!(stream);
-    while let Some(diffs) = stream.next().await {
-        let batch = diffs
-            .into_iter()
-            .map(|d| map_diff(d, |item| summarize(&item)))
-            .collect();
-        if events
-            .send(CoreEvent::RoomListChanged(batch))
-            .await
-            .is_err()
-        {
+    // Rooms registered for latest events live and die with this task, so the
+    // set starts empty again after sync restarts.
+    let mut registered = Registered::default();
+    let mut loading_open = true;
+    loop {
+        let event = tokio::select! {
+            diffs = stream.next() => match diffs {
+                Some(diffs) => CoreEvent::RoomListChanged(map_batch(diffs, &mut registered).await),
+                None => return,
+            },
+            state = loading.next(), if loading_open => match state {
+                Some(state) => match loaded_event(&state) {
+                    Some(event) => event,
+                    None => continue,
+                },
+                None => {
+                    loading_open = false;
+                    continue;
+                }
+            },
+        };
+        if events.send(event).await.is_err() {
             return;
         }
     }

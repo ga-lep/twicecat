@@ -33,7 +33,7 @@ Phase 0 agent work is done; the Phase 0 human checkpoint is fully signed off (20
 ## Phase 2 steps
 - [x] 1. App dependencies, boundary check hardening, Phase 2 ledger (phase2.1)
 - [x] 2. Additive core API for Phase 2 (phase2.2)
-- [ ] 3. Room view models in the core (roadmap step 3)
+- [x] 3. Room view models in the core (roadmap step 3) (phase2.3)
 - [ ] 4. Room list query (tabs, search) and paging in the core (roadmap step 5, core side)
 - [ ] 5. Avatar thumbnails through the SDK media API (roadmap step 6, core side)
 - [ ] 6. App library split and the core bridge (roadmap step 1)
@@ -275,6 +275,19 @@ Phase 0 agent work is done; the Phase 0 human checkpoint is fully signed off (20
 - Engine: `SetRoomListQuery` and `LoadMoreRooms` are no-ops until Task 4; `FetchAvatars` answers each id with `Avatar { id, image: None }` until Task 5. The CLI ignores the two new events. `summarize` uses `RoomSummary::new` with struct update syntax.
 - No iced, matrix-sdk(-ui), `open` or `image` API was used in this task (core API types and engine plumbing only).
 - Open issues: none. New human items: none.
+
+## Phase 2 / Task 3 notes
+- Checks: `cargo fmt --all --check`, clippy (`--workspace --all-targets --all-features --locked -D warnings`), `cargo test --workspace --locked`, `scripts/check-app-deps.sh`, `scripts/check-core-api.sh`, `cargo deny check` all pass. Ignored run (`cargo test -p tessera-core --locked -- --ignored --skip keyring` against the local Synapse, then `docker compose stop`) passes, including the 3 new tests (`last_message_preview_shows_own_message`, `dm_and_space_flags`, `room_list_loaded_is_signalled`).
+- TDD: the unit tests (`highlights_of`, `preview_body`, `pick_avatar`, `Registered`, `loaded_event`, `items_mut`) were written first and failed to compile (functions missing), then the code was added. The integration tests can only pass with the new code (they assert the new fields); they were not run against the old code.
+- Core: `summarize` fills the Q6 fields (without the preview, which needs async). `map_batch` (async) registers each new room once and attaches `last_message` from the latest event. `forward_room_list` now `select!`s the diff stream and `RoomList::loading_state()`; `Loaded` becomes `RoomListLoaded`, `NotLoaded` emits nothing. The registration set lives in the forwarder task, so it is empty again after sync restarts. A failed registration is forgotten and retried on the next sighting. Previews are never logged (the only log is a fixed warning).
+- APIs used, confirmed in `~/.cargo/registry/src/*/` (pinned 0.19.1):
+  - matrix-sdk-ui: `RoomListItem` derefs to `matrix_sdk::Room` (room_list_service/room_list.rs:392, :458); `RoomList::loading_state()` :119; `RoomListLoadingState::{NotLoaded, Loaded { maximum_number_of_rooms }}` (room_list.rs, enum after :275; re-exported by `pub use room_list::*`, room_list_service/mod.rs:68); `RoomExt::latest_event` (timeline/traits.rs:65, impl :85); `LatestEventValue::{None, Remote, RemoteInvite, Local}` (timeline/latest_event.rs:27-71); `TimelineItemContent::as_message` (timeline/event_item/content/mod.rs:279); `Message::body` (content/message.rs:83); `TimelineDetails::Ready`, `Profile.display_name` (event_item/mod.rs:777, :728).
+  - matrix-sdk-base: `Room::is_space` room/mod.rs:156, `unread_notification_counts` :181 (`highlight_count`, sync.rs:264), `num_unread_mentions` :206, `avatar_url` :240, `is_marked_unread` :582, `Room::state` room/state.rs:23 (`RoomState::Invited`), `clone_info` room/room_info.rs:91, `RoomInfo::heroes` :990, `RoomHero.avatar_url` room/display_name.rs:398.
+  - matrix-sdk: `Room::is_dm` room/mod.rs:4737; `Client::latest_events` client/mod.rs:3630; `LatestEvents::listen_to_room` latest_events/mod.rs:143; `Client::create_dm` client/mod.rs:1964 and `create_room` :1931 (tests).
+  - ruma: `MxcUri::is_valid` ruma-common-0.20.0 identifiers/mxc_uri.rs:51; `CreationContent.room_type` and `Request.creation_content` ruma-client-api-0.25.0 room/create_room.rs:161, :54 (tests); `MilliSecondsSinceUnixEpoch::get` ruma-common time.rs:40.
+  - eyeball: `Subscriber<T>: Stream` eyeball-*/src/subscriber.rs:197.
+- Not exercised by a test: a Local (unsent) latest event preview, and the DM-hero avatar fallback against a real server (pure `pick_avatar` is unit-tested).
+- Open issues: a room's first preview arrives one `Set` diff after the room first appears (latest events are lazy, per plan Q10). No new human items.
 
 ## Phase 2 human checkpoint
 - [ ] CI green on Linux, Windows and macOS with the new dependencies (iced `image-without-codecs`, image, open, tokio in the app).
