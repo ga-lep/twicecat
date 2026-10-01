@@ -16,3 +16,5 @@ Task 5: complete (d5221c9..a9cea0f, gate ok, security PASS, review PASS)
 Final review: VERDICT: PASS
   notes: stale "Linux may fail until step 5" line in PROGRESS.md; check-app-deps.sh fails open + misses optional/target deps; space() confirmation not cited in PROGRESS.md; ci.yml lacks permissions/persist-credentials:false/SHA pins/--locked
 Fix (final-review follow-up: boundary check + CI hardening): started
+Fix: complete (2a5aedc..49a48dd, gate ok, security PASS, review PASS; actionlint + shellcheck re-run by controller: clean)
+  notes: commits 3998cf8 (fail-closed boundary check, --all-features --target all, ci permissions/persist-credentials/--locked), 0b66c0d (stale PROGRESS notes, space() citation), 49a48dd (step 4/5 tags). [sec Low] actions still tag-pinned (human decision); [sec Low] check only covers direct deps — core re-exporting matrix-sdk would bypass it (revisit in Phase 1); [sec Low] tail/awk failure inside if still fails open; [review Sugg] step 4 hardening bullet sits below "Open issues: none"
