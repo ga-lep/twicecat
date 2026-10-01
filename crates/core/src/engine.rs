@@ -20,6 +20,7 @@ use crate::api::{
     Command, CoreError, CoreEvent, DeviceId, ListDiff, MessageText, Password, RoomId,
     RoomListQuery, UserId,
 };
+use crate::avatars::{Avatars, SdkFetcher, answer_unavailable};
 use crate::client::{
     ServerSpec, WRONG_ACCOUNT, account_bound, build_client, discover_homeserver_url,
     ensure_homeserver_after_login, map_login_error, same_origin,
@@ -122,6 +123,9 @@ struct Active {
     changes: broadcast::Receiver<SessionChange>,
     sync: Option<Syncing>,
     selected: Option<Selected>,
+    /// Avatar fetches of this session (in flight and answered).
+    avatars: Avatars,
+    fetcher: Arc<SdkFetcher>,
 }
 
 impl Active {
@@ -129,6 +133,8 @@ impl Active {
     /// service, so that nothing holds the client or its store afterwards (the
     /// tasks own clones of it).
     async fn stop_tasks(&mut self) {
+        // Fetch tasks hold clones of the client, so they go first.
+        self.avatars.stop().await;
         if let Some(selected) = self.selected.take() {
             selected.stop().await;
         }
@@ -474,12 +480,13 @@ impl Engine {
                     let _ = more.try_send(());
                 }
             }
-            // Fetching arrives in a later task; every ID is unavailable until then.
-            Command::FetchAvatars(ids) => {
-                for id in ids {
-                    self.emit(CoreEvent::Avatar { id, image: None }).await;
-                }
-            }
+            // Validated, bounded and deduplicated in `avatars`; the fetches run
+            // in tasks, so this never waits for the network.
+            Command::FetchAvatars(ids) => match self.active.as_mut() {
+                Some(active) => active.avatars.request(ids, &active.fetcher, &self.events),
+                // No session to fetch with: every ID is unavailable.
+                None => answer_unavailable(ids, &self.events).await,
+            },
             // Handled in `run`.
             Command::Shutdown => {}
         }
@@ -785,11 +792,13 @@ impl Engine {
                 let changes = client.subscribe_to_session_changes();
                 Ok((
                     Active {
+                        fetcher: Arc::new(SdkFetcher(client.clone())),
                         client,
                         record,
                         changes,
                         sync: None,
                         selected: None,
+                        avatars: Avatars::new(),
                     },
                     event,
                 ))
@@ -959,11 +968,13 @@ impl Engine {
         let changes = client.subscribe_to_session_changes();
         Ok(Some((
             Active {
+                fetcher: Arc::new(SdkFetcher(client.clone())),
                 client,
                 record,
                 changes,
                 sync: None,
                 selected: None,
+                avatars: Avatars::new(),
             },
             event,
         )))

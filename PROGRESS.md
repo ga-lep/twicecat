@@ -35,7 +35,7 @@ Phase 0 agent work is done; the Phase 0 human checkpoint is fully signed off (20
 - [x] 2. Additive core API for Phase 2 (phase2.2)
 - [x] 3. Room view models in the core (roadmap step 3) (phase2.3)
 - [x] 4. Room list query (tabs, search) and paging in the core (roadmap step 5, core side) (phase2.4)
-- [ ] 5. Avatar thumbnails through the SDK media API (roadmap step 6, core side)
+- [x] 5. Avatar thumbnails through the SDK media API (roadmap step 6, core side) (phase2.5)
 - [ ] 6. App library split and the core bridge (roadmap step 1)
 - [ ] 7. Room list and timeline state from diffs, 2,000-room timing test (roadmap step 2)
 - [ ] 8. Light and dark theme following the system (roadmap step 7)
@@ -305,6 +305,27 @@ Phase 0 agent work is done; the Phase 0 human checkpoint is fully signed off (20
   - Possible product note (not changed, not this step): a room list `Set` is not emitted when `m.direct` arrives after the room, so a DM seen before its `m.direct` stays non-DM until the list is rebuilt. Worth a look in a later step.
 - Verification of the fix: ignored run (`cargo test -p tessera-core --locked -- --ignored --skip keyring`) three times in a row, run 1 on a fresh `docker compose down -v` volume; all passed. `room_list` file wall time: 11.14 s, 12.35 s, 14.12 s (was 190 s). Before the fix on a fresh volume: 189 s, failing.
 - No new human items.
+
+## Phase 2 / Task 5 notes
+- Checks: `cargo fmt --all --check`, clippy (`--workspace --all-targets --all-features --locked -D warnings`), `cargo test --workspace --locked`, `scripts/check-app-deps.sh`, `scripts/check-core-api.sh`, `cargo deny check` and the ignored run (`cargo test -p tessera-core --locked -- --ignored --skip keyring`) all pass (all suites ok; avatars 1 passed in 8.5 s, room_list 8 in 17 s). The keyring test was not run.
+- TDD: the `avatars.rs` unit tests (11) were written first against `todo!()` stubs and failed (11 failed, 1 passed), then the code was added.
+- Core: private module `avatars.rs` (not in `check-core-api.sh`). `Active` owns `avatars: Avatars` (a `JoinSet`, the seen set, a 4-permit `Semaphore`) and `fetcher: Arc<SdkFetcher>`; `stop_tasks` calls `avatars.stop()` (abort all, drain, clear the seen set) first, before the sync tasks and the store go. With no session, `FetchAvatars` answers every ID with `image: None` (`answer_unavailable`).
+- Security rules from the reviews, all covered by unit tests:
+  - Each `AvatarId` is parsed as an `OwnedMxcUri` and must be `mxc://server/media` (non-empty media ID, at most 255 bytes) before any request. `"not-mxc"`, `https://` and `file://` URLs, userinfo, `/`, `?`, `#`, `..`, whitespace, wrong case of the scheme, empty media ID and over-long IDs give `image: None` with zero fetch calls. The 255-byte bound also avoids a wrap in ruma's validator (`(index + 6) as u8` then `NonZeroU8::new(..).unwrap()`, ruma-identifiers-validation mxc_uri.rs:25, which could panic for a 250-byte server name).
+  - Fetching is only through `client.media().get_media_content(&MediaRequestParameters { source: MediaSource::Plain(parsed), format }, true)`. The `Fetcher` trait takes the parsed `OwnedMxcUri`, so no URL is ever built from the raw string.
+  - Cap: 1 MiB (inclusive) on thumbnail and file; empty is unavailable; an oversized thumbnail is refused and the (bigger) file is not tried. Residual: the SDK's media API returns a whole `Vec<u8>` (no streaming limit exists in 0.19.1: no response-size option in `RequestConfig`), so the cap applies after the download and the SDK has already stored it in its encrypted media cache; the bytes are not handed on. Memory for one download is bounded only by the server.
+  - A command looks at no more than 256 IDs (`bounded_unique`: order kept, repeats removed, the rest ignored and not answered; the app asks again for what it still renders). Every answer is sent from a task, so the command loop never waits on the network or on a full event channel.
+- Behaviour: an ID in flight or already answered gets no second event (the second `FetchAvatars([id])` gives none); a repeat of an ID within one command is dropped too, so each ID gets exactly one answer per session. At most 4 fetches run at once (permit held for the fetch only). The thumbnail is 96x96 with `use_cache = true`; `File` is requested only if the thumbnail request errors. SDK error text is dropped (it can quote server data); image bytes are never logged (`AvatarImage` Debug shows the length).
+- Fixture: `crates/core/tests/fixtures/avatar.png` is a 64x64 8-bit RGB PNG (7858 bytes) generated for this step with a short Python script (zlib and struct only, a plain gradient); it is original, with no third-party content or licence.
+- Integration test (`tests/avatars.rs`, verbatim ignore reason): alice uploads the fixture as a new room's avatar through `Room::upload_avatar`; the core's list shows `avatar: Some(id)`; `FetchAvatars([not-mxc, id, id])` gives one `None` and one `Some(bytes)` (non-empty) within 30 s; a second `FetchAvatars([id])` gives no event within 3 s; then the tempdir is scanned: any file containing the returned bytes or the fixture must be a SQLite file (`.sqlite` in its name).
+- APIs used, confirmed in `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/` (pinned versions):
+  - matrix-sdk 0.19.1: `Client::media` client/mod.rs:928; `Media::get_media_content` media.rs:431 (cache read/write inside, :431-480); `Room::upload_avatar` room/mod.rs:3040 (tests).
+  - matrix-sdk-base 0.19.1 media/mod.rs: `MediaFormat` :46, `MediaThumbnailSettings` :65 with `new(width, height)` :99, `MediaRequestParameters` :130, `MediaSource::Plain` (re-exported by ruma events::room).
+  - ruma-common 0.20.0 identifiers/mxc_uri.rs: `MxcUri::parts` :35, `is_valid` :51; ruma-identifiers-validation `mxc_uri::validate` :7.
+  - tokio 1.53.1: `JoinSet::spawn` task/join_set.rs:142, `join_next` :296, `try_join_next` :323, `abort_all` :463; `Arc<Semaphore>::acquire_owned` sync/semaphore.rs:796.
+  - `uint!` is re-exported through `matrix_sdk::ruma` (compiled). `mime` is not re-exported by the SDK, so the test passes `&"image/png".parse().unwrap()` (inferred as `Mime`) and adds no dependency.
+- The CLI is unchanged (it ignores `Avatar`). Nothing is cached outside the SDK store.
+- Open issues: the 1 MiB cap cannot stop a large download in progress (see above). No new human items.
 
 ## Phase 2 human checkpoint
 - [ ] CI green on Linux, Windows and macOS with the new dependencies (iced `image-without-codecs`, image, open, tokio in the app).
