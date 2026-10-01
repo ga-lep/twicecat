@@ -34,6 +34,8 @@ Phase 0 agent work is done; only the human checkpoint remains.
 - `multiple-versions = "warn"` yields many duplicate warnings from iced's tree; expected.
 - Open issues: none.
 
+- Hardening fixes: `check-app-deps.sh` now captures `cargo tree` output before grepping, so a cargo failure exits non-zero (before: a fake failing cargo gave exit 0; after: 1), and passes `--all-features --target all` so optional and target-specific deps are caught (a temporary `cfg(windows)` optional `matrix-sdk-x` dep was missed before, exit 0, and caught after, exit 1; manifest reverted). ci.yml: top-level `permissions: contents: read`, `persist-credentials: false` on both checkouts, `--locked` on cargo build/clippy/test. Action tags unchanged (SHA pinning left to the human). actionlint and shellcheck clean.
+
 ## Step 5 notes
 - Both CI jobs install the apt packages (libxkbcommon-dev libwayland-dev libx11-dev libdbus-1-dev libssl-dev pkg-config) under `if: runner.os == 'Linux'`, right after checkout and before any cargo step. Before the edit the grep for the package list found 0 matches; after, 2. actionlint 1.7.7 (docker) reports no errors. Full gate passes.
 - Open issues: none.
