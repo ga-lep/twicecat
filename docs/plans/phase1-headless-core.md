@@ -210,12 +210,12 @@ Language: rust
 Files: crates/core/src/sync.rs, crates/core/src/logging.rs, crates/core/src/lib.rs, PROGRESS.md
 Depends on: Task 7
 Acceptance criteria:
-- Supervisor: on `State::Error` or an unexpected `Terminated`, the core emits `SyncState(Reconnecting { attempt })` and calls `sync_service.start()` again after an exponential backoff: 1 s, 2 s, 4 s … capped at 60 s, with ±20% jitter. A `Running` state resets the attempt count.
-  - `Offline` is left to the SDK's offline mode, which polls `/versions` and resumes by itself, and is reported as `SyncState(Offline)`.
+- Supervisor: on `State::Error` or an unexpected `Terminated`, the core emits `SyncState(Reconnecting { attempt })` and calls `sync_service.start()` again after an exponential backoff: 1 s, 2 s, 4 s … capped at 60 s, with ±20% jitter. The attempt count resets only after `Running` has held for 30 s without a failure (`STABLE_RESET`), because the SDK publishes `Running` before any request succeeds.
+  - `Offline` is left to the SDK's offline mode, which polls `/versions` and resumes by itself, and is reported as `SyncState(Offline)`. Offline-cycle throttle: a `Running` that does not reach `STABLE_RESET` before the next `Offline` is an unstable cycle; after 3 consecutive unstable cycles (`OFFLINE_CYCLE_LIMIT`) the supervisor emits `Reconnecting { attempt }`, calls `stop()`, waits the backoff delay (attempt counter shared with the `Error` path), then calls `start()`.
   - The backoff policy is a pure function, unit-tested for the sequence, the cap, the jitter bounds, and the reset.
   - The supervisor loop is unit-tested with a fake state stream (no network).
 - `logging::init(default_filter)` sets up `tracing-subscriber` `fmt` on stderr with `EnvFilter` (`RUST_LOG` overrides the default `warn,tessera_core=info`). Tracing calls in the core never format tokens, passwords, passphrases, or bodies. `grep -nE 'body|token|password|passphrase' crates/core/src` is reviewed, and any hits inside `tracing::` macros are justified in PROGRESS.md.
-- An agent-run reconnection check, recorded in PROGRESS.md with the observed event sequence. It needs the Task 9 CLI, or a temporary test binary if Task 9 isn't done yet; otherwise run it as part of Task 9 and note that here.
+- An agent-run reconnection check, recorded in PROGRESS.md with the observed event sequence. It needs the Task 10 CLI, or a temporary test binary if Task 10 isn't done yet; otherwise run it as part of Task 10 and note that here.
   1. CLI logged in as alice against the local server, with sync running.
   2. `docker compose stop synapse`: the core reports `Offline` or `Reconnecting`.
   3. `docker compose start synapse`: within 90 s the core reports `Running` again, and a message sent afterwards is delivered.
