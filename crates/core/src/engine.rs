@@ -10,7 +10,7 @@ use tracing::{info, warn};
 use zeroize::Zeroizing;
 
 use crate::api::{Command, CoreError, CoreEvent, DeviceId, Password, UserId};
-use crate::client::{ServerSpec, build_client, map_login_error};
+use crate::client::{ServerSpec, build_client, ensure_homeserver_after_login, map_login_error};
 use crate::paths::DataPaths;
 use crate::secrets::{SecretError, SecretStore};
 use crate::session::{
@@ -244,6 +244,10 @@ impl Engine {
             .await
             .map_err(|_| CoreError::Login("login timed out, try again later".into()))?
             .map_err(|e| map_login_error(&e))?;
+
+        // Never talk to a homeserver that fails the policy, not even to log
+        // out: drop the local session only (the caller removes the store dir).
+        ensure_homeserver_after_login(&client)?;
 
         match self.persist_new(&client, session_id, passphrase).await {
             Ok((record, event)) => {

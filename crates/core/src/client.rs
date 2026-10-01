@@ -24,6 +24,13 @@ fn ensure_https(url: &str) -> Result<(), CoreError> {
     }
 }
 
+/// Re-applies the transport policy to the client's current homeserver. Call
+/// after login and before anything is stored or sent, as defence in depth
+/// against the homeserver changing during login.
+pub(crate) fn ensure_homeserver_after_login(client: &Client) -> Result<(), CoreError> {
+    ensure_https(client.homeserver().as_str())
+}
+
 /// Where to find the homeserver.
 pub(crate) enum ServerSpec<'a> {
     /// A server name (discovery via `.well-known`) or a full homeserver URL.
@@ -61,6 +68,9 @@ pub(crate) async fn build_client(
     let client = builder
         .sqlite_store(store_dir, Some(passphrase))
         .handle_refresh_tokens()
+        // A login response's `well_known` must not move the client to another
+        // (possibly cleartext) homeserver after the policy check above.
+        .respect_login_well_known(false)
         .build()
         .await
         .map_err(|e| map_build_error(&e))?;
@@ -103,5 +113,34 @@ pub(crate) fn map_login_error(e: &SdkError) -> CoreError {
             }
             _ => CoreError::Login("login failed".into()),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn client_for(url: &str) -> Client {
+        // `homeserver_url` does no discovery, so this contacts nobody.
+        Client::builder()
+            .homeserver_url(url)
+            .build()
+            .await
+            .expect("client builds without network")
+    }
+
+    #[tokio::test]
+    async fn recheck_rejects_cleartext_non_loopback_homeserver() {
+        let client = client_for("http://evil.example.org").await;
+        let err = ensure_homeserver_after_login(&client).expect_err("must be refused");
+        assert!(matches!(&err, CoreError::Login(m) if m == HTTPS_REQUIRED));
+    }
+
+    #[tokio::test]
+    async fn recheck_accepts_https_and_loopback_http() {
+        for url in ["https://matrix.example.org", "http://127.0.0.1:8008"] {
+            let client = client_for(url).await;
+            ensure_homeserver_after_login(&client).expect("allowed");
+        }
     }
 }
