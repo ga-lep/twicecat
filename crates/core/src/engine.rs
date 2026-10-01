@@ -20,8 +20,9 @@ use crate::api::{
     Command, CoreError, CoreEvent, DeviceId, ListDiff, MessageText, Password, RoomId, UserId,
 };
 use crate::client::{
-    ServerSpec, WRONG_ACCOUNT, build_client, ensure_homeserver_after_login, login_account_matches,
-    map_login_error,
+    ServerSpec, WRONG_ACCOUNT, build_client, discover_homeserver_url,
+    ensure_homeserver_after_login, login_account_matches, map_login_error, same_origin,
+    server_name_bound, server_name_of,
 };
 use crate::paths::DataPaths;
 use crate::room_list::{map_diff, summarize};
@@ -458,15 +459,24 @@ impl Engine {
 
         // A homeserver must not choose which account's record we overwrite:
         // check before anything is persisted. No logout is sent to it either.
-        // A server override or a URL gives no server name to compare.
-        let expected_server = (self.config.homeserver_override.is_none()
-            && !server.contains("://"))
-        .then_some(server);
+        // The returned user ID must name the account asked for, and its server
+        // name must be served by the homeserver we actually talked to. A bare
+        // server name (no `://`) means the client was built by discovery from
+        // exactly that name.
+        let typed_server = (!server.contains("://")).then_some(server);
         let returned = client.user_id().map(ToString::to_string);
-        if !returned
-            .as_deref()
-            .is_some_and(|r| login_account_matches(username, expected_server, r))
-        {
+        let homeserver = client.homeserver();
+        let bound = match returned.as_deref() {
+            Some(r) if login_account_matches(username, r) => match server_name_of(r) {
+                Some(name) => {
+                    server_name_bound(typed_server, &homeserver, name, discover_homeserver_url)
+                        .await
+                }
+                None => false,
+            },
+            _ => false,
+        };
+        if !bound {
             return Err(CoreError::Login(WRONG_ACCOUNT.into()));
         }
 
@@ -484,6 +494,9 @@ impl Engine {
                     event,
                 ))
             }
+            // An existing record of another homeserver is left untouched, and
+            // that server gets no request.
+            Err(e) if matches!(&e, CoreError::Login(m) if m == WRONG_ACCOUNT) => Err(e),
             Err(e) => {
                 // Do not leave a device behind that we cannot restore.
                 if client.logout().await.is_err() {
@@ -510,6 +523,10 @@ impl Engine {
         };
         let user_id = session.meta.user_id.to_string();
         let device_id = session.meta.device_id.to_string();
+        // Never overwrite the record of an account on another homeserver.
+        let old_session = self
+            .existing_record_session(&user_id, &client.homeserver())
+            .await?;
         let record = SessionRecord {
             version: RECORD_VERSION,
             user_id: user_id.clone(),
@@ -524,6 +541,11 @@ impl Engine {
         blocking(move || paths.write_last_account(&account))
             .await?
             .map_err(fs_err)?;
+        // The replaced record's store is now unreachable: do not orphan it.
+        if let Some(old) = old_session.filter(|old| old != session_id) {
+            let paths = self.config.data.clone();
+            let _ = blocking(move || paths.remove_session_store_dir(&old)).await;
+        }
         Ok((
             record,
             CoreEvent::LoggedIn {
@@ -532,6 +554,32 @@ impl Engine {
                 restored: false,
             },
         ))
+    }
+
+    /// Looks for a stored record of `user_id`. `Ok(None)` if there is none (or
+    /// it is unreadable and so unusable anyway); `Ok(Some(session_id))` if it
+    /// is for the same homeserver origin, so the new login may replace it;
+    /// `Err(WRONG_ACCOUNT)` if it is for another homeserver.
+    async fn existing_record_session(
+        &self,
+        user_id: &str,
+        homeserver: &url::Url,
+    ) -> Result<Option<String>, CoreError> {
+        let secrets = self.secrets.clone();
+        let account = user_id.to_owned();
+        let bytes = blocking(move || secrets.get(&account))
+            .await?
+            .map_err(secret_err)?;
+        let Some(bytes) = bytes else {
+            return Ok(None);
+        };
+        let Ok(old) = SessionRecord::from_bytes(&bytes) else {
+            return Ok(None);
+        };
+        match url::Url::parse(&old.homeserver_url) {
+            Ok(old_url) if same_origin(&old_url, homeserver) => Ok(Some(old.session_id)),
+            _ => Err(CoreError::Login(WRONG_ACCOUNT.into())),
+        }
     }
 
     async fn save_record(&self, record: &SessionRecord) -> Result<(), CoreError> {
@@ -719,5 +767,89 @@ impl Engine {
         drop(active);
         self.delete_local(&record).await;
         self.emit(CoreEvent::LoggedOut).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::secrets::InMemorySecretStore;
+
+    fn engine(secrets: Arc<dyn SecretStore>) -> Engine {
+        let (events, _rx) = mpsc::channel(1);
+        Engine {
+            config: CoreConfig {
+                data: DataPaths::at(std::env::temp_dir().join("tessera-unused")),
+                homeserver_override: None,
+                room_list_page_size: DEFAULT_ROOM_LIST_PAGE_SIZE,
+            },
+            secrets,
+            events,
+            active: None,
+        }
+    }
+
+    fn record_bytes(user: &str, homeserver: &str, session_id: &str) -> Vec<u8> {
+        use matrix_sdk::authentication::matrix::MatrixSession;
+        use matrix_sdk::ruma::{OwnedUserId, owned_device_id};
+        use matrix_sdk::{SessionMeta, SessionTokens};
+        let user_id = OwnedUserId::try_from(user).unwrap();
+        SessionRecord {
+            version: RECORD_VERSION,
+            user_id: user.to_owned(),
+            homeserver_url: homeserver.to_owned(),
+            session_id: session_id.to_owned(),
+            store_passphrase: Zeroizing::new("p".to_owned()),
+            auth: SessionAuth::Matrix(MatrixSession {
+                meta: SessionMeta {
+                    user_id,
+                    device_id: owned_device_id!("DEV"),
+                },
+                tokens: SessionTokens {
+                    access_token: "a".to_owned(),
+                    refresh_token: None,
+                },
+            }),
+        }
+        .to_bytes()
+        .unwrap()
+        .to_vec()
+    }
+
+    fn u(s: &str) -> url::Url {
+        url::Url::parse(s).unwrap()
+    }
+
+    #[tokio::test]
+    async fn existing_record_for_another_homeserver_is_refused_and_untouched() {
+        let secrets = Arc::new(InMemorySecretStore::new());
+        let bytes = record_bytes("@alice:matrix.org", "https://matrix.org/", "s1");
+        secrets.set("@alice:matrix.org", &bytes).unwrap();
+        let e = engine(secrets.clone());
+        let err = e
+            .existing_record_session("@alice:matrix.org", &u("https://evil.example"))
+            .await
+            .expect_err("must be refused");
+        assert!(matches!(&err, CoreError::Login(m) if m == WRONG_ACCOUNT));
+        let kept = secrets.get("@alice:matrix.org").unwrap().unwrap();
+        assert_eq!(kept.as_slice(), bytes.as_slice());
+    }
+
+    #[tokio::test]
+    async fn existing_record_for_same_homeserver_may_be_replaced() {
+        let secrets = Arc::new(InMemorySecretStore::new());
+        let bytes = record_bytes("@alice:matrix.org", "https://matrix.org/", "s1");
+        secrets.set("@alice:matrix.org", &bytes).unwrap();
+        let e = engine(secrets);
+        let old = e
+            .existing_record_session("@alice:matrix.org", &u("https://matrix.org:443/"))
+            .await
+            .unwrap();
+        assert_eq!(old.as_deref(), Some("s1"));
+        let none = e
+            .existing_record_session("@bob:matrix.org", &u("https://matrix.org"))
+            .await
+            .unwrap();
+        assert_eq!(none, None);
     }
 }
