@@ -3,6 +3,7 @@
 use std::fmt;
 
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 macro_rules! string_newtype {
     ($(#[$meta:meta])* $name:ident) => {
@@ -50,7 +51,8 @@ string_newtype!(
     DeviceId
 );
 
-/// A password. `Debug` never shows the value.
+/// A password. `Debug` never shows the value, and the memory is zeroized on
+/// drop (each clone separately).
 ///
 /// ```
 /// use tessera_core::api::Password;
@@ -59,7 +61,7 @@ string_newtype!(
 /// assert_eq!(p.expose(), "hunter2");
 /// ```
 #[derive(Clone, PartialEq, Eq)]
-pub struct Password(String);
+pub struct Password(Zeroizing<String>);
 
 impl Password {
     /// Returns the secret. Call only where the password is actually needed.
@@ -70,13 +72,13 @@ impl Password {
 
 impl From<String> for Password {
     fn from(value: String) -> Self {
-        Self(value)
+        Self(Zeroizing::new(value))
     }
 }
 
 impl From<&str> for Password {
     fn from(value: &str) -> Self {
-        Self(value.to_owned())
+        Self(Zeroizing::new(value.to_owned()))
     }
 }
 
@@ -86,7 +88,8 @@ impl fmt::Debug for Password {
     }
 }
 
-/// Text of an outgoing message. `Debug` shows only its byte length.
+/// Text of an outgoing message. `Debug` shows only its byte length, and the
+/// memory is zeroized on drop (each clone separately).
 ///
 /// ```
 /// use tessera_core::api::MessageText;
@@ -95,7 +98,7 @@ impl fmt::Debug for Password {
 /// assert_eq!(t.expose(), "hello");
 /// ```
 #[derive(Clone, PartialEq, Eq)]
-pub struct MessageText(String);
+pub struct MessageText(Zeroizing<String>);
 
 impl MessageText {
     /// Returns the text. Call only where the message is actually sent.
@@ -106,13 +109,13 @@ impl MessageText {
 
 impl From<String> for MessageText {
     fn from(value: String) -> Self {
-        Self(value)
+        Self(Zeroizing::new(value))
     }
 }
 
 impl From<&str> for MessageText {
     fn from(value: &str) -> Self {
-        Self(value.to_owned())
+        Self(Zeroizing::new(value.to_owned()))
     }
 }
 

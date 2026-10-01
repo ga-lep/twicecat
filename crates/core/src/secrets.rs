@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 /// Keychain service name used in production (plan Decision 5).
 pub const KEYCHAIN_SERVICE: &str = "io.github.ga_lep.Tessera";
@@ -27,22 +28,25 @@ pub enum SecretError {
     Poisoned,
 }
 
-/// A place to keep small secrets, keyed by account name.
+/// A place to keep small secrets, keyed by account name. Returned secrets are
+/// zeroized when dropped.
 pub trait SecretStore: Send + Sync {
     /// Returns the secret for `account`, or `None` if there is none.
-    fn get(&self, account: &str) -> Result<Option<Vec<u8>>, SecretError>;
+    fn get(&self, account: &str) -> Result<Option<Zeroizing<Vec<u8>>>, SecretError>;
     /// Stores `secret` for `account`, replacing any previous value.
     fn set(&self, account: &str, secret: &[u8]) -> Result<(), SecretError>;
     /// Removes the secret for `account`. A missing entry is `Ok`.
     fn delete(&self, account: &str) -> Result<(), SecretError>;
 }
 
+type Entries = HashMap<String, Zeroizing<Vec<u8>>>;
+
 /// A [`SecretStore`] that keeps everything in process memory.
 ///
 /// Debug output shows only the number of entries.
 #[derive(Default)]
 pub struct InMemorySecretStore {
-    entries: Mutex<HashMap<String, Vec<u8>>>,
+    entries: Mutex<Entries>,
 }
 
 impl InMemorySecretStore {
@@ -62,18 +66,19 @@ impl std::fmt::Debug for InMemorySecretStore {
 }
 
 impl InMemorySecretStore {
-    fn lock(&self) -> Result<std::sync::MutexGuard<'_, HashMap<String, Vec<u8>>>, SecretError> {
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, Entries>, SecretError> {
         self.entries.lock().map_err(|_| SecretError::Poisoned)
     }
 }
 
 impl SecretStore for InMemorySecretStore {
-    fn get(&self, account: &str) -> Result<Option<Vec<u8>>, SecretError> {
+    fn get(&self, account: &str) -> Result<Option<Zeroizing<Vec<u8>>>, SecretError> {
         Ok(self.lock()?.get(account).cloned())
     }
 
     fn set(&self, account: &str, secret: &[u8]) -> Result<(), SecretError> {
-        self.lock()?.insert(account.to_owned(), secret.to_vec());
+        self.lock()?
+            .insert(account.to_owned(), Zeroizing::new(secret.to_vec()));
         Ok(())
     }
 
@@ -109,9 +114,9 @@ fn backend(e: keyring::Error) -> SecretError {
 }
 
 impl SecretStore for KeyringSecretStore {
-    fn get(&self, account: &str) -> Result<Option<Vec<u8>>, SecretError> {
+    fn get(&self, account: &str) -> Result<Option<Zeroizing<Vec<u8>>>, SecretError> {
         match self.entry(account)?.get_secret() {
-            Ok(secret) => Ok(Some(secret)),
+            Ok(secret) => Ok(Some(Zeroizing::new(secret))),
             Err(keyring::Error::NoEntry) => Ok(None),
             Err(e) => Err(backend(e)),
         }
@@ -138,9 +143,15 @@ mod tests {
         let store = InMemorySecretStore::new();
         assert_eq!(store.get("a").unwrap(), None);
         store.set("a", b"one").unwrap();
-        assert_eq!(store.get("a").unwrap().as_deref(), Some(&b"one"[..]));
+        assert_eq!(
+            store.get("a").unwrap().as_deref().map(Vec::as_slice),
+            Some(&b"one"[..])
+        );
         store.set("a", b"two").unwrap();
-        assert_eq!(store.get("a").unwrap().as_deref(), Some(&b"two"[..]));
+        assert_eq!(
+            store.get("a").unwrap().as_deref().map(Vec::as_slice),
+            Some(&b"two"[..])
+        );
         store.delete("a").unwrap();
         assert_eq!(store.get("a").unwrap(), None);
     }
@@ -157,7 +168,10 @@ mod tests {
         store.set("a", b"1").unwrap();
         store.set("b", b"2").unwrap();
         store.delete("a").unwrap();
-        assert_eq!(store.get("b").unwrap().as_deref(), Some(&b"2"[..]));
+        assert_eq!(
+            store.get("b").unwrap().as_deref().map(Vec::as_slice),
+            Some(&b"2"[..])
+        );
     }
 
     #[test]
@@ -203,7 +217,7 @@ mod tests {
         assert_eq!(store.get(&account).unwrap(), None);
         store.set(&account, b"keyring-test-secret").unwrap();
         assert_eq!(
-            store.get(&account).unwrap().as_deref(),
+            store.get(&account).unwrap().as_deref().map(Vec::as_slice),
             Some(&b"keyring-test-secret"[..])
         );
         store.delete(&account).unwrap();

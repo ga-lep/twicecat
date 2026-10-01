@@ -4,16 +4,15 @@
 //! passphrase). It lives only in the secret store, and its `Debug` output is
 //! redacted. This module is private, so it may name SDK types.
 
-// Task 4 (engine) is the first consumer of this module.
-#![allow(dead_code)]
-
 use std::fmt;
 
 use matrix_sdk::authentication::matrix::MatrixSession;
 use matrix_sdk::authentication::oauth::UserSession;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::api::CoreError;
+use crate::paths::validate_session_id;
 
 /// Current record format version.
 pub(crate) const RECORD_VERSION: u32 = 1;
@@ -56,7 +55,7 @@ pub(crate) struct SessionRecord {
     /// The store directory name under `<data>/sessions/`.
     pub session_id: String,
     /// Passphrase of the encrypted SQLite store.
-    pub store_passphrase: String,
+    pub store_passphrase: Zeroizing<String>,
     /// Tokens.
     pub auth: SessionAuth,
 }
@@ -78,8 +77,9 @@ impl SessionRecord {
     /// Serializes the record, refusing to exceed [`MAX_RECORD_BYTES`].
     ///
     /// Errors carry no record content: serde messages can quote values.
-    pub(crate) fn to_bytes(&self) -> Result<Vec<u8>, CoreError> {
+    pub(crate) fn to_bytes(&self) -> Result<Zeroizing<Vec<u8>>, CoreError> {
         let bytes = serde_json::to_vec(self)
+            .map(Zeroizing::new)
             .map_err(|_| CoreError::Storage("could not serialize session record".into()))?;
         if bytes.len() > MAX_RECORD_BYTES {
             return Err(CoreError::Storage(format!(
@@ -100,25 +100,67 @@ impl SessionRecord {
                 record.version
             )));
         }
+        validate_session_id(&record.session_id)
+            .map_err(|_| CoreError::Storage("stored session record is invalid".into()))?;
+        validate_homeserver_url(&record.homeserver_url)?;
+        let auth_user = match &record.auth {
+            SessionAuth::Matrix(s) => &s.meta.user_id,
+            SessionAuth::OAuth { user, .. } => &user.meta.user_id,
+        };
+        if auth_user.as_str() != record.user_id {
+            return Err(CoreError::Storage(
+                "stored session record is inconsistent".into(),
+            ));
+        }
         Ok(record)
     }
 }
 
-/// Generates a store passphrase: 32 random bytes from the OS-seeded CSPRNG,
-/// hex encoded (64 characters).
-pub(crate) fn generate_store_passphrase() -> String {
+/// Accepts `https` URLs, and `http` only for loopback hosts (the local test
+/// homeserver). Errors carry no part of the URL.
+fn validate_homeserver_url(raw: &str) -> Result<(), CoreError> {
+    let invalid = || CoreError::Storage("stored session record has an invalid homeserver".into());
+    let url = url::Url::parse(raw).map_err(|_| invalid())?;
+    match (url.scheme(), url.host()) {
+        ("https", Some(_)) => Ok(()),
+        ("http", Some(url::Host::Domain(d))) if d.eq_ignore_ascii_case("localhost") => Ok(()),
+        ("http", Some(url::Host::Ipv4(ip))) if ip.is_loopback() => Ok(()),
+        ("http", Some(url::Host::Ipv6(ip))) if ip.is_loopback() => Ok(()),
+        _ => Err(invalid()),
+    }
+}
+
+/// Generates a random store directory name: 16 random bytes, hex encoded
+/// (32 characters, valid per [`validate_session_id`]). Not secret.
+pub(crate) fn generate_session_id() -> String {
     use std::fmt::Write as _;
 
-    let mut bytes = [0u8; 32];
-    // `rand::fill` uses the thread-local ChaCha CSPRNG, seeded from the OS.
+    let mut bytes = [0u8; 16];
     rand::fill(&mut bytes[..]);
     bytes
         .iter()
-        .fold(String::with_capacity(64), |mut out, byte| {
+        .fold(String::with_capacity(32), |mut out, byte| {
             // Writing to a String cannot fail.
             let _ = write!(out, "{byte:02x}");
             out
         })
+}
+
+/// Generates a store passphrase: 32 random bytes from the OS-seeded CSPRNG,
+/// hex encoded (64 characters).
+pub(crate) fn generate_store_passphrase() -> Zeroizing<String> {
+    use std::fmt::Write as _;
+
+    let mut bytes = Zeroizing::new([0u8; 32]);
+    // `rand::fill` uses the thread-local ChaCha CSPRNG, seeded from the OS.
+    rand::fill(&mut bytes[..]);
+    let mut out = Zeroizing::new(String::with_capacity(64));
+    for byte in bytes.iter() {
+        // Writing to a String cannot fail.
+        let _ = write!(out, "{byte:02x}");
+    }
+    // `bytes` is zeroized on drop here.
+    out
 }
 
 #[cfg(test)]
@@ -152,7 +194,7 @@ mod tests {
             user_id: "@alice:example.org".into(),
             homeserver_url: "https://matrix.example.org/".into(),
             session_id: "session-1".into(),
-            store_passphrase: PASS.into(),
+            store_passphrase: PASS.to_owned().into(),
             auth: SessionAuth::Matrix(MatrixSession {
                 meta: meta(),
                 tokens: tokens(ACCESS, Some(REFRESH)),
@@ -192,7 +234,7 @@ mod tests {
         assert_eq!(back.user_id, rec.user_id);
         assert_eq!(back.homeserver_url, rec.homeserver_url);
         assert_eq!(back.session_id, rec.session_id);
-        assert_eq!(back.store_passphrase, PASS);
+        assert_eq!(back.store_passphrase.as_str(), PASS);
         match back.auth {
             SessionAuth::Matrix(s) => {
                 assert_eq!(s.tokens.access_token, ACCESS);
@@ -224,6 +266,60 @@ mod tests {
         rec.version = 2;
         let bytes = serde_json::to_vec(&rec).unwrap();
         assert!(SessionRecord::from_bytes(&bytes).is_err());
+    }
+
+    fn rejected(rec: &SessionRecord) {
+        let bytes = serde_json::to_vec(rec).unwrap();
+        let err = SessionRecord::from_bytes(&bytes).unwrap_err();
+        assert!(matches!(err, CoreError::Storage(_)), "{err:?}");
+        let msg = err.to_string();
+        assert!(!msg.contains(PASS) && !msg.contains(ACCESS), "{msg}");
+    }
+
+    #[test]
+    fn from_bytes_validates_session_id() {
+        for bad in ["", "../x", "a/b", "a\\b", "CON", "x.", "C:x", "a b"] {
+            let mut rec = matrix_record();
+            rec.session_id = bad.into();
+            rejected(&rec);
+        }
+    }
+
+    #[test]
+    fn from_bytes_validates_homeserver_url() {
+        for bad in [
+            "",
+            "not a url",
+            "http://matrix.example.org/",
+            "ftp://localhost/",
+            "file:///etc/passwd",
+            "https://",
+            "http://localhost.evil.example/",
+            "http://10.0.0.1:8008/",
+        ] {
+            let mut rec = matrix_record();
+            rec.homeserver_url = bad.into();
+            rejected(&rec);
+        }
+        for good in [
+            "https://matrix.example.org/",
+            "http://localhost:8008/",
+            "http://127.0.0.1:8008/",
+            "http://[::1]:8008/",
+        ] {
+            let mut rec = matrix_record();
+            rec.homeserver_url = good.into();
+            let bytes = serde_json::to_vec(&rec).unwrap();
+            assert!(SessionRecord::from_bytes(&bytes).is_ok(), "{good}");
+        }
+    }
+
+    #[test]
+    fn from_bytes_requires_matching_user_id() {
+        for mut rec in [matrix_record(), oauth_record()] {
+            rec.user_id = "@mallory:example.org".into();
+            rejected(&rec);
+        }
     }
 
     #[test]
@@ -274,6 +370,14 @@ mod tests {
         let err = rec.to_bytes().unwrap_err();
         assert!(matches!(err, CoreError::Storage(_)), "{err:?}");
         assert!(!err.to_string().contains(&"x".repeat(50)));
+    }
+
+    #[test]
+    fn session_ids_are_valid_and_unique() {
+        let a = generate_session_id();
+        assert_eq!(a.len(), 32);
+        assert!(validate_session_id(&a).is_ok());
+        assert_ne!(a, generate_session_id());
     }
 
     #[test]

@@ -5,6 +5,10 @@
 #![recursion_limit = "256"]
 
 pub mod api;
+mod client;
+mod engine;
 pub mod paths;
 pub mod secrets;
 mod session;
+
+pub use engine::{Core, CoreConfig, CoreHandle};

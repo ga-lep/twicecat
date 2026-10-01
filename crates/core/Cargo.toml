@@ -21,6 +21,7 @@ thiserror = "2"
 url = "2"
 rand = "0.10"
 rpassword = "7"
+zeroize = { version = "1.9", features = ["serde"] }
 
 [dev-dependencies]
 tempfile = "3"
