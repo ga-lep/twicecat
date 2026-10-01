@@ -5,6 +5,7 @@
 - iced =0.14.0
 - Synapse matrixdotorg/synapse:v1.151.0 (docker-compose.yml)
 - Cargo.lock is committed
+- Phase 1 (core): matrix-sdk =0.19.1 (features bundled-sqlite, local-server), matrix-sdk-ui =0.19.1, keyring =4.2.0, directories =6.0.0; caret ranges (locked by Cargo.lock) for tokio, tracing, tracing-subscriber, futures-util, serde, serde_json, thiserror, url, rand, rpassword; dev-dep tempfile
 
 ## Phase 0 steps
 - [x] 2. Cargo workspace with core, app, ptt crates (phase0.2)
@@ -14,6 +15,18 @@
 - [x] 6. License and name check (phase0.6)
 
 Phase 0 agent work is done; the Phase 0 human checkpoint is fully signed off (2026-10-01).
+
+## Phase 1 steps
+- [x] 1. Core dependencies, license policy, data paths (phase1.1; roadmap step 1)
+- [ ] 2. Public command/event API and SDK boundary check (roadmap step 8)
+- [ ] 3. Secret store trait, keychain and in-memory backends
+- [ ] 4. Engine, client builder, password login, persistence, restore (roadmap steps 2, 3a, 4)
+- [ ] 5. Linux CI job for homeserver integration tests
+- [ ] 6. SyncService and room list events (roadmap step 5)
+- [ ] 7. Timeline, select room, send message (roadmap step 6)
+- [ ] 8. Sync supervision, reconnection, tracing (roadmap step 7)
+- [ ] 9. OAuth 2.0 / MAS login (roadmap step 3b)
+- [ ] 10. tessera-cli binary
 
 ## Step 2 notes
 - Checks run: cargo fmt --all --check, cargo clippy --workspace --all-targets --all-features -- -D warnings, cargo test --workspace, cargo build --workspace (all pass).
@@ -50,6 +63,23 @@ Phase 0 agent work is done; the Phase 0 human checkpoint is fully signed off (20
   - Flathub: an unrelated GTK QR-mosaic app called "Tessera" (`fr.ethal.tessera`) has submission PR flathub/flathub#10239 open and awaiting review.
   - Flathub IDs are unique by reverse-DNS, so our ID would be something like `io.github.ga_lep.Tessera`. The shared display name is left to the human to decide. Per the user's decision, we don't rename.
 - Open issues: none.
+
+## Phase 1 / Task 1 notes
+- Checks run (all pass): `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`, `cargo test --workspace --locked` (3 new paths tests), `scripts/check-app-deps.sh` (exit 0), `cargo deny check` (advisories, bans, licenses, sources ok). TDD: the 3 paths tests were first run against `todo!()` stubs and failed, then passed after implementation.
+- `cargo tree -p tessera-core --depth 1`: matrix-sdk v0.19.1, matrix-sdk-ui v0.19.1, keyring v4.2.0, directories v6.0.0, rand v0.10.3, rpassword v7.5.4, tokio v1.53.1, tracing-subscriber v0.3.23, tempfile v3.27.0 (dev). `iced` stays 0.14.0 and wgpu 27.0.1 in Cargo.lock; no existing package version removed.
+- deny.toml: `MPL-2.0` re-added to the allowlist and a `[[licenses.exceptions]]` entry for `webpki-root-certs` with `CDLA-Permissive-2.0`, each with a reason comment (Q2). The iced advisory ignores are unchanged.
+- Reference study (tag `matrix-sdk-0.19.1`, cloned in the session scratchpad, nothing copied into the repo): `labs/multiverse/src/main.rs` (SyncService builder, `entries_with_dynamic_adapters` plus `set_filter(new_filter_non_left())`, per-room timelines), `examples/persist_session/src/main.rs` (`sqlite_store(path, Some(passphrase))`, `restore_session`, session file split), `examples/oauth_cli/src/main.rs` (`LocalServerBuilder::new().spawn()`, `finish_login`, OAuth session restore), `examples/timeline/src/main.rs` (`timeline.subscribe()`), `examples/login/src/main.rs` (password login). Patterns adopted: per-session encrypted sqlite store with a random passphrase kept out of the data dir (keychain instead of the example's plain JSON file), session restore through `restore_session`, dynamic-adapter room list with explicit filter.
+- APIs used: `directories::ProjectDirs::from(&str, &str, &str) -> Option<ProjectDirs>` and `.data_dir()` (directories-6.0.0/src/lib.rs:428, :473 for the platform impl; :220 is the BaseDirs doc variant). No matrix-sdk API is called yet.
+- `paths.rs`: `DataPaths::{from_os, at, root, session_store_dir, last_account_file}`; session ids that are empty, `.`, or contain `..`, `/`, `\` or NUL are rejected with `PathsError::InvalidSessionId`.
+- `lib.rs` starts with `#![recursion_limit = "256"]` plus a comment.
+- Open issues: none. Windows and macOS CI with the new SDK tree is on the human list below.
+
+## Phase 1 human checkpoint
+- [ ] CI green on Linux, Windows, and macOS with the new SDK tree (aws-lc-sys and bundled sqlite builds), and the `integration` job green (Task 5).
+- [ ] Real-keychain test `cargo test -p tessera-core --locked -- --ignored keyring` passes on each OS you use, and no `io.github.ga_lep.Tessera.test` entry is left in the keychain.
+- [ ] CLI against your real account: password login, room list with unread counts, open a room, send and receive, restart restores without a prompt.
+- [ ] OIDC login on matrix.org in a browser; restore after restart; restore still works after more than 10 minutes (token refresh).
+- [ ] Approve the `api` module as the Phase 2 contract.
 
 ## Human checkpoint
 - [x] Push the branch and confirm CI is green on Linux, Windows, and macOS (confirmed by human 2026-10-01).
