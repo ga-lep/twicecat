@@ -43,6 +43,34 @@ impl fmt::Debug for SessionAuth {
     }
 }
 
+impl SessionAuth {
+    /// The SDK session to hand to `Client::restore_session`.
+    pub(crate) fn to_auth_session(&self) -> matrix_sdk::AuthSession {
+        match self {
+            Self::Matrix(session) => matrix_sdk::AuthSession::Matrix(session.clone()),
+            Self::OAuth { client_id, user } => matrix_sdk::AuthSession::OAuth(Box::new(
+                matrix_sdk::authentication::oauth::OAuthSession {
+                    client_id: matrix_sdk::authentication::oauth::ClientId::new(client_id.clone()),
+                    user: user.clone(),
+                },
+            )),
+        }
+    }
+
+    /// The record form of a live client session; `None` for a future session
+    /// kind this code does not know.
+    pub(crate) fn from_auth_session(session: matrix_sdk::AuthSession) -> Option<Self> {
+        match session {
+            matrix_sdk::AuthSession::Matrix(s) => Some(Self::Matrix(s)),
+            matrix_sdk::AuthSession::OAuth(s) => Some(Self::OAuth {
+                client_id: s.client_id.as_str().to_owned(),
+                user: s.user,
+            }),
+            _ => None,
+        }
+    }
+}
+
 /// A restorable session, stored as JSON in the secret store.
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct SessionRecord {
@@ -282,6 +310,26 @@ mod tests {
             }
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn oauth_record_is_selected_for_the_oauth_restore_path() {
+        use matrix_sdk::AuthSession;
+        let rec = oauth_record();
+        let SessionAuth::OAuth { client_id, .. } = &rec.auth else {
+            panic!("not an oauth record")
+        };
+        match rec.auth.to_auth_session() {
+            AuthSession::OAuth(s) => {
+                assert_eq!(s.client_id.as_str(), client_id);
+                assert_eq!(s.user.meta.user_id.as_str(), rec.user_id);
+            }
+            _ => panic!("wrong restore path"),
+        }
+        assert!(matches!(
+            matrix_record().auth.to_auth_session(),
+            AuthSession::Matrix(_)
+        ));
     }
 
     #[test]

@@ -11,7 +11,7 @@ use matrix_sdk_ui::eyeball_im::{Vector, VectorDiff};
 use matrix_sdk_ui::room_list_service::filters::new_filter_non_left;
 use matrix_sdk_ui::sync_service::SyncService;
 use matrix_sdk_ui::timeline::{RoomExt as _, Timeline, TimelineItem as SdkTimelineItem};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 use zeroize::Zeroizing;
@@ -24,6 +24,7 @@ use crate::client::{
     ensure_homeserver_after_login, login_account_matches, map_login_error, same_origin,
     server_name_bound, server_name_of,
 };
+use crate::oauth::authorize;
 use crate::paths::DataPaths;
 use crate::room_list::{map_diff, summarize};
 use crate::secrets::{SecretError, SecretStore};
@@ -76,6 +77,7 @@ impl Core {
             secrets,
             events: ev_tx,
             active: None,
+            oauth: None,
         };
         tokio::spawn(engine.run(cmd_rx));
         CoreHandle {
@@ -260,6 +262,32 @@ struct Engine {
     secrets: Arc<dyn SecretStore>,
     events: mpsc::Sender<CoreEvent>,
     active: Option<Active>,
+    /// An OAuth login waiting for the browser.
+    oauth: Option<PendingOAuth>,
+}
+
+/// An OAuth login in progress. Its task builds the client, emits `OAuthUrl`,
+/// waits for the redirect, and returns the logged-in client; the engine then
+/// checks and persists the session (see [`Engine::on_oauth_done`]).
+struct PendingOAuth {
+    /// Fires the cancellation; taken by `CancelOAuth`.
+    cancel: Option<oneshot::Sender<()>>,
+    task: JoinHandle<Result<Client, CoreError>>,
+    /// What the user asked for; a bare name binds the returned account.
+    server: String,
+    session_id: String,
+    passphrase: Zeroizing<String>,
+}
+
+/// Waits for the pending OAuth task, or forever when there is none. Safe to
+/// drop and call again: awaiting a `JoinHandle` by reference loses nothing.
+async fn next_oauth(
+    pending: &mut Option<PendingOAuth>,
+) -> Result<Result<Client, CoreError>, tokio::task::JoinError> {
+    match pending {
+        Some(p) => (&mut p.task).await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Runs blocking work (keychain, file system) off the async threads.
@@ -311,6 +339,7 @@ impl Engine {
                         watch_changes = true;
                     }
                 },
+                joined = next_oauth(&mut self.oauth) => self.on_oauth_done(joined).await,
                 change = next_change(&mut self.active), if watch_changes => match change {
                     Change::Got(c) => self.on_change(Some(c)).await,
                     Change::Missed => self.on_change(None).await,
@@ -318,6 +347,7 @@ impl Engine {
                 },
             }
         }
+        self.cancel_oauth_and_wait().await;
         // Stop sync and drop the client before the events sender so that, once
         // the channel closes, the store is already released.
         if let Some(mut active) = self.active.take() {
@@ -338,8 +368,7 @@ impl Engine {
                 password,
                 server,
             } => {
-                if self.active.is_some() {
-                    let e = CoreError::Login("already logged in".into());
+                if let Some(e) = self.login_busy() {
                     self.emit(CoreEvent::LoginFailed(e)).await;
                     return;
                 }
@@ -352,11 +381,13 @@ impl Engine {
                 }
             }
             Command::Logout => self.logout().await,
-            Command::LoginOAuth { .. } => {
-                let e = CoreError::Internal("OAuth login is not implemented yet".into());
-                self.emit(CoreEvent::LoginFailed(e)).await;
+            Command::LoginOAuth { server } => self.login_oauth(server).await,
+            // The task ends with `Cancelled`, which `on_oauth_done` reports.
+            Command::CancelOAuth => {
+                if let Some(cancel) = self.oauth.as_mut().and_then(|p| p.cancel.take()) {
+                    let _ = cancel.send(());
+                }
             }
-            Command::CancelOAuth => {}
             Command::SelectRoom(room_id) => {
                 if let Err(e) = self.select_room(room_id).await {
                     self.emit(CoreEvent::Error(e)).await;
@@ -366,6 +397,114 @@ impl Engine {
             // Handled in `run`.
             Command::Shutdown => {}
         }
+    }
+
+    /// Why a new login cannot start now, if so.
+    fn login_busy(&self) -> Option<CoreError> {
+        if self.active.is_some() {
+            Some(CoreError::Login("already logged in".into()))
+        } else if self.oauth.is_some() {
+            Some(CoreError::Login("a login is already in progress".into()))
+        } else {
+            None
+        }
+    }
+
+    /// Starts an OAuth login; the outcome arrives through `on_oauth_done`.
+    async fn login_oauth(&mut self, server: String) {
+        if let Some(e) = self.login_busy() {
+            self.emit(CoreEvent::LoginFailed(e)).await;
+            return;
+        }
+        let server = self.config.homeserver_override.clone().unwrap_or(server);
+        let session_id = generate_session_id();
+        let passphrase = generate_store_passphrase();
+        let paths = self.config.data.clone();
+        let sid = session_id.clone();
+        let dir = match blocking(move || paths.create_session_store_dir(&sid)).await {
+            Ok(Ok(dir)) => dir,
+            Ok(Err(e)) => {
+                self.emit(CoreEvent::LoginFailed(fs_err(e))).await;
+                return;
+            }
+            Err(e) => {
+                self.emit(CoreEvent::LoginFailed(e)).await;
+                return;
+            }
+        };
+        let (cancel, cancelled) = oneshot::channel();
+        let events = self.events.clone();
+        let task_server = server.clone();
+        let task_passphrase = passphrase.clone();
+        let task = tokio::spawn(async move {
+            let client =
+                build_client(&dir, &task_passphrase, ServerSpec::NameOrUrl(&task_server)).await?;
+            authorize(&client, &events, cancelled).await?;
+            Ok(client)
+        });
+        self.oauth = Some(PendingOAuth {
+            cancel: Some(cancel),
+            task,
+            server,
+            session_id,
+            passphrase,
+        });
+    }
+
+    /// Finishes an OAuth login: the same account binding and persistence as a
+    /// password login, then sync. On any failure the store directory goes.
+    async fn on_oauth_done(
+        &mut self,
+        joined: Result<Result<Client, CoreError>, tokio::task::JoinError>,
+    ) {
+        let Some(pending) = self.oauth.take() else {
+            return;
+        };
+        let result =
+            joined.unwrap_or_else(|_| Err(CoreError::Internal("background task failed".into())));
+        let outcome = match result {
+            Ok(client) => {
+                self.adopt_login(
+                    client,
+                    None,
+                    &pending.server,
+                    &pending.session_id,
+                    pending.passphrase.clone(),
+                )
+                .await
+            }
+            Err(e) => Err(e),
+        };
+        match outcome {
+            Ok((active, event)) => {
+                self.active = Some(active);
+                self.emit(event).await;
+                self.start_sync().await;
+            }
+            Err(e) => {
+                // The client is already dropped, so the store is released.
+                let paths = self.config.data.clone();
+                let sid = pending.session_id;
+                let _ = blocking(move || paths.remove_session_store_dir(&sid)).await;
+                self.emit(CoreEvent::LoginFailed(e)).await;
+            }
+        }
+    }
+
+    /// On shutdown: cancels a pending OAuth login, waits for its task to
+    /// release the client, and removes its store directory.
+    async fn cancel_oauth_and_wait(&mut self) {
+        let Some(mut pending) = self.oauth.take() else {
+            return;
+        };
+        if let Some(cancel) = pending.cancel.take() {
+            let _ = cancel.send(());
+        }
+        // The task drops the client when it ends.
+        let _ = pending.task.await;
+        let paths = self.config.data.clone();
+        let sid = pending.session_id;
+        let _ = blocking(move || paths.remove_session_store_dir(&sid)).await;
     }
 
     /// Opens the timeline of `room_id`, replacing any previous selection.
@@ -481,7 +620,21 @@ impl Engine {
             .await
             .map_err(|_| CoreError::Login("login timed out, try again later".into()))?
             .map_err(|e| map_login_error(&e))?;
+        self.adopt_login(client, Some(username), server, session_id, passphrase)
+            .await
+    }
 
+    /// Checks a freshly logged-in client (password or OAuth) and persists its
+    /// session. `username` is what the user typed for a password login; OAuth
+    /// has none.
+    async fn adopt_login(
+        &self,
+        client: Client,
+        username: Option<&str>,
+        server: &str,
+        session_id: &str,
+        passphrase: Zeroizing<String>,
+    ) -> Result<(Active, CoreEvent), CoreError> {
         // Never talk to a homeserver that fails the policy, not even to log
         // out: drop the local session only (the caller removes the store dir).
         ensure_homeserver_after_login(&client)?;
@@ -496,13 +649,15 @@ impl Engine {
         let returned = client.user_id().map(ToString::to_string);
         let homeserver = client.homeserver();
         let bound = match returned.as_deref() {
-            Some(r) if login_account_matches(username, r) => match server_name_of(r) {
-                Some(name) => {
-                    server_name_bound(typed_server, &homeserver, name, discover_homeserver_url)
-                        .await
+            Some(r) if username.is_none_or(|u| login_account_matches(u, r)) => {
+                match server_name_of(r) {
+                    Some(name) => {
+                        server_name_bound(typed_server, &homeserver, name, discover_homeserver_url)
+                            .await
+                    }
+                    None => false,
                 }
-                None => false,
-            },
+            }
             _ => false,
         };
         if !bound {
@@ -547,11 +702,10 @@ impl Engine {
         passphrase: Zeroizing<String>,
     ) -> Result<(SessionRecord, CoreEvent), CoreError> {
         let internal = || CoreError::Internal("the login produced no session".into());
-        let Some(matrix_sdk::AuthSession::Matrix(session)) = client.session() else {
-            return Err(internal());
-        };
-        let user_id = session.meta.user_id.to_string();
-        let device_id = session.meta.device_id.to_string();
+        let session = client.session().ok_or_else(internal)?;
+        let user_id = session.meta().user_id.to_string();
+        let device_id = session.meta().device_id.to_string();
+        let auth = SessionAuth::from_auth_session(session).ok_or_else(internal)?;
         // Never overwrite the record of an account on another homeserver.
         let old_session = self
             .existing_record_session(&user_id, &client.homeserver())
@@ -562,7 +716,7 @@ impl Engine {
             homeserver_url: client.homeserver().to_string(),
             session_id: session_id.to_owned(),
             store_passphrase: passphrase,
-            auth: SessionAuth::Matrix(session),
+            auth,
         };
         self.save_record(&record).await?;
         let paths = self.config.data.clone();
@@ -621,7 +775,7 @@ impl Engine {
     }
 
     async fn restore(&mut self) {
-        if self.active.is_some() {
+        if self.active.is_some() || self.oauth.is_some() {
             let e = CoreError::Internal("a session is already active".into());
             self.emit(CoreEvent::Error(e)).await;
             return;
@@ -667,11 +821,9 @@ impl Engine {
         if !dir.is_dir() {
             return Err(CoreError::Storage("the session store is missing".into()));
         }
-        let SessionAuth::Matrix(session) = record.auth.clone() else {
-            return Err(CoreError::Internal(
-                "OAuth sessions are not supported yet".into(),
-            ));
-        };
+        let session = record.auth.to_auth_session();
+        let user_id = session.meta().user_id.to_string();
+        let device_id = session.meta().device_id.to_string();
         let client = build_client(
             &dir,
             &record.store_passphrase,
@@ -679,13 +831,13 @@ impl Engine {
         )
         .await?;
         client
-            .restore_session(session.clone())
+            .restore_session(session)
             .await
             .map_err(|_| CoreError::Storage("could not restore the session".into()))?;
         info!("session restored");
         let event = CoreEvent::LoggedIn {
-            user_id: UserId::from(session.meta.user_id.to_string()),
-            device_id: DeviceId::from(session.meta.device_id.to_string()),
+            user_id: UserId::from(user_id),
+            device_id: DeviceId::from(device_id),
             restored: true,
         };
         let changes = client.subscribe_to_session_changes();
@@ -760,11 +912,15 @@ impl Engine {
         let Some(active) = self.active.as_mut() else {
             return;
         };
-        // OAuth sessions are persisted by Task 9.
-        if let Some(matrix_sdk::AuthSession::Matrix(session)) = active.client.session() {
-            active.record.auth = SessionAuth::Matrix(session);
-        } else {
-            return;
+        // Refreshed tokens (Matrix or OAuth) must reach the keychain, or the
+        // next start restores a revoked refresh token.
+        match active
+            .client
+            .session()
+            .and_then(SessionAuth::from_auth_session)
+        {
+            Some(auth) => active.record.auth = auth,
+            None => return,
         }
         let record = active.record.clone();
         if let Err(e) = self.save_record(&record).await {
@@ -823,6 +979,7 @@ mod tests {
             secrets,
             events,
             active: None,
+            oauth: None,
         }
     }
 

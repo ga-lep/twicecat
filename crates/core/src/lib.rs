@@ -8,6 +8,7 @@ pub mod api;
 mod client;
 mod engine;
 pub mod logging;
+mod oauth;
 pub mod paths;
 mod room_list;
 pub mod secrets;

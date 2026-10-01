@@ -26,7 +26,7 @@ Phase 0 agent work is done; the Phase 0 human checkpoint is fully signed off (20
 - [x] 6. SyncService and room list events (roadmap step 5)
 - [x] 7. Timeline, select room, send message (roadmap step 6)
 - [x] 8. Sync supervision, reconnection, tracing (roadmap step 7; the agent-run reconnection check is deferred to Task 10)
-- [ ] 9. OAuth 2.0 / MAS login (roadmap step 3b)
+- [x] 9. OAuth 2.0 / MAS login (roadmap step 3b; the browser flow itself is on the human list)
 - [ ] 10. tessera-cli binary
 
 ## Step 2 notes
@@ -174,12 +174,23 @@ Phase 0 agent work is done; the Phase 0 human checkpoint is fully signed off (20
 - Security Low (Task 5): the CI `integration` job has `timeout-minutes: 20`; actionlint clean.
 - Checks: full gate and the ignored run (see commit) pass.
 
+## Phase 1 / Task 9 notes
+- Checks run (all pass): `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`, `cargo test --workspace --locked` (89 core unit tests; 10 homeserver tests reported as ignored), `scripts/check-app-deps.sh`, `scripts/check-core-api.sh`, `cargo deny check`; ignored run `cargo test -p tessera-core --locked -- --ignored --skip keyring` 10/10 (incl. the new `tests/oauth.rs`), then `docker compose stop`.
+- TDD: the unit tests (client metadata JSON, auth-URL policy, error mapping, 127.0.0.1 listener, OAuth record restore path) were seen failing to compile before the code existed; the integration test was seen failing (`Internal("OAuth login is not implemented yet")` instead of `OAuthNotSupported`) before the engine change.
+- Design: `crates/core/src/oauth.rs` (metadata, `check_auth_url`, `map_oauth_error`, `spawn_redirect_listener`, `authorize`). `LoginOAuth` runs in a spawned task (build client, `authorize`) so that `CancelOAuth` and `Shutdown` stay responsive; the engine loop awaits the task (`next_oauth`) and `on_oauth_done` then runs the same `adopt_login` as a password login (https/loopback recheck, returned account bound to the server asked for, no cross-origin record overwrite, persist, sync). `persist_new`, restore, and `rewrite_record` now handle both session kinds through `SessionAuth::{to_auth_session, from_auth_session}`, so refreshed OAuth tokens are written back to the keychain. `CancelOAuth` aborts the pending authorization (`abort_login`), the task ends with `Cancelled`, `LoginFailed(Cancelled)` is emitted, and the store directory is removed. Unrequested additions: a 10 minute limit on the browser step, and refusing a second login while one is pending.
+- Security carry-overs applied: the redirect listener binds `127.0.0.1` only (`LocalServerIpAddress::Localhostv4`); the auth URL must be `https` (or loopback `http`) without userinfo before `OAuthUrl` is emitted; SDK OAuth error text is never forwarded (fixed messages).
+- APIs used (matrix-sdk-0.19.1, `src/`): `authentication/oauth/mod.rs` `OAuth::login` :923, `finish_login` :958, `abort_login` :1095, `full_session` :596, `restore_session` (via `Client::restore_session`, `AuthSession::OAuth(Box<OAuthSession>)` `authentication/mod.rs:198`), `Client::session`/`logout` `client/mod.rs:889`/`:1652` (both dispatch on OAuth); `auth_code_builder.rs` `OAuthAuthCodeUrlBuilder::build`; `registration.rs` `ClientMetadata::new`, `Localized::new`, `OAuthGrantType::AuthorizationCode`, `ApplicationType::Native`; `error.rs` `OAuthError`, `OAuthDiscoveryError::NotSupported`, `OAuthClientRegistrationError::NotSupported`; `utils/local_server.rs` `LocalServerBuilder::{ip_address, spawn}` :91/:135, `LocalServerIpAddress::Localhostv4` :303; `utils/mod.rs:276` `From<QueryString> for UrlOrQuery`. Registry path: `~/.cargo/registry/src/*/matrix-sdk-0.19.1/`. I did not read the repo's `examples/oauth_cli` (not in the tarball).
+- Open issues: the SDK validates the authorization server's metadata URLs itself (`validate_urls`), but Tessera does not re-check them beyond the auth URL. A cancel during client build or registration waits for that network call to finish (the build step is not cancellable). A stray local GET to the redirect port makes that login fail (state check), by design of the SDK listener (one request). Local MAS does not exist, so the real flow and token refresh are unverified.
+- New human items (also in the Phase 1 checklist): OIDC login on matrix.org through the CLI; the session survives a CLI restart; CLI kept running over 10 minutes so MAS refreshes the access token, then restart and confirm restore works.
+
 ## Phase 1 human checkpoint
 - [ ] Push the branch and confirm the new `integration` job is green (Task 5).
 - [ ] CI green on Linux, Windows, and macOS with the new SDK tree (aws-lc-sys and bundled sqlite builds), and the `integration` job green (Task 5).
 - [ ] Real-keychain test `cargo test -p tessera-core --locked -- --ignored keyring` passes on each OS you use, and no `io.github.ga_lep.Tessera.test` entry is left in the keychain.
 - [ ] CLI against your real account: password login, room list with unread counts, open a room, send and receive, restart restores without a prompt.
-- [ ] OIDC login on matrix.org in a browser; restore after restart; restore still works after more than 10 minutes (token refresh).
+- [ ] OIDC login on matrix.org in a browser via the CLI (Task 9 code is done; unverifiable locally).
+- [ ] The OIDC session survives a CLI restart.
+- [ ] Keep the CLI running for over 10 minutes so MAS refreshes the access token, then restart and confirm restore still works (refresh persistence cannot be verified locally).
 - [ ] Approve the `api` module as the Phase 2 contract.
 
 ## Human checkpoint
