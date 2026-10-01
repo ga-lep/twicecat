@@ -202,6 +202,12 @@ Phase 0 agent work is done; the Phase 0 human checkpoint is fully signed off (20
   - `/rooms` prints every room; no paging.
 - New human items: see the Phase 1 checklist below (CLI real-account run, restart without prompt, keychain viewer entry `io.github.ga_lep.Tessera` and no token in the data dir).
 
+## Phase 1 / Task 10 review follow-up
+- Password prompt race fixed: one reader thread owns the terminal and serves one request at a time (`Request::Line` or `Request::Password`), driven by a `Gate`; a password read is only started when no line read is outstanding, and a password input can never be routed to the REPL (unit tests: `password_is_read_apart_from_repl_lines`, `gate_never_routes_a_password_to_the_repl`, `gate_allows_one_reader_at_a_time`). Real-terminal behaviour is unverified (human list).
+- `sanitize` also maps U+200B-U+200F, U+202A-U+202E, U+2066-U+2069, U+FEFF to `?` (unit-tested).
+- Ctrl-C: `tokio::signal::ctrl_c` runs alongside the REPL (tokio `signal` feature added to `crates/core/Cargo.toml`, human-approved, no version change) and takes the normal Shutdown and temp-dir cleanup path. With `--ephemeral` the CLI sends `Logout` and waits (10 s) before `Shutdown` so the server session is revoked; documented in the help text. A SIGINT during a login in flight relies on the engine's Shutdown cancel path.
+- `--password-stdin` with a terminal on stdin prints a warning to stderr (echo); documented in the help text.
+
 ## Phase 1 human checkpoint
 - [ ] Push the branch and confirm the new `integration` job is green (Task 5).
 - [ ] CI green on Linux, Windows, and macOS with the new SDK tree (aws-lc-sys and bundled sqlite builds), and the `integration` job green (Task 5).
@@ -212,6 +218,7 @@ Phase 0 agent work is done; the Phase 0 human checkpoint is fully signed off (20
 - [ ] OIDC login on matrix.org in a browser via the CLI (Task 9 code is done; unverifiable locally).
 - [ ] The OIDC session survives a CLI restart.
 - [ ] Keep the CLI running for over 10 minutes so MAS refreshes the access token, then restart and confirm restore still works (refresh persistence cannot be verified locally).
+- [ ] CLI in a real terminal: `/login` then the password prompt does not echo, and the password never appears as a REPL line, "Unknown command", or a sent message, even if typed ahead; Ctrl-C at the REPL and at the password prompt exits cleanly and leaves the terminal usable (echo restored); `--ephemeral` then Ctrl-C leaves no `/tmp/tessera-cli-*` dir and the device is gone from the account's session list; `--password-stdin` on a terminal prints the echo warning.
 - [ ] Approve the `api` module as the Phase 2 contract.
 
 ## Human checkpoint

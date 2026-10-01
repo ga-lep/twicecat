@@ -5,6 +5,7 @@
 //! nothing here sends a token, password, or message body to the log.
 
 use std::collections::HashSet;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -20,7 +21,6 @@ use tessera_core::secrets::{
     InMemorySecretStore, KEYCHAIN_SERVICE, KeyringSecretStore, SecretStore,
 };
 use tessera_core::{Core, CoreConfig, CoreHandle, DEFAULT_ROOM_LIST_PAGE_SIZE};
-use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
 
 const HELP: &str = "\
@@ -35,9 +35,13 @@ OPTIONS:
     --homeserver <url>    Use this homeserver (URL or server name) instead of
                           discovering it from the user ID
     --ephemeral           Keep the secret store in memory and use a temporary
-                          data directory that is deleted on exit
+                          data directory that is deleted on exit. On exit
+                          (/quit, end of input, or Ctrl-C) the session is
+                          logged out on the server first.
     --password-stdin      Read the password from the next stdin line instead of
-                          prompting on the terminal
+                          prompting on the terminal. If stdin is a terminal the
+                          password is echoed; the CLI warns about that. Use it
+                          only with piped input.
     --help                Show this help
 
 COMMANDS (type them at the prompt):
@@ -65,6 +69,9 @@ const REPL_HINT: &str =
 
 /// How long to wait for the engine to finish after `Shutdown`.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(20);
+
+/// How long to wait for the server logout of an ephemeral session on exit.
+const LOGOUT_WAIT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, PartialEq, Eq)]
 struct Options {
@@ -165,12 +172,134 @@ fn status_line(state: &SyncState) -> String {
     }
 }
 
-/// Replaces control characters so server-controlled text cannot drive the
-/// terminal with escape sequences.
+/// Bidirectional and invisible formatting characters that can disguise text.
+fn is_spoofing_format_char(c: char) -> bool {
+    matches!(c,
+        '\u{200B}'..='\u{200F}'
+        | '\u{202A}'..='\u{202E}'
+        | '\u{2066}'..='\u{2069}'
+        | '\u{FEFF}')
+}
+
+/// Replaces control and bidi/invisible formatting characters so
+/// server-controlled text cannot drive the terminal with escape sequences or
+/// reorder and hide what is shown.
 fn sanitize(text: &str) -> String {
     text.chars()
-        .map(|c| if c.is_control() { '?' } else { c })
+        .map(|c| {
+            if c.is_control() || is_spoofing_format_char(c) {
+                '?'
+            } else {
+                c
+            }
+        })
         .collect()
+}
+
+/// What the terminal reader thread is asked to read next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Request {
+    /// One REPL line (also the password line with `--password-stdin`).
+    Line,
+    /// One password with echo off.
+    Password,
+}
+
+/// What the terminal reader thread produced.
+#[derive(Debug, PartialEq, Eq)]
+enum Input {
+    Line(String),
+    Password(Option<String>),
+}
+
+/// The terminal, as the single reader thread sees it.
+trait Source {
+    fn read_line(&mut self) -> Option<String>;
+    fn read_password(&mut self) -> Option<String>;
+}
+
+struct TerminalSource;
+
+impl Source for TerminalSource {
+    fn read_line(&mut self) -> Option<String> {
+        let mut line = String::new();
+        match std::io::stdin().read_line(&mut line) {
+            Ok(0) | Err(_) => None,
+            Ok(_) => Some(line),
+        }
+    }
+
+    fn read_password(&mut self) -> Option<String> {
+        rpassword::prompt_password("Password: ").ok()
+    }
+}
+
+/// The only code that reads the terminal. It serves one request at a time, so
+/// a password read and a line read can never overlap and a password line can
+/// never be returned as a REPL line. Ends on EOF or when the receiver is gone.
+fn reader_loop(
+    requests: std::sync::mpsc::Receiver<Request>,
+    out: mpsc::Sender<Input>,
+    mut source: impl Source,
+) {
+    while let Ok(request) = requests.recv() {
+        let input = match request {
+            Request::Line => match source.read_line() {
+                Some(line) => Input::Line(line),
+                None => return,
+            },
+            Request::Password => Input::Password(source.read_password()),
+        };
+        if out.blocking_send(input).is_err() {
+            return;
+        }
+    }
+}
+
+/// Decides when a line read may be outstanding, so the terminal has exactly
+/// one reader at a time.
+#[derive(Debug, Default)]
+struct Gate {
+    line_outstanding: bool,
+    password_pending: bool,
+}
+
+impl Gate {
+    /// A line request to issue now, if any. At most one is ever outstanding,
+    /// and none while a password is being read.
+    fn line_request(&mut self, reading: bool) -> Option<Request> {
+        if reading && !self.line_outstanding && !self.password_pending {
+            self.line_outstanding = true;
+            Some(Request::Line)
+        } else {
+            None
+        }
+    }
+
+    /// Routes reader output headed for the REPL: only lines get through.
+    fn repl_line(&mut self, input: Input) -> Option<String> {
+        match input {
+            Input::Line(line) => {
+                self.line_outstanding = false;
+                Some(line)
+            }
+            Input::Password(_) => None,
+        }
+    }
+
+    /// Takes the terminal for a password. `false` if a line read is still
+    /// outstanding (the reader would race for the same input).
+    fn begin_password(&mut self) -> bool {
+        if self.line_outstanding {
+            return false;
+        }
+        self.password_pending = true;
+        true
+    }
+
+    fn end_password(&mut self) {
+        self.password_pending = false;
+    }
 }
 
 fn format_message(room: &str, sender: &str, body: &str) -> String {
@@ -201,8 +330,11 @@ struct Selected {
 
 struct Cli {
     core: CoreHandle,
-    lines: mpsc::Receiver<String>,
+    requests: std::sync::mpsc::Sender<Request>,
+    inputs: mpsc::Receiver<Input>,
+    gate: Gate,
     password_stdin: bool,
+    logged_in: bool,
     mode: Mode,
     rooms: Vec<RoomSummary>,
     selected: Option<Selected>,
@@ -230,14 +362,22 @@ impl Cli {
         self.mode = Mode::Busy;
         loop {
             let reading = self.mode != Mode::Busy;
+            if let Some(request) = self.gate.line_request(reading)
+                && self.requests.send(request).is_err()
+            {
+                return;
+            }
+            let waiting = self.gate.line_outstanding;
             tokio::select! {
                 event = self.core.events.recv() => match event {
                     Some(event) => self.on_event(event),
                     None => return,
                 },
-                line = self.lines.recv(), if reading => match line {
-                    Some(line) => {
-                        if matches!(self.on_line(&line).await, Flow::Quit) {
+                input = self.inputs.recv(), if waiting => match input {
+                    Some(input) => {
+                        if let Some(line) = self.gate.repl_line(input)
+                            && matches!(self.on_line(&line).await, Flow::Quit)
+                        {
                             return;
                         }
                     }
@@ -253,12 +393,43 @@ impl Cli {
     }
 
     async fn read_password(&mut self) -> Option<Password> {
-        if self.password_stdin {
-            return self.lines.recv().await.map(Password::from);
+        if !self.gate.begin_password() {
+            return None;
         }
-        match tokio::task::spawn_blocking(|| rpassword::prompt_password("Password: ")).await {
-            Ok(Ok(password)) => Some(Password::from(password)),
-            _ => None,
+        let request = if self.password_stdin {
+            Request::Line
+        } else {
+            Request::Password
+        };
+        let password = if self.requests.send(request).is_ok() {
+            match self.inputs.recv().await {
+                Some(Input::Line(line)) if self.password_stdin => {
+                    Some(line.trim_end_matches(['\r', '\n']).to_owned())
+                }
+                Some(Input::Password(password)) if !self.password_stdin => password,
+                _ => None,
+            }
+        } else {
+            None
+        };
+        self.gate.end_password();
+        password.map(Password::from)
+    }
+
+    /// Logs out on the server and waits (bounded) for the engine's answer.
+    async fn logout_and_wait(&mut self) {
+        if !self.logged_in || self.core.commands.send(Command::Logout).await.is_err() {
+            return;
+        }
+        let wait = async {
+            while let Some(event) = self.core.events.recv().await {
+                if matches!(event, CoreEvent::LoggedOut | CoreEvent::Error(_)) {
+                    return;
+                }
+            }
+        };
+        if tokio::time::timeout(LOGOUT_WAIT, wait).await.is_err() {
+            eprintln!("tessera-cli: server logout did not finish within {LOGOUT_WAIT:?}");
         }
     }
 
@@ -374,6 +545,7 @@ impl Cli {
             } => {
                 let how = if restored { " (restored)" } else { "" };
                 println!("Logged in as {}{how}", sanitize(user_id.as_str()));
+                self.logged_in = true;
                 self.mode = Mode::Idle;
             }
             CoreEvent::LoginFailed(error) => {
@@ -385,6 +557,7 @@ impl Cli {
             }
             CoreEvent::LoggedOut => {
                 println!("Logged out. Use /login to log in again.");
+                self.logged_in = false;
                 self.rooms.clear();
                 self.selected = None;
                 self.timeline.clear();
@@ -393,6 +566,7 @@ impl Cli {
             }
             CoreEvent::SessionExpired => {
                 println!("Session expired. Use /login to log in again.");
+                self.logged_in = false;
                 self.rooms.clear();
                 self.selected = None;
                 self.mode = Mode::Idle;
@@ -493,28 +667,41 @@ async fn main() -> ExitCode {
         secrets,
     );
 
-    let (line_tx, lines) = mpsc::channel(64);
-    tokio::spawn(async move {
-        let mut reader = BufReader::new(tokio::io::stdin()).lines();
-        while let Ok(Some(line)) = reader.next_line().await {
-            if line_tx.send(line).await.is_err() {
-                break;
-            }
-        }
-    });
+    if options.password_stdin && std::io::stdin().is_terminal() {
+        eprintln!(
+            "tessera-cli: warning: --password-stdin with a terminal on stdin; \
+             the password will be echoed as you type it"
+        );
+    }
+
+    let (requests, request_rx) = std::sync::mpsc::channel();
+    let (input_tx, inputs) = mpsc::channel(1);
+    // A plain thread, not a tokio task: a blocked terminal read must not keep
+    // the runtime from shutting down.
+    std::thread::spawn(move || reader_loop(request_rx, input_tx, TerminalSource));
 
     let mut cli = Cli {
         core,
-        lines,
+        requests,
+        inputs,
+        gate: Gate::default(),
         password_stdin: options.password_stdin,
+        logged_in: false,
         mode: Mode::Busy,
         rooms: Vec::new(),
         selected: None,
         timeline: Vec::new(),
         printed: HashSet::new(),
     };
-    cli.run().await;
+    tokio::select! {
+        () = cli.run() => {}
+        _ = tokio::signal::ctrl_c() => println!("Interrupted."),
+    }
 
+    // An ephemeral session is thrown away, so revoke it on the server too.
+    if cleanup.is_some() {
+        cli.logout_and_wait().await;
+    }
     // Ask the engine to stop and wait until it has released the store.
     let _ = cli.core.commands.send(Command::Shutdown).await;
     let drain = async { while cli.core.events.recv().await.is_some() {} };
@@ -656,5 +843,106 @@ mod tests {
             format_message("R\x1b[2J", "@a:x", "a\nb\x07"),
             "[R?[2J] @a:x: a?b?"
         );
+    }
+
+    #[test]
+    fn bidi_and_invisible_characters_are_neutralised() {
+        for c in ('\u{200B}'..='\u{200F}')
+            .chain('\u{202A}'..='\u{202E}')
+            .chain('\u{2066}'..='\u{2069}')
+            .chain(['\u{FEFF}'])
+        {
+            assert_eq!(sanitize(&format!("a{c}b")), "a?b", "U+{:04X}", c as u32);
+        }
+        assert_eq!(sanitize("plain \u{e9}\u{4e2d}"), "plain \u{e9}\u{4e2d}");
+    }
+
+    /// Serves scripted lines and passwords; reading the wrong kind panics.
+    struct Fake {
+        lines: Vec<&'static str>,
+        passwords: Vec<&'static str>,
+    }
+
+    impl Source for Fake {
+        fn read_line(&mut self) -> Option<String> {
+            assert!(!self.lines.is_empty(), "a line was read out of turn");
+            Some(self.lines.remove(0).to_owned())
+        }
+
+        fn read_password(&mut self) -> Option<String> {
+            assert!(
+                !self.passwords.is_empty(),
+                "a password was read out of turn"
+            );
+            Some(self.passwords.remove(0).to_owned())
+        }
+    }
+
+    fn run_reader(requests: &[Request], fake: Fake) -> Vec<Input> {
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        let (out_tx, mut out_rx) = mpsc::channel(8);
+        for request in requests {
+            request_tx.send(*request).expect("queue request");
+        }
+        drop(request_tx);
+        reader_loop(request_rx, out_tx, fake);
+        let mut all = Vec::new();
+        while let Ok(input) = out_rx.try_recv() {
+            all.push(input);
+        }
+        all
+    }
+
+    #[test]
+    fn password_is_read_apart_from_repl_lines() {
+        let out = run_reader(
+            &[Request::Line, Request::Password, Request::Line],
+            Fake {
+                lines: vec!["bob", "/rooms"],
+                passwords: vec!["s3cret"],
+            },
+        );
+        assert_eq!(
+            out,
+            [
+                Input::Line("bob".into()),
+                Input::Password(Some("s3cret".into())),
+                Input::Line("/rooms".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn gate_never_routes_a_password_to_the_repl() {
+        let mut gate = Gate::default();
+        assert_eq!(gate.repl_line(Input::Password(Some("s3cret".into()))), None);
+        assert_eq!(gate.repl_line(Input::Password(None)), None);
+        assert_eq!(gate.repl_line(Input::Line("hi".into())), Some("hi".into()));
+    }
+
+    #[test]
+    fn gate_allows_one_reader_at_a_time() {
+        let mut gate = Gate::default();
+        assert_eq!(gate.line_request(false), None);
+        assert_eq!(gate.line_request(true), Some(Request::Line));
+        // A line read is in flight: no second one, and no password read.
+        assert_eq!(gate.line_request(true), None);
+        assert!(!gate.begin_password());
+        assert_eq!(
+            gate.repl_line(Input::Line("bob".into())),
+            Some("bob".into())
+        );
+        assert!(gate.begin_password());
+        // While the password is read, no line read may start.
+        assert_eq!(gate.line_request(true), None);
+        gate.end_password();
+        assert_eq!(gate.line_request(true), Some(Request::Line));
+    }
+
+    #[test]
+    fn help_documents_password_stdin_echo_and_ephemeral_logout() {
+        assert!(HELP.contains("echoed"));
+        assert!(HELP.contains("logged out on the server"));
+        assert!(HELP.contains("Ctrl-C"));
     }
 }
