@@ -25,3 +25,4 @@ Task 7: complete (bd84eff..cf91539, gate ok, security PASS, review PASS)
 Task 8: started
 Task 8: complete (04a39db..fcf6c89, gate ok, security PASS, review PASS)
   notes: review — Theme::custom allocates on every redraw (cache if it shows in profiling); semantic() keys on is_dark only. security — none (WCAG 2.1 0.03928 cutoff, harmless).
+Task 9: started
