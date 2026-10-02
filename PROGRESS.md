@@ -395,6 +395,11 @@ Phase 0 agent work is done; the Phase 0 human checkpoint is fully signed off (20
 - Open issues: (1) fixed, see the review fixes below. (2) iced's text-input buffers are not zeroized (Q19 residual). (3) `open_in_browser` runs on iced's executor; on Linux `xdg-open` starts quickly, but a slow launcher would block one executor thread. (4) `http://localhost` is allowed per the review even though a hosts file could point it elsewhere. (5) `Core` emits `OAuthUrl` only after `LoginOAuth`; if a core ever sent one unsolicited, the app ignores it.
 - New human items (rule 9, not ticked by the agent): below.
 
+- Review fixes 2 (tests first, seen failing: 5 of the new/extended tests):
+  - Critical: `on_core_error` returns a `Task`; an `Error` while `WaitingForBrowser` now also sends `Command::CancelOAuth` (the core's `Engine.oauth` stayed `Some`, so retries were refused as busy and the loopback listener stayed open).
+  - Warning: `LoginFailed(Cancelled)` no longer overwrites the notice of a refused URL or of the error above. New `App.pending_cancel` is set when the app ends an OAuth attempt itself and sends `CancelOAuth` (`cancel_in_core`); exactly one `Cancelled` reply is consumed with it. A `Cancelled` with no login in flight is also ignored.
+  - Warning: a late `Cancelled` after a new attempt started is consumed by `pending_cancel`, so the new attempt stays in flight. A user Cancel does not set the flag (the attempt stays in flight until the reply). `pending_cancel` is also cleared by `LoggedIn` and by any other `LoginFailed`, since a cancel reply would have arrived first (the core sends no reply when no OAuth was pending, so the flag must not linger).
+  - Low: notices from core errors and `send_error` go through `text_safety::one_line_capped(.., 512)`.
 ## Phase 2 human checkpoint
 - [ ] CI green on Linux, Windows and macOS with the new dependencies (iced `image-without-codecs`, image, open, tokio in the app).
 - [ ] Don't run tessera-cli and the app on the same data dir at once (SQLite store lock; plan Q20).

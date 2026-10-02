@@ -19,6 +19,7 @@ use crate::bridge::{self, Bridge, EventsSlot};
 use crate::room_list;
 use crate::screens::login::{self, BrowserUrl, LoginForm};
 use crate::screens::{self, loading, main_view};
+use crate::text_safety;
 
 /// How long to wait for the core to close after `Shutdown` (plan Q18).
 pub const SHUTDOWN_WAIT: Duration = Duration::from_secs(10);
@@ -148,6 +149,10 @@ pub struct App {
     pub login: LoginForm,
     /// A login request was sent and not answered yet.
     pub login_in_flight: bool,
+    /// The app ended an OAuth attempt itself and sent `CancelOAuth`; the core
+    /// answers with one `LoginFailed(Cancelled)`, which must not touch the
+    /// notice or a newer attempt.
+    pub pending_cancel: bool,
     /// A non-secret line shown above the login form: why the last login
     /// failed, or why the user is logged out.
     pub notice: Option<String>,
@@ -181,6 +186,11 @@ impl std::fmt::Debug for App {
     }
 }
 
+/// Core error text shown to the user: one line, at most 512 characters.
+fn safe_line(text: &str) -> String {
+    text_safety::one_line_capped(text, 512)
+}
+
 impl App {
     /// Creates the app and the boot task: ask the core to restore the session
     /// and read the system theme.
@@ -198,6 +208,7 @@ impl App {
             sync_state: SyncState::Idle,
             login: LoginForm::new(),
             login_in_flight: false,
+            pending_cancel: false,
             notice: None,
             browser_link: None,
             browser_opened: None,
@@ -328,15 +339,27 @@ impl App {
                 self.screen = Screen::Login;
             }
             CoreEvent::LoggedIn { user_id, .. } => {
+                // Any cancel reply would have come before this login.
+                self.pending_cancel = false;
                 self.user_id = Some(user_id);
                 self.notice = None;
                 self.end_login_attempt();
                 self.screen = Screen::Loading;
             }
+            CoreEvent::LoginFailed(CoreError::Cancelled)
+                if self.pending_cancel || !self.login_in_flight =>
+            {
+                // The reply to a cancel the app sent after ending the attempt
+                // itself: one reply, consumed once; or one with no attempt.
+                self.pending_cancel = false;
+            }
             CoreEvent::LoginFailed(error) => {
+                if !matches!(error, CoreError::Cancelled) {
+                    self.pending_cancel = false;
+                }
                 self.notice = Some(match error {
                     CoreError::Cancelled => "Sign-in cancelled.".to_owned(),
-                    other => other.to_string(),
+                    other => safe_line(&other.to_string()),
                 });
                 self.end_login_attempt();
                 self.screen = Screen::Login;
@@ -371,10 +394,10 @@ impl App {
             }
             CoreEvent::SendFailed { room_id, error } => {
                 if self.selected.as_ref() == Some(&room_id) {
-                    self.send_error = Some(error.to_string());
+                    self.send_error = Some(safe_line(&error.to_string()));
                 }
             }
-            CoreEvent::Error(error) => self.on_core_error(&error),
+            CoreEvent::Error(error) => task = self.on_core_error(&error),
             // Later step: avatars.
             CoreEvent::Avatar { .. } => {}
         }
@@ -385,20 +408,39 @@ impl App {
     /// (the core emits `Error`, not `NoSession`) leaves `Starting`, and an
     /// error during a login ends that attempt. `CoreError`'s `Display` never
     /// carries secrets, so it is safe to show. Other screens ignore it.
-    fn on_core_error(&mut self, error: &CoreError) {
+    ///
+    /// Ending an attempt that waits for the browser also cancels it in the
+    /// core, or the core stays busy and its redirect listener stays open.
+    fn on_core_error(&mut self, error: &CoreError) -> Task<Message> {
+        let waiting = self.screen == Screen::WaitingForBrowser;
         match self.screen {
             Screen::Starting => {
-                self.notice = Some(format!("Could not restore your session: {error}"));
+                self.notice = Some(safe_line(&format!(
+                    "Could not restore your session: {error}"
+                )));
                 self.end_login_attempt();
                 self.screen = Screen::Login;
+                Task::none()
             }
             Screen::Login | Screen::WaitingForBrowser if self.login_in_flight => {
-                self.notice = Some(format!("Sign-in failed: {error}"));
+                self.notice = Some(safe_line(&format!("Sign-in failed: {error}")));
                 self.end_login_attempt();
                 self.screen = Screen::Login;
+                if waiting {
+                    self.cancel_in_core()
+                } else {
+                    Task::none()
+                }
             }
-            _ => {}
+            _ => Task::none(),
         }
+    }
+
+    /// Sends `CancelOAuth` for an attempt the app ended itself, and expects
+    /// one `LoginFailed(Cancelled)` back.
+    fn cancel_in_core(&mut self) -> Task<Message> {
+        self.pending_cancel = true;
+        self.send(Command::CancelOAuth)
     }
 
     /// Sends the password login from the form. The password moves into the
@@ -456,7 +498,7 @@ impl App {
             Err(refused) => {
                 self.notice = Some(format!("Sign-in stopped: {refused}."));
                 self.end_login_attempt();
-                self.send(Command::CancelOAuth)
+                self.cancel_in_core()
             }
         }
     }
@@ -1117,13 +1159,80 @@ mod tests {
 
     #[test]
     fn an_error_while_waiting_for_the_browser_returns_to_the_form() {
-        let (mut app, _rx, _task) = waiting_app("https://auth.example.org/a?state=secret-state-x");
+        let (mut app, mut rx, _task) =
+            waiting_app("https://auth.example.org/a?state=secret-state-x");
         let _ = app.update(core(CoreEvent::Error(CoreError::Network("down".into()))));
         assert_eq!(app.screen, Screen::Login);
         assert!(!app.login_in_flight);
         assert!(app.browser_link.is_none());
         let notice = app.notice.clone().expect("a notice");
         assert!(!notice.contains("secret-state-x"), "{notice}");
+        assert!(matches!(rx.try_recv(), Ok(Command::CancelOAuth)));
+    }
+
+    #[test]
+    fn the_cancel_reply_keeps_the_notice_of_a_refused_url() {
+        let (mut app, mut rx, _task) = waiting_app("http://auth.example.org/a");
+        assert!(matches!(rx.try_recv(), Ok(Command::CancelOAuth)));
+        let before = app.notice.clone().expect("a notice");
+        assert!(before.starts_with("Sign-in stopped"), "{before}");
+        let _ = app.update(core(CoreEvent::LoginFailed(CoreError::Cancelled)));
+        assert_eq!(app.notice.as_deref(), Some(before.as_str()));
+        assert_eq!(app.screen, Screen::Login);
+    }
+
+    #[test]
+    fn the_cancel_reply_keeps_the_notice_of_an_error_while_waiting() {
+        let (mut app, mut rx, _task) = waiting_app("https://auth.example.org/a");
+        let _ = app.update(core(CoreEvent::Error(CoreError::Network("down".into()))));
+        assert!(matches!(rx.try_recv(), Ok(Command::CancelOAuth)));
+        let before = app.notice.clone().expect("a notice");
+        let _ = app.update(core(CoreEvent::LoginFailed(CoreError::Cancelled)));
+        assert_eq!(app.notice.as_deref(), Some(before.as_str()));
+    }
+
+    #[test]
+    fn a_late_cancel_reply_does_not_end_a_new_attempt() {
+        let (mut app, mut rx, _task) = waiting_app("http://auth.example.org/a");
+        assert!(matches!(rx.try_recv(), Ok(Command::CancelOAuth)));
+        // The user starts a new attempt before the core answers the cancel.
+        let _ = app.update(Message::OAuthRequested);
+        assert!(matches!(rx.try_recv(), Ok(Command::LoginOAuth { .. })));
+        assert!(app.login_in_flight);
+        let _ = app.update(core(CoreEvent::LoginFailed(CoreError::Cancelled)));
+        assert!(app.login_in_flight, "the stale reply is consumed");
+        assert_eq!(app.screen, Screen::Login);
+        // A second Cancelled is a real one and ends the attempt.
+        let _ = app.update(Message::CancelOAuth);
+        let _ = app.update(core(CoreEvent::OAuthUrl(AuthUrl::from(
+            "https://auth.example.org/b",
+        ))));
+        let _ = app.update(Message::CancelOAuth);
+        let _ = app.update(core(CoreEvent::LoginFailed(CoreError::Cancelled)));
+        assert!(!app.login_in_flight);
+        assert_eq!(app.screen, Screen::Login);
+    }
+
+    #[test]
+    fn error_and_send_error_text_is_one_capped_line() {
+        let (mut app, _rx) = login_app();
+        fill(&mut app, "", "alice", "pw");
+        let _ = app.update(Message::LoginSubmitted);
+        let long = format!("line1\nline2\u{202E}{}", "x".repeat(2000));
+        let _ = app.update(core(CoreEvent::Error(CoreError::Internal(long.clone()))));
+        let notice = app.notice.clone().expect("a notice");
+        assert!(!notice.contains('\n') && !notice.contains('\u{202E}'));
+        assert!(notice.chars().count() <= 512, "{}", notice.chars().count());
+
+        let (mut app, _rx) = main_app();
+        let room = app.selected.clone().expect("a selected room");
+        let _ = app.update(core(CoreEvent::SendFailed {
+            room_id: room,
+            error: CoreError::Internal(long),
+        }));
+        let line = app.send_error.clone().expect("an error line");
+        assert!(!line.contains('\n') && !line.contains('\u{202E}'));
+        assert!(line.chars().count() <= 512);
     }
 
     #[test]
