@@ -5,6 +5,7 @@
 
 pub mod bridge;
 pub mod room_list;
+pub mod screens;
 pub mod state;
 pub mod theme;
 

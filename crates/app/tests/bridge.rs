@@ -179,11 +179,11 @@ fn login_reaches_main_with_rooms_and_shutdown_closes_the_bridge() {
         assert!(std::time::Instant::now() < limit, "no login screen in 60 s");
         next(&mut app, Duration::from_secs(5));
     }
-    let _ = app.update(Message::LoginSubmitted {
-        server: String::new(),
-        username: user,
-        password: tessera_core::api::Password::from(password),
-    });
+    let _ = app.update(Message::UsernameChanged(user));
+    let _ = app.update(Message::PasswordChanged(tessera_core::api::Password::from(
+        password,
+    )));
+    let _ = app.update(Message::LoginSubmitted);
 
     let limit = deadline(60);
     while !(app.screen == Screen::Main && !app.rooms.is_empty()) {
