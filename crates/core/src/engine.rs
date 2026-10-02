@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{Stream, StreamExt as _, pin_mut};
+use matrix_sdk::ruma::OwnedUserId;
 use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
 use matrix_sdk::{Client, SessionChange};
 use matrix_sdk_ui::eyeball_im::{Vector, VectorDiff};
@@ -280,9 +281,10 @@ async fn forward_timeline(
     items: Vector<Arc<SdkTimelineItem>>,
     stream: impl Stream<Item = Vec<VectorDiff<Arc<SdkTimelineItem>>>>,
     events: mpsc::Sender<CoreEvent>,
+    own: Option<OwnedUserId>,
 ) {
     let initial = ListDiff::Reset {
-        values: items.iter().map(|i| map_item(i)).collect(),
+        values: items.iter().map(|i| map_item(i, own.as_deref())).collect(),
     };
     let first = CoreEvent::TimelineDiff {
         room_id: room_id.clone(),
@@ -295,7 +297,7 @@ async fn forward_timeline(
     while let Some(diffs) = stream.next().await {
         let diffs = diffs
             .into_iter()
-            .map(|d| map_diff(d, |item| map_item(&item)))
+            .map(|d| map_diff(d, |item| map_item(&item, own.as_deref())))
             .collect();
         let event = CoreEvent::TimelineDiff {
             room_id: room_id.clone(),
@@ -732,6 +734,7 @@ impl Engine {
             items,
             stream,
             self.events.clone(),
+            active.client.user_id().map(ToOwned::to_owned),
         ));
         active.selected = Some(Selected {
             room_id,
@@ -1202,7 +1205,7 @@ mod tests {
 
     fn record(user: &str, homeserver: &str, session_id: &str) -> SessionRecord {
         use matrix_sdk::authentication::matrix::MatrixSession;
-        use matrix_sdk::ruma::{OwnedUserId, owned_device_id};
+        use matrix_sdk::ruma::owned_device_id;
         use matrix_sdk::{SessionMeta, SessionTokens};
         let user_id = OwnedUserId::try_from(user).unwrap();
         SessionRecord {

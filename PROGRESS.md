@@ -13,7 +13,7 @@
 ## Phase 3 steps
 - [x] 1. Phase 3 dependencies, advisory triage, ledger (phase3.1)
 - [x] 2. Additive core API for Phase 3 (phase3.2)
-- [ ] 3. Timeline item view models in the core (roadmap steps 1, 7, 8, 9, core side)
+- [x] 3. Timeline item view models in the core (roadmap steps 1, 7, 8, 9, core side)
 - [ ] 4. HTML to rich text mapper in the core (roadmap step 4, core side)
 - [ ] 5. Sending: markdown, mentions, replies, local echo retry and discard (roadmap steps 6, 7, 9, core side)
 - [ ] 6. Edit, redact, react and member search in the core (roadmap steps 6, 7, core side)
@@ -40,6 +40,16 @@
 - Checks: fmt, clippy (`--all-targets --all-features --locked -D warnings`), `cargo test --workspace --locked` (146 core lib, 177 app lib), `check-app-deps.sh`, `check-core-api.sh` and `cargo deny check` pass. Ignored run against the local Synapse (`--ignored --skip keyring`): all pass in about 55 s total, then `docker compose stop`.
 - APIs used: none from matrix-sdk, ruma or iced beyond what Phase 2 already used (the new code is plain Rust types and engine glue).
 - Open issues: none. No new human items.
+
+## Phase 3 / Task 3 notes
+- `timeline.rs`: `map_item(item, own)` now fills the Q7/Q23 model (virtual items, `Message` with `details`, `State`, `Placeholder`, `read_by`); `forward_timeline` in `engine.rs` takes the logged-in user ID (`client.user_id()`) for the own-reaction and own-receipt checks. Pure, table-tested helpers: `map_membership` (all 17 `MembershipChange` variants; `None`, `Error` and `NotImplemented` become `Other { "m.room.member" }`, `KickedAndBanned` becomes `Banned`), `reaction_groups` (SDK order, `count` = all senders, 5 kept, `own` flag), `reply_body` (first line, 200 chars, never splits a char), `receipts_without_own` (at most 20), `plain_rich_text`, `item_actions`.
+- Interpretation notes: `can_redact` = own or remote event (the server decides about other people's, a refusal comes back as `ActionFailed`); `can_react` = remote or local echo; `can_copy` always true for messages. A reply whose quoted event is not loaded has an empty `sender` (the SDK does not know it) and `Loading` (Pending) or `Unavailable` (Unavailable, Error). Media messages, stickers, polls, live location, `CallInvite` and `RtcNotification` become `Placeholder`; failed-to-parse events become `State::Other { "unknown" }`.
+- Test helpers `set_display_name` and `send_text` (plus `send_content`, which `send_text` uses) in `tests/common/mod.rs`; they print nothing.
+- Integration tests in `tests/timeline_items.rs` (both pass, twice in a row). Finding: when a sync response is limited the SDK emits `Clear` and the earlier events are gone until back-pagination (Task 7), so the notice/emote test sends one message at a time and the state test selects the room before carol joins. Not flaky: the first attempt failed deterministically for this reason.
+- `StateChange` still derives `Debug` and so prints display names, the new room name and `Other.event_type` (same policy as `MessagePreview`); no user text was added to it in this task. Revisit if the human wants those hidden.
+- Checks: fmt, clippy (`--all-targets --all-features --locked -D warnings`), `cargo test --workspace --locked` (152 core lib, 177 app lib), `check-app-deps.sh`, `check-core-api.sh`, `cargo deny check` pass. Ignored run (`--ignored --skip keyring`) against the local Synapse: all pass, about 1m23 including build, then `docker compose stop`.
+- APIs confirmed in `~/.cargo/registry/src/*/`: matrix-sdk-ui 0.19.1 `timeline/event_item/mod.rs` (`is_local_echo` 192, `is_remote_event` 203, `sender_profile` 292, `read_receipts` 328, `is_editable` 355, `is_highlighted` 391, `can_be_replied_to` 461, `TimelineDetails` 777), `event_item/content/mod.rs` (`as_message` 279, `MembershipChange` 691, `displayname_change` 762, `AnyOtherStateEventContentChange` 787), `content/msg_like.rs` (`MsgLikeKind` 27), `content/message.rs` (`is_edited` 89), `content/reply.rs` (`InReplyToDetails` 34, `EmbeddedEvent` 65), `virtual_item.rs` (`VirtualTimelineItem` 19); matrix-sdk 0.19.1 `account.rs:139` (`set_display_name`), `client/mod.rs:2094` (`send`); ruma-client-api 0.25.0 `message/send_message_event.rs:103` (`Request::new`); ruma-events 0.35.0 `room/message.rs` (`text_plain`, `notice_plain`, `emote_plain`), `kinds.rs:867` (`StateEventContentChange`), `room/member/change.rs:81` (`Change`).
+- Open issues: none. No new human items (no rendering yet).
 
 ## Phase 3 human checkpoint
 - [ ] CI green on Linux, Windows and macOS with the new dependencies (matrix-sdk `markdown`, emojis, chrono, dev-only iced `advanced`).
