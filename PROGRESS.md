@@ -1175,6 +1175,7 @@ Phase 2 signed off by the human on 2026-10-02 (merge of PR #3). Every other unti
 - Fix round (phase4.10): on close, exit now waits until the clipboard read has been answered and the clear write issued (`flushes_pending`, `core_closed`, `App::exit_if_flushed`); `ShutdownDeadline` still exits at once. The restore field is emptied on **Back** and whenever `on_status` closes the Restore screen. Tests first (both failed before the code).
 
 ## Phase 6 steps (calls: MatrixRTC, LiveKit SFU, native audio; plan docs/plans/phase6-calls.md)
+Order (revised 2026-10-02, plan decision 12): 1–8, 8b, 9, 10, 11, 12, 14, 15, then 13. Deferred options (audio-only libwebrtc build, pure-Rust WebRTC stack, PulseAudio backend) are recorded in the plan.
 - [x] 1. libwebrtc supply chain (pinned SHA-256 fetch script, fail-closed build) and livekit dependency (phase6.1)
 - [x] 2. Local SFU stack (LiveKit server, lk-jwt-service, Synapse MatrixRTC config)
 - [x] 3. Call API contract and settings persistence
@@ -1188,7 +1189,9 @@ Phase 2 signed off by the human on 2026-10-02 (merge of PR #3). Every other unti
 - [ ] 10. Ringing and voice rooms
 - [ ] 11. Push-to-talk service (global-hotkey, portal, gamepad, in-window)
 - [ ] 12. CLI call commands
-- [ ] 13. DeepFilterNet3 via tract-onnx
+- [ ] 13. DeepFilterNet3 via tract-onnx (after 14 and 15)
+- [ ] 14. Own PipeWire client on Linux (communication role, latency, registry events, system-mix echo reference)
+- [ ] 15. Steam Frame performance (CPU budget per mode, Frame defaults, rtkit priority)
 
 ## Phase 6 / Task 1 notes
 - Checks run (all pass): `cargo fmt --all --check`; `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`; `cargo test --workspace --locked` (new `tests/livekit_link.rs`, 2 tests); `scripts/check-app-deps.sh`; `scripts/check-app-deps.sh livekit`; `scripts/check-core-api.sh`; `scripts/check-no-webrtc-download.sh`; `cargo deny check` (cargo-deny 0.20.2, reinstalled with `--locked`; advisories, bans, licenses, sources ok, deny.toml unchanged). Ignored run `docker compose up -d --wait && scripts/create-test-users.sh && cargo test -p tessera-core --locked -- --ignored --skip keyring`: 11/11 (first recorded as 12/12, a miscount: cli 1, login 4, oauth 1, room_list 2, timeline 3), then `docker compose stop`. shellcheck (docker koalaman/shellcheck:stable) clean on both new scripts; actionlint 1.7.7 (docker) clean on ci.yml.
@@ -1303,5 +1306,5 @@ Phase 2 signed off by the human on 2026-10-02 (merge of PR #3). Every other unti
 - [ ] Device hot-plug (USB headset in and out, Bluetooth) on each OS you use; macOS microphone permission prompt.
 - [ ] Interop with Element Call, both directions, in unencrypted and encrypted rooms, on a real homeserver with a real SFU.
 - [ ] Global PTT hotkey on X11, Wayland (KDE/GNOME portal), Windows and macOS; gamepad PTT.
-- [ ] Steam Frame: aarch64 build runs on the device (desktop mode and game mode); built-in mic and speakers with AEC; PipeWire device switching; CPU/battery cost of each NS mode; rtkit real-time priority granted.
+- [ ] Steam Frame: aarch64 build runs on the device (desktop mode and game mode); built-in mic and speakers with AEC; game audio cancelled with the system-mix reference (Task 14); PipeWire device switching; CPU/battery cost of each NS mode within the Task 15 budget while a standalone VR game runs; rtkit real-time priority granted.
 - [ ] CLI call against a real account; leave by crash (kill -9) clears the membership within the delayed-event timeout.

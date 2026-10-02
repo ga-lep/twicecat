@@ -19,6 +19,7 @@ Native voice calls and Discord-style voice rooms, with no Element Call widget. `
 9. **Local SFU in compose:** `livekit/livekit-server:v1.13.7` and `ghcr.io/element-hq/lk-jwt-service:v0.7.0`, bound to 127.0.0.1, with test-only LiveKit key/secret in `.env.test`. Synapse gets the MatrixRTC transport and delayed-event config (one `docker compose down -v` needed).
 10. **Interop format: Element Call's current one.** That is `m.call.member` state events per device, a delayed leave event, and `io.element.call.encryption_keys` to-device. MSC4354 sticky `m.rtc.member` is revisited when the SDK supports it.
 11. **Target platform: Steam Frame / SteamOS** in addition to desktop Linux, Windows and macOS (see "Steam Frame / SteamOS").
+12. **Native PipeWire on Linux, our own client in the end** (human, 2026-10-02, after Task 8). The PulseAudio protocol (pipewire-pulse) brings nothing our targets need and costs latency, a real-time thread and graph control. Task 4 uses cpal's PipeWire backend now; Task 14 replaces it on Linux with our own client on the `pipewire` crate. cpal stays for macOS (CoreAudio) and Windows (WASAPI), ALSA stays the Linux fallback. The Steam Frame is a constrained device that also runs a standalone VR game, so the call path gets a measured CPU budget (Task 15).
 
 ## Steam Frame / SteamOS
 Steam Frame runs SteamOS on ARM64 (Snapdragon). The system is Arch-based with a read-only root, so third-party apps are Flatpaks. Audio goes through PipeWire. The UI is either KDE Plasma on Wayland (desktop mode) or gamescope (game mode). The device has built-in speakers and a mic array, so open-speaker echo cancellation is the normal case, not an edge case. Consequences for this phase:
@@ -32,6 +33,9 @@ Steam Frame runs SteamOS on ARM64 (Snapdragon). The system is Arch-based with a 
   - `global-hotkey` on X11, Windows and macOS.
 - **Battery.** RNNoise is the default ML option (DeepFilterNet3 is opt-in). Opus DTX is on. The processing thread sleeps between 10 ms frames. A CPU-cost unit benchmark is recorded for each NS mode on x86_64 and aarch64 (CI ARM runner).
 - **Real-time audio threads** use cpal's `realtime` feature (rtkit over D-Bus, which also works inside Flatpak through the portal). This is a human checkpoint item on the device.
+- **Game audio in the echo canceller.** In standalone VR the game plays through the same speakers as the call, and the AEC render reference only holds call audio, so game sound reaching the mic goes to everyone in the call. Task 14 feeds the system output mix (the sink being played) to AEC3 as the render reference, on the graph's clock.
+- **CPU budget.** The whole call path (capture, chain, Opus, mixer, playback) gets a measured per-frame budget on aarch64 (Task 15), with Frame defaults chosen from it.
+- **Flatpak permission for native PipeWire:** `--filesystem=xdg-run/pipewire-0` (as OBS and other audio apps request), instead of `--socket=pulseaudio`. Recorded for the packaging phase.
 
 ## Facts verified while planning (2026-10-02)
 Each task re-confirms the APIs it uses (rule 2) and cites file:line in PROGRESS.md. The paths below are under `~/.cargo/registry/src/index.crates.io-*/`.
@@ -146,6 +150,8 @@ As built in Task 3 (`crates/core/src/api/call.rs`, commands and events in `api/m
 - **Voice rooms:** an MSC3417 call room (room type `org.matrix.msc3417.call`), or any room with an active session, can be joined like a Discord channel. Creating such a room waits for the room-creation phase (Phase 5).
 
 ## Tasks (one `feat` commit each with a `Step: phase6.<n>` trailer, gated as in Phase 1)
+Order (revised 2026-10-02, decision 12): 1–8, 8b, 9, 10, 11, 12, 14, 15, then 13.
+
 Each task follows the full Phase 1 gate: fmt, clippy -D warnings, tests, `check-app-deps.sh`, `check-core-api.sh`, `cargo deny check`, and the ignored homeserver run, which from task 2 also needs the SFU stack.
 
 1. **libwebrtc supply chain and livekit dependency.**
@@ -252,6 +258,19 @@ Each task follows the full Phase 1 gate: fmt, clippy -D warnings, tests, `check-
    - Exposed as `NoiseSuppression::DeepFilter { attenuation_limit_db }`.
    - Tests: the model loads; output on speech plus noise improves SNR by at least the RNNoise result on the same fixture; the per-frame cost is recorded on x86_64 and aarch64; the fallback is RNNoise if the model files are missing.
 
+14. **Own PipeWire client on Linux** (decision 12; replaces cpal there).
+   - A `pw_stream` per direction on the `pipewire` crate (`=0.10.1`, MIT, already in the tree through cpal), driven by PipeWire's real-time data loop. The callbacks only move samples through the existing rings; the processing thread stays as it is (sonora allocates per frame, so no DSP in the RT callback).
+   - Stream properties: `media.role = Communication` (WirePlumber policy: Bluetooth headset profile, ducking), `node.latency = 480/48000`, our `application.name`, `node.rate` 48 kHz when the graph allows, so nothing resamples.
+   - Enumeration from the registry by `media.class`: `Audio/Source` and `Audio/Sink` (plus the Internal variants) only, so other applications' streams are no longer listed (Task 4's known limitation). Stable IDs stay the node names (`pipewire:<node.name>`), so saved settings keep working.
+   - Device and default changes from registry and metadata events instead of the 2 s poll.
+   - Optional system-mix echo reference: capture the playing sink (`stream.capture.sink`) and feed it to AEC3 as the render reference, so game audio is cancelled too. Measured with a fixture (game-like noise plus speech on a loopback sink): echo suppression with and without it.
+   - Tests: registry filtering and the property set as unit tests; the ignored output-only stream test from Task 4 runs against it; the real-device behaviour is a human item.
+15. **Steam Frame performance.**
+   - A benchmark binary measures per-10 ms-frame cost of each stage (capture conversion, HPF, AEC3, each NS mode, AGC2, gate, mixer, Opus through LiveKit's encoder, playback) on x86_64 and on the CI aarch64 runner, recorded in PROGRESS.md. Budget target: the whole call path under 5 % of one core on the Frame (to be confirmed on the device).
+   - Frame defaults from the measurements: RNNoise (DeepFilterNet opt-in), AEC3 on, 10 ms buffers, Opus at 32 kb/s with DTX; a "low power" profile if the budget is not met.
+   - Real-time priority for the processing thread through rtkit (D-Bus, also inside Flatpak), with a fallback to normal priority and a reported reason.
+   - Human check on the device: desktop and game mode, a standalone VR game running, CPU and battery during a call, crackles under load.
+
 ## Dependencies (approved 2026-10-02, newest releases, exact pins)
 | Crate | Version | Licence | Used by | Added in task |
 |---|---|---|---|---|
@@ -266,8 +285,16 @@ Each task follows the full Phase 1 gate: fmt, clippy -D warnings, tests, `check-
 | global-hotkey | =0.8.0 | Apache-2.0 OR MIT | ptt | 11 |
 | ashpd | =0.13.13 | MIT | ptt | 11 |
 | gilrs | =0.11.2 | Apache-2.0 OR MIT | ptt | 11 |
+| pipewire (direct; today through cpal) | =0.10.1 | MIT | audio | 14 |
+| libspa (direct, format pods) | =0.10.1 | MIT | audio | 14 |
 
 Each crate is added in the task that first uses it, so no dependency sits unused. Each task records `cargo tree` and `cargo deny check` output. A newer release that appears mid-phase is asked about before bumping (rule 3).
+
+## Options considered and deferred (2026-10-02)
+Recorded so the reasoning is not lost; none is planned.
+- **Custom audio-only libwebrtc build.** Would bring a much smaller binary and download (no video codecs, screen capture or video processing; the static lib is 82 MB today, the shipped share unmeasured), fewer system dependencies (no glib, X11 or the PipeWire capture shims), Frame-specific compile flags, a source build we can audit instead of a checksum-pinned prebuilt, and faster local builds. It cannot be done alone: webrtc-sys always compiles its video and capture bridges (`video_track`, encoder/decoder factories, `desktop_capturer`, VA-API, NVIDIA, AV1), so it needs forks of webrtc-sys (and likely `livekit`), Chromium's build setup (depot_tools, a tens-of-GB checkout, hours per platform in CI), and LiveKit's exact WebRTC revision and patches, including the frame encryptor Element Call interop needs. Revisit for release packaging, with measurements first (release binary size, memory on the Frame during a call). A middle step is building the full libwebrtc from source with LiveKit's configuration: the supply-chain benefit without forks.
+- **Pure-Rust WebRTC stack** (str0m or webrtc-rs) with our own LiveKit client. Would drop the C++ toolchain, but we would rebuild what libwebrtc gives today: ICE/TURN, DTLS-SRTP, NetEQ-grade jitter buffer and loss concealment (the hard part, and a large share of call quality on bad networks), bandwidth estimation, LiveKit's signalling protocol and its E2EE frame encryption matched to Element Call; Opus would still need libopus or a less proven Rust decoder. Months of work with interop risk and, at first, worse quality. For audio only, libwebrtc's CPU cost is small (NEON-optimised Opus and NetEQ), so it would not by itself help the Frame. A separate research spike if the C++ toolchain or binary size becomes a real problem.
+- **PulseAudio protocol backend** (cpal `pulseaudio`, a pure-Rust client of pipewire-pulse). Used for a few hours after Task 8 as a stopgap for the `pw_*` crash, then dropped (decision 12): its only benefits (no C library at build time, old PulseAudio-only distributions, the standard Flatpak socket) do not matter for our targets, and it adds a buffer hop, normal-priority threads and less graph control.
 
 ## Human checkpoint (collected in PROGRESS.md, never ticked by the agent; rule 9)
 - [x] Questions answered 2026-10-02 (see Decisions).
@@ -276,6 +303,6 @@ Each crate is added in the task that first uses it, so no dependency sits unused
 - [ ] Device hot-plug (USB headset in and out, Bluetooth) on each OS you use; macOS microphone permission prompt.
 - [ ] Interop with Element Call, both directions, in unencrypted and encrypted rooms, on a real homeserver with a real SFU (matrix.org / element.io call infrastructure or your own).
 - [ ] Global PTT hotkey on X11, Wayland (KDE/GNOME portal), Windows and macOS; gamepad PTT.
-- [ ] Steam Frame: aarch64 build runs on the device (desktop mode and game mode); built-in mic and speakers with AEC; PipeWire device switching; CPU/battery cost of each NS mode; rtkit real-time priority granted.
+- [ ] Steam Frame: aarch64 build runs on the device (desktop mode and game mode); built-in mic and speakers with AEC; game audio cancelled with the system-mix reference (Task 14); PipeWire device switching; CPU/battery cost of each NS mode within the Task 15 budget while a standalone VR game runs; rtkit real-time priority granted.
 - [ ] CLI call against a real account; leave by crash (kill -9) clears the membership within the delayed-event timeout.
 - [ ] CI green on Linux, Windows and macOS with livekit/libwebrtc in the tree (build time and disk to be watched).
