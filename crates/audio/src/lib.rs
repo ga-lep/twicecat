@@ -4,15 +4,23 @@
 //!
 //! Internally everything is 48 kHz mono `f32` in 10 ms [`Frame`]s.
 
+mod chain;
 mod convert;
+mod denormals;
 mod devices;
 mod frame;
+mod gate;
 mod io;
 mod pipeline;
 mod resample;
 
+pub use chain::{
+    CaptureChain, CaptureResult, ChainSettings, ChainStats, LEVEL_FLOOR_DB, NoiseMode, NsLevel,
+};
+pub use denormals::flush_denormals_on_this_thread;
 pub use devices::{DeviceInfo, DeviceList, DeviceWatcher, list_devices};
 pub use frame::{FRAME_LEN, Frame, SAMPLE_RATE, SILENCE};
+pub use gate::GateMode;
 pub use io::{AudioIo, IoConfig, IoEvent, IoInfo, StreamInfo};
 pub use pipeline::{FrameProcessor, IoCounters, IoStats};
 

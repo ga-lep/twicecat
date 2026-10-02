@@ -158,6 +158,9 @@ fn run(
     events: mpsc::Sender<IoEvent>,
     ready: mpsc::SyncSender<Result<IoInfo, AudioError>>,
 ) {
+    // Everything that runs on this thread (the processor included) treats
+    // denormals as zero; see `denormals`.
+    crate::denormals::flush_denormals_on_this_thread();
     let host = cpal::default_host();
     let mut info = IoInfo::default();
     let mut streams = Vec::new();

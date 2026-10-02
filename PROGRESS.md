@@ -1179,7 +1179,7 @@ Phase 2 signed off by the human on 2026-10-02 (merge of PR #3). Every other unti
 - [x] 2. Local SFU stack (LiveKit server, lk-jwt-service, Synapse MatrixRTC config)
 - [x] 3. Call API contract and settings persistence
 - [x] 4. Audio devices and I/O threads (tessera-audio, cpal PipeWire)
-- [ ] 5. Processing chain (sonora AEC3/NS/AGC2, denormal guard, RNNoise, gate, PTT tail)
+- [x] 5. Processing chain (sonora AEC3/NS/AGC2, denormal guard, RNNoise, gate, PTT tail)
 - [ ] 6. Mixer and playout (per-user volume, deafen, AEC render tap, mic test)
 - [ ] 7. MatrixRTC signalling (transports, JWT, m.call.member, delayed leave)
 - [ ] 8. LiveKit media (publish, subscribe, reconnection)
@@ -1235,8 +1235,19 @@ Phase 2 signed off by the human on 2026-10-02 (merge of PR #3). Every other unti
 - Open issues: real devices (hot-plug, Bluetooth, 44.1 kHz USB devices, macOS permission prompt) are human items. The capture/playback clock-drift handling is a frame drop at 60 ms; the audible glitch is a 10 ms skip (fine for voice, to be checked by ear). Windows and macOS device code is CI-compiled only.
 - New human items: none beyond the checkpoint list (device hot-plug and the macOS microphone prompt are already there).
 
+## Phase 6 / Task 5 notes
+- Checks run (all pass): `cargo fmt --all --check`; `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` (a first run failed on a `collapsible_if` in gate.rs, fixed); `cargo test --workspace --locked` (tessera-audio 29 passed, 2 ignored; workspace total 171 passed, 17 ignored); `scripts/check-app-deps.sh` (and `livekit`); `scripts/check-core-api.sh`; `scripts/check-no-webrtc-download.sh`; `cargo deny check` (sonora's 7 crates and nnnoiseless: BSD-3-Clause, deny.toml unchanged); ignored suite 14/14.
+- Measured (debug test build with the DSP crates at opt-level 3, x86_64): AEC ERLE 36.9 dB after 4 s on the synthetic echo path; RNNoise -15.5 dB and WebRTC NS (High) -20.7 dB on stationary white noise at -26 dBFS. Mutation checks: with AEC disabled the AEC test measures 0.0 dB and fails; with RNNoise bypassed the NS test measures 0.0 dB and fails. Both reverted.
+- **sonora #34 reproduced, and the guard confirmed** (`cargo test --release -p tessera-audio -- --ignored timing`, x86_64): after 3 s of far-end speech, a silent far end costs 482.7 µs mean / 613.6 µs worst per 10 ms frame without the denormal guard, and 88.2 µs / 120.0 µs with it (full default chain: HPF, AEC3, RNNoise, AGC2). Only silence that follows speech shows it: silence from the start was 96 µs vs 91 µs, because the filter states have to decay into denormals first.
+- APIs used (registry src/): sonora `AudioProcessing::builder().config().capture_config().render_config().build()` (src/audio_processing.rs:311-365), `apply_config` (:452), `process_capture_f32(&[&[f32]], &mut [&mut [f32]])` and `process_render_f32` (:615, :643), `statistics() -> &AudioProcessingStats { echo_return_loss_enhancement, residual_echo_likelihood, delay_ms, .. }` (:537; src/stats.rs:11-38), `StreamConfig::new(rate, channels)`, `Config { high_pass_filter, echo_canceller, noise_suppression, gain_controller2, .. }` and the `EchoCanceller`, `HighPassFilter`, `NoiseSuppression { level: NoiseSuppressionLevel }`, `GainController2 { adaptive_digital: Option<AdaptiveDigital>, .. }` defaults (src/config.rs:32-290). nnnoiseless `DenoiseState::new() -> Box<DenoiseState<'static>>`, `process_frame(&mut [f32], &[f32]) -> f32` (VAD probability; samples in i16 scale; src/denoise.rs:53, :95), `default-features = false` (the defaults pull a CLI's deps). Inline asm `stmxcsr`/`ldmxcsr` and `mrs`/`msr fpcr` (std::arch::asm).
+- `unsafe`: only `crates/audio/src/denormals.rs` (decision 7), with SAFETY comments and a test that denormals flush on the calling thread and stay IEEE on others. aarch64 is CI-compiled; the arm64 test job runs that test.
+- Deviation from the plan: the libwebrtc APM A/B backend is not in this task (tessera-audio does not link livekit); it moves to Task 8.
+- Open issues: sonora 0.2.0 allocates on every frame in AEC3 (upstream #39/#40, about 40 per frame). It runs on the processing thread, not in device callbacks, so the rings absorb an occasional slow frame, but steady state is not allocation-free until a sonora release fixes it (bump asked first). Real-time thread priority for the processing thread is not set yet. Gate thresholds and AGC behaviour need checking by ear (human list).
+- New human items: none beyond the list (audio quality by ear, Steam Frame CPU per NS mode).
+
 ## Phase 6 known limitations
-- Denormal guard (decision 7, human-approved 2026-10-02, pre-production): Task 5 adds one audited `unsafe` function that sets FTZ/DAZ on the audio processing thread, because sonora 0.2.0 AEC3 slows 10–50× on silent render (upstream issue #34). Remove it once a sonora release with upstream PR #38 ships (version bump asked first, rule 3).
+- Denormal guard (decision 7, human-approved 2026-10-02, pre-production): `crates/audio/src/denormals.rs` is the one audited `unsafe` function. It sets FTZ/DAZ (x86_64) or FZ (aarch64) on the audio processing thread, because sonora 0.2.0 AEC3 slows down on a silent far end after speech (upstream issue #34; measured 5.5× here, see Task 5). Remove it once a sonora release with upstream PR #38 ships (version bump asked first, rule 3).
+- sonora 0.2.0 allocates about 40 times per 10 ms frame in AEC3 (upstream #39/#40). The processing thread is not a device callback, so this is tolerable, but not real-time clean until upstream ships the fix.
 
 ## Phase 6 human checkpoint
 - [x] Plan questions answered and plan approved (2026-10-02).

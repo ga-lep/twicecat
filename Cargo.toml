@@ -7,6 +7,8 @@ edition = "2024"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/ga-lep/tessera"
 
+# Real-time DSP is far too slow unoptimised: debug AEC3 cannot keep up with
+# 10 ms frames. Optimise these crates in dev and test builds too.
 # Each test binary statically links libwebrtc; with full debug info for every
 # dependency that is ~1.1 GB per binary (130 GB of target/ after a few
 # rebuilds). Dependencies keep line tables (backtraces and gdb still show
@@ -21,3 +23,26 @@ debug = true
 debug = true
 [profile.dev.package.tessera-app]
 debug = true
+
+[profile.dev.package.sonora]
+opt-level = 3
+[profile.dev.package.sonora-aec3]
+opt-level = 3
+[profile.dev.package.sonora-agc2]
+opt-level = 3
+[profile.dev.package.sonora-ns]
+opt-level = 3
+[profile.dev.package.sonora-common-audio]
+opt-level = 3
+[profile.dev.package.sonora-fft]
+opt-level = 3
+[profile.dev.package.sonora-simd]
+opt-level = 3
+[profile.dev.package.nnnoiseless]
+opt-level = 3
+[profile.dev.package.rubato]
+opt-level = 3
+[profile.dev.package.rustfft]
+opt-level = 3
+[profile.dev.package.realfft]
+opt-level = 3
