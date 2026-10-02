@@ -14,8 +14,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::{
-    DEFAULT_TIMEOUT, TestEnv, create_room, expect_event, raw_login, start_core_with_audio,
-    start_core_with_call_service, unique_room_name, wait_for_room,
+    DEFAULT_TIMEOUT, TestEnv, create_encrypted_room, create_room, expect_event, raw_login,
+    start_core_with_audio, start_core_with_call_service, unique_room_name, wait_for_room,
 };
 use serde_json::Value;
 use tessera_core::CoreHandle;
@@ -166,6 +166,11 @@ async fn login(mut core: CoreHandle, n: u8) -> CoreHandle {
 }
 
 async fn join(core: &mut CoreHandle, room_id: &str) {
+    join_expecting(core, room_id, false).await;
+}
+
+/// Joins and checks that the call is (not) end-to-end encrypted.
+async fn join_expecting(core: &mut CoreHandle, room_id: &str, encrypted: bool) {
     core.commands
         .send(Command::JoinCall {
             room_id: RoomId::from(room_id),
@@ -181,7 +186,7 @@ async fn join(core: &mut CoreHandle, room_id: &str) {
     })
     .await;
     assert!(
-        matches!(state, CoreEvent::CallState(CallState::Connected { .. })),
+        matches!(state, CoreEvent::CallState(CallState::Connected { encrypted: e, .. }) if e == encrypted),
         "{state:?}"
     );
 }
@@ -560,6 +565,199 @@ async fn a_participant_without_a_membership_is_not_played() {
     assert!(stranger < 0.01, "intruder: amplitude {stranger:.4}");
 
     let _ = intruder.close().await;
+    for core in [&alice, &carol] {
+        core.commands.send(Command::LeaveCall).await.unwrap();
+        core.commands.send(Command::Shutdown).await.unwrap();
+    }
+}
+
+/// Joins the call's LiveKit room as `client`'s user with a made-up device,
+/// without any E2EE keys, and records what alice's track decodes to.
+async fn eavesdrop(
+    client: &matrix_sdk::Client,
+    room_id: &str,
+    alice: &str,
+) -> (
+    livekit::prelude::Room,
+    Arc<Mutex<Vec<f32>>>,
+    Arc<Mutex<Option<String>>>,
+) {
+    use futures_util::StreamExt as _;
+    use livekit::prelude::{RemoteTrack, Room, RoomEvent, RoomOptions};
+    use livekit::webrtc::audio_stream::native::NativeAudioStream;
+    use matrix_sdk::ruma::api::client::account::request_openid_token;
+
+    let env = TestEnv::load();
+    let openid = client
+        .send(request_openid_token::v3::Request::new(
+            client.user_id().unwrap().to_owned(),
+        ))
+        .await
+        .unwrap();
+    let body = serde_json::json!({
+        "room": room_id,
+        "openid_token": {
+            "access_token": openid.access_token,
+            "token_type": openid.token_type,
+            "matrix_server_name": openid.matrix_server_name,
+            "expires_in": openid.expires_in.as_secs(),
+        },
+        "device_id": "LISTENER",
+    });
+    let reply = matrix_sdk::reqwest::Client::new()
+        .post(format!("{}/sfu/get", env.get("LK_JWT_URL")))
+        .header("content-type", "application/json")
+        .body(body.to_string())
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let reply: Value = serde_json::from_str(&reply).unwrap();
+    let (room, mut events) = Room::connect(
+        reply["url"].as_str().unwrap(),
+        reply["jwt"].as_str().unwrap(),
+        RoomOptions::default(),
+    )
+    .await
+    .expect("eavesdropper connects");
+    let heard = Arc::new(Mutex::new(Vec::new()));
+    let encryption = Arc::new(Mutex::new(None));
+    let (heard_tx, encryption_tx, alice) = (heard.clone(), encryption.clone(), alice.to_owned());
+    tokio::spawn(async move {
+        while let Some(event) = events.recv().await {
+            if let RoomEvent::TrackSubscribed {
+                track: RemoteTrack::Audio(track),
+                publication,
+                participant,
+            } = event
+            {
+                if !participant.identity().as_str().starts_with(&alice) {
+                    continue;
+                }
+                *encryption_tx.lock().unwrap() =
+                    Some(format!("{:?}", publication.encryption_type()));
+                let mut stream = NativeAudioStream::new(track.rtc_track(), 48_000, 1);
+                let heard = heard_tx.clone();
+                tokio::spawn(async move {
+                    while let Some(frame) = stream.next().await {
+                        heard
+                            .lock()
+                            .unwrap()
+                            .extend(frame.data.iter().map(|s| f32::from(*s) / 32768.0));
+                    }
+                });
+            }
+        }
+    });
+    (room, heard, encryption)
+}
+
+/// In an encrypted room, media is end-to-end encrypted as Element Call
+/// does it: alice and carol hear each other with keys sent over Olm, a
+/// listener on the SFU with a valid token but no keys hears nothing usable,
+/// and after carol leaves (alice rotates her key) and rejoins, both hear
+/// each other again.
+#[tokio::test]
+#[ignore = "needs local homeserver: docker compose up -d --wait"]
+async fn encrypted_room_calls_are_end_to_end_encrypted() {
+    const ALICE_HZ: f32 = 1000.0;
+    const CAROL_HZ: f32 = 600.0;
+    let env = TestEnv::load();
+    let alice_raw = raw_login(1).await;
+    let carol_raw = raw_login(3).await;
+    let room_id = create_encrypted_room(&alice_raw, &unique_room_name(), Some(&env.user_id(3)))
+        .await
+        .to_string();
+    allow_calls(&alice_raw, &room_id).await;
+    carol_raw
+        .join_room_by_id(room_id.as_str().try_into().unwrap())
+        .await
+        .unwrap();
+
+    let (alice_audio, carol_audio) = (
+        Arc::new(Duplex::new(ALICE_HZ)),
+        Arc::new(Duplex::new(CAROL_HZ)),
+    );
+    let (dir_a, dir_c) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let mut alice = logged_in(dir_a.path(), 1, AudioBackend::Virtual(alice_audio.clone())).await;
+    let mut carol = logged_in(dir_c.path(), 3, AudioBackend::Virtual(carol_audio.clone())).await;
+    wait_for_room(&mut alice, &room_id).await;
+    wait_for_room(&mut carol, &room_id).await;
+    for core in [&mut alice, &mut carol] {
+        core.commands
+            .send(Command::UpdateAudioSettings(tone_settings()))
+            .await
+            .unwrap();
+        expect_event(core, |e| matches!(e, CoreEvent::AudioSettings(_))).await;
+    }
+
+    join_expecting(&mut alice, &room_id, true).await;
+    join_expecting(&mut carol, &room_id, true).await;
+    let (listener, overheard, encryption) = eavesdrop(&carol_raw, &room_id, &env.user_id(1)).await;
+
+    alice_as_seen_by(&mut carol, &env.user_id(1), |p| p.speaking).await;
+    alice_as_seen_by(&mut alice, &env.user_id(3), |p| p.speaking).await;
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let alice_hears = alice_audio.level(CAROL_HZ, 2.0);
+    let carol_hears = carol_audio.level(ALICE_HZ, 2.0);
+    let stranger = level_of(&overheard.lock().unwrap(), ALICE_HZ, 2.0);
+    let samples = overheard.lock().unwrap().len();
+    let encryption = encryption.lock().unwrap().clone();
+    eprintln!(
+        "encrypted call: alice hears carol {alice_hears:.4}, carol hears alice {carol_hears:.4}; \
+         listener without keys: {stranger:.5} over {samples} samples, publication encryption {encryption:?}"
+    );
+    assert!(alice_hears > HEARD, "alice hears carol: {alice_hears:.4}");
+    assert!(carol_hears > HEARD, "carol hears alice: {carol_hears:.4}");
+    assert_eq!(
+        encryption.as_deref(),
+        Some("Gcm"),
+        "alice publishes an encrypted track"
+    );
+    // Decoding ciphertext gives some noise (seen up to 0.008), not the tone.
+    assert!(stranger < 0.03, "listener without keys: {stranger:.4}");
+    let _ = listener.close().await;
+
+    // Carol leaves (alice rotates her key) and comes back.
+    carol.commands.send(Command::LeaveCall).await.unwrap();
+    expect_event(&mut carol, |e| {
+        matches!(e, CoreEvent::CallState(CallState::Left { .. }))
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    join_expecting(&mut carol, &room_id, true).await;
+    // Both directions need the other's new key (to-device) and the new
+    // subscription: wait until both hear the other, up to 20 s, rather than
+    // measuring once after a fixed delay (6 s was once not enough in a gate
+    // run; the time it takes is printed).
+    let rejoined = std::time::Instant::now();
+    let (mut alice_hears, mut carol_hears);
+    loop {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        alice_hears = alice_audio.level(CAROL_HZ, 2.0);
+        carol_hears = carol_audio.level(ALICE_HZ, 2.0);
+        let heard = alice_hears > HEARD && carol_hears > HEARD;
+        if (heard && rejoined.elapsed() >= Duration::from_secs(3))
+            || rejoined.elapsed() > Duration::from_secs(20)
+        {
+            break;
+        }
+    }
+    eprintln!(
+        "after carol rejoined ({:?}): alice hears carol {alice_hears:.4}, carol hears alice {carol_hears:.4}",
+        rejoined.elapsed()
+    );
+    assert!(
+        alice_hears > HEARD,
+        "after rejoin, alice hears carol: {alice_hears:.4}"
+    );
+    assert!(
+        carol_hears > HEARD,
+        "after rejoin, carol hears alice (rotated key): {carol_hears:.4}"
+    );
+
     for core in [&alice, &carol] {
         core.commands.send(Command::LeaveCall).await.unwrap();
         core.commands.send(Command::Shutdown).await.unwrap();

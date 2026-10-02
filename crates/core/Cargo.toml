@@ -11,7 +11,8 @@ name = "tessera-cli"
 path = "src/bin/tessera-cli.rs"
 
 [dependencies]
-matrix-sdk = { version = "=0.19.1", features = ["bundled-sqlite", "local-server", "markdown", "qrcode"] }
+# experimental-send-custom-to-device: Olm-encrypted call keys (Phase 6 Task 9).
+matrix-sdk = { version = "=0.19.1", features = ["bundled-sqlite", "local-server", "markdown", "qrcode", "experimental-send-custom-to-device"] }
 matrix-sdk-ui = "=0.19.1"
 # Only to name `UtdCause` (not re-exported by matrix-sdk or matrix-sdk-ui); same pin as matrix-sdk.
 matrix-sdk-crypto = "=0.19.1"

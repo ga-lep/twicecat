@@ -1356,8 +1356,12 @@ impl Engine {
         let client = active.client.clone();
         if let Some(call) = &self.call {
             if call.room_id == room_id {
-                self.emit(CoreEvent::CallState(CallState::Connected { room_id }))
-                    .await;
+                let encrypted = call.encrypted;
+                self.emit(CoreEvent::CallState(CallState::Connected {
+                    room_id,
+                    encrypted,
+                }))
+                .await;
                 return;
             }
             self.leave_call().await;
@@ -1385,9 +1389,13 @@ impl Engine {
         .await
         {
             Ok(session) => {
+                let encrypted = session.encrypted;
                 self.call = Some(session);
-                self.emit(CoreEvent::CallState(CallState::Connected { room_id }))
-                    .await;
+                self.emit(CoreEvent::CallState(CallState::Connected {
+                    room_id,
+                    encrypted,
+                }))
+                .await;
             }
             Err(e) => {
                 self.stop_call_audio().await;
@@ -1478,8 +1486,12 @@ impl Engine {
             }
             MediaNotice::Reconnected => {
                 self.call_reconnects = 0;
-                self.emit(CoreEvent::CallState(CallState::Connected { room_id }))
-                    .await;
+                let encrypted = self.call.as_ref().is_some_and(|c| c.encrypted);
+                self.emit(CoreEvent::CallState(CallState::Connected {
+                    room_id,
+                    encrypted,
+                }))
+                .await;
             }
             MediaNotice::Disconnected => {
                 if let Some(call) = self.call.take() {

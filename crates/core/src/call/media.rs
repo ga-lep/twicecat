@@ -14,6 +14,9 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock};
 use std::time::Duration;
 
 use futures_util::StreamExt as _;
+use livekit::e2ee::E2eeOptions;
+use livekit::e2ee::manager::E2eeManager;
+use livekit::id::ParticipantIdentity;
 use livekit::options::{AudioEncoding, TrackPublishOptions};
 use livekit::prelude::{
     LocalAudioTrack, LocalTrack, Participant, RemoteAudioTrack, RemoteTrack, Room, RoomEvent,
@@ -75,6 +78,28 @@ pub(crate) type Expected = watch::Receiver<BTreeSet<String>>;
 pub(crate) struct Publish {
     pub outgoing: Option<Outgoing>,
     pub bitrate_kbps: u16,
+    /// In an encrypted call: the index of our current key. LiveKit's native
+    /// encryptor uses the index it was given (0 by default), not the latest
+    /// key set, so a rotation has to be applied to our track's cryptor.
+    pub key_index: Option<watch::Receiver<i32>>,
+}
+
+/// Keeps our published tracks' encryptors on our current key index.
+struct KeyIndex {
+    e2ee: E2eeManager,
+    local: ParticipantIdentity,
+    index: watch::Receiver<i32>,
+}
+
+impl KeyIndex {
+    fn apply(&self) {
+        let index = *self.index.borrow();
+        for ((identity, _), cryptor) in self.e2ee.frame_cryptors() {
+            if identity == self.local {
+                cryptor.set_key_index(index);
+            }
+        }
+    }
 }
 
 /// The user of a `user:device` identity.
@@ -171,6 +196,9 @@ pub(crate) struct SfuConnection {
 
 /// What a connection needs besides its SFU access.
 pub(crate) struct ConnectionShared {
+    /// The call's frame encryption (one key provider for all SFUs), in an
+    /// encrypted room.
+    pub encryption: Option<E2eeOptions>,
     pub voice: Option<Voice>,
     pub volumes: UserVolumes,
     pub flags: SharedFlags,
@@ -188,17 +216,23 @@ impl SfuConnection {
         mut expected: Expected,
         shared: &ConnectionShared,
     ) -> Result<Self, CoreError> {
-        let (room, room_events) = tokio::time::timeout(
-            CONNECT_TIMEOUT,
-            Room::connect(&sfu.url, &sfu.jwt, RoomOptions::default()),
-        )
-        .await
-        .map_err(|_| CoreError::Call("connecting to the call server timed out".into()))?
-        .map_err(|_| CoreError::Call("could not connect to the call server".into()))?;
+        let mut options = RoomOptions::default();
+        options.encryption = shared.encryption.clone();
+        let (room, room_events) =
+            tokio::time::timeout(CONNECT_TIMEOUT, Room::connect(&sfu.url, &sfu.jwt, options))
+                .await
+                .map_err(|_| CoreError::Call("connecting to the call server timed out".into()))?
+                .map_err(|_| CoreError::Call("could not connect to the call server".into()))?;
 
         let mut tasks = Vec::new();
         let mut track = None;
+        let mut key_index = None;
         if let Some(publish) = publish {
+            key_index = publish.key_index.map(|index| KeyIndex {
+                e2ee: room.e2ee_manager().clone(),
+                local: room.local_participant().identity(),
+                index,
+            });
             let source = NativeAudioSource::new(
                 // Our own pipeline already did echo cancellation, noise
                 // suppression and gain.
@@ -253,6 +287,7 @@ impl SfuConnection {
             },
             room_events,
             expected,
+            key_index,
         )));
         Ok(Self {
             key,
@@ -415,13 +450,31 @@ async fn handle_events(
     cx: EventContext,
     mut events: mpsc::UnboundedReceiver<RoomEvent>,
     mut expected: Expected,
+    mut key_index: Option<KeyIndex>,
 ) {
     let mut expected_open = true;
+    let mut index_open = key_index.is_some();
     // Who speaks on this SFU, as last seen starting (see
     // `ActiveSpeakersChanged` below).
     let mut talkers: HashMap<String, Participant> = HashMap::new();
     loop {
         let event = tokio::select! {
+            changed = async {
+                match key_index.as_mut() {
+                    Some(k) => k.index.changed().await,
+                    None => std::future::pending().await,
+                }
+            }, if index_open => {
+                match changed {
+                    Ok(()) => {
+                        if let Some(k) = &key_index {
+                            k.apply();
+                        }
+                    }
+                    Err(_) => index_open = false,
+                }
+                continue;
+            }
             event = events.recv() => match event {
                 Some(event) => event,
                 None => return,
@@ -438,6 +491,13 @@ async fn handle_events(
             }
         };
         match event {
+            // Also after a full reconnect, which republishes with a fresh
+            // encryptor.
+            RoomEvent::LocalTrackPublished { .. } => {
+                if let Some(k) = &key_index {
+                    k.apply();
+                }
+            }
             RoomEvent::TrackSubscribed {
                 track: RemoteTrack::Audio(track),
                 participant,

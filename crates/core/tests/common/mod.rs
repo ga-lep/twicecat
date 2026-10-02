@@ -232,9 +232,37 @@ pub async fn create_room(
     name: &str,
     invitee: Option<&str>,
 ) -> matrix_sdk::ruma::OwnedRoomId {
+    create_room_with(creator, name, invitee, false).await
+}
+
+/// Like [`create_room`], with Megolm encryption enabled from the start.
+pub async fn create_encrypted_room(
+    creator: &matrix_sdk::Client,
+    name: &str,
+    invitee: Option<&str>,
+) -> matrix_sdk::ruma::OwnedRoomId {
+    create_room_with(creator, name, invitee, true).await
+}
+
+async fn create_room_with(
+    creator: &matrix_sdk::Client,
+    name: &str,
+    invitee: Option<&str>,
+    encrypted: bool,
+) -> matrix_sdk::ruma::OwnedRoomId {
     use matrix_sdk::ruma::api::client::room::create_room::v3::Request;
+    use matrix_sdk::ruma::events::InitialStateEvent;
+    use matrix_sdk::ruma::events::room::encryption::RoomEncryptionEventContent;
     let mut request = Request::new();
     request.name = Some(name.to_owned());
+    if encrypted {
+        request.initial_state = vec![
+            InitialStateEvent::with_empty_state_key(
+                RoomEncryptionEventContent::with_recommended_defaults(),
+            )
+            .to_raw_any(),
+        ];
+    }
     if let Some(user) = invitee {
         request
             .invite
@@ -516,37 +544,6 @@ pub async fn seed_recovery(n: u8, passphrase: Option<&str>) -> zeroize::Zeroizin
     client.logout().await.expect("log the reset device out");
     println!("e2ee seed {}: {removed} devices removed", env.user(n));
     zeroize::Zeroizing::new(key)
-}
-
-/// Creates an encrypted room (initial `m.room.encryption` state,
-/// `m.megolm.v1.aes-sha2`) as `creator` and invites `invitee` when given.
-pub async fn create_encrypted_room(
-    creator: &matrix_sdk::Client,
-    name: &str,
-    invitee: Option<&str>,
-) -> matrix_sdk::ruma::OwnedRoomId {
-    use matrix_sdk::ruma::api::client::room::create_room::v3::Request;
-    use matrix_sdk::ruma::events::InitialStateEvent;
-    use matrix_sdk::ruma::events::room::encryption::RoomEncryptionEventContent;
-    let mut request = Request::new();
-    request.name = Some(name.to_owned());
-    request.initial_state = vec![
-        InitialStateEvent::with_empty_state_key(
-            RoomEncryptionEventContent::with_recommended_defaults(),
-        )
-        .to_raw_any(),
-    ];
-    if let Some(user) = invitee {
-        request
-            .invite
-            .push(user.try_into().expect("valid invitee user id"));
-    }
-    creator
-        .create_room(request)
-        .await
-        .expect("create encrypted room")
-        .room_id()
-        .to_owned()
 }
 
 /// The `type` of the event `event_id` in `room`, read raw from the server

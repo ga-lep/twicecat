@@ -78,6 +78,9 @@ pub enum CallState {
     Connected {
         /// Room of the call.
         room_id: RoomId,
+        /// Media is end-to-end encrypted (an encrypted room, as Element
+        /// Call does).
+        encrypted: bool,
     },
     /// The SFU connection dropped; reconnecting.
     Reconnecting {

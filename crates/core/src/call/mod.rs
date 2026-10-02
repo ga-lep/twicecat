@@ -11,10 +11,13 @@
 //!    membership before it expires, and report the participants;
 //! 7. multi-SFU: subscribe on every other member's SFU (their own call
 //!    service, e.g. another homeserver's), opened and closed as members come
-//!    and go.
+//!    and go;
+//! 8. in an encrypted room, encrypt our media with our own key and send it
+//!    to the other members, Olm-encrypted (`e2ee`).
 //!
 //! Leaving fires the delayed leave at once (or sends the empty membership).
 
+mod e2ee;
 mod jwt;
 mod media;
 pub(crate) mod membership;
@@ -23,12 +26,17 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use matrix_sdk::deserialized_responses::RawAnySyncOrStrippedState;
+use livekit::e2ee::key_provider::KeyProvider;
+use livekit::e2ee::{E2eeOptions, EncryptionType};
+use livekit::id::ParticipantIdentity;
+use matrix_sdk::deserialized_responses::{EncryptionInfo, RawAnySyncOrStrippedState};
+use matrix_sdk::event_handler::EventHandlerHandle;
 use matrix_sdk::ruma::api::client::delayed_events::update_delayed_event::UpdateAction;
 use matrix_sdk::ruma::api::client::delayed_events::update_delayed_event::unstable_v2 as update_delayed;
 use matrix_sdk::ruma::api::client::delayed_events::{DelayParameters, delayed_state_event};
 use matrix_sdk::ruma::api::client::rtc::RtcTransport;
 use matrix_sdk::ruma::api::error::ErrorKind;
+use matrix_sdk::ruma::events::AnyToDeviceEvent;
 use matrix_sdk::ruma::events::StateEventType;
 use matrix_sdk::ruma::serde::Raw;
 use matrix_sdk::{Client, Room, RoomState};
@@ -36,6 +44,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, Notify, mpsc, watch};
 use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 
+use self::e2ee::{KeyPlanner, Recipient};
 pub(crate) use self::media::MediaNotice;
 use self::media::{ConnectionShared, Publish, SfuConnection, SharedFlags};
 use self::membership::{
@@ -80,6 +89,10 @@ pub(crate) struct CallSession {
     remotes: Remotes,
     flags: SharedFlags,
     own_identity: String,
+    /// Media is end-to-end encrypted (the room is).
+    pub encrypted: bool,
+    /// Receives the other members' call keys, in an encrypted room.
+    key_handler: Option<EventHandlerHandle>,
     /// SFU connection notices for the engine.
     pub notices: mpsc::Receiver<MediaNotice>,
     tasks: Vec<JoinHandle<()>>,
@@ -274,6 +287,11 @@ impl CallSession {
             .ok_or(CoreError::NotLoggedIn)?
             .to_string();
         let service_url = own_livekit_service(client, service_override).await?;
+        let encrypted = room
+            .latest_encryption_state()
+            .await
+            .map_err(|_| CoreError::Call("could not check whether the room is encrypted".into()))?
+            .is_encrypted();
         let version = room
             .version()
             .map_or_else(|| "1".to_owned(), |v| v.as_str().to_owned());
@@ -304,6 +322,8 @@ impl CallSession {
             remotes: remotes.clone(),
             flags: flags.clone(),
             own_identity: own_identity.clone(),
+            encrypted,
+            key_handler: None,
             notices,
             tasks: Vec::new(),
         };
@@ -323,17 +343,45 @@ impl CallSession {
             },
             joined_ms,
         )));
+        // In an encrypted room: our first key, used at once, and the others'
+        // keys as they arrive (registered before anyone can see us join).
+        let keys = encrypted.then(|| KeyProvider::new(e2ee::key_provider_options()));
+        let planner = keys.as_ref().map(|provider| {
+            let first = e2ee::random_key();
+            provider.set_key(
+                &ParticipantIdentity(own_identity.clone()),
+                0,
+                first.to_vec(),
+            );
+            KeyPlanner::new(first, Instant::now())
+        });
+        if let Some(provider) = &keys {
+            let provider = provider.clone();
+            let room_id = room_id.as_str().to_owned();
+            session.key_handler = Some(client.add_event_handler(
+                move |event: Raw<AnyToDeviceEvent>, info: Option<EncryptionInfo>| {
+                    let provider = provider.clone();
+                    let room_id = room_id.clone();
+                    async move { receive_key(&event, info.as_ref(), &room_id, &provider) }
+                },
+            ));
+        }
         if let Err(e) = send_membership(&room, &state_key, content).await {
             session.leave().await;
             return Err(e);
         }
         let shared = ConnectionShared {
+            encryption: keys.as_ref().map(|provider| E2eeOptions {
+                encryption_type: EncryptionType::Gcm,
+                key_provider: provider.clone(),
+            }),
             voice: audio.voice,
             volumes: volumes.clone(),
             flags: flags.clone(),
             notices: notices_all,
         };
         let (own_expected, own_expected_rx) = watch::channel(BTreeSet::new());
+        let (key_index, key_index_rx) = watch::channel(0);
         let own = match jwt::sfu_access(client, &service_url, room_id.as_str()).await {
             Ok(sfu) => {
                 SfuConnection::connect(
@@ -342,6 +390,7 @@ impl CallSession {
                     Some(Publish {
                         outgoing: audio.outgoing,
                         bitrate_kbps: audio.bitrate_kbps,
+                        key_index: encrypted.then_some(key_index_rx),
                     }),
                     own_expected_rx,
                     &shared,
@@ -358,6 +407,18 @@ impl CallSession {
             }
         }
         let (expected_tx, expected_rx) = watch::channel(Expected::new());
+        let (recipients, recipients_rx) = watch::channel(Vec::new());
+        if let (Some(provider), Some(planner)) = (keys, planner) {
+            session.tasks.push(tokio::spawn(distribute_keys(
+                client.clone(),
+                room_id.as_str().to_owned(),
+                own_identity.clone(),
+                planner,
+                provider,
+                key_index,
+                recipients_rx,
+            )));
+        }
 
         session.tasks.push(tokio::spawn(watch_participants(
             room,
@@ -369,6 +430,7 @@ impl CallSession {
                 identity: own_identity,
                 service: service_url.clone(),
                 expected: expected_tx,
+                recipients,
                 gone: own_gone,
             },
         )));
@@ -416,6 +478,9 @@ impl CallSession {
 
     /// Leaves: stops the tasks and removes our membership.
     pub(crate) async fn leave(mut self) {
+        if let Some(handle) = self.key_handler.take() {
+            self.room.client().remove_event_handler(handle);
+        }
         for task in self.tasks.drain(..) {
             task.abort();
             let _ = task.await;
@@ -584,6 +649,8 @@ struct Ours {
     service: String,
     /// Who to play on which SFU, for `manage_sfus`.
     expected: watch::Sender<Expected>,
+    /// The other members' devices, for our key (`distribute_keys`).
+    recipients: watch::Sender<Vec<Recipient>>,
     /// Told when our membership, once seen, is gone (`keep_membership`).
     gone: Arc<Notify>,
 }
@@ -617,6 +684,20 @@ async fn watch_participants(
         ours.expected.send_if_modified(|e| {
             let changed = *e != expected;
             *e = expected;
+            changed
+        });
+        let recipients: Vec<Recipient> = active
+            .iter()
+            .filter(|m| m.backend_identity != ours.identity)
+            .map(|m| Recipient {
+                user_id: m.user_id.clone(),
+                device_id: m.device_id.clone(),
+                since: m.joined_ms,
+            })
+            .collect();
+        ours.recipients.send_if_modified(|r| {
+            let changed = *r != recipients;
+            *r = recipients;
             changed
         });
         let now = participants(&room, &active, &volumes, &flags).await;
@@ -721,6 +802,7 @@ async fn manage_sfus(
                 let url = url.clone();
                 let rx = remote.expected.subscribe();
                 let shared = ConnectionShared {
+                    encryption: m.shared.encryption.clone(),
                     voice: m.shared.voice.clone(),
                     volumes: m.shared.volumes.clone(),
                     flags: m.shared.flags.clone(),
@@ -773,6 +855,81 @@ async fn manage_sfus(
                 }
             }
             _ = ticker.tick() => {}
+        }
+    }
+}
+
+/// Takes a member's call key from a decrypted to-device event. Keys sent
+/// in clear, for another room, or claiming another device than the Olm
+/// session's are ignored.
+fn receive_key(
+    event: &Raw<AnyToDeviceEvent>,
+    info: Option<&EncryptionInfo>,
+    room_id: &str,
+    provider: &KeyProvider,
+) {
+    let Ok(event) = event.deserialize_as::<Value>() else {
+        return;
+    };
+    if event.get("type").and_then(Value::as_str) != Some(e2ee::KEYS_EVENT) {
+        return;
+    }
+    let Some(info) = info else {
+        tracing::warn!("call key sent unencrypted; ignored");
+        return;
+    };
+    let Some(key) = event.get("content").and_then(|content| {
+        e2ee::parse_key(
+            content,
+            info.sender.as_str(),
+            info.sender_device.as_deref().map(|d| d.as_str()),
+            room_id,
+        )
+    }) else {
+        return;
+    };
+    provider.set_key(
+        &ParticipantIdentity(membership::member_id(&key.user_id, &key.device_id)),
+        i32::from(key.index),
+        key.key.to_vec(),
+    );
+}
+
+/// Shares our key with the members as they come, rotates it as they go,
+/// and retries devices it could not reach. A new key is used after
+/// `USE_KEY_DELAY`, once the others have it (also when some could not be
+/// reached: they get it on the next try), or at once with nobody to send
+/// it to.
+async fn distribute_keys(
+    client: Client,
+    room_id: String,
+    own_identity: String,
+    mut planner: KeyPlanner,
+    provider: KeyProvider,
+    key_index: watch::Sender<i32>,
+    mut members: watch::Receiver<Vec<Recipient>>,
+) {
+    let own = ParticipantIdentity(own_identity.clone());
+    let mut retry = tokio::time::interval(PARTICIPANT_RECHECK);
+    loop {
+        let now = members.borrow_and_update().clone();
+        if let Some(rollout) = planner.plan(&now, Instant::now(), e2ee::random_key) {
+            if !rollout.to.is_empty() {
+                let got =
+                    e2ee::send_key(&client, &room_id, &own_identity, &rollout, now_ms()).await;
+                planner.shared(&got);
+                if rollout.rotated {
+                    tokio::time::sleep(e2ee::USE_KEY_DELAY).await;
+                }
+            }
+            if rollout.rotated {
+                provider.set_key(&own, i32::from(rollout.index), rollout.key.to_vec());
+                key_index.send_replace(i32::from(rollout.index));
+            }
+        }
+        tokio::select! {
+            changed = members.changed() => if changed.is_err() { return },
+            _ = retry.tick() => {}
         }
     }
 }
