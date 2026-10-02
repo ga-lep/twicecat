@@ -10,8 +10,8 @@ use std::time::Duration;
 use iced::theme;
 use iced::{Element, Subscription, Task, Theme, clipboard, system, window};
 use tessera_core::api::{
-    Command, CoreError, CoreEvent, ListDiff, MessageText, Password, RoomId, RoomSummary, SyncState,
-    TimelineItem, UserId,
+    Command, CoreError, CoreEvent, ListDiff, MessageText, Password, RoomId, RoomListQuery,
+    RoomListTab, RoomSummary, SyncState, TimelineItem, UserId,
 };
 use tokio::sync::mpsc;
 
@@ -113,6 +113,17 @@ pub enum Message {
     LogoutRequested,
     /// The user picked a room in the list.
     SelectRoom(RoomId),
+    /// The user picked a tab above the room list.
+    TabSelected(RoomListTab),
+    /// The room list search field changed.
+    SearchChanged(String),
+    /// The room list scrolled, or its size changed.
+    RoomListScrolled {
+        /// Pixels scrolled from the top.
+        offset_y: f32,
+        /// Height of the visible part, in pixels.
+        viewport_h: f32,
+    },
     /// The user asked to close the window.
     CloseRequested,
     /// The core did not close in time after `Shutdown`.
@@ -137,6 +148,16 @@ pub struct App {
     pub rooms: Vec<RoomSummary>,
     /// How many rooms the server reported, once the first load is done.
     pub total_rooms: Option<u32>,
+    /// The room list query last sent to the core (the search is trimmed).
+    pub query: RoomListQuery,
+    /// The search field as typed, untrimmed.
+    pub search_input: String,
+    /// Scroll offset of the room list, in pixels.
+    pub list_offset_y: f32,
+    /// Height of the room list viewport, in pixels.
+    pub list_viewport_h: f32,
+    /// The loaded length for which `LoadMoreRooms` was last sent.
+    pub load_more_at: Option<usize>,
     /// The room whose timeline is open.
     pub selected: Option<RoomId>,
     /// The selected room's timeline, kept in step with the core's diffs.
@@ -202,6 +223,11 @@ impl App {
             screen: Screen::Starting,
             rooms: Vec::new(),
             total_rooms: None,
+            query: RoomListQuery::default(),
+            search_input: String::new(),
+            list_offset_y: 0.0,
+            list_viewport_h: room_list::DEFAULT_VIEWPORT_HEIGHT,
+            load_more_at: None,
             selected: None,
             timeline: Vec::new(),
             user_id: None,
@@ -303,6 +329,29 @@ impl App {
                 self.clear_draft();
                 self.send(Command::SelectRoom(id))
             }
+            Message::TabSelected(tab) => {
+                let query = RoomListQuery {
+                    tab,
+                    search: self.query.search.clone(),
+                };
+                self.set_query(query)
+            }
+            Message::SearchChanged(search) => {
+                let query = RoomListQuery {
+                    tab: self.query.tab,
+                    search: search.trim().to_owned(),
+                };
+                self.search_input = search;
+                self.set_query(query)
+            }
+            Message::RoomListScrolled {
+                offset_y,
+                viewport_h,
+            } => {
+                self.list_offset_y = offset_y;
+                self.list_viewport_h = viewport_h;
+                self.check_paging()
+            }
             Message::CloseRequested => {
                 if self.screen == Screen::ShuttingDown {
                     return Task::none();
@@ -379,15 +428,22 @@ impl App {
                 if selection_gone {
                     self.deselect();
                 }
+                if self.rooms.is_empty() {
+                    // No scrollable is built for an empty list; it restarts
+                    // at the top.
+                    self.list_offset_y = 0.0;
+                }
                 if self.screen == Screen::Loading && !self.rooms.is_empty() {
                     self.screen = Screen::Main;
                 }
+                task = self.check_paging();
             }
             CoreEvent::RoomListLoaded { total_rooms } => {
                 self.total_rooms = total_rooms;
                 if self.screen == Screen::Loading {
                     self.screen = Screen::Main;
                 }
+                task = self.check_paging();
             }
             CoreEvent::TimelineDiff { room_id, diffs } => {
                 self.apply_timeline(&room_id, &diffs);
@@ -503,6 +559,39 @@ impl App {
         }
     }
 
+    /// Keeps `query` and asks the core for it, unless it is the query the core
+    /// already has. The list comes back as a `Reset`, so paging may ask again.
+    fn set_query(&mut self, query: RoomListQuery) -> Task<Message> {
+        if query == self.query {
+            return Task::none();
+        }
+        self.query = query.clone();
+        self.load_more_at = None;
+        self.send(Command::SetRoomListQuery(query))
+    }
+
+    /// The paging bookkeeping (plan Q8): asks for the next page when the
+    /// built rows reach the end of the loaded list, at most once per loaded
+    /// length.
+    fn check_paging(&mut self) -> Task<Message> {
+        let len = self.rooms.len();
+        if self.load_more_at == Some(len) {
+            return Task::none();
+        }
+        let range = room_list::visible_range(
+            self.list_offset_y,
+            self.list_viewport_h,
+            room_list::ROW_HEIGHT,
+            len,
+            room_list::OVERSCAN_ROWS,
+        );
+        if !room_list::should_load_more(range.end, len, self.total_rooms) {
+            return Task::none();
+        }
+        self.load_more_at = Some(len);
+        self.send(Command::LoadMoreRooms)
+    }
+
     /// Sends the composer text to the selected room and clears the field.
     fn submit_composer(&mut self) -> Task<Message> {
         if self.selected.is_none() || self.composer.expose().trim().is_empty() {
@@ -531,6 +620,8 @@ impl App {
         self.user_id = None;
         self.rooms.clear();
         self.total_rooms = None;
+        self.load_more_at = None;
+        self.list_offset_y = 0.0;
         self.deselect();
         self.sync_state = SyncState::Idle;
         self.notice = Some(notice.to_owned());

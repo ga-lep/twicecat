@@ -6,6 +6,7 @@
 pub mod loading;
 pub mod login;
 pub mod main_view;
+pub mod room_list_pane;
 
 use iced::widget::{container, text};
 use iced::{Element, Fill};

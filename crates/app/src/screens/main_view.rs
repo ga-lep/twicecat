@@ -1,14 +1,15 @@
-//! The two-pane main layout: the room list on the left (Task 10 fills it) and
-//! a minimal room view on the right (plan Q15; Phase 3 replaces it).
+//! The two-pane main layout: the room list pane on the left and a minimal
+//! room view on the right (plan Q15; Phase 3 replaces it).
 
 use iced::font::Weight;
 use iced::widget::{button, column, container, row, scrollable, space, text, text_input};
-use iced::{Element, Fill, Font, Length};
+use iced::{Element, Fill, Font};
 use tessera_core::api::{MessageText, TimelineItem, TimelineItemKind, UserId};
 
 use crate::screens::loading::sync_label;
+use crate::screens::room_list_pane;
 use crate::state::{App, Message};
-use crate::text_safety::{MAX_NAME_CHARS, one_line, one_line_capped};
+use crate::text_safety::{MAX_BODY_CHARS, MAX_NAME_CHARS, one_line_capped};
 use crate::theme;
 
 /// Width of the left pane.
@@ -16,10 +17,6 @@ pub const LIST_PANE_WIDTH: f32 = 300.0;
 
 /// How many timeline messages the right pane shows.
 pub const MAX_MESSAGES: usize = 50;
-
-/// How many rooms the placeholder list shows until Task 10 replaces it with
-/// the windowed list.
-const PLACEHOLDER_ROWS: usize = 100;
 
 /// The last [`MAX_MESSAGES`] message items, oldest first, as `(sender, body)`.
 /// Other kinds of item are skipped.
@@ -43,7 +40,7 @@ pub fn last_messages(items: &[TimelineItem]) -> Vec<(&UserId, &str)> {
 pub struct DisplayLine {
     /// The sender, sanitised and capped.
     pub sender: String,
-    /// The body, sanitised onto one line.
+    /// The body, sanitised onto one line and capped.
     pub body: String,
 }
 
@@ -53,7 +50,7 @@ pub fn display_lines(items: &[TimelineItem]) -> Vec<DisplayLine> {
         .into_iter()
         .map(|(sender, body)| DisplayLine {
             sender: one_line_capped(&sender.to_string(), MAX_NAME_CHARS),
-            body: one_line(body),
+            body: one_line_capped(body, MAX_BODY_CHARS),
         })
         .collect()
 }
@@ -66,26 +63,10 @@ pub fn display_name(name: &str) -> String {
 /// The main screen: panes above a status bar.
 pub fn view(app: &App) -> Element<'_, Message> {
     column![
-        row![room_list_pane(app), room_pane(app)].height(Fill),
+        row![room_list_pane::view(app), room_pane(app)].height(Fill),
         status_bar(app)
     ]
     .into()
-}
-
-/// Placeholder for the room list: the first rows as plain buttons.
-fn room_list_pane(app: &App) -> Element<'_, Message> {
-    let rows = app.rooms.iter().take(PLACEHOLDER_ROWS).map(|room| {
-        button(text(display_name(&room.name)))
-            .on_press(Message::SelectRoom(room.id.clone()))
-            .style(button::text)
-            .width(Fill)
-            .into()
-    });
-    container(scrollable(column(rows)).height(Fill))
-        .width(Length::Fixed(LIST_PANE_WIDTH))
-        .height(Fill)
-        .padding(8)
-        .into()
 }
 
 /// The selected room: name, last messages, composer.
@@ -133,13 +114,17 @@ fn room_pane(app: &App) -> Element<'_, Message> {
     container(body).width(Fill).height(Fill).padding(8).into()
 }
 
+/// The signed-in user ID for the status bar: one line, capped. It comes from
+/// the server, so it is sanitised like any other remote text.
+pub fn account_label(user_id: Option<&UserId>) -> String {
+    user_id.map_or_else(String::new, |id| {
+        one_line_capped(&id.to_string(), MAX_NAME_CHARS)
+    })
+}
+
 /// Sync state, account and **Log out**.
 fn status_bar(app: &App) -> Element<'_, Message> {
-    let account = app
-        .user_id
-        .as_ref()
-        .map(ToString::to_string)
-        .unwrap_or_default();
+    let account = account_label(app.user_id.as_ref());
     container(
         row![
             text(format!("Sync: {}", sync_label(&app.sync_state))).style(|t| text::Style {
@@ -240,6 +225,28 @@ mod tests {
         let lines = display_lines(&items);
         assert!(!lines[0].sender.contains('\n'));
         assert_eq!(lines[0].sender.chars().count(), 256);
+    }
+
+    #[test]
+    fn bodies_are_capped() {
+        let items = [message_from("@a:x", &"b".repeat(10_000))];
+        let lines = display_lines(&items);
+        assert_eq!(lines[0].body.chars().count(), MAX_BODY_CHARS);
+        assert!(lines[0].body.ends_with('\u{2026}'));
+        let items = [message_from("@a:x", &"b".repeat(MAX_BODY_CHARS))];
+        assert_eq!(
+            display_lines(&items)[0].body.chars().count(),
+            MAX_BODY_CHARS
+        );
+    }
+
+    #[test]
+    fn the_account_label_is_sanitised_and_capped() {
+        assert_eq!(account_label(None), "");
+        let id = UserId::from("@a\u{202E}b:x");
+        assert_eq!(account_label(Some(&id)), "@a\u{FFFD}b:x");
+        let long = UserId::from(format!("@{}:x", "u".repeat(1000)));
+        assert_eq!(account_label(Some(&long)).chars().count(), 256);
     }
 
     #[test]
