@@ -1181,7 +1181,7 @@ Phase 2 signed off by the human on 2026-10-02 (merge of PR #3). Every other unti
 - [x] 4. Audio devices and I/O threads (tessera-audio, cpal PipeWire)
 - [x] 5. Processing chain (sonora AEC3/NS/AGC2, denormal guard, RNNoise, gate, PTT tail)
 - [x] 6. Mixer and playout (per-user volume, deafen, AEC render tap, mic test)
-- [ ] 7. MatrixRTC signalling (transports, JWT, m.call.member, delayed leave)
+- [x] 7. MatrixRTC signalling (transports, JWT, m.call.member, delayed leave)
 - [ ] 8. LiveKit media (publish, subscribe, reconnection)
 - [ ] 9. Call E2EE (per-sender keys over to-device)
 - [ ] 10. Ringing and voice rooms
@@ -1254,6 +1254,27 @@ Phase 2 signed off by the human on 2026-10-02 (merge of PR #3). Every other unti
 - Open issues: the mic test and every real device path are human items. The `VoiceControl` command queue (64) returns `false` when full (a stuck processing thread); callers ignore that for now.
 - New human items: `cargo test -p tessera-core -- --ignored hardware_` (mic test: levels arrive), and the mic test by ear (loopback with headphones).
 
+## Phase 6 / Task 7 notes
+- Checks run (all pass): `cargo fmt --all --check`; `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` (a first run flagged `comparison_to_empty`, fixed); `cargo test --workspace --locked` (188 passed, 20 ignored; 12 new `call::` unit tests); `scripts/check-app-deps.sh` (and `livekit`); `scripts/check-core-api.sh`; `scripts/check-no-webrtc-download.sh`; `cargo deny check` (see the advisory note below); ignored suite `--ignored --skip keyring --skip hardware_` twice in a row, 16/16 (2 new in `tests/call_signalling.rs`, ~28 s each because one waits out the 18 s delay).
+- **New advisory, not caused by this task:** `cargo deny check` began failing on RUSTSEC-2026-0319 (`anymap2` unmaintained; informational, no vulnerability; published 2026-10-02, no patched version). `anymap2` 0.13.0 comes from the pinned matrix-sdk 0.19.1 and is already in main's Cargo.lock, so main's CI fails on it too. Following the Phase 0 precedent for unmaintained notices from pinned crates (paste, ttf-parser via iced), it is ignored in deny.toml with a reason, to be revisited on the next matrix-sdk bump (a pin change needs the human, rule 3). Human item: confirm this ignore.
+- **Interop reference (rule 2):** read at tags in the scratchpad, nothing copied: matrix-js-sdk v43.0.0 `src/matrixrtc/{CallMembership,MembershipManager}.ts`, and Element Call v0.26.1 `src/livekit/openIDSFU.ts`, `src/config/ConfigOptions.ts`, `src/state/CallViewModel/localMember/LocalMember.ts`. Facts used:
+  - EC's default `MatrixRTCMode` is `Compatibility` (CallViewModel.ts:536): state events, legacy `/sfu/get`, multi-SFU.
+  - In that mode the LiveKit identity for session memberships is `` `${sender}:${device_id}` `` (CallMembership.ts:108-116), and `membershipID` is sent as `user:device` (MembershipManager.ts:1031).
+  - State key `_${user}_${device}_m.call` (:983-995).
+  - Content fields (:1016-1035).
+  - EC compatibility join: `multi_sfu` focus with `foci_preferred: [{livekit_alias: roomId, ...transport}]` (LocalMember.ts:1022-1050).
+  - Delayed leave 18 s, restart 4 s (ConfigOptions.ts:311).
+  - `/sfu/get` body `{room, openid_token, device_id, delay_*?}` (openIDSFU.ts:189-224).
+- SDK and ruma APIs used: `Room::send_state_event_raw(&str, &str, impl IntoRawStateEventContent)` (matrix-sdk-0.19.1/src/room/mod.rs:3384; `serde_json::Value` impl at src/utils/mod.rs:174), `Room::get_state_events(StateEventType)` (:1303) → `deserialized_responses::RawAnySyncOrStrippedState` (matrix-sdk-base src/deserialized_responses.rs:282), `Raw::deserialize_as` (ruma-common src/serde/raw.rs:191), `Room::version` (matrix-sdk-base src/room/mod.rs:593), `Room::subscribe_info` (room_info.rs:86), `Room::get_member_no_sync` (matrix-sdk src/room/mod.rs:1217) and `RoomMember::display_name` (base members.rs:333), `HttpError::client_api_error_kind` (src/error.rs:120), ruma `ErrorKind::{Forbidden, NotFound, Unrecognized}`, `delayed_events::update_delayed_event::{UpdateAction, unstable_v2::Request::new(delay_id, action)}` (`/_matrix/client/unstable/org.matrix.msc4140/delayed_events/{id}/{action}`, which Synapse 1.151 serves: rest/client/delayed_events.py), `delayed_state_event::unstable::Request::new_raw`, and `account::request_openid_token`.
+- Test findings: the first two-device run failed with "could not publish the call membership". Cause: carol's power level (0) was below `state_default` (50) in a room created by a plain client. Element sets `org.matrix.msc3401.call.member: 0` in rooms it creates. The test now does the same through `m.room.power_levels`, and the core maps `M_FORBIDDEN` to "you are not allowed to join calls in this room". Mutation: without the restart task, the membership was gone after 25 s and the test failed; reverted.
+- Test helpers: `login_and_run` and `wait_for_room` moved from tests/timeline.rs to tests/common (shared, no behaviour change).
+- Open issues:
+  - (1) `JoinCall` runs in the engine loop, so other commands wait for the join's network round trips (as login does).
+  - (2) Per Task 2, Synapse drops a delayed leave that hits `rc_message`. On a real server the membership's `expires` (4 h) is the last fallback, and other clients also treat a member whose SFU participant is gone as left (Task 8).
+  - (3) Participant `muted`/`speaking` are placeholders until media.
+  - (4) `DeclineCall` is a stub until Task 10.
+- New human items: none new (Element Call interop is on the list); note that calls in your own rooms need the call-member power level at 0 (Element does this for rooms it creates).
+
 ## Phase 6 known limitations
 - Denormal guard (decision 7, human-approved 2026-10-02, pre-production): `crates/audio/src/denormals.rs` is the one audited `unsafe` function. It sets FTZ/DAZ (x86_64) or FZ (aarch64) on the audio processing thread, because sonora 0.2.0 AEC3 slows down on a silent far end after speech (upstream issue #34; measured 5.5× here, see Task 5). Remove it once a sonora release with upstream PR #38 ships (version bump asked first, rule 3).
 - sonora 0.2.0 allocates about 40 times per 10 ms frame in AEC3 (upstream #39/#40). The processing thread is not a device callback, so this is tolerable, but not real-time clean until upstream ships the fix.
@@ -1263,6 +1284,7 @@ Phase 2 signed off by the human on 2026-10-02 (merge of PR #3). Every other unti
 - [ ] Push the branch and confirm CI is green on Linux x64 and arm64 (`ubuntu-26.04`, `ubuntu-26.04-arm`), Windows and macOS with livekit/libwebrtc in the tree; check build time and disk.
 - [ ] Locally: clang >= 21 and the glib headers (Arch/SteamOS: `sudo pacman -S clang glib2 lld`; Ubuntu 26.04: `clang-22 libglib2.0-dev lld` with `CXX=clang++-22`; Ubuntu 24.04's clang 18 is too old), then `scripts/fetch-libwebrtc.sh` once before building.
 - [ ] Call API additions (Task 3) approved as the UI-phase contract.
+- [ ] Confirm the deny.toml ignore of RUSTSEC-2026-0319 (anymap2 unmaintained, via pinned matrix-sdk 0.19.1; also affects main's CI).
 - [ ] `cargo test -p tessera-core -- --ignored hardware_` passes (opens the microphone; the agent does not run it), and the mic test loopback sounds right on headphones.
 - [ ] Audio quality by ear: real mic and speakers; echo cancellation on open speakers (sonora vs libwebrtc APM A/B); RNNoise on keyboard and fan noise; AGC level; VAD gate threshold.
 - [ ] Device hot-plug (USB headset in and out, Bluetooth) on each OS you use; macOS microphone permission prompt.

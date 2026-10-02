@@ -8,50 +8,16 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{TestEnv, create_room, expect_event, raw_login, start_core, unique_room_name};
+use common::{
+    TestEnv, create_room, expect_event, login_and_run, raw_login, start_core, unique_room_name,
+    wait_for_room,
+};
 use tessera_core::CoreHandle;
 use tessera_core::api::{
-    Command, CoreError, CoreEvent, ListDiff, MessageText, Password, RoomId, RoomSummary,
-    SendStatus, SyncState, TimelineItem, TimelineItemKind,
+    Command, CoreError, CoreEvent, ListDiff, MessageText, RoomId, SendStatus, TimelineItem,
+    TimelineItemKind,
 };
 use tessera_core::secrets::InMemorySecretStore;
-
-async fn login_and_run(core: &mut CoreHandle, env: &TestEnv, n: u8) {
-    core.commands
-        .send(Command::LoginPassword {
-            username: env.user(n).to_owned(),
-            password: Password::from(env.password(n)),
-            server: None,
-        })
-        .await
-        .unwrap();
-    expect_event(core, |e| matches!(e, CoreEvent::LoggedIn { .. })).await;
-    expect_event(core, |e| {
-        matches!(e, CoreEvent::SyncState(SyncState::Running))
-    })
-    .await;
-}
-
-/// Waits until the room list contains `room_id`, so `SelectRoom` can find it.
-async fn wait_for_room(core: &mut CoreHandle, room_id: &str) {
-    let mut rooms: Vec<RoomSummary> = Vec::new();
-    let wait = async {
-        while !rooms.iter().any(|r| r.id.as_str() == room_id) {
-            match core.events.recv().await {
-                Some(CoreEvent::RoomListChanged(diffs)) => {
-                    for diff in diffs {
-                        ListDiff::apply(&diff, &mut rooms);
-                    }
-                }
-                Some(_) => {}
-                None => panic!("event channel closed"),
-            }
-        }
-    };
-    tokio::time::timeout(common::DEFAULT_TIMEOUT, wait)
-        .await
-        .expect("timed out waiting for the room to sync");
-}
 
 /// Applies timeline diffs of `room_id` to `items` until `done` holds.
 async fn apply_until(

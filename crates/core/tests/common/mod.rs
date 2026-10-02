@@ -837,3 +837,24 @@ pub async fn first_device(core: &mut CoreHandle, n: u8) {
     // the login is safe.
     reset_identity_on(core, n).await;
 }
+
+/// Waits until the room list contains `room_id`, so `SelectRoom` can find it.
+pub async fn wait_for_room(core: &mut CoreHandle, room_id: &str) {
+    let mut rooms: Vec<RoomSummary> = Vec::new();
+    let wait = async {
+        while !rooms.iter().any(|r| r.id.as_str() == room_id) {
+            match core.events.recv().await {
+                Some(CoreEvent::RoomListChanged(diffs)) => {
+                    for diff in diffs {
+                        ListDiff::apply(&diff, &mut rooms);
+                    }
+                }
+                Some(_) => {}
+                None => panic!("event channel closed"),
+            }
+        }
+    };
+    tokio::time::timeout(DEFAULT_TIMEOUT, wait)
+        .await
+        .expect("timed out waiting for the room to sync");
+}

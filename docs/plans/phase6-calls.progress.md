@@ -12,3 +12,5 @@ Task 5: complete (gate ok after a collapsible_if fix, boundary ok, cargo deny ok
   notes: [deviation] libwebrtc APM A/B moved to Task 8; [open] sonora allocs per frame (#39), no RT priority yet
 Task 6: complete (gate ok, boundary ok, deny ok, integration --skip keyring --skip hardware_ 14/14; echo-reference mutation fails as expected (2.9 dB))
   notes: [process] hardware_* ignored tests are human-run; CI and agent gate skip them; [open] mic test by ear is human
+Task 7: complete (gate ok, boundary ok, deny ok after RUSTSEC-2026-0319 ignore (anymap2 via matrix-sdk, new today), integration --skip keyring --skip hardware_ 16/16 x2; restart-task mutation fails as expected)
+  notes: [finding] power levels must allow org.matrix.msc3401.call.member (Element sets 0); [interop] EC 0.26.1 compatibility mode: /sfu/get, identity user:device, 18 s / 4 s delayed leave; [human] confirm the deny.toml ignore

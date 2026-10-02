@@ -7,6 +7,7 @@
 pub mod api;
 mod audio_session;
 mod avatars;
+mod call;
 mod call_settings;
 mod client;
 mod drafts;

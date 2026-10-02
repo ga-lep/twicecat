@@ -26,12 +26,13 @@ use tracing::{info, warn};
 use zeroize::Zeroizing;
 
 use crate::api::{
-    ActionKind, AudioDevice, AudioDeviceId, AudioDevices, AudioSettings, Command, CoreError,
-    CoreEvent, DeviceId, Draft, ListDiff, Member, MessageText, OutgoingMessage, PaginationState,
-    Password, RoomId, RoomListQuery, TypingUser, UserId,
+    ActionKind, AudioDevice, AudioDeviceId, AudioDevices, AudioSettings, CallEndReason, CallState,
+    Command, CoreError, CoreEvent, DeviceId, Draft, ListDiff, Member, MessageText, OutgoingMessage,
+    PaginationState, Password, RoomId, RoomListQuery, TypingUser, UserId,
 };
 use crate::audio_session::AudioSession;
 use crate::avatars::{Avatars, SdkFetcher, answer_unavailable};
+use crate::call::{CallSession, UserVolumes};
 use crate::call_settings;
 use crate::client::{
     ServerSpec, WRONG_ACCOUNT, account_bound, build_client, discover_homeserver_url,
@@ -105,6 +106,10 @@ impl Core {
             audio_settings: None,
             device_watcher: None,
             audio_session: None,
+            call: None,
+            user_volumes: UserVolumes::default(),
+            mic_muted: false,
+            deafened: false,
         };
         tokio::spawn(engine.run(cmd_rx));
         CoreHandle {
@@ -431,6 +436,13 @@ struct Engine {
     device_watcher: Option<tessera_audio::DeviceWatcher>,
     /// Open devices and the voice engine (mic test for now).
     audio_session: Option<AudioSession>,
+    /// The local user's call.
+    call: Option<CallSession>,
+    /// Per-user volumes, shared with the call's participant reporting.
+    user_volumes: UserVolumes,
+    /// Microphone mute and deafen requested for the call (media: Task 8).
+    mic_muted: bool,
+    deafened: bool,
 }
 
 /// An OAuth login in progress. Its task builds the client, emits `OAuthUrl`,
@@ -853,6 +865,7 @@ impl Engine {
                 },
             }
         }
+        self.leave_call().await;
         if let Some(session) = self.audio_session.take() {
             session.stop().await;
         }
@@ -1171,17 +1184,36 @@ impl Engine {
                 settings.user_volumes.insert(user_id, percent);
                 self.store_audio_settings(settings.validated()).await;
             }
-            // Calls and the audio pipeline land in later Phase 6 tasks.
-            Command::JoinCall { .. } | Command::DeclineCall { .. } => {
+            Command::JoinCall { room_id, intent: _ } => self.join_call(room_id).await,
+            Command::LeaveCall => {
+                if self.call.is_some() {
+                    self.leave_call().await;
+                } else {
+                    self.emit(CoreEvent::Error(CoreError::NotInCall)).await;
+                }
+            }
+            Command::SetMicMuted(muted) => {
+                if self.call.is_some() {
+                    self.mic_muted = muted;
+                } else {
+                    self.emit(CoreEvent::Error(CoreError::NotInCall)).await;
+                }
+            }
+            Command::SetDeafened(deafened) => {
+                if self.call.is_some() {
+                    self.deafened = deafened;
+                } else {
+                    self.emit(CoreEvent::Error(CoreError::NotInCall)).await;
+                }
+            }
+            // Ringing lands in Phase 6 Task 10.
+            Command::DeclineCall { .. } => {
                 let error = if self.active.is_none() {
                     CoreError::NotLoggedIn
                 } else {
-                    CoreError::Call("calls are not available yet".into())
+                    CoreError::Call("declining calls is not available yet".into())
                 };
                 self.emit(CoreEvent::Error(error)).await;
-            }
-            Command::LeaveCall | Command::SetMicMuted(_) | Command::SetDeafened(_) => {
-                self.emit(CoreEvent::Error(CoreError::NotInCall)).await;
             }
             Command::ListAudioDevices => self.list_audio_devices().await,
             Command::StartMicTest { loopback } => self.start_mic_test(loopback).await,
@@ -1259,6 +1291,9 @@ impl Engine {
             .await
             .and_then(|r| r);
         self.audio_settings = Some(settings.clone());
+        if let Ok(mut shared) = self.user_volumes.write() {
+            shared.clone_from(&settings.user_volumes);
+        }
         if let Err(e) = saved {
             self.emit(CoreEvent::Error(e)).await;
         }
@@ -1269,6 +1304,69 @@ impl Engine {
         {
             let loopback = session.loopback();
             self.start_mic_test(loopback).await;
+        }
+    }
+
+    /// Joins `room_id`'s call, leaving another call first.
+    async fn join_call(&mut self, room_id: RoomId) {
+        let Some(active) = self.active.as_ref() else {
+            self.emit(CoreEvent::Error(CoreError::NotLoggedIn)).await;
+            return;
+        };
+        let client = active.client.clone();
+        if let Some(call) = &self.call {
+            if call.room_id == room_id {
+                self.emit(CoreEvent::CallState(CallState::Connected { room_id }))
+                    .await;
+                return;
+            }
+            self.leave_call().await;
+        }
+        // Participants carry the per-user volumes.
+        let volumes = self.audio_settings().await.user_volumes.clone();
+        if let Ok(mut shared) = self.user_volumes.write() {
+            *shared = volumes;
+        }
+        self.mic_muted = false;
+        self.deafened = false;
+        self.emit(CoreEvent::CallState(CallState::Joining {
+            room_id: room_id.clone(),
+        }))
+        .await;
+        match CallSession::join(
+            &client,
+            room_id.clone(),
+            self.events.clone(),
+            self.user_volumes.clone(),
+        )
+        .await
+        {
+            Ok(session) => {
+                self.call = Some(session);
+                self.emit(CoreEvent::CallState(CallState::Connected { room_id }))
+                    .await;
+            }
+            Err(e) => {
+                self.emit(CoreEvent::CallState(CallState::Left {
+                    room_id,
+                    reason: CallEndReason::Failed(e.to_string()),
+                }))
+                .await;
+                self.emit(CoreEvent::Error(e)).await;
+            }
+        }
+    }
+
+    /// Leaves the current call, if any.
+    async fn leave_call(&mut self) {
+        if let Some(call) = self.call.take() {
+            let room_id = call.room_id.clone();
+            call.leave().await;
+            self.emit(CoreEvent::CallState(CallState::Left {
+                room_id,
+                reason: CallEndReason::Hangup,
+            }))
+            .await;
         }
     }
 
@@ -1987,6 +2085,8 @@ impl Engine {
     }
 
     async fn logout(&mut self) {
+        // The call needs the session to remove its membership.
+        self.leave_call().await;
         let Some(mut active) = self.active.take() else {
             self.emit(CoreEvent::Error(CoreError::NotLoggedIn)).await;
             return;
@@ -2025,6 +2125,10 @@ mod tests {
             audio_settings: None,
             device_watcher: None,
             audio_session: None,
+            call: None,
+            user_volumes: UserVolumes::default(),
+            mic_muted: false,
+            deafened: false,
         }
     }
 
@@ -2112,6 +2216,10 @@ mod tests {
             audio_settings: None,
             device_watcher: None,
             audio_session: None,
+            call: None,
+            user_volumes: UserVolumes::default(),
+            mic_muted: false,
+            deafened: false,
         };
         (engine, rx)
     }
