@@ -14,10 +14,14 @@ use matrix_sdk::ruma::html::{Html, SanitizerConfig};
 
 use crate::api::{MentionRef, MessageKind, OutgoingMessage};
 
-/// Most `<` characters a message may hold and still be sent as HTML. Raw
-/// HTML needs a `<`, and the sanitizer parses it into a tree, so a flood of
-/// tags is sent as plain text instead.
-const MAX_ANGLE_BRACKETS: usize = 1000;
+/// Most start tags (`<` followed by a letter) a formatted body may hold. The
+/// sanitizer here and the receive mapper (`rich_text::from_html`) parse the
+/// body into a tree whose recursive `Drop` overflowed a 2 MiB debug stack at
+/// about 6,000 nested elements. A tree is never deeper than its element count,
+/// so counting tags in the generated HTML (not in the source: markdown nests
+/// with `>` and list markers alone) keeps both far from that. Above it the
+/// message is sent as plain text.
+const MAX_TAGS: usize = 1500;
 
 /// Elements removed together with their content. The sanitizer's spec list
 /// would drop the others' tags and keep their text.
@@ -25,9 +29,9 @@ const REMOVED_ELEMENTS: [&str; 3] = ["img", "script", "style"];
 
 /// Builds the event content for `message`:
 /// - each mention label is linked at its first free occurrence in the text;
-/// - the text goes through markdown, and raw HTML in it is sanitized away;
+/// - the text goes through markdown, and the HTML is sanitized and bounded;
 /// - the `body` is the text as typed, and `m.mentions` lists the users whose
-///   label was found.
+///   label was found and survives in the formatted body.
 pub(crate) fn outgoing_content(
     message: &OutgoingMessage,
 ) -> RoomMessageEventContentWithoutRelation {
@@ -44,13 +48,25 @@ pub(crate) fn outgoing_content(
         MessageType::Emote(e) => Some((&mut e.body, &mut e.formatted)),
         _ => None,
     };
+    let mut html = None;
     if let Some((body, formatted)) = formatted {
         text.clone_into(body);
-        sanitize_formatted(formatted, text);
-        if formatted.is_none() && text.contains('\n') {
-            *formatted = Some(FormattedBody::html(line_breaks_html(text)));
+        let made_by_markdown = formatted.is_some();
+        sanitize_formatted(formatted);
+        if !made_by_markdown && text.contains('\n') {
+            let breaks = line_breaks_html(text);
+            if !too_many_tags(&breaks) {
+                *formatted = Some(FormattedBody::html(breaks));
+            }
         }
+        html = formatted.as_ref().map(|f| f.body.as_str());
     }
+    // Only a user whose link is in the body that is sent is notified: a label
+    // inside code, or in a body sent as plain text, shows no pill.
+    let mentioned: Vec<OwnedUserId> = mentioned
+        .into_iter()
+        .filter(|user| html.is_some_and(|h| h.contains(&mention_href(user))))
+        .collect();
     if mentioned.is_empty() {
         content
     } else {
@@ -58,27 +74,44 @@ pub(crate) fn outgoing_content(
     }
 }
 
-/// Drops raw HTML from a markdown-made formatted body.
+/// Makes the markdown-made formatted body safe: always, because markdown
+/// itself makes links (`javascript:`, `data:`) and images, not only raw HTML.
 ///
 /// `matrix-sdk`'s markdown (pulldown-cmark) passes HTML events through
-/// unchanged. Without a `<` in the source there is none, so the body is kept
-/// as is; with one, the Matrix-spec sanitizer allow-lists the tags and
-/// attributes and `img`, `script` and `style` go with their content. Code
-/// spans are unaffected: markdown has already escaped their `<`.
-fn sanitize_formatted(formatted: &mut Option<FormattedBody>, source: &str) {
-    let angle_brackets = source.matches('<').count();
-    if angle_brackets == 0 {
+/// unchanged. The Matrix-spec sanitizer allow-lists the tags and attributes
+/// (`href` schemes: http, https, ftp, mailto, magnet, matrix; `img` `src`:
+/// mxc), and `img`, `script` and `style` go with their content. Code spans
+/// are unaffected: markdown has already escaped their `<`. A body with more
+/// than [`MAX_TAGS`] start tags is dropped before it is parsed.
+fn sanitize_formatted(formatted: &mut Option<FormattedBody>) {
+    let Some(f) = formatted else {
         return;
-    }
-    if angle_brackets > MAX_ANGLE_BRACKETS {
+    };
+    if too_many_tags(&f.body) {
         *formatted = None;
         return;
     }
-    if let Some(f) = formatted {
-        let html = Html::parse(&f.body);
-        html.sanitize_with(&SanitizerConfig::strict().remove_elements(REMOVED_ELEMENTS));
-        f.body = html.to_string();
-    }
+    let html = Html::parse(&f.body);
+    html.sanitize_with(&SanitizerConfig::strict().remove_elements(REMOVED_ELEMENTS));
+    f.body = html.to_string();
+}
+
+/// Whether `html` has more than [`MAX_TAGS`] start-tag candidates (`<`
+/// followed by an ASCII letter). Over-counts, which is the safe side.
+fn too_many_tags(html: &str) -> bool {
+    html.as_bytes()
+        .windows(2)
+        .filter(|w| w[0] == b'<' && w[1].is_ascii_alphabetic())
+        .nth(MAX_TAGS)
+        .is_some()
+}
+
+/// The `href` attribute (as serialized) of a mention link.
+fn mention_href(user: &OwnedUserId) -> String {
+    let mut href = String::from(r#"href="https://matrix.to/#/"#);
+    percent_encode(user.as_str(), &mut href);
+    href.push('"');
+    href
 }
 
 /// HTML for a text that has no markdown but several lines: the escaped lines
@@ -353,5 +386,111 @@ mod tests {
         let source = "<b>".repeat(5000);
         let c = outgoing_content(&message(&source, vec![], MessageKind::Text));
         assert_eq!(text_parts(&c), (source, None));
+    }
+
+    /// Runs `f` on a 2 MiB thread, the smallest stack we run on.
+    fn on_small_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(f)
+            .expect("spawn")
+            .join()
+            .expect("no crash on a 2 MiB stack")
+    }
+
+    #[test]
+    fn markdown_made_unsafe_links_and_images_are_sanitized() {
+        for source in [
+            "[x](javascript:alert(1))",
+            "[x](data:text/html,hi)",
+            "![a](https://e.example/x.png)",
+            "[x](JavaScript:alert(1))",
+            "[x](vbscript:y)",
+        ] {
+            let c = outgoing_content(&message(source, vec![], MessageKind::Text));
+            let html = text_parts(&c).1.unwrap_or_default().to_lowercase();
+            for bad in ["javascript:", "data:", "vbscript:", "<img", "e.example"] {
+                assert!(!html.contains(bad), "{bad} survived in {html} ({source})");
+            }
+        }
+        let c = outgoing_content(&message(
+            "[x](https://e.example/)",
+            vec![],
+            MessageKind::Text,
+        ));
+        let html = text_parts(&c).1.expect("formatted");
+        assert!(html.contains(r#"href="https://e.example/""#), "{html}");
+    }
+
+    #[test]
+    fn raw_anchor_with_href_after_another_attribute_is_sanitized() {
+        let source = r#"<a title="t" href="javascript:alert(1)">x</a>"#;
+        let c = outgoing_content(&message(source, vec![], MessageKind::Text));
+        let html = text_parts(&c).1.unwrap_or_default().to_lowercase();
+        assert!(!html.contains("javascript:"), "{html}");
+    }
+
+    #[test]
+    fn nesting_made_by_markdown_alone_is_sent_as_plain_text() {
+        for source in [
+            format!("<b>x</b>\n\n{} y", ">".repeat(50_000)),
+            format!("{} y", ">".repeat(50_000)),
+            format!("<b>x</b>\n\n{}", ">".repeat(50_000)),
+            format!("{}y", "- ".repeat(50_000)),
+            "![](u)".repeat(5_000),
+        ] {
+            let kept = source.clone();
+            let (body, html) = on_small_stack(move || {
+                let c = outgoing_content(&message(&source, vec![], MessageKind::Text));
+                text_parts(&c)
+            });
+            assert_eq!(body, kept);
+            assert!(
+                html.is_none(),
+                "{:?} formatted body of {} bytes",
+                &kept[..12],
+                html.map_or(0, |h| h.len())
+            );
+        }
+    }
+
+    #[test]
+    fn a_body_at_the_tag_cap_is_kept_and_maps_on_a_small_stack() {
+        // Raw `<div>` nests as deep as the source says (markdown caps `>` at 100).
+        let source = format!("{}y", "<div>".repeat(MAX_TAGS - 10));
+        let html = on_small_stack(move || {
+            let c = outgoing_content(&message(&source, vec![], MessageKind::Text));
+            let html = text_parts(&c).1.expect("formatted");
+            // Our own echo must stay safe for the receive mapper.
+            let _ = crate::rich_text::from_html(&html, "y");
+            html
+        });
+        // The sanitizer also caps the depth (100, from the spec).
+        assert!(html.contains("<div>"), "{html}");
+    }
+
+    #[test]
+    fn many_lines_are_sent_without_a_formatted_body_above_the_cap() {
+        let source = "a\n".repeat(MAX_TAGS + 10);
+        let c = outgoing_content(&message(&source, vec![], MessageKind::Text));
+        assert!(text_parts(&c).1.is_none());
+    }
+
+    #[test]
+    fn a_mention_inside_code_is_not_notified() {
+        let m = mention("Alice", "@alice:localhost");
+        for text in ["`hi Alice`", "```\nhi Alice\n```", "    hi Alice"] {
+            let c = outgoing_content(&message(text, vec![m.clone()], MessageKind::Text));
+            let html = text_parts(&c).1.expect("formatted");
+            assert!(!html.contains("href="), "{html}");
+            assert!(user_ids(&c).is_empty(), "{text}: {:?}", user_ids(&c));
+        }
+    }
+
+    #[test]
+    fn a_mention_outside_code_is_kept_next_to_one_inside() {
+        let m = mention("Alice", "@alice:localhost");
+        let c = outgoing_content(&message("Alice and `Alice`", vec![m], MessageKind::Text));
+        assert_eq!(user_ids(&c), ["@alice:localhost"]);
     }
 }
