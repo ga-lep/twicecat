@@ -30,6 +30,7 @@ rpassword = "7"
 zeroize = { version = "1.9", features = ["serde"] }
 # Build with LK_CUSTOM_WEBRTC from scripts/fetch-libwebrtc.sh (pinned SHA-256);
 # without it webrtc-sys downloads libwebrtc unverified.
+tessera-audio = { path = "../audio" }
 livekit = { version = "=0.9.3", default-features = false, features = ["native", "rustls-tls-native-roots"] }
 
 [dev-dependencies]

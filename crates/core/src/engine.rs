@@ -26,9 +26,9 @@ use tracing::{info, warn};
 use zeroize::Zeroizing;
 
 use crate::api::{
-    ActionKind, AudioSettings, Command, CoreError, CoreEvent, DeviceId, Draft, ListDiff, Member,
-    MessageText, OutgoingMessage, PaginationState, Password, RoomId, RoomListQuery, TypingUser,
-    UserId,
+    ActionKind, AudioDevice, AudioDeviceId, AudioDevices, AudioSettings, Command, CoreError,
+    CoreEvent, DeviceId, Draft, ListDiff, Member, MessageText, OutgoingMessage, PaginationState,
+    Password, RoomId, RoomListQuery, TypingUser, UserId,
 };
 use crate::avatars::{Avatars, SdkFetcher, answer_unavailable};
 use crate::call_settings;
@@ -102,6 +102,7 @@ impl Core {
             oauth: None,
             room_list_query: watch::channel(RoomListQuery::default()).0,
             audio_settings: None,
+            device_watcher: None,
         };
         tokio::spawn(engine.run(cmd_rx));
         CoreHandle {
@@ -424,6 +425,8 @@ struct Engine {
     room_list_query: watch::Sender<RoomListQuery>,
     /// Audio settings, loaded from disk on first use.
     audio_settings: Option<AudioSettings>,
+    /// Hot-plug watcher, started by the first `ListAudioDevices`.
+    device_watcher: Option<tessera_audio::DeviceWatcher>,
 }
 
 /// An OAuth login in progress. Its task builds the client, emits `OAuthUrl`,
@@ -450,6 +453,24 @@ async fn next_oauth(
     match pending {
         Some(p) => (&mut p.task).await,
         None => std::future::pending().await,
+    }
+}
+
+/// How often the device watcher re-lists audio devices.
+const DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+fn audio_device(info: tessera_audio::DeviceInfo) -> AudioDevice {
+    AudioDevice {
+        id: AudioDeviceId::from(info.id),
+        name: info.name,
+        is_default: info.is_default,
+    }
+}
+
+fn audio_devices(list: tessera_audio::DeviceList) -> AudioDevices {
+    AudioDevices {
+        inputs: list.inputs.into_iter().map(audio_device).collect(),
+        outputs: list.outputs.into_iter().map(audio_device).collect(),
     }
 }
 
@@ -1155,9 +1176,10 @@ impl Engine {
             Command::LeaveCall | Command::SetMicMuted(_) | Command::SetDeafened(_) => {
                 self.emit(CoreEvent::Error(CoreError::NotInCall)).await;
             }
-            Command::ListAudioDevices | Command::StartMicTest { .. } => {
+            Command::ListAudioDevices => self.list_audio_devices().await,
+            Command::StartMicTest { .. } => {
                 self.emit(CoreEvent::Error(CoreError::Audio(
-                    "audio devices are not available yet".into(),
+                    "the mic test is not available yet".into(),
                 )))
                 .await;
             }
@@ -1165,6 +1187,36 @@ impl Engine {
             Command::PushToTalk { .. } | Command::StopMicTest => {}
             // Handled in `run`.
             Command::Shutdown => {}
+        }
+    }
+
+    /// Lists audio devices (blocking enumeration off the async threads) and,
+    /// the first time, starts the hot-plug watcher, which sends
+    /// `AudioDevices` again whenever the list changes.
+    async fn list_audio_devices(&mut self) {
+        match blocking(tessera_audio::list_devices).await {
+            Ok(Ok(list)) => {
+                self.emit(CoreEvent::AudioDevices(audio_devices(list)))
+                    .await
+            }
+            Ok(Err(_)) | Err(_) => {
+                self.emit(CoreEvent::Error(CoreError::Audio(
+                    "audio devices could not be listed".into(),
+                )))
+                .await;
+            }
+        }
+        if self.device_watcher.is_none() {
+            let events = self.events.clone();
+            let watcher = tessera_audio::DeviceWatcher::spawn(DEVICE_POLL_INTERVAL, move |list| {
+                // A plain thread, not a runtime one, so blocking is fine; a
+                // closed channel means the engine is gone.
+                let _ = events.blocking_send(CoreEvent::AudioDevices(audio_devices(list)));
+            });
+            match watcher {
+                Ok(w) => self.device_watcher = Some(w),
+                Err(_) => tracing::warn!("audio device watcher could not start"),
+            }
         }
     }
 
@@ -1941,6 +1993,7 @@ mod tests {
             oauth: None,
             room_list_query: watch::channel(RoomListQuery::default()).0,
             audio_settings: None,
+            device_watcher: None,
         }
     }
 
@@ -2026,6 +2079,7 @@ mod tests {
             oauth: None,
             room_list_query: watch::channel(RoomListQuery::default()).0,
             audio_settings: None,
+            device_watcher: None,
         };
         (engine, rx)
     }

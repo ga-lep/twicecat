@@ -33,7 +33,7 @@ jobs:
         run: scripts/check-commits.sh "origin/$BASE_REF" "$HEAD_SHA"
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libdbus-1-dev libssl-dev pkg-config libglib2.0-dev lld
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libdbus-1-dev libssl-dev pkg-config libglib2.0-dev lld libasound2-dev libpipewire-0.3-dev
       # webrtc-sys needs clang >= 21 on Linux (Chromium libc++); the image has 22.
       - name: Use clang 22
         if: runner.os == 'Linux'
@@ -68,7 +68,7 @@ jobs:
           persist-credentials: false
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libdbus-1-dev libssl-dev pkg-config libglib2.0-dev lld
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libdbus-1-dev libssl-dev pkg-config libglib2.0-dev lld libasound2-dev libpipewire-0.3-dev
       # webrtc-sys needs clang >= 21 on Linux (Chromium libc++); the image has 22.
       - name: Use clang 22
         if: runner.os == 'Linux'
@@ -97,7 +97,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install Linux build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libdbus-1-dev libssl-dev pkg-config libglib2.0-dev lld
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libdbus-1-dev libssl-dev pkg-config libglib2.0-dev lld libasound2-dev libpipewire-0.3-dev
       # webrtc-sys needs clang >= 21 on Linux (Chromium libc++); the image has 22.
       - name: Use clang 22
         if: runner.os == 'Linux'

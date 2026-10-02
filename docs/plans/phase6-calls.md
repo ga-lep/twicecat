@@ -23,7 +23,7 @@ Native voice calls and Discord-style voice rooms, with no Element Call widget. `
 ## Steam Frame / SteamOS
 Steam Frame runs SteamOS on ARM64 (Snapdragon). The system is Arch-based with a read-only root, so third-party apps are Flatpaks. Audio goes through PipeWire. The UI is either KDE Plasma on Wayland (desktop mode) or gamescope (game mode). The device has built-in speakers and a mic array, so open-speaker echo cancellation is the normal case, not an edge case. Consequences for this phase:
 - **Native `aarch64-unknown-linux-gnu`.** CI gains a Linux ARM64 job (GitHub `ubuntu-26.04-arm` runner) for build and test. livekit publishes `webrtc-linux-arm64-release.zip` for the pinned tag (sha256 `f716b10e…6420`); sonora has a NEON backend; tract has NEON kernels.
-- **PipeWire.** cpal's native `pipewire` backend on Linux (cpal 0.18.2 feature `pipewire`; CI and dev need `libpipewire-0.3-dev` and clang for bindgen). ALSA stays as a runtime fallback. Device names and hot-plug come from PipeWire.
+- **PipeWire.** cpal's native `pipewire` backend on Linux (cpal 0.18.2 feature `pipewire`; CI and dev need `libpipewire-0.3-dev` and clang for bindgen). ALSA stays as a runtime fallback. Device names and hot-plug come from PipeWire. libwebrtc's weak `pw_*` stubs, which would take libpipewire's place in the same binary, are renamed by the fetch script (Task 1).
 - **Flatpak-friendly builds.** No build-time network access (the fetch script plus SHA-256 maps directly onto Flatpak `sources`). rustls, not OpenSSL (livekit feature `rustls-tls-native-roots`). Flatpak packaging itself is a later phase; this phase just doesn't block it.
 - **Push-to-talk without a global-shortcut portal.** gamescope has no GlobalShortcuts portal. PTT sources are therefore:
   - an in-window key;
@@ -178,8 +178,9 @@ Each task follows the full Phase 1 gate: fmt, clippy -D warnings, tests, `check-
    - Playback more than 60 ms ahead of the device clock drops a frame, which bounds the latency from clock drift.
    - A configured device that is missing falls back to the default (`IoEvent::FellBackToDefault`). Stream errors (unplug) arrive as `IoEvent::StreamError`. Defaults follow the system default by themselves (cpal).
    - The format prefers 48 kHz when the device supports it with its default format and channels.
-   - `list_devices()` (stable IDs: cpal `DeviceId` text, the PipeWire node name) and a polling `DeviceWatcher` (2 s) for hot-plug.
+   - `list_devices()` (stable IDs: cpal `DeviceId` text, the PipeWire node name; on PipeWire, sinks, which cpal also offers as inputs, are left out of the inputs) and a polling `DeviceWatcher` (2 s) for hot-plug.
    - cpal's native PipeWire backend on Linux (feature `pipewire`, ALSA fallback); CI and dev need `libasound2-dev libpipewire-0.3-dev`.
+   - Device buffers are 10 ms (one frame) when the device reports its range, which cpal's PipeWire backend applies as `node.latency`; otherwise the host default, which can be far larger.
    - Core: `ListAudioDevices` answers with `AudioDevices` and starts the watcher, which re-sends `AudioDevices` on change.
    - Tests use rings directly (no hardware): bit-exact 48 kHz loopback, 44.1 kHz capture and 96 kHz playback keep a 1 kHz tone (amplitude within 0.02–0.03), drift drop, timer mode, watcher diffing. An ignored output-only device test exists.
    - cpal's `realtime` feature is not enabled: the PipeWire callbacks already run on PipeWire's RT thread. Real-time priority for the processing thread is a Task 5 item.

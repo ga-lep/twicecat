@@ -1,6 +1,6 @@
 //! Audio settings through the core API: defaults, validation, persistence
-//! across restarts, per-user volume, a corrupt file, and the call commands
-//! that are not available yet. Needs no server.
+//! across restarts, per-user volume, a corrupt file, device listing, and the
+//! call commands that are not available yet. Needs no server or audio device.
 
 mod common;
 
@@ -130,4 +130,24 @@ async fn call_commands_need_a_session_or_a_call() {
     send(&handle, Command::SetMicMuted(true)).await;
     let e = expect_event(&mut handle, |e| matches!(e, CoreEvent::Error(_))).await;
     assert!(matches!(e, CoreEvent::Error(CoreError::NotInCall)), "{e:?}");
+}
+
+#[tokio::test]
+async fn listing_audio_devices_answers_without_assuming_hardware() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut handle = core(dir.path());
+    send(&handle, Command::ListAudioDevices).await;
+    let answer = expect_event(&mut handle, |e| {
+        matches!(
+            e,
+            CoreEvent::AudioDevices(_) | CoreEvent::Error(CoreError::Audio(_))
+        )
+    })
+    .await;
+    if let CoreEvent::AudioDevices(devices) = answer {
+        // At most one default per direction.
+        assert!(devices.inputs.iter().filter(|d| d.is_default).count() <= 1);
+        assert!(devices.outputs.iter().filter(|d| d.is_default).count() <= 1);
+    }
+    send(&handle, Command::Shutdown).await;
 }

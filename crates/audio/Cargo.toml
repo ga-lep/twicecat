@@ -1,0 +1,22 @@
+[package]
+name = "tessera-audio"
+version = "0.1.0"
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+cpal = "=0.18.2"
+rtrb = "=0.4.0"
+rubato = "=5.0.1"
+thiserror = "2"
+tracing = "0.1"
+
+# Native PipeWire on Linux (SteamOS, desktops): the stream runs in the
+# graph's real-time cycle, with no extra hop through pipewire-pulse. cpal
+# falls back to ALSA when no PipeWire daemon runs. libwebrtc's weak pw_*
+# stubs, which would take libpipewire's place, are renamed by
+# scripts/fetch-libwebrtc.sh.
+[target.'cfg(target_os = "linux")'.dependencies]
+cpal = { version = "=0.18.2", features = ["pipewire"] }

@@ -2,7 +2,8 @@
 //!
 //! libwebrtc.a is built against Chromium's libc++, whose `trivial_abi`
 //! smart pointers change the calling convention; a mismatched C++ compiler
-//! would hand back garbage pointers here. Needs no server or audio device.
+//! would hand back garbage pointers here. Needs no server or audio device,
+//! except the ignored playback test.
 
 use livekit::webrtc::native::apm::AudioProcessingModule;
 use livekit::webrtc::native::create_random_uuid;
@@ -32,4 +33,23 @@ fn libwebrtc_apm_processes_ten_ms_frames() {
         apm.set_stream_delay_ms(10).unwrap();
         apm.process_stream(&mut capture, RATE, 1).unwrap();
     }
+}
+
+/// libwebrtc's weak `pw_*` stubs took libpipewire's place in this binary
+/// until `scripts/fetch-libwebrtc.sh` renamed them: opening a PipeWire
+/// stream then crashed in `pw_init` (address 0).
+#[test]
+#[ignore = "needs an audio output device; plays 300 ms of silence"]
+fn hardware_audio_output_opens_in_a_binary_linking_libwebrtc() {
+    let io = tessera_audio::AudioIo::start(
+        tessera_audio::IoConfig {
+            playback: true,
+            ..tessera_audio::IoConfig::default()
+        },
+        |_: &_, _: &mut _| {},
+    )
+    .expect("default output device");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(io.stats().frames >= 20, "{:?}", io.stats());
+    assert!(io.info().output.is_some());
 }
