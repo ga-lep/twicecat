@@ -3,7 +3,7 @@
 //! Senders and bodies are untrusted server data: nothing here logs them.
 
 use matrix_sdk::ruma::events::StateEventContentChange;
-use matrix_sdk::ruma::events::room::message::MessageType;
+use matrix_sdk::ruma::events::room::message::{MessageFormat, MessageType};
 use matrix_sdk::ruma::{OwnedRoomId, UserId as SdkUserId};
 use matrix_sdk_ui::timeline::{
     AnyOtherStateEventContentChange, EmbeddedEvent, EventSendState, EventTimelineItem,
@@ -12,10 +12,11 @@ use matrix_sdk_ui::timeline::{
 };
 
 use crate::api::{
-    Block, CoreError, Inline, ItemActions, MessageDetails, MessageKind, PlaceholderKind,
-    ReactionGroup, ReplyPreview, ReplyState, RichText, RoomId, SendFailure, SendStatus,
-    StateChange, TextStyle, TimelineItem, TimelineItemKind, UserId,
+    CoreError, ItemActions, MessageDetails, MessageKind, PlaceholderKind, ReactionGroup,
+    ReplyPreview, ReplyState, RoomId, SendFailure, SendStatus, StateChange, TimelineItem,
+    TimelineItemKind, UserId,
 };
+use crate::rich_text;
 
 /// Longest quoted line of a reply, in characters.
 const REPLY_BODY_CHARS: usize = 200;
@@ -108,7 +109,11 @@ fn map_event(event: &EventTimelineItem, own: Option<&SdkUserId>) -> TimelineItem
                         TimelineDetails::Ready(p) if p.display_name_ambiguous
                     ),
                     kind,
-                    content: plain_rich_text(message.body()),
+                    content: rich_text::message_rich_text(
+                        event.latest_json().map(|raw| raw.json().get()),
+                        sdk_formatted_html(message.msgtype()),
+                        message.body(),
+                    ),
                     edited: message.is_edited(),
                     highlighted: event.is_highlighted(),
                     reply_to: content.in_reply_to.as_ref().map(map_reply),
@@ -334,26 +339,15 @@ pub(crate) fn receipts_without_own<'a>(
         .collect()
 }
 
-/// The plain text as rich text, one paragraph per line.
-pub(crate) fn plain_rich_text(body: &str) -> RichText {
-    if body.is_empty() {
-        return RichText::default();
-    }
-    RichText {
-        blocks: body
-            .split('\n')
-            .map(|line| {
-                Block::Paragraph(if line.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![Inline::Text {
-                        text: line.to_owned(),
-                        style: TextStyle::default(),
-                    }]
-                })
-            })
-            .collect(),
-    }
+/// The SDK's sanitized HTML body of a text-like message.
+fn sdk_formatted_html(msgtype: &MessageType) -> Option<&str> {
+    let formatted = match msgtype {
+        MessageType::Text(m) => m.formatted.as_ref(),
+        MessageType::Notice(m) => m.formatted.as_ref(),
+        MessageType::Emote(m) => m.formatted.as_ref(),
+        _ => None,
+    }?;
+    matches!(formatted.format, MessageFormat::Html).then_some(formatted.body.as_str())
 }
 
 /// What the user may do with a message. Redacting is offered on own and on
@@ -554,17 +548,6 @@ mod tests {
         assert!(few.is_empty());
         let no_own = receipts_without_own([&*own], None);
         assert_eq!(no_own.len(), 1);
-    }
-
-    #[test]
-    fn plain_rich_text_splits_paragraphs() {
-        let rt = plain_rich_text("a\nb");
-        assert_eq!(rt.blocks.len(), 2);
-        assert!(matches!(
-            &rt.blocks[0],
-            Block::Paragraph(i) if matches!(i.as_slice(), [Inline::Text { text, .. }] if text == "a")
-        ));
-        assert!(plain_rich_text("").blocks.is_empty());
     }
 
     #[test]

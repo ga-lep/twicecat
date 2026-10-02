@@ -388,7 +388,7 @@ pub enum Inline {
     Link {
         /// Link text.
         text: String,
-        /// Target URL, already checked by the core.
+        /// Target URL: `http`, `https` or `mailto`, normalized and checked by the core.
         url: String,
         /// Its style.
         style: TextStyle,

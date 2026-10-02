@@ -15,8 +15,8 @@ use common::{
 use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
 use tessera_core::CoreHandle;
 use tessera_core::api::{
-    Command, CoreEvent, ListDiff, MessageKind, Password, RoomId, RoomSummary, StateChange,
-    SyncState, TimelineItem, TimelineItemKind,
+    Block, Command, CoreEvent, Inline, ListDiff, MentionTarget, MessageKind, Password, RoomId,
+    RoomSummary, StateChange, SyncState, TimelineItem, TimelineItemKind,
 };
 use tessera_core::secrets::InMemorySecretStore;
 
@@ -223,6 +223,76 @@ async fn notices_and_emotes_become_messages_with_details() {
         seen(items, MessageKind::Emote)
     })
     .await;
+
+    logout(&mut alice).await;
+}
+
+#[tokio::test]
+#[ignore = "needs local homeserver: docker compose up -d --wait"]
+async fn formatted_body_becomes_rich_text_without_script_content() {
+    let env = TestEnv::load();
+    let alice_raw = raw_login(1).await;
+    let carol_raw = raw_login(3).await;
+    let name = unique_room_name();
+    let room_id = create_room(&alice_raw, &name, Some(&env.user_id(3))).await;
+    carol_raw
+        .join_room_by_id(&room_id)
+        .await
+        .expect("carol joins");
+    let room = room_id.to_string();
+
+    let alice_dir = tempfile::tempdir().unwrap();
+    let mut alice = start_core(alice_dir.path(), Arc::new(InMemorySecretStore::new()));
+    login_and_run(&mut alice, &env, 1).await;
+    open_room(&mut alice, &room).await;
+
+    let alice_id = env.user_id(1);
+    let html = format!(
+        "<b>ok</b><script>alert(1)</script><a href=\"https://matrix.to/#/{alice_id}\">Alice</a>"
+    );
+    send_content(
+        &carol_raw,
+        &room_id,
+        &RoomMessageEventContent::text_html("ok", html),
+    )
+    .await;
+
+    let content_of = |items: &[TimelineItem]| {
+        items.iter().find_map(|i| match &i.kind {
+            TimelineItemKind::Message {
+                details, is_own, ..
+            } if !is_own => Some(details.content.clone()),
+            _ => None,
+        })
+    };
+    let mut items = Vec::new();
+    apply_until(&mut alice, &room, &mut items, |items| {
+        content_of(items).is_some()
+    })
+    .await;
+    let content = content_of(&items).expect("message arrived");
+
+    let mut inlines = Vec::new();
+    for block in &content.blocks {
+        if let Block::Paragraph(i) = block {
+            inlines.extend(i.iter());
+        }
+    }
+    assert!(inlines.iter().any(|i| matches!(
+        i,
+        Inline::Text { text, style } if text == "ok" && style.bold
+    )));
+    assert!(inlines.iter().any(|i| matches!(
+        i,
+        Inline::Mention { target: MentionTarget::User(u), .. } if u.as_str() == alice_id
+    )));
+    assert!(
+        !inlines.iter().any(|i| matches!(
+            i,
+            Inline::Text { text, .. } if text.contains("alert")
+        )),
+        "script contents leaked into the rich text"
+    );
 
     logout(&mut alice).await;
 }

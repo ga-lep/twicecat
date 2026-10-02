@@ -11,6 +11,7 @@ mod engine;
 pub mod logging;
 mod oauth;
 pub mod paths;
+mod rich_text;
 mod room_list;
 pub mod secrets;
 mod session;
