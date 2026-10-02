@@ -10,6 +10,7 @@ mod client;
 mod engine;
 pub mod logging;
 mod oauth;
+mod outgoing;
 pub mod paths;
 mod rich_text;
 mod room_list;

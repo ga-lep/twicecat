@@ -8,18 +8,21 @@ use std::time::Duration;
 use futures_util::{Stream, StreamExt as _, pin_mut};
 use matrix_sdk::ruma::OwnedUserId;
 use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
+use matrix_sdk::send_queue::SendHandle;
 use matrix_sdk::{Client, SessionChange};
 use matrix_sdk_ui::eyeball_im::{Vector, VectorDiff};
 use matrix_sdk_ui::sync_service::SyncService;
-use matrix_sdk_ui::timeline::{RoomExt as _, Timeline, TimelineItem as SdkTimelineItem};
-use tokio::sync::{broadcast, mpsc, oneshot, watch};
-use tokio::task::JoinHandle;
+use matrix_sdk_ui::timeline::{
+    EventSendState, RoomExt as _, Timeline, TimelineItem as SdkTimelineItem,
+};
+use tokio::sync::{Notify, broadcast, mpsc, oneshot, watch};
+use tokio::task::{JoinHandle, JoinSet};
 use tracing::{info, warn};
 use zeroize::Zeroizing;
 
 use crate::api::{
-    ActionKind, Command, CoreError, CoreEvent, DeviceId, ListDiff, MessageText, Password, RoomId,
-    RoomListQuery, UserId,
+    ActionKind, Command, CoreError, CoreEvent, DeviceId, ListDiff, MessageText, OutgoingMessage,
+    Password, RoomId, RoomListQuery, UserId,
 };
 use crate::avatars::{Avatars, SdkFetcher, answer_unavailable};
 use crate::client::{
@@ -27,6 +30,7 @@ use crate::client::{
     ensure_homeserver_after_login, map_login_error, same_origin,
 };
 use crate::oauth::authorize;
+use crate::outgoing::outgoing_content;
 use crate::paths::DataPaths;
 use crate::room_list::{Registered, build_filter, loaded_event, map_batch, map_diff};
 use crate::secrets::{SecretError, SecretStore};
@@ -102,19 +106,53 @@ struct Syncing {
     more_rooms: mpsc::Sender<()>,
 }
 
-/// The room whose timeline is open, and the task forwarding its diffs.
+/// The room whose timeline is open, the task forwarding its diffs and the
+/// tasks of its actions (send, retry, discard: every network call runs
+/// there, so `handle` never waits on the network).
 struct Selected {
     room_id: RoomId,
-    timeline: Timeline,
+    timeline: Arc<Timeline>,
     task: JoinHandle<()>,
+    tasks: JoinSet<()>,
 }
 
 impl Selected {
-    /// Ends the forwarder; the timeline is dropped with `self`.
-    async fn stop(self) {
+    /// Ends the forwarder and the action tasks; the timeline is dropped with
+    /// `self`, after the tasks that hold clones of it.
+    async fn stop(mut self) {
         self.task.abort();
         // An aborted task ends with a cancellation error; that is expected.
         let _ = self.task.await;
+        self.tasks.shutdown().await;
+    }
+
+    /// Runs `work` on the timeline in the action tasks. Its error, if any,
+    /// is reported as `ActionFailed`.
+    fn spawn_action<F, Fut>(
+        &mut self,
+        action: ActionKind,
+        events: &mpsc::Sender<CoreEvent>,
+        work: F,
+    ) where
+        F: FnOnce(Arc<Timeline>) -> Fut,
+        Fut: std::future::Future<Output = Result<(), CoreError>> + Send + 'static,
+    {
+        // Forget finished tasks, so the set does not grow with every action.
+        while self.tasks.try_join_next().is_some() {}
+        let fut = work(self.timeline.clone());
+        let events = events.clone();
+        let room_id = self.room_id.clone();
+        self.tasks.spawn(async move {
+            if let Err(error) = fut.await {
+                let _ = events
+                    .send(CoreEvent::ActionFailed {
+                        room_id,
+                        action,
+                        error,
+                    })
+                    .await;
+            }
+        });
     }
 }
 
@@ -180,9 +218,12 @@ impl SyncControl for ServiceControl {
 }
 
 /// Forwards sync state changes as events and restarts the service after a
-/// failure (see [`supervise`]).
+/// failure (see [`supervise`]). When the sync comes back after an outage it
+/// also re-enables the send queue, which the SDK disables after a failed
+/// send, so that recoverable failures are retried.
 async fn forward_sync_state(
     service: Arc<SyncService>,
+    client: Client,
     events: mpsc::Sender<CoreEvent>,
     cancel: crate::sync::Cancel,
 ) {
@@ -191,14 +232,23 @@ async fn forward_sync_state(
     // transition.
     let mut subscriber = service.state();
     let initial = subscriber.next_now();
-    run_supervised(
-        &ServiceControl(service),
-        initial,
-        subscriber,
-        events,
-        cancel,
-    )
-    .await;
+    let resumed = Notify::new();
+    // Runs in this task, so it ends with the supervisor and holds the client
+    // no longer than the supervisor does.
+    let reenable = async {
+        loop {
+            resumed.notified().await;
+            client.send_queue().set_enabled(true).await;
+        }
+    };
+    let control = ServiceControl(service);
+    let supervised = run_supervised(&control, initial, subscriber, events, cancel, || {
+        resumed.notify_one()
+    });
+    tokio::select! {
+        () = supervised => {}
+        () = reenable => {}
+    }
 }
 
 /// Forwards every room list diff batch as one `RoomListChanged` event.
@@ -408,6 +458,89 @@ fn command_action(cmd: &Command) -> Option<(RoomId, ActionKind)> {
     Some((room_id.clone(), kind))
 }
 
+/// Finds the timeline item with this `TimelineItem::id`.
+async fn find_item(timeline: &Timeline, item_id: &str) -> Result<Arc<SdkTimelineItem>, CoreError> {
+    timeline
+        .items()
+        .await
+        .iter()
+        .find(|item| item.unique_id().0 == item_id)
+        .cloned()
+        .ok_or(CoreError::ItemNotFound)
+}
+
+/// Queues a message, as a reply when it names the item to reply to.
+async fn send_task(timeline: Arc<Timeline>, message: OutgoingMessage) -> Result<(), CoreError> {
+    // Resolve the reply target first: a refused reply sends nothing.
+    let reply_to = match &message.reply_to {
+        None => None,
+        Some(item_id) => {
+            let item = find_item(&timeline, item_id).await?;
+            let event = item.as_event().ok_or(CoreError::NotAllowed)?;
+            if !event.can_be_replied_to() {
+                return Err(CoreError::NotAllowed);
+            }
+            Some(event.event_id().ok_or(CoreError::NotAllowed)?.to_owned())
+        }
+    };
+    let content = outgoing_content(&message);
+    let queued = match reply_to {
+        Some(event_id) => timeline.send_reply(content, event_id).await,
+        None => {
+            timeline
+                .send(RoomMessageEventContent::from(content).into())
+                .await
+        }
+    };
+    queued
+        .map(drop)
+        .map_err(|_| CoreError::Internal("the message could not be queued".into()))
+}
+
+/// The send handle of the failed local echo `item_id`, and whether the
+/// failure is unrecoverable (the request is parked until unwedged).
+async fn local_echo(timeline: &Timeline, item_id: &str) -> Result<(SendHandle, bool), CoreError> {
+    let item = find_item(timeline, item_id).await?;
+    let event = item.as_event().ok_or(CoreError::NotAllowed)?;
+    let handle = event
+        .local_echo_send_handle()
+        .ok_or(CoreError::NotAllowed)?;
+    let wedged = matches!(
+        event.send_state(),
+        Some(EventSendState::SendingFailed {
+            is_recoverable: false,
+            ..
+        })
+    );
+    Ok((handle, wedged))
+}
+
+/// Sends a failed local echo again: unwedges it when needed, then re-enables
+/// the room's send queue, which a failure disabled.
+async fn retry_task(timeline: Arc<Timeline>, item_id: String) -> Result<(), CoreError> {
+    let (handle, wedged) = local_echo(&timeline, &item_id).await?;
+    if wedged {
+        handle
+            .unwedge()
+            .await
+            .map_err(|_| CoreError::Internal("the message could not be retried".into()))?;
+    }
+    timeline.room().send_queue().set_enabled(true);
+    Ok(())
+}
+
+/// Drops a local echo, then re-enables the room's send queue so that later
+/// messages go out.
+async fn discard_task(timeline: Arc<Timeline>, item_id: String) -> Result<(), CoreError> {
+    let (handle, _) = local_echo(&timeline, &item_id).await?;
+    let result = handle.abort().await;
+    // Enabled even when the abort failed: the queue must not stay stuck.
+    timeline.room().send_queue().set_enabled(true);
+    result
+        .map(drop)
+        .map_err(|_| CoreError::Internal("the message could not be discarded".into()))
+}
+
 /// Why an action on `room` cannot run: no session, the room is not the
 /// selected one, or (for now) the handler does not exist yet.
 fn action_error(logged_in: bool, selected: Option<&RoomId>, room: &RoomId) -> CoreError {
@@ -544,14 +677,30 @@ impl Engine {
                 // No session to fetch with: every ID is unavailable.
                 None => answer_unavailable(ids, &self.events).await,
             },
+            Command::Send(message) => {
+                let room_id = message.room_id.clone();
+                self.run_action(room_id, ActionKind::Send, |timeline| {
+                    send_task(timeline, message)
+                })
+                .await;
+            }
+            Command::RetrySend { room_id, item_id } => {
+                self.run_action(room_id, ActionKind::Retry, |timeline| {
+                    retry_task(timeline, item_id)
+                })
+                .await;
+            }
+            Command::DiscardSend { room_id, item_id } => {
+                self.run_action(room_id, ActionKind::Discard, |timeline| {
+                    discard_task(timeline, item_id)
+                })
+                .await;
+            }
             // The real handlers land in later tasks; until then each answers
             // without touching the network.
-            Command::Send(_)
-            | Command::Edit { .. }
+            Command::Edit { .. }
             | Command::Redact { .. }
             | Command::ToggleReaction { .. }
-            | Command::RetrySend { .. }
-            | Command::DiscardSend { .. }
             | Command::PaginateBackwards { .. }
             | Command::MarkRead { .. }
             | Command::SetTyping { .. }
@@ -738,10 +887,38 @@ impl Engine {
         ));
         active.selected = Some(Selected {
             room_id,
-            timeline,
+            timeline: Arc::new(timeline),
             task,
+            tasks: JoinSet::new(),
         });
         Ok(())
+    }
+
+    /// Runs an action on the selected room's timeline in the background, or
+    /// reports `ActionFailed` when there is no session or `room_id` is not the
+    /// selected room.
+    async fn run_action<F, Fut>(&mut self, room_id: RoomId, action: ActionKind, work: F)
+    where
+        F: FnOnce(Arc<Timeline>) -> Fut,
+        Fut: std::future::Future<Output = Result<(), CoreError>> + Send + 'static,
+    {
+        let events = self.events.clone();
+        let error = match self.active.as_mut() {
+            None => CoreError::NotLoggedIn,
+            Some(active) => match active.selected.as_mut().filter(|s| s.room_id == room_id) {
+                Some(selected) => {
+                    selected.spawn_action(action, &events, work);
+                    return;
+                }
+                None => CoreError::NoRoomSelected,
+            },
+        };
+        self.emit(CoreEvent::ActionFailed {
+            room_id,
+            action,
+            error,
+        })
+        .await;
     }
 
     /// Sends a text message to the selected room.
@@ -1080,6 +1257,7 @@ impl Engine {
         let (cancel, cancelled) = cancel_pair();
         let supervisor = tokio::spawn(forward_sync_state(
             service.clone(),
+            active.client.clone(),
             self.events.clone(),
             cancelled,
         ));
