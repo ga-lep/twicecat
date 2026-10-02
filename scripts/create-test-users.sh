@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Registers the test users from .env.test on the local homeserver. Idempotent.
+# Registers the test users from .env.test on the local homeserver, then empties
+# their rooms (see prune-test-rooms.sh, needs curl and jq). Idempotent. Run it
+# between test runs, not during one.
 # Never prints passwords or tokens.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -46,3 +48,6 @@ register() {
 register "$TEST_USER_1" "$TEST_PASSWORD_1"
 register "$TEST_USER_2" "$TEST_PASSWORD_2"
 register "$TEST_USER_3" "$TEST_PASSWORD_3"
+
+# Rooms left over from earlier runs slow every later test run down.
+"$(dirname "$0")/prune-test-rooms.sh"
