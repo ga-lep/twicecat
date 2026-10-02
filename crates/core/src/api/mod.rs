@@ -5,10 +5,16 @@
 
 use std::fmt;
 
+mod call;
 mod diff;
 mod security;
 mod types;
 
+pub use call::{
+    AudioDevice, AudioDeviceId, AudioDevices, AudioProcessing, AudioSettings, AudioStats,
+    CallEndReason, CallIntent, CallState, InputLevel, InputMode, NoiseSuppression, NsLevel,
+    Participant, ParticipantId, limits,
+};
 pub use diff::ListDiff;
 pub use security::{
     CancelReason, CrossSigning, DeviceSummary, DeviceTrust, DeviceVerification, QrImage,
@@ -233,6 +239,55 @@ pub enum Command {
     Logout,
     /// Stop the engine.
     Shutdown,
+
+    // Calls (Phase 6). One call at a time; joining another room leaves the
+    // current call first.
+    /// Join (or start) the MatrixRTC session of a room.
+    JoinCall {
+        /// Room of the call.
+        room_id: RoomId,
+        /// Voice only for now.
+        intent: CallIntent,
+    },
+    /// Leave the current call.
+    LeaveCall,
+    /// Decline the ringing call in `room_id` (on every device of this user).
+    DeclineCall {
+        /// Room that rings.
+        room_id: RoomId,
+    },
+    /// Mute or unmute the microphone in the current call.
+    SetMicMuted(bool),
+    /// Deafen: play nothing and mute the microphone (Discord semantics).
+    SetDeafened(bool),
+    /// Push-to-talk key or button state, from any source (hotkey, gamepad,
+    /// window key). Ignored unless the input mode is push-to-talk.
+    PushToTalk {
+        /// Held down.
+        pressed: bool,
+    },
+    /// Playback volume for one user, percent (0..=200); remembered.
+    SetUserVolume {
+        /// Account.
+        user_id: UserId,
+        /// Percent; 100 is unchanged.
+        percent: u16,
+    },
+    /// Re-enumerate audio devices; answered by `AudioDevices`.
+    ListAudioDevices,
+    /// Ask for the current settings; answered by `AudioSettings`.
+    GetAudioSettings,
+    /// Replace all audio settings. They are validated, applied (to a running
+    /// call too), saved, and echoed back as `AudioSettings`.
+    UpdateAudioSettings(AudioSettings),
+    /// Open the microphone without a call: level meter and, when `loopback`
+    /// is set, hear yourself through the processing chain.
+    StartMicTest {
+        /// Play the processed microphone back.
+        loopback: bool,
+    },
+    /// Close the mic test.
+    StopMicTest,
 }
 
 // Manual impl: message text, reaction keys, reasons and queries are user
@@ -387,6 +442,38 @@ impl fmt::Debug for Command {
                 .finish(),
             Self::Logout => f.write_str("Logout"),
             Self::Shutdown => f.write_str("Shutdown"),
+            Self::JoinCall { room_id, intent } => f
+                .debug_struct("JoinCall")
+                .field("room_id", room_id)
+                .field("intent", intent)
+                .finish(),
+            Self::LeaveCall => f.write_str("LeaveCall"),
+            Self::DeclineCall { room_id } => f
+                .debug_struct("DeclineCall")
+                .field("room_id", room_id)
+                .finish(),
+            Self::SetMicMuted(muted) => f.debug_tuple("SetMicMuted").field(muted).finish(),
+            Self::SetDeafened(deafened) => f.debug_tuple("SetDeafened").field(deafened).finish(),
+            Self::PushToTalk { pressed } => f
+                .debug_struct("PushToTalk")
+                .field("pressed", pressed)
+                .finish(),
+            Self::SetUserVolume { user_id, percent } => f
+                .debug_struct("SetUserVolume")
+                .field("user_id", user_id)
+                .field("percent", percent)
+                .finish(),
+            Self::ListAudioDevices => f.write_str("ListAudioDevices"),
+            Self::GetAudioSettings => f.write_str("GetAudioSettings"),
+            Self::UpdateAudioSettings(settings) => f
+                .debug_tuple("UpdateAudioSettings")
+                .field(settings)
+                .finish(),
+            Self::StartMicTest { loopback } => f
+                .debug_struct("StartMicTest")
+                .field("loopback", loopback)
+                .finish(),
+            Self::StopMicTest => f.write_str("StopMicTest"),
         }
     }
 }
@@ -528,6 +615,48 @@ pub enum CoreEvent {
     },
     /// Any other error.
     Error(CoreError),
+
+    // Calls (Phase 6).
+    /// The local call state changed.
+    CallState(CallState),
+    /// Participants of the current call changed (including this device).
+    CallParticipants {
+        /// Room of the call.
+        room_id: RoomId,
+        /// Changes, in order.
+        diffs: Vec<ListDiff<Participant>>,
+    },
+    /// How many devices are in a room's call; sent when it changes, for the
+    /// room list (voice rooms). Zero means the call ended.
+    ActiveCall {
+        /// Room.
+        room_id: RoomId,
+        /// Devices in the call.
+        participants: u32,
+    },
+    /// Someone rings this user.
+    IncomingCall {
+        /// Room that rings.
+        room_id: RoomId,
+        /// Who started the call.
+        caller: UserId,
+        /// Voice or (later) video.
+        intent: CallIntent,
+    },
+    /// The ringing in a room stopped: declined (maybe on another device),
+    /// answered, or timed out.
+    RingingStopped {
+        /// Room.
+        room_id: RoomId,
+    },
+    /// Audio devices, answering `ListAudioDevices` or after a hot-plug.
+    AudioDevices(AudioDevices),
+    /// The effective audio settings.
+    AudioSettings(AudioSettings),
+    /// Microphone level (about 20 Hz while the microphone is open).
+    InputLevel(InputLevel),
+    /// Processing statistics (about 1 Hz while the microphone is open).
+    AudioStats(AudioStats),
 }
 
 #[cfg(test)]

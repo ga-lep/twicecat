@@ -26,10 +26,12 @@ use tracing::{info, warn};
 use zeroize::Zeroizing;
 
 use crate::api::{
-    ActionKind, Command, CoreError, CoreEvent, DeviceId, Draft, ListDiff, Member, MessageText,
-    OutgoingMessage, PaginationState, Password, RoomId, RoomListQuery, TypingUser, UserId,
+    ActionKind, AudioSettings, Command, CoreError, CoreEvent, DeviceId, Draft, ListDiff, Member,
+    MessageText, OutgoingMessage, PaginationState, Password, RoomId, RoomListQuery, TypingUser,
+    UserId,
 };
 use crate::avatars::{Avatars, SdkFetcher, answer_unavailable};
+use crate::call_settings;
 use crate::client::{
     ServerSpec, WRONG_ACCOUNT, account_bound, build_client, discover_homeserver_url,
     ensure_homeserver_after_login, map_login_error, same_origin,
@@ -99,6 +101,7 @@ impl Core {
             active: None,
             oauth: None,
             room_list_query: watch::channel(RoomListQuery::default()).0,
+            audio_settings: None,
         };
         tokio::spawn(engine.run(cmd_rx));
         CoreHandle {
@@ -419,6 +422,8 @@ struct Engine {
     /// The latest room list query. It outlives sessions, so one set before
     /// login applies when the list starts.
     room_list_query: watch::Sender<RoomListQuery>,
+    /// Audio settings, loaded from disk on first use.
+    audio_settings: Option<AudioSettings>,
 }
 
 /// An OAuth login in progress. Its task builds the client, emits `OAuthUrl`,
@@ -1125,9 +1130,77 @@ impl Engine {
                 ),
                 None => self.not_logged_in(ActionKind::SignOutDevices).await,
             },
+            // Audio settings.
+            Command::GetAudioSettings => {
+                let settings = self.audio_settings().await.clone();
+                self.emit(CoreEvent::AudioSettings(settings)).await;
+            }
+            Command::UpdateAudioSettings(settings) => {
+                self.store_audio_settings(settings.validated()).await;
+            }
+            Command::SetUserVolume { user_id, percent } => {
+                let mut settings = self.audio_settings().await.clone();
+                settings.user_volumes.insert(user_id, percent);
+                self.store_audio_settings(settings.validated()).await;
+            }
+            // Calls and the audio pipeline land in later Phase 6 tasks.
+            Command::JoinCall { .. } | Command::DeclineCall { .. } => {
+                let error = if self.active.is_none() {
+                    CoreError::NotLoggedIn
+                } else {
+                    CoreError::Call("calls are not available yet".into())
+                };
+                self.emit(CoreEvent::Error(error)).await;
+            }
+            Command::LeaveCall | Command::SetMicMuted(_) | Command::SetDeafened(_) => {
+                self.emit(CoreEvent::Error(CoreError::NotInCall)).await;
+            }
+            Command::ListAudioDevices | Command::StartMicTest { .. } => {
+                self.emit(CoreEvent::Error(CoreError::Audio(
+                    "audio devices are not available yet".into(),
+                )))
+                .await;
+            }
+            // Without a call or mic test there is nothing to gate or stop.
+            Command::PushToTalk { .. } | Command::StopMicTest => {}
             // Handled in `run`.
             Command::Shutdown => {}
         }
+    }
+
+    /// The audio settings, loading them from disk on first use. A file that
+    /// cannot be used is reported once and replaced by the defaults in memory
+    /// (the file itself stays until the next save).
+    async fn audio_settings(&mut self) -> &AudioSettings {
+        if self.audio_settings.is_none() {
+            let paths = self.config.data.clone();
+            let loaded = blocking(move || call_settings::load(&paths))
+                .await
+                .unwrap_or_else(|e| call_settings::Loaded {
+                    settings: AudioSettings::default(),
+                    problem: Some(e),
+                });
+            if let Some(problem) = loaded.problem {
+                self.emit(CoreEvent::Error(problem)).await;
+            }
+            self.audio_settings = Some(loaded.settings);
+        }
+        self.audio_settings.as_ref().expect("loaded above")
+    }
+
+    /// Adopts already validated settings, saves them, and echoes them back.
+    /// A failed save is reported; the settings still apply for this run.
+    async fn store_audio_settings(&mut self, settings: AudioSettings) {
+        let paths = self.config.data.clone();
+        let to_save = settings.clone();
+        let saved = blocking(move || call_settings::save(&paths, &to_save))
+            .await
+            .and_then(|r| r);
+        self.audio_settings = Some(settings.clone());
+        if let Err(e) = saved {
+            self.emit(CoreEvent::Error(e)).await;
+        }
+        self.emit(CoreEvent::AudioSettings(settings)).await;
     }
 
     /// Answers a Phase 4 action sent without a session. These actions belong
@@ -1867,6 +1940,7 @@ mod tests {
             active: None,
             oauth: None,
             room_list_query: watch::channel(RoomListQuery::default()).0,
+            audio_settings: None,
         }
     }
 
@@ -1951,6 +2025,7 @@ mod tests {
             active: None,
             oauth: None,
             room_list_query: watch::channel(RoomListQuery::default()).0,
+            audio_settings: None,
         };
         (engine, rx)
     }

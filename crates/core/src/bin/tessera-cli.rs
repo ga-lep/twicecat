@@ -683,6 +683,16 @@ impl Cli {
                     self.mode = Mode::Idle;
                 }
             }
+            // Call commands arrive in Phase 6 Task 12.
+            CoreEvent::CallState(_)
+            | CoreEvent::CallParticipants { .. }
+            | CoreEvent::ActiveCall { .. }
+            | CoreEvent::IncomingCall { .. }
+            | CoreEvent::RingingStopped { .. }
+            | CoreEvent::AudioDevices(_)
+            | CoreEvent::AudioSettings(_)
+            | CoreEvent::InputLevel(_)
+            | CoreEvent::AudioStats(_) => {}
         }
     }
 

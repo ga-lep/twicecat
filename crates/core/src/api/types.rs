@@ -7,10 +7,15 @@ use zeroize::Zeroizing;
 
 use super::{Shield, UtdReason};
 
+/// Declares a `String` newtype with `as_str`, `From`, `Display` and
+/// transparent serde (the bare string).
 macro_rules! string_newtype {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
-        #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        #[derive(
+            Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::serde::Serialize, ::serde::Deserialize,
+        )]
+        #[serde(transparent)]
         pub struct $name(String);
 
         impl $name {
@@ -32,13 +37,15 @@ macro_rules! string_newtype {
             }
         }
 
-        impl fmt::Display for $name {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        impl ::std::fmt::Display for $name {
+            fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
                 f.write_str(&self.0)
             }
         }
     };
 }
+
+pub(super) use string_newtype;
 
 string_newtype!(
     /// A Matrix room ID such as `!abc:example.org`.
@@ -1136,6 +1143,15 @@ pub enum CoreError {
     /// The action is not allowed on that item.
     #[error("action not allowed")]
     NotAllowed,
+    /// A call could not be joined or kept up (non-secret description).
+    #[error("call error: {0}")]
+    Call(String),
+    /// An audio device or the audio pipeline failed.
+    #[error("audio error: {0}")]
+    Audio(String),
+    /// The command needs an active call.
+    #[error("not in a call")]
+    NotInCall,
     /// Unexpected internal failure.
     #[error("internal error: {0}")]
     Internal(String),

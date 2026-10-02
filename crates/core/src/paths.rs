@@ -148,6 +148,45 @@ impl DataPaths {
     pub fn last_account_file(&self) -> PathBuf {
         self.root.join("last_account")
     }
+
+    /// `<root>/call_settings.json`: audio devices, processing, input mode and
+    /// per-user volumes. No secrets.
+    pub fn call_settings_file(&self) -> PathBuf {
+        self.root.join("call_settings.json")
+    }
+
+    /// Reads the call settings file; a missing file is `Ok(None)`.
+    pub fn read_call_settings(&self) -> std::io::Result<Option<Vec<u8>>> {
+        match std::fs::read(self.call_settings_file()) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Replaces the call settings file atomically: writes a temporary file
+    /// next to it, then renames it over the old one, so a crash leaves either
+    /// the old or the new file. On Unix the file gets mode 0o600 and the
+    /// root 0o700.
+    pub fn write_call_settings(&self, bytes: &[u8]) -> std::io::Result<()> {
+        use std::io::Write as _;
+
+        create_private_dir_all(&self.root)?;
+        let path = self.call_settings_file();
+        let tmp = self.root.join("call_settings.json.tmp");
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, &path)
+    }
 }
 
 #[cfg(test)]
@@ -279,5 +318,34 @@ mod tests {
         let p = DataPaths::from_os().expect("OS data dir available on the test machine");
         assert!(p.root().is_absolute());
         assert!(p.last_account_file().starts_with(p.root()));
+    }
+
+    #[test]
+    fn call_settings_round_trip_and_replace() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = DataPaths::at(dir.path().join("root"));
+        assert_eq!(paths.read_call_settings().unwrap(), None);
+        paths.write_call_settings(b"{\"a\":1}").unwrap();
+        paths.write_call_settings(b"{\"a\":2}").unwrap();
+        assert_eq!(
+            paths.read_call_settings().unwrap().as_deref(),
+            Some(&b"{\"a\":2}"[..])
+        );
+        assert!(!dir.path().join("root/call_settings.json.tmp").exists());
+        assert!(paths.call_settings_file().starts_with(paths.root()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn call_settings_file_is_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = DataPaths::at(dir.path().join("root"));
+        paths.write_call_settings(b"{}").unwrap();
+        let mode = std::fs::metadata(paths.call_settings_file())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 }

@@ -6,6 +6,7 @@
 
 pub mod api;
 mod avatars;
+mod call_settings;
 mod client;
 mod drafts;
 mod engine;
