@@ -4,3 +4,4 @@ Task 1: complete (f2dea91..00f9285, gate ok, security PASS, review PASS)
 Task 2: started
 Task 2: complete (0b3e105..1f3debf, gate ok, security PASS, review PASS)
   notes: Low: `CoreEvent::Members { query }` derived Debug prints the search query (redact + sentinel test, Task 6). Low (Task 4): `Inline::Link.url` doc claims "checked by core" but no check yet; the mapper must allow-list schemes (http/https/mailto/matrix) or else Text, consider a core-only SafeUrl newtype. Low (Task 4): count/Debug recursion is unbounded; cap nesting depth in the mapper (e.g. 32). Info: display/room names print in Debug (same as MessagePreview policy); watch StateChange in Task 3. Matching-room engine path tested only via the pure helper `unfinished_action_event` (no offline Room); cover via handle when real handlers land. SearchMembers without session/room answers ActionFailed (controller accepted). `Pending` now boxes Command (clippy result_large_err).
+Task 3: started
