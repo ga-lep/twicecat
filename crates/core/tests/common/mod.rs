@@ -107,6 +107,17 @@ pub fn start_core_with_audio(
     secrets: Arc<InMemorySecretStore>,
     audio: tessera_core::api::AudioBackend,
 ) -> CoreHandle {
+    start_core_with_call_service(dir, secrets, audio, None)
+}
+
+/// Like [`start_core_with_audio`], publishing calls on `call_service`
+/// instead of the homeserver's call service.
+pub fn start_core_with_call_service(
+    dir: &Path,
+    secrets: Arc<InMemorySecretStore>,
+    audio: tessera_core::api::AudioBackend,
+    call_service: Option<String>,
+) -> CoreHandle {
     let env = TestEnv::load();
     Core::start(
         CoreConfig {
@@ -114,6 +125,7 @@ pub fn start_core_with_audio(
             homeserver_override: Some(env.homeserver_url().to_owned()),
             room_list_page_size: tessera_core::DEFAULT_ROOM_LIST_PAGE_SIZE,
             audio,
+            call_service_override: call_service,
         },
         secrets,
     )
@@ -154,6 +166,7 @@ pub fn start_core_with_page_size(
             homeserver_override: Some(env.homeserver_url().to_owned()),
             room_list_page_size,
             audio: silence(),
+            call_service_override: None,
         },
         secrets,
     )

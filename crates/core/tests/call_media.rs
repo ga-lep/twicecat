@@ -2,6 +2,8 @@
 //! && scripts/create-test-users.sh`): alice's (virtual) microphone plays a
 //! 1 kHz tone, and it must come out of carol's (virtual) speakers through
 //! the LiveKit SFU, Opus and both voice pipelines. Muting alice stops it.
+//! Multi-SFU: with carol publishing on the second call service, each still
+//! hears the other.
 //!
 //! Uses alice and carol; bob stays untouched.
 
@@ -13,7 +15,7 @@ use std::time::Duration;
 
 use common::{
     DEFAULT_TIMEOUT, TestEnv, create_room, expect_event, raw_login, start_core_with_audio,
-    unique_room_name, wait_for_room,
+    start_core_with_call_service, unique_room_name, wait_for_room,
 };
 use serde_json::Value;
 use tessera_core::CoreHandle;
@@ -26,6 +28,13 @@ use tessera_core::secrets::InMemorySecretStore;
 
 const TONE_HZ: f32 = 1000.0;
 const RATE: f32 = 48_000.0;
+
+/// A tone sent at 0.3 is heard at 0.23 to 0.29 (through Opus and the
+/// voice chain) when nothing is lost. The level is measured coherently over
+/// its window, so gaps and phase jumps pull it down: this bar catches
+/// dropouts (call audio starved on a busy runtime gave 0.03 to 0.27, mostly
+/// under 0.15), not only silence.
+const HEARD: f32 = 0.15;
 
 /// A microphone playing a steady tone.
 #[derive(Default)]
@@ -59,25 +68,87 @@ impl VirtualAudio for Recorder {
     }
 }
 
+/// Amplitude of a `hz` tone in the last `seconds` of `played`.
+fn level_of(played: &[f32], hz: f32, seconds: f32) -> f32 {
+    let n = ((seconds * RATE) as usize).min(played.len());
+    let tail = &played[played.len() - n..];
+    let w = 2.0 * std::f32::consts::PI * hz / RATE;
+    let (mut re, mut im) = (0.0_f32, 0.0_f32);
+    for (i, s) in tail.iter().enumerate() {
+        re += s * (w * i as f32).cos();
+        im += s * (w * i as f32).sin();
+    }
+    2.0 * (re * re + im * im).sqrt() / n.max(1) as f32
+}
+
 impl Recorder {
     /// Amplitude of the tone in the last `seconds` of playback.
     fn tone_level(&self, seconds: f32) -> f32 {
-        let played = self.played.lock().unwrap();
-        let n = ((seconds * RATE) as usize).min(played.len());
-        let tail = &played[played.len() - n..];
-        let w = 2.0 * std::f32::consts::PI * TONE_HZ / RATE;
-        let (mut re, mut im) = (0.0_f32, 0.0_f32);
-        for (i, s) in tail.iter().enumerate() {
-            re += s * (w * i as f32).cos();
-            im += s * (w * i as f32).sin();
+        level_of(&self.played.lock().unwrap(), TONE_HZ, seconds)
+    }
+}
+
+/// Plays a `hz` tone into the microphone and records the speakers.
+struct Duplex {
+    hz: f32,
+    n: AtomicU64,
+    played: Mutex<Vec<f32>>,
+}
+
+impl Duplex {
+    fn new(hz: f32) -> Self {
+        Self {
+            hz,
+            n: AtomicU64::new(0),
+            played: Mutex::default(),
         }
-        2.0 * (re * re + im * im).sqrt() / n.max(1) as f32
+    }
+
+    fn level(&self, hz: f32, seconds: f32) -> f32 {
+        level_of(&self.played.lock().unwrap(), hz, seconds)
+    }
+}
+
+impl VirtualAudio for Duplex {
+    fn capture(&self, frame: &mut [f32; AUDIO_FRAME_LEN]) {
+        let start = self.n.fetch_add(AUDIO_FRAME_LEN as u64, Ordering::Relaxed);
+        for (i, s) in frame.iter_mut().enumerate() {
+            let t = (start + i as u64) as f32 / RATE;
+            *s = 0.3 * (2.0 * std::f32::consts::PI * self.hz * t).sin();
+        }
+    }
+    fn playback(&self, frame: &[f32; AUDIO_FRAME_LEN]) {
+        self.played.lock().unwrap().extend_from_slice(frame);
+    }
+}
+
+/// Settings that send a pure tone as is: a denoiser takes it for noise,
+/// a gain control and a gate would shape it.
+fn tone_settings() -> AudioSettings {
+    AudioSettings {
+        processing: AudioProcessing {
+            noise_suppression: NoiseSuppression::Off,
+            auto_gain: false,
+            ..AudioProcessing::default()
+        },
+        input_mode: InputMode::VoiceActivity {
+            automatic: false,
+            threshold_db: -100.0,
+        },
+        ..AudioSettings::default()
     }
 }
 
 async fn logged_in(dir: &std::path::Path, n: u8, audio: AudioBackend) -> CoreHandle {
+    login(
+        start_core_with_audio(dir, Arc::new(InMemorySecretStore::new()), audio),
+        n,
+    )
+    .await
+}
+
+async fn login(mut core: CoreHandle, n: u8) -> CoreHandle {
     let env = TestEnv::load();
-    let mut core = start_core_with_audio(dir, Arc::new(InMemorySecretStore::new()), audio);
     core.commands
         .send(Command::LoginPassword {
             username: env.user(n).to_owned(),
@@ -138,6 +209,27 @@ async fn alice_as_seen_by(core: &mut CoreHandle, alice: &str, done: impl Fn(&Par
     tokio::time::timeout(DEFAULT_TIMEOUT, wait)
         .await
         .expect("timed out waiting for alice's participant state");
+}
+
+/// The call service `user`'s membership publishes on (`foci_preferred[0]`).
+async fn call_service_of(reader: &matrix_sdk::Client, room_id: &str, user: &str) -> Option<String> {
+    use matrix_sdk::ruma::api::client::state::get_state_events;
+    let reply = reader
+        .send(get_state_events::v3::Request::new(
+            room_id.try_into().unwrap(),
+        ))
+        .await
+        .ok()?;
+    reply.room_state.iter().find_map(|raw| {
+        let event: Value = raw.deserialize_as().ok()?;
+        (event["type"] == "org.matrix.msc3401.call.member" && event["sender"] == user)
+            .then(|| {
+                event["content"]["foci_preferred"][0]["livekit_service_url"]
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .flatten()
+    })
 }
 
 /// Lets members at power level 0 publish call memberships (as Element does).
@@ -223,7 +315,7 @@ async fn alices_tone_reaches_carols_speakers_and_mute_stops_it() {
     let heard = recorder.tone_level(2.0);
     eprintln!("tone amplitude at carol's speakers: {heard:.4} (sent 0.3)");
     assert!(
-        heard > 0.05,
+        heard > HEARD,
         "tone at carol's speakers: amplitude {heard:.4}"
     );
 
@@ -241,6 +333,233 @@ async fn alices_tone_reaches_carols_speakers_and_mute_stops_it() {
         "muted: amplitude {after_mute:.4} (was {heard:.4})"
     );
 
+    for core in [&alice, &carol] {
+        core.commands.send(Command::LeaveCall).await.unwrap();
+        core.commands.send(Command::Shutdown).await.unwrap();
+    }
+}
+
+/// Carol publishes on the second call service (another homeserver's, in
+/// Element Call's multi-SFU mode), alice on the first. Each subscribes on
+/// the other's SFU: alice hears carol's 600 Hz tone, carol alice's 1 kHz.
+#[tokio::test]
+#[ignore = "needs local homeserver: docker compose up -d --wait"]
+async fn members_on_different_sfus_hear_each_other() {
+    const ALICE_HZ: f32 = 1000.0;
+    const CAROL_HZ: f32 = 600.0;
+    let env = TestEnv::load();
+    let alice_raw = raw_login(1).await;
+    let carol_raw = raw_login(3).await;
+    let room_id = create_room(&alice_raw, &unique_room_name(), Some(&env.user_id(3)))
+        .await
+        .to_string();
+    allow_calls(&alice_raw, &room_id).await;
+    carol_raw
+        .join_room_by_id(room_id.as_str().try_into().unwrap())
+        .await
+        .unwrap();
+
+    let (alice_audio, carol_audio) = (
+        Arc::new(Duplex::new(ALICE_HZ)),
+        Arc::new(Duplex::new(CAROL_HZ)),
+    );
+    let (dir_a, dir_c) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let mut alice = logged_in(dir_a.path(), 1, AudioBackend::Virtual(alice_audio.clone())).await;
+    let service_b = env.get("LK_JWT_URL_B").to_owned();
+    let mut carol = login(
+        start_core_with_call_service(
+            dir_c.path(),
+            Arc::new(InMemorySecretStore::new()),
+            AudioBackend::Virtual(carol_audio.clone()),
+            Some(service_b.clone()),
+        ),
+        3,
+    )
+    .await;
+    wait_for_room(&mut alice, &room_id).await;
+    wait_for_room(&mut carol, &room_id).await;
+    for core in [&mut alice, &mut carol] {
+        core.commands
+            .send(Command::UpdateAudioSettings(tone_settings()))
+            .await
+            .unwrap();
+        expect_event(core, |e| matches!(e, CoreEvent::AudioSettings(_))).await;
+    }
+
+    join(&mut alice, &room_id).await;
+    join(&mut carol, &room_id).await;
+
+    // Carol advertises the second service, as a member of another homeserver would.
+    assert_eq!(
+        call_service_of(&alice_raw, &room_id, &env.user_id(3))
+            .await
+            .as_deref(),
+        Some(service_b.as_str())
+    );
+    assert_eq!(
+        call_service_of(&alice_raw, &room_id, &env.user_id(1))
+            .await
+            .as_deref(),
+        Some(env.get("LK_JWT_URL"))
+    );
+
+    alice_as_seen_by(&mut carol, &env.user_id(1), |p| p.speaking).await;
+    alice_as_seen_by(&mut alice, &env.user_id(3), |p| p.speaking).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let alice_hears = alice_audio.level(CAROL_HZ, 2.0);
+    let carol_hears = carol_audio.level(ALICE_HZ, 2.0);
+    eprintln!(
+        "alice hears carol (via SFU B): {alice_hears:.4}; carol hears alice (via SFU A): {carol_hears:.4} (sent 0.3)"
+    );
+    assert!(
+        alice_hears > HEARD,
+        "alice hears carol: amplitude {alice_hears:.4}"
+    );
+    assert!(
+        carol_hears > HEARD,
+        "carol hears alice: amplitude {carol_hears:.4}"
+    );
+
+    for core in [&alice, &carol] {
+        core.commands.send(Command::LeaveCall).await.unwrap();
+        core.commands.send(Command::Shutdown).await.unwrap();
+    }
+}
+
+/// Joins the call's LiveKit room as `client`'s user with a made-up device
+/// (a token from the call service, no call membership) and publishes a
+/// `hz` tone: what anyone with a Matrix account could do.
+async fn intrude(client: &matrix_sdk::Client, room_id: &str, hz: f32) -> livekit::prelude::Room {
+    use livekit::options::TrackPublishOptions;
+    use livekit::prelude::{LocalAudioTrack, LocalTrack, Room, RoomOptions, TrackSource};
+    use livekit::webrtc::audio_frame::AudioFrame;
+    use livekit::webrtc::audio_source::native::NativeAudioSource;
+    use livekit::webrtc::audio_source::{AudioSourceOptions, RtcAudioSource};
+    use matrix_sdk::ruma::api::client::account::request_openid_token;
+
+    let env = TestEnv::load();
+    let openid = client
+        .send(request_openid_token::v3::Request::new(
+            client.user_id().unwrap().to_owned(),
+        ))
+        .await
+        .unwrap();
+    let body = serde_json::json!({
+        "room": room_id,
+        "openid_token": {
+            "access_token": openid.access_token,
+            "token_type": openid.token_type,
+            "matrix_server_name": openid.matrix_server_name,
+            "expires_in": openid.expires_in.as_secs(),
+        },
+        "device_id": "INTRUDER",
+    });
+    let reply = matrix_sdk::reqwest::Client::new()
+        .post(format!("{}/sfu/get", env.get("LK_JWT_URL")))
+        .header("content-type", "application/json")
+        .body(body.to_string())
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let reply: Value = serde_json::from_str(&reply).unwrap();
+    let (room, _events) = Room::connect(
+        reply["url"].as_str().unwrap(),
+        reply["jwt"].as_str().unwrap(),
+        RoomOptions::default(),
+    )
+    .await
+    .expect("intruder connects");
+    let source = NativeAudioSource::new(AudioSourceOptions::default(), 48_000, 1, 50);
+    let track = LocalAudioTrack::create_audio_track("tone", RtcAudioSource::Native(source.clone()));
+    room.local_participant()
+        .publish_track(
+            LocalTrack::Audio(track),
+            TrackPublishOptions {
+                source: TrackSource::Microphone,
+                ..TrackPublishOptions::default()
+            },
+        )
+        .await
+        .expect("intruder publishes");
+    tokio::spawn(async move {
+        let mut n = 0u64;
+        let mut ticker = tokio::time::interval(Duration::from_millis(10));
+        loop {
+            ticker.tick().await;
+            let data: Vec<i16> = (0..480)
+                .map(|i| {
+                    let t = (n + i) as f32 / RATE;
+                    (0.3 * (2.0 * std::f32::consts::PI * hz * t).sin() * f32::from(i16::MAX)) as i16
+                })
+                .collect();
+            n += 480;
+            let frame = AudioFrame {
+                data: data.into(),
+                sample_rate: 48_000,
+                num_channels: 1,
+                samples_per_channel: 480,
+            };
+            if source.capture_frame(&frame).await.is_err() {
+                return;
+            }
+        }
+    });
+    room
+}
+
+/// The call services give a LiveKit token to any Matrix user, so a
+/// participant on the SFU without a call membership is not played; a real
+/// member next to it is.
+#[tokio::test]
+#[ignore = "needs local homeserver: docker compose up -d --wait"]
+async fn a_participant_without_a_membership_is_not_played() {
+    const CAROL_HZ: f32 = 600.0;
+    const INTRUDER_HZ: f32 = 800.0;
+    let env = TestEnv::load();
+    let alice_raw = raw_login(1).await;
+    let carol_raw = raw_login(3).await;
+    let room_id = create_room(&alice_raw, &unique_room_name(), Some(&env.user_id(3)))
+        .await
+        .to_string();
+    allow_calls(&alice_raw, &room_id).await;
+    carol_raw
+        .join_room_by_id(room_id.as_str().try_into().unwrap())
+        .await
+        .unwrap();
+
+    let alice_audio = Arc::new(Duplex::new(TONE_HZ));
+    let (dir_a, dir_c) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let mut alice = logged_in(dir_a.path(), 1, AudioBackend::Virtual(alice_audio.clone())).await;
+    let mut carol = logged_in(
+        dir_c.path(),
+        3,
+        AudioBackend::Virtual(Arc::new(Duplex::new(CAROL_HZ))),
+    )
+    .await;
+    wait_for_room(&mut alice, &room_id).await;
+    wait_for_room(&mut carol, &room_id).await;
+    carol
+        .commands
+        .send(Command::UpdateAudioSettings(tone_settings()))
+        .await
+        .unwrap();
+    expect_event(&mut carol, |e| matches!(e, CoreEvent::AudioSettings(_))).await;
+    join(&mut alice, &room_id).await;
+    join(&mut carol, &room_id).await;
+    let intruder = intrude(&carol_raw, &room_id, INTRUDER_HZ).await;
+
+    alice_as_seen_by(&mut alice, &env.user_id(3), |p| p.speaking).await;
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let member = alice_audio.level(CAROL_HZ, 3.0);
+    let stranger = alice_audio.level(INTRUDER_HZ, 3.0);
+    eprintln!("alice hears carol's device {member:.4}, the intruder {stranger:.5} (each sent 0.3)");
+    assert!(member > HEARD, "member: amplitude {member:.4}");
+    assert!(stranger < 0.01, "intruder: amplitude {stranger:.4}");
+
+    let _ = intruder.close().await;
     for core in [&alice, &carol] {
         core.commands.send(Command::LeaveCall).await.unwrap();
         core.commands.send(Command::Shutdown).await.unwrap();

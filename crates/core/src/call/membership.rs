@@ -6,6 +6,7 @@
 //! Built and parsed as plain JSON because the content carries
 //! `membershipID`, which ruma's `SessionMembershipData` does not model.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -73,16 +74,31 @@ pub(crate) fn join_content(
     content
 }
 
+/// How a member picks its SFU (`focus_active.focus_selection`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FocusSelection {
+    /// Its own `foci_preferred[0]` (Element Call's default).
+    MultiSfu,
+    /// The oldest membership's SFU (older Element Call versions).
+    OldestMembership,
+}
+
 /// One device's membership, as read from the room state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Membership {
     pub user_id: String,
     pub device_id: String,
-    /// `membershipID`, or `user:device` when absent; also the LiveKit
-    /// identity of this device.
+    /// `membershipID`, or `user:device` when absent.
     pub member_id: String,
-    /// The SFU this device publishes to (`foci_preferred[0]`), if any.
+    /// The LiveKit identity of this device: `sender:device_id`, as
+    /// matrix-js-sdk's `CallMembership.rtcBackendIdentity` for these
+    /// (session) memberships, whatever `membershipID` says.
+    pub backend_identity: String,
+    /// `foci_preferred[0]` when it is a LiveKit focus.
     pub livekit_service_url: Option<String>,
+    /// `None` when `focus_active` is missing or not understood: such a
+    /// member has no SFU we can find (as in Element Call).
+    pub focus: Option<FocusSelection>,
     /// When the membership started, ms since the epoch.
     pub joined_ms: u64,
     /// Validity from `joined_ms`.
@@ -128,6 +144,16 @@ pub(crate) fn parse(
         .get("membershipID")
         .and_then(Value::as_str)
         .map_or_else(|| member_id(sender, device_id), str::to_owned);
+    let focus = content
+        .get("focus_active")
+        .filter(|f| f.get("type").and_then(Value::as_str) == Some("livekit"))
+        .and_then(|f| f.get("focus_selection"))
+        .and_then(Value::as_str)
+        .and_then(|s| match s {
+            "multi_sfu" => Some(FocusSelection::MultiSfu),
+            "oldest_membership" => Some(FocusSelection::OldestMembership),
+            _ => None,
+        });
     let livekit_service_url = content
         .get("foci_preferred")
         .and_then(Value::as_array)
@@ -140,10 +166,51 @@ pub(crate) fn parse(
         user_id: sender.to_owned(),
         device_id: device_id.to_owned(),
         member_id,
+        backend_identity: format!("{sender}:{device_id}"),
         livekit_service_url,
+        focus,
         joined_ms,
         expires_ms,
     })
+}
+
+/// The SFU (call service URL) `member` publishes to, as matrix-js-sdk's
+/// `CallMembership.getTransport`: its own `foci_preferred[0]` in multi-SFU
+/// mode, the oldest membership's in `oldest_membership` mode. `oldest` is
+/// the active membership that joined first.
+pub(crate) fn transport_of<'a>(member: &'a Membership, oldest: &'a Membership) -> Option<&'a str> {
+    match member.focus? {
+        FocusSelection::MultiSfu => member.livekit_service_url.as_deref(),
+        FocusSelection::OldestMembership if member == oldest => {
+            member.livekit_service_url.as_deref()
+        }
+        FocusSelection::OldestMembership => transport_of(oldest, oldest),
+    }
+}
+
+/// For each SFU, the LiveKit identities of the members publishing there,
+/// for every active member but `own_identity` (`active` oldest first). Our
+/// own service is always present, maybe empty: we publish there.
+pub(crate) fn expected_by_sfu(
+    active: &[Membership],
+    own_identity: &str,
+    own_service: &str,
+) -> BTreeMap<String, BTreeSet<String>> {
+    let mut out = BTreeMap::from([(own_service.to_owned(), BTreeSet::new())]);
+    let Some(oldest) = active.first() else {
+        return out;
+    };
+    for m in active {
+        if m.backend_identity == own_identity {
+            continue;
+        }
+        if let Some(url) = transport_of(m, oldest) {
+            out.entry(url.to_owned())
+                .or_default()
+                .insert(m.backend_identity.clone());
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -229,6 +296,73 @@ mod tests {
         let m = parse(ALICE, "_@alice:example.org_EC_m.call", 900, &c).unwrap();
         assert_eq!(m.member_id, "@alice:example.org:EC");
         assert_eq!(m.joined_ms, 500, "min(created_ts, origin_server_ts)");
+    }
+
+    fn member(user: &str, url: &str, focus: Option<FocusSelection>) -> Membership {
+        Membership {
+            user_id: user.into(),
+            device_id: "D".into(),
+            member_id: format!("{user}:D"),
+            backend_identity: format!("{user}:D"),
+            livekit_service_url: Some(url.into()),
+            focus,
+            joined_ms: 0,
+            expires_ms: 1,
+        }
+    }
+
+    #[test]
+    fn transports_follow_the_focus_selection() {
+        use FocusSelection::{MultiSfu, OldestMembership};
+        let first = member("@a:x", "https://a", Some(OldestMembership));
+        let multi = member("@b:y", "https://b", Some(MultiSfu));
+        let follower = member("@c:z", "https://c", Some(OldestMembership));
+        let unknown = member("@d:w", "https://d", None);
+        assert_eq!(transport_of(&first, &first), Some("https://a"));
+        assert_eq!(transport_of(&multi, &first), Some("https://b"));
+        assert_eq!(transport_of(&follower, &first), Some("https://a"));
+        assert_eq!(transport_of(&unknown, &first), None);
+        // A follower of a multi-SFU oldest member uses that member's SFU.
+        assert_eq!(transport_of(&follower, &multi), Some("https://b"));
+    }
+
+    #[test]
+    fn members_are_expected_on_their_sfu_but_not_us() {
+        use FocusSelection::MultiSfu;
+        let us = member("@us:x", "https://own", Some(MultiSfu));
+        let near = member("@near:x", "https://own", Some(MultiSfu));
+        let far = member("@far:y", "https://far", Some(MultiSfu));
+        let lost = member("@lost:z", "https://lost", None);
+        let got = expected_by_sfu(&[us, near, far, lost], "@us:x:D", "https://own");
+        let ids = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<BTreeSet<_>>();
+        assert_eq!(
+            got,
+            BTreeMap::from([
+                ("https://far".to_owned(), ids(&["@far:y:D"])),
+                ("https://own".to_owned(), ids(&["@near:x:D"])),
+            ])
+        );
+        assert_eq!(
+            expected_by_sfu(&[], "@us:x:D", "https://own"),
+            BTreeMap::from([("https://own".to_owned(), BTreeSet::new())])
+        );
+    }
+
+    #[test]
+    fn the_livekit_identity_is_sender_and_device_whatever_membership_id_says() {
+        let mut c = join_content(
+            ALICE,
+            "DEV",
+            "https://sfu",
+            "!r:x",
+            None,
+            MEMBERSHIP_EXPIRES,
+        );
+        c["membershipID"] = json!("a-random-uuid");
+        let m = parse(ALICE, &state_key(ALICE, "DEV", "11"), 0, &c).unwrap();
+        assert_eq!(m.member_id, "a-random-uuid");
+        assert_eq!(m.backend_identity, "@alice:example.org:DEV");
+        assert_eq!(m.focus, Some(FocusSelection::MultiSfu));
     }
 
     #[test]

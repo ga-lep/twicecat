@@ -13,6 +13,11 @@ services:
       - "127.0.0.1:7880:7880" # LiveKit signalling (ws)
       - "127.0.0.1:7881:7881" # LiveKit ICE over TCP
       - "127.0.0.1:7882:7882/udp" # LiveKit ICE over UDP (muxed)
+      # Second SFU and lk-jwt-service (multi-SFU tests: another "homeserver's" call service).
+      - "127.0.0.1:8081:8081" # lk-jwt-service B
+      - "127.0.0.1:7890:7890" # LiveKit B signalling (ws)
+      - "127.0.0.1:7891:7891" # LiveKit B ICE over TCP
+      - "127.0.0.1:7892:7892/udp" # LiveKit B ICE over UDP (muxed)
     volumes:
       - synapse-data:/data
       - ./dev/synapse/start.sh:/start-dev.sh:ro
@@ -67,15 +72,58 @@ services:
       retries: 30
       start_period: 2s
 
+  # A second SFU and authorization service, standing in for another
+  # homeserver's call service: in Element Call's multi-SFU mode each member
+  # publishes to their own, and the others subscribe there. Same dev key as
+  # the first pair (test-only), different ports.
+  livekit-b:
+    image: livekit/livekit-server:v1.13.7
+    network_mode: "service:synapse"
+    depends_on:
+      synapse:
+        condition: service_healthy
+    env_file: .env.test
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - 'LIVEKIT_KEYS="$$LIVEKIT_KEY: $$LIVEKIT_SECRET" exec /livekit-server --config /etc/livekit.yaml'
+    volumes:
+      - ./dev/livekit/livekit-b.yaml:/etc/livekit.yaml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:7890 >/dev/null"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 2s
+
+  lk-jwt-b:
+    image: ghcr.io/element-hq/lk-jwt-service:0.7.0
+    network_mode: "service:synapse"
+    depends_on:
+      livekit-b:
+        condition: service_healthy
+    env_file: .env.test
+    environment:
+      LIVEKIT_JWT_BIND: ":8081"
+      LIVEKIT_URL: ws://127.0.0.1:7890
+      LIVEKIT_FULL_ACCESS_HOMESERVERS: localhost
+      # Dev only: Synapse's federation listener uses a self-signed certificate.
+      LIVEKIT_INSECURE_SKIP_VERIFY_TLS: YES_I_KNOW_WHAT_I_AM_DOING
+    healthcheck:
+      test: ["CMD", "/lk-jwt-service-healthcheck"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 2s
+
   # Element Web for the human checks, as the other side of a chat. Browsers
   # block app.element.io from calling http://localhost, so it runs locally.
   # Not started by default (CI does not need it): `docker compose --profile element up -d`,
-  # then open http://localhost:8081.
+  # then open http://localhost:8082.
   element:
     image: vectorim/element-web:v1.12.30
     profiles: ["element"]
     ports:
-      - "127.0.0.1:8081:80"
+      - "127.0.0.1:8082:80"
     volumes:
       - ./dev/element/config.json:/app/config.json:ro
     depends_on:

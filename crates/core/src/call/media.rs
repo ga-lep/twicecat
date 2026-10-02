@@ -1,25 +1,30 @@
-//! Call media over LiveKit: publish the processed microphone, play every
-//! remote audio track through the voice engine's mixer, and track who
+//! Call media over LiveKit, one connection per SFU (Element Call's
+//! multi-SFU mode): ours publishes the processed microphone, on the others
+//! we only subscribe. Each connection plays the remote audio tracks of the
+//! members expected there through the voice engine's mixer, and tracks who
 //! speaks and who is muted.
 //!
-//! In Element Call's compatibility mode a participant's LiveKit identity is
-//! its membership ID, `user:device`.
+//! A LiveKit identity is the member's `user:device` (session memberships).
+//! A participant that is not an active member on that SFU is not played:
+//! the call services hand out tokens to any Matrix user (as Element Call,
+//! which only shows participants matching a membership).
 
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex as StdMutex, RwLock};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock};
 use std::time::Duration;
 
 use futures_util::StreamExt as _;
 use livekit::options::{AudioEncoding, TrackPublishOptions};
 use livekit::prelude::{
-    LocalAudioTrack, LocalTrack, RemoteTrack, Room, RoomEvent, RoomOptions, TrackKind, TrackSource,
+    LocalAudioTrack, LocalTrack, Participant, RemoteAudioTrack, RemoteTrack, Room, RoomEvent,
+    RoomOptions, TrackKind, TrackSource,
 };
 use livekit::webrtc::audio_frame::AudioFrame;
 use livekit::webrtc::audio_source::native::NativeAudioSource;
 use livekit::webrtc::audio_source::{AudioSourceOptions, RtcAudioSource};
 use livekit::webrtc::audio_stream::native::NativeAudioStream;
 use tessera_audio::{FRAME_LEN, Outgoing, SAMPLE_RATE, SILENCE, SourceId};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 
 use super::UserVolumes;
@@ -32,11 +37,18 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 /// Buffer inside the LiveKit audio source, ms (multiple of 10).
 const SOURCE_QUEUE_MS: u32 = 50;
 
-/// Who speaks and who is muted, by LiveKit identity (= member ID).
+/// Who speaks and who is muted, by LiveKit identity (`user:device`).
 #[derive(Debug, Default)]
 pub(crate) struct MediaFlags {
-    pub speaking: HashSet<String>,
+    /// Active speakers per SFU connection: each room reports only its own.
+    pub speaking: HashMap<String, HashSet<String>>,
     pub muted: HashSet<String>,
+}
+
+impl MediaFlags {
+    pub(crate) fn is_speaking(&self, identity: &str) -> bool {
+        self.speaking.values().any(|s| s.contains(identity))
+    }
 }
 
 /// Flags shared with the participant reporting, and a nudge to re-report.
@@ -46,13 +58,23 @@ pub(crate) struct SharedFlags {
     pub changed: Arc<Notify>,
 }
 
-/// What the engine must react to.
+/// What a connection reports, with its SFU (call service URL).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MediaNotice {
     Reconnecting,
     Reconnected,
     /// The SFU connection is gone for good.
     Disconnected,
+}
+
+/// The identities a connection plays; the call updates it as memberships
+/// change.
+pub(crate) type Expected = watch::Receiver<BTreeSet<String>>;
+
+/// The microphone side of the connection that publishes.
+pub(crate) struct Publish {
+    pub outgoing: Option<Outgoing>,
+    pub bitrate_kbps: u16,
 }
 
 /// The user of a `user:device` identity.
@@ -67,29 +89,104 @@ fn to_i16(frame: &tessera_audio::Frame) -> Vec<i16> {
         .collect()
 }
 
-/// Remote sources by identity: the mixer source and its reader task.
-type Sources = Arc<StdMutex<HashMap<String, (SourceId, JoinHandle<()>)>>>;
+fn volume_of(volumes: &UserVolumes, identity: &str) -> u16 {
+    volumes
+        .read()
+        .ok()
+        .and_then(|v| v.get(&UserId::from(user_of(identity))).copied())
+        .unwrap_or(100)
+}
 
-/// A connected SFU session.
-pub(crate) struct Media {
+/// The subscribed remote audio tracks of one connection and the ones
+/// playing: exactly those of expected identities.
+#[derive(Default)]
+struct Players {
+    tracks: HashMap<String, RemoteAudioTrack>,
+    playing: HashMap<String, (SourceId, JoinHandle<()>)>,
+    expected: BTreeSet<String>,
+}
+
+impl Players {
+    fn stop(&mut self, identity: &str, voice: Option<&Voice>) {
+        if let Some((id, task)) = self.playing.remove(identity) {
+            task.abort();
+            if let Some(voice) = voice {
+                audio_session::remove_source(voice, id);
+            }
+        }
+    }
+
+    /// Starts and stops mixer sources so that exactly the subscribed tracks
+    /// of expected identities play.
+    fn reconcile(&mut self, voice: Option<&Voice>, volumes: &UserVolumes) {
+        let stale: Vec<String> = self
+            .playing
+            .keys()
+            .filter(|id| !self.tracks.contains_key(*id) || !self.expected.contains(*id))
+            .cloned()
+            .collect();
+        for identity in stale {
+            self.stop(&identity, voice);
+        }
+        let Some(voice) = voice else {
+            return;
+        };
+        for (identity, track) in &self.tracks {
+            if self.playing.contains_key(identity) || !self.expected.contains(identity) {
+                continue;
+            }
+            let Some((id, input)) = audio_session::add_source(voice, volume_of(volumes, identity))
+            else {
+                tracing::warn!("mixer queue full; a participant is not played");
+                continue;
+            };
+            let stream = NativeAudioStream::new(track.rtc_track(), SAMPLE_RATE as i32, 1);
+            self.playing.insert(
+                identity.clone(),
+                (id, spawn_audio_task(read_track(stream, input))),
+            );
+        }
+    }
+
+    fn stop_all(&mut self, voice: Option<&Voice>) {
+        let all: Vec<String> = self.playing.keys().cloned().collect();
+        for identity in all {
+            self.stop(&identity, voice);
+        }
+    }
+}
+
+/// One SFU connection.
+pub(crate) struct SfuConnection {
+    /// The call service URL this SFU belongs to.
+    key: String,
     room: Room,
-    track: LocalAudioTrack,
+    /// Our microphone, on the connection that publishes.
+    track: Option<LocalAudioTrack>,
     voice: Option<Voice>,
-    sources: Sources,
+    players: Arc<StdMutex<Players>>,
+    flags: SharedFlags,
     tasks: Vec<JoinHandle<()>>,
 }
 
-impl Media {
-    /// Connects to the SFU, publishes the microphone track (fed from
-    /// `outgoing`), and plays remote tracks through `voice`.
+/// What a connection needs besides its SFU access.
+pub(crate) struct ConnectionShared {
+    pub voice: Option<Voice>,
+    pub volumes: UserVolumes,
+    pub flags: SharedFlags,
+    pub notices: mpsc::Sender<(String, MediaNotice)>,
+}
+
+impl SfuConnection {
+    /// Connects to the SFU of the call service `key`, plays the expected
+    /// members' audio and, with `publish`, publishes the microphone (fed
+    /// from its `outgoing`).
     pub(crate) async fn connect(
+        key: String,
         sfu: &SfuAccess,
-        voice: Option<Voice>,
-        outgoing: Option<Outgoing>,
-        bitrate_kbps: u16,
-        volumes: UserVolumes,
-        flags: SharedFlags,
-        notices: mpsc::Sender<MediaNotice>,
+        publish: Option<Publish>,
+        mut expected: Expected,
+        shared: &ConnectionShared,
     ) -> Result<Self, CoreError> {
         let (room, room_events) = tokio::time::timeout(
             CONNECT_TIMEOUT,
@@ -99,68 +196,83 @@ impl Media {
         .map_err(|_| CoreError::Call("connecting to the call server timed out".into()))?
         .map_err(|_| CoreError::Call("could not connect to the call server".into()))?;
 
-        let source = NativeAudioSource::new(
-            // Our own pipeline already did echo cancellation, noise
-            // suppression and gain.
-            AudioSourceOptions {
-                echo_cancellation: false,
-                noise_suppression: false,
-                auto_gain_control: false,
-            },
-            SAMPLE_RATE,
-            1,
-            SOURCE_QUEUE_MS,
-        );
-        let track = LocalAudioTrack::create_audio_track(
-            "microphone",
-            RtcAudioSource::Native(source.clone()),
-        );
-        room.local_participant()
-            .publish_track(
-                LocalTrack::Audio(track.clone()),
-                TrackPublishOptions {
-                    source: TrackSource::Microphone,
-                    audio_encoding: Some(AudioEncoding {
-                        max_bitrate: u64::from(bitrate_kbps) * 1000,
-                    }),
-                    // Opus DTX (near-free silence) and RED (redundant
-                    // packets against loss), both on by default in LiveKit.
-                    dtx: true,
-                    red: true,
-                    ..TrackPublishOptions::default()
-                },
-            )
-            .await
-            .map_err(|_| CoreError::Call("could not publish the microphone".into()))?;
-
-        let sources: Sources = Arc::default();
         let mut tasks = Vec::new();
-        if let Some(outgoing) = outgoing {
-            tasks.push(tokio::spawn(send_microphone(outgoing, source)));
+        let mut track = None;
+        if let Some(publish) = publish {
+            let source = NativeAudioSource::new(
+                // Our own pipeline already did echo cancellation, noise
+                // suppression and gain.
+                AudioSourceOptions {
+                    echo_cancellation: false,
+                    noise_suppression: false,
+                    auto_gain_control: false,
+                },
+                SAMPLE_RATE,
+                1,
+                SOURCE_QUEUE_MS,
+            );
+            let local = LocalAudioTrack::create_audio_track(
+                "microphone",
+                RtcAudioSource::Native(source.clone()),
+            );
+            room.local_participant()
+                .publish_track(
+                    LocalTrack::Audio(local.clone()),
+                    TrackPublishOptions {
+                        source: TrackSource::Microphone,
+                        audio_encoding: Some(AudioEncoding {
+                            max_bitrate: u64::from(publish.bitrate_kbps) * 1000,
+                        }),
+                        // Opus DTX (near-free silence) and RED (redundant
+                        // packets against loss), both on by default in LiveKit.
+                        dtx: true,
+                        red: true,
+                        ..TrackPublishOptions::default()
+                    },
+                )
+                .await
+                .map_err(|_| CoreError::Call("could not publish the microphone".into()))?;
+            if let Some(outgoing) = publish.outgoing {
+                tasks.push(spawn_audio_task(send_microphone(outgoing, source)));
+            }
+            track = Some(local);
         }
+
+        let players = Arc::new(StdMutex::new(Players {
+            expected: expected.borrow_and_update().clone(),
+            ..Players::default()
+        }));
         tasks.push(tokio::spawn(handle_events(
+            EventContext {
+                key: key.clone(),
+                voice: shared.voice.clone(),
+                players: players.clone(),
+                volumes: shared.volumes.clone(),
+                flags: shared.flags.clone(),
+                notices: shared.notices.clone(),
+            },
             room_events,
-            voice.clone(),
-            sources.clone(),
-            volumes,
-            flags,
-            notices,
+            expected,
         )));
         Ok(Self {
+            key,
             room,
             track,
-            voice,
-            sources,
+            voice: shared.voice.clone(),
+            players,
+            flags: shared.flags.clone(),
             tasks,
         })
     }
 
     /// Mutes or unmutes the published track (others see it as muted).
     pub(crate) fn set_muted(&self, muted: bool) {
-        if muted {
-            self.track.mute();
-        } else {
-            self.track.unmute();
+        if let Some(track) = &self.track {
+            if muted {
+                track.mute();
+            } else {
+                track.unmute();
+            }
         }
     }
 
@@ -169,30 +281,36 @@ impl Media {
         let Some(voice) = &self.voice else {
             return;
         };
-        let sources = self.sources.lock().expect("sources lock");
-        for (identity, (id, _)) in sources.iter() {
+        let players = self.players.lock().expect("players lock");
+        for (identity, (id, _)) in &players.playing {
             if user_of(identity) == user.as_str() {
                 audio_session::set_source_volume(voice, *id, percent);
             }
         }
     }
 
-    /// Disconnects and stops every task.
+    /// Disconnects, stops every task and forgets this SFU's flags.
     pub(crate) async fn close(mut self) {
         for task in self.tasks.drain(..) {
             task.abort();
             let _ = task.await;
         }
-        let readers: Vec<_> = self
-            .sources
-            .lock()
-            .expect("sources lock")
-            .drain()
-            .map(|(_, (_, task))| task)
-            .collect();
-        for task in readers {
-            task.abort();
+        let identities: Vec<String> = {
+            let mut players = self.players.lock().expect("players lock");
+            players.stop_all(self.voice.as_ref());
+            players
+                .tracks
+                .drain()
+                .map(|(identity, _)| identity)
+                .collect()
+        };
+        if let Ok(mut f) = self.flags.flags.write() {
+            f.speaking.remove(&self.key);
+            for identity in &identities {
+                f.muted.remove(identity);
+            }
         }
+        self.flags.changed.notify_one();
         let _ = self.room.close().await;
     }
 }
@@ -218,6 +336,37 @@ async fn send_microphone(mut outgoing: Outgoing, source: NativeAudioSource) {
     }
 }
 
+/// Runs a task that moves call audio between LiveKit and our voice engine
+/// on its own thread, not the core's runtime. LiveKit's queues are short:
+/// decoded audio waits in 100 ms that drop the oldest frames when full, and
+/// the microphone source holds 50 ms and sends silence when it runs dry. A
+/// task waiting behind the core's other work (a large sync, decryption; in
+/// tests a single-threaded runtime) for longer is heard as gaps: a few
+/// frames, then silence, every 200 ms. One thread serves every call track;
+/// it only moves samples.
+fn spawn_audio_task(task: impl Future<Output = ()> + Send + 'static) -> JoinHandle<()> {
+    static AUDIO: OnceLock<Option<tokio::runtime::Handle>> = OnceLock::new();
+    let handle = AUDIO.get_or_init(|| {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .ok()?;
+        let handle = runtime.handle().clone();
+        std::thread::Builder::new()
+            .name("tessera-call-audio".into())
+            .spawn(move || runtime.block_on(std::future::pending::<()>()))
+            .ok()?;
+        Some(handle)
+    });
+    match handle {
+        Some(handle) => handle.spawn(task),
+        None => {
+            tracing::warn!("no thread for call audio; it runs on the core's runtime");
+            tokio::spawn(task)
+        }
+    }
+}
+
 /// Reads one remote track into its mixer source.
 async fn read_track(mut stream: NativeAudioStream, mut input: tessera_audio::SourceInput) {
     let mut samples = Vec::with_capacity(FRAME_LEN);
@@ -234,24 +383,60 @@ async fn read_track(mut stream: NativeAudioStream, mut input: tessera_audio::Sou
     }
 }
 
-fn remove(sources: &Sources, voice: Option<&Voice>, identity: &str) {
-    if let Some((id, task)) = sources.lock().expect("sources lock").remove(identity) {
-        task.abort();
-        if let Some(voice) = voice {
-            audio_session::remove_source(voice, id);
+struct EventContext {
+    key: String,
+    voice: Option<Voice>,
+    players: Arc<StdMutex<Players>>,
+    volumes: UserVolumes,
+    flags: SharedFlags,
+    notices: mpsc::Sender<(String, MediaNotice)>,
+}
+
+impl EventContext {
+    fn with_players(&self, change: impl FnOnce(&mut Players)) {
+        let mut players = self.players.lock().expect("players lock");
+        change(&mut players);
+        players.reconcile(self.voice.as_ref(), &self.volumes);
+    }
+
+    fn flags(&self, change: impl FnOnce(&mut MediaFlags)) {
+        if let Ok(mut f) = self.flags.flags.write() {
+            change(&mut f);
         }
+        self.flags.changed.notify_one();
+    }
+
+    async fn notice(&self, notice: MediaNotice) {
+        let _ = self.notices.send((self.key.clone(), notice)).await;
     }
 }
 
 async fn handle_events(
+    cx: EventContext,
     mut events: mpsc::UnboundedReceiver<RoomEvent>,
-    voice: Option<Voice>,
-    sources: Sources,
-    volumes: UserVolumes,
-    flags: SharedFlags,
-    notices: mpsc::Sender<MediaNotice>,
+    mut expected: Expected,
 ) {
-    while let Some(event) = events.recv().await {
+    let mut expected_open = true;
+    // Who speaks on this SFU, as last seen starting (see
+    // `ActiveSpeakersChanged` below).
+    let mut talkers: HashMap<String, Participant> = HashMap::new();
+    loop {
+        let event = tokio::select! {
+            event = events.recv() => match event {
+                Some(event) => event,
+                None => return,
+            },
+            changed = expected.changed(), if expected_open => {
+                match changed {
+                    Ok(()) => {
+                        let now = expected.borrow_and_update().clone();
+                        cx.with_players(|p| p.expected = now);
+                    }
+                    Err(_) => expected_open = false,
+                }
+                continue;
+            }
+        };
         match event {
             RoomEvent::TrackSubscribed {
                 track: RemoteTrack::Audio(track),
@@ -259,78 +444,71 @@ async fn handle_events(
                 ..
             } => {
                 let identity = participant.identity().as_str().to_owned();
-                let Some(voice) = voice.as_ref() else {
-                    continue;
-                };
-                let volume = volumes
-                    .read()
-                    .ok()
-                    .and_then(|v| v.get(&UserId::from(user_of(&identity))).copied())
-                    .unwrap_or(100);
-                let Some((id, input)) = audio_session::add_source(voice, volume) else {
-                    tracing::warn!("mixer queue full; a participant is not played");
-                    continue;
-                };
-                let stream = NativeAudioStream::new(track.rtc_track(), SAMPLE_RATE as i32, 1);
-                let reader = tokio::spawn(read_track(stream, input));
-                if let Some((old, old_task)) = sources
-                    .lock()
-                    .expect("sources lock")
-                    .insert(identity, (id, reader))
-                {
-                    old_task.abort();
-                    audio_session::remove_source(voice, old);
-                }
+                cx.with_players(|p| {
+                    // A new track of the same identity replaces the old one.
+                    p.stop(&identity, cx.voice.as_ref());
+                    p.tracks.insert(identity, track);
+                });
             }
             RoomEvent::TrackUnsubscribed {
                 track: RemoteTrack::Audio(_),
                 participant,
                 ..
-            } => remove(&sources, voice.as_ref(), participant.identity().as_str()),
+            } => {
+                let identity = participant.identity().as_str().to_owned();
+                cx.with_players(|p| {
+                    p.tracks.remove(&identity);
+                });
+            }
             RoomEvent::ParticipantDisconnected(participant) => {
                 let identity = participant.identity().as_str().to_owned();
-                remove(&sources, voice.as_ref(), &identity);
-                if let Ok(mut f) = flags.flags.write() {
-                    f.speaking.remove(&identity);
+                talkers.remove(&identity);
+                cx.with_players(|p| {
+                    p.tracks.remove(&identity);
+                });
+                cx.flags(|f| {
+                    if let Some(s) = f.speaking.get_mut(&cx.key) {
+                        s.remove(&identity);
+                    }
                     f.muted.remove(&identity);
-                }
-                flags.changed.notify_one();
+                });
             }
+            // LiveKit lists only the participants whose speaking changed and
+            // started; each participant's own flag is current. Taking the
+            // list as the whole set cleared everyone still talking whenever
+            // someone else began.
             RoomEvent::ActiveSpeakersChanged { speakers } => {
-                if let Ok(mut f) = flags.flags.write() {
-                    f.speaking = speakers
-                        .iter()
-                        .map(|p| p.identity().as_str().to_owned())
-                        .collect();
+                for p in speakers {
+                    talkers.insert(p.identity().as_str().to_owned(), p);
                 }
-                flags.changed.notify_one();
+                talkers.retain(|_, p| p.is_speaking());
+                let now = talkers.keys().cloned().collect();
+                cx.flags(|f| {
+                    f.speaking.insert(cx.key.clone(), now);
+                });
             }
             RoomEvent::TrackMuted {
                 participant,
                 publication,
             } if publication.kind() == TrackKind::Audio => {
-                if let Ok(mut f) = flags.flags.write() {
-                    f.muted.insert(participant.identity().as_str().to_owned());
-                }
-                flags.changed.notify_one();
+                let identity = participant.identity().as_str().to_owned();
+                cx.flags(|f| {
+                    f.muted.insert(identity);
+                });
             }
             RoomEvent::TrackUnmuted {
                 participant,
                 publication,
             } if publication.kind() == TrackKind::Audio => {
-                if let Ok(mut f) = flags.flags.write() {
-                    f.muted.remove(participant.identity().as_str());
-                }
-                flags.changed.notify_one();
+                let identity = participant.identity().as_str().to_owned();
+                cx.flags(|f| {
+                    f.muted.remove(&identity);
+                });
             }
-            RoomEvent::Reconnecting => {
-                let _ = notices.send(MediaNotice::Reconnecting).await;
-            }
-            RoomEvent::Reconnected => {
-                let _ = notices.send(MediaNotice::Reconnected).await;
-            }
+            RoomEvent::Reconnecting => cx.notice(MediaNotice::Reconnecting).await,
+            RoomEvent::Reconnected => cx.notice(MediaNotice::Reconnected).await,
             RoomEvent::Disconnected { .. } => {
-                let _ = notices.send(MediaNotice::Disconnected).await;
+                cx.notice(MediaNotice::Disconnected).await;
                 return;
             }
             _ => {}
@@ -363,5 +541,15 @@ mod tests {
         assert_eq!(s[0], i16::MAX);
         assert_eq!(s[1], -i16::MAX);
         assert_eq!(s[2], i16::MAX / 2);
+    }
+
+    #[test]
+    fn speaking_counts_on_any_sfu() {
+        let mut f = MediaFlags::default();
+        f.speaking
+            .insert("https://a".into(), HashSet::from(["@a:x:D".to_owned()]));
+        f.speaking.insert("https://b".into(), HashSet::new());
+        assert!(f.is_speaking("@a:x:D"));
+        assert!(!f.is_speaking("@b:y:D"));
     }
 }

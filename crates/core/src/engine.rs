@@ -78,6 +78,10 @@ pub struct CoreConfig {
     /// Audio devices for calls and the mic test (`AudioBackend::System`
     /// unless testing).
     pub audio: AudioBackend,
+    /// Call service (MatrixRTC authorization service, lk-jwt-service URL)
+    /// to publish on instead of the homeserver's advertised one: a
+    /// self-hosted SFU, or tests. `https`, or `http` on loopback.
+    pub call_service_override: Option<String>,
 }
 
 /// The channels to talk to a running engine.
@@ -1376,6 +1380,7 @@ impl Engine {
             audio,
             self.events.clone(),
             self.user_volumes.clone(),
+            self.config.call_service_override.as_deref(),
         )
         .await
         {
@@ -2259,6 +2264,7 @@ mod tests {
                 homeserver_override: None,
                 room_list_page_size: DEFAULT_ROOM_LIST_PAGE_SIZE,
                 audio: AudioBackend::default(),
+                call_service_override: None,
             },
             secrets,
             events,
@@ -2352,6 +2358,7 @@ mod tests {
                 homeserver_override: None,
                 room_list_page_size: DEFAULT_ROOM_LIST_PAGE_SIZE,
                 audio: AudioBackend::default(),
+                call_service_override: None,
             },
             secrets: Arc::new(InMemorySecretStore::new()),
             events,

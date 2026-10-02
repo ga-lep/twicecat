@@ -117,6 +117,7 @@ fn run(options: Options) -> Result<(), String> {
         homeserver_override: options.homeserver,
         room_list_page_size: DEFAULT_ROOM_LIST_PAGE_SIZE,
         audio: AudioBackend::System,
+        call_service_override: None,
     };
     let (bridge, events) = Bridge::start(config, secrets)
         .map_err(|error| format!("could not start the core runtime: {error}"))?;
