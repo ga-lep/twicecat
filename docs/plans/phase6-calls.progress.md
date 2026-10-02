@@ -10,3 +10,5 @@ Task 4: complete (gate ok, boundary ok, cargo deny ok, integration --ignored --s
   notes: [fix, after Task 8] PipeWire crash from libwebrtc's pw_* stubs fixed by the Task 1 rename (mutation crashes), 10 ms device buffers, sinks out of the inputs; [open] other apps' streams listed as devices until Task 14; [design] polling DeviceWatcher (cpal has no hot-plug events); drift handled by a 60 ms playback high-water frame drop; [open] real devices + Windows/macOS device paths are human/CI items
 Task 5: complete (gate ok after a collapsible_if fix, boundary ok, cargo deny ok, integration 14/14; ERLE 36.9 dB, RNNoise 15.5 dB, WebRTC NS 20.7 dB; mutation checks fail as expected; sonora#34 reproduced 482.7 vs 88.2 µs/frame without/with guard)
   notes: [deviation] libwebrtc APM A/B moved to Task 8; [open] sonora allocs per frame (#39), no RT priority yet
+Task 6: complete (gate ok, boundary ok, deny ok, integration --skip keyring --skip hardware_ 14/14; echo-reference mutation fails as expected (2.9 dB))
+  notes: [process] hardware_* ignored tests are human-run; CI and agent gate skip them; [open] mic test by ear is human

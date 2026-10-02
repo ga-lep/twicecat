@@ -5,6 +5,7 @@
 #![recursion_limit = "256"]
 
 pub mod api;
+mod audio_session;
 mod avatars;
 mod call_settings;
 mod client;

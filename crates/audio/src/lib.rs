@@ -1,5 +1,5 @@
-//! Tessera audio: devices, I/O threads and (later tasks) the voice
-//! processing pipeline. Knows nothing about Matrix or LiveKit; the core
+//! Tessera audio: devices, I/O threads, and the voice engine (mixing,
+//! echo cancellation, noise suppression, gain, gate). Knows nothing about Matrix or LiveKit; the core
 //! adapts between this crate and the call.
 //!
 //! Internally everything is 48 kHz mono `f32` in 10 ms [`Frame`]s.
@@ -13,6 +13,7 @@ mod gate;
 mod io;
 mod pipeline;
 mod resample;
+mod voice;
 
 pub use chain::{
     CaptureChain, CaptureResult, ChainSettings, ChainStats, LEVEL_FLOOR_DB, NoiseMode, NsLevel,
@@ -23,6 +24,10 @@ pub use frame::{FRAME_LEN, Frame, SAMPLE_RATE, SILENCE};
 pub use gate::GateMode;
 pub use io::{AudioIo, IoConfig, IoEvent, IoInfo, StreamInfo};
 pub use pipeline::{FrameProcessor, IoCounters, IoStats};
+pub use voice::{
+    Meters, OUTGOING_RING_LEN, Outgoing, SOURCE_RING_LEN, SourceId, SourceInput, VoiceControl,
+    VoiceEngine, VoiceStats,
+};
 
 /// Audio errors. Messages are fixed text: backend error text is not
 /// forwarded (it can name devices, which is fine, but is not stable).

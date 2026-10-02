@@ -30,6 +30,7 @@ use crate::api::{
     CoreEvent, DeviceId, Draft, ListDiff, Member, MessageText, OutgoingMessage, PaginationState,
     Password, RoomId, RoomListQuery, TypingUser, UserId,
 };
+use crate::audio_session::AudioSession;
 use crate::avatars::{Avatars, SdkFetcher, answer_unavailable};
 use crate::call_settings;
 use crate::client::{
@@ -103,6 +104,7 @@ impl Core {
             room_list_query: watch::channel(RoomListQuery::default()).0,
             audio_settings: None,
             device_watcher: None,
+            audio_session: None,
         };
         tokio::spawn(engine.run(cmd_rx));
         CoreHandle {
@@ -427,6 +429,8 @@ struct Engine {
     audio_settings: Option<AudioSettings>,
     /// Hot-plug watcher, started by the first `ListAudioDevices`.
     device_watcher: Option<tessera_audio::DeviceWatcher>,
+    /// Open devices and the voice engine (mic test for now).
+    audio_session: Option<AudioSession>,
 }
 
 /// An OAuth login in progress. Its task builds the client, emits `OAuthUrl`,
@@ -849,6 +853,9 @@ impl Engine {
                 },
             }
         }
+        if let Some(session) = self.audio_session.take() {
+            session.stop().await;
+        }
         self.cancel_oauth_and_wait().await;
         // Stop sync and drop the client before the events sender so that, once
         // the channel closes, the store is already released.
@@ -1177,14 +1184,17 @@ impl Engine {
                 self.emit(CoreEvent::Error(CoreError::NotInCall)).await;
             }
             Command::ListAudioDevices => self.list_audio_devices().await,
-            Command::StartMicTest { .. } => {
-                self.emit(CoreEvent::Error(CoreError::Audio(
-                    "the mic test is not available yet".into(),
-                )))
-                .await;
+            Command::StartMicTest { loopback } => self.start_mic_test(loopback).await,
+            Command::StopMicTest => {
+                if let Some(session) = self.audio_session.take() {
+                    session.stop().await;
+                }
             }
-            // Without a call or mic test there is nothing to gate or stop.
-            Command::PushToTalk { .. } | Command::StopMicTest => {}
+            Command::PushToTalk { pressed } => {
+                if let Some(session) = &self.audio_session {
+                    session.push_to_talk(pressed);
+                }
+            }
             // Handled in `run`.
             Command::Shutdown => {}
         }
@@ -1252,7 +1262,27 @@ impl Engine {
         if let Err(e) = saved {
             self.emit(CoreEvent::Error(e)).await;
         }
-        self.emit(CoreEvent::AudioSettings(settings)).await;
+        self.emit(CoreEvent::AudioSettings(settings.clone())).await;
+        // A running session follows; a device change reopens it.
+        if let Some(session) = &self.audio_session
+            && !session.apply(&settings)
+        {
+            let loopback = session.loopback();
+            self.start_mic_test(loopback).await;
+        }
+    }
+
+    /// Opens the microphone (and, with `loopback`, the speakers) and starts
+    /// reporting levels; replaces a running mic test.
+    async fn start_mic_test(&mut self, loopback: bool) {
+        if let Some(session) = self.audio_session.take() {
+            session.stop().await;
+        }
+        let settings = self.audio_settings().await.clone();
+        match AudioSession::start(&settings, loopback, self.events.clone()).await {
+            Ok(session) => self.audio_session = Some(session),
+            Err(e) => self.emit(CoreEvent::Error(e)).await,
+        }
     }
 
     /// Answers a Phase 4 action sent without a session. These actions belong
@@ -1994,6 +2024,7 @@ mod tests {
             room_list_query: watch::channel(RoomListQuery::default()).0,
             audio_settings: None,
             device_watcher: None,
+            audio_session: None,
         }
     }
 
@@ -2080,6 +2111,7 @@ mod tests {
             room_list_query: watch::channel(RoomListQuery::default()).0,
             audio_settings: None,
             device_watcher: None,
+            audio_session: None,
         };
         (engine, rx)
     }

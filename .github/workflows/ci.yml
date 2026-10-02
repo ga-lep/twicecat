@@ -113,9 +113,10 @@ jobs:
         run: docker compose up -d --wait
       - name: Register test users
         run: scripts/create-test-users.sh
-      # The real-keychain test needs a desktop session, hence --skip keyring.
+      # The real-keychain test needs a desktop session, and hardware_ tests a
+      # microphone or speakers; both are human-run.
       - name: Run homeserver integration tests
-        run: cargo test -p tessera-core -p tessera-app --locked -- --ignored --skip keyring
+        run: cargo test -p tessera-core -p tessera-app --locked -- --ignored --skip keyring --skip hardware_
       - run: scripts/check-no-webrtc-download.sh
       - name: Stop local Synapse
         if: always()

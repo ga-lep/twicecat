@@ -1180,7 +1180,7 @@ Phase 2 signed off by the human on 2026-10-02 (merge of PR #3). Every other unti
 - [x] 3. Call API contract and settings persistence
 - [x] 4. Audio devices and I/O threads (tessera-audio, cpal PipeWire)
 - [x] 5. Processing chain (sonora AEC3/NS/AGC2, denormal guard, RNNoise, gate, PTT tail)
-- [ ] 6. Mixer and playout (per-user volume, deafen, AEC render tap, mic test)
+- [x] 6. Mixer and playout (per-user volume, deafen, AEC render tap, mic test)
 - [ ] 7. MatrixRTC signalling (transports, JWT, m.call.member, delayed leave)
 - [ ] 8. LiveKit media (publish, subscribe, reconnection)
 - [ ] 9. Call E2EE (per-sender keys over to-device)
@@ -1245,6 +1245,15 @@ Phase 2 signed off by the human on 2026-10-02 (merge of PR #3). Every other unti
 - Open issues: sonora 0.2.0 allocates on every frame in AEC3 (upstream #39/#40, about 40 per frame). It runs on the processing thread, not in device callbacks, so the rings absorb an occasional slow frame, but steady state is not allocation-free until a sonora release fixes it (bump asked first). Real-time thread priority for the processing thread is not set yet. Gate thresholds and AGC behaviour need checking by ear (human list).
 - New human items: none beyond the list (audio quality by ear, Steam Frame CPU per NS mode).
 
+## Phase 6 / Task 6 notes
+- Checks run (all pass): `cargo fmt --all --check`; `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` (first runs flagged `manual_checked_ops` and `manual_is_multiple_of`, fixed); `cargo test --workspace --locked` (181 passed, 18 ignored); `scripts/check-app-deps.sh` (and `livekit`); `scripts/check-core-api.sh`; `scripts/check-no-webrtc-download.sh`; `cargo deny check`; `cargo test -p tessera-core --locked -- --ignored --skip keyring --skip hardware_` 14/14; actionlint 1.7.12 clean.
+- Tests: `voice` module (8): mixing with volumes, removal and clamping; underrun silence plus count; trim of a source far ahead; deafen; mute (silence sent, meter live); loopback; `the_echo_reference_is_what_is_played` (ERLE ≥ 20 dB with source volume 70 % and master 80 %; mutation: rendering `SILENCE` instead of the playback frame gives 2.9 dB and fails; reverted). Core `audio_session` (3): settings mapping, DeepFilter → RNNoise fallback, device changes need a restart.
+- **Gate command change:** tests that open real devices are named `hardware_*` and `#[ignore]`d (human-run, rule 9). The ignored homeserver run is now `cargo test -p tessera-core --locked -- --ignored --skip keyring --skip hardware_`, in the agent gate and in the CI `integration` job. The agent did not run `hardware_mic_test_reports_levels` (it opens the microphone).
+- APIs used (registry src/): rtrb `Producer::push_partial_slice` (src/chunks.rs:281), `Consumer::pop_partial_slice` (:408), `Consumer::read_chunk(n)` + `ReadChunk::commit_all` (:342, :651); everything else as in Tasks 4 and 5.
+- Design notes: the processing thread never takes a lock; `VoiceControl` sits behind a `std::sync::Mutex` only between the engine and the reporting task. Adding a source allocates (on the control side; the `Vec` on the processing thread has capacity 16). Outgoing frames are always produced (silence when gated) so the sender's timing never depends on the gate; Opus DTX (Task 8) makes silence cheap. In a mic test the outgoing stream is drained and discarded by the reporting task.
+- Open issues: the mic test and every real device path are human items. The `VoiceControl` command queue (64) returns `false` when full (a stuck processing thread); callers ignore that for now.
+- New human items: `cargo test -p tessera-core -- --ignored hardware_` (mic test: levels arrive), and the mic test by ear (loopback with headphones).
+
 ## Phase 6 known limitations
 - Denormal guard (decision 7, human-approved 2026-10-02, pre-production): `crates/audio/src/denormals.rs` is the one audited `unsafe` function. It sets FTZ/DAZ (x86_64) or FZ (aarch64) on the audio processing thread, because sonora 0.2.0 AEC3 slows down on a silent far end after speech (upstream issue #34; measured 5.5× here, see Task 5). Remove it once a sonora release with upstream PR #38 ships (version bump asked first, rule 3).
 - sonora 0.2.0 allocates about 40 times per 10 ms frame in AEC3 (upstream #39/#40). The processing thread is not a device callback, so this is tolerable, but not real-time clean until upstream ships the fix.
@@ -1254,6 +1263,7 @@ Phase 2 signed off by the human on 2026-10-02 (merge of PR #3). Every other unti
 - [ ] Push the branch and confirm CI is green on Linux x64 and arm64 (`ubuntu-26.04`, `ubuntu-26.04-arm`), Windows and macOS with livekit/libwebrtc in the tree; check build time and disk.
 - [ ] Locally: clang >= 21 and the glib headers (Arch/SteamOS: `sudo pacman -S clang glib2 lld`; Ubuntu 26.04: `clang-22 libglib2.0-dev lld` with `CXX=clang++-22`; Ubuntu 24.04's clang 18 is too old), then `scripts/fetch-libwebrtc.sh` once before building.
 - [ ] Call API additions (Task 3) approved as the UI-phase contract.
+- [ ] `cargo test -p tessera-core -- --ignored hardware_` passes (opens the microphone; the agent does not run it), and the mic test loopback sounds right on headphones.
 - [ ] Audio quality by ear: real mic and speakers; echo cancellation on open speakers (sonora vs libwebrtc APM A/B); RNNoise on keyboard and fan noise; AGC level; VAD gate threshold.
 - [ ] Device hot-plug (USB headset in and out, Bluetooth) on each OS you use; macOS microphone permission prompt.
 - [ ] Interop with Element Call, both directions, in unencrypted and encrypted rooms, on a real homeserver with a real SFU.

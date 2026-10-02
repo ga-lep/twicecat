@@ -151,3 +151,22 @@ async fn listing_audio_devices_answers_without_assuming_hardware() {
     }
     send(&handle, Command::Shutdown).await;
 }
+
+/// Human-run (AGENTS.md rule 9): opens the real microphone for about a
+/// second. Run with `cargo test -p tessera-core -- --ignored hardware_`.
+#[tokio::test]
+#[ignore = "needs a microphone; opens it for about a second (human-run)"]
+async fn hardware_mic_test_reports_levels() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut handle = core(dir.path());
+    send(&handle, Command::StartMicTest { loopback: false }).await;
+    for _ in 0..10 {
+        let e = expect_event(&mut handle, |e| {
+            matches!(e, CoreEvent::InputLevel(_) | CoreEvent::Error(_))
+        })
+        .await;
+        assert!(matches!(e, CoreEvent::InputLevel(_)), "{e:?}");
+    }
+    send(&handle, Command::StopMicTest).await;
+    send(&handle, Command::Shutdown).await;
+}
