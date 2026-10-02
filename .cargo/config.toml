@@ -1,0 +1,31 @@
+# libwebrtc for webrtc-sys comes only from scripts/fetch-libwebrtc.sh, which
+# checks a pinned SHA-256 and links the unpacked copy into dev/libwebrtc. That
+# directory is committed so it always exists: webrtc-sys downloads, unverified,
+# into a missing LK_CUSTOM_WEBRTC path, but fails when the path exists without
+# webrtc.ninja. An LK_CUSTOM_WEBRTC from the environment (CI, Windows) wins.
+[env]
+LK_CUSTOM_WEBRTC = { value = "dev/libwebrtc", relative = true }
+
+# Link flags libwebrtc needs, as in livekit/rust-sdks' own .cargo/config.toml.
+# aarch64 Linux (Steam Frame): GNU ld fails on libwebrtc.a, lld works.
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+
+# libwebrtc is built against the static MSVC runtime (/MT); without this the
+# link fails with LNK2038 RuntimeLibrary mismatches.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+# Loads the Objective-C categories in libwebrtc's static lib; without it a
+# static initializer aborts at startup (+[NSString stringForStdString:]).
+# rustdoc links doctests itself, so it needs the flag too.
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-args=-ObjC"]
+rustdocflags = ["-C", "link-args=-ObjC"]
+
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-args=-ObjC"]
+rustdocflags = ["-C", "link-args=-ObjC"]

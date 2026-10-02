@@ -6,3 +6,16 @@ members = ["crates/*"]
 edition = "2024"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/ga-lep/tessera"
+
+# Each test binary statically links libwebrtc; with full debug info for every
+# dependency that is ~1.1 GB per binary (130 GB of target/ after a few
+# rebuilds). Dependencies keep line tables (backtraces and gdb still show
+# functions and lines); our own crates keep full debug info.
+[profile.dev]
+debug = "line-tables-only"
+[profile.dev.package.tessera-core]
+debug = true
+[profile.dev.package.tessera-ptt]
+debug = true
+[profile.dev.package.tessera-app]
+debug = true

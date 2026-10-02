@@ -1,1 +1,4 @@
 Phase 6 plan: approved by human 2026-10-02 (decisions 1–11 in docs/plans/phase6-calls.md)
+Task 1: started
+Task 1: complete (gate ok, boundary scripts ok, cargo deny ok, integration --ignored --skip keyring 12/12, shellcheck + actionlint clean; self-review only, no separate security/review agents run this session)
+  notes: [fix, after Task 8] fetch script renames libwebrtc's weak pw_* stubs (they crashed libpipewire next to cpal's PipeWire backend), checked by symbols on x64 and arm64; [finding] webrtc-sys downloads unverified into a missing LK_CUSTOM_WEBRTC dir — fixed with committed dev/libwebrtc + links, verified fail-closed; one unverified download happened during this check and was deleted; [open] Windows/macOS/arm64 CI unverified until PR run; [open] Windows devs must export LK_CUSTOM_WEBRTC
