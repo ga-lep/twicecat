@@ -1,0 +1,268 @@
+# Phase 6 Calls Plan: MatrixRTC, LiveKit SFU, native audio
+Status: APPROVED (all questions answered by the human, 2026-10-02)
+
+## Goal
+Native voice calls and Discord-style voice rooms, with no Element Call widget. `tessera-core` joins MatrixRTC sessions (MSC4143 `m.call.member` with a LiveKit focus, MSC4140 delayed leave events, MSC4195 LiveKit transport discovery), gets a LiveKit JWT through the homeserver's `lk-jwt-service`, connects to the SFU with the LiveKit Rust SDK, publishes the microphone, and plays remote participants. All audio runs through our own pipeline: device capture and playback, echo cancellation, noise suppression (WebRTC NS, RNNoise, and a DeepFilterNet-class option), automatic gain, a voice-activity gate or push-to-talk, a per-participant mixer with per-user volume, and level meters. Media is end-to-end encrypted with MatrixRTC per-sender keys, so we interoperate with Element Call in encrypted rooms. Every setting is a command in the core API, so the UI phase can put it all on screen. This phase is headless: it is driven by the core API and the CLI, and tested against a local Synapse plus a local LiveKit SFU.
+
+## Decisions (human, 2026-10-02)
+1. **New phase, Phase 6.** Plan file `docs/plans/phase6-calls.md`, branch `feat/calls-matrixrtc` (rebased on `main` after the Phase 1 merge). Ledger: `docs/plans/phase6-calls.progress.md` plus a "Phase 6" section in PROGRESS.md. Commits follow Conventional Commits (AGENTS.md rule 5, adopted 2026-10-02): one `feat(<scope>): …` commit per task with a `Step: phase6.<n>` trailer, `docs(…)` for plan and ledger changes, and fixes folded into the commit they belong to.
+2. **Ordering: core first, then UI.** This phase delivers the headless call engine, the audio pipeline and CLI commands. The call UI (voice room view, device and processing settings, PTT binding) comes with the Iced shell. The core/app boundary (rule 7) is unchanged.
+3. **Audio stack: our own pipeline, with sonora as the APM.**
+   - cpal capture and playback, then processing, then `NativeAudioSource`.
+   - Remote tracks come in through `NativeAudioStream`, go into our mixer, and feed sonora's render (echo-reference) input.
+   - sonora is the echo/noise/gain backend. The libwebrtc APM is kept only as a compile-time A/B fallback (see "Sonora assessment").
+4. **Newest releases of every new dependency** (rule 3 approval for the list under "Dependencies"). The existing pins are already the newest releases (matrix-sdk/-ui 0.19.1, iced 0.14.0, checked 2026-10-02), so no existing pin changes.
+5. **Noise suppression:** RNNoise (nnnoiseless) first. DeepFilterNet3 follows as its own task: we run its ONNX models with `tract-onnx` and write the feature extraction and deep-filter stages ourselves. The model files are pinned by SHA-256.
+6. **libwebrtc fetch script with pinned SHA-256** (`scripts/fetch-libwebrtc.sh`). The build uses `LK_CUSTOM_WEBRTC` and never lets webrtc-sys download anything itself.
+7. **Denormal guard: allowed now** (pre-production). A single audited `unsafe` function sets FTZ/DAZ on the processing thread. It is documented in PROGRESS.md "Known limitations", with a note to drop it once a sonora release ships upstream PR #38 (any version bump is asked first, rule 3).
+8. **Call E2EE is in scope** (MatrixRTC per-sender keys over encrypted to-device messages), so we interoperate with Element Call in encrypted rooms.
+9. **Local SFU in compose:** `livekit/livekit-server:v1.13.7` and `ghcr.io/element-hq/lk-jwt-service:v0.7.0`, bound to 127.0.0.1, with test-only LiveKit key/secret in `.env.test`. Synapse gets the MatrixRTC transport and delayed-event config (one `docker compose down -v` needed).
+10. **Interop format: Element Call's current one.** That is `m.call.member` state events per device, a delayed leave event, and `io.element.call.encryption_keys` to-device. MSC4354 sticky `m.rtc.member` is revisited when the SDK supports it.
+11. **Target platform: Steam Frame / SteamOS** in addition to desktop Linux, Windows and macOS (see "Steam Frame / SteamOS").
+
+## Steam Frame / SteamOS
+Steam Frame runs SteamOS on ARM64 (Snapdragon). The system is Arch-based with a read-only root, so third-party apps are Flatpaks. Audio goes through PipeWire. The UI is either KDE Plasma on Wayland (desktop mode) or gamescope (game mode). The device has built-in speakers and a mic array, so open-speaker echo cancellation is the normal case, not an edge case. Consequences for this phase:
+- **Native `aarch64-unknown-linux-gnu`.** CI gains a Linux ARM64 job (GitHub `ubuntu-26.04-arm` runner) for build and test. livekit publishes `webrtc-linux-arm64-release.zip` for the pinned tag (sha256 `f716b10e…6420`); sonora has a NEON backend; tract has NEON kernels.
+- **PipeWire.** cpal's native `pipewire` backend on Linux (cpal 0.18.2 feature `pipewire`; CI and dev need `libpipewire-0.3-dev` and clang for bindgen). ALSA stays as a runtime fallback. Device names and hot-plug come from PipeWire.
+- **Flatpak-friendly builds.** No build-time network access (the fetch script plus SHA-256 maps directly onto Flatpak `sources`). rustls, not OpenSSL (livekit feature `rustls-tls-native-roots`). Flatpak packaging itself is a later phase; this phase just doesn't block it.
+- **Push-to-talk without a global-shortcut portal.** gamescope has no GlobalShortcuts portal. PTT sources are therefore:
+  - an in-window key;
+  - a gamepad button via `gilrs` (Steam Input can map controller buttons);
+  - the portal on KDE/GNOME Wayland;
+  - `global-hotkey` on X11, Windows and macOS.
+- **Battery.** RNNoise is the default ML option (DeepFilterNet3 is opt-in). Opus DTX is on. The processing thread sleeps between 10 ms frames. A CPU-cost unit benchmark is recorded for each NS mode on x86_64 and aarch64 (CI ARM runner).
+- **Real-time audio threads** use cpal's `realtime` feature (rtkit over D-Bus, which also works inside Flatpak through the portal). This is a human checkpoint item on the device.
+
+## Facts verified while planning (2026-10-02)
+Each task re-confirms the APIs it uses (rule 2) and cites file:line in PROGRESS.md. The paths below are under `~/.cargo/registry/src/index.crates.io-*/`.
+
+**matrix-sdk 0.19.1 / ruma 0.17.0 (pinned, no feature change needed for signalling)**
+- matrix-sdk already turns on ruma `unstable-msc3401`, `-msc3417` (call rooms), `-msc4075`, `-msc4140` (delayed events), `-msc4143`, `-msc4195`, `-msc4310` (matrix-sdk-0.19.1/Cargo.toml:331-344).
+- Transport discovery: `Client::discover_rtc_transports() -> HttpResult<Option<Vec<RtcTransport>>>` (client/mod.rs:2898), which falls back to `well_known_rtc_transports` (:2752). `RtcTransport::LiveKit(LiveKitRtcTransport)` (ruma-client-api-0.25.0/src/rtc.rs), endpoint `/_matrix/client/unstable/org.matrix.msc4143/rtc/transports` (rtc/transports.rs:22).
+- Membership event: `CallMemberEventContent::{new, new_empty(leave_reason)}` (ruma-events-0.35.0/src/call/member.rs:69, :88), `SessionMembershipData`, `CallApplicationContent::new_with_intent` (member/member_data.rs:250, :346), `CallScope`, `LivekitFocus::new(alias, service_url)` and `ActiveLivekitFocus` (member/focus.rs:23-72), `CallMemberStateKey::new(user, member_id, underscore)` (member/member_state_key.rs:29).
+- Reading call state: `Room::{has_active_room_call, active_room_call_participants, is_device_in_active_room_call, active_room_call_consensus_intent}` (matrix-sdk-base-0.19.1/src/room/call.rs:46-75).
+- Ringing: `RtcNotificationEventContent::new`, `NotificationType`, `CallIntent` (ruma-events rtc/notification.rs:57, :117, :133); `Room::make_decline_call_event`, `Room::subscribe_to_call_decline_events` (matrix-sdk room/calls.rs).
+- Delayed events: request types in ruma-client-api-0.25.0/src/delayed_events/{delayed_state_event,update_delayed_event}.rs. They are sent with `client.send(request)`, because matrix-sdk has no high-level wrapper.
+- OpenID token for the JWT service: ruma-client-api account/request_openid_token.rs.
+- Call E2EE key distribution needs the matrix-sdk feature `experimental-send-custom-to-device` (Cargo.toml features list). This is a feature flag on the pinned version, approved in decision 4.
+
+**Synapse v1.151.0 (pinned image)**
+- `matrix_rtc: transports: [...]` config section (synapse/config/matrixrtc.py), `experimental_features.msc4143_enabled` (config/experimental.py:560), `max_event_delay_duration` for MSC4140 (config/server.py:911). MSC4354 sticky events exist behind `msc4354_enabled` but ruma 0.17 has no `m.rtc.member` type, so we use `m.call.member` state events, as current Element Call does.
+
+**LiveKit Rust SDK: livekit 0.9.3 (Apache-2.0), libwebrtc 0.3.50, webrtc-sys 0.3.47**
+- `Room::connect(url, token, RoomOptions) -> RoomResult<(Room, UnboundedReceiver<RoomEvent>)>` (livekit-0.9.3/src/room/mod.rs:567).
+- `E2eeOptions { encryption_type, key_provider }` (room/e2ee/mod.rs:28). `KeyProvider::{new, set_key(identity, index, key), ratchet_key, get_latest_key_index}` (room/e2ee/key_provider.rs:60-117): per-participant keys, as MatrixRTC needs.
+- `NativeAudioSource::new(options, sample_rate, channels, queue_size_ms)` and `capture_frame` (libwebrtc-0.3.50/src/native/audio_source.rs:49, :92). `NativeAudioStream::new(track, sample_rate, channels)` (audio_stream.rs:62).
+- libwebrtc APM wrapper `AudioProcessingModule::new(aec, agc, hpf, ns)`. It takes only on/off flags (webrtc-sys-0.3.47/src/apm.cpp:60-71) and only i16 input, with no NS level and no AGC tuning.
+- `PlatformAudio` (platform_audio/mod.rs:408) exists, but we don't use it (decision 2).
+- **Supply chain:** webrtc-sys-build downloads a prebuilt libwebrtc zip from `github.com/livekit/rust-sdks/releases/download/webrtc-89d790b/…` at build time, with **no checksum check** (webrtc-sys-build-0.3.19/src/lib.rs:31, :101-106). `LK_CUSTOM_WEBRTC` points it at a local directory instead (:80-85). cargo-deny does not see this download. Handled by decision 6 (Task 1). Release assets carry GitHub sha256 digests (`linux-x64` `b167adad…bf70c5`, `linux-arm64` `f716b10e…706420`).
+
+**Audio crates**
+- cpal 0.18.2 (Apache-2.0, MSRV 1.85).
+- nnnoiseless 0.5.2 (BSD-3, pure Rust RNNoise): `DenoiseState::new() -> Box<…>`, `process_frame(&mut out, &in) -> f32` (the return value is the VAD probability), 480-sample frames at 48 kHz (src/denoise.rs:53, :95; lib.rs:38).
+- **deep_filter 0.2.5 on crates.io is DeepFilterNet's dataset/training library only.** It has no `tract` or real-time inference API (Cargo.toml features: bin, cache, dataset, transforms, flac, vorbis). Upstream github.com/Rikorose/DeepFilterNet was last pushed 2024-10-17. Handled by decision 5 (Task 13: our own DF3 pipeline on tract-onnx).
+- global-hotkey 0.8.0 (Apache-2.0 OR MIT): `GlobalHotKeyManager::register`, events with `HotKeyState::{Pressed, Released}` (src/lib.rs:66-146). It works on X11, Windows and macOS. Wayland needs the xdg-desktop-portal GlobalShortcuts portal instead (a human checkpoint item, rule 9).
+
+**Local SFU images:** `livekit/livekit-server:v1.13.7` (2026-09-14) and `ghcr.io/element-hq/lk-jwt-service:v0.7.0` (2026-09-10).
+
+## Sonora assessment (human request)
+sonora 0.2.0 (BSD-3-Clause, MSRV 1.91, github.com/dignifiedquire/sonora) is a pure-Rust port of WebRTC's AudioProcessing module at M145.
+
+Coverage is complete for our needs:
+- AEC3, with a residual echo detector;
+- NS with Low/Moderate/High/VeryHigh levels;
+- AGC2 (adaptive digital, fixed digital, input volume controller);
+- high-pass filter;
+- pre/post gain, capture level adjustment and analog mic gain emulation;
+- `set_stream_delay_ms`;
+- statistics (ERL/ERLE, echo likelihood) for a UI meter;
+- f32 and i16 APIs at 8–384 kHz.
+
+That is far more tunable than the livekit APM wrapper, which offers four on/off flags.
+
+| | sonora 0.2.0 | libwebrtc APM via livekit |
+|---|---|---|
+| Extra dependency | 7 crates, about 51k lines, all BSD-3 | none (already linked by livekit) |
+| Configurability | full (NS level, AGC2 targets, gains, stats) | on/off flags only, i16 only |
+| Build | plain cargo; no C++ and no download | part of the prebuilt libwebrtc blob |
+| Validation | upstream's 2400+ C++ tests pass against the Rust backend (FFI bridge); CI on Linux, macOS, Windows, Android, iOS | Google production code |
+| Speed (vendor numbers, M4) | 1.07–1.24× the C++ time; 48 kHz mono full pipeline 13 µs per 10 ms | baseline |
+| Maturity | created 2026-02, 2 releases, one maintainer (213 of 225 commits), AI-assisted port | very mature |
+
+Known 0.2.0 problems that matter for calls:
+- **#34 (open):** AEC3 runs 10–50× slower while the far end is silent, because of denormal floats. The worst case is about 15 ms per 10 ms frame, which falls behind real time. Upstream WebRTC wraps processing in a denormal disabler, and the port does not. Silence is the normal state in a voice room.
+- **#39/#40 (open PRs):** about 40 heap allocations per 10 ms frame in the AEC3 path. The fix is bit-identical.
+- **#38 (open PR)** fixes the denormals. **#36 (open PR)** syncs post-M145 upstream fixes.
+
+**Recommendation:** use sonora behind a small `EchoProcessor` trait, with two mitigations:
+1. Run processing on a dedicated audio-processing thread, never inside the cpal device callback. Lock-free SPSC rings connect the callbacks to that thread, so an allocation or a slow frame cannot cause a device xrun.
+2. Set flush-to-zero/denormals-are-zero on that thread (x86 MXCSR, AArch64 FPCR). This is a few lines of `unsafe` in one audited function (decision 7). It goes away once a sonora release with #38 lands; any version bump is asked first (rule 3).
+
+Keep the libwebrtc APM as a second, compile-time backend. It costs no new dependency and gives an A/B comparison for the human checkpoint. A unit test fails if processing a steady-state frame takes over 2 ms in release mode, with silent render, to catch #34 regressions.
+
+## Architecture
+- **`crates/core`** gains a private `call/` module:
+  - signalling: transport discovery, OpenID token to JWT, `m.call.member` join with a delayed leave event and a periodic restart, leave, membership tracking, ringing, E2EE key exchange;
+  - the LiveKit room;
+  - a `CallSession` actor owned by the engine.
+
+  The public `api/` gains SDK-free call types. `check-core-api.sh` also rejects `livekit`, `libwebrtc`, `cpal` and `sonora` names in `api/`.
+- **New `crates/audio` (`tessera-audio`)**, the media pipeline. It depends on no Matrix crate and no LiveKit crate: core adapts between it and LiveKit frames. It has:
+  - device enumeration and hot-plug (cpal);
+  - capture and playout threads;
+  - resampling to 48 kHz;
+  - the processing chain: HPF → AEC → NS (WebRTC / RNNoise / DFN-class) → AGC2 → input gain → gate (VAD threshold or PTT, with a release tail) → limiter;
+  - the mixer: per-participant gain, deafen, master volume, and the AEC render tap;
+  - mic test (local loopback) and RMS/peak meters.
+
+  It is fully unit-testable offline with synthetic signals.
+- **`crates/ptt`**: the global push-to-talk hotkey service (X11/Windows/macOS via global-hotkey; Wayland via the portal). It emits pressed/released events that the app forwards as core commands. It never depends on matrix-sdk.
+- **Settings:** a non-secret `call_settings.json` in the data dir: devices, processing choices, input mode and key, per-user volumes. It has a version field and atomic write, like `last_account`.
+
+### API additions (SDK-free; the final shape is approved by the human after Task 3)
+As built in Task 3 (`crates/core/src/api/call.rs`, commands and events in `api/mod.rs`). Settings are one value, not a setter per field: the UI edits a copy and sends it whole.
+- **Commands:**
+  - `JoinCall { room_id, intent: CallIntent::Audio }`, `LeaveCall`, `DeclineCall { room_id }`;
+  - `SetMicMuted(bool)`, `SetDeafened(bool)`, `PushToTalk { pressed }` (from any source: hotkey, gamepad, window key);
+  - `SetUserVolume { user_id, percent }` (remembered per user);
+  - `ListAudioDevices`, `GetAudioSettings`, `UpdateAudioSettings(AudioSettings)`;
+  - `StartMicTest { loopback }`, `StopMicTest`.
+- **`AudioSettings`** (also the `call_settings.json` format, versioned wrapper, atomic write, 0o600):
+  - `input_device` and `output_device` (`None` follows the system default);
+  - `processing { echo_cancellation, noise_suppression: Off | WebRtc { level } | RnNoise | DeepFilter { attenuation_limit_db }, auto_gain, high_pass }`;
+  - `input_mode: VoiceActivity { automatic, threshold_db } | PushToTalk { release_delay_ms }`;
+  - `input_gain_db`, `output_volume_percent`, `voice_bitrate_kbps` (default 64), and `user_volumes`.
+
+  `validated()` clamps every field (`api::limits`).
+- **Events:**
+  - `CallState(Idle | Joining | Connected | Reconnecting { attempt } | Left { reason })`;
+  - `CallParticipants { room_id, diffs: Vec<ListDiff<Participant { id, user_id, device_id, display_name, is_local, muted, speaking, volume_percent }>> }`;
+  - `ActiveCall { room_id, participants }` for the room list;
+  - `IncomingCall { room_id, caller, intent }`, `RingingStopped { room_id }`;
+  - `AudioDevices { inputs, outputs }`, `AudioSettings(..)`;
+  - `InputLevel { rms_db, peak_db, transmitting }` at about 20 Hz;
+  - `AudioStats { echo_return_loss_enhancement_db, residual_echo_likelihood, echo_delay_ms, processing_us }` at about 1 Hz.
+- **Errors:** `CoreError::{Call(String), Audio(String), NotInCall}`.
+- **Voice rooms:** an MSC3417 call room (room type `org.matrix.msc3417.call`), or any room with an active session, can be joined like a Discord channel. Creating such a room waits for the room-creation phase (Phase 5).
+
+## Tasks (one `feat` commit each with a `Step: phase6.<n>` trailer, gated as in Phase 1)
+Each task follows the full Phase 1 gate: fmt, clippy -D warnings, tests, `check-app-deps.sh`, `check-core-api.sh`, `cargo deny check`, and the ignored homeserver run, which from task 2 also needs the SFU stack.
+
+1. **libwebrtc supply chain and livekit dependency.**
+   - `scripts/fetch-libwebrtc.sh [triple]` downloads the zip for the host (or the given triple) at the pinned tag `webrtc-89d790b` (`linux-{x64,arm64}`, `mac-{x64,arm64}`, `win-{x64,arm64}`). It checks the SHA-256 committed in `scripts/libwebrtc.sha256` (GitHub release digests), unpacks into `${TESSERA_WEBRTC_CACHE:-$XDG_CACHE_HOME/tessera/libwebrtc}/<tag>/<triple>`, and prints the path for `LK_CUSTOM_WEBRTC`. It fails closed on a digest mismatch, a malformed digest, an unknown triple, a wrong archive layout or a missing tool. It is idempotent (a `.verified` marker holds the digest), and shellcheck is clean.
+   - **webrtc-sys downloads into `LK_CUSTOM_WEBRTC` whenever that directory is missing** (webrtc-sys-0.3.47 build.rs:112-113), so pointing at a missing path is not safe. The committed directory `dev/libwebrtc/` (README and `.gitignore` only) is set as `LK_CUSTOM_WEBRTC` by `.cargo/config.toml` `[env]`. For a host build the fetch script links the verified entries into it. Unfetched, the build fails on the missing `webrtc.ninja`, without a download. An environment `LK_CUSTOM_WEBRTC` wins (CI, Windows, where symlinks need privileges).
+   - `scripts/check-no-webrtc-download.sh` fails if webrtc-sys's downloader ran (it creates `build/scratch-*/out/livekit_webrtc`). CI runs it after every build.
+   - `tessera-core` depends on `livekit =0.9.3` with `default-features = false, features = ["native", "rustls-tls-native-roots"]` (no OpenSSL or native-tls in the tree).
+   - Link/ABI smoke test `crates/core/tests/livekit_link.rs`, calling the libwebrtc APM and a UUID across the FFI.
+   - CI: every compiling job runs the fetch script and exports `LK_CUSTOM_WEBRTC` (no cache action). Linux jobs run on `ubuntu-26.04` and a new `ubuntu-26.04-arm` entry with `CC=clang-22 CXX=clang++-22`: webrtc-sys needs clang >= 21 on Linux (libwebrtc uses Chromium's libc++, whose `trivial_abi` GCC ignores, build.rs:531-547, version check :598), and Ubuntu 24.04 only has clang 18. The apt line gains `libglib2.0-dev` (headers). `scripts/check-app-deps.sh livekit` runs in lint.
+   - Per-target link flags in `.cargo/config.toml`, from livekit/rust-sdks' own config: `+crt-static` on Windows MSVC (libwebrtc uses the static CRT), `-ObjC` on macOS (rustflags and rustdocflags), and `-fuse-ld=lld` on aarch64 Linux (CI apt line gains `lld`).
+   - deny.toml: unchanged if cargo-deny passes. Audio packages (`libasound2-dev libpipewire-0.3-dev`) come in Task 4 with cpal.
+2. **Local SFU stack.**
+   - docker-compose gains `livekit` (`livekit/livekit-server:v1.13.7`, config `dev/livekit/livekit.yaml`: ws 7880, ICE TCP 7881, one muxed ICE UDP port 7882, `node_ip: 127.0.0.1`, `room.auto_create: false` as lk-jwt-service requires, a webhook to lk-jwt-service) and `lk-jwt` (`ghcr.io/element-hq/lk-jwt-service:0.7.0`; the tag has no `v`).
+   - Both run in **synapse's network namespace** (`network_mode: service:synapse`). All ports are published on 127.0.0.1 by the synapse service. So `127.0.0.1:7880` and `127.0.0.1:8008` mean the same thing to the host (tests) and to lk-jwt-service (room creation, delegated leave).
+   - **lk-jwt-service standalone mode** (MSC4195 `POST /get_token`): Synapse 1.151 has no MSC4502/MSC4512 proxying, so the application-service mode is out. Standalone mode checks the OpenID token at `https://<server_name>:8448/_matrix/federation/v1/openid/userinfo` (always TLS; lk-jwt helper.rs:1192-1247). So `dev/synapse/start.sh` adds a federation-only TLS listener on 8448 with a self-signed `CN=localhost` certificate (generated with the image's openssl, owned by 991:991, not published), and lk-jwt runs with `LIVEKIT_INSECURE_SKIP_VERIFY_TLS` (dev only).
+   - Synapse also gains `experimental_features.msc4143_enabled`, `matrix_rtc.transports: [livekit → http://127.0.0.1:8080]`, `max_event_delay_duration: 24h`, and relaxed `rc_message` / `rc_delayed_event_mgmt`. A delayed event that hits `rc_message` is **dropped by Synapse, not retried** (synapse/handlers/delayed_events.py:494-498), which a test hit.
+   - `.env.test` gains test-only `LIVEKIT_KEY`, `LIVEKIT_SECRET`, `LIVEKIT_URL` and `LK_JWT_URL`. livekit builds `LIVEKIT_KEYS` from them in its entrypoint, and lk-jwt reads them directly, so the secret has one source.
+   - Integration tests (`crates/core/tests/rtc_stack.rs`, plain SDK clients):
+     - `discover_rtc_transports` returns exactly the local lk-jwt URL;
+     - OpenID token → `/get_token` → a JWT with which `livekit::Room::connect` joins the local SFU;
+     - a delayed state event is sent by the server after its timeout.
+   - LiveKit identities from lk-jwt are pseudonymous, `base64_nopad(sha256(json([user_id, device_id, member_id])))`, and room names are `base64_nopad(sha256(json([room_id, slot_id])))` (lk-jwt helper.rs:198-222). Tasks 7 and 9 map participants and E2EE keys through these.
+3. **Call API contract.** Types and commands as above, redacted `Debug` where needed, the `check-core-api.sh` extension with negative self-checks, and settings persistence.
+4. **Audio devices and I/O threads** (`tessera-audio`, as built).
+   - Internal format: 48 kHz mono `f32`, 10 ms `Frame`s.
+   - `AudioIo::start(IoConfig, impl FrameProcessor)` opens the capture and/or playback device on one dedicated thread (cpal streams are not `Send` everywhere), then runs the pipeline there.
+   - Device callbacks only down/up-mix and move samples through `rtrb` SPSC rings (200 ms, device rate): no allocation, no locks.
+   - The processing thread resamples with rubato 5 `Async` sinc (128 taps; passthrough at 48 kHz) and calls `FrameProcessor::process(capture, playback)` every 10 ms, paced by the capture clock (by a 10 ms timer without a microphone).
+   - Playback more than 60 ms ahead of the device clock drops a frame, which bounds the latency from clock drift.
+   - A configured device that is missing falls back to the default (`IoEvent::FellBackToDefault`). Stream errors (unplug) arrive as `IoEvent::StreamError`. Defaults follow the system default by themselves (cpal).
+   - The format prefers 48 kHz when the device supports it with its default format and channels.
+   - `list_devices()` (stable IDs: cpal `DeviceId` text, the PipeWire node name) and a polling `DeviceWatcher` (2 s) for hot-plug.
+   - cpal's native PipeWire backend on Linux (feature `pipewire`, ALSA fallback); CI and dev need `libasound2-dev libpipewire-0.3-dev`.
+   - Core: `ListAudioDevices` answers with `AudioDevices` and starts the watcher, which re-sends `AudioDevices` on change.
+   - Tests use rings directly (no hardware): bit-exact 48 kHz loopback, 44.1 kHz capture and 96 kHz playback keep a 1 kHz tone (amplitude within 0.02–0.03), drift drop, timer mode, watcher diffing. An ignored output-only device test exists.
+   - cpal's `realtime` feature is not enabled: the PipeWire callbacks already run on PipeWire's RT thread. Real-time priority for the processing thread is a Task 5 item.
+5. **Processing chain** (`tessera-audio::CaptureChain`, as built).
+   - Order: high-pass → AEC3 → noise suppression (WebRTC NS or RNNoise) → AGC2 → input gain → limiter (-0.5 dBFS, 50 ms release) → level meter → transmit gate.
+   - HPF, AEC3 and WebRTC NS run in a "front" sonora instance that also gets the played frames (`render`). AGC2 runs in a separate "back" instance, so RNNoise sees the signal before gain (denoise first, then level).
+   - Gate: voice activity with a fixed threshold, or automatic (RNNoise voice probability ≥ 0.6, else noise floor + 12 dB), with a 200 ms hangover; or push-to-talk with a release tail. Ramps (2.5 ms open, 10 ms close) avoid clicks.
+   - All settings change live (`configure`).
+   - Denormal guard `flush_denormals_on_this_thread` (x86_64 MXCSR FTZ/DAZ, aarch64 FPCR FZ), called at the start of the I/O thread.
+   - `[profile.dev.package.*] opt-level = 3` for the DSP crates: unoptimised AEC3 cannot keep up in dev builds and tests.
+   - Offline tests:
+     - AEC on a synthetic echo path (30 ms, -12 dB, low-pass) needs ≥ 20 dB ERLE (measured 36.9);
+     - RNNoise and WebRTC NS (High) need ≥ 10 dB on stationary noise (measured 15.5 and 20.7);
+     - gate, PTT tail, limiter, live switching, and `Send`.
+   - Mutation checks (AEC off; RNNoise bypassed) make the tests fail.
+   - Release timing test (ignored; `--release -- --ignored timing`): 3 s far-end speech, then 10 s of silence, needs < 2 ms per frame with the guard.
+   - The libwebrtc APM A/B backend moves to Task 8: `tessera-audio` does not link livekit, and the core does.
+6. **Mixer, playout and mic test** (as built).
+   - `tessera-audio::VoiceEngine` is the `FrameProcessor`. Each 10 ms it:
+     1. mixes the remote sources (one 200 ms `rtrb` ring each, fed through `SourceInput::push` by the track receiver; per-source volume; trimmed above 100 ms queued; underruns counted; per-source level for "speaking");
+     2. adds the mic-test loopback (the previous processed frame);
+     3. applies deafen and master volume, then clamps;
+     4. passes **exactly the played frame** to `CaptureChain::render` (the AEC reference);
+     5. processes the microphone, and pushes it (silence when gated or muted) to the `Outgoing` ring for the sender, with a `transmitting` flag;
+     6. publishes meters and statistics through atomics.
+   - The owner uses `VoiceControl`: commands over a lock-free queue (configure, PTT, mute, deafen, loopback, master and source volume, add or remove source); meters and stats come back through atomics.
+   - Core `audio_session::AudioSession` opens `AudioIo` with the engine (off the async threads) and runs a reporting task: `InputLevel` at 20 Hz, `AudioStats` at 1 Hz, device problems as `Error(Audio(..))`, closing devices on stop.
+   - `StartMicTest { loopback }`, `StopMicTest`, `PushToTalk`, and settings changes are applied live; a device change reopens the session. DeepFilter maps to RNNoise until Task 13.
+   - Tests:
+     - mix math with volumes, removal and clamping;
+     - underrun silence and counting; trim of a source far ahead;
+     - deafen; mute (silence out, meter still live); loopback;
+     - the echo reference is exactly the played frame: a perfect echo of the mix after source and master volume gives ≥ 20 dB ERLE, and rendering silence instead fails (2.9 dB);
+     - settings mapping, and device changes needing a restart.
+   - Tests that open real devices are named `hardware_*`, are `#[ignore]`, and are human-run. The ignored homeserver run (agent gate and CI) is now `--ignored --skip keyring --skip hardware_`.
+7. **MatrixRTC signalling** (as built, matching Element Call 0.26.1 "compatibility" mode, its default, and matrix-js-sdk v43 `MembershipManager`; read at those tags in the scratchpad).
+   - **Membership:** an `org.matrix.msc3401.call.member` state event under the key `_{user}_{device}_m.call` (no leading `_` in MSC3757/3779 room versions). The content is `{application: "m.call", call_id: "", scope: "m.room", device_id, membershipID: "{user}:{device}", expires: 14400000, "m.call.intent": "audio", focus_active: {type: livekit, focus_selection: "multi_sfu"}, foci_preferred: [{type: livekit, livekit_service_url, livekit_alias: room_id}]}`. It is built as raw JSON, because ruma has no `membershipID`.
+   - **Crash-safe leave:** a delayed empty membership (MSC4140, 18 s), restarted every 4 s (`update_delayed_event::unstable_v2`), and rescheduled if the server lost it. Leaving fires it at once (`send`), falling back to sending `{}`.
+   - **Expiry:** the membership is refreshed 10 min before it expires, with `created_ts` and a growing `expires`.
+   - **Token:** our own SFU comes from MSC4143 discovery. The token comes from `POST {service}/sfu/get {room, openid_token, device_id}` (the legacy endpoint compatibility mode uses), and the LiveKit identity is then `{user}:{device}`. Service URLs must be https (http only on loopback); LiveKit URLs must be wss (ws only on loopback). The JWT is `Zeroizing` and redacted in `Debug`.
+   - **Participants:** read from room state on every room-info change and every 5 s (expiry), as `CallParticipants` resets, oldest first. A state key not owned by its sender, another application or call, or no `expires` is ignored.
+   - **Power levels:** members need permission to send `org.matrix.msc3401.call.member` (Element creates rooms with it at 0). `M_FORBIDDEN` gives "you are not allowed to join calls in this room".
+   - `CallState::Connected` is emitted once the membership is published and the token obtained; Task 8 moves it to after the SFU connection. Mute and deafen are stored for Task 8.
+   - Multi-SFU (subscribing to other members' SFUs from their `foci_preferred[0]`) is Task 8.
+   - Integration tests (`tests/call_signalling.rs`): the published content checked field by field by a separate client; the membership still present after 25 s (> 18 s delay; mutation without the restart task fails, the server removed it); leave empties it; alice and carol each see both participants, and carol leaving drops her.
+8. **LiveKit media.** Connect, publish the processed mic track, subscribe to remote audio into the mixer, active-speaker events, reconnection supervision (reusing the Phase 1 backoff), and mute via track mute plus the gate. A test-only audio backend injects frames instead of cpal. Integration test: alice and bob in one call on the local SFU; bob's mixer receives alice's 1 kHz tone (energy at 1 kHz above the noise floor).
+9. **Call E2EE.**
+   - Per-sender keys as Element Call does: a random 16-byte key per join, rotated when someone leaves. The keys travel as Olm-encrypted to-device messages in the Element Call format (wire format re-checked against the Element Call/MatrixRTC JS source at plan approval; rule 8 if it is ambiguous).
+   - The LiveKit `KeyProvider` is set per participant.
+   - Integration test in an encrypted room: bob decodes alice's tone; a third party without keys gets no usable audio.
+10. **Ringing and voice rooms.** Send and receive `m.rtc.notification`, decline, `IncomingCall` and `CallDeclined`, MSC3417 room detection, and `ActiveCalls` in the room list. Integration tests on the local server.
+11. **Push-to-talk service** (`tessera-ptt`). Backends: `global-hotkey` on X11/Windows/macOS, the xdg-desktop-portal GlobalShortcuts backend (`ashpd`) on KDE/GNOME Wayland, a gamepad-button source (`gilrs`; Steam Frame and Steam Deck controllers via Steam Input), and the in-window key the app forwards (gamescope game mode). The binding is part of the settings. Unit tests cover the press/release state machine, merging several sources (any held means transmit), and the release tail. Real hotkeys and controllers are human items.
+12. **CLI.** `/call`, `/leave`, `/mute`, `/deafen`, `/ptt` (hold-to-talk through a terminal key is limited; documented), `/devices`, `/input`, `/output`, `/ns`, `/aec`, `/agc`, `/gate`, `/vol <user> <pct>` and `/mictest`. CLI integration test: join, then leave.
+
+13. **DeepFilterNet3 via tract-onnx.**
+   - `scripts/fetch-models.sh` fetches the DeepFilterNet3 ONNX export, pinned by SHA-256 like libwebrtc, with the MIT/Apache licence recorded.
+   - `tessera-audio` implements the DF3 pipeline: STFT (960/480 at 48 kHz), ERB and complex features with the normalisation, the encoder/ERB-decoder/DF-decoder graphs in tract, ERB gain application, the deep-filter stage, and ISTFT with an overlap-add hop of 480. The math is studied from upstream libDF (MIT/Apache), not copied wholesale; any copied block keeps its licence header.
+   - Exposed as `NoiseSuppression::DeepFilter { attenuation_limit_db }`.
+   - Tests: the model loads; output on speech plus noise improves SNR by at least the RNNoise result on the same fixture; the per-frame cost is recorded on x86_64 and aarch64; the fallback is RNNoise if the model files are missing.
+
+## Dependencies (approved 2026-10-02, newest releases, exact pins)
+| Crate | Version | Licence | Used by | Added in task |
+|---|---|---|---|---|
+| livekit (features `rustls-tls-native-roots`) | =0.9.3 | Apache-2.0 | core | 1 |
+| matrix-sdk feature `experimental-send-custom-to-device` | (=0.19.1, unchanged) | Apache-2.0 | core | 9 |
+| cpal (Linux: feature `pipewire`, `realtime`) | =0.18.2 | Apache-2.0 | audio | 4 |
+| rtrb | =0.4.0 | MIT OR Apache-2.0 | audio | 4 |
+| rubato | =5.0.1 | MIT OR Apache-2.0 | audio | 4 |
+| sonora | =0.2.0 | BSD-3-Clause | audio | 5 |
+| nnnoiseless | =0.5.2 | BSD-3-Clause | audio | 5 |
+| tract-onnx | =0.23.8 | MIT OR Apache-2.0 | audio | 13 |
+| global-hotkey | =0.8.0 | Apache-2.0 OR MIT | ptt | 11 |
+| ashpd | =0.13.13 | MIT | ptt | 11 |
+| gilrs | =0.11.2 | Apache-2.0 OR MIT | ptt | 11 |
+
+Each crate is added in the task that first uses it, so no dependency sits unused. Each task records `cargo tree` and `cargo deny check` output. A newer release that appears mid-phase is asked about before bumping (rule 3).
+
+## Human checkpoint (collected in PROGRESS.md, never ticked by the agent; rule 9)
+- [x] Questions answered 2026-10-02 (see Decisions).
+- [ ] Call API additions (Task 3) approved as the UI-phase contract.
+- [ ] Audio quality by ear: real mic and speakers; echo cancellation on open speakers (sonora vs libwebrtc APM A/B); RNNoise on keyboard and fan noise; AGC level; VAD gate threshold.
+- [ ] Device hot-plug (USB headset in and out, Bluetooth) on each OS you use; macOS microphone permission prompt.
+- [ ] Interop with Element Call, both directions, in unencrypted and encrypted rooms, on a real homeserver with a real SFU (matrix.org / element.io call infrastructure or your own).
+- [ ] Global PTT hotkey on X11, Wayland (KDE/GNOME portal), Windows and macOS; gamepad PTT.
+- [ ] Steam Frame: aarch64 build runs on the device (desktop mode and game mode); built-in mic and speakers with AEC; PipeWire device switching; CPU/battery cost of each NS mode; rtkit real-time priority granted.
+- [ ] CLI call against a real account; leave by crash (kill -9) clears the membership within the delayed-event timeout.
+- [ ] CI green on Linux, Windows and macOS with livekit/libwebrtc in the tree (build time and disk to be watched).
