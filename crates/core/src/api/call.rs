@@ -6,6 +6,7 @@
 //! renaming a field or variant needs a settings version bump.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -21,6 +22,39 @@ string_newtype!(
     /// only meaningful on this machine.
     AudioDeviceId
 );
+
+/// Samples in one 10 ms audio frame (48 kHz mono) for [`VirtualAudio`].
+pub const AUDIO_FRAME_LEN: usize = 480;
+
+/// A software microphone and speakers, used instead of the system's audio
+/// devices when [`AudioBackend::Virtual`] is configured (tests, bots,
+/// headless use). Called every 10 ms from the audio thread, in real time:
+/// do not block.
+pub trait VirtualAudio: Send + Sync + 'static {
+    /// Fills one 48 kHz mono microphone frame, samples in -1..=1.
+    fn capture(&self, frame: &mut [f32; AUDIO_FRAME_LEN]);
+    /// Receives one frame that would be played.
+    fn playback(&self, frame: &[f32; AUDIO_FRAME_LEN]);
+}
+
+/// Where call and mic-test audio comes from and goes to.
+#[derive(Clone, Default)]
+pub enum AudioBackend {
+    /// The system's devices (`AudioSettings::{input,output}_device`).
+    #[default]
+    System,
+    /// A [`VirtualAudio`] implementation.
+    Virtual(Arc<dyn VirtualAudio>),
+}
+
+impl std::fmt::Debug for AudioBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::System => f.write_str("System"),
+            Self::Virtual(_) => f.write_str("Virtual"),
+        }
+    }
+}
 
 /// What a call is for. Only voice for now; video comes later.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

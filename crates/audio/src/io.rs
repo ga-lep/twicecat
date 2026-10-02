@@ -16,7 +16,7 @@ use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig, SupportedStreamC
 
 use crate::AudioError;
 use crate::convert::{downmix, upmix};
-use crate::frame::SAMPLE_RATE;
+use crate::frame::{Frame, SAMPLE_RATE, SILENCE};
 use crate::pipeline::{
     CaptureSide, FrameProcessor, IoCounters, IoStats, Pipeline, PlaybackSide, capture_ring_len,
     playback_ring_len,
@@ -77,6 +77,15 @@ pub enum IoEvent {
     Stopped(AudioError),
 }
 
+/// A software stand-in for a microphone and speakers (tests, headless use):
+/// called every 10 ms on the processing thread, in real time.
+pub trait VirtualDevice: Send + 'static {
+    /// Fills one microphone frame.
+    fn capture(&mut self, frame: &mut Frame);
+    /// Takes one frame that would be played.
+    fn playback(&mut self, frame: &Frame);
+}
+
 /// Running audio I/O. Dropping it stops the streams and the thread.
 pub struct AudioIo {
     stop: Arc<AtomicBool>,
@@ -122,6 +131,61 @@ impl AudioIo {
             counters,
             events,
             info,
+        })
+    }
+
+    /// Runs `processor` against a [`VirtualDevice`] instead of real
+    /// hardware, paced by a 10 ms timer.
+    pub fn start_virtual(
+        mut device: impl VirtualDevice,
+        mut processor: impl FrameProcessor,
+    ) -> Result<Self, AudioError> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let counters = Arc::new(IoCounters::default());
+        let (_events_tx, events) = mpsc::channel();
+        let thread = {
+            let stop = stop.clone();
+            let counters = counters.clone();
+            std::thread::Builder::new()
+                .name("tessera-audio-virtual".into())
+                .spawn(move || {
+                    crate::denormals::flush_denormals_on_this_thread();
+                    let tick = Duration::from_millis(10);
+                    let mut next = Instant::now();
+                    let mut capture = SILENCE;
+                    while !stop.load(Ordering::Acquire) {
+                        device.capture(&mut capture);
+                        let mut playback = SILENCE;
+                        processor.process(&capture, &mut playback);
+                        device.playback(&playback);
+                        counters.frames.fetch_add(1, Ordering::Relaxed);
+                        next += tick;
+                        let now = Instant::now();
+                        if next > now {
+                            std::thread::sleep(next - now);
+                        } else {
+                            // Fell behind (debugger, overloaded CI): resync.
+                            next = now;
+                        }
+                    }
+                })
+                .map_err(|_| AudioError::Internal)?
+        };
+        let virtual_info = StreamInfo {
+            device_id: "virtual".into(),
+            device_name: "virtual".into(),
+            sample_rate: SAMPLE_RATE,
+            channels: 1,
+        };
+        Ok(Self {
+            stop,
+            thread: Some(thread),
+            counters,
+            events,
+            info: IoInfo {
+                input: Some(virtual_info.clone()),
+                output: Some(virtual_info),
+            },
         })
     }
 
@@ -471,6 +535,35 @@ mod tests {
     fn nothing_to_open_is_an_error() {
         let err = AudioIo::start(IoConfig::default(), |_: &_, _: &mut _| {});
         assert!(matches!(err, Err(AudioError::NothingToOpen)));
+    }
+
+    struct Loop {
+        sent: std::sync::Arc<std::sync::Mutex<Vec<f32>>>,
+    }
+
+    impl VirtualDevice for Loop {
+        fn capture(&mut self, frame: &mut Frame) {
+            frame.fill(0.5);
+        }
+        fn playback(&mut self, frame: &Frame) {
+            self.sent.lock().unwrap().extend_from_slice(frame);
+        }
+    }
+
+    #[test]
+    fn virtual_device_runs_in_real_time() {
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let io = AudioIo::start_virtual(
+            Loop { sent: sent.clone() },
+            |capture: &Frame, playback: &mut Frame| playback.copy_from_slice(capture),
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        drop(io);
+        let sent = sent.lock().unwrap();
+        let frames = sent.len() / crate::FRAME_LEN;
+        assert!((10..=30).contains(&frames), "{frames} frames in 200 ms");
+        assert!(sent.iter().all(|s| *s == 0.5));
     }
 
     #[test]

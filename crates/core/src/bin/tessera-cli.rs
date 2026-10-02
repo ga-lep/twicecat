@@ -774,6 +774,7 @@ async fn main() -> ExitCode {
             data,
             homeserver_override: options.homeserver,
             room_list_page_size: DEFAULT_ROOM_LIST_PAGE_SIZE,
+            audio: Default::default(),
         },
         secrets,
     );

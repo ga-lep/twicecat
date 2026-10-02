@@ -226,7 +226,18 @@ Each task follows the full Phase 1 gate: fmt, clippy -D warnings, tests, `check-
    - `CallState::Connected` is emitted once the membership is published and the token obtained; Task 8 moves it to after the SFU connection. Mute and deafen are stored for Task 8.
    - Multi-SFU (subscribing to other members' SFUs from their `foci_preferred[0]`) is Task 8.
    - Integration tests (`tests/call_signalling.rs`): the published content checked field by field by a separate client; the membership still present after 25 s (> 18 s delay; mutation without the restart task fails, the server removed it); leave empties it; alice and carol each see both participants, and carol leaving drops her.
-8. **LiveKit media.** Connect, publish the processed mic track, subscribe to remote audio into the mixer, active-speaker events, reconnection supervision (reusing the Phase 1 backoff), and mute via track mute plus the gate. A test-only audio backend injects frames instead of cpal. Integration test: alice and bob in one call on the local SFU; bob's mixer receives alice's 1 kHz tone (energy at 1 kHz above the noise floor).
+8. **LiveKit media** (as built, own SFU).
+   - `call/media.rs` connects `livekit::Room` with the `/sfu/get` token.
+   - **Publish:** the microphone is a `NativeAudioSource` (48 kHz mono, 50 ms queue, WebRTC's own AEC/NS/AGC off because our pipeline did it) published as `TrackSource::Microphone`, Opus at the configured bitrate, DTX and RED on. A task moves `Outgoing` frames into it.
+   - **Receive:** each subscribed remote audio track becomes a `NativeAudioStream` read into a mixer source at that user's volume (identity `user:device` → user). Sources are removed on unsubscribe or disconnect, and `SetUserVolume` applies live.
+   - **Flags:** `ActiveSpeakersChanged` and `TrackMuted`/`TrackUnmuted` set `speaking` and `muted` on participants.
+   - **Mute and deafen:** mute stops the mixer output and mutes the track (others see it); deafen also mutes (Discord semantics).
+   - **Connection:** `Reconnecting`/`Reconnected` become `CallState::Reconnecting { attempt }` and `Connected`; `Disconnected` leaves the call with `Failed`. `Connected` is now emitted after the SFU connection.
+   - **Audio in a call:** joining opens an `AudioSession` in `Mode::Call` (replacing a mic test). Without usable devices the call still joins, silent, and the audio error is shown.
+   - **Virtual audio:** `CoreConfig.audio: AudioBackend::{System, Virtual(Arc<dyn VirtualAudio>)}` (API: 480-sample `f32` frames) runs the voice engine on a 10 ms timer against software devices: tests, bots, headless use.
+   - Integration test `tests/call_media.rs`: alice's virtual mic plays a 0.3-amplitude 1 kHz tone; carol's virtual speakers receive it at 0.2858 (-0.4 dB) through the SFU and Opus; carol sees alice `speaking`, then `muted`; after mute the tone is 0.0. Mutation: without the microphone sender, the test fails.
+   - Not in this task: changing devices during a call (it applies to the next call; open issue), and the libwebrtc APM A/B backend (dropped from the plan, see notes).
+8b. **Multi-SFU** (added 2026-10-02). Element Call's compatibility mode is `multi_sfu`: each member publishes to their own homeserver's SFU. For every other member whose `foci_preferred[0]` is a different service, connect a subscribe-only LiveKit room through that service (EC tries `/get_token` first, then `/sfu/get`) and play its tracks through the same mixer. Needed for cross-homeserver calls (e.g. with matrix.org users). A second local SFU and jwt pair in compose (alice and carol on different "homeservers" is not possible with one Synapse, so the test points carol's membership at the second service) verifies it.
 9. **Call E2EE.**
    - Per-sender keys as Element Call does: a random 16-byte key per join, rotated when someone leaves. The keys travel as Olm-encrypted to-device messages in the Element Call format (wire format re-checked against the Element Call/MatrixRTC JS source at plan approval; rule 8 if it is ambiguous).
    - The LiveKit `KeyProvider` is set per participant.
@@ -261,7 +272,7 @@ Each crate is added in the task that first uses it, so no dependency sits unused
 ## Human checkpoint (collected in PROGRESS.md, never ticked by the agent; rule 9)
 - [x] Questions answered 2026-10-02 (see Decisions).
 - [ ] Call API additions (Task 3) approved as the UI-phase contract.
-- [ ] Audio quality by ear: real mic and speakers; echo cancellation on open speakers (sonora vs libwebrtc APM A/B); RNNoise on keyboard and fan noise; AGC level; VAD gate threshold.
+- [ ] Audio quality by ear: real mic and speakers; echo cancellation on open speakers (sonora AEC3; the libwebrtc APM A/B was dropped in Task 8); RNNoise on keyboard and fan noise; AGC level; VAD gate threshold.
 - [ ] Device hot-plug (USB headset in and out, Bluetooth) on each OS you use; macOS microphone permission prompt.
 - [ ] Interop with Element Call, both directions, in unencrypted and encrypted rooms, on a real homeserver with a real SFU (matrix.org / element.io call infrastructure or your own).
 - [ ] Global PTT hotkey on X11, Wayland (KDE/GNOME portal), Windows and macOS; gamepad PTT.

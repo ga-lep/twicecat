@@ -6,15 +6,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tessera_audio::{
-    AudioIo, ChainSettings, GateMode, IoConfig, IoEvent, NoiseMode, NsLevel as AudioNsLevel,
-    Outgoing, VoiceControl, VoiceEngine,
+    AudioIo, ChainSettings, Frame, GateMode, IoConfig, IoEvent, NoiseMode, NsLevel as AudioNsLevel,
+    Outgoing, SourceId, SourceInput, VirtualDevice, VoiceControl, VoiceEngine,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::api::{
-    AudioSettings, AudioStats, CoreError, CoreEvent, InputLevel, InputMode, NoiseSuppression,
-    NsLevel,
+    AudioBackend, AudioSettings, AudioStats, CoreError, CoreEvent, InputLevel, InputMode,
+    NoiseSuppression, NsLevel, VirtualAudio,
 };
 
 /// `InputLevel` events while a session runs (20 Hz).
@@ -79,10 +79,37 @@ fn audio_error(e: tessera_audio::AudioError) -> CoreError {
     CoreError::Audio(e.to_string())
 }
 
+/// What a session is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Mode {
+    /// Mic test: the processed microphone is discarded, or played back
+    /// with `loopback`.
+    MicTest { loopback: bool },
+    /// A call: the processed microphone goes to the caller, remote audio
+    /// comes in through sources.
+    Call,
+}
+
+/// Adapts the API's [`VirtualAudio`] to the audio crate.
+struct Virtual(Arc<dyn VirtualAudio>);
+
+impl VirtualDevice for Virtual {
+    fn capture(&mut self, frame: &mut Frame) {
+        self.0.capture(frame);
+    }
+    fn playback(&mut self, frame: &Frame) {
+        self.0.playback(frame);
+    }
+}
+
+/// The voice engine's control handle, shared with the media layer.
+pub(crate) type Voice = Arc<Mutex<VoiceControl>>;
+
 /// A running session. Stop it with [`AudioSession::stop`]; dropping it also
 /// ends the reporting task, which closes the devices.
 pub(crate) struct AudioSession {
-    control: Arc<Mutex<VoiceControl>>,
+    control: Voice,
+    mode: Mode,
     io_config: IoConfig,
     stop: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<()>>,
@@ -90,32 +117,45 @@ pub(crate) struct AudioSession {
 
 impl AudioSession {
     /// Opens the devices (blocking work off the async threads) and starts
-    /// the voice engine. `loopback` plays the processed microphone back
-    /// (mic test). `outgoing` is left to the caller in a call; for a mic
-    /// test it is drained here.
+    /// the voice engine. For a call, the processed microphone is returned
+    /// for sending; for a mic test it is drained here.
     pub(crate) async fn start(
         settings: &AudioSettings,
-        loopback: bool,
+        mode: Mode,
+        backend: &AudioBackend,
         events: mpsc::Sender<CoreEvent>,
-    ) -> Result<Self, CoreError> {
-        let io_config = io_config(settings, loopback);
+    ) -> Result<(Self, Option<Outgoing>), CoreError> {
+        let loopback = matches!(mode, Mode::MicTest { loopback: true });
+        let io_config = io_config(settings, loopback || mode == Mode::Call);
         let (engine, mut control, outgoing) = VoiceEngine::new(chain_settings(settings));
         control.set_loopback(loopback);
         control.set_master_volume(settings.output_volume_percent);
         let config = io_config.clone();
-        let io = tokio::task::spawn_blocking(move || AudioIo::start(config, engine))
-            .await
-            .map_err(|_| CoreError::Internal("audio start task failed".into()))?
-            .map_err(audio_error)?;
-        let control = Arc::new(Mutex::new(control));
-        let (stop_tx, stop_rx) = oneshot::channel();
-        let task = tokio::spawn(report(io, outgoing, control.clone(), events, stop_rx));
-        Ok(Self {
-            control,
-            io_config,
-            stop: Some(stop_tx),
-            task: Some(task),
+        let backend = backend.clone();
+        let io = tokio::task::spawn_blocking(move || match backend {
+            AudioBackend::System => AudioIo::start(config, engine),
+            AudioBackend::Virtual(device) => AudioIo::start_virtual(Virtual(device), engine),
         })
+        .await
+        .map_err(|_| CoreError::Internal("audio start task failed".into()))?
+        .map_err(audio_error)?;
+        let control = Arc::new(Mutex::new(control));
+        let (drain, handed_out) = match mode {
+            Mode::MicTest { .. } => (Some(outgoing), None),
+            Mode::Call => (None, Some(outgoing)),
+        };
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let task = tokio::spawn(report(io, drain, control.clone(), events, stop_rx));
+        Ok((
+            Self {
+                control,
+                mode,
+                io_config,
+                stop: Some(stop_tx),
+                task: Some(task),
+            },
+            handed_out,
+        ))
     }
 
     /// Applies new settings. Returns false when the devices changed, so the
@@ -138,9 +178,30 @@ impl AudioSession {
             .push_to_talk(pressed);
     }
 
-    /// Whether the processed microphone is played back (mic test).
-    pub(crate) fn loopback(&self) -> bool {
-        self.io_config.playback
+    /// Mute the microphone (the meter keeps working).
+    pub(crate) fn set_muted(&self, muted: bool) {
+        self.control
+            .lock()
+            .expect("voice control lock")
+            .set_muted(muted);
+    }
+
+    /// Play nothing.
+    pub(crate) fn set_deafened(&self, deafened: bool) {
+        self.control
+            .lock()
+            .expect("voice control lock")
+            .set_deafened(deafened);
+    }
+
+    /// The control handle, for the media layer's sources.
+    pub(crate) fn voice(&self) -> Voice {
+        self.control.clone()
+    }
+
+    /// What this session is for.
+    pub(crate) fn mode(&self) -> Mode {
+        self.mode
     }
 
     /// Stops the session and waits until the devices are closed.
@@ -151,6 +212,28 @@ impl AudioSession {
         if let Some(task) = self.task.take() {
             let _ = task.await;
         }
+    }
+}
+
+/// Adds a remote source at the user's volume.
+pub(crate) fn add_source(voice: &Voice, volume_percent: u16) -> Option<(SourceId, SourceInput)> {
+    voice
+        .lock()
+        .ok()
+        .and_then(|mut c| c.add_source(volume_percent))
+}
+
+/// Removes a remote source.
+pub(crate) fn remove_source(voice: &Voice, id: SourceId) {
+    if let Ok(mut c) = voice.lock() {
+        c.remove_source(id);
+    }
+}
+
+/// Changes a remote source's volume.
+pub(crate) fn set_source_volume(voice: &Voice, id: SourceId, percent: u16) {
+    if let Ok(mut c) = voice.lock() {
+        c.set_source_volume(id, percent);
     }
 }
 
@@ -166,7 +249,7 @@ impl Drop for AudioSession {
 /// outgoing stream (mic test), and closes the devices at the end.
 async fn report(
     io: AudioIo,
-    mut outgoing: Outgoing,
+    mut drain: Option<Outgoing>,
     control: Arc<Mutex<VoiceControl>>,
     events: mpsc::Sender<CoreEvent>,
     mut stop: oneshot::Receiver<()>,
@@ -180,7 +263,9 @@ async fn report(
             _ = &mut stop => break,
             _ = ticker.tick() => {}
         }
-        while outgoing.pop_frame(&mut scratch) {}
+        if let Some(outgoing) = drain.as_mut() {
+            while outgoing.pop_frame(&mut scratch) {}
+        }
         while let Some(event) = io.try_event() {
             let error = match event {
                 IoEvent::FellBackToDefault { .. } => {

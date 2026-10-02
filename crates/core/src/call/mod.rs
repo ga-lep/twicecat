@@ -1,16 +1,19 @@
-//! MatrixRTC calls (Phase 6): signalling here, media in later tasks.
+//! MatrixRTC calls (Phase 6): signalling here, media in `media`.
 //!
 //! Joining follows Element Call's compatibility mode (see `membership`):
 //! 1. find our homeserver's LiveKit service (MSC4143 transport discovery);
 //! 2. schedule a delayed empty membership (MSC4140), the crash-safe leave;
 //! 3. publish our membership;
 //! 4. get a LiveKit token for that service (`jwt`);
-//! 5. keep the delayed leave from firing (restart every 4 s), refresh the
+//! 5. connect to the SFU, publish the microphone and play the others
+//!    (`media`);
+//! 6. keep the delayed leave from firing (restart every 4 s), refresh the
 //!    membership before it expires, and report the participants.
 //!
 //! Leaving fires the delayed leave at once (or sends the empty membership).
 
 mod jwt;
+mod media;
 pub(crate) mod membership;
 
 use std::collections::BTreeMap;
@@ -30,7 +33,8 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, Notify, mpsc};
 use tokio::task::JoinHandle;
 
-use self::jwt::SfuAccess;
+pub(crate) use self::media::MediaNotice;
+use self::media::{Media, SharedFlags};
 use self::membership::{
     CALL_MEMBER_EVENT, DELAYED_LEAVE, DELAYED_LEAVE_RESTART, MEMBERSHIP_EXPIRES, Membership,
 };
@@ -60,10 +64,19 @@ pub(crate) struct CallSession {
     room: Room,
     state_key: String,
     delay_id: Arc<Mutex<Option<String>>>,
-    /// The SFU we publish to (used by the media task).
-    #[allow(dead_code)] // Read once media lands (Phase 6 Task 8).
-    pub sfu: SfuAccess,
+    media: Option<Media>,
+    flags: SharedFlags,
+    own_identity: String,
+    /// SFU connection notices for the engine.
+    pub notices: mpsc::Receiver<MediaNotice>,
     tasks: Vec<JoinHandle<()>>,
+}
+
+/// The audio side handed to a call.
+pub(crate) struct CallAudio {
+    pub voice: Option<crate::audio_session::Voice>,
+    pub outgoing: Option<tessera_audio::Outgoing>,
+    pub bitrate_kbps: u16,
 }
 
 /// Schedules the empty membership that fires if we stop restarting it.
@@ -155,7 +168,7 @@ async fn read_memberships(room: &Room) -> Vec<Membership> {
 }
 
 /// Active memberships as API participants, oldest first.
-async fn participants(room: &Room, volumes: &UserVolumes) -> Vec<Participant> {
+async fn participants(room: &Room, volumes: &UserVolumes, flags: &SharedFlags) -> Vec<Participant> {
     let now = now_ms();
     let own_user = room.own_user_id().as_str().to_owned();
     let own_device = room
@@ -185,14 +198,24 @@ async fn participants(room: &Room, volumes: &UserVolumes) -> Vec<Participant> {
             .read()
             .map(|v| v.get(&user_id).copied().unwrap_or(100))
             .unwrap_or(100);
+        let (speaking, muted) = flags
+            .flags
+            .read()
+            .map(|f| {
+                (
+                    f.speaking.contains(&m.member_id),
+                    f.muted.contains(&m.member_id),
+                )
+            })
+            .unwrap_or_default();
         out.push(Participant {
             id: ParticipantId::from(m.member_id.as_str()),
             is_local: m.user_id == own_user && m.device_id == own_device,
             user_id,
             device_id: DeviceId::from(m.device_id.as_str()),
             display_name,
-            muted: false,
-            speaking: false,
+            muted,
+            speaking,
             volume_percent,
         });
     }
@@ -204,6 +227,7 @@ impl CallSession {
     pub(crate) async fn join(
         client: &Client,
         room_id: RoomId,
+        audio: CallAudio,
         events: mpsc::Sender<CoreEvent>,
         volumes: UserVolumes,
     ) -> Result<Self, CoreError> {
@@ -234,15 +258,17 @@ impl CallSession {
             MEMBERSHIP_EXPIRES,
         );
         let delay_id = Arc::new(Mutex::new(delay_id));
+        let flags = SharedFlags::default();
+        let (notices_tx, notices) = mpsc::channel(8);
         let mut session = Self {
             room_id: room_id.clone(),
             room: room.clone(),
             state_key: state_key.clone(),
             delay_id: delay_id.clone(),
-            sfu: SfuAccess {
-                url: String::new(),
-                jwt: Default::default(),
-            },
+            media: None,
+            flags: flags.clone(),
+            own_identity: membership::member_id(&user_id, &device_id),
+            notices,
             tasks: Vec::new(),
         };
         // Kept from now on: joining (the SFU above all) can take longer than
@@ -265,8 +291,23 @@ impl CallSession {
             session.leave().await;
             return Err(e);
         }
-        match jwt::sfu_access(client, &service_url, room_id.as_str()).await {
-            Ok(sfu) => session.sfu = sfu,
+        let media = match jwt::sfu_access(client, &service_url, room_id.as_str()).await {
+            Ok(sfu) => {
+                Media::connect(
+                    &sfu,
+                    audio.voice,
+                    audio.outgoing,
+                    audio.bitrate_kbps,
+                    volumes.clone(),
+                    flags.clone(),
+                    notices_tx,
+                )
+                .await
+            }
+            Err(e) => Err(e),
+        };
+        match media {
+            Ok(media) => session.media = Some(media),
             Err(e) => {
                 session.leave().await;
                 return Err(e);
@@ -274,9 +315,32 @@ impl CallSession {
         }
 
         session.tasks.push(tokio::spawn(watch_participants(
-            room, room_id, events, volumes, own_gone,
+            room, room_id, events, volumes, flags, own_gone,
         )));
         Ok(session)
+    }
+
+    /// Mutes or unmutes our published microphone; others see the change.
+    pub(crate) fn set_muted(&self, muted: bool) {
+        if let Some(media) = &self.media {
+            media.set_muted(muted);
+        }
+        if let Ok(mut f) = self.flags.flags.write() {
+            if muted {
+                f.muted.insert(self.own_identity.clone());
+            } else {
+                f.muted.remove(&self.own_identity);
+            }
+        }
+        self.flags.changed.notify_one();
+    }
+
+    /// Applies a user's new playback volume (and re-reports participants).
+    pub(crate) fn set_user_volume(&self, user: &UserId, percent: u16) {
+        if let Some(media) = &self.media {
+            media.set_user_volume(user, percent);
+        }
+        self.flags.changed.notify_one();
     }
 
     /// Leaves: stops the tasks and removes our membership.
@@ -284,6 +348,9 @@ impl CallSession {
         for task in self.tasks.drain(..) {
             task.abort();
             let _ = task.await;
+        }
+        if let Some(media) = self.media.take() {
+            media.close().await;
         }
         let delay_id = self.delay_id.lock().await.take();
         let client = self.room.client();
@@ -437,6 +504,7 @@ async fn watch_participants(
     room_id: RoomId,
     events: mpsc::Sender<CoreEvent>,
     volumes: UserVolumes,
+    flags: SharedFlags,
     gone: Arc<Notify>,
 ) {
     let mut info = room.subscribe_info();
@@ -446,7 +514,7 @@ async fn watch_participants(
     // disappearance after that counts.
     let mut seen_own = false;
     loop {
-        let now = participants(&room, &volumes).await;
+        let now = participants(&room, &volumes, &flags).await;
         if now.iter().any(|p| p.is_local) {
             seen_own = true;
         } else if seen_own {
@@ -468,6 +536,7 @@ async fn watch_participants(
         }
         tokio::select! {
             changed = info.next() => if changed.is_none() { return },
+            () = flags.changed.notified() => {}
             _ = ticker.tick() => {}
         }
     }

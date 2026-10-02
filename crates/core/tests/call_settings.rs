@@ -6,7 +6,7 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{expect_event, start_core};
+use common::{expect_event, start_core, start_core_with_audio};
 use tessera_core::CoreHandle;
 use tessera_core::api::{
     AudioSettings, CallIntent, Command, CoreError, CoreEvent, InputMode, RoomId, UserId,
@@ -158,7 +158,11 @@ async fn listing_audio_devices_answers_without_assuming_hardware() {
 #[ignore = "needs a microphone; opens it for about a second (human-run)"]
 async fn hardware_mic_test_reports_levels() {
     let dir = tempfile::tempdir().unwrap();
-    let mut handle = core(dir.path());
+    let mut handle = start_core_with_audio(
+        dir.path(),
+        Arc::new(InMemorySecretStore::new()),
+        tessera_core::api::AudioBackend::System,
+    );
     send(&handle, Command::StartMicTest { loopback: false }).await;
     for _ in 0..10 {
         let e = expect_event(&mut handle, |e| {

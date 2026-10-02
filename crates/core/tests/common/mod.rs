@@ -100,7 +100,43 @@ pub fn parse_env(text: &str) -> HashMap<String, String> {
         .collect()
 }
 
-/// Starts a core on `dir` against the local homeserver.
+/// Starts a core on `dir` against the local homeserver, with `audio` as
+/// its audio devices.
+pub fn start_core_with_audio(
+    dir: &Path,
+    secrets: Arc<InMemorySecretStore>,
+    audio: tessera_core::api::AudioBackend,
+) -> CoreHandle {
+    let env = TestEnv::load();
+    Core::start(
+        CoreConfig {
+            data: DataPaths::at(dir),
+            homeserver_override: Some(env.homeserver_url().to_owned()),
+            room_list_page_size: tessera_core::DEFAULT_ROOM_LIST_PAGE_SIZE,
+            audio,
+        },
+        secrets,
+    )
+}
+
+/// Virtual devices that capture silence and drop what they play. Tests
+/// never open the real microphone or speakers (a call opens them); only
+/// the human-run `hardware_*` tests ask for `AudioBackend::System`.
+struct Silence;
+
+impl tessera_core::api::VirtualAudio for Silence {
+    fn capture(&self, frame: &mut [f32; tessera_core::api::AUDIO_FRAME_LEN]) {
+        frame.fill(0.0);
+    }
+    fn playback(&self, _: &[f32; tessera_core::api::AUDIO_FRAME_LEN]) {}
+}
+
+fn silence() -> tessera_core::api::AudioBackend {
+    tessera_core::api::AudioBackend::Virtual(Arc::new(Silence))
+}
+
+/// Starts a core on `dir` against the local homeserver, with silent
+/// virtual audio devices.
 pub fn start_core(dir: &Path, secrets: Arc<InMemorySecretStore>) -> CoreHandle {
     start_core_with_page_size(dir, secrets, tessera_core::DEFAULT_ROOM_LIST_PAGE_SIZE)
 }
@@ -117,6 +153,7 @@ pub fn start_core_with_page_size(
             data: DataPaths::at(dir),
             homeserver_override: Some(env.homeserver_url().to_owned()),
             room_list_page_size,
+            audio: silence(),
         },
         secrets,
     )

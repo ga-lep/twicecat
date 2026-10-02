@@ -26,13 +26,14 @@ use tracing::{info, warn};
 use zeroize::Zeroizing;
 
 use crate::api::{
-    ActionKind, AudioDevice, AudioDeviceId, AudioDevices, AudioSettings, CallEndReason, CallState,
-    Command, CoreError, CoreEvent, DeviceId, Draft, ListDiff, Member, MessageText, OutgoingMessage,
-    PaginationState, Password, RoomId, RoomListQuery, TypingUser, UserId,
+    ActionKind, AudioBackend, AudioDevice, AudioDeviceId, AudioDevices, AudioSettings,
+    CallEndReason, CallState, Command, CoreError, CoreEvent, DeviceId, Draft, ListDiff, Member,
+    MessageText, OutgoingMessage, PaginationState, Password, RoomId, RoomListQuery, TypingUser,
+    UserId,
 };
-use crate::audio_session::AudioSession;
+use crate::audio_session::{AudioSession, Mode};
 use crate::avatars::{Avatars, SdkFetcher, answer_unavailable};
-use crate::call::{CallSession, UserVolumes};
+use crate::call::{CallAudio, CallSession, MediaNotice, UserVolumes};
 use crate::call_settings;
 use crate::client::{
     ServerSpec, WRONG_ACCOUNT, account_bound, build_client, discover_homeserver_url,
@@ -74,6 +75,9 @@ pub struct CoreConfig {
     pub homeserver_override: Option<String>,
     /// Page size of the room list (`DEFAULT_ROOM_LIST_PAGE_SIZE` is 500).
     pub room_list_page_size: usize,
+    /// Audio devices for calls and the mic test (`AudioBackend::System`
+    /// unless testing).
+    pub audio: AudioBackend,
 }
 
 /// The channels to talk to a running engine.
@@ -110,6 +114,7 @@ impl Core {
             user_volumes: UserVolumes::default(),
             mic_muted: false,
             deafened: false,
+            call_reconnects: 0,
         };
         tokio::spawn(engine.run(cmd_rx));
         CoreHandle {
@@ -440,9 +445,11 @@ struct Engine {
     call: Option<CallSession>,
     /// Per-user volumes, shared with the call's participant reporting.
     user_volumes: UserVolumes,
-    /// Microphone mute and deafen requested for the call (media: Task 8).
+    /// Microphone mute and deafen requested for the call.
     mic_muted: bool,
     deafened: bool,
+    /// Consecutive SFU reconnects of the current call.
+    call_reconnects: u32,
 }
 
 /// An OAuth login in progress. Its task builds the client, emits `OAuthUrl`,
@@ -468,6 +475,18 @@ async fn next_oauth(
 ) -> Result<Result<Client, CoreError>, tokio::task::JoinError> {
     match pending {
         Some(p) => (&mut p.task).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The current call's next SFU notice, or forever without a call (or once
+/// its notices end).
+async fn next_media_notice(call: &mut Option<CallSession>) -> MediaNotice {
+    match call {
+        Some(call) => match call.notices.recv().await {
+            Some(notice) => notice,
+            None => std::future::pending().await,
+        },
         None => std::future::pending().await,
     }
 }
@@ -858,6 +877,7 @@ impl Engine {
                     }
                 },
                 joined = next_oauth(&mut self.oauth) => self.on_oauth_done(joined).await,
+                notice = next_media_notice(&mut self.call) => self.on_media_notice(notice).await,
                 change = next_change(&mut self.active), if watch_changes => match change {
                     Change::Got(c) => self.on_change(Some(c)).await,
                     Change::Missed => self.on_change(None).await,
@@ -1181,8 +1201,13 @@ impl Engine {
             }
             Command::SetUserVolume { user_id, percent } => {
                 let mut settings = self.audio_settings().await.clone();
-                settings.user_volumes.insert(user_id, percent);
-                self.store_audio_settings(settings.validated()).await;
+                settings.user_volumes.insert(user_id.clone(), percent);
+                let settings = settings.validated();
+                let applied = settings.user_volume(&user_id);
+                self.store_audio_settings(settings).await;
+                if let Some(call) = &self.call {
+                    call.set_user_volume(&user_id, applied);
+                }
             }
             Command::JoinCall { room_id, intent: _ } => self.join_call(room_id).await,
             Command::LeaveCall => {
@@ -1195,6 +1220,7 @@ impl Engine {
             Command::SetMicMuted(muted) => {
                 if self.call.is_some() {
                     self.mic_muted = muted;
+                    self.apply_mute();
                 } else {
                     self.emit(CoreEvent::Error(CoreError::NotInCall)).await;
                 }
@@ -1202,6 +1228,7 @@ impl Engine {
             Command::SetDeafened(deafened) => {
                 if self.call.is_some() {
                     self.deafened = deafened;
+                    self.apply_mute();
                 } else {
                     self.emit(CoreEvent::Error(CoreError::NotInCall)).await;
                 }
@@ -1302,8 +1329,17 @@ impl Engine {
         if let Some(session) = &self.audio_session
             && !session.apply(&settings)
         {
-            let loopback = session.loopback();
-            self.start_mic_test(loopback).await;
+            match session.mode() {
+                Mode::MicTest { loopback } => self.start_mic_test(loopback).await,
+                // Rewiring a running call's media to new devices is a
+                // follow-up; the new devices are used from the next call.
+                Mode::Call => {
+                    self.emit(CoreEvent::Error(CoreError::Audio(
+                        "the new audio devices are used from the next call".into(),
+                    )))
+                    .await;
+                }
+            }
         }
     }
 
@@ -1333,9 +1369,11 @@ impl Engine {
             room_id: room_id.clone(),
         }))
         .await;
+        let audio = self.start_call_audio().await;
         match CallSession::join(
             &client,
             room_id.clone(),
+            audio,
             self.events.clone(),
             self.user_volumes.clone(),
         )
@@ -1347,6 +1385,7 @@ impl Engine {
                     .await;
             }
             Err(e) => {
+                self.stop_call_audio().await;
                 self.emit(CoreEvent::CallState(CallState::Left {
                     room_id,
                     reason: CallEndReason::Failed(e.to_string()),
@@ -1357,11 +1396,106 @@ impl Engine {
         }
     }
 
+    /// Opens the audio devices for a call (replacing a mic test). Without
+    /// usable devices the call still joins, silent, and the error is shown.
+    async fn start_call_audio(&mut self) -> CallAudio {
+        if let Some(session) = self.audio_session.take() {
+            session.stop().await;
+        }
+        let settings = self.audio_settings().await.clone();
+        let bitrate_kbps = settings.voice_bitrate_kbps;
+        match AudioSession::start(
+            &settings,
+            Mode::Call,
+            &self.config.audio,
+            self.events.clone(),
+        )
+        .await
+        {
+            Ok((session, outgoing)) => {
+                let voice = Some(session.voice());
+                self.audio_session = Some(session);
+                CallAudio {
+                    voice,
+                    outgoing,
+                    bitrate_kbps,
+                }
+            }
+            Err(e) => {
+                self.emit(CoreEvent::Error(e)).await;
+                CallAudio {
+                    voice: None,
+                    outgoing: None,
+                    bitrate_kbps,
+                }
+            }
+        }
+    }
+
+    /// Closes the call's audio devices, if they are open.
+    async fn stop_call_audio(&mut self) {
+        if self
+            .audio_session
+            .as_ref()
+            .is_some_and(|s| s.mode() == Mode::Call)
+            && let Some(session) = self.audio_session.take()
+        {
+            session.stop().await;
+        }
+    }
+
+    /// Applies mute and deafen (deafen also mutes, as in Discord).
+    fn apply_mute(&self) {
+        let muted = self.mic_muted || self.deafened;
+        if let Some(session) = &self.audio_session {
+            session.set_muted(muted);
+            session.set_deafened(self.deafened);
+        }
+        if let Some(call) = &self.call {
+            call.set_muted(muted);
+        }
+    }
+
+    /// Reacts to the SFU connection of the current call.
+    async fn on_media_notice(&mut self, notice: MediaNotice) {
+        let Some(call) = &self.call else {
+            return;
+        };
+        let room_id = call.room_id.clone();
+        match notice {
+            MediaNotice::Reconnecting => {
+                self.call_reconnects += 1;
+                self.emit(CoreEvent::CallState(CallState::Reconnecting {
+                    room_id,
+                    attempt: self.call_reconnects,
+                }))
+                .await;
+            }
+            MediaNotice::Reconnected => {
+                self.call_reconnects = 0;
+                self.emit(CoreEvent::CallState(CallState::Connected { room_id }))
+                    .await;
+            }
+            MediaNotice::Disconnected => {
+                if let Some(call) = self.call.take() {
+                    call.leave().await;
+                }
+                self.stop_call_audio().await;
+                self.emit(CoreEvent::CallState(CallState::Left {
+                    room_id,
+                    reason: CallEndReason::Failed("the call server connection was lost".into()),
+                }))
+                .await;
+            }
+        }
+    }
+
     /// Leaves the current call, if any.
     async fn leave_call(&mut self) {
         if let Some(call) = self.call.take() {
             let room_id = call.room_id.clone();
             call.leave().await;
+            self.stop_call_audio().await;
             self.emit(CoreEvent::CallState(CallState::Left {
                 room_id,
                 reason: CallEndReason::Hangup,
@@ -1376,9 +1510,17 @@ impl Engine {
         if let Some(session) = self.audio_session.take() {
             session.stop().await;
         }
+        if self.call.is_some() {
+            self.emit(CoreEvent::Error(CoreError::Audio(
+                "the mic test is not available during a call".into(),
+            )))
+            .await;
+            return;
+        }
         let settings = self.audio_settings().await.clone();
-        match AudioSession::start(&settings, loopback, self.events.clone()).await {
-            Ok(session) => self.audio_session = Some(session),
+        let mode = Mode::MicTest { loopback };
+        match AudioSession::start(&settings, mode, &self.config.audio, self.events.clone()).await {
+            Ok((session, _)) => self.audio_session = Some(session),
             Err(e) => self.emit(CoreEvent::Error(e)).await,
         }
     }
@@ -2116,6 +2258,7 @@ mod tests {
                 data: DataPaths::at(std::env::temp_dir().join("tessera-unused")),
                 homeserver_override: None,
                 room_list_page_size: DEFAULT_ROOM_LIST_PAGE_SIZE,
+                audio: AudioBackend::default(),
             },
             secrets,
             events,
@@ -2129,6 +2272,7 @@ mod tests {
             user_volumes: UserVolumes::default(),
             mic_muted: false,
             deafened: false,
+            call_reconnects: 0,
         }
     }
 
@@ -2207,6 +2351,7 @@ mod tests {
                 data: DataPaths::at(dir),
                 homeserver_override: None,
                 room_list_page_size: DEFAULT_ROOM_LIST_PAGE_SIZE,
+                audio: AudioBackend::default(),
             },
             secrets: Arc::new(InMemorySecretStore::new()),
             events,
@@ -2220,6 +2365,7 @@ mod tests {
             user_volumes: UserVolumes::default(),
             mic_muted: false,
             deafened: false,
+            call_reconnects: 0,
         };
         (engine, rx)
     }

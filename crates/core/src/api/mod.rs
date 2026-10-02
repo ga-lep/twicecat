@@ -11,9 +11,9 @@ mod security;
 mod types;
 
 pub use call::{
-    AudioDevice, AudioDeviceId, AudioDevices, AudioProcessing, AudioSettings, AudioStats,
-    CallEndReason, CallIntent, CallState, InputLevel, InputMode, NoiseSuppression, NsLevel,
-    Participant, ParticipantId, limits,
+    AUDIO_FRAME_LEN, AudioBackend, AudioDevice, AudioDeviceId, AudioDevices, AudioProcessing,
+    AudioSettings, AudioStats, CallEndReason, CallIntent, CallState, InputLevel, InputMode,
+    NoiseSuppression, NsLevel, Participant, ParticipantId, VirtualAudio, limits,
 };
 pub use diff::ListDiff;
 pub use security::{

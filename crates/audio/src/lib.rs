@@ -22,7 +22,7 @@ pub use denormals::flush_denormals_on_this_thread;
 pub use devices::{DeviceInfo, DeviceList, DeviceWatcher, list_devices};
 pub use frame::{FRAME_LEN, Frame, SAMPLE_RATE, SILENCE};
 pub use gate::GateMode;
-pub use io::{AudioIo, IoConfig, IoEvent, IoInfo, StreamInfo};
+pub use io::{AudioIo, IoConfig, IoEvent, IoInfo, StreamInfo, VirtualDevice};
 pub use pipeline::{FrameProcessor, IoCounters, IoStats};
 pub use voice::{
     Meters, OUTGOING_RING_LEN, Outgoing, SOURCE_RING_LEN, SourceId, SourceInput, VoiceControl,
