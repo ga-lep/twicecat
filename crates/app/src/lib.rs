@@ -7,6 +7,7 @@ pub mod bridge;
 pub mod room_list;
 pub mod screens;
 pub mod state;
+pub mod text_safety;
 pub mod theme;
 
 pub use bridge::{Bridge, BridgeEvent, EventsSlot};

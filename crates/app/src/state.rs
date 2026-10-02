@@ -374,10 +374,31 @@ impl App {
                     self.send_error = Some(error.to_string());
                 }
             }
-            // Later steps: avatars and generic errors.
-            CoreEvent::Avatar { .. } | CoreEvent::Error(_) => {}
+            CoreEvent::Error(error) => self.on_core_error(&error),
+            // Later step: avatars.
+            CoreEvent::Avatar { .. } => {}
         }
         task
+    }
+
+    /// A plain `Error` strands the user unless it is handled: a failed restore
+    /// (the core emits `Error`, not `NoSession`) leaves `Starting`, and an
+    /// error during a login ends that attempt. `CoreError`'s `Display` never
+    /// carries secrets, so it is safe to show. Other screens ignore it.
+    fn on_core_error(&mut self, error: &CoreError) {
+        match self.screen {
+            Screen::Starting => {
+                self.notice = Some(format!("Could not restore your session: {error}"));
+                self.end_login_attempt();
+                self.screen = Screen::Login;
+            }
+            Screen::Login | Screen::WaitingForBrowser if self.login_in_flight => {
+                self.notice = Some(format!("Sign-in failed: {error}"));
+                self.end_login_attempt();
+                self.screen = Screen::Login;
+            }
+            _ => {}
+        }
     }
 
     /// Sends the password login from the form. The password moves into the
@@ -651,7 +672,7 @@ mod tests {
 
     // ---- Task 9: screens ----
 
-    use tessera_core::api::{AuthUrl, CoreError};
+    use tessera_core::api::{AuthUrl, AvatarId, AvatarImage, CoreError};
 
     /// Types into the login form through `update`.
     fn fill(app: &mut App, server: &str, user: &str, password: &str) {
@@ -1053,5 +1074,80 @@ mod tests {
         let _ = app.update(core(CoreEvent::LoggedOut));
         assert_eq!(app.composer.expose(), "");
         assert!(app.send_error.is_none());
+    }
+
+    #[test]
+    fn a_failed_restore_leaves_starting_for_the_login_screen_with_a_notice() {
+        let (mut app, _rx) = app_with(8);
+        assert_eq!(app.screen, Screen::Starting);
+        let _ = app.update(core(CoreEvent::Error(CoreError::Storage(
+            "secret store unavailable".into(),
+        ))));
+        assert_eq!(app.screen, Screen::Login);
+        assert!(!app.login_in_flight);
+        let notice = app.notice.clone().expect("a notice");
+        assert!(
+            notice.starts_with("Could not restore your session"),
+            "{notice}"
+        );
+        assert!(notice.contains("secret store unavailable"), "{notice}");
+    }
+
+    #[test]
+    fn an_error_during_a_login_returns_to_the_form_and_ends_the_attempt() {
+        let (mut app, mut rx) = login_app();
+        fill(&mut app, "", "alice", "hunter2-x");
+        let _ = app.update(Message::LoginSubmitted);
+        let _ = rx.try_recv();
+        assert!(app.login_in_flight);
+        let _ = app.update(core(CoreEvent::Error(CoreError::Internal(
+            "could not set up syncing".into(),
+        ))));
+        assert_eq!(app.screen, Screen::Login);
+        assert!(!app.login_in_flight);
+        assert_eq!(app.login.password.expose(), "");
+        let notice = app.notice.clone().expect("a notice");
+        assert!(notice.contains("could not set up syncing"), "{notice}");
+        assert!(!notice.contains("hunter2-x"));
+        // The form works again.
+        fill(&mut app, "", "alice", "pw2");
+        let _ = app.update(Message::LoginSubmitted);
+        assert!(matches!(rx.try_recv(), Ok(Command::LoginPassword { .. })));
+    }
+
+    #[test]
+    fn an_error_while_waiting_for_the_browser_returns_to_the_form() {
+        let (mut app, _rx, _task) = waiting_app("https://auth.example.org/a?state=secret-state-x");
+        let _ = app.update(core(CoreEvent::Error(CoreError::Network("down".into()))));
+        assert_eq!(app.screen, Screen::Login);
+        assert!(!app.login_in_flight);
+        assert!(app.browser_link.is_none());
+        let notice = app.notice.clone().expect("a notice");
+        assert!(!notice.contains("secret-state-x"), "{notice}");
+    }
+
+    #[test]
+    fn an_error_on_other_screens_changes_nothing() {
+        // Idle login form, no login in flight.
+        let (mut app, _rx) = login_app();
+        let _ = app.update(core(CoreEvent::Error(CoreError::NotLoggedIn)));
+        assert_eq!(app.screen, Screen::Login);
+        assert!(app.notice.is_none());
+        // Loading and main.
+        let (mut app, _rx) = main_app();
+        let _ = app.update(core(CoreEvent::Error(CoreError::Internal("x".into()))));
+        assert_eq!(app.screen, Screen::Main);
+        assert!(app.notice.is_none());
+        assert!(app.selected.is_some());
+        let (mut app, _rx) = login_app();
+        logged_in(&mut app);
+        let _ = app.update(core(CoreEvent::Error(CoreError::Internal("x".into()))));
+        assert_eq!(app.screen, Screen::Loading);
+        // Avatars stay ignored.
+        let _ = app.update(core(CoreEvent::Avatar {
+            id: AvatarId::from("mxc://x/a"),
+            image: Some(AvatarImage::from(vec![1])),
+        }));
+        assert_eq!(app.screen, Screen::Loading);
     }
 }

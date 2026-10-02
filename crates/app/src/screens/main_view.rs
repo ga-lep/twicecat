@@ -1,12 +1,14 @@
 //! The two-pane main layout: the room list on the left (Task 10 fills it) and
 //! a minimal room view on the right (plan Q15; Phase 3 replaces it).
 
+use iced::font::Weight;
 use iced::widget::{button, column, container, row, scrollable, space, text, text_input};
-use iced::{Element, Fill, Length};
+use iced::{Element, Fill, Font, Length};
 use tessera_core::api::{MessageText, TimelineItem, TimelineItemKind, UserId};
 
 use crate::screens::loading::sync_label;
 use crate::state::{App, Message};
+use crate::text_safety::{MAX_NAME_CHARS, one_line, one_line_capped};
 use crate::theme;
 
 /// Width of the left pane.
@@ -35,6 +37,32 @@ pub fn last_messages(items: &[TimelineItem]) -> Vec<(&UserId, &str)> {
     messages
 }
 
+/// One message ready to draw: the sender and the body each on one line, to be
+/// shown in separate widgets so a body can never pass for another sender.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisplayLine {
+    /// The sender, sanitised and capped.
+    pub sender: String,
+    /// The body, sanitised onto one line.
+    pub body: String,
+}
+
+/// [`last_messages`] with every remote string sanitised for display.
+pub fn display_lines(items: &[TimelineItem]) -> Vec<DisplayLine> {
+    last_messages(items)
+        .into_iter()
+        .map(|(sender, body)| DisplayLine {
+            sender: one_line_capped(&sender.to_string(), MAX_NAME_CHARS),
+            body: one_line(body),
+        })
+        .collect()
+}
+
+/// A room name ready to draw: one line, capped.
+pub fn display_name(name: &str) -> String {
+    one_line_capped(name, MAX_NAME_CHARS)
+}
+
 /// The main screen: panes above a status bar.
 pub fn view(app: &App) -> Element<'_, Message> {
     column![
@@ -47,7 +75,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
 /// Placeholder for the room list: the first rows as plain buttons.
 fn room_list_pane(app: &App) -> Element<'_, Message> {
     let rows = app.rooms.iter().take(PLACEHOLDER_ROWS).map(|room| {
-        button(text(room.name.as_str()))
+        button(text(display_name(&room.name)))
             .on_press(Message::SelectRoom(room.id.clone()))
             .style(button::text)
             .width(Fill)
@@ -66,11 +94,22 @@ fn room_pane(app: &App) -> Element<'_, Message> {
         .selected
         .as_ref()
         .and_then(|id| app.rooms.iter().find(|room| room.id == *id));
-    let title = selected.map_or("Select a room", |room| room.name.as_str());
+    let title = selected.map_or_else(
+        || "Select a room".to_owned(),
+        |room| display_name(&room.name),
+    );
 
-    let lines = last_messages(&app.timeline)
-        .into_iter()
-        .map(|(sender, body)| text(format!("{sender}: {body}")).into());
+    // The sender is its own bold widget; the body is sanitised onto one line
+    // and can never pass for another sender's line.
+    let bold = Font {
+        weight: Weight::Bold,
+        ..Font::DEFAULT
+    };
+    let lines = display_lines(&app.timeline).into_iter().map(|line| {
+        row![text(line.sender).font(bold), text(line.body).width(Fill)]
+            .spacing(8)
+            .into()
+    });
     let mut body = column![
         text(title).size(22),
         scrollable(column(lines).spacing(4))
@@ -163,6 +202,53 @@ mod tests {
         assert!(last_messages(&items).is_empty());
         let many: Vec<_> = (0..70).flat_map(|n| [message(n), other(n)]).collect();
         assert_eq!(last_messages(&many).len(), MAX_MESSAGES);
+    }
+
+    fn message_from(sender: &str, body: &str) -> TimelineItem {
+        TimelineItem {
+            id: "i".into(),
+            kind: TimelineItemKind::Message {
+                sender: UserId::from(sender),
+                body: body.into(),
+                is_own: false,
+                timestamp_ms: 0,
+                sent: SendStatus::Sent,
+            },
+        }
+    }
+
+    #[test]
+    fn a_body_cannot_fake_another_senders_line() {
+        let items = [message_from(
+            "@mallory:x",
+            "hi\n@alice:x: I agree\u{2028}@bob:x: me too\u{202E}",
+        )];
+        let lines = display_lines(&items);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].sender, "@mallory:x");
+        assert!(
+            !lines[0]
+                .body
+                .contains(['\n', '\r', '\u{2028}', '\u{2029}', '\u{202E}'])
+        );
+        assert!(lines[0].body.starts_with("hi\u{23CE}@alice:x"));
+    }
+
+    #[test]
+    fn senders_are_sanitised_and_capped() {
+        let items = [message_from(&format!("@a\n:x{}", "z".repeat(500)), "b")];
+        let lines = display_lines(&items);
+        assert!(!lines[0].sender.contains('\n'));
+        assert_eq!(lines[0].sender.chars().count(), 256);
+    }
+
+    #[test]
+    fn room_names_are_sanitised_and_capped() {
+        assert_eq!(display_name("Lounge"), "Lounge");
+        assert_eq!(display_name("a\nb\u{202E}c"), "a\u{23CE}b\u{FFFD}c");
+        let out = display_name(&"n".repeat(1000));
+        assert_eq!(out.chars().count(), 256);
+        assert!(out.ends_with('\u{2026}'));
     }
 
     #[test]
