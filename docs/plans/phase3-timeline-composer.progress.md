@@ -7,3 +7,4 @@ Task 2: complete (0b3e105..1f3debf, gate ok, security PASS, review PASS)
 Task 3: started
 Task 3: complete (095d5e6..0e7f8dd, gate ok, security PASS, review PASS)
   notes: Security Low: ReplyPreview and membership names lack the ambiguity flag (spoofing); unloaded reply sender is an empty UserId (prefer Option); no cap on reaction-group count, reaction key length or paragraphs per message (body copied twice); StateChange/MessageDetails Debug print names (policy as MessagePreview). Review: map_event/map_reply have no unit tests; replies, reactions and send_failure must be covered by Tasks 5-6 integration tests. SDK behaviour (Tasks 7, 9): a limited sync emits Clear and drops earlier events until back-pagination. State test accepts InviteAccepted as well as Joined.
+Task 4: started
