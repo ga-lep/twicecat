@@ -9,7 +9,7 @@ use tessera_core::api::{MessageText, TimelineItem, TimelineItemKind, UserId};
 use crate::screens::loading::sync_label;
 use crate::screens::room_list_pane;
 use crate::state::{App, Message};
-use crate::text_safety::{MAX_BODY_CHARS, MAX_NAME_CHARS, one_line_capped};
+use crate::text_safety::{MAX_BODY_CHARS, MAX_NAME_CHARS, name_or_placeholder, one_line_capped};
 use crate::theme;
 
 /// Width of the left pane.
@@ -49,15 +49,15 @@ pub fn display_lines(items: &[TimelineItem]) -> Vec<DisplayLine> {
     last_messages(items)
         .into_iter()
         .map(|(sender, body)| DisplayLine {
-            sender: one_line_capped(&sender.to_string(), MAX_NAME_CHARS),
+            sender: name_or_placeholder(&sender.to_string(), MAX_NAME_CHARS),
             body: one_line_capped(body, MAX_BODY_CHARS),
         })
         .collect()
 }
 
-/// A room name ready to draw: one line, capped.
+/// A room name ready to draw: one line, capped, a placeholder when blank.
 pub fn display_name(name: &str) -> String {
-    one_line_capped(name, MAX_NAME_CHARS)
+    name_or_placeholder(name, MAX_NAME_CHARS)
 }
 
 /// The main screen: panes above a status bar.

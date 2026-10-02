@@ -35,6 +35,7 @@ impl TestEnv {
                 *value = over;
             }
         }
+        assert_local_homeserver(values.get("HOMESERVER_URL").map_or("", String::as_str));
         Self(values)
     }
 
@@ -45,9 +46,33 @@ impl TestEnv {
     }
 }
 
+/// Whether `url` is plain http on a loopback address with a port, the only
+/// kind of homeserver the test accounts may be used with (AGENTS.md rule 6).
+fn is_local_homeserver(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("http://") else {
+        return false;
+    };
+    let rest = rest.strip_suffix('/').unwrap_or(rest);
+    ["127.0.0.1", "localhost", "[::1]"].iter().any(|host| {
+        rest.strip_prefix(host)
+            .and_then(|r| r.strip_prefix(':'))
+            .is_some_and(|port| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()))
+    })
+}
+
+/// Panics unless `url` is a local homeserver; call before sending credentials.
+fn assert_local_homeserver(url: &str) {
+    assert!(
+        is_local_homeserver(url),
+        "HOMESERVER_URL must be http://127.0.0.1:<port>, http://localhost:<port> or http://[::1]:<port>; \
+         the test accounts must never be used against another server"
+    );
+}
+
 /// One plain-HTTP JSON request to the local homeserver; returns the body.
 /// HTTP/1.0 and `Connection: close`, so the body ends where the stream does.
 fn http_json(base: &str, method: &str, path: &str, token: Option<&str>, body: &str) -> String {
+    assert_local_homeserver(base);
     let authority = base
         .strip_prefix("http://")
         .expect("the test homeserver is plain http")
@@ -207,4 +232,30 @@ fn login_reaches_main_with_rooms_and_shutdown_closes_the_bridge() {
 
     drop(app);
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn only_loopback_http_urls_count_as_local() {
+    for ok in [
+        "http://127.0.0.1:8008",
+        "http://localhost:8008",
+        "http://[::1]:8008",
+        "http://127.0.0.1:8008/",
+    ] {
+        assert!(is_local_homeserver(ok), "{ok}");
+    }
+    for bad in [
+        "https://127.0.0.1:8008",
+        "https://matrix.org",
+        "http://example.com:8008",
+        "http://127.0.0.1",
+        "http://127.0.0.1.evil.com:8008",
+        "http://localhost:8008@evil.com",
+        "http://evil.com:80/@localhost:8008",
+        "http://localhost:80/path",
+        "http://localhost:",
+        "",
+    ] {
+        assert!(!is_local_homeserver(bad), "{bad}");
+    }
 }

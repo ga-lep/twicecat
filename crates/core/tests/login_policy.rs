@@ -54,3 +54,29 @@ async fn http_non_loopback_homeserver_is_refused_before_login() {
     core.commands.send(Command::Shutdown).await.unwrap();
     while core.events.recv().await.is_some() {}
 }
+
+#[test]
+fn only_loopback_http_urls_count_as_local() {
+    for ok in [
+        "http://127.0.0.1:8008",
+        "http://localhost:8008",
+        "http://[::1]:8008",
+        "http://127.0.0.1:8008/",
+    ] {
+        assert!(common::is_local_homeserver(ok), "{ok}");
+    }
+    for bad in [
+        "https://127.0.0.1:8008",
+        "https://matrix.org",
+        "http://example.com:8008",
+        "http://127.0.0.1",
+        "http://127.0.0.1.evil.com:8008",
+        "http://localhost:8008@evil.com",
+        "http://evil.com:80/@localhost:8008",
+        "http://localhost:80/path",
+        "http://localhost:",
+        "",
+    ] {
+        assert!(!common::is_local_homeserver(bad), "{bad}");
+    }
+}

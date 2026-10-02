@@ -388,6 +388,7 @@ impl App {
         let mut task = Task::none();
         match event {
             CoreEvent::NoSession => {
+                self.pending_cancel = false;
                 self.end_login_attempt();
                 self.screen = Screen::Login;
             }
@@ -425,10 +426,14 @@ impl App {
             CoreEvent::SyncState(state) => self.sync_state = state,
             CoreEvent::RoomListChanged(diffs) => {
                 room_list::apply_room_diffs(&mut self.rooms, &diffs);
-                let selection_gone = self
-                    .selected
-                    .as_ref()
-                    .is_some_and(|id| !room_list::contains(&self.rooms, id));
+                // A search or tab filters the list, so an open room missing
+                // from it is only hidden: keep it and its draft. Without a
+                // filter, a missing room has really gone.
+                let selection_gone = self.query == RoomListQuery::default()
+                    && self
+                        .selected
+                        .as_ref()
+                        .is_some_and(|id| !room_list::contains(&self.rooms, id));
                 if selection_gone {
                     self.deselect();
                 }
@@ -650,6 +655,7 @@ impl App {
     }
 
     fn back_to_login(&mut self, notice: &str) {
+        self.pending_cancel = false;
         self.user_id = None;
         self.rooms.clear();
         self.total_rooms = None;
@@ -1383,5 +1389,75 @@ mod tests {
             image: Some(AvatarImage::from(vec![1])),
         }));
         assert_eq!(app.screen, Screen::Loading);
+    }
+
+    #[test]
+    fn search_keeps_the_open_room_and_its_draft_when_the_filtered_list_lacks_it() {
+        let (mut app, _rx) = main_app();
+        let _ = app.update(Message::ComposerChanged(MessageText::from("unsent")));
+        let _ = app.update(Message::SearchChanged("zzz".into()));
+        let _ = app.update(core(room_event(&["z"])));
+        assert_eq!(app.selected, Some(RoomId::from("!a:x")));
+        assert_eq!(app.composer.expose(), "unsent");
+        // Emptied list, too.
+        let _ = app.update(core(CoreEvent::RoomListChanged(vec![ListDiff::Clear])));
+        assert_eq!(app.selected, Some(RoomId::from("!a:x")));
+        assert_eq!(app.composer.expose(), "unsent");
+    }
+
+    #[test]
+    fn switching_tabs_keeps_the_open_room_and_its_draft() {
+        let (mut app, _rx) = main_app();
+        let _ = app.update(Message::ComposerChanged(MessageText::from("unsent")));
+        let _ = app.update(Message::TabSelected(RoomListTab::People));
+        let _ = app.update(core(room_event(&["z"])));
+        assert_eq!(app.selected, Some(RoomId::from("!a:x")));
+        assert_eq!(app.composer.expose(), "unsent");
+    }
+
+    #[test]
+    fn the_open_room_is_deselected_when_the_default_query_loses_it() {
+        let (mut app, _rx) = main_app();
+        let _ = app.update(Message::ComposerChanged(MessageText::from("unsent")));
+        assert_eq!(app.query, RoomListQuery::default());
+        let _ = app.update(core(room_event(&["b"])));
+        assert_eq!(app.selected, None);
+        assert_eq!(app.composer.expose(), "");
+
+        // Also after returning to the default query.
+        let (mut app, _rx) = main_app();
+        let _ = app.update(Message::SearchChanged("zzz".into()));
+        let _ = app.update(core(room_event(&["z"])));
+        assert!(app.selected.is_some());
+        let _ = app.update(Message::SearchChanged(String::new()));
+        let _ = app.update(core(room_event(&["b"])));
+        assert_eq!(app.selected, None);
+    }
+
+    #[test]
+    fn the_open_room_survives_a_filtered_list_that_still_has_it_and_logout_clears_it() {
+        let (mut app, _rx) = main_app();
+        let _ = app.update(Message::SearchChanged("zzz".into()));
+        let _ = app.update(core(room_event(&["z"])));
+        let _ = app.update(core(CoreEvent::LoggedOut));
+        assert_eq!(app.selected, None);
+        let (mut app, _rx) = main_app();
+        let _ = app.update(Message::SearchChanged("zzz".into()));
+        let _ = app.update(core(CoreEvent::SessionExpired));
+        assert_eq!(app.selected, None);
+    }
+
+    #[test]
+    fn a_pending_cancel_is_forgotten_when_the_session_state_changes() {
+        for event in [
+            CoreEvent::NoSession,
+            CoreEvent::LoggedOut,
+            CoreEvent::SessionExpired,
+        ] {
+            let (mut app, _rx) = login_app();
+            app.pending_cancel = true;
+            let _ = app.update(core(event.clone()));
+            assert!(!app.pending_cancel, "{event:?}");
+        }
     }
 }

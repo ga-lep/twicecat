@@ -8,7 +8,7 @@ use std::ops::Range;
 
 use tessera_core::api::{ListDiff, RoomId, RoomListTab, RoomSummary};
 
-use crate::text_safety::{MAX_NAME_CHARS, one_line_capped};
+use crate::text_safety::{MAX_NAME_CHARS, name_or_placeholder, one_line_capped};
 
 /// Height of one room row, in logical pixels (plan Q12).
 pub const ROW_HEIGHT: f32 = 64.0;
@@ -127,9 +127,9 @@ pub fn should_load_more(visible_end: usize, len: usize, total: Option<u32>) -> b
     more_on_server && visible_end.saturating_add(LOAD_MORE_MARGIN) >= len
 }
 
-/// A room name for a row: one line, capped.
+/// A room name for a row: one line, capped, with a placeholder when blank.
 pub fn row_name(name: &str) -> String {
-    one_line_capped(name, MAX_NAME_CHARS)
+    name_or_placeholder(name, MAX_NAME_CHARS)
 }
 
 /// The one-line preview of a room's last message: `sender: body`, with the
@@ -140,7 +140,7 @@ pub fn preview_line(room: &RoomSummary) -> Option<String> {
     let sender = if message.is_own {
         "You".to_owned()
     } else if let Some(name) = &message.sender_name {
-        one_line_capped(name, MAX_PREVIEW_NAME_CHARS)
+        name_or_placeholder(name, MAX_PREVIEW_NAME_CHARS)
     } else {
         one_line_capped(&message.sender.to_string(), MAX_PREVIEW_NAME_CHARS)
     };
@@ -1264,5 +1264,10 @@ mod pure_tests {
     fn row_names_are_sanitised_and_capped() {
         assert_eq!(row_name("a\nb"), "a\u{23CE}b");
         assert_eq!(row_name(&"n".repeat(1000)).chars().count(), 256);
+        assert_eq!(row_name(""), crate::text_safety::NAME_PLACEHOLDER);
+        assert_eq!(
+            row_name("\u{3000}\u{200B}"),
+            crate::text_safety::NAME_PLACEHOLDER
+        );
     }
 }

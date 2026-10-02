@@ -4,11 +4,15 @@
 # between test runs, not during one.
 # Never prints passwords or tokens.
 set -euo pipefail
-cd "$(dirname "$0")/.."
+script_dir=$(cd "$(dirname "$0")" && pwd)
+cd "$script_dir/.."
 set -a
 # shellcheck disable=SC1091
 source .env.test
 set +a
+# shellcheck source=scripts/require-local-homeserver.sh
+source "$script_dir/require-local-homeserver.sh"
+require_local_homeserver
 
 for _ in $(seq 60); do
     curl -sf "$HOMESERVER_URL/_matrix/client/versions" >/dev/null && break
@@ -50,4 +54,4 @@ register "$TEST_USER_2" "$TEST_PASSWORD_2"
 register "$TEST_USER_3" "$TEST_PASSWORD_3"
 
 # Rooms left over from earlier runs slow every later test run down.
-"$(dirname "$0")/prune-test-rooms.sh"
+"$script_dir/prune-test-rooms.sh"

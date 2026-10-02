@@ -33,7 +33,9 @@ impl TestEnv {
                 *value = over;
             }
         }
-        Self { values }
+        let env = Self { values };
+        assert_local_homeserver(env.get("HOMESERVER_URL"));
+        env
     }
 
     pub fn get(&self, key: &str) -> &str {
@@ -60,6 +62,29 @@ impl TestEnv {
     pub fn user_id(&self, n: u8) -> String {
         format!("@{}:{}", self.user(n), self.get("HOMESERVER_DOMAIN"))
     }
+}
+
+/// Whether `url` is plain http on a loopback address with a port, the only
+/// kind of homeserver the test accounts may be used with (AGENTS.md rule 6).
+pub fn is_local_homeserver(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("http://") else {
+        return false;
+    };
+    let rest = rest.strip_suffix('/').unwrap_or(rest);
+    ["127.0.0.1", "localhost", "[::1]"].iter().any(|host| {
+        rest.strip_prefix(host)
+            .and_then(|r| r.strip_prefix(':'))
+            .is_some_and(|port| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()))
+    })
+}
+
+/// Panics unless `url` is a local homeserver; call before sending credentials.
+pub fn assert_local_homeserver(url: &str) {
+    assert!(
+        is_local_homeserver(url),
+        "HOMESERVER_URL must be http://127.0.0.1:<port>, http://localhost:<port> or http://[::1]:<port>; \
+         the test accounts must never be used against another server"
+    );
 }
 
 /// Parses `KEY=VALUE` lines; `#` comments and blank lines are skipped.
