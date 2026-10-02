@@ -6,23 +6,24 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{Stream, StreamExt as _, pin_mut};
+use matrix_sdk::room::edit::EditedContent;
 use matrix_sdk::ruma::OwnedUserId;
 use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
 use matrix_sdk::send_queue::SendHandle;
-use matrix_sdk::{Client, SessionChange};
+use matrix_sdk::{Client, RoomMemberships, SessionChange};
 use matrix_sdk_ui::eyeball_im::{Vector, VectorDiff};
 use matrix_sdk_ui::sync_service::SyncService;
 use matrix_sdk_ui::timeline::{
     EventSendState, RoomExt as _, Timeline, TimelineItem as SdkTimelineItem,
 };
-use tokio::sync::{Notify, broadcast, mpsc, oneshot, watch};
+use tokio::sync::{Notify, OnceCell, broadcast, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::{info, warn};
 use zeroize::Zeroizing;
 
 use crate::api::{
-    ActionKind, Command, CoreError, CoreEvent, DeviceId, ListDiff, MessageText, OutgoingMessage,
-    Password, RoomId, RoomListQuery, UserId,
+    ActionKind, Command, CoreError, CoreEvent, DeviceId, ListDiff, Member, MessageText,
+    OutgoingMessage, Password, RoomId, RoomListQuery, UserId,
 };
 use crate::avatars::{Avatars, SdkFetcher, answer_unavailable};
 use crate::client::{
@@ -38,7 +39,7 @@ use crate::session::{
     RECORD_VERSION, SessionAuth, SessionRecord, generate_session_id, generate_store_passphrase,
 };
 use crate::sync::{CancelTrigger, SyncControl, cancel_pair, run_supervised};
-use crate::timeline::{map_item, parse_room_id};
+use crate::timeline::{map_item, normalize_reaction_key, parse_room_id, rank_members};
 
 /// Default number of rooms the room list loads per page.
 pub const DEFAULT_ROOM_LIST_PAGE_SIZE: usize = 500;
@@ -114,6 +115,8 @@ struct Selected {
     timeline: Arc<Timeline>,
     task: JoinHandle<()>,
     tasks: JoinSet<()>,
+    /// Set once the full member list has been fetched for this selection.
+    members_synced: Arc<OnceCell<()>>,
 }
 
 impl Selected {
@@ -497,6 +500,96 @@ async fn send_task(timeline: Arc<Timeline>, message: OutgoingMessage) -> Result<
         .map_err(|_| CoreError::Internal("the message could not be queued".into()))
 }
 
+/// Replaces the content of one of the user's own messages. The new content
+/// goes through the same `outgoing_content` (sanitizer and tag cap) as a send.
+async fn edit_task(
+    timeline: Arc<Timeline>,
+    item_id: String,
+    message: OutgoingMessage,
+) -> Result<(), CoreError> {
+    let item = find_item(&timeline, &item_id).await?;
+    let event = item.as_event().ok_or(CoreError::NotAllowed)?;
+    if !event.is_editable() {
+        return Err(CoreError::NotAllowed);
+    }
+    let content = EditedContent::RoomMessage(outgoing_content(&message));
+    timeline
+        .edit(&event.identifier(), content)
+        .await
+        .map_err(|_| CoreError::Internal("the message could not be edited".into()))
+}
+
+/// Redacts a message. The reason is exposed only at the SDK call.
+async fn redact_task(
+    timeline: Arc<Timeline>,
+    item_id: String,
+    reason: Option<MessageText>,
+) -> Result<(), CoreError> {
+    let item = find_item(&timeline, &item_id).await?;
+    let event = item.as_event().ok_or(CoreError::NotAllowed)?;
+    timeline
+        .redact(
+            &event.identifier(),
+            reason.as_ref().map(MessageText::expose),
+        )
+        .await
+        .map_err(|_| CoreError::Internal("the message could not be redacted".into()))
+}
+
+/// Adds the user's reaction to a message, or removes it when present.
+async fn react_task(
+    timeline: Arc<Timeline>,
+    item_id: String,
+    key: String,
+) -> Result<(), CoreError> {
+    let key = normalize_reaction_key(&key)?;
+    let item = find_item(&timeline, &item_id).await?;
+    let event = item.as_event().ok_or(CoreError::NotAllowed)?;
+    timeline
+        .toggle_reaction(&event.identifier(), &key)
+        .await
+        .map(drop)
+        .map_err(|_| CoreError::Internal("the reaction could not be sent".into()))
+}
+
+/// Answers a member search with the best matches among the joined members.
+/// The member list is fetched once per selection (`synced`); the search
+/// itself reads only the local store.
+async fn members_task(
+    timeline: Arc<Timeline>,
+    synced: Arc<OnceCell<()>>,
+    events: mpsc::Sender<CoreEvent>,
+    query: MessageText,
+) -> Result<(), CoreError> {
+    let room = timeline.room();
+    let fail = |_| CoreError::Internal("the members could not be loaded".into());
+    synced
+        .get_or_try_init(|| async { room.sync_members().await })
+        .await
+        .map_err(fail)?;
+    let joined = room
+        .members_no_sync(RoomMemberships::JOIN)
+        .await
+        .map_err(fail)?;
+    let all = joined
+        .iter()
+        .map(|m| Member {
+            user_id: UserId::from(m.user_id().as_str()),
+            display_name: m.display_name().map(str::to_owned),
+        })
+        .collect();
+    let members = rank_members(query.expose(), all);
+    // A dropped receiver just means nobody listens any more.
+    let _ = events
+        .send(CoreEvent::Members {
+            room_id: RoomId::from(room.room_id().as_str()),
+            query,
+            members,
+        })
+        .await;
+    Ok(())
+}
+
 /// The send handle of the failed local echo `item_id`, and whether the
 /// failure is unrecoverable (the request is parked until unwedged).
 async fn local_echo(timeline: &Timeline, item_id: &str) -> Result<(SendHandle, bool), CoreError> {
@@ -554,8 +647,7 @@ fn action_error(logged_in: bool, selected: Option<&RoomId>, room: &RoomId) -> Co
 }
 
 /// The answer to an action command whose handler does not exist yet; `None`
-/// for a command that is not an action. A member search with a matching room
-/// finds nobody.
+/// for a command that is not an action.
 fn unfinished_action_event(
     logged_in: bool,
     selected: Option<&RoomId>,
@@ -563,13 +655,6 @@ fn unfinished_action_event(
 ) -> Option<CoreEvent> {
     let (room_id, action) = command_action(cmd)?;
     let error = action_error(logged_in, selected, &room_id);
-    if let (Command::SearchMembers { query, .. }, CoreError::Internal(_)) = (cmd, &error) {
-        return Some(CoreEvent::Members {
-            room_id,
-            query: query.clone(),
-            members: Vec::new(),
-        });
-    }
     Some(CoreEvent::ActionFailed {
         room_id,
         action,
@@ -696,15 +781,53 @@ impl Engine {
                 })
                 .await;
             }
+            Command::Edit { item_id, message } => {
+                let room_id = message.room_id.clone();
+                self.run_action(room_id, ActionKind::Edit, |timeline| {
+                    edit_task(timeline, item_id, message)
+                })
+                .await;
+            }
+            Command::Redact {
+                room_id,
+                item_id,
+                reason,
+            } => {
+                self.run_action(room_id, ActionKind::Redact, |timeline| {
+                    redact_task(timeline, item_id, reason)
+                })
+                .await;
+            }
+            Command::ToggleReaction {
+                room_id,
+                item_id,
+                key,
+            } => {
+                self.run_action(room_id, ActionKind::React, |timeline| {
+                    react_task(timeline, item_id, key)
+                })
+                .await;
+            }
+            Command::SearchMembers { room_id, query } => {
+                let query = MessageText::from(query);
+                let events = self.events.clone();
+                let synced = self
+                    .active
+                    .as_ref()
+                    .and_then(|a| a.selected.as_ref())
+                    .map(|s| s.members_synced.clone());
+                self.run_action(room_id, ActionKind::Members, |timeline| {
+                    // `run_action` only calls this with a selected room, so
+                    // `synced` is present then.
+                    members_task(timeline, synced.unwrap_or_default(), events, query)
+                })
+                .await;
+            }
             // The real handlers land in later tasks; until then each answers
             // without touching the network.
-            Command::Edit { .. }
-            | Command::Redact { .. }
-            | Command::ToggleReaction { .. }
-            | Command::PaginateBackwards { .. }
+            Command::PaginateBackwards { .. }
             | Command::MarkRead { .. }
-            | Command::SetTyping { .. }
-            | Command::SearchMembers { .. } => {
+            | Command::SetTyping { .. } => {
                 let selected = self
                     .active
                     .as_ref()
@@ -890,6 +1013,7 @@ impl Engine {
             timeline: Arc::new(timeline),
             task,
             tasks: JoinSet::new(),
+            members_synced: Arc::new(OnceCell::new()),
         });
         Ok(())
     }
@@ -1688,33 +1812,17 @@ mod tests {
     fn unfinished_actions_with_a_matching_room_answer_not_implemented() {
         let room = rid("a");
         for (cmd, kind) in action_commands(&room) {
-            let ev = unfinished_action_event(true, Some(&room), &cmd);
-            match (kind, ev) {
-                (
-                    ActionKind::Members,
-                    Some(CoreEvent::Members {
-                        room_id,
-                        query,
-                        members,
-                    }),
-                ) => {
-                    assert_eq!(room_id, room);
-                    assert_eq!(query, "a");
-                    assert!(members.is_empty());
-                }
-                (
-                    kind,
-                    Some(CoreEvent::ActionFailed {
-                        room_id,
-                        action,
-                        error,
-                    }),
-                ) => {
+            match unfinished_action_event(true, Some(&room), &cmd) {
+                Some(CoreEvent::ActionFailed {
+                    room_id,
+                    action,
+                    error,
+                }) => {
                     assert_eq!(room_id, room);
                     assert_eq!(action, kind);
                     assert_eq!(error, CoreError::Internal("not implemented yet".into()));
                 }
-                (kind, other) => panic!("{kind:?}: {other:?}"),
+                other => panic!("{kind:?}: {other:?}"),
             }
         }
         assert!(unfinished_action_event(true, Some(&room), &Command::Logout).is_none());

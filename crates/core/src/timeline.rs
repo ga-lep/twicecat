@@ -12,7 +12,7 @@ use matrix_sdk_ui::timeline::{
 };
 
 use crate::api::{
-    CoreError, ItemActions, MessageDetails, MessageKind, PlaceholderKind, ReactionGroup,
+    CoreError, ItemActions, Member, MessageDetails, MessageKind, PlaceholderKind, ReactionGroup,
     ReplyPreview, ReplyState, RoomId, SendFailure, SendStatus, StateChange, TimelineItem,
     TimelineItemKind, UserId,
 };
@@ -24,6 +24,15 @@ const REPLY_BODY_CHARS: usize = 200;
 const REACTION_SENDERS: usize = 5;
 /// Most readers listed on one item.
 const MAX_READERS: usize = 20;
+/// Most reaction groups kept per message; a hostile room can add thousands.
+pub(crate) const MAX_REACTION_GROUPS: usize = 24;
+/// Longest reaction key, in bytes. Longer incoming keys are dropped, and an
+/// outgoing key is cut to this length.
+pub(crate) const MAX_REACTION_KEY_BYTES: usize = 64;
+/// Most members returned by a member search.
+pub(crate) const MAX_MEMBER_RESULTS: usize = 8;
+/// Longest member-search query, in bytes; a longer one matches nobody.
+const MAX_MEMBER_QUERY_BYTES: usize = 256;
 
 /// Maps the send state of a local echo.
 pub(crate) fn map_send_state(state: &EventSendState) -> SendStatus {
@@ -305,6 +314,8 @@ where
 {
     groups
         .into_iter()
+        .filter(|(key, _)| key.len() <= MAX_REACTION_KEY_BYTES)
+        .take(MAX_REACTION_GROUPS)
         .map(|(key, senders)| {
             let mut count = 0u32;
             let mut is_own = false;
@@ -323,6 +334,58 @@ where
                 senders: kept,
             }
         })
+        .collect()
+}
+
+/// Trims a reaction key and cuts it to [`MAX_REACTION_KEY_BYTES`] at a
+/// character boundary. An empty key is refused.
+pub(crate) fn normalize_reaction_key(key: &str) -> Result<String, CoreError> {
+    let key = key.trim();
+    if key.is_empty() {
+        return Err(CoreError::NotAllowed);
+    }
+    let mut end = key.len().min(MAX_REACTION_KEY_BYTES);
+    while !key.is_char_boundary(end) {
+        end -= 1;
+    }
+    Ok(key[..end].to_owned())
+}
+
+/// The members matching a mention query: at most 8, those whose display name
+/// or ID localpart starts with the query before those that merely contain it
+/// in the display name or ID, each group sorted by name (the display name, or
+/// the user ID when there is none). Matching ignores case and a leading `@`.
+/// An empty or over-long query matches nobody.
+pub(crate) fn rank_members(query: &str, members: Vec<Member>) -> Vec<Member> {
+    let query = query.trim();
+    let query = query.strip_prefix('@').unwrap_or(query).to_lowercase();
+    if query.is_empty() || query.len() > MAX_MEMBER_QUERY_BYTES {
+        return Vec::new();
+    }
+    // (starts with, sort key, member)
+    let mut hits: Vec<(bool, String, Member)> = members
+        .into_iter()
+        .filter_map(|member| {
+            let name = member.display_name.as_deref().map(str::to_lowercase);
+            let id = member.user_id.as_str().to_lowercase();
+            let localpart = id.strip_prefix('@').unwrap_or(&id);
+            let starts = name.as_deref().is_some_and(|n| n.starts_with(&query))
+                || localpart.starts_with(&query);
+            let contains = starts
+                || name.as_deref().is_some_and(|n| n.contains(&query))
+                || id.contains(&query);
+            let key = name.unwrap_or_else(|| id.clone());
+            contains.then_some((starts, key, member))
+        })
+        .collect();
+    hits.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.user_id.as_str().cmp(b.2.user_id.as_str()))
+    });
+    hits.into_iter()
+        .take(MAX_MEMBER_RESULTS)
+        .map(|(_, _, member)| member)
         .collect()
 }
 
@@ -517,6 +580,94 @@ mod tests {
         assert!(reaction_groups(Vec::<Group<'_>>::new(), None).is_empty());
         let none = reaction_groups(vec![("a", vec![refs[0]])], None);
         assert!(!none[0].own);
+    }
+
+    #[test]
+    fn reaction_groups_drop_long_keys_and_cap_the_group_count() {
+        let user = uid("@u:localhost");
+        let long = "k".repeat(MAX_REACTION_KEY_BYTES + 1);
+        let exact = "e".repeat(MAX_REACTION_KEY_BYTES);
+        let mut groups: Vec<Group<'_>> = vec![(long.as_str(), vec![&*user])];
+        groups.push((exact.as_str(), vec![&*user]));
+        let out = reaction_groups(groups, None);
+        let keys: Vec<_> = out.iter().map(|g| g.key.as_str()).collect();
+        assert_eq!(keys, [exact.as_str()], "the over-long key is dropped");
+
+        let keys: Vec<String> = (0..MAX_REACTION_GROUPS + 10)
+            .map(|i| format!("k{i}"))
+            .collect();
+        let groups: Vec<Group<'_>> = keys.iter().map(|k| (k.as_str(), vec![&*user])).collect();
+        let out = reaction_groups(groups, None);
+        assert_eq!(out.len(), MAX_REACTION_GROUPS);
+        assert_eq!(out[0].key, "k0", "the first groups are kept");
+    }
+
+    #[test]
+    fn reaction_keys_are_trimmed_capped_and_never_empty() {
+        assert_eq!(normalize_reaction_key("  👍 \n").as_deref(), Ok("👍"));
+        assert_eq!(normalize_reaction_key(""), Err(CoreError::NotAllowed));
+        assert_eq!(normalize_reaction_key(" \t\n"), Err(CoreError::NotAllowed));
+        let exact = "a".repeat(64);
+        assert_eq!(normalize_reaction_key(&exact).as_deref(), Ok(&*exact));
+        let long = "a".repeat(100);
+        assert_eq!(normalize_reaction_key(&long).as_deref(), Ok(&long[..64]));
+        // The cap falls inside a 4-byte emoji: cut before it, never inside.
+        let emoji = format!("{}{}", "a".repeat(62), "👍");
+        let key = normalize_reaction_key(&emoji).unwrap();
+        assert_eq!(key, "a".repeat(62));
+        assert!(key.len() <= 64);
+    }
+
+    fn member(id: &str, name: Option<&str>) -> Member {
+        Member {
+            user_id: UserId::from(id),
+            display_name: name.map(str::to_owned),
+        }
+    }
+
+    fn ranked(query: &str, members: Vec<Member>) -> Vec<String> {
+        rank_members(query, members)
+            .into_iter()
+            .map(|m| m.user_id.as_str().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn rank_members_puts_prefix_matches_first_then_sorts_by_name() {
+        let members = vec![
+            member("@z:x", Some("Oscar")),
+            member("@carol:x", Some("Zed Carol")),
+            member("@b:x", Some("Cara")),
+            member("@a:x", Some("Carl")),
+            member("@dave:x", None),
+            member("@scar:x", Some("Scar")),
+        ];
+        // Prefix (display name or user ID localpart): Cara, Carl, Zed Carol
+        // (via @carol). Contains: Oscar, Scar.
+        assert_eq!(
+            ranked("CAR", members),
+            ["@b:x", "@a:x", "@carol:x", "@z:x", "@scar:x"]
+        );
+    }
+
+    #[test]
+    fn rank_members_matches_ids_ignores_a_leading_at_and_caps_at_eight() {
+        let members = vec![member("@dave:x", None), member("@alice:x", Some("Someone"))];
+        assert_eq!(ranked("dav", members.clone()), ["@dave:x"]);
+        assert_eq!(ranked("@dav", members.clone()), ["@dave:x"]);
+        assert_eq!(ranked("alic", members.clone()), ["@alice:x"]);
+        assert!(ranked("", members.clone()).is_empty());
+        assert!(ranked("   ", members.clone()).is_empty());
+        assert!(ranked("nobody", members).is_empty());
+        let many: Vec<Member> = (0..20)
+            .map(|i| member(&format!("@u{i:02}:x"), Some(&format!("User {i:02}"))))
+            .collect();
+        let out = ranked("user", many);
+        assert_eq!(out.len(), MAX_MEMBER_RESULTS);
+        assert_eq!(out[0], "@u00:x");
+        assert_eq!(out[7], "@u07:x");
+        let huge = "a".repeat(10_000);
+        assert!(ranked(&huge, vec![member("@a:x", None)]).is_empty());
     }
 
     #[test]

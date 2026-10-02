@@ -292,8 +292,9 @@ pub enum CoreEvent {
     Members {
         /// Room.
         room_id: RoomId,
-        /// The query this answers.
-        query: String,
+        /// The query this answers. A [`MessageText`], so that `Debug` does
+        /// not print what the user typed.
+        query: MessageText,
         /// Matching members.
         members: Vec<Member>,
     },
@@ -587,6 +588,21 @@ mod tests {
     }
 
     #[test]
+    fn members_event_debug_hides_the_query() {
+        let ev = CoreEvent::Members {
+            room_id: RoomId::from("!r:x"),
+            query: MessageText::from("secret-body-x"),
+            members: vec![Member {
+                user_id: UserId::from("@a:x"),
+                display_name: None,
+            }],
+        };
+        let dbg = format!("{ev:?}");
+        assert_clean(&dbg);
+        assert!(dbg.contains("@a:x") && dbg.contains("!r:x"), "{dbg}");
+    }
+
+    #[test]
     fn new_commands_debug_is_clean() {
         let cmds = [
             Command::Send(outgoing()),
@@ -664,7 +680,7 @@ mod tests {
         };
         let _ = CoreEvent::Members {
             room_id: r.clone(),
-            query: String::new(),
+            query: MessageText::from(""),
             members: vec![Member {
                 user_id: UserId::from("@a:x"),
                 display_name: None,
