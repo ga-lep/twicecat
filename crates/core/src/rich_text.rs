@@ -27,8 +27,12 @@ const MAX_LIST_ITEMS: usize = 1_000;
 const MAX_BLOCKS: usize = 1_000;
 /// Longest link target kept, before and after normalization.
 const MAX_URL_BYTES: usize = 2_048;
-/// Open elements in the markup above which it is not parsed at all.
-const MAX_SCAN_DEPTH: usize = 256;
+/// Start-tag candidates in the markup above which it is not parsed at all.
+/// This bounds the parsed tree's depth, and dropping a deep tree recurses.
+const MAX_TAGS: usize = 4_000;
+/// Bytes a token may exceed `MAX_URL_BYTES` by (leading and trailing
+/// punctuation) and still be tried as a link; longer tokens never are.
+const MAX_TOKEN_MARGIN: usize = 64;
 /// The only `format` that is parsed.
 const HTML_FORMAT: &str = "org.matrix.custom.html";
 
@@ -109,7 +113,7 @@ fn raw_html(raw: &Value) -> Option<String> {
 /// Maps an HTML fragment to rich text. A fragment that maps to no visible
 /// text gives the linkified plain `body` instead.
 pub(crate) fn from_html(html: &str, body: &str) -> RichText {
-    if nesting_exceeds(html, MAX_SCAN_DEPTH) {
+    if too_many_tags(html, MAX_TAGS) {
         return from_plain(body);
     }
     let dom = Html::parse(html);
@@ -145,36 +149,18 @@ pub(crate) fn from_plain(body: &str) -> RichText {
     builder.finish()
 }
 
-/// Whether `html` opens more than `limit` elements at once, judged from the
-/// markup alone (a pre-parse guard: dropping a very deep parsed tree
-/// overflows the stack). It over-counts elements the parser closes
-/// implicitly, which is the safe side.
-fn nesting_exceeds(html: &str, limit: usize) -> bool {
-    const VOID: &[&str] = &[
-        "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param",
-        "source", "track", "wbr",
-    ];
-    let mut depth = 0usize;
-    let mut rest = html;
-    while let Some(at) = rest.find('<') {
-        rest = &rest[at + 1..];
-        if let Some(after) = rest.strip_prefix('/') {
-            depth = depth.saturating_sub(1);
-            rest = after;
-        } else if rest.starts_with(|c: char| c.is_ascii_alphabetic()) {
-            let end = rest
-                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
-                .unwrap_or(rest.len());
-            if !VOID.iter().any(|v| rest[..end].eq_ignore_ascii_case(v)) {
-                depth += 1;
-                if depth > limit {
-                    return true;
-                }
-            }
-            rest = &rest[end..];
-        }
-    }
-    false
+/// Whether `html` has more than `limit` start-tag candidates (`<` followed by
+/// an ASCII letter). The parsed tree is never deeper than the number of
+/// elements it contains, and an element needs such a candidate, so this bounds
+/// the depth without mirroring the tokenizer (which ignores `</>`, turns
+/// `</ x>` into comments, and so on). It over-counts closed elements, void
+/// elements and comments, which is the safe side.
+fn too_many_tags(html: &str, limit: usize) -> bool {
+    html.as_bytes()
+        .windows(2)
+        .filter(|w| w[0] == b'<' && w[1].is_ascii_alphabetic())
+        .nth(limit)
+        .is_some()
 }
 
 fn has_text(blocks: &[Block]) -> bool {
@@ -201,7 +187,7 @@ fn normalize_url(href: &str) -> Option<String> {
     if href.len() > MAX_URL_BYTES {
         return None;
     }
-    let url = Url::parse(href).ok()?;
+    let mut url = Url::parse(href).ok()?;
     if !matches!(url.scheme(), "http" | "https" | "mailto") {
         return None;
     }
@@ -211,8 +197,30 @@ fn normalize_url(href: &str) -> Option<String> {
     if url.scheme() != "mailto" && url.host_str().is_none_or(str::is_empty) {
         return None;
     }
+    if url.scheme() == "mailto" {
+        url = keep_safe_mailto_query(url);
+    }
     let normalized = String::from(url);
     (normalized.len() <= MAX_URL_BYTES).then_some(normalized)
+}
+
+/// Drops every `mailto:` query parameter but `subject`, `body`, `cc` and
+/// `bcc` (mail clients honour others, such as `attach`, to read local files).
+fn keep_safe_mailto_query(mut url: Url) -> Url {
+    let kept: Vec<(String, String)> = url
+        .query_pairs()
+        .filter(|(k, _)| {
+            ["subject", "body", "cc", "bcc"]
+                .iter()
+                .any(|safe| k.eq_ignore_ascii_case(safe))
+        })
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    url.set_query(None);
+    if !kept.is_empty() {
+        url.query_pairs_mut().extend_pairs(kept);
+    }
+    url
 }
 
 /// The mention a `matrix.to` or `matrix:` link stands for.
@@ -274,6 +282,9 @@ fn linkify(text: &str) -> Vec<Piece<'_>> {
 /// The URL inside one whitespace-free token: the length of the leading
 /// characters before it, its text, and its normalized form.
 fn url_in_token(token: &str) -> Option<(usize, &str, String)> {
+    if token.len() > MAX_URL_BYTES + MAX_TOKEN_MARGIN {
+        return None;
+    }
     let lead = token.len() - token.trim_start_matches(['(', '<', '\'', '"']).len();
     let rest = &token[lead..];
     let has_scheme = |scheme: &str| {
@@ -284,12 +295,15 @@ fn url_in_token(token: &str) -> Option<(usize, &str, String)> {
         return None;
     }
     let mut end = rest.len();
+    // Counted once and updated while stripping, so the loop is linear.
+    let opens = rest.matches('(').count();
+    let mut closes = rest.matches(')').count();
     while let Some(c) = rest[..end].chars().next_back() {
         let strip = match c {
             '.' | ',' | ';' | ':' | '!' | '?' | '\'' | '"' | '>' => true,
-            ')' => {
-                let kept = &rest[..end];
-                kept.matches(')').count() > kept.matches('(').count()
+            ')' if closes > opens => {
+                closes -= 1;
+                true
             }
             _ => false,
         };
@@ -1345,7 +1359,7 @@ mod tests {
     fn paragraphs_are_capped() {
         let body = "line\n".repeat(5000);
         assert_eq!(from_plain(&body).blocks.len(), 1000);
-        let html = "<p>x</p>".repeat(5000);
+        let html = "<p>x</p>".repeat(3500);
         assert_eq!(from_html(&html, "x").blocks.len(), 1000);
     }
 
@@ -1375,13 +1389,77 @@ mod tests {
             let deep = format!("{}x", open.repeat(20_000));
             assert_eq!(from_html(&deep, "fallback"), want);
         }
-        let deep = format!("{}x{}", "<div>".repeat(300), "</div>".repeat(300));
-        assert_eq!(from_html(&deep, "fallback"), want);
         // Closed elements, void elements and comments do not count.
-        let flat = format!("{}ok", "<b>a</b><br><!-- <i> -->".repeat(2_000));
+        let flat = format!("{}ok", "<b>a</b><br><!-- <i> -->".repeat(1_000));
         assert!(has_text(&from_html(&flat, "fallback").blocks));
         let ok = format!("{}ok{}", "<div>".repeat(200), "</div>".repeat(200));
         assert_ne!(from_html(&ok, "fallback"), want);
+    }
+
+    #[test]
+    fn linkify_trailing_parentheses_is_linear() {
+        let start = std::time::Instant::now();
+        let token = format!("http://a{}", ")".repeat(65_000));
+        let rt = from_plain(&token);
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        assert!(all_text(&rt).starts_with("http://a"));
+        // An over-long token is never a link.
+        let long = format!("https://example.org/{}", "a".repeat(3_000));
+        assert_rt(&from_plain(&long), &[p(vec![t(&long)])]);
+        // Balanced and unbalanced parentheses still behave.
+        assert_rt(
+            &from_plain("https://e.org/(a))"),
+            &[p(vec![
+                link("https://e.org/(a)", "https://e.org/(a)"),
+                t(")"),
+            ])],
+        );
+    }
+
+    #[test]
+    fn nesting_guard_cannot_be_bypassed() {
+        let want = from_plain("fallback");
+        let cases = [
+            "<b></>".repeat(10_900),
+            "<b></ x>".repeat(10_900),
+            "<b><!--</-->".repeat(10_900),
+            "<b></>".repeat(20_000),
+        ];
+        for html in &cases {
+            assert_eq!(from_html(html, "fallback"), want);
+        }
+        let deep = format!("{}x{}", "<div>".repeat(5_000), "</div>".repeat(5_000));
+        assert_eq!(from_html(&deep, "fallback"), want);
+        // The deepest tree that is still parsed drops without overflowing.
+        for open in ["<div>", "<b>", "<blockquote>", "<ul><li>"] {
+            let max = format!("{}x", open.repeat(MAX_TAGS / open.matches('<').count()));
+            assert!(has_text(&from_html(&max, "fallback").blocks));
+        }
+        // Normal messages are untouched.
+        let ok = format!("{}ok{}", "<div>".repeat(30), "</div>".repeat(30));
+        assert_ne!(from_html(&ok, "fallback"), want);
+    }
+
+    #[test]
+    fn mailto_keeps_only_safe_query_parameters() {
+        let rt = anchor(
+            "mailto:a@example.org?subject=Hi&attach=/home/u/.ssh/id_rsa&body=x&bcc=b@example.org",
+            "m",
+        );
+        assert_rt(
+            &rt,
+            &[p(vec![link(
+                "m",
+                "mailto:a@example.org?subject=Hi&body=x&bcc=b%40example.org",
+            )])],
+        );
+        let rt = anchor("mailto:a@example.org?attach=/etc/passwd", "m");
+        assert_rt(&rt, &[p(vec![link("m", "mailto:a@example.org")])]);
+        let rt = anchor("mailto:a@example.org?SUBJECT=Hi", "m");
+        assert_rt(
+            &rt,
+            &[p(vec![link("m", "mailto:a@example.org?SUBJECT=Hi")])],
+        );
     }
 
     // ---- plain bodies and linkify -------------------------------------
