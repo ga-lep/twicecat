@@ -27,10 +27,7 @@ pub(crate) fn parse_room_id(id: &RoomId) -> Result<OwnedRoomId, CoreError> {
 /// Maps one SDK timeline item. Only text messages carry content.
 pub(crate) fn map_item(item: &SdkItem) -> TimelineItem {
     let kind = item.as_event().map_or(TimelineItemKind::Other, map_event);
-    TimelineItem {
-        id: item.unique_id().0.clone(),
-        kind,
-    }
+    TimelineItem::new(item.unique_id().0.clone(), kind)
 }
 
 fn map_event(event: &EventTimelineItem) -> TimelineItemKind {
@@ -51,6 +48,7 @@ fn map_event(event: &EventTimelineItem) -> TimelineItemKind {
         is_own: event.is_own(),
         timestamp_ms: u64::from(event.timestamp().get()),
         sent,
+        details: Box::default(),
     }
 }
 

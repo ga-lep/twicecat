@@ -26,7 +26,7 @@ pub fn last_messages(items: &[TimelineItem]) -> Vec<(&UserId, &str)> {
         .rev()
         .filter_map(|item| match &item.kind {
             TimelineItemKind::Message { sender, body, .. } => Some((sender, body.as_str())),
-            TimelineItemKind::Other => None,
+            _ => None,
         })
         .take(MAX_MESSAGES)
         .collect();
@@ -150,23 +150,21 @@ mod tests {
     use super::*;
 
     fn message(n: usize) -> TimelineItem {
-        TimelineItem {
-            id: format!("i{n}"),
-            kind: TimelineItemKind::Message {
+        TimelineItem::new(
+            format!("i{n}"),
+            TimelineItemKind::Message {
                 sender: UserId::from("@a:x"),
                 body: format!("m{n}"),
                 is_own: false,
                 timestamp_ms: n as u64,
                 sent: SendStatus::Sent,
+                details: Box::default(),
             },
-        }
+        )
     }
 
     fn other(n: usize) -> TimelineItem {
-        TimelineItem {
-            id: format!("o{n}"),
-            kind: TimelineItemKind::Other,
-        }
+        TimelineItem::new(format!("o{n}"), TimelineItemKind::Other)
     }
 
     #[test]
@@ -190,16 +188,17 @@ mod tests {
     }
 
     fn message_from(sender: &str, body: &str) -> TimelineItem {
-        TimelineItem {
-            id: "i".into(),
-            kind: TimelineItemKind::Message {
+        TimelineItem::new(
+            "i".into(),
+            TimelineItemKind::Message {
                 sender: UserId::from(sender),
                 body: body.into(),
                 is_own: false,
                 timestamp_ms: 0,
                 sent: SendStatus::Sent,
+                details: Box::default(),
             },
-        }
+        )
     }
 
     #[test]

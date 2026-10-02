@@ -88,7 +88,8 @@ pub fn events_subscription(slot: EventsSlot) -> Subscription<Message> {
 #[derive(Debug)]
 pub struct Pending {
     commands: mpsc::Sender<Command>,
-    command: Command,
+    // Boxed: `Command` is large, and this is the `Err` of `try_send`.
+    command: Box<Command>,
 }
 
 impl Pending {
@@ -96,7 +97,7 @@ impl Pending {
     /// channel send, not network work.
     pub async fn deliver(self) {
         // An error means the core is gone; there is nobody to tell.
-        let _ = self.commands.send(self.command).await;
+        let _ = self.commands.send(*self.command).await;
     }
 
     /// The same, as an Iced task that produces no message.
@@ -112,7 +113,7 @@ pub fn try_send(commands: &mpsc::Sender<Command>, command: Command) -> Result<()
         Ok(()) | Err(TrySendError::Closed(_)) => Ok(()),
         Err(TrySendError::Full(command)) => Err(Pending {
             commands: commands.clone(),
-            command,
+            command: Box::new(command),
         }),
     }
 }

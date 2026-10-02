@@ -12,7 +12,7 @@
 
 ## Phase 3 steps
 - [x] 1. Phase 3 dependencies, advisory triage, ledger (phase3.1)
-- [ ] 2. Additive core API for Phase 3 (phase3.2)
+- [x] 2. Additive core API for Phase 3 (phase3.2)
 - [ ] 3. Timeline item view models in the core (roadmap steps 1, 7, 8, 9, core side)
 - [ ] 4. HTML to rich text mapper in the core (roadmap step 4, core side)
 - [ ] 5. Sending: markdown, mentions, replies, local echo retry and discard (roadmap steps 6, 7, 9, core side)
@@ -30,6 +30,16 @@
 - `cargo tree -p tessera-app --depth 1 -e normal` lists emojis v0.9.0 and chrono v0.4.45; `cargo tree -p tessera-app -e features -i iced` shows `advanced` only under `[dev-dependencies]`.
 - Checks: the full gate (fmt, clippy, test, check-app-deps.sh, check-core-api.sh, cargo deny check) passes; no integration run (no core or bridge code touched).
 - Open issues: none. No new APIs used.
+
+## Phase 3 / Task 2 notes
+- Added the Q7 API (types, commands, events, `CoreError::ItemNotFound` and `NotAllowed`) to `api/types.rs` and `api/mod.rs`; `TimelineItem::new` and `MessageDetails::default()` carry the old struct literals (core mapping, app and core tests). Mapping in `timeline.rs` still yields only `Message` (with `details: Box::default()`) and `Other`; the real mapping is Task 3.
+- Redacted `Debug` (sentinel-tested): `Inline`, `Block`, `RichText` (counts only), `ReplyPreview`, `ReactionGroup`, `MentionRef`, `OutgoingMessage`, and a manual `Command` impl (hides reaction keys and search queries; `Redact` reason and message text are already redacted newtypes). `MessageDetails` derives `Debug` because every field that holds content has a redacted `Debug`.
+- Engine: every new command is accepted. Pure helpers `command_action`, `action_error` and `unfinished_action_event` pick the answer; `NotLoggedIn` without a session, `NoRoomSelected` without a matching selected room, else `ActionFailed(Internal("not implemented yet"))`. `SearchMembers` with a matching room answers `Members { members: [] }`; without session or room it answers `ActionFailed` like the others (the plan sentence is ambiguous on this). The matching-room case is unit-tested on the pure helper, not through `Engine::handle`, because a `Selected` needs an SDK `Timeline` and the SDK offers no offline way to create a room without its `testing` feature; no-session and no-selection are tested through `handle`.
+- Files outside the plan's list that had to change to compile: `crates/app/src/state.rs` (ignores the four new events for now) and `crates/app/src/bridge.rs` (`Pending` boxes its `Command`, because `Command` grew and clippy `result_large_err` fired on `try_send`).
+- `CoreEvent::Members` shows its `query` in `Debug` (a fragment of composer text); `Command::SearchMembers` hides it. Revisit in Task 6 if the event should hide it too.
+- Checks: fmt, clippy (`--all-targets --all-features --locked -D warnings`), `cargo test --workspace --locked` (146 core lib, 177 app lib), `check-app-deps.sh`, `check-core-api.sh` and `cargo deny check` pass. Ignored run against the local Synapse (`--ignored --skip keyring`): all pass in about 55 s total, then `docker compose stop`.
+- APIs used: none from matrix-sdk, ruma or iced beyond what Phase 2 already used (the new code is plain Rust types and engine glue).
+- Open issues: none. No new human items.
 
 ## Phase 3 human checkpoint
 - [ ] CI green on Linux, Windows and macOS with the new dependencies (matrix-sdk `markdown`, emojis, chrono, dev-only iced `advanced`).

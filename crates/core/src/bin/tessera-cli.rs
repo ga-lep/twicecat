@@ -638,7 +638,12 @@ impl Cli {
                 }
             }
             // Room list paging and avatars are for the graphical app.
-            CoreEvent::RoomListLoaded { .. } | CoreEvent::Avatar { .. } => {}
+            CoreEvent::RoomListLoaded { .. }
+            | CoreEvent::Avatar { .. }
+            | CoreEvent::Pagination { .. }
+            | CoreEvent::Typing { .. }
+            | CoreEvent::Members { .. }
+            | CoreEvent::ActionFailed { .. } => {}
             CoreEvent::TimelineDiff { room_id, diffs } => self.on_timeline(&room_id, &diffs),
             CoreEvent::SendFailed { room_id, error } => {
                 println!("Send failed in {}: {error}", sanitize(room_id.as_str()));

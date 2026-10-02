@@ -340,16 +340,17 @@ mod tests {
     }
 
     fn item(id: &str, body: &str) -> TimelineItem {
-        TimelineItem {
-            id: id.to_owned(),
-            kind: TimelineItemKind::Message {
+        TimelineItem::new(
+            id.to_owned(),
+            TimelineItemKind::Message {
                 sender: UserId::from("@a:x"),
                 body: body.to_owned(),
                 is_own: false,
                 timestamp_ms: 1,
                 sent: SendStatus::Sent,
+                details: Box::default(),
             },
-        }
+        )
     }
 
     fn timeline_event(room: &str, diffs: Vec<ListDiff<TimelineItem>>) -> Message {

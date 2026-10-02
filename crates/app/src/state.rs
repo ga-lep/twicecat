@@ -464,6 +464,11 @@ impl App {
             }
             CoreEvent::Error(error) => task = self.on_core_error(&error),
             CoreEvent::Avatar { id, image } => self.avatars.answer(&id, image),
+            // Shown by the Phase 3 timeline and composer; ignored until then.
+            CoreEvent::Pagination { .. }
+            | CoreEvent::Typing { .. }
+            | CoreEvent::Members { .. }
+            | CoreEvent::ActionFailed { .. } => {}
         }
         task
     }

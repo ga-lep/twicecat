@@ -17,7 +17,7 @@ use tracing::{info, warn};
 use zeroize::Zeroizing;
 
 use crate::api::{
-    Command, CoreError, CoreEvent, DeviceId, ListDiff, MessageText, Password, RoomId,
+    ActionKind, Command, CoreError, CoreEvent, DeviceId, ListDiff, MessageText, Password, RoomId,
     RoomListQuery, UserId,
 };
 use crate::avatars::{Avatars, SdkFetcher, answer_unavailable};
@@ -387,6 +387,61 @@ async fn next_change(active: &mut Option<Active>) -> Change {
     }
 }
 
+/// The room and action kind of a Phase 3 action command; `None` for any
+/// other command.
+fn command_action(cmd: &Command) -> Option<(RoomId, ActionKind)> {
+    let (room_id, kind) = match cmd {
+        Command::Send(m) => (&m.room_id, ActionKind::Send),
+        Command::Edit { message, .. } => (&message.room_id, ActionKind::Edit),
+        Command::Redact { room_id, .. } => (room_id, ActionKind::Redact),
+        Command::ToggleReaction { room_id, .. } => (room_id, ActionKind::React),
+        Command::RetrySend { room_id, .. } => (room_id, ActionKind::Retry),
+        Command::DiscardSend { room_id, .. } => (room_id, ActionKind::Discard),
+        Command::PaginateBackwards { room_id } => (room_id, ActionKind::Paginate),
+        Command::MarkRead { room_id, .. } => (room_id, ActionKind::Receipt),
+        Command::SetTyping { room_id, .. } => (room_id, ActionKind::Typing),
+        Command::SearchMembers { room_id, .. } => (room_id, ActionKind::Members),
+        _ => return None,
+    };
+    Some((room_id.clone(), kind))
+}
+
+/// Why an action on `room` cannot run: no session, the room is not the
+/// selected one, or (for now) the handler does not exist yet.
+fn action_error(logged_in: bool, selected: Option<&RoomId>, room: &RoomId) -> CoreError {
+    if !logged_in {
+        CoreError::NotLoggedIn
+    } else if selected != Some(room) {
+        CoreError::NoRoomSelected
+    } else {
+        CoreError::Internal("not implemented yet".into())
+    }
+}
+
+/// The answer to an action command whose handler does not exist yet; `None`
+/// for a command that is not an action. A member search with a matching room
+/// finds nobody.
+fn unfinished_action_event(
+    logged_in: bool,
+    selected: Option<&RoomId>,
+    cmd: &Command,
+) -> Option<CoreEvent> {
+    let (room_id, action) = command_action(cmd)?;
+    let error = action_error(logged_in, selected, &room_id);
+    if let (Command::SearchMembers { query, .. }, CoreError::Internal(_)) = (cmd, &error) {
+        return Some(CoreEvent::Members {
+            room_id,
+            query: query.clone(),
+            members: Vec::new(),
+        });
+    }
+    Some(CoreEvent::ActionFailed {
+        room_id,
+        action,
+        error,
+    })
+}
+
 impl Engine {
     async fn run(mut self, mut commands: mpsc::Receiver<Command>) {
         let mut watch_changes = true;
@@ -487,6 +542,28 @@ impl Engine {
                 // No session to fetch with: every ID is unavailable.
                 None => answer_unavailable(ids, &self.events).await,
             },
+            // The real handlers land in later tasks; until then each answers
+            // without touching the network.
+            Command::Send(_)
+            | Command::Edit { .. }
+            | Command::Redact { .. }
+            | Command::ToggleReaction { .. }
+            | Command::RetrySend { .. }
+            | Command::DiscardSend { .. }
+            | Command::PaginateBackwards { .. }
+            | Command::MarkRead { .. }
+            | Command::SetTyping { .. }
+            | Command::SearchMembers { .. } => {
+                let selected = self
+                    .active
+                    .as_ref()
+                    .and_then(|a| a.selected.as_ref())
+                    .map(|s| &s.room_id);
+                if let Some(event) = unfinished_action_event(self.active.is_some(), selected, &cmd)
+                {
+                    self.emit(event).await;
+                }
+            }
             // Handled in `run`.
             Command::Shutdown => {}
         }
@@ -1117,6 +1194,13 @@ mod tests {
     }
 
     fn record_bytes(user: &str, homeserver: &str, session_id: &str) -> Vec<u8> {
+        record(user, homeserver, session_id)
+            .to_bytes()
+            .unwrap()
+            .to_vec()
+    }
+
+    fn record(user: &str, homeserver: &str, session_id: &str) -> SessionRecord {
         use matrix_sdk::authentication::matrix::MatrixSession;
         use matrix_sdk::ruma::{OwnedUserId, owned_device_id};
         use matrix_sdk::{SessionMeta, SessionTokens};
@@ -1138,9 +1222,6 @@ mod tests {
                 },
             }),
         }
-        .to_bytes()
-        .unwrap()
-        .to_vec()
     }
 
     fn u(s: &str) -> url::Url {
@@ -1308,5 +1389,213 @@ mod tests {
             }
         }
         assert!(rx.try_recv().is_err());
+    }
+
+    use crate::api::{MessageKind, OutgoingMessage};
+
+    fn rid(n: &str) -> RoomId {
+        RoomId::from(format!("!{n}:x"))
+    }
+
+    /// One of every new command, each naming `room`, with its action kind.
+    fn action_commands(room: &RoomId) -> Vec<(Command, ActionKind)> {
+        let message = OutgoingMessage {
+            room_id: room.clone(),
+            text: MessageText::from("hi"),
+            mentions: Vec::new(),
+            reply_to: None,
+            kind: MessageKind::Text,
+        };
+        let item_id = || "i".to_owned();
+        vec![
+            (Command::Send(message.clone()), ActionKind::Send),
+            (
+                Command::Edit {
+                    item_id: item_id(),
+                    message,
+                },
+                ActionKind::Edit,
+            ),
+            (
+                Command::Redact {
+                    room_id: room.clone(),
+                    item_id: item_id(),
+                    reason: None,
+                },
+                ActionKind::Redact,
+            ),
+            (
+                Command::ToggleReaction {
+                    room_id: room.clone(),
+                    item_id: item_id(),
+                    key: "k".into(),
+                },
+                ActionKind::React,
+            ),
+            (
+                Command::RetrySend {
+                    room_id: room.clone(),
+                    item_id: item_id(),
+                },
+                ActionKind::Retry,
+            ),
+            (
+                Command::DiscardSend {
+                    room_id: room.clone(),
+                    item_id: item_id(),
+                },
+                ActionKind::Discard,
+            ),
+            (
+                Command::PaginateBackwards {
+                    room_id: room.clone(),
+                },
+                ActionKind::Paginate,
+            ),
+            (
+                Command::MarkRead {
+                    room_id: room.clone(),
+                    fully_read: false,
+                },
+                ActionKind::Receipt,
+            ),
+            (
+                Command::SetTyping {
+                    room_id: room.clone(),
+                    typing: true,
+                },
+                ActionKind::Typing,
+            ),
+            (
+                Command::SearchMembers {
+                    room_id: room.clone(),
+                    query: "a".into(),
+                },
+                ActionKind::Members,
+            ),
+        ]
+    }
+
+    #[test]
+    fn every_new_command_names_its_room_and_action() {
+        let room = rid("a");
+        for (cmd, kind) in action_commands(&room) {
+            assert_eq!(command_action(&cmd), Some((room.clone(), kind)), "{cmd:?}");
+        }
+        assert_eq!(command_action(&Command::LoadMoreRooms), None);
+        assert_eq!(command_action(&Command::Logout), None);
+    }
+
+    #[test]
+    fn unfinished_action_errors_follow_session_and_selection() {
+        let a = rid("a");
+        let b = rid("b");
+        assert_eq!(
+            action_error(false, Some(&a), &a),
+            CoreError::NotLoggedIn,
+            "no session wins"
+        );
+        assert_eq!(action_error(true, None, &a), CoreError::NoRoomSelected);
+        assert_eq!(action_error(true, Some(&b), &a), CoreError::NoRoomSelected);
+        assert_eq!(
+            action_error(true, Some(&a), &a),
+            CoreError::Internal("not implemented yet".into())
+        );
+    }
+
+    #[test]
+    fn unfinished_actions_with_a_matching_room_answer_not_implemented() {
+        let room = rid("a");
+        for (cmd, kind) in action_commands(&room) {
+            let ev = unfinished_action_event(true, Some(&room), &cmd);
+            match (kind, ev) {
+                (
+                    ActionKind::Members,
+                    Some(CoreEvent::Members {
+                        room_id,
+                        query,
+                        members,
+                    }),
+                ) => {
+                    assert_eq!(room_id, room);
+                    assert_eq!(query, "a");
+                    assert!(members.is_empty());
+                }
+                (
+                    kind,
+                    Some(CoreEvent::ActionFailed {
+                        room_id,
+                        action,
+                        error,
+                    }),
+                ) => {
+                    assert_eq!(room_id, room);
+                    assert_eq!(action, kind);
+                    assert_eq!(error, CoreError::Internal("not implemented yet".into()));
+                }
+                (kind, other) => panic!("{kind:?}: {other:?}"),
+            }
+        }
+        assert!(unfinished_action_event(true, Some(&room), &Command::Logout).is_none());
+    }
+
+    async fn drain(rx: &mut mpsc::Receiver<CoreEvent>) -> Vec<CoreEvent> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn new_commands_without_a_session_fail_with_not_logged_in() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut engine, mut rx) = oauth_engine(tmp.path());
+        let room = rid("a");
+        for (cmd, kind) in action_commands(&room) {
+            engine.handle(cmd).await;
+            let got = drain(&mut rx).await;
+            assert!(
+                matches!(
+                    got.as_slice(),
+                    [CoreEvent::ActionFailed { room_id, action, error: CoreError::NotLoggedIn }]
+                        if *room_id == room && *action == kind
+                ),
+                "{kind:?}: {got:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn new_commands_without_a_selected_room_fail_with_no_room_selected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut engine, mut rx) = oauth_engine(tmp.path());
+        let client = Client::builder()
+            .homeserver_url("http://127.0.0.1:1")
+            .build()
+            .await
+            .unwrap();
+        engine.active = Some(Active {
+            fetcher: Arc::new(SdkFetcher(client.clone())),
+            client,
+            record: record("@alice:x", "http://127.0.0.1:1", "s1"),
+            changes: broadcast::channel(1).1,
+            sync: None,
+            selected: None,
+            avatars: Avatars::new(),
+        });
+        let room = rid("a");
+        for (cmd, kind) in action_commands(&room) {
+            engine.handle(cmd).await;
+            let got = drain(&mut rx).await;
+            assert!(
+                matches!(
+                    got.as_slice(),
+                    [CoreEvent::ActionFailed { room_id, action, error: CoreError::NoRoomSelected }]
+                        if *room_id == room && *action == kind
+                ),
+                "{kind:?}: {got:?}"
+            );
+        }
     }
 }

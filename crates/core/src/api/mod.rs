@@ -3,18 +3,25 @@
 //! Everything here is SDK-free: no type of the Matrix SDK or its helper crates
 //! appears in it (enforced by `scripts/check-core-api.sh`).
 
+use std::fmt;
+
 mod diff;
 mod types;
 
 pub use diff::ListDiff;
 pub use types::{
-    AuthUrl, AvatarId, AvatarImage, CoreError, DeviceId, MessagePreview, MessageText, Password,
-    RoomId, RoomListQuery, RoomListTab, RoomSummary, SendStatus, SyncState, TimelineItem,
-    TimelineItemKind, UserId,
+    ActionKind, AuthUrl, AvatarId, AvatarImage, Block, CoreError, DeviceId, Inline, ItemActions,
+    Member, MentionRef, MentionTarget, MessageDetails, MessageKind, MessagePreview, MessageText,
+    OutgoingMessage, PaginationState, Password, PlaceholderKind, ReactionGroup, ReplyPreview,
+    ReplyState, RichText, RoomId, RoomListQuery, RoomListTab, RoomSummary, SendFailure, SendStatus,
+    StateChange, SyncState, TextStyle, TimelineItem, TimelineItemKind, TypingUser, UserId,
 };
 
 /// A request from the front end to the engine.
-#[derive(Clone, Debug)]
+///
+/// `Debug` hides message text, reaction keys, redaction reasons and search
+/// queries.
+#[derive(Clone)]
 pub enum Command {
     /// Restore the last session from the secret store.
     RestoreSession,
@@ -48,10 +55,171 @@ pub enum Command {
     /// Request avatar thumbnails; each ID is answered by one
     /// [`CoreEvent::Avatar`].
     FetchAvatars(Vec<AvatarId>),
+    /// Send a message (markdown, mentions, reply) to the selected room.
+    Send(OutgoingMessage),
+    /// Replace the content of one of the user's own messages.
+    Edit {
+        /// `TimelineItem::id` of the message.
+        item_id: String,
+        /// The new content; its `room_id` names the room.
+        message: OutgoingMessage,
+    },
+    /// Redact a message.
+    Redact {
+        /// Room.
+        room_id: RoomId,
+        /// `TimelineItem::id` of the message.
+        item_id: String,
+        /// Why, when given.
+        reason: Option<MessageText>,
+    },
+    /// Add the user's reaction to a message, or remove it if present.
+    ToggleReaction {
+        /// Room.
+        room_id: RoomId,
+        /// `TimelineItem::id` of the message.
+        item_id: String,
+        /// The reaction, usually an emoji.
+        key: String,
+    },
+    /// Send a failed local echo again.
+    RetrySend {
+        /// Room.
+        room_id: RoomId,
+        /// `TimelineItem::id` of the local echo.
+        item_id: String,
+    },
+    /// Drop a failed local echo.
+    DiscardSend {
+        /// Room.
+        room_id: RoomId,
+        /// `TimelineItem::id` of the local echo.
+        item_id: String,
+    },
+    /// Load older events into the selected room's timeline.
+    PaginateBackwards {
+        /// Room.
+        room_id: RoomId,
+    },
+    /// Send a read receipt for the newest event.
+    MarkRead {
+        /// Room.
+        room_id: RoomId,
+        /// Also move the read marker.
+        fully_read: bool,
+    },
+    /// Tell the room whether the user is typing.
+    SetTyping {
+        /// Room.
+        room_id: RoomId,
+        /// Typing now.
+        typing: bool,
+    },
+    /// Look up room members whose name or ID matches `query`.
+    SearchMembers {
+        /// Room.
+        room_id: RoomId,
+        /// Text to match.
+        query: String,
+    },
     /// Log out and delete the local session.
     Logout,
     /// Stop the engine.
     Shutdown,
+}
+
+// Manual impl: message text, reaction keys, reasons and queries are user
+// content and must not reach logs.
+impl fmt::Debug for Command {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RestoreSession => f.write_str("RestoreSession"),
+            Self::LoginPassword {
+                username,
+                password,
+                server,
+            } => f
+                .debug_struct("LoginPassword")
+                .field("username", username)
+                .field("password", password)
+                .field("server", server)
+                .finish(),
+            Self::LoginOAuth { server } => f
+                .debug_struct("LoginOAuth")
+                .field("server", server)
+                .finish(),
+            Self::CancelOAuth => f.write_str("CancelOAuth"),
+            Self::SelectRoom(room) => f.debug_tuple("SelectRoom").field(room).finish(),
+            Self::SendMessage { text } => {
+                f.debug_struct("SendMessage").field("text", text).finish()
+            }
+            Self::SetRoomListQuery(query) => {
+                f.debug_tuple("SetRoomListQuery").field(query).finish()
+            }
+            Self::LoadMoreRooms => f.write_str("LoadMoreRooms"),
+            Self::FetchAvatars(ids) => f.debug_tuple("FetchAvatars").field(ids).finish(),
+            Self::Send(message) => f.debug_tuple("Send").field(message).finish(),
+            Self::Edit { item_id, message } => f
+                .debug_struct("Edit")
+                .field("item_id", item_id)
+                .field("message", message)
+                .finish(),
+            Self::Redact {
+                room_id,
+                item_id,
+                reason,
+            } => f
+                .debug_struct("Redact")
+                .field("room_id", room_id)
+                .field("item_id", item_id)
+                .field("reason", reason)
+                .finish(),
+            Self::ToggleReaction {
+                room_id,
+                item_id,
+                key,
+            } => f
+                .debug_struct("ToggleReaction")
+                .field("room_id", room_id)
+                .field("item_id", item_id)
+                .field("key", &format_args!("<redacted, {} bytes>", key.len()))
+                .finish(),
+            Self::RetrySend { room_id, item_id } => f
+                .debug_struct("RetrySend")
+                .field("room_id", room_id)
+                .field("item_id", item_id)
+                .finish(),
+            Self::DiscardSend { room_id, item_id } => f
+                .debug_struct("DiscardSend")
+                .field("room_id", room_id)
+                .field("item_id", item_id)
+                .finish(),
+            Self::PaginateBackwards { room_id } => f
+                .debug_struct("PaginateBackwards")
+                .field("room_id", room_id)
+                .finish(),
+            Self::MarkRead {
+                room_id,
+                fully_read,
+            } => f
+                .debug_struct("MarkRead")
+                .field("room_id", room_id)
+                .field("fully_read", fully_read)
+                .finish(),
+            Self::SetTyping { room_id, typing } => f
+                .debug_struct("SetTyping")
+                .field("room_id", room_id)
+                .field("typing", typing)
+                .finish(),
+            Self::SearchMembers { room_id, query } => f
+                .debug_struct("SearchMembers")
+                .field("room_id", room_id)
+                .field("query", &format_args!("<redacted, {} bytes>", query.len()))
+                .finish(),
+            Self::Logout => f.write_str("Logout"),
+            Self::Shutdown => f.write_str("Shutdown"),
+        }
+    }
 }
 
 /// A notification from the engine to the front end.
@@ -103,6 +271,38 @@ pub enum CoreEvent {
     SendFailed {
         /// Room.
         room_id: RoomId,
+        /// Why.
+        error: CoreError,
+    },
+    /// Back-pagination of a room changed state.
+    Pagination {
+        /// Room.
+        room_id: RoomId,
+        /// The new state.
+        state: PaginationState,
+    },
+    /// Who is typing in a room (other users only).
+    Typing {
+        /// Room.
+        room_id: RoomId,
+        /// The users, replacing the previous list.
+        users: Vec<TypingUser>,
+    },
+    /// Answer to [`Command::SearchMembers`].
+    Members {
+        /// Room.
+        room_id: RoomId,
+        /// The query this answers.
+        query: String,
+        /// Matching members.
+        members: Vec<Member>,
+    },
+    /// An action on a room or item failed.
+    ActionFailed {
+        /// Room.
+        room_id: RoomId,
+        /// Which action.
+        action: ActionKind,
         /// Why.
         error: CoreError,
     },
@@ -190,16 +390,17 @@ mod tests {
 
     #[test]
     fn message_item_debug_hides_body() {
-        let item = TimelineItem {
-            id: "i".into(),
-            kind: TimelineItemKind::Message {
+        let item = TimelineItem::new(
+            "i".into(),
+            TimelineItemKind::Message {
                 sender: UserId::from("@a:x"),
                 body: "secret-body-x".into(),
                 is_own: false,
                 timestamp_ms: 1,
                 sent: SendStatus::Sent,
+                details: Box::default(),
             },
-        };
+        );
         assert!(!format!("{item:?}").contains("secret-body-x"));
         let ev = CoreEvent::TimelineDiff {
             room_id: RoomId::from("!r:x"),
@@ -226,6 +427,260 @@ mod tests {
         assert!(!dbg.contains("secret-state-x"), "{dbg}");
         assert!(!dbg.contains("code_challenge"), "{dbg}");
         assert!(dbg.contains("auth.example.org"), "{dbg}");
+    }
+
+    #[test]
+    fn new_item_has_no_readers_and_default_details_are_empty() {
+        let item = TimelineItem::new("i".into(), TimelineItemKind::ReadMarker);
+        assert_eq!(item.id, "i");
+        assert!(item.read_by.is_empty());
+        let d = MessageDetails::default();
+        assert!(d.content.blocks.is_empty());
+        assert_eq!(d.kind, MessageKind::Text);
+        assert!(!d.sender_name_ambiguous && !d.edited && !d.highlighted);
+        assert!(d.sender_name.is_none() && d.reply_to.is_none() && d.send_failure.is_none());
+        assert!(d.reactions.is_empty());
+        assert_eq!(d.actions, ItemActions::default());
+        let a = d.actions;
+        assert!(!a.can_reply && !a.can_edit && !a.can_redact && !a.can_react && !a.can_copy);
+    }
+
+    const SENTINELS: [&str; 4] = [
+        "secret-body-x",
+        "secret-key-x",
+        "secret-url-x",
+        "secret-reason-x",
+    ];
+
+    fn assert_clean(dbg: &str) {
+        for s in SENTINELS {
+            assert!(!dbg.contains(s), "{s} leaked in {dbg}");
+        }
+    }
+
+    fn rich() -> RichText {
+        RichText {
+            blocks: vec![
+                Block::Paragraph(vec![
+                    Inline::Text {
+                        text: "secret-body-x".into(),
+                        style: TextStyle::default(),
+                    },
+                    Inline::Link {
+                        text: "secret-body-x".into(),
+                        url: "https://secret-url-x".into(),
+                        style: TextStyle::default(),
+                    },
+                    Inline::Mention {
+                        target: MentionTarget::User(UserId::from("@a:x")),
+                        label: "secret-body-x".into(),
+                    },
+                    Inline::Spoiler(vec![Inline::Text {
+                        text: "secret-body-x".into(),
+                        style: TextStyle::default(),
+                    }]),
+                ]),
+                Block::Code {
+                    text: "secret-body-x".into(),
+                },
+                Block::Quote(vec![Block::Heading {
+                    level: 1,
+                    inlines: vec![Inline::LineBreak],
+                }]),
+            ],
+        }
+    }
+
+    fn preview_reply() -> ReplyPreview {
+        ReplyPreview {
+            sender: UserId::from("@a:x"),
+            sender_name: Some("Ann".into()),
+            body: "secret-body-x".into(),
+            state: ReplyState::Ready,
+        }
+    }
+
+    fn reaction() -> ReactionGroup {
+        ReactionGroup {
+            key: "secret-key-x".into(),
+            count: 2,
+            own: true,
+            senders: vec![UserId::from("@a:x")],
+        }
+    }
+
+    fn outgoing() -> OutgoingMessage {
+        OutgoingMessage {
+            room_id: RoomId::from("!r:x"),
+            text: MessageText::from("secret-body-x"),
+            mentions: vec![MentionRef {
+                label: "secret-body-x".into(),
+                user_id: UserId::from("@a:x"),
+            }],
+            reply_to: Some("item-1".into()),
+            kind: MessageKind::Text,
+        }
+    }
+
+    fn rich_item() -> TimelineItem {
+        let details = MessageDetails {
+            content: rich(),
+            reply_to: Some(preview_reply()),
+            reactions: vec![reaction()],
+            ..MessageDetails::default()
+        };
+        TimelineItem::new(
+            "i".into(),
+            TimelineItemKind::Message {
+                sender: UserId::from("@a:x"),
+                body: "secret-body-x".into(),
+                is_own: false,
+                timestamp_ms: 7,
+                sent: SendStatus::Sent,
+                details: Box::new(details),
+            },
+        )
+    }
+
+    #[test]
+    fn rich_text_debug_shows_counts_only() {
+        let dbg = format!("{:?}", rich());
+        assert_clean(&dbg);
+        assert_eq!(dbg, "RichText(<4 blocks, 6 inlines>)");
+        for block in &rich().blocks {
+            assert_clean(&format!("{block:?}"));
+        }
+    }
+
+    #[test]
+    fn rich_message_item_debug_is_clean() {
+        let item = rich_item();
+        assert_clean(&format!("{item:?}"));
+        let ev = CoreEvent::TimelineDiff {
+            room_id: RoomId::from("!r:x"),
+            diffs: vec![
+                ListDiff::Reset {
+                    values: vec![item.clone()],
+                },
+                ListDiff::PushBack { value: item },
+            ],
+        };
+        assert_clean(&format!("{ev:?}"));
+    }
+
+    #[test]
+    fn reply_reaction_and_outgoing_debug_are_clean() {
+        let dbg = format!("{:?}", preview_reply());
+        assert_clean(&dbg);
+        assert!(dbg.contains("@a:x"), "{dbg}");
+        let dbg = format!("{:?}", reaction());
+        assert_clean(&dbg);
+        assert!(dbg.contains('2'), "{dbg}");
+        assert_clean(&format!("{:?}", outgoing()));
+        assert_clean(&format!(
+            "{:?}",
+            MentionRef {
+                label: "secret-body-x".into(),
+                user_id: UserId::from("@a:x")
+            }
+        ));
+    }
+
+    #[test]
+    fn new_commands_debug_is_clean() {
+        let cmds = [
+            Command::Send(outgoing()),
+            Command::Edit {
+                item_id: "i".into(),
+                message: outgoing(),
+            },
+            Command::Redact {
+                room_id: RoomId::from("!r:x"),
+                item_id: "i".into(),
+                reason: Some(MessageText::from("secret-reason-x")),
+            },
+            Command::ToggleReaction {
+                room_id: RoomId::from("!r:x"),
+                item_id: "i".into(),
+                key: "secret-key-x".into(),
+            },
+            Command::SearchMembers {
+                room_id: RoomId::from("!r:x"),
+                query: "secret-body-x".into(),
+            },
+        ];
+        for cmd in cmds {
+            assert_clean(&format!("{cmd:?}"));
+        }
+        let dbg = format!(
+            "{:?}",
+            Command::Redact {
+                room_id: RoomId::from("!r:x"),
+                item_id: "item-9".into(),
+                reason: None,
+            }
+        );
+        assert!(dbg.contains("item-9") && dbg.contains("!r:x"), "{dbg}");
+    }
+
+    #[test]
+    fn plain_new_commands_are_constructible() {
+        let r = RoomId::from("!r:x");
+        let cmds = [
+            Command::RetrySend {
+                room_id: r.clone(),
+                item_id: "i".into(),
+            },
+            Command::DiscardSend {
+                room_id: r.clone(),
+                item_id: "i".into(),
+            },
+            Command::PaginateBackwards { room_id: r.clone() },
+            Command::MarkRead {
+                room_id: r.clone(),
+                fully_read: true,
+            },
+            Command::SetTyping {
+                room_id: r,
+                typing: false,
+            },
+        ];
+        assert_eq!(cmds.len(), 5);
+    }
+
+    #[test]
+    fn new_events_are_constructible_and_comparable() {
+        let r = RoomId::from("!r:x");
+        let _ = CoreEvent::Pagination {
+            room_id: r.clone(),
+            state: PaginationState::Loading,
+        };
+        let _ = CoreEvent::Typing {
+            room_id: r.clone(),
+            users: vec![TypingUser {
+                user_id: UserId::from("@a:x"),
+                name: None,
+            }],
+        };
+        let _ = CoreEvent::Members {
+            room_id: r.clone(),
+            query: String::new(),
+            members: vec![Member {
+                user_id: UserId::from("@a:x"),
+                display_name: None,
+            }],
+        };
+        let _ = CoreEvent::ActionFailed {
+            room_id: r,
+            action: ActionKind::Send,
+            error: CoreError::ItemNotFound,
+        };
+        assert_ne!(CoreError::ItemNotFound, CoreError::NotAllowed);
+        assert_ne!(PaginationState::Idle, PaginationState::ReachedStart);
+        assert_eq!(
+            TimelineItemKind::DateDivider { timestamp_ms: 1 },
+            TimelineItemKind::DateDivider { timestamp_ms: 1 }
+        );
     }
 
     #[test]
