@@ -8,6 +8,32 @@
 - Phase 1 (core): matrix-sdk =0.19.1 (features bundled-sqlite, local-server), matrix-sdk-ui =0.19.1, keyring =4.2.0, directories =6.0.0; caret ranges (locked by Cargo.lock) for tokio, tracing, tracing-subscriber, futures-util, serde, serde_json, thiserror, url, rand, rpassword; dev-dep tempfile
 - Phase 1 Task 4 (human-approved, rule 3): zeroize 1.9.0 (`zeroize = { version = "1.9", features = ["serde"] }`, already in Cargo.lock; lock diff only adds the edge and zeroize's serde edge)
 - Phase 2 Task 1 (plan Q1, adopted under the human's standing pre-authorization 2026-10-01; revisit at checkpoint): `crates/app` gains `iced = { version = "=0.14.0", features = ["image-without-codecs"] }` (pin unchanged), `image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }`, `tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }`, `open = "5"` (5.4.4). `Cargo.lock` adds packages only (16): the 13 image crates (byteorder-lite 0.1.0, fdeflate 0.3.7, image 0.25.10, image-webp 0.2.4, kamadak-exif 0.6.1, miniz_oxide 0.8.9, moxcms 0.8.1, mutate_once 0.1.2, png 0.18.1, pxfm 0.1.30, quick-error 2.0.1, zune-core 0.5.3, zune-jpeg 0.5.15) plus open 5.4.4, is-wsl 0.4.0, is-docker 0.2.0. No existing version changed; the only edit to an existing entry is flate2's `miniz_oxide` dependency line, which becomes `miniz_oxide 0.9.1` because two versions now coexist. `deny.toml` unchanged.
+- Phase 3 Task 1 (plan Q2, Q3; approved by the human 2026-10-02): matrix-sdk keeps the pin `=0.19.1` and gains the `markdown` feature; `crates/app` gains `emojis = "0.9"` (0.9.0), `chrono = { version = "0.4", default-features = false, features = ["clock"] }` (0.4.45) and a dev-only `iced = { version = "=0.14.0", features = ["image-without-codecs", "advanced"] }`. `Cargo.lock` adds exactly pulldown-cmark 0.13.4, pulldown-cmark-escape 0.11.0 and unicase 2.9.0 (sorted name/version comparison before vs after: only those three lines differ; no existing version changed). `deny.toml` gains only the RUSTSEC-2026-0319 ignore (anymap2 unmaintained via matrix-sdk 0.19.1); that advisory failure was pre-existing on `main`.
+
+## Phase 3 steps
+- [x] 1. Phase 3 dependencies, advisory triage, ledger (phase3.1)
+- [ ] 2. Additive core API for Phase 3 (phase3.2)
+- [ ] 3. Timeline item view models in the core (roadmap steps 1, 7, 8, 9, core side)
+- [ ] 4. HTML to rich text mapper in the core (roadmap step 4, core side)
+- [ ] 5. Sending: markdown, mentions, replies, local echo retry and discard (roadmap steps 6, 7, 9, core side)
+- [ ] 6. Edit, redact, react and member search in the core (roadmap steps 6, 7, core side)
+- [ ] 7. Back-pagination, room subscription, receipts and typing in the core (roadmap steps 3, 8, core side)
+- [ ] 8. Timeline state and virtualization model in the app, 10,000-item timing test (roadmap step 2, model)
+- [ ] 9. Timeline pane rendering, measurement and visible-only layout test (roadmap steps 1, 2, 3, UI)
+- [ ] 10. Rich text rendering, link handling and pills (roadmap steps 4, 5, UI)
+- [ ] 11. Composer with markdown, mention and emoji autocomplete, typing notices (roadmap step 6, UI)
+- [ ] 12. Message actions: reply, edit, redact, react with emoji picker, copy (roadmap step 7, UI)
+- [ ] 13. Read receipts, typing display, local echo states; Phase 3 wrap-up (roadmap steps 8, 9, UI)
+
+## Phase 3 / Task 1 notes
+- No testable Rust code in this task (manifest, lock, deny and ledger changes only), so there is no failing-test-first step; the checks below stand in for it.
+- `cargo tree -p tessera-app --depth 1 -e normal` lists emojis v0.9.0 and chrono v0.4.45; `cargo tree -p tessera-app -e features -i iced` shows `advanced` only under `[dev-dependencies]`.
+- Checks: the full gate (fmt, clippy, test, check-app-deps.sh, check-core-api.sh, cargo deny check) passes; no integration run (no core or bridge code touched).
+- Open issues: none. No new APIs used.
+
+## Phase 3 human checkpoint
+- [ ] CI green on Linux, Windows and macOS with the new dependencies (matrix-sdk `markdown`, emojis, chrono, dev-only iced `advanced`).
+- [ ] Revisit plan decisions Q1-Q25.
 
 ## Phase 0 steps
 - [x] 2. Cargo workspace with core, app, ptt crates (phase0.2)
@@ -462,7 +488,7 @@ Phase 0 agent work is done; the Phase 0 human checkpoint is fully signed off (20
   4. A selector and a joiner each survive once per base, so a hostile string can carry two invisible characters per visible character within the length caps.
 
 ## Phase 2 human checkpoint
-- [ ] CI green on Linux, Windows and macOS with the new dependencies (iced `image-without-codecs`, image, open, tokio in the app), and the `integration` job green with the app tests (watch its 20-minute timeout).
+- [x] (human, 2026-10-02) CI green on Linux, Windows and macOS with the new dependencies (iced `image-without-codecs`, image, open, tokio in the app), and the `integration` job green with the app tests (watch its 20-minute timeout).
 - [ ] Don't run tessera-cli and the app on the same data dir at once (SQLite store lock; plan Q20).
 - [ ] shellcheck is not part of CI: the wrap-up ran `shellcheck -x scripts/*.sh` via docker with no findings, but the `lint` job does not run it. Consider adding it there.
 - [ ] Revisit plan decisions Q1-Q22 (adopted under the standing pre-authorization).
@@ -484,8 +510,10 @@ Phase 0 agent work is done; the Phase 0 human checkpoint is fully signed off (20
 - [ ] Avatars (Task 11): rooms without an avatar, and rooms whose avatar failed to load, show readable white-on-colour initials (one or two letters, a grey `?` for blank names) in both themes.
 - [ ] Text (Task 11 wrap-up): emoji (❤️, 1️⃣, 👨‍👩‍👧, flags) and Persian/Indic names draw correctly in room names and previews; blank names show "(unnamed)"; searching or switching tabs keeps the open room and its unsent draft.
 - [ ] Avatars (Task 11): no flicker while scrolling (initials do not flash back after an image has shown; images do not reload).
-- [ ] Approve the additive API (Q6) as the Phase 3 baseline.
-- [ ] Approve (or reject) adding a Unicode general-category crate (AGENTS.md rule 3) to replace the hand-written `text_safety` ranges.
+- [x] Approve the additive API (Q6) as the Phase 3 baseline. (approved by the human, 2026-10-02)
+- [x] Approve (or reject) adding a Unicode general-category crate (AGENTS.md rule 3) to replace the hand-written `text_safety` ranges. Not approved by the human (2026-10-02); text_safety keeps hand-written ranges.
+
+Phase 2 signed off by the human on 2026-10-02 (merge of PR #3). Every other unticked Phase 2 item above stays a known open check.
 
 ## Phase 2 open issues (summary)
 - A DM seen before its `m.direct` account data stays non-DM and shows under the wrong tab (Task 4 notes).
