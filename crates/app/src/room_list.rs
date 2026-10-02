@@ -675,6 +675,236 @@ mod tests {
         assert_eq!(names(&app), ["c", "a", "b"]);
     }
 
+    // ---- Avatars (Task 11) -------------------------------------------------
+
+    use std::collections::HashMap;
+
+    use tessera_core::api::AvatarImage;
+
+    use crate::avatars::AvatarState;
+
+    fn fetches(sent: &[Command]) -> Vec<Vec<AvatarId>> {
+        sent.iter()
+            .filter_map(|c| match c {
+                Command::FetchAvatars(ids) => Some(ids.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The avatar IDs of rows `range` of the synthetic list.
+    fn avatar_ids(range: std::ops::Range<usize>) -> Vec<AvatarId> {
+        range
+            .map(|i| synthetic(i).avatar.expect("synthetic rooms have avatars"))
+            .collect()
+    }
+
+    /// An app showing a 20-row viewport over `n` synthetic rooms, with the
+    /// startup commands drained.
+    fn avatar_app(n: usize) -> (App, mpsc::Receiver<Command>) {
+        let (mut app, mut rx) = app();
+        app.list_viewport_h = 20.0 * ROW_HEIGHT;
+        drain(&mut rx);
+        let _ = app.update(rooms_event(vec![ListDiff::Reset {
+            values: synthetic_range(0, n),
+        }]));
+        (app, rx)
+    }
+
+    fn scroll_rows(rows: usize) -> Message {
+        Message::RoomListScrolled {
+            offset_y: rows as f32 * ROW_HEIGHT,
+            viewport_h: 20.0 * ROW_HEIGHT,
+        }
+    }
+
+    #[test]
+    fn a_reset_requests_exactly_the_visible_rows_avatars_in_one_command() {
+        let (app, mut rx) = avatar_app(100);
+        let range = super::visible_range(0.0, 20.0 * ROW_HEIGHT, ROW_HEIGHT, 100, 10);
+        assert_eq!(range, 0..30, "20 visible rows plus 10 overscan");
+        let sent = drain(&mut rx);
+        assert_eq!(fetches(&sent), [avatar_ids(range)]);
+        assert_eq!(app.avatars.requested_len(), 30);
+    }
+
+    #[test]
+    fn a_repeat_requests_nothing() {
+        let (mut app, mut rx) = avatar_app(100);
+        drain(&mut rx);
+        let _ = app.update(rooms_event(vec![ListDiff::Reset {
+            values: synthetic_range(0, 100),
+        }]));
+        let _ = app.update(scroll_rows(0));
+        let _ = app.update(Message::Core(Box::new(CoreEvent::RoomListLoaded {
+            total_rooms: Some(100),
+        })));
+        assert!(fetches(&drain(&mut rx)).is_empty());
+    }
+
+    #[test]
+    fn scrolling_requests_only_the_new_rows() {
+        let (mut app, mut rx) = avatar_app(100);
+        drain(&mut rx);
+        let _ = app.update(scroll_rows(40));
+        let range = super::visible_range(40.0 * ROW_HEIGHT, 20.0 * ROW_HEIGHT, ROW_HEIGHT, 100, 10);
+        assert_eq!(range, 30..70);
+        assert_eq!(fetches(&drain(&mut rx)), [avatar_ids(30..70)]);
+        // A short scroll back only brings rows 20..30 into view, which were
+        // requested with the first window.
+        let _ = app.update(scroll_rows(15));
+        assert!(fetches(&drain(&mut rx)).is_empty());
+    }
+
+    #[test]
+    fn rooms_without_an_avatar_send_nothing() {
+        let (mut app, mut rx) = app();
+        drain(&mut rx);
+        let _ = app.update(rooms_event(vec![ListDiff::Reset {
+            values: vec![room("a"), room("b")],
+        }]));
+        assert!(fetches(&drain(&mut rx)).is_empty());
+    }
+
+    #[test]
+    fn a_shared_avatar_is_requested_once() {
+        let (mut app, mut rx) = app();
+        drain(&mut rx);
+        let mut a = room("a");
+        let mut b = room("b");
+        a.avatar = Some(AvatarId::from("mxc://x/shared"));
+        b.avatar = a.avatar.clone();
+        let _ = app.update(rooms_event(vec![ListDiff::Reset { values: vec![a, b] }]));
+        assert_eq!(
+            fetches(&drain(&mut rx)),
+            [vec![AvatarId::from("mxc://x/shared")]]
+        );
+    }
+
+    #[test]
+    fn a_changed_avatar_of_a_visible_room_is_requested() {
+        let (mut app, mut rx) = avatar_app(5);
+        drain(&mut rx);
+        let mut changed = synthetic(2);
+        changed.avatar = Some(AvatarId::from("mxc://x/new"));
+        let _ = app.update(rooms_event(vec![ListDiff::Set {
+            index: 2,
+            value: changed,
+        }]));
+        assert_eq!(
+            fetches(&drain(&mut rx)),
+            [vec![AvatarId::from("mxc://x/new")]]
+        );
+    }
+
+    fn answer(id: &AvatarId, image: Option<Vec<u8>>) -> Message {
+        Message::Core(Box::new(CoreEvent::Avatar {
+            id: id.clone(),
+            image: image.map(AvatarImage::from),
+        }))
+    }
+
+    fn tiny_png() -> Vec<u8> {
+        let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 255]));
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, image::ImageFormat::Png)
+            .expect("encode");
+        out.into_inner()
+    }
+
+    #[test]
+    fn an_avatar_answer_stores_a_handle_or_unavailable() {
+        let (mut app, _rx) = avatar_app(10);
+        let ids = avatar_ids(0..3);
+        let _ = app.update(answer(&ids[0], Some(tiny_png())));
+        let _ = app.update(answer(&ids[1], None));
+        let _ = app.update(answer(&ids[2], Some(b"not an image".to_vec())));
+        assert!(matches!(
+            app.avatars.state(&ids[0]),
+            Some(AvatarState::Ready(_))
+        ));
+        assert!(matches!(
+            app.avatars.state(&ids[1]),
+            Some(AvatarState::Unavailable)
+        ));
+        assert!(matches!(
+            app.avatars.state(&ids[2]),
+            Some(AvatarState::Unavailable)
+        ));
+    }
+
+    #[test]
+    fn logged_out_and_session_expired_clear_the_avatars() {
+        for event in [CoreEvent::LoggedOut, CoreEvent::SessionExpired] {
+            let (mut app, mut rx) = avatar_app(10);
+            let ids = avatar_ids(0..1);
+            let _ = app.update(answer(&ids[0], Some(tiny_png())));
+            assert!(app.avatars.state(&ids[0]).is_some());
+            let _ = app.update(Message::Core(Box::new(event)));
+            assert!(app.avatars.state(&ids[0]).is_none());
+            assert_eq!(app.avatars.requested_len(), 0);
+            // A new session asks again.
+            drain(&mut rx);
+            let _ = app.update(rooms_event(vec![ListDiff::Reset {
+                values: synthetic_range(0, 10),
+            }]));
+            assert_eq!(fetches(&drain(&mut rx)).len(), 1);
+        }
+    }
+
+    #[test]
+    fn scrolling_back_and_forth_over_failed_avatars_sends_no_repeat() {
+        let (mut app, mut rx) = avatar_app(200);
+        let mut seen: HashMap<AvatarId, usize> = HashMap::new();
+        let mut note = |sent: Vec<Command>| {
+            for ids in fetches(&sent) {
+                for id in ids {
+                    *seen.entry(id).or_default() += 1;
+                }
+            }
+        };
+        note(drain(&mut rx));
+        // The core fails every fetch (`None`), as it does for a homeserver
+        // that is down.
+        let fail_all = |app: &mut App, ids: Vec<AvatarId>| {
+            for id in ids {
+                let _ = app.update(answer(&id, None));
+            }
+        };
+        fail_all(&mut app, avatar_ids(0..30));
+        for _ in 0..5 {
+            for rows in [60, 120, 60, 0, 140, 0] {
+                let _ = app.update(scroll_rows(rows));
+                let sent = drain(&mut rx);
+                let ids: Vec<_> = fetches(&sent).into_iter().flatten().collect();
+                fail_all(&mut app, ids);
+                note(sent);
+            }
+        }
+        assert!(!seen.is_empty());
+        assert!(
+            seen.values().all(|n| *n == 1),
+            "an avatar was requested twice: {:?}",
+            seen.iter().filter(|(_, n)| **n > 1).count()
+        );
+        // Everything the list ever showed is covered, once each.
+        assert_eq!(seen.len(), app.avatars.requested_len());
+    }
+
+    #[test]
+    fn a_reset_with_answered_unavailable_avatars_does_not_ask_again() {
+        let (mut app, mut rx) = avatar_app(100);
+        for id in avatar_ids(0..30) {
+            let _ = app.update(answer(&id, None));
+        }
+        drain(&mut rx);
+        let _ = app.update(rooms_event(vec![ListDiff::Clear]));
+        let _ = app.update(rooms_event(vec![ListDiff::Reset {
+            values: synthetic_range(0, 100),
+        }]));
+        assert!(fetches(&drain(&mut rx)).is_empty());
+    }
+
     // ---- Timing (plan Q17) ------------------------------------------------
 
     const ROOMS: usize = 2_000;
@@ -752,13 +982,18 @@ mod tests {
     fn time_shape(start_rooms: usize, diffs: &[ListDiff<RoomSummary>]) -> Vec<Duration> {
         (0..=RUNS)
             .map(|_| {
-                let (mut app, rx) = app_with_rooms(start_rooms);
+                let (mut app, mut rx) = app_with_rooms(start_rooms);
                 let message = rooms_event(diffs.to_vec());
                 let began = Instant::now();
                 let _ = app.update(message);
                 let took = began.elapsed();
                 // The bookkeeping really ran: it asked for the next page.
                 assert_eq!(app.load_more_at, Some(app.rooms.len()));
+                // The avatar bookkeeping ran too: the built rows' avatars
+                // were collected and sent in one command.
+                let sent = drain(&mut rx);
+                assert_eq!(fetches(&sent).len(), 1, "one FetchAvatars");
+                assert!(app.avatars.requested_len() > 0);
                 std::hint::black_box((&app, &rx));
                 took
             })

@@ -6,10 +6,11 @@
 //! [`row_name`] and [`preview_line`]).
 
 use iced::widget::text::Wrapping;
-use iced::widget::{button, column, container, row, scrollable, space, text, text_input};
-use iced::{Background, Element, Fill, Length, border};
+use iced::widget::{button, column, container, image, row, scrollable, space, text, text_input};
+use iced::{Background, Color, Element, Fill, Length, border};
 use tessera_core::api::{RoomListTab, RoomSummary};
 
+use crate::avatars::{AvatarState, Avatars, NEUTRAL_INITIALS, initials, placeholder_color};
 use crate::room_list::{
     Badge, OVERSCAN_ROWS, ROW_HEIGHT, badge_for, empty_label, preview_line, row_name,
     spacer_heights, visible_range,
@@ -26,7 +27,7 @@ pub const TABS: [RoomListTab; 4] = [
     RoomListTab::Spaces,
 ];
 
-/// Side of the square left of each row, kept for the avatar (Task 11).
+/// Side of the round avatar left of each row.
 pub const AVATAR_SLOT: f32 = 40.0;
 
 /// The label of a tab.
@@ -97,7 +98,7 @@ fn windowed_list(app: &App) -> Element<'_, Message> {
     let (top, bottom) = spacer_heights(&range, len, ROW_HEIGHT);
     let rows = app.rooms[range]
         .iter()
-        .map(|room| room_row(room, app.selected.as_ref() == Some(&room.id)));
+        .map(|room| room_row(room, &app.avatars, app.selected.as_ref() == Some(&room.id)));
     let content = column![space().height(top)]
         .extend(rows)
         .push(space().height(bottom));
@@ -110,18 +111,16 @@ fn windowed_list(app: &App) -> Element<'_, Message> {
         .into()
 }
 
-/// One fixed-height row: avatar slot, name (and "Invite"), preview, badge.
-fn room_row(room: &RoomSummary, selected: bool) -> Element<'_, Message> {
+/// One fixed-height row: avatar, name (and "Invite"), preview, badge.
+fn room_row<'a>(room: &'a RoomSummary, avatars: &Avatars, selected: bool) -> Element<'a, Message> {
     let muted = |t: &iced::Theme| text::Style {
         color: Some(theme::semantic(t).muted),
     };
-    let mut name_line = row![
-        text(row_name(&room.name))
-            .wrapping(Wrapping::None)
-            .width(Fill)
-    ]
-    .spacing(6)
-    .align_y(iced::Center);
+    let name = row_name(&room.name);
+    let avatar = avatar_view(room, &name, avatars);
+    let mut name_line = row![text(name).wrapping(Wrapping::None).width(Fill)]
+        .spacing(6)
+        .align_y(iced::Center);
     if room.is_invite {
         name_line = name_line.push(tag("Invite"));
     }
@@ -132,13 +131,9 @@ fn room_row(room: &RoomSummary, selected: bool) -> Element<'_, Message> {
     ]
     .spacing(2)
     .width(Fill);
-    let content = row![
-        space().width(AVATAR_SLOT).height(AVATAR_SLOT),
-        body,
-        badge_view(badge_for(room)),
-    ]
-    .spacing(8)
-    .align_y(iced::Center);
+    let content = row![avatar, body, badge_view(badge_for(room)),]
+        .spacing(8)
+        .align_y(iced::Center);
     button(content)
         .on_press(Message::SelectRoom(room.id.clone()))
         .width(Fill)
@@ -155,6 +150,46 @@ fn room_row(room: &RoomSummary, selected: bool) -> Element<'_, Message> {
             } else {
                 base
             }
+        })
+        .into()
+}
+
+/// The room's avatar: the decoded image once it arrived, otherwise (and when
+/// it is unavailable) a round placeholder with the initials of the already
+/// sanitised `name`.
+fn avatar_view<'a>(room: &RoomSummary, name: &str, avatars: &Avatars) -> Element<'a, Message> {
+    let ready = room
+        .avatar
+        .as_ref()
+        .and_then(|id| avatars.state(id))
+        .and_then(|state| match state {
+            AvatarState::Ready(handle) => Some(handle),
+            AvatarState::Unavailable => None,
+        });
+    if let Some(handle) = ready {
+        return image(handle.clone())
+            .width(AVATAR_SLOT)
+            .height(AVATAR_SLOT)
+            .border_radius(AVATAR_SLOT / 2.0)
+            .into();
+    }
+    let label = initials(name);
+    let fill = if label == NEUTRAL_INITIALS {
+        None
+    } else {
+        Some(placeholder_color(&room.id))
+    };
+    container(text(label).size(16).color(Color::WHITE))
+        .width(AVATAR_SLOT)
+        .height(AVATAR_SLOT)
+        .center_x(AVATAR_SLOT)
+        .center_y(AVATAR_SLOT)
+        .style(move |t| container::Style {
+            background: Some(Background::Color(
+                fill.unwrap_or_else(|| theme::semantic(t).muted),
+            )),
+            border: border::rounded(AVATAR_SLOT / 2.0),
+            ..container::Style::default()
         })
         .into()
 }
@@ -225,5 +260,34 @@ mod tests {
         assert_eq!(count_label(99), "99");
         assert_eq!(count_label(100), "99+");
         assert_eq!(count_label(u64::MAX), "99+");
+    }
+
+    #[test]
+    fn avatar_views_build_for_every_state() {
+        use tessera_core::api::{AvatarId, AvatarImage, RoomId};
+
+        let mut avatars = Avatars::default();
+        let id = AvatarId::from("mxc://x/a");
+        let _ = avatars.take_unrequested([id.clone()]);
+        let mut room = RoomSummary::new(RoomId::from("!r:x"), String::new());
+        room.avatar = Some(id.clone());
+        // Requested, not answered: placeholder.
+        let _: Element<'_, Message> = avatar_view(&room, "", &avatars);
+        // Unavailable: placeholder.
+        avatars.answer(&id, None);
+        let _: Element<'_, Message> = avatar_view(&room, "Room", &avatars);
+        // No avatar at all.
+        room.avatar = None;
+        let _: Element<'_, Message> = avatar_view(&room, "#x", &avatars);
+        // Ready: the image.
+        let img = ::image::RgbaImage::from_pixel(2, 2, ::image::Rgba([1, 2, 3, 255]));
+        let mut png = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut png, ::image::ImageFormat::Png)
+            .expect("encode");
+        let id2 = AvatarId::from("mxc://x/b");
+        let _ = avatars.take_unrequested([id2.clone()]);
+        avatars.answer(&id2, Some(AvatarImage::from(png.into_inner())));
+        room.avatar = Some(id2);
+        let _: Element<'_, Message> = avatar_view(&room, "Room", &avatars);
     }
 }

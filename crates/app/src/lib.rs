@@ -3,6 +3,7 @@
 //! The app talks to the core only through its command and event API (see
 //! `tessera_core::api`); it never depends on the Matrix SDK.
 
+pub mod avatars;
 pub mod bridge;
 pub mod room_list;
 pub mod screens;

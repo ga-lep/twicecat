@@ -15,6 +15,7 @@ use tessera_core::api::{
 };
 use tokio::sync::mpsc;
 
+use crate::avatars::Avatars;
 use crate::bridge::{self, Bridge, EventsSlot};
 use crate::room_list;
 use crate::screens::login::{self, BrowserUrl, LoginForm};
@@ -158,6 +159,8 @@ pub struct App {
     pub list_viewport_h: f32,
     /// The loaded length for which `LoadMoreRooms` was last sent.
     pub load_more_at: Option<usize>,
+    /// Avatar requests and answers of this session (plan Q11).
+    pub avatars: Avatars,
     /// The room whose timeline is open.
     pub selected: Option<RoomId>,
     /// The selected room's timeline, kept in step with the core's diffs.
@@ -228,6 +231,7 @@ impl App {
             list_offset_y: 0.0,
             list_viewport_h: room_list::DEFAULT_VIEWPORT_HEIGHT,
             load_more_at: None,
+            avatars: Avatars::default(),
             selected: None,
             timeline: Vec::new(),
             user_id: None,
@@ -350,7 +354,7 @@ impl App {
             } => {
                 self.list_offset_y = offset_y;
                 self.list_viewport_h = viewport_h;
-                self.check_paging()
+                self.after_list_change()
             }
             Message::CloseRequested => {
                 if self.screen == Screen::ShuttingDown {
@@ -436,7 +440,7 @@ impl App {
                 if self.screen == Screen::Loading && !self.rooms.is_empty() {
                     self.screen = Screen::Main;
                 }
-                task = self.check_paging();
+                task = self.after_list_change();
             }
             CoreEvent::RoomListLoaded { total_rooms } => {
                 self.total_rooms = total_rooms;
@@ -454,8 +458,7 @@ impl App {
                 }
             }
             CoreEvent::Error(error) => task = self.on_core_error(&error),
-            // Later step: avatars.
-            CoreEvent::Avatar { .. } => {}
+            CoreEvent::Avatar { id, image } => self.avatars.answer(&id, image),
         }
         task
     }
@@ -570,6 +573,36 @@ impl App {
         self.send(Command::SetRoomListQuery(query))
     }
 
+    /// What follows every change of the list or of the viewport: paging and
+    /// avatar requests.
+    fn after_list_change(&mut self) -> Task<Message> {
+        Task::batch([self.check_paging(), self.request_avatars()])
+    }
+
+    /// Asks the core for the avatars of the built rows that were never
+    /// requested this session (plan Q11): one `FetchAvatars`, or nothing when
+    /// the set is empty. An ID is requested once per session whatever the
+    /// answer, so a failing homeserver is not hit again by scrolling.
+    fn request_avatars(&mut self) -> Task<Message> {
+        let len = self.rooms.len();
+        let range = room_list::visible_range(
+            self.list_offset_y,
+            self.list_viewport_h,
+            room_list::ROW_HEIGHT,
+            len,
+            room_list::OVERSCAN_ROWS,
+        );
+        let ids = self.avatars.take_unrequested(
+            self.rooms[range]
+                .iter()
+                .filter_map(|room| room.avatar.clone()),
+        );
+        if ids.is_empty() {
+            return Task::none();
+        }
+        self.send(Command::FetchAvatars(ids))
+    }
+
     /// The paging bookkeeping (plan Q8): asks for the next page when the
     /// built rows reach the end of the loaded list, at most once per loaded
     /// length.
@@ -621,6 +654,7 @@ impl App {
         self.rooms.clear();
         self.total_rooms = None;
         self.load_more_at = None;
+        self.avatars.clear();
         self.list_offset_y = 0.0;
         self.deselect();
         self.sync_state = SyncState::Idle;
