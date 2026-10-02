@@ -50,6 +50,101 @@ string_newtype!(
     /// A Matrix device ID.
     DeviceId
 );
+string_newtype!(
+    /// Identifies an avatar image; holds its `mxc://` URI. The core checks the
+    /// URI when the avatar is fetched, not when the ID is built.
+    AvatarId
+);
+
+/// The bytes of an encoded avatar image. `Debug` shows only the length.
+///
+/// ```
+/// use tessera_core::api::AvatarImage;
+/// let img = AvatarImage::from(vec![1, 2, 3]);
+/// assert_eq!(format!("{img:?}"), "AvatarImage(<3 bytes>)");
+/// assert_eq!(img.as_bytes(), &[1, 2, 3]);
+/// ```
+#[derive(Clone, PartialEq, Eq)]
+pub struct AvatarImage(Vec<u8>);
+
+impl AvatarImage {
+    /// Borrows the encoded image bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// Takes the encoded image bytes.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+}
+
+impl From<Vec<u8>> for AvatarImage {
+    fn from(value: Vec<u8>) -> Self {
+        Self(value)
+    }
+}
+
+impl fmt::Debug for AvatarImage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "AvatarImage(<{} bytes>)", self.0.len())
+    }
+}
+
+/// The last message of a room, for the room list. The body is untrusted user
+/// content: `Debug` hides it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct MessagePreview {
+    /// Sender user ID.
+    pub sender: UserId,
+    /// Sender's display name, when known.
+    pub sender_name: Option<String>,
+    /// First line of the message text, shortened.
+    pub body: String,
+    /// Origin timestamp, milliseconds since the Unix epoch.
+    pub timestamp_ms: u64,
+    /// Sent by the logged-in user.
+    pub is_own: bool,
+}
+
+// Manual impl: the body is user content and must not reach logs.
+impl fmt::Debug for MessagePreview {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MessagePreview")
+            .field("sender", &self.sender)
+            .field("sender_name", &self.sender_name)
+            .field(
+                "body",
+                &format_args!("<redacted, {} bytes>", self.body.len()),
+            )
+            .field("timestamp_ms", &self.timestamp_ms)
+            .field("is_own", &self.is_own)
+            .finish()
+    }
+}
+
+/// Which rooms the room list shows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum RoomListTab {
+    /// Every room.
+    #[default]
+    All,
+    /// Direct messages.
+    People,
+    /// Group rooms that are not spaces.
+    Rooms,
+    /// Spaces.
+    Spaces,
+}
+
+/// A room list query: a tab plus a name search.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RoomListQuery {
+    /// Which rooms to show.
+    pub tab: RoomListTab,
+    /// Case- and diacritic-insensitive name filter; blank means no filter.
+    pub search: String,
+}
 
 /// A password. `Debug` never shows the value, and the memory is zeroized on
 /// drop (each clone separately).
@@ -187,6 +282,8 @@ pub enum SyncState {
 }
 
 /// One row of the room list.
+///
+/// `Debug` hides the preview body (see [`MessagePreview`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RoomSummary {
     /// Room ID.
@@ -199,6 +296,47 @@ pub struct RoomSummary {
     pub unread_mentions: u64,
     /// Unread notifications.
     pub unread_notifications: u64,
+    /// Avatar to show, if the room (or its DM partner) has one.
+    pub avatar: Option<AvatarId>,
+    /// A direct message.
+    pub is_dm: bool,
+    /// A space.
+    pub is_space: bool,
+    /// The user is invited and has not joined.
+    pub is_invite: bool,
+    /// Unread highlights (mentions and keyword matches).
+    pub highlights: u64,
+    /// Manually marked as unread.
+    pub marked_unread: bool,
+    /// The latest message, if any.
+    pub last_message: Option<MessagePreview>,
+}
+
+impl RoomSummary {
+    /// A summary with zero counts, `false` flags and no avatar or preview.
+    ///
+    /// ```
+    /// use tessera_core::api::{RoomId, RoomSummary};
+    /// let r = RoomSummary::new(RoomId::from("!r:x"), "Lounge".into());
+    /// assert_eq!(r.unread_messages, 0);
+    /// assert!(r.last_message.is_none());
+    /// ```
+    pub fn new(id: RoomId, name: String) -> Self {
+        Self {
+            id,
+            name,
+            unread_messages: 0,
+            unread_mentions: 0,
+            unread_notifications: 0,
+            avatar: None,
+            is_dm: false,
+            is_space: false,
+            is_invite: false,
+            highlights: 0,
+            marked_unread: false,
+            last_message: None,
+        }
+    }
 }
 
 /// Delivery state of a message.

@@ -9,24 +9,25 @@ use futures_util::{Stream, StreamExt as _, pin_mut};
 use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
 use matrix_sdk::{Client, SessionChange};
 use matrix_sdk_ui::eyeball_im::{Vector, VectorDiff};
-use matrix_sdk_ui::room_list_service::filters::new_filter_non_left;
 use matrix_sdk_ui::sync_service::SyncService;
 use matrix_sdk_ui::timeline::{RoomExt as _, Timeline, TimelineItem as SdkTimelineItem};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 use zeroize::Zeroizing;
 
 use crate::api::{
-    Command, CoreError, CoreEvent, DeviceId, ListDiff, MessageText, Password, RoomId, UserId,
+    Command, CoreError, CoreEvent, DeviceId, ListDiff, MessageText, Password, RoomId,
+    RoomListQuery, UserId,
 };
+use crate::avatars::{Avatars, SdkFetcher, answer_unavailable};
 use crate::client::{
     ServerSpec, WRONG_ACCOUNT, account_bound, build_client, discover_homeserver_url,
     ensure_homeserver_after_login, map_login_error, same_origin,
 };
 use crate::oauth::authorize;
 use crate::paths::DataPaths;
-use crate::room_list::{map_diff, summarize};
+use crate::room_list::{Registered, build_filter, loaded_event, map_batch, map_diff};
 use crate::secrets::{SecretError, SecretStore};
 use crate::session::{
     RECORD_VERSION, SessionAuth, SessionRecord, generate_session_id, generate_store_passphrase,
@@ -78,6 +79,7 @@ impl Core {
             events: ev_tx,
             active: None,
             oauth: None,
+            room_list_query: watch::channel(RoomListQuery::default()).0,
         };
         tokio::spawn(engine.run(cmd_rx));
         CoreHandle {
@@ -95,6 +97,8 @@ struct Syncing {
     cancel: CancelTrigger,
     supervisor: JoinHandle<()>,
     room_list: JoinHandle<()>,
+    /// Asks the room list forwarder to load one more page.
+    more_rooms: mpsc::Sender<()>,
 }
 
 /// The room whose timeline is open, and the task forwarding its diffs.
@@ -119,6 +123,9 @@ struct Active {
     changes: broadcast::Receiver<SessionChange>,
     sync: Option<Syncing>,
     selected: Option<Selected>,
+    /// Avatar fetches of this session (in flight and answered).
+    avatars: Avatars,
+    fetcher: Arc<SdkFetcher>,
 }
 
 impl Active {
@@ -126,6 +133,8 @@ impl Active {
     /// service, so that nothing holds the client or its store afterwards (the
     /// tasks own clones of it).
     async fn stop_tasks(&mut self) {
+        // Fetch tasks hold clones of the client, so they go first.
+        self.avatars.stop().await;
         if let Some(selected) = self.selected.take() {
             selected.stop().await;
         }
@@ -192,9 +201,15 @@ async fn forward_sync_state(
 }
 
 /// Forwards every room list diff batch as one `RoomListChanged` event.
+///
+/// Owns the list's controller: the query in `query` (applied when the list
+/// starts, then on every change) sets the filter and goes back to the first
+/// page, and each message on `more` adds one page.
 async fn forward_room_list(
     service: Arc<SyncService>,
     page_size: usize,
+    mut query: watch::Receiver<RoomListQuery>,
+    mut more: mpsc::Receiver<()>,
     events: mpsc::Sender<CoreEvent>,
 ) {
     let room_list = match service.room_list_service().all_rooms().await {
@@ -205,20 +220,55 @@ async fn forward_room_list(
             return;
         }
     };
+    let mut loading = room_list.loading_state();
     let (stream, controller) = room_list.entries_with_dynamic_adapters(page_size.max(1));
-    // The stream yields nothing until a filter is set.
-    controller.set_filter(Box::new(new_filter_non_left()));
+    // The stream yields nothing until a filter is set. `borrow_and_update`
+    // marks this value seen, so only later queries wake the loop below.
+    let first = build_filter(&query.borrow_and_update());
+    controller.set_filter(first);
+    let mut query_open = true;
+    let mut more_open = true;
     pin_mut!(stream);
-    while let Some(diffs) = stream.next().await {
-        let batch = diffs
-            .into_iter()
-            .map(|d| map_diff(d, |item| summarize(&item)))
-            .collect();
-        if events
-            .send(CoreEvent::RoomListChanged(batch))
-            .await
-            .is_err()
-        {
+    // Rooms registered for latest events live and die with this task, so the
+    // set starts empty again after sync restarts.
+    let mut registered = Registered::default();
+    let mut loading_open = true;
+    loop {
+        let event = tokio::select! {
+            diffs = stream.next() => match diffs {
+                Some(diffs) => CoreEvent::RoomListChanged(map_batch(diffs, &mut registered).await),
+                None => return,
+            },
+            changed = query.changed(), if query_open => {
+                if changed.is_err() {
+                    query_open = false;
+                    continue;
+                }
+                let filter = build_filter(&query.borrow_and_update());
+                controller.set_filter(filter);
+                controller.reset_to_one_page();
+                continue;
+            }
+            request = more.recv(), if more_open => {
+                if request.is_none() {
+                    more_open = false;
+                } else {
+                    controller.add_one_page();
+                }
+                continue;
+            }
+            state = loading.next(), if loading_open => match state {
+                Some(state) => match loaded_event(&state) {
+                    Some(event) => event,
+                    None => continue,
+                },
+                None => {
+                    loading_open = false;
+                    continue;
+                }
+            },
+        };
+        if events.send(event).await.is_err() {
             return;
         }
     }
@@ -268,6 +318,9 @@ struct Engine {
     active: Option<Active>,
     /// An OAuth login waiting for the browser.
     oauth: Option<PendingOAuth>,
+    /// The latest room list query. It outlives sessions, so one set before
+    /// login applies when the list starts.
+    room_list_query: watch::Sender<RoomListQuery>,
 }
 
 /// An OAuth login in progress. Its task builds the client, emits `OAuthUrl`,
@@ -404,6 +457,36 @@ impl Engine {
                 }
             }
             Command::SendMessage { text } => self.send_message(&text).await,
+            Command::SetRoomListQuery(query) => {
+                // The value is stored even with no forwarder listening; an
+                // unchanged query does not wake one.
+                self.room_list_query.send_if_modified(|current| {
+                    let changed = *current != query;
+                    if changed {
+                        *current = query;
+                    }
+                    changed
+                });
+            }
+            Command::LoadMoreRooms => {
+                let more = self
+                    .active
+                    .as_ref()
+                    .and_then(|a| a.sync.as_ref())
+                    .map(|s| s.more_rooms.clone());
+                // A full channel already has requests pending. With no sync
+                // there is no list, so this is a no-op.
+                if let Some(more) = more {
+                    let _ = more.try_send(());
+                }
+            }
+            // Validated, bounded and deduplicated in `avatars`; the fetches run
+            // in tasks, so this never waits for the network.
+            Command::FetchAvatars(ids) => match self.active.as_mut() {
+                Some(active) => active.avatars.request(ids, &active.fetcher, &self.events),
+                // No session to fetch with: every ID is unavailable.
+                None => answer_unavailable(ids, &self.events).await,
+            },
             // Handled in `run`.
             Command::Shutdown => {}
         }
@@ -709,11 +792,13 @@ impl Engine {
                 let changes = client.subscribe_to_session_changes();
                 Ok((
                     Active {
+                        fetcher: Arc::new(SdkFetcher(client.clone())),
                         client,
                         record,
                         changes,
                         sync: None,
                         selected: None,
+                        avatars: Avatars::new(),
                     },
                     event,
                 ))
@@ -883,11 +968,13 @@ impl Engine {
         let changes = client.subscribe_to_session_changes();
         Ok(Some((
             Active {
+                fetcher: Arc::new(SdkFetcher(client.clone())),
                 client,
                 record,
                 changes,
                 sync: None,
                 selected: None,
+                avatars: Avatars::new(),
             },
             event,
         )))
@@ -916,9 +1003,12 @@ impl Engine {
             self.events.clone(),
             cancelled,
         ));
+        let (more_rooms, more_rx) = mpsc::channel(8);
         let room_list = tokio::spawn(forward_room_list(
             service.clone(),
             self.config.room_list_page_size,
+            self.room_list_query.subscribe(),
+            more_rx,
             self.events.clone(),
         ));
         service.start().await;
@@ -928,6 +1018,7 @@ impl Engine {
                 cancel,
                 supervisor,
                 room_list,
+                more_rooms,
             });
         }
     }
@@ -1006,6 +1097,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::{AvatarId, RoomListQuery, RoomListTab};
     use crate::secrets::InMemorySecretStore;
 
     fn engine(secrets: Arc<dyn SecretStore>) -> Engine {
@@ -1020,6 +1112,7 @@ mod tests {
             events,
             active: None,
             oauth: None,
+            room_list_query: watch::channel(RoomListQuery::default()).0,
         }
     }
 
@@ -1099,6 +1192,7 @@ mod tests {
             events,
             active: None,
             oauth: None,
+            room_list_query: watch::channel(RoomListQuery::default()).0,
         };
         (engine, rx)
     }
@@ -1170,5 +1264,49 @@ mod tests {
         .expect("shutdown must not hang");
         assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
         assert!(!dir.exists(), "store dir must be removed");
+    }
+
+    #[tokio::test]
+    async fn room_list_query_is_kept_for_the_list_and_paging_is_a_noop_without_sync() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut engine, mut rx) = oauth_engine(tmp.path());
+        let mut watcher = engine.room_list_query.subscribe();
+        assert_eq!(*watcher.borrow_and_update(), RoomListQuery::default());
+        let query = RoomListQuery {
+            tab: RoomListTab::Spaces,
+            search: "x".into(),
+        };
+        engine
+            .handle(Command::SetRoomListQuery(query.clone()))
+            .await;
+        assert!(watcher.has_changed().unwrap());
+        assert_eq!(*watcher.borrow_and_update(), query);
+        // The same query again does not wake the list.
+        engine
+            .handle(Command::SetRoomListQuery(query.clone()))
+            .await;
+        assert!(!watcher.has_changed().unwrap());
+        // A list that starts later sees the stored query.
+        assert_eq!(*engine.room_list_query.subscribe().borrow(), query);
+        engine.handle(Command::LoadMoreRooms).await;
+        assert!(rx.try_recv().is_err(), "no event expected");
+    }
+
+    #[tokio::test]
+    async fn fetch_avatars_answers_each_id_with_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut engine, mut rx) = oauth_engine(tmp.path());
+        let ids = [AvatarId::from("mxc://x/a"), AvatarId::from("mxc://x/b")];
+        engine.handle(Command::FetchAvatars(ids.to_vec())).await;
+        for id in ids {
+            match rx.try_recv() {
+                Ok(CoreEvent::Avatar { id: got, image }) => {
+                    assert_eq!(got, id);
+                    assert!(image.is_none());
+                }
+                other => panic!("unexpected: {other:?}"),
+            }
+        }
+        assert!(rx.try_recv().is_err());
     }
 }

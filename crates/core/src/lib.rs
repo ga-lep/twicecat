@@ -5,6 +5,7 @@
 #![recursion_limit = "256"]
 
 pub mod api;
+mod avatars;
 mod client;
 mod engine;
 pub mod logging;

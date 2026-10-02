@@ -637,6 +637,8 @@ impl Cli {
                     ListDiff::apply(diff, &mut self.rooms);
                 }
             }
+            // Room list paging and avatars are for the graphical app.
+            CoreEvent::RoomListLoaded { .. } | CoreEvent::Avatar { .. } => {}
             CoreEvent::TimelineDiff { room_id, diffs } => self.on_timeline(&room_id, &diffs),
             CoreEvent::SendFailed { room_id, error } => {
                 println!("Send failed in {}: {error}", sanitize(room_id.as_str()));
@@ -804,13 +806,7 @@ mod tests {
     }
 
     fn room(id: &str, name: &str) -> RoomSummary {
-        RoomSummary {
-            id: RoomId::from(id),
-            name: name.to_owned(),
-            unread_messages: 0,
-            unread_mentions: 0,
-            unread_notifications: 0,
-        }
+        RoomSummary::new(RoomId::from(id), name.to_owned())
     }
 
     #[test]

@@ -33,7 +33,9 @@ impl TestEnv {
                 *value = over;
             }
         }
-        Self { values }
+        let env = Self { values };
+        assert_local_homeserver(env.get("HOMESERVER_URL"));
+        env
     }
 
     pub fn get(&self, key: &str) -> &str {
@@ -62,6 +64,29 @@ impl TestEnv {
     }
 }
 
+/// Whether `url` is plain http on a loopback address with a port, the only
+/// kind of homeserver the test accounts may be used with (AGENTS.md rule 6).
+pub fn is_local_homeserver(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("http://") else {
+        return false;
+    };
+    let rest = rest.strip_suffix('/').unwrap_or(rest);
+    ["127.0.0.1", "localhost", "[::1]"].iter().any(|host| {
+        rest.strip_prefix(host)
+            .and_then(|r| r.strip_prefix(':'))
+            .is_some_and(|port| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()))
+    })
+}
+
+/// Panics unless `url` is a local homeserver; call before sending credentials.
+pub fn assert_local_homeserver(url: &str) {
+    assert!(
+        is_local_homeserver(url),
+        "HOMESERVER_URL must be http://127.0.0.1:<port>, http://localhost:<port> or http://[::1]:<port>; \
+         the test accounts must never be used against another server"
+    );
+}
+
 /// Parses `KEY=VALUE` lines; `#` comments and blank lines are skipped.
 pub fn parse_env(text: &str) -> HashMap<String, String> {
     text.lines()
@@ -74,12 +99,21 @@ pub fn parse_env(text: &str) -> HashMap<String, String> {
 
 /// Starts a core on `dir` against the local homeserver.
 pub fn start_core(dir: &Path, secrets: Arc<InMemorySecretStore>) -> CoreHandle {
+    start_core_with_page_size(dir, secrets, tessera_core::DEFAULT_ROOM_LIST_PAGE_SIZE)
+}
+
+/// Like [`start_core`] with an explicit room list page size.
+pub fn start_core_with_page_size(
+    dir: &Path,
+    secrets: Arc<InMemorySecretStore>,
+    room_list_page_size: usize,
+) -> CoreHandle {
     let env = TestEnv::load();
     Core::start(
         CoreConfig {
             data: DataPaths::at(dir),
             homeserver_override: Some(env.homeserver_url().to_owned()),
-            room_list_page_size: tessera_core::DEFAULT_ROOM_LIST_PAGE_SIZE,
+            room_list_page_size,
         },
         secrets,
     )
@@ -157,6 +191,67 @@ pub async fn create_room(
         .create_room(request)
         .await
         .expect("create room")
+        .room_id()
+        .to_owned()
+}
+
+/// Serializes DM creation within a test binary, see [`create_dm`].
+static DM_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Creates a DM from `creator` to `with` (a full user ID), using the SDK's
+/// own DM helper.
+///
+/// The SDK marks the room in the `m.direct` account data by reading the
+/// client's local copy and writing the whole event back. A test client never
+/// syncs, so its copy is empty and every DM it creates would replace the
+/// server's `m.direct`, dropping the DMs of tests running at the same time on
+/// the same account (those rooms then stay non-DM forever). So the create and
+/// a merge with the server's current `m.direct` happen under one lock.
+pub async fn create_dm(creator: &matrix_sdk::Client, with: &str) -> matrix_sdk::ruma::OwnedRoomId {
+    use matrix_sdk::ruma::events::direct::DirectEventContent;
+    let user: matrix_sdk::ruma::OwnedUserId = with.try_into().expect("valid user id");
+    let _guard = DM_LOCK.lock().await;
+    let account = creator.account();
+    let mut direct: DirectEventContent = account
+        .fetch_account_data_static::<DirectEventContent>()
+        .await
+        .expect("fetch m.direct")
+        .map(|raw| raw.deserialize().expect("parse m.direct"))
+        .unwrap_or_default();
+    let room_id = creator
+        .create_dm(&user)
+        .await
+        .expect("create dm")
+        .room_id()
+        .to_owned();
+    let rooms = direct.entry(user.into()).or_default();
+    if !rooms.contains(&room_id) {
+        rooms.push(room_id.clone());
+    }
+    account
+        .set_account_data(direct)
+        .await
+        .expect("restore merged m.direct");
+    room_id
+}
+
+/// Creates a space named `name` as `creator`.
+pub async fn create_space(
+    creator: &matrix_sdk::Client,
+    name: &str,
+) -> matrix_sdk::ruma::OwnedRoomId {
+    use matrix_sdk::ruma::api::client::room::create_room::v3::{CreationContent, Request};
+    use matrix_sdk::ruma::room::RoomType;
+    use matrix_sdk::ruma::serde::Raw;
+    let mut content = CreationContent::new();
+    content.room_type = Some(RoomType::Space);
+    let mut request = Request::new();
+    request.name = Some(name.to_owned());
+    request.creation_content = Some(Raw::new(&content).expect("serialize creation content"));
+    creator
+        .create_room(request)
+        .await
+        .expect("create space")
         .room_id()
         .to_owned()
 }

@@ -8,8 +8,9 @@ mod types;
 
 pub use diff::ListDiff;
 pub use types::{
-    AuthUrl, CoreError, DeviceId, MessageText, Password, RoomId, RoomSummary, SendStatus,
-    SyncState, TimelineItem, TimelineItemKind, UserId,
+    AuthUrl, AvatarId, AvatarImage, CoreError, DeviceId, MessagePreview, MessageText, Password,
+    RoomId, RoomListQuery, RoomListTab, RoomSummary, SendStatus, SyncState, TimelineItem,
+    TimelineItemKind, UserId,
 };
 
 /// A request from the front end to the engine.
@@ -40,6 +41,13 @@ pub enum Command {
         /// Message text.
         text: MessageText,
     },
+    /// Change the room list's tab and search filter.
+    SetRoomListQuery(RoomListQuery),
+    /// List one more page of rooms.
+    LoadMoreRooms,
+    /// Request avatar thumbnails; each ID is answered by one
+    /// [`CoreEvent::Avatar`].
+    FetchAvatars(Vec<AvatarId>),
     /// Log out and delete the local session.
     Logout,
     /// Stop the engine.
@@ -72,6 +80,18 @@ pub enum CoreEvent {
     SyncState(SyncState),
     /// Room list changed.
     RoomListChanged(Vec<ListDiff<RoomSummary>>),
+    /// The room list finished its initial load.
+    RoomListLoaded {
+        /// Number of rooms the server reported, when known.
+        total_rooms: Option<u32>,
+    },
+    /// Answer to [`Command::FetchAvatars`] for one avatar.
+    Avatar {
+        /// The requested avatar.
+        id: AvatarId,
+        /// The image bytes, or `None` when it is unavailable.
+        image: Option<AvatarImage>,
+    },
     /// Selected room's timeline changed.
     TimelineDiff {
         /// Room.
@@ -93,6 +113,74 @@ pub enum CoreEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn room_summary_new_has_zero_defaults() {
+        let r = RoomSummary::new(RoomId::from("!r:x"), "Lounge".into());
+        assert_eq!(r.id, RoomId::from("!r:x"));
+        assert_eq!(r.name, "Lounge");
+        assert_eq!(
+            (r.unread_messages, r.unread_mentions, r.unread_notifications),
+            (0, 0, 0)
+        );
+        assert_eq!(r.highlights, 0);
+        assert!(!r.is_dm && !r.is_space && !r.is_invite && !r.marked_unread);
+        assert!(r.avatar.is_none() && r.last_message.is_none());
+    }
+
+    #[test]
+    fn room_list_query_defaults() {
+        let q = RoomListQuery::default();
+        assert_eq!(q.tab, RoomListTab::All);
+        assert_eq!(RoomListTab::default(), RoomListTab::All);
+        assert!(q.search.is_empty());
+    }
+
+    fn preview() -> MessagePreview {
+        MessagePreview {
+            sender: UserId::from("@a:x"),
+            sender_name: Some("Ann".into()),
+            body: "secret-body-x".into(),
+            timestamp_ms: 4242,
+            is_own: false,
+        }
+    }
+
+    #[test]
+    fn message_preview_debug_hides_body() {
+        let dbg = format!("{:?}", preview());
+        assert!(!dbg.contains("secret-body-x"), "{dbg}");
+        assert!(dbg.contains("@a:x"), "{dbg}");
+        assert!(dbg.contains("4242"), "{dbg}");
+    }
+
+    #[test]
+    fn room_summary_debug_hides_preview_body() {
+        let mut room = RoomSummary::new(RoomId::from("!r:x"), "Lounge".into());
+        room.last_message = Some(preview());
+        let dbg = format!("{room:?}");
+        assert!(!dbg.contains("secret-body-x"), "{dbg}");
+        assert!(dbg.contains("Lounge"), "{dbg}");
+        let ev = CoreEvent::RoomListChanged(vec![ListDiff::Reset { values: vec![room] }]);
+        assert!(!format!("{ev:?}").contains("secret-body-x"));
+    }
+
+    #[test]
+    fn avatar_image_debug_shows_length_only() {
+        let img = AvatarImage::from(vec![0xAB; 3]);
+        let dbg = format!("{img:?}");
+        assert!(dbg.contains('3'), "{dbg}");
+        assert!(
+            !dbg.to_lowercase().contains("ab") && !dbg.contains("171"),
+            "{dbg}"
+        );
+        assert_eq!(img.as_bytes(), &[0xAB; 3]);
+        let ev = CoreEvent::Avatar {
+            id: AvatarId::from("mxc://x/y"),
+            image: Some(img),
+        };
+        assert!(format!("{ev:?}").contains("mxc://x/y"));
+    }
 
     #[test]
     fn password_debug_is_redacted() {
