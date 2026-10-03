@@ -2,7 +2,7 @@
 //! Systems) and prints the frame times.
 //!
 //! `cargo run --release -p tessera-audio --features onnxruntime --example
-//! dfn_profile -- <cpu|gpu> [frames]`; the models from
+//! dfn_profile -- <cpu|gpu|trt> [frames]`; the models from
 //! `scripts/fetch-models.sh` and, for `gpu`, `scripts/export-deepfilternet.sh`,
 //! `scripts/fetch-onnxruntime.sh cuda13` (and NVIDIA's libraries).
 
@@ -36,19 +36,35 @@ fn load(mode: &str) -> DeepFilter {
     match mode {
         "cpu" => DeepFilter::load(&dir, 100.0).expect("run scripts/fetch-models.sh"),
         #[cfg(feature = "onnxruntime")]
-        "gpu" => {
+        "gpu" | "trt" => {
             use tessera_audio::onnx::{Accelerator, OnnxRuntime, default_runtime_dir};
             let runtime = OnnxRuntime::load(&default_runtime_dir().expect("ONNX Runtime"))
                 .expect("load ONNX Runtime");
             let model = tessera_audio::default_stateful_model().expect("stateful model");
+            let prefer = if mode == "trt" {
+                Accelerator::TensorRt
+            } else {
+                Accelerator::Cuda
+            };
             let (filter, accelerator) =
-                DeepFilter::load_gpu(&dir, &model, 100.0, &runtime, &[Accelerator::Cuda])
-                    .expect("load");
+                DeepFilter::load_gpu(&dir, &model, 100.0, &runtime, &[prefer]).expect("load");
             eprintln!("running on {accelerator:?}");
             filter
         }
-        other => panic!("unknown mode {other} (cpu, gpu with --features onnxruntime)"),
+        other => panic!("unknown mode {other} (cpu; gpu, trt with --features onnxruntime)"),
     }
+}
+
+/// CPU time of every thread of this process so far (Linux: the kernel's
+/// per-thread run time, nanoseconds), `None` elsewhere.
+fn process_cpu_ns() -> Option<u64> {
+    let tasks = std::fs::read_dir("/proc/self/task").ok()?;
+    let mut total = 0;
+    for task in tasks.flatten() {
+        let stat = std::fs::read_to_string(task.path().join("schedstat")).ok()?;
+        total += stat.split_whitespace().next()?.parse::<u64>().ok()?;
+    }
+    Some(total)
 }
 
 fn main() {
@@ -62,6 +78,7 @@ fn main() {
 
     let input = voice_in_noise(frames);
     let mut times = Vec::with_capacity(frames);
+    let cpu_before = process_cpu_ns();
     let mut sink = 0.0_f32;
     for chunk in input.chunks_exact(FRAME_LEN) {
         let mut frame: Frame = chunk.try_into().unwrap();
@@ -70,12 +87,15 @@ fn main() {
         times.push(start.elapsed());
         sink += frame[0];
     }
+    let cpu = process_cpu_ns()
+        .zip(cpu_before)
+        .map(|(after, before)| Duration::from_nanos((after - before) / frames as u64));
     times.sort();
     let pct = |p: usize| times[(times.len() - 1) * p / 100];
     let mean = times.iter().sum::<Duration>() / times.len() as u32;
     println!(
-        "{mode}: {frames} frames, mean {mean:?}, median {:?}, p99 {:?}, worst {:?} \
-         ({:?}, {sink:.1e})",
+        "{mode}: {frames} frames, mean {mean:?}, median {:?}, p99 {:?}, worst {:?}, \
+         CPU per frame {cpu:?} ({:?}, {sink:.1e})",
         pct(50),
         pct(99),
         times.last().unwrap(),

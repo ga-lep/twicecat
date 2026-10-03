@@ -49,13 +49,34 @@ fn deep_filter(attenuation_limit_db: f32, gpu: bool) -> AudioSettings {
 
 #[tokio::test]
 #[ignore = "needs the GPU parts and a GPU"]
-async fn deep_filter_runs_on_the_gpu_and_takes_a_new_limit_without_reloading() {
+async fn the_probe_finds_the_gpu_and_deep_filter_runs_on_it_and_takes_a_new_limit() {
     let dir = tempfile::tempdir().unwrap();
     let mut core = start_core_with_audio(
         dir.path(),
         Arc::new(InMemorySecretStore::new()),
         AudioBackend::Virtual(Arc::new(Hiss(std::sync::Mutex::new(0x9e37_79b9)))),
     );
+    let gpu = |e: &CoreEvent| matches!(e, CoreEvent::GpuEnhancement(_));
+    // A fresh probe opens each backend once; nothing runs yet.
+    core.commands
+        .send(Command::ProbeGpuEnhancement)
+        .await
+        .unwrap();
+    let CoreEvent::GpuEnhancement(fresh) =
+        expect_event_within(&mut core, Duration::from_secs(90), gpu).await
+    else {
+        unreachable!()
+    };
+    eprintln!("fresh probe: {fresh:?}");
+    assert!(
+        fresh
+            .available
+            .iter()
+            .any(|b| matches!(b, GpuBackend::TensorRt | GpuBackend::Cuda)),
+        "{fresh:?}"
+    );
+    assert_eq!(fresh.running, None, "{fresh:?}");
+
     let send = |cmd| core.commands.send(cmd);
     send(Command::UpdateAudioSettings(deep_filter(100.0, true)))
         .await
@@ -64,18 +85,22 @@ async fn deep_filter_runs_on_the_gpu_and_takes_a_new_limit_without_reloading() {
         .await
         .unwrap();
 
-    let gpu = |e: &CoreEvent| matches!(e, CoreEvent::GpuEnhancement(_));
     let CoreEvent::GpuEnhancement(loaded) =
-        expect_event_within(&mut core, Duration::from_secs(30), gpu).await
+        expect_event_within(&mut core, Duration::from_secs(90), gpu).await
     else {
         unreachable!()
     };
     eprintln!("after loading: {loaded:?}");
-    assert_eq!(
-        loaded.running,
-        Some(EnhancerBackend::Gpu {
-            backend: GpuBackend::Cuda
-        })
+    // TensorRT when its libraries are fetched (scripts/fetch-tensorrt.sh),
+    // else CUDA.
+    assert!(
+        matches!(
+            loaded.running,
+            Some(EnhancerBackend::Gpu {
+                backend: GpuBackend::TensorRt | GpuBackend::Cuda
+            })
+        ),
+        "{loaded:?}"
     );
 
     core.commands
@@ -86,7 +111,11 @@ async fn deep_filter_runs_on_the_gpu_and_takes_a_new_limit_without_reloading() {
         unreachable!()
     };
     eprintln!("probe: {probed:?}");
-    assert!(probed.available.contains(&GpuBackend::Cuda));
+    // The running filter's backend is listed.
+    let Some(EnhancerBackend::Gpu { backend }) = loaded.running else {
+        unreachable!("checked above")
+    };
+    assert!(probed.available.contains(&backend), "{probed:?}");
     assert_eq!(probed.running, loaded.running, "the probe left it running");
 
     // A new limit goes to the running filter: no reload, so no new status.

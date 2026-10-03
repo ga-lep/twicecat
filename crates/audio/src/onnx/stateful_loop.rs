@@ -6,10 +6,13 @@
 //! CUDA graph: one launch instead of one per kernel (profiling showed a
 //! launch-bound workload, about 115 small kernels for 130 µs of GPU work).
 //! A call is a copy of the input to the device, the replay, a copy of the
-//! new state over the old one on the device, and a copy of the output back.
-//! The copies are synchronous `cudaMemcpy` calls through the CUDA runtime
-//! the provider has loaded, ordered with the replay by ONNX Runtime's
-//! synchronisation at the end of each run. (Two captured graphs swapping
+//! new state over the old one on the device, and a copy of the output back,
+//! then one wait. Everything goes on one CUDA stream of ours, which the
+//! provider runs on too, so the copies and the replay are ordered by the
+//! stream. (Synchronous `cudaMemcpy` on the default stream was not enough:
+//! TensorRT replays on a stream of its own, and the input copy or the state
+//! copy could overlap the replay; its output then drifted from the CPU's by
+//! up to 3.5 per frame, depending on timing.) (Two captured graphs swapping
 //! two state buffers would save the device copy, but replays of a session's
 //! second graph read wrong data with ONNX Runtime 1.28; one graph is exact.)
 //!
@@ -20,10 +23,10 @@ use std::ffi::{c_int, c_uint, c_void};
 use std::path::Path;
 
 use ort::memory::{AllocationDevice, Allocator, AllocatorType, MemoryInfo, MemoryType};
-use ort::session::{IoBinding, Session};
+use ort::session::{IoBinding, RunOptions, Session};
 use ort::value::Tensor;
 
-use super::{Accelerator, OnnxRuntime, SessionConfig, open_session};
+use super::{Accelerator, ComputeStream, OnnxRuntime, SessionConfig, open_session};
 use crate::AudioError;
 
 /// What a stateful model takes and gives; the batch dimension is fixed to 1
@@ -75,12 +78,16 @@ impl OnnxRuntime {
             if !self.accelerators().contains(&accelerator) {
                 continue;
             }
-            if accelerator == Accelerator::Cuda && graphs {
-                match CudaLoop::open(model, spec) {
+            if matches!(accelerator, Accelerator::Cuda | Accelerator::TensorRt) && graphs {
+                match CudaLoop::open(model, spec, accelerator) {
                     Ok(cuda) => {
                         return Ok((make(Backend::Cuda(Box::new(cuda))), Some(accelerator)));
                     }
-                    Err(e) => tracing::info!("CUDA graphs unavailable ({e}); trying plain CUDA"),
+                    Err(e) => {
+                        tracing::info!(
+                            "{accelerator:?} with CUDA graphs unavailable ({e}); trying without"
+                        )
+                    }
                 }
             }
             match HostLoop::open(model, Some(accelerator), spec) {
@@ -172,7 +179,7 @@ impl HostLoop {
         accelerator: Option<Accelerator>,
         spec: &LoopSpec<'_>,
     ) -> Result<Self, String> {
-        let session = open_session(model, accelerator, &session_config(spec, false))?;
+        let session = open_session(model, accelerator, &session_config(spec, false), None)?;
         let state = vec![0.0; state_len(&session, spec)?];
         let index = |name: &str| {
             session
@@ -220,13 +227,35 @@ impl HostLoop {
     }
 }
 
-/// The CUDA runtime's copy and fill functions, from the library the CUDA
-/// provider loaded.
+type MemcpyAsync =
+    unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_int, *mut c_void) -> c_int;
+type MemsetAsync = unsafe extern "C" fn(*mut c_void, c_int, usize, *mut c_void) -> c_int;
+type StreamCall = unsafe extern "C" fn(*mut c_void) -> c_int;
+
+/// The CUDA runtime's stream, copy and fill functions, from the library the
+/// CUDA provider loaded.
 struct Cudart {
-    memcpy: unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_int) -> c_int,
-    memset: unsafe extern "C" fn(*mut c_void, c_int, usize) -> c_int,
+    memcpy_async: MemcpyAsync,
+    memset_async: MemsetAsync,
     set_device_flags: unsafe extern "C" fn(c_uint) -> c_int,
+    stream_create: unsafe extern "C" fn(*mut *mut c_void) -> c_int,
+    stream_destroy: StreamCall,
+    stream_synchronize: StreamCall,
     _library: libloading::Library,
+}
+
+/// A CUDA stream, destroyed on drop.
+struct Stream {
+    raw: *mut c_void,
+    destroy: StreamCall,
+}
+
+impl Drop for Stream {
+    fn drop(&mut self) {
+        // SAFETY: the stream was created by `Cudart::stream` and nothing
+        // runs on it any more (its users drop first).
+        unsafe { (self.destroy)(self.raw) };
+    }
 }
 
 /// `cudaDeviceScheduleBlockingSync`: a thread waiting for the GPU sleeps
@@ -250,26 +279,17 @@ impl Cudart {
             let Ok(library) = (unsafe { libloading::Library::new(*name) }) else {
                 continue;
             };
-            // SAFETY: the signatures of cudaMemcpy and cudaMemset, unchanged
-            // in every CUDA runtime.
+            // SAFETY: the signatures of these functions, unchanged in every
+            // CUDA runtime (`cudaStream_t` is a pointer).
             unsafe {
-                let memcpy = *library
-                    .get::<unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_int) -> c_int>(
-                        b"cudaMemcpy\0",
-                    )
-                    .map_err(|e| e.to_string())?;
-                let memset = *library
-                    .get::<unsafe extern "C" fn(*mut c_void, c_int, usize) -> c_int>(
-                        b"cudaMemset\0",
-                    )
-                    .map_err(|e| e.to_string())?;
-                let set_device_flags = *library
-                    .get::<unsafe extern "C" fn(c_uint) -> c_int>(b"cudaSetDeviceFlags\0")
-                    .map_err(|e| e.to_string())?;
+                let text = |e: libloading::Error| e.to_string();
                 return Ok(Self {
-                    memcpy,
-                    memset,
-                    set_device_flags,
+                    memcpy_async: *library.get(b"cudaMemcpyAsync\0").map_err(text)?,
+                    memset_async: *library.get(b"cudaMemsetAsync\0").map_err(text)?,
+                    set_device_flags: *library.get(b"cudaSetDeviceFlags\0").map_err(text)?,
+                    stream_create: *library.get(b"cudaStreamCreate\0").map_err(text)?,
+                    stream_destroy: *library.get(b"cudaStreamDestroy\0").map_err(text)?,
+                    stream_synchronize: *library.get(b"cudaStreamSynchronize\0").map_err(text)?,
                     _library: library,
                 });
             }
@@ -277,21 +297,49 @@ impl Cudart {
         Err("no CUDA runtime library".into())
     }
 
-    /// Copies `bytes` from `src` to `dst` (`kind`: direction), waiting for it.
+    /// A new stream (a blocking one: it also waits for work on the default
+    /// stream, should anything put some there).
+    fn stream(&self) -> Result<Stream, String> {
+        let mut raw = std::ptr::null_mut();
+        // SAFETY: `raw` is a valid place for the new stream.
+        match unsafe { (self.stream_create)(&mut raw) } {
+            0 => Ok(Stream {
+                raw,
+                destroy: self.stream_destroy,
+            }),
+            code => Err(format!("cudaStreamCreate failed ({code})")),
+        }
+    }
+
+    /// Queues a copy of `bytes` from `src` to `dst` (`kind`: direction) on
+    /// `stream`. A host source may be reused when this returns (pageable
+    /// memory is staged at once); a host destination is filled when the
+    /// stream has been waited for.
     ///
     /// # Safety
-    /// Both pointers must be valid for `bytes` on their side of the copy.
+    /// Both pointers must be valid for `bytes` on their side of the copy,
+    /// a host destination until the stream has been waited for.
     unsafe fn copy(
         &self,
+        stream: &Stream,
         dst: *mut c_void,
         src: *const c_void,
         bytes: usize,
         kind: c_int,
     ) -> Result<(), String> {
         // SAFETY: as the caller guarantees.
-        match unsafe { (self.memcpy)(dst, src, bytes, kind) } {
+        match unsafe { (self.memcpy_async)(dst, src, bytes, kind, stream.raw) } {
             0 => Ok(()),
-            code => Err(format!("cudaMemcpy failed ({code})")),
+            code => Err(format!("cudaMemcpyAsync failed ({code})")),
+        }
+    }
+
+    /// Waits until everything queued on `stream` has run.
+    fn wait(&self, stream: &Stream) -> Result<(), String> {
+        // SAFETY: a valid stream.
+        match unsafe { (self.stream_synchronize)(stream.raw) } {
+            0 => Ok(()),
+            code => Err(format!("cudaStreamSynchronize failed ({code})")),
         }
     }
 }
@@ -299,14 +347,20 @@ impl Cudart {
 /// The state on the GPU, each call replaying the captured CUDA graph.
 ///
 /// Fields drop in order: the binding and buffers, then the allocator they
-/// were made with (freeing a tensor goes through it), then the session.
+/// were made with (freeing a tensor goes through it), then the session, then
+/// the stream it runs on, then the runtime library.
 struct CudaLoop {
     binding: IoBinding,
+    /// Runs without ONNX Runtime's wait at the end: `run` waits for the
+    /// stream once, after the copies (measured: the least CPU per frame of
+    /// the orders tried, and no slower).
+    no_wait: RunOptions,
     /// Device buffers: the input, the state, the constants; the binding owns
     /// the output and the next state.
     _held: Vec<Tensor<f32>>,
     _allocator: Allocator,
     session: Session,
+    stream: Stream,
     cudart: Cudart,
     input: *mut c_void,
     output: *mut c_void,
@@ -316,11 +370,11 @@ struct CudaLoop {
 }
 
 // SAFETY: the raw pointers are device addresses of tensors this struct or
-// its binding owns; nothing here is tied to a thread.
+// its binding owns, and a stream it owns; nothing here is tied to a thread.
 unsafe impl Send for CudaLoop {}
 
 impl CudaLoop {
-    fn open(model: &Path, spec: &LoopSpec<'_>) -> Result<Self, String> {
+    fn open(model: &Path, spec: &LoopSpec<'_>, accelerator: Accelerator) -> Result<Self, String> {
         let text = |e: ort::Error| e.to_string();
         let cudart = Cudart::load()?;
         // Waiting for the GPU (at the end of each run) spun the calling
@@ -334,7 +388,15 @@ impl CudaLoop {
             0 => {}
             code => tracing::info!("CUDA scheduling left as it was ({code})"),
         }
-        let session = open_session(model, Some(Accelerator::Cuda), &session_config(spec, true))?;
+        let stream = cudart.stream()?;
+        // SAFETY: the stream is destroyed after the session (field order).
+        let compute = unsafe { ComputeStream::new(stream.raw) };
+        let session = open_session(
+            model,
+            Some(accelerator),
+            &session_config(spec, true),
+            Some(compute),
+        )?;
         let state_len = state_len(&session, spec)?;
         let info = MemoryInfo::new(
             AllocationDevice::CUDA,
@@ -365,6 +427,7 @@ impl CudaLoop {
             // SAFETY: the tensor holds `value.len()` floats on the device.
             unsafe {
                 cudart.copy(
+                    &stream,
                     tensor.data_ptr_mut(),
                     value.as_ptr().cast(),
                     size_of_val(*value),
@@ -379,11 +442,15 @@ impl CudaLoop {
             .bind_output(spec.state.1, next_state)
             .map_err(text)?;
 
+        let mut no_wait = RunOptions::new().map_err(text)?;
+        no_wait.disable_device_sync().map_err(text)?;
         let mut this = Self {
             binding,
+            no_wait,
             _held: held,
             _allocator: allocator,
             session,
+            stream,
             cudart,
             input: pointers.0,
             state: pointers.1,
@@ -391,12 +458,13 @@ impl CudaLoop {
             next_state: pointers.3,
             state_bytes: state_len * size_of::<f32>(),
         };
-        // The first call runs, allocates and captures (ONNX Runtime runs the
-        // graph more than once inside it): do it here, not on the audio
-        // thread, and fail here if capture does.
+        // The first call captures the graph (ONNX Runtime runs it more than
+        // once inside that call): here, not on the audio thread, and failing
+        // here if capture does.
         this.reset()?;
         let mut scratch = vec![0.0; spec.output.1];
-        this.run(&vec![0.0; spec.input.1], &mut scratch)?;
+        let zeros = vec![0.0; spec.input.1];
+        this.run(&zeros, &mut scratch)?;
         this.reset()?;
         Ok(this)
     }
@@ -404,9 +472,11 @@ impl CudaLoop {
     fn run(&mut self, input: &[f32], output: &mut [f32]) -> Result<(), String> {
         // SAFETY: each device buffer holds the floats copied in or out: the
         // input and output lengths come from the spec the buffers were made
-        // with (checked by `OnnxLoop::run`), the state from the model.
+        // with (checked by `OnnxLoop::run`), the state from the model; the
+        // host output is not touched before the wait below.
         unsafe {
             self.cudart.copy(
+                &self.stream,
                 self.input,
                 input.as_ptr().cast(),
                 size_of_val(input),
@@ -414,29 +484,34 @@ impl CudaLoop {
             )?;
             drop(
                 self.session
-                    .run_binding(&self.binding)
+                    .run_binding_with_options(&self.binding, &self.no_wait)
                     .map_err(|e| e.to_string())?,
             );
             self.cudart.copy(
+                &self.stream,
                 self.state,
                 self.next_state,
                 self.state_bytes,
                 DEVICE_TO_DEVICE,
             )?;
             self.cudart.copy(
+                &self.stream,
                 output.as_mut_ptr().cast(),
                 self.output,
                 size_of_val(output),
                 DEVICE_TO_HOST,
-            )
+            )?;
         }
+        self.cudart.wait(&self.stream)
     }
 
     fn reset(&mut self) -> Result<(), String> {
         // SAFETY: the state buffer holds `state_bytes` bytes on the device.
-        match unsafe { (self.cudart.memset)(self.state, 0, self.state_bytes) } {
-            0 => Ok(()),
-            code => Err(format!("cudaMemset failed ({code})")),
+        match unsafe {
+            (self.cudart.memset_async)(self.state, 0, self.state_bytes, self.stream.raw)
+        } {
+            0 => self.cudart.wait(&self.stream),
+            code => Err(format!("cudaMemsetAsync failed ({code})")),
         }
     }
 }

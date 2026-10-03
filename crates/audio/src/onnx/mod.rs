@@ -50,16 +50,43 @@ impl Accelerator {
     /// Every accelerator, preferred first.
     pub const ALL: [Self; 4] = [Self::TensorRt, Self::Cuda, Self::DirectMl, Self::CoreMl];
 
-    fn dispatch(self, config: &SessionConfig<'_>) -> ExecutionProviderDispatch {
+    fn dispatch(
+        self,
+        config: &SessionConfig<'_>,
+        stream: Option<ComputeStream>,
+    ) -> ExecutionProviderDispatch {
         match self {
             // The heuristic picks convolution algorithms at once; the default
             // exhaustive search benchmarks them on the first frame (seconds).
-            Self::Cuda => ep::CUDA::default()
-                .with_conv_algorithm_search(ep::cuda::ConvAlgorithmSearch::Heuristic)
-                .with_cuda_graph(config.cuda_graph)
-                .build()
-                .error_on_failure(),
-            Self::TensorRt => ep::TensorRT::default().build().error_on_failure(),
+            Self::Cuda => {
+                let mut cuda = ep::CUDA::default()
+                    .with_conv_algorithm_search(ep::cuda::ConvAlgorithmSearch::Heuristic)
+                    .with_cuda_graph(config.cuda_graph);
+                if let Some(stream) = stream {
+                    // SAFETY: `ComputeStream::new`'s caller keeps the stream
+                    // alive as long as the session.
+                    cuda = unsafe { cuda.with_compute_stream(stream.0.cast()) };
+                }
+                cuda.build().error_on_failure()
+            }
+            // Building an engine takes seconds to minutes: it is cached (with
+            // its timing cache) for the next session on this GPU and driver.
+            Self::TensorRt => {
+                let mut trt = ep::TensorRT::default().with_cuda_graph(config.cuda_graph);
+                if let Some(stream) = stream {
+                    // SAFETY: as for CUDA above.
+                    trt = unsafe { trt.with_compute_stream(stream.0.cast()) };
+                }
+                if let Some(dir) = engine_cache_dir() {
+                    let dir = dir.to_string_lossy();
+                    trt = trt
+                        .with_engine_cache(true)
+                        .with_engine_cache_path(dir.as_ref())
+                        .with_timing_cache(true)
+                        .with_timing_cache_path(dir.as_ref());
+                }
+                trt.build().error_on_failure()
+            }
             Self::DirectMl => ep::DirectML::default().build().error_on_failure(),
             Self::CoreMl => ep::CoreML::default().build().error_on_failure(),
         }
@@ -127,6 +154,61 @@ pub fn default_cuda_dir() -> Option<PathBuf> {
     dir.is_dir().then_some(dir)
 }
 
+/// Where `scripts/fetch-tensorrt.sh` put TensorRT, or
+/// `TESSERA_TENSORRT_DIR`; `None` when neither exists (a system install is
+/// then used, if any).
+pub fn default_tensorrt_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("TESSERA_TENSORRT_DIR") {
+        return Some(PathBuf::from(dir));
+    }
+    let dir = cache_root()?.join("tessera/cuda/tensorrt-10.16.1/lib");
+    dir.is_dir().then_some(dir)
+}
+
+/// Where TensorRT engines built for this machine are kept.
+fn engine_cache_dir() -> Option<PathBuf> {
+    let dir = cache_root()?.join("tessera/tensorrt-engines");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+fn cache_root() -> Option<PathBuf> {
+    std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+}
+
+/// TensorRT's libraries, dependencies first; the engine builder's resources
+/// (one per GPU architecture, found by name) go between the runtime and its
+/// plugins, as NVIDIA's own loader loads everything in the directory.
+#[cfg(target_os = "linux")]
+fn preload_tensorrt(dir: &Path) {
+    let mut names = vec!["libnvinfer.so.10".to_owned()];
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        let mut resources: Vec<String> = entries
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|n| n.starts_with("libnvinfer_builder_resource_") && !n.contains("_win_"))
+            .collect();
+        resources.sort();
+        names.extend(resources);
+    }
+    names.extend([
+        "libnvinfer_plugin.so.10".into(),
+        "libnvonnxparser.so.10".into(),
+    ]);
+    for name in names {
+        let path = dir.join(&name);
+        if !path.exists() {
+            tracing::debug!("{name} not in {}", dir.display());
+            continue;
+        }
+        if let Err(e) = ort::util::preload_dylib(&path) {
+            tracing::warn!("could not preload {name}: {e}");
+            return;
+        }
+    }
+}
+
 /// NVIDIA's libraries the CUDA 13 provider loads, dependencies first (as
 /// ONNX Runtime's own Python preloader orders them).
 #[cfg(target_os = "linux")]
@@ -183,6 +265,12 @@ impl OnnxRuntime {
             {
                 preload_cuda(&cuda);
             }
+            #[cfg(target_os = "linux")]
+            if dir.join("libonnxruntime_providers_tensorrt.so").exists()
+                && let Some(tensorrt) = default_tensorrt_dir()
+            {
+                preload_tensorrt(&tensorrt);
+            }
             let builder = ort::init_from(dir.join(library_name())).map_err(|e| e.to_string())?;
             if !builder.with_name("tessera").commit() {
                 tracing::debug!("ONNX Runtime environment was already set up");
@@ -226,7 +314,7 @@ impl OnnxRuntime {
         prefer: &[Accelerator],
         config: &SessionConfig<'_>,
     ) -> Result<(OnnxSession, Option<Accelerator>), AudioError> {
-        let open = |accelerator| open_session(model, accelerator, config);
+        let open = |accelerator| open_session(model, accelerator, config, None);
         for &accelerator in prefer {
             if !self.accelerators.contains(&accelerator) {
                 continue;
@@ -245,10 +333,25 @@ impl OnnxRuntime {
 }
 
 /// Opens `model` on `accelerator` (`None`: the CPU) as `config` says.
+/// A CUDA stream for a session's CUDA and TensorRT providers to run on
+/// (`cudaStream_t`).
+#[derive(Clone, Copy)]
+pub(crate) struct ComputeStream(*mut std::ffi::c_void);
+
+impl ComputeStream {
+    /// # Safety
+    /// `stream` must be a CUDA stream that outlives every session opened
+    /// with it.
+    pub(crate) unsafe fn new(stream: *mut std::ffi::c_void) -> Self {
+        Self(stream)
+    }
+}
+
 pub(crate) fn open_session(
     model: &Path,
     accelerator: Option<Accelerator>,
     config: &SessionConfig<'_>,
+    stream: Option<ComputeStream>,
 ) -> Result<Session, String> {
     // One stream of 10 ms frames: the calling thread runs the graph (no
     // pool), and nothing spins between calls. The default pool keeps a
@@ -266,8 +369,22 @@ pub(crate) fn open_session(
             .map_err(|e| e.to_string())?;
     }
     if let Some(accelerator) = accelerator {
+        // TensorRT runs what it supports; CUDA takes any node it does not.
+        let fallback = (accelerator == Accelerator::TensorRt).then(|| {
+            Accelerator::Cuda.dispatch(
+                &SessionConfig {
+                    cuda_graph: false,
+                    ..config.clone()
+                },
+                stream,
+            )
+        });
         builder = builder
-            .with_execution_providers([accelerator.dispatch(config)])
+            .with_execution_providers(
+                std::iter::once(accelerator.dispatch(config, stream))
+                    .chain(fallback)
+                    .collect::<Vec<_>>(),
+            )
             .map_err(|e| e.to_string())?;
     }
     builder.commit_from_file(model).map_err(|e| e.to_string())

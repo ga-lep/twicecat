@@ -34,9 +34,12 @@ mod imp {
     use super::*;
     use tessera_audio::onnx::{Accelerator, OnnxRuntime, default_runtime_dir};
 
-    /// Tried in this order. TensorRT is left out until measured (it builds
-    /// an engine for the GPU on first use, which takes long).
-    const PREFER: [Accelerator; 3] = [
+    /// Tried in this order. TensorRT first: on an RTX 5090 it runs a frame in
+    /// 0.13 ms for 16 µs of CPU, against 0.36 ms and 76 µs with CUDA. Its
+    /// first use on a machine builds an engine for the GPU (about 20 s,
+    /// cached after); without its libraries it fails at once and CUDA runs.
+    const PREFER: [Accelerator; 4] = [
+        Accelerator::TensorRt,
         Accelerator::Cuda,
         Accelerator::DirectMl,
         Accelerator::CoreMl,

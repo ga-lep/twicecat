@@ -1,0 +1,5 @@
+# NVIDIA TensorRT 10 runtime for scripts/fetch-tensorrt.sh: the latest 10.x,
+# the major ONNX Runtime 1.28's TensorRT provider links against
+# (libnvinfer.so.10). <sha256> <arch> <url>; digests from NVIDIA's package
+# index. NVIDIA proprietary licence.
+91142c8ab3c58bed213cf1a563a6eb4e4f0ac529d05b5f909073acece0e3b712  x86_64  https://pypi.nvidia.com/tensorrt-cu13-libs/tensorrt_cu13_libs-10.16.1.11-py3-none-manylinux_2_28_x86_64.whl
