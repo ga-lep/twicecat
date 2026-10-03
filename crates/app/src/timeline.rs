@@ -50,10 +50,14 @@ const MAX_ESTIMATED_LINES: usize = 500;
 
 const LINE_H: f32 = 20.0;
 const HEADER_H: f32 = 22.0;
-const TOP_PAD: f32 = 8.0;
-const CONTINUATION_PAD: f32 = 2.0;
-const INDENT_PX: f32 = 64.0;
-const SIDE_PAD_PX: f32 = 16.0;
+/// Space above a row that starts with a header.
+pub const TOP_PAD: f32 = 8.0;
+/// Space above a continuation row.
+pub const CONTINUATION_PAD: f32 = 2.0;
+/// Left margin of the content column (room for the header and avatar).
+pub const INDENT_PX: f32 = 64.0;
+/// Right margin of the content column.
+pub const SIDE_PAD_PX: f32 = 16.0;
 const CHAR_W: f32 = 7.5;
 const MIN_CHARS_PER_LINE: usize = 8;
 const BLOCK_GAP: f32 = 6.0;
@@ -61,10 +65,14 @@ const REPLY_H: f32 = 44.0;
 const REACTIONS_H: f32 = 30.0;
 const RECEIPTS_H: f32 = 18.0;
 const FAILURE_H: f32 = 22.0;
-const DIVIDER_H: f32 = 36.0;
-const STATE_H: f32 = 28.0;
-const MARKER_H: f32 = 24.0;
-const START_H: f32 = 40.0;
+/// Height of a day divider row.
+pub const DIVIDER_H: f32 = 36.0;
+/// Estimated height of a state event row.
+pub const STATE_H: f32 = 28.0;
+/// Height of the read marker row.
+pub const MARKER_H: f32 = 24.0;
+/// Height of the start-of-room row.
+pub const START_H: f32 = 40.0;
 const RULE_H: f32 = 8.0;
 
 fn clean_width(width: f32) -> f32 {
@@ -161,6 +169,10 @@ fn rich_height(content: &RichText, body: &str, cpl: usize) -> f32 {
 /// `continuation` rows have no header and less padding. The estimate grows
 /// with the text, and is finite for any `width`.
 pub fn estimate_height(item: &TimelineItem, continuation: bool, width: f32) -> f32 {
+    estimate_unclamped(item, continuation, width).min(MAX_MEASURED_PX)
+}
+
+fn estimate_unclamped(item: &TimelineItem, continuation: bool, width: f32) -> f32 {
     let lead = if continuation {
         CONTINUATION_PAD
     } else {
@@ -1642,5 +1654,12 @@ mod tests {
                 },
             ]
         });
+    }
+
+    #[test]
+    fn the_estimate_is_capped_however_many_blocks_there_are() {
+        let blocks = (0..5_000).map(|_| text_block(10_000)).collect();
+        let item = msg_with("a", "@a:x", 0, rich(blocks));
+        assert_eq!(estimate_height(&item, false, 800.0), MAX_MEASURED_PX);
     }
 }

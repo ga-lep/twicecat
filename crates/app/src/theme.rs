@@ -48,6 +48,8 @@ pub struct Semantic {
     pub muted: Color,
     /// Background of the selected row.
     pub selection: Color,
+    /// Background of a timeline message that mentions the user.
+    pub message_highlight: Color,
 }
 
 /// Semantic colours of the light theme.
@@ -58,6 +60,7 @@ pub const LIGHT_SEMANTIC: Semantic = Semantic {
     highlight_text: color!(0xFFFFFF),
     muted: color!(0x59636E),
     selection: color!(0xDDE1FA),
+    message_highlight: color!(0xFFF1B8),
 };
 
 /// Semantic colours of the dark theme.
@@ -68,6 +71,7 @@ pub const DARK_SEMANTIC: Semantic = Semantic {
     highlight_text: color!(0xFFFFFF),
     muted: color!(0xA0A4AB),
     selection: color!(0x35385A),
+    message_highlight: color!(0x3D3519),
 };
 
 /// The theme for a system mode. `Mode::None` is light.
@@ -153,6 +157,13 @@ mod tests {
                 ),
                 ("muted/background", sem.muted, palette.background),
                 ("text/selection", palette.text, sem.selection),
+                (
+                    "text/message highlight",
+                    palette.text,
+                    sem.message_highlight,
+                ),
+                ("muted/message highlight", sem.muted, sem.message_highlight),
+                ("primary/background", palette.primary, palette.background),
             ];
             for (what, fg, bg) in checks {
                 let ratio = contrast(fg, bg);

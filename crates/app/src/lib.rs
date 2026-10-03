@@ -5,6 +5,7 @@
 
 pub mod avatars;
 pub mod bridge;
+pub mod dates;
 pub mod room_list;
 pub mod screens;
 pub mod state;
