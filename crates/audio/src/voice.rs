@@ -112,6 +112,7 @@ enum Command {
     Loopback(bool),
     MasterVolume(u16),
     AddSource(Box<Source>),
+    Enhancer(Option<Box<dyn crate::chain::Enhancer>>),
     SourceVolume(SourceId, u16),
     RemoveSource(SourceId),
 }
@@ -183,6 +184,12 @@ impl VoiceControl {
     /// (the processing thread is stuck); retry later.
     pub fn configure(&mut self, settings: ChainSettings) -> bool {
         self.send(Command::Configure(settings))
+    }
+
+    /// Plugs a speech enhancer (loaded off this thread) into the chain, or
+    /// removes it; it runs while the noise mode is `NoiseMode::Enhancer`.
+    pub fn set_enhancer(&mut self, enhancer: Option<Box<dyn crate::Enhancer>>) -> bool {
+        self.send(Command::Enhancer(enhancer))
     }
 
     /// Push-to-talk key state.
@@ -363,6 +370,7 @@ impl VoiceEngine {
         while let Ok(command) = self.commands.pop() {
             match command {
                 Command::Configure(s) => self.chain.configure(s),
+                Command::Enhancer(e) => self.chain.set_enhancer(e),
                 Command::PushToTalk(p) => self.chain.set_push_to_talk(p),
                 Command::Muted(m) => self.muted = m,
                 Command::Deafened(d) => self.deafened = d,

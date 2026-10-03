@@ -78,7 +78,9 @@ AUDIO SETTINGS (saved; take effect at the next call or mic test):
     /input <n|default>    Choose the microphone (index from /devices)
     /output <n|default>   Choose the speakers
     /ns off|rnnoise|webrtc [low|moderate|high|very_high]|deepfilter [dB]
-                          Noise suppression
+                          Noise suppression: one of them, or off (they do
+                          not stack; processing outside Tessera, such as
+                          NVIDIA Broadcast, is up to you)
     /aec [on|off]         Echo cancellation
     /aec system [on|off]  Also cancel other apps' sound (a game) picked up by
                           the microphone (Linux with PipeWire)

@@ -8,6 +8,7 @@ mod chain;
 mod convert;
 mod denormals;
 mod devices;
+mod dfn;
 mod frame;
 mod gate;
 mod io;
@@ -18,10 +19,12 @@ mod resample;
 mod voice;
 
 pub use chain::{
-    CaptureChain, CaptureResult, ChainSettings, ChainStats, LEVEL_FLOOR_DB, NoiseMode, NsLevel,
+    CaptureChain, CaptureResult, ChainSettings, ChainStats, Enhancer, LEVEL_FLOOR_DB, NoiseMode,
+    NsLevel,
 };
 pub use denormals::flush_denormals_on_this_thread;
 pub use devices::{DeviceInfo, DeviceList, DeviceWatcher, list_devices};
+pub use dfn::{DeepFilter, default_model_dir};
 pub use frame::{FRAME_LEN, Frame, SAMPLE_RATE, SILENCE};
 pub use gate::GateMode;
 pub use io::{AudioIo, IoConfig, IoEvent, IoInfo, StreamInfo, VirtualDevice};
@@ -59,6 +62,9 @@ pub enum AudioError {
     /// The resampler could not be set up or failed.
     #[error("audio resampling failed")]
     Resampler,
+    /// A noise suppression model is missing or could not be loaded.
+    #[error("the noise suppression model could not be loaded")]
+    Model,
     /// Any other backend failure.
     #[error("the audio backend failed")]
     Backend,

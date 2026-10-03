@@ -14,6 +14,11 @@ sonora = "=0.2.0"
 nnnoiseless = { version = "=0.5.2", default-features = false }
 thiserror = "2"
 tracing = "0.1"
+# DeepFilterNet3 (Task 13): its ONNX graphs, run frame by frame with their
+# state by tract-pulse; the STFT and features are ours (crate::dfn).
+tract-onnx = "=0.23.8"
+tract-pulse = "=0.23.8"
+realfft = "3"
 
 # Linux: our own PipeWire client (src/pw, plan decision 12): call-role
 # streams in the graph's real-time cycle, devices and changes from the

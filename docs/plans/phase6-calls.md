@@ -284,13 +284,13 @@ Each task follows the full Phase 1 gate: fmt, clippy -D warnings, tests, `check-
    - `--silent-audio` runs calls on silent virtual devices (tests, scripts); without it a call opens the system microphone and speakers.
    - Tests: the parser, settings edits, devices, the in-call state, push-to-talk and rings as unit tests (`calls.rs`); `tests/cli.rs` joins a call from the CLI against the local stack, mutes (and sees itself muted in `/who`), leaves, quits, and checks that the membership is gone.
 
-13. **DeepFilterNet3 via tract-onnx.**
-   - `scripts/fetch-models.sh` fetches the DeepFilterNet3 ONNX export, pinned by SHA-256 like libwebrtc, with the MIT/Apache licence recorded.
-   - `tessera-audio` implements the DF3 pipeline: STFT (960/480 at 48 kHz), ERB and complex features with the normalisation, the encoder/ERB-decoder/DF-decoder graphs in tract, ERB gain application, the deep-filter stage, and ISTFT with an overlap-add hop of 480. The math is studied from upstream libDF (MIT/Apache), not copied wholesale; any copied block keeps its licence header.
-   - Exposed as `NoiseSuppression::DeepFilter { attenuation_limit_db }`.
-   - **Pluggable enhancer** (added 2026-10-03, for Task 13b): the noise-suppression stage sits behind one trait (`process(&mut [f32; 480])`, a reported per-frame cost, a fallback), so a GPU or vendor backend slots in without touching the chain. RNNoise, WebRTC NS and DeepFilterNet on the CPU are the first implementations.
-   - **Already-processed inputs** (added 2026-10-03): an input that is known to be processed already (NVIDIA Broadcast's virtual microphone on Windows, matched by device name) skips our noise suppression by default, so the voice is not cleaned twice. Whether AEC3 stays on for it is decided by ear (human item).
-   - Tests: the model loads; output on speech plus noise improves SNR by at least the RNNoise result on the same fixture; the per-frame cost is recorded on x86_64 and aarch64; the fallback is RNNoise if the model files are missing.
+13. **DeepFilterNet3 via tract-onnx** (as built; DeepFilterNet v0.5.6 libDF studied, tract 0.23.8 read in the registry).
+   - **Models:** `scripts/fetch-models.sh` downloads `DeepFilterNet3_onnx.tar.gz` from Rikorose/DeepFilterNet at commit 978576aa (tag v0.5.6), checks the SHA-256 in `scripts/models.sha256`, and unpacks `enc.onnx`, `erb_dec.onnx`, `df_dec.onnx`, `config.ini` and a `SOURCE` note (MIT OR Apache-2.0) into `${TESSERA_MODEL_CACHE:-$XDG_CACHE_HOME/tessera/models}/deepfilternet3`. `TESSERA_MODEL_DIR` overrides where the runtime looks.
+   - **Runtime** (`tessera-audio::dfn`): our own STFT (Vorbis window, 960/480), ERB features with exponential mean normalisation, unit-normalised complex features, ERB gains and the order-5 deep filter (`dsp.rs`), and the three graphs loaded with tract-onnx and pulsed to one frame by **tract-pulse** (`model.rs`; added with the human's approval on 2026-10-03, same release and licence as tract-onnx), so each call advances the convolution buffers and GRU states. Latency 30 ms (one hop plus a two-frame lookahead). Local-SNR thresholds −15/35/35 dB, as upstream's `deep-filter` binary (the library's −10/30/20 measured far worse). The attenuation limit mixes the noisy signal back.
+   - **Pluggable enhancer:** `tessera-audio::Enhancer` (`enhance`, `latency_samples`), `NoiseMode::Enhancer` and `VoiceControl::set_enhancer`: the model is loaded off the processing thread and handed over; RNNoise runs until then, if the model is missing, and if the enhancer fails. Task 13b's GPU backend implements the same trait.
+   - **Processing outside Tessera** (human decision 2026-10-03, replacing the planned detection of already-processed inputs): NVIDIA Broadcast, Krisp or a virtual PipeWire source are not detected. Our settings only cover our own stack, and the user decides whether ours runs on top (off, WebRTC, RNNoise or DeepFilterNet3). The settings document what combines (high-pass, AEC, one noise suppressor, AGC) and what excludes (one noise suppressor at a time; `cancel_system_audio` needs AEC); the UI must show the same.
+   - **Core:** `NoiseSuppression::DeepFilter { attenuation_limit_db }` maps to the enhancer; the session loads the model in a blocking task (again when the limit changes) and reports a missing model as an `Audio` error, with RNNoise in use.
+   - Tests: DSP unit tests (ERB widths, STFT reconstruction, features, deep filter), config parsing, stage thresholds, the enhancer plumbing with a fake enhancer; with the fetched models (ignored, local gate): latency, cost per frame, white noise against RNNoise, the chain with DeepFilterNet plugged in, and SI-SDR on real speech when `TESSERA_SPEECH_WAV`/`TESSERA_NOISE_WAV` are set (recordings carry their own licences; not shipped).
 
 13b. **GPU speech enhancement, opt-in** (added 2026-10-03, human request: "like NVIDIA Broadcast", optional, depending on hardware).
    - **Off by default; offered only when the hardware is there.** A capability probe at start lists the usable GPU backends; the setting is hidden without one. The CPU path stays the default everywhere, and the Steam Frame never uses the GPU (the VR game owns it).
@@ -327,6 +327,8 @@ Each task follows the full Phase 1 gate: fmt, clippy -D warnings, tests, `check-
 | sonora | =0.2.0 | BSD-3-Clause | audio | 5 |
 | nnnoiseless | =0.5.2 | BSD-3-Clause | audio | 5 |
 | tract-onnx | =0.23.8 | MIT OR Apache-2.0 | audio | 13 |
+| tract-pulse (added 2026-10-03, human approval) | =0.23.8 | MIT OR Apache-2.0 | audio | 13 |
+| realfft (already in the tree) | 3 (3.5.0) | MIT | audio | 13 |
 | global-hotkey | =0.8.0 | Apache-2.0 OR MIT | ptt | 11 |
 | ashpd | =0.13.13 | MIT | ptt | 11 |
 | gilrs | =0.11.2 | Apache-2.0 OR MIT | ptt | 11 |
@@ -350,7 +352,7 @@ Recorded so the reasoning is not lost; none is planned.
 - [ ] Cross-homeserver call (Task 8b): members on two homeservers with their own call services hear each other (the subscribe-only token path for a non-full-access homeserver cannot be exercised with the single local Synapse).
 - [ ] Double talk by ear: talking while others talk, on open speakers and headphones. In a virtual test without any echo path, AEC3 cut a member's microphone to near silence while loud audio played on their speakers (Task 8b notes).
 - [ ] Ringing (Task 10) with Element Web and Element X, both directions: a DM call rings and shows the caller, a group call notifies quietly, declining on one side stops the ring on the other, answering on another device stops it here.
-- [ ] GPU enhancement (Task 13b): each offered backend on real hardware (NVIDIA, and AMD where available), by ear and with the recorded latency; the fallback when the GPU is busy with a game; NVIDIA Broadcast's microphone detected on Windows (Task 13).
+- [ ] GPU enhancement (Task 13b): each offered backend on real hardware (NVIDIA, and AMD where available), by ear and with the recorded latency; the fallback when the GPU is busy with a game.
 - [ ] Global PTT hotkey on X11, Wayland (KDE/GNOME portal), Windows and macOS; gamepad PTT.
 - [ ] Steam Frame: aarch64 build runs on the device (desktop mode and game mode); built-in mic and speakers with AEC; game audio cancelled with the system-mix reference (Task 14); PipeWire device switching; CPU/battery cost of each NS mode within the Task 15 budget while a standalone VR game runs; rtkit real-time priority granted.
 - [ ] CLI call against a real account; leave by crash (kill -9) clears the membership within the delayed-event timeout.

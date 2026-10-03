@@ -162,7 +162,7 @@ pub enum NsLevel {
     VeryHigh,
 }
 
-/// Which noise suppressor runs on the microphone.
+/// Which noise suppressor runs on the microphone: exactly one, or none.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum NoiseSuppression {
@@ -183,7 +183,19 @@ pub enum NoiseSuppression {
     },
 }
 
-/// Microphone processing before sending.
+/// Microphone processing before sending, in this order: high-pass, echo
+/// cancellation, noise suppression, automatic gain.
+///
+/// What combines and what excludes:
+/// - `high_pass`, `echo_cancellation`, `noise_suppression` and `auto_gain`
+///   are independent stages and run together.
+/// - `noise_suppression` picks exactly one suppressor (or none): WebRTC,
+///   RNNoise and DeepFilterNet3 never run on top of each other.
+/// - `cancel_system_audio` extends echo cancellation and does nothing
+///   without it.
+/// - Processing done outside Tessera (NVIDIA Broadcast, a virtual
+///   PipeWire source, Krisp) is the user's choice: it is not detected, and
+///   ours runs on top of it unless turned off here.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AudioProcessing {

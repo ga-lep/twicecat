@@ -6,8 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tessera_audio::{
-    AudioIo, ChainSettings, Frame, GateMode, IoConfig, IoEvent, NoiseMode, NsLevel as AudioNsLevel,
-    Outgoing, SourceId, SourceInput, VirtualDevice, VoiceControl, VoiceEngine,
+    AudioIo, ChainSettings, DeepFilter, Frame, GateMode, IoConfig, IoEvent, NoiseMode,
+    NsLevel as AudioNsLevel, Outgoing, SourceId, SourceInput, VirtualDevice, VoiceControl,
+    VoiceEngine,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -22,9 +23,9 @@ const LEVEL_INTERVAL: Duration = Duration::from_millis(50);
 /// `AudioStats` every this many level ticks (1 Hz).
 const STATS_EVERY: u32 = 20;
 
-/// The processing settings for `settings`. DeepFilterNet arrives in Task 13;
-/// until then it falls back to RNNoise, as `NoiseSuppression::DeepFilter`
-/// documents for a missing model.
+/// The processing settings for `settings`. DeepFilterNet runs as the
+/// chain's plugged enhancer, RNNoise until its model is loaded (or when it
+/// is missing).
 pub(crate) fn chain_settings(settings: &AudioSettings) -> ChainSettings {
     let p = &settings.processing;
     ChainSettings {
@@ -39,7 +40,8 @@ pub(crate) fn chain_settings(settings: &AudioSettings) -> ChainSettings {
                 NsLevel::High => AudioNsLevel::High,
                 NsLevel::VeryHigh => AudioNsLevel::VeryHigh,
             }),
-            NoiseSuppression::RnNoise | NoiseSuppression::DeepFilter { .. } => NoiseMode::RnNoise,
+            NoiseSuppression::RnNoise => NoiseMode::RnNoise,
+            NoiseSuppression::DeepFilter { .. } => NoiseMode::Enhancer,
         },
         gate: match settings.input_mode {
             InputMode::VoiceActivity {
@@ -114,6 +116,9 @@ pub(crate) struct AudioSession {
     control: Voice,
     mode: Mode,
     io_config: IoConfig,
+    /// The attenuation limit of the DeepFilterNet loaded or loading.
+    enhancer: Arc<Mutex<Option<f32>>>,
+    events: mpsc::Sender<CoreEvent>,
     stop: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<()>>,
 }
@@ -148,17 +153,66 @@ impl AudioSession {
             Mode::Call => (None, Some(outgoing)),
         };
         let (stop_tx, stop_rx) = oneshot::channel();
-        let task = tokio::spawn(report(io, drain, control.clone(), events, stop_rx));
-        Ok((
-            Self {
-                control,
-                mode,
-                io_config,
-                stop: Some(stop_tx),
-                task: Some(task),
-            },
-            handed_out,
-        ))
+        let task = tokio::spawn(report(io, drain, control.clone(), events.clone(), stop_rx));
+        let session = Self {
+            control,
+            mode,
+            io_config,
+            enhancer: Arc::new(Mutex::new(None)),
+            events,
+            stop: Some(stop_tx),
+            task: Some(task),
+        };
+        session.load_enhancer(settings);
+        Ok((session, handed_out))
+    }
+
+    /// Loads DeepFilterNet3 off the async threads when the settings ask for
+    /// it (and its attenuation limit changed), then plugs it in; RNNoise
+    /// runs meanwhile, and stays if the model is missing.
+    fn load_enhancer(&self, settings: &AudioSettings) {
+        let NoiseSuppression::DeepFilter {
+            attenuation_limit_db,
+        } = settings.processing.noise_suppression
+        else {
+            return;
+        };
+        {
+            let mut loaded = self.enhancer.lock().expect("enhancer lock");
+            if *loaded == Some(attenuation_limit_db) {
+                return;
+            }
+            *loaded = Some(attenuation_limit_db);
+        }
+        let control = self.control.clone();
+        let marker = self.enhancer.clone();
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            let loaded = tokio::task::spawn_blocking(move || {
+                let dir =
+                    tessera_audio::default_model_dir().ok_or(tessera_audio::AudioError::Model)?;
+                DeepFilter::load(&dir, attenuation_limit_db)
+            })
+            .await;
+            match loaded {
+                Ok(Ok(filter)) => {
+                    let _ = control
+                        .lock()
+                        .expect("voice control lock")
+                        .set_enhancer(Some(Box::new(filter)));
+                }
+                _ => {
+                    *marker.lock().expect("enhancer lock") = None;
+                    let _ = events
+                        .send(CoreEvent::Error(CoreError::Audio(
+                            "DeepFilterNet's model could not be loaded (scripts/fetch-models.sh \
+                             installs it); RNNoise is used instead"
+                                .into(),
+                        )))
+                        .await;
+                }
+            }
+        });
     }
 
     /// Applies new settings. Returns false when the devices changed, so the
@@ -167,9 +221,12 @@ impl AudioSession {
         if io_config(settings, self.io_config.playback) != self.io_config {
             return false;
         }
-        let mut control = self.control.lock().expect("voice control lock");
-        control.configure(chain_settings(settings));
-        control.set_master_volume(settings.output_volume_percent);
+        {
+            let mut control = self.control.lock().expect("voice control lock");
+            control.configure(chain_settings(settings));
+            control.set_master_volume(settings.output_volume_percent);
+        }
+        self.load_enhancer(settings);
         true
     }
 
@@ -348,11 +405,13 @@ mod tests {
     }
 
     #[test]
-    fn deep_filter_falls_back_to_rnnoise_for_now() {
+    fn deep_filter_runs_as_the_enhancer() {
         let mut settings = AudioSettings::default();
         settings.processing.noise_suppression = NoiseSuppression::DeepFilter {
             attenuation_limit_db: 40.0,
         };
+        assert_eq!(chain_settings(&settings).noise, NoiseMode::Enhancer);
+        settings.processing.noise_suppression = NoiseSuppression::RnNoise;
         assert_eq!(chain_settings(&settings).noise, NoiseMode::RnNoise);
     }
 

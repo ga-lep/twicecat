@@ -1,8 +1,9 @@
 //! The microphone processing chain, run once per 10 ms frame on the
 //! processing thread:
 //!
-//! high-pass → AEC3 → noise suppression (WebRTC NS or RNNoise) → AGC2 →
-//! input gain → transmit gate → limiter → level meter.
+//! high-pass → AEC3 → noise suppression (WebRTC NS, RNNoise, or a plugged
+//! [`Enhancer`] such as DeepFilterNet3) → AGC2 → input gain → transmit gate
+//! → limiter → level meter.
 //!
 //! Echo cancellation, high-pass and WebRTC NS run in one sonora instance
 //! ("front"); AGC2 runs in a second one ("back") so that RNNoise, between
@@ -17,8 +18,21 @@ use sonora::config::{
 };
 use sonora::{AudioProcessing, Config, StreamConfig};
 
+use crate::AudioError;
 use crate::frame::{FRAME_LEN, Frame, SAMPLE_RATE};
 use crate::gate::{Gate, GateMode};
+
+/// A speech enhancer plugged into the chain in place of the built-in noise
+/// suppressors ([`NoiseMode::Enhancer`]): DeepFilterNet3 on the CPU today, a
+/// GPU backend later (plan Task 13b). Loaded off the processing thread, then
+/// handed over with [`crate::VoiceControl::set_enhancer`].
+pub trait Enhancer: Send + 'static {
+    /// Cleans one frame in place. An error removes the enhancer and the
+    /// chain falls back to RNNoise.
+    fn enhance(&mut self, frame: &mut Frame) -> Result<(), AudioError>;
+    /// How late its output is, in samples.
+    fn latency_samples(&self) -> usize;
+}
 
 /// Strength of the WebRTC noise suppressor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,6 +56,8 @@ pub enum NoiseMode {
     WebRtc(NsLevel),
     /// RNNoise.
     RnNoise,
+    /// The plugged [`Enhancer`]; RNNoise until one is plugged in.
+    Enhancer,
 }
 
 /// Settings of the chain; every field can change while it runs.
@@ -134,7 +150,7 @@ fn front_config(s: &ChainSettings) -> Config {
                 },
                 ..NoiseSuppression::default()
             }),
-            NoiseMode::Off | NoiseMode::RnNoise => None,
+            NoiseMode::Off | NoiseMode::RnNoise | NoiseMode::Enhancer => None,
         },
         ..Config::default()
     }
@@ -145,7 +161,7 @@ fn front_config(s: &ChainSettings) -> Config {
 fn front_key(s: &ChainSettings) -> (bool, bool, Option<NsLevel>) {
     let ns = match s.noise {
         NoiseMode::WebRtc(level) => Some(level),
-        NoiseMode::Off | NoiseMode::RnNoise => None,
+        NoiseMode::Off | NoiseMode::RnNoise | NoiseMode::Enhancer => None,
     };
     (s.echo_cancellation, s.high_pass, ns)
 }
@@ -212,6 +228,7 @@ pub struct CaptureChain {
     front: AudioProcessing,
     back: AudioProcessing,
     rnnoise: Option<Box<DenoiseState<'static>>>,
+    enhancer: Option<Box<dyn Enhancer>>,
     gate: Gate,
     limiter: Limiter,
     scratch: Frame,
@@ -224,7 +241,9 @@ impl CaptureChain {
         Self {
             front: apm(front_config(&settings)),
             back: apm(back_config(&settings)),
-            rnnoise: (settings.noise == NoiseMode::RnNoise).then(DenoiseState::new),
+            rnnoise: matches!(settings.noise, NoiseMode::RnNoise | NoiseMode::Enhancer)
+                .then(DenoiseState::new),
+            enhancer: None,
             gate: Gate::new(settings.gate),
             limiter: Limiter { gain: 1.0 },
             scratch: [0.0; FRAME_LEN],
@@ -241,13 +260,35 @@ impl CaptureChain {
         if settings.auto_gain != self.settings.auto_gain {
             self.back.apply_config(back_config(&settings));
         }
-        match (settings.noise == NoiseMode::RnNoise, self.rnnoise.is_some()) {
+        self.settings = settings;
+        self.update_rnnoise();
+        self.gate.set_mode(settings.gate);
+    }
+
+    /// Plugs an enhancer in (or out). It runs while the noise mode is
+    /// [`NoiseMode::Enhancer`].
+    pub fn set_enhancer(&mut self, enhancer: Option<Box<dyn Enhancer>>) {
+        self.enhancer = enhancer;
+        self.update_rnnoise();
+    }
+
+    /// Whether an enhancer is plugged in.
+    pub fn has_enhancer(&self) -> bool {
+        self.enhancer.is_some()
+    }
+
+    /// RNNoise runs when chosen, and in place of a missing enhancer.
+    fn update_rnnoise(&mut self) {
+        let wanted = match self.settings.noise {
+            NoiseMode::RnNoise => true,
+            NoiseMode::Enhancer => self.enhancer.is_none(),
+            NoiseMode::Off | NoiseMode::WebRtc(_) => false,
+        };
+        match (wanted, self.rnnoise.is_some()) {
             (true, false) => self.rnnoise = Some(DenoiseState::new()),
             (false, true) => self.rnnoise = None,
             _ => {}
         }
-        self.gate.set_mode(settings.gate);
-        self.settings = settings;
     }
 
     /// The current settings.
@@ -281,6 +322,14 @@ impl CaptureChain {
             .process_capture_f32(&[&src[..]], &mut [&mut frame[..]]);
 
         let mut voice = None;
+        if self.settings.noise == NoiseMode::Enhancer
+            && let Some(enhancer) = self.enhancer.as_mut()
+            && enhancer.enhance(frame).is_err()
+        {
+            tracing::warn!("the speech enhancer failed; RNNoise takes over");
+            self.enhancer = None;
+            self.update_rnnoise();
+        }
         if let Some(rn) = self.rnnoise.as_mut() {
             for (dst, s) in self.rn_in.iter_mut().zip(frame.iter()) {
                 *dst = s * 32768.0;
@@ -442,6 +491,72 @@ mod tests {
     fn webrtc_ns_suppresses_stationary_noise() {
         let r = noise_reduction_db(NoiseMode::WebRtc(NsLevel::High));
         assert!(r >= 10.0, "WebRTC NS reduction {r:.1} dB");
+    }
+
+    /// Halves the signal, or fails after `fail_after` frames.
+    struct Half {
+        calls: std::sync::Arc<std::sync::atomic::AtomicU32>,
+        fail_after: u32,
+    }
+
+    impl Enhancer for Half {
+        fn enhance(&mut self, frame: &mut Frame) -> Result<(), AudioError> {
+            let n = self
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n >= self.fail_after {
+                return Err(AudioError::Internal);
+            }
+            for s in frame.iter_mut() {
+                *s *= 0.5;
+            }
+            Ok(())
+        }
+        fn latency_samples(&self) -> usize {
+            0
+        }
+    }
+
+    #[test]
+    fn a_plugged_enhancer_runs_rnnoise_stands_in_and_takes_over_on_failure() {
+        let settings = ChainSettings {
+            echo_cancellation: false,
+            high_pass: false,
+            auto_gain: false,
+            noise: NoiseMode::Enhancer,
+            gate: open_gate(),
+            input_gain_db: 0.0,
+        };
+        let mut chain = CaptureChain::new(settings);
+        assert!(
+            chain.rnnoise.is_some(),
+            "RNNoise until an enhancer is plugged in"
+        );
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        chain.set_enhancer(Some(Box::new(Half {
+            calls: calls.clone(),
+            fail_after: 2,
+        })));
+        assert!(chain.has_enhancer() && chain.rnnoise.is_none());
+        // The gate fades in over the first frame: look at the second.
+        let mut f = [0.4; FRAME_LEN];
+        chain.capture(&mut [0.4; FRAME_LEN]);
+        chain.capture(&mut f);
+        assert!((f[100] - 0.2).abs() < 1e-6, "{}", f[100]);
+        // Another mode leaves it plugged in but unused.
+        chain.configure(ChainSettings {
+            noise: NoiseMode::Off,
+            ..settings
+        });
+        let mut f = [0.4; FRAME_LEN];
+        chain.capture(&mut f);
+        assert!((f[100] - 0.4).abs() < 1e-6, "{}", f[100]);
+        chain.configure(settings);
+        for _ in 0..3 {
+            chain.capture(&mut [0.4; FRAME_LEN]);
+        }
+        assert!(!chain.has_enhancer(), "removed after it failed");
+        assert!(chain.rnnoise.is_some(), "RNNoise took over");
     }
 
     #[test]
