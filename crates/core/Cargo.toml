@@ -34,5 +34,10 @@ zeroize = { version = "1.9", features = ["serde"] }
 tessera-audio = { path = "../audio" }
 livekit = { version = "=0.9.3", default-features = false, features = ["native", "rustls-tls-native-roots"] }
 
+[features]
+# GPU speech enhancement (plan Task 13b): DeepFilterNet3 on ONNX Runtime,
+# fetched and loaded at run time. Off by default.
+gpu-enhancement = ["tessera-audio/onnxruntime"]
+
 [dev-dependencies]
 tempfile = "3"

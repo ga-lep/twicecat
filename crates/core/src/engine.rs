@@ -1204,6 +1204,24 @@ impl Engine {
                 let settings = self.audio_settings().await.clone();
                 self.emit(CoreEvent::AudioSettings(settings)).await;
             }
+            Command::ProbeGpuEnhancement => {
+                let running = self
+                    .audio_session
+                    .as_ref()
+                    .and_then(|s| s.enhancer_running());
+                let events = self.events.clone();
+                tokio::spawn(async move {
+                    let available = tokio::task::spawn_blocking(|| {
+                        tessera_audio::default_model_dir()
+                            .map(|dir| crate::gpu_enhancement::probe(&dir))
+                            .unwrap_or_default()
+                    })
+                    .await
+                    .unwrap_or_default();
+                    let event = crate::api::GpuEnhancement { available, running };
+                    let _ = events.send(CoreEvent::GpuEnhancement(event)).await;
+                });
+            }
             Command::UpdateAudioSettings(settings) => {
                 self.store_audio_settings(settings.validated()).await;
             }

@@ -23,15 +23,20 @@ use crate::frame::{FRAME_LEN, Frame, SAMPLE_RATE};
 use crate::gate::{Gate, GateMode};
 
 /// A speech enhancer plugged into the chain in place of the built-in noise
-/// suppressors ([`NoiseMode::Enhancer`]): DeepFilterNet3 on the CPU today, a
-/// GPU backend later (plan Task 13b). Loaded off the processing thread, then
-/// handed over with [`crate::VoiceControl::set_enhancer`].
+/// suppressors ([`NoiseMode::Enhancer`]): DeepFilterNet3, on the CPU or a
+/// GPU (plan Tasks 13, 13b). Loaded off the processing thread, then handed
+/// over with [`crate::VoiceControl::set_enhancer`]; a replaced or failed
+/// enhancer goes back to the control side to be dropped there (freeing a
+/// model, or a GPU context, has no place on the processing thread).
 pub trait Enhancer: Send + 'static {
     /// Cleans one frame in place. An error removes the enhancer and the
     /// chain falls back to RNNoise.
     fn enhance(&mut self, frame: &mut Frame) -> Result<(), AudioError>;
     /// How late its output is, in samples.
     fn latency_samples(&self) -> usize;
+    /// Most attenuation applied, dB (100 or more: no limit). Enhancers
+    /// without one ignore it.
+    fn set_attenuation_limit(&mut self, _db: f32) {}
 }
 
 /// Strength of the WebRTC noise suppressor.
@@ -229,6 +234,8 @@ pub struct CaptureChain {
     back: AudioProcessing,
     rnnoise: Option<Box<DenoiseState<'static>>>,
     enhancer: Option<Box<dyn Enhancer>>,
+    /// A replaced or failed enhancer, waiting to leave the processing thread.
+    retired: Option<Box<dyn Enhancer>>,
     gate: Gate,
     limiter: Limiter,
     scratch: Frame,
@@ -244,6 +251,7 @@ impl CaptureChain {
             rnnoise: matches!(settings.noise, NoiseMode::RnNoise | NoiseMode::Enhancer)
                 .then(DenoiseState::new),
             enhancer: None,
+            retired: None,
             gate: Gate::new(settings.gate),
             limiter: Limiter { gain: 1.0 },
             scratch: [0.0; FRAME_LEN],
@@ -267,9 +275,31 @@ impl CaptureChain {
 
     /// Plugs an enhancer in (or out). It runs while the noise mode is
     /// [`NoiseMode::Enhancer`].
+    /// The one it replaces waits in [`take_retired`](Self::take_retired).
     pub fn set_enhancer(&mut self, enhancer: Option<Box<dyn Enhancer>>) {
-        self.enhancer = enhancer;
+        let old = std::mem::replace(&mut self.enhancer, enhancer);
+        self.retire(old);
         self.update_rnnoise();
+    }
+
+    /// Sets the plugged enhancer's attenuation limit, dB.
+    pub fn set_enhancer_attenuation(&mut self, db: f32) {
+        if let Some(enhancer) = self.enhancer.as_mut() {
+            enhancer.set_attenuation_limit(db);
+        }
+    }
+
+    /// The enhancer last replaced or failed, to be dropped elsewhere.
+    pub fn take_retired(&mut self) -> Option<Box<dyn Enhancer>> {
+        self.retired.take()
+    }
+
+    fn retire(&mut self, enhancer: Option<Box<dyn Enhancer>>) {
+        if enhancer.is_some() {
+            // An older one not yet collected is dropped here (only when two
+            // are replaced within one frame).
+            self.retired = enhancer;
+        }
     }
 
     /// Whether an enhancer is plugged in.
@@ -327,7 +357,8 @@ impl CaptureChain {
             && enhancer.enhance(frame).is_err()
         {
             tracing::warn!("the speech enhancer failed; RNNoise takes over");
-            self.enhancer = None;
+            let failed = self.enhancer.take();
+            self.retire(failed);
             self.update_rnnoise();
         }
         if let Some(rn) = self.rnnoise.as_mut() {
@@ -515,6 +546,78 @@ mod tests {
         fn latency_samples(&self) -> usize {
             0
         }
+    }
+
+    /// Records being dropped; fails on its first frame when asked to.
+    struct Tracked {
+        dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        fails: bool,
+        limit: std::sync::Arc<std::sync::Mutex<Option<f32>>>,
+    }
+
+    impl Drop for Tracked {
+        fn drop(&mut self) {
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    impl Enhancer for Tracked {
+        fn enhance(&mut self, _: &mut Frame) -> Result<(), AudioError> {
+            if self.fails {
+                Err(AudioError::Internal)
+            } else {
+                Ok(())
+            }
+        }
+        fn latency_samples(&self) -> usize {
+            0
+        }
+        fn set_attenuation_limit(&mut self, db: f32) {
+            *self.limit.lock().unwrap() = Some(db);
+        }
+    }
+
+    #[test]
+    fn replaced_and_failed_enhancers_leave_the_chain_alive_for_dropping_elsewhere() {
+        let mut chain = CaptureChain::new(ChainSettings {
+            echo_cancellation: false,
+            high_pass: false,
+            auto_gain: false,
+            noise: NoiseMode::Enhancer,
+            gate: open_gate(),
+            input_gain_db: 0.0,
+        });
+        let tracked = |fails| {
+            let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let limit = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let enhancer = Tracked {
+                dropped: dropped.clone(),
+                fails,
+                limit: limit.clone(),
+            };
+            (Box::new(enhancer), dropped, limit)
+        };
+        let is_dropped = |d: &std::sync::Arc<std::sync::atomic::AtomicBool>| {
+            d.load(std::sync::atomic::Ordering::Relaxed)
+        };
+
+        let (first, first_dropped, first_limit) = tracked(false);
+        chain.set_enhancer(Some(first));
+        chain.set_enhancer_attenuation(12.0);
+        assert_eq!(*first_limit.lock().unwrap(), Some(12.0), "set in place");
+        let (second, second_dropped, _) = tracked(true);
+        chain.set_enhancer(Some(second));
+        assert!(!is_dropped(&first_dropped), "replaced, not dropped");
+        let retired = chain.take_retired().expect("the replaced one");
+        drop(retired);
+        assert!(is_dropped(&first_dropped));
+
+        chain.capture(&mut [0.1; FRAME_LEN]);
+        assert!(!chain.has_enhancer(), "removed after it failed");
+        assert!(!is_dropped(&second_dropped), "failed, not dropped");
+        assert!(chain.take_retired().is_some());
+        assert!(chain.take_retired().is_none());
     }
 
     #[test]

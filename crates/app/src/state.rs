@@ -1028,7 +1028,8 @@ impl App {
             | CoreEvent::AudioDevices(_)
             | CoreEvent::AudioSettings(_)
             | CoreEvent::InputLevel(_)
-            | CoreEvent::AudioStats(_) => {}
+            | CoreEvent::AudioStats(_)
+            | CoreEvent::GpuEnhancement(_) => {}
         }
         task
     }

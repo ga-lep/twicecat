@@ -8,6 +8,15 @@
 //! DirectML, CoreML) and fall back to the CPU, reporting what runs: an
 //! accelerator can be compiled in and still fail at run time (missing CUDA
 //! or cuDNN libraries, an unsupported operator).
+//!
+//! Stateful models (one frame per call, their state carried from call to
+//! call) run through [`OnnxLoop`]: on CUDA the state never leaves the GPU
+//! and each call replays one captured CUDA graph ([`stateful_loop`]).
+//!
+//! On Linux the CUDA build's libraries (CUDA 13, cuDNN 9) come from the
+//! system, or from `scripts/fetch-cuda-runtime.sh` (or `TESSERA_CUDA_DIR`):
+//! those are preloaded before the runtime starts, so its CUDA provider finds
+//! them without `LD_LIBRARY_PATH`.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -17,6 +26,9 @@ use ort::session::Session;
 use ort::value::Tensor;
 
 use crate::AudioError;
+
+mod stateful_loop;
+pub use stateful_loop::{LoopSpec, OnnxLoop};
 
 /// The ONNX Runtime release `scripts/fetch-onnxruntime.sh` pins.
 pub const ONNXRUNTIME_VERSION: &str = "1.28.3";
@@ -38,9 +50,15 @@ impl Accelerator {
     /// Every accelerator, preferred first.
     pub const ALL: [Self; 4] = [Self::TensorRt, Self::Cuda, Self::DirectMl, Self::CoreMl];
 
-    fn dispatch(self) -> ExecutionProviderDispatch {
+    fn dispatch(self, config: &SessionConfig<'_>) -> ExecutionProviderDispatch {
         match self {
-            Self::Cuda => ep::CUDA::default().build().error_on_failure(),
+            // The heuristic picks convolution algorithms at once; the default
+            // exhaustive search benchmarks them on the first frame (seconds).
+            Self::Cuda => ep::CUDA::default()
+                .with_conv_algorithm_search(ep::cuda::ConvAlgorithmSearch::Heuristic)
+                .with_cuda_graph(config.cuda_graph)
+                .build()
+                .error_on_failure(),
             Self::TensorRt => ep::TensorRT::default().build().error_on_failure(),
             Self::DirectMl => ep::DirectML::default().build().error_on_failure(),
             Self::CoreMl => ep::CoreML::default().build().error_on_failure(),
@@ -95,6 +113,58 @@ pub fn default_runtime_dir() -> Option<PathBuf> {
         .find(|dir| dir.join(library_name()).exists())
 }
 
+/// Where `scripts/fetch-cuda-runtime.sh` put NVIDIA's libraries, or
+/// `TESSERA_CUDA_DIR`; `None` when neither exists (a system install is then
+/// used, if any).
+pub fn default_cuda_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("TESSERA_CUDA_DIR") {
+        return Some(PathBuf::from(dir));
+    }
+    let cache = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
+    let dir = cache.join("tessera/cuda/13.0/lib");
+    dir.is_dir().then_some(dir)
+}
+
+/// NVIDIA's libraries the CUDA 13 provider loads, dependencies first (as
+/// ONNX Runtime's own Python preloader orders them).
+#[cfg(target_os = "linux")]
+const CUDA_LIBRARIES: &[&str] = &[
+    "libcudart.so.13",
+    "libcublasLt.so.13",
+    "libcublas.so.13",
+    "libcurand.so.10",
+    "libnvrtc.so.13",
+    "libnvrtc-builtins.so.13.0",
+    "libcudnn.so.9",
+    "libcudnn_graph.so.9",
+    "libcudnn_ops.so.9",
+    "libcudnn_heuristic.so.9",
+    "libcudnn_adv.so.9",
+    "libcudnn_cnn.so.9",
+    "libcudnn_engines_precompiled.so.9",
+    "libcudnn_engines_runtime_compiled.so.9",
+];
+
+/// Loads NVIDIA's libraries from `dir`, so that the CUDA provider's own
+/// loads find them already in the process. Missing files are skipped (the
+/// provider then fails to start and the CPU runs).
+#[cfg(target_os = "linux")]
+fn preload_cuda(dir: &Path) {
+    for name in CUDA_LIBRARIES {
+        let path = dir.join(name);
+        if !path.exists() {
+            tracing::debug!("{name} not in {}", dir.display());
+            continue;
+        }
+        if let Err(e) = ort::util::preload_dylib(&path) {
+            tracing::warn!("could not preload {name}: {e}");
+            return;
+        }
+    }
+}
+
 /// The loaded runtime (once per process).
 pub struct OnnxRuntime {
     accelerators: Vec<Accelerator>,
@@ -107,6 +177,12 @@ impl OnnxRuntime {
     /// later calls get the same result whatever `dir` they pass.
     pub fn load(dir: &Path) -> Result<Self, AudioError> {
         let loaded = RUNTIME.get_or_init(|| {
+            #[cfg(target_os = "linux")]
+            if dir.join("libonnxruntime_providers_cuda.so").exists()
+                && let Some(cuda) = default_cuda_dir()
+            {
+                preload_cuda(&cuda);
+            }
             let builder = ort::init_from(dir.join(library_name())).map_err(|e| e.to_string())?;
             if !builder.with_name("tessera").commit() {
                 tracing::debug!("ONNX Runtime environment was already set up");
@@ -140,30 +216,74 @@ impl OnnxRuntime {
         model: &Path,
         prefer: &[Accelerator],
     ) -> Result<(OnnxSession, Option<Accelerator>), AudioError> {
+        self.session_with(model, prefer, &SessionConfig::default())
+    }
+
+    /// [`session`](Self::session) with `config`.
+    pub fn session_with(
+        &self,
+        model: &Path,
+        prefer: &[Accelerator],
+        config: &SessionConfig<'_>,
+    ) -> Result<(OnnxSession, Option<Accelerator>), AudioError> {
+        let open = |accelerator| open_session(model, accelerator, config);
         for &accelerator in prefer {
             if !self.accelerators.contains(&accelerator) {
                 continue;
             }
-            let opened = Session::builder()
-                .map_err(|e| e.to_string())
-                .and_then(|b| {
-                    b.with_execution_providers([accelerator.dispatch()])
-                        .map_err(|e| e.to_string())
-                })
-                .and_then(|mut b| b.commit_from_file(model).map_err(|e| e.to_string()));
-            match opened {
+            match open(Some(accelerator)) {
                 Ok(session) => return Ok((OnnxSession { session }, Some(accelerator))),
                 Err(e) => tracing::info!("{accelerator:?} unavailable, trying the next: {e}"),
             }
         }
-        let session = Session::builder()
-            .and_then(|mut b| b.commit_from_file(model))
-            .map_err(|e| {
-                tracing::warn!("ONNX model could not be opened: {e}");
-                AudioError::Model
-            })?;
+        let session = open(None).map_err(|e| {
+            tracing::warn!("ONNX model could not be opened: {e}");
+            AudioError::Model
+        })?;
         Ok((OnnxSession { session }, None))
     }
+}
+
+/// Opens `model` on `accelerator` (`None`: the CPU) as `config` says.
+pub(crate) fn open_session(
+    model: &Path,
+    accelerator: Option<Accelerator>,
+    config: &SessionConfig<'_>,
+) -> Result<Session, String> {
+    // One stream of 10 ms frames: the calling thread runs the graph (no
+    // pool), and nothing spins between calls. The default pool keeps a
+    // thread per core spinning after each run, which burned most of the
+    // process's CPU time while the GPU did the work.
+    let text = |e: ort::Error<_>| e.to_string();
+    let mut builder = Session::builder().map_err(|e| e.to_string())?;
+    builder = builder.with_intra_threads(1).map_err(text)?;
+    builder = builder.with_inter_threads(1).map_err(text)?;
+    builder = builder.with_intra_op_spinning(false).map_err(text)?;
+    builder = builder.with_inter_op_spinning(false).map_err(text)?;
+    for (name, size) in config.dimensions {
+        builder = builder
+            .with_dimension_override(*name, *size)
+            .map_err(|e| e.to_string())?;
+    }
+    if let Some(accelerator) = accelerator {
+        builder = builder
+            .with_execution_providers([accelerator.dispatch(config)])
+            .map_err(|e| e.to_string())?;
+    }
+    builder.commit_from_file(model).map_err(|e| e.to_string())
+}
+
+/// How a session is set up.
+#[derive(Clone, Debug, Default)]
+pub struct SessionConfig<'a> {
+    /// Free dimensions fixed by name (such as `("batch", 1)`): shapes known
+    /// when the session starts let the runtime fold shape computations away
+    /// instead of running them, with their copies, on every call.
+    pub dimensions: &'a [(&'a str, i64)],
+    /// CUDA only: capture the graph on the first calls and replay it after
+    /// (one launch instead of one per kernel). Needs every input and output
+    /// bound to device memory at fixed addresses ([`OnnxLoop`] does it).
+    pub cuda_graph: bool,
 }
 
 /// An open model.
@@ -181,6 +301,19 @@ impl OnnxSession {
             .inputs()
             .iter()
             .map(|i| i.name().to_owned())
+            .collect()
+    }
+
+    /// Each input's name and shape (`-1` for a dimension left free, such as
+    /// a batch axis).
+    pub fn input_shapes(&self) -> Vec<(String, Vec<i64>)> {
+        self.session
+            .inputs()
+            .iter()
+            .map(|i| {
+                let shape = i.dtype().tensor_shape().map(|s| s.to_vec());
+                (i.name().to_owned(), shape.unwrap_or_default())
+            })
             .collect()
     }
 

@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use tessera_core::api::{
     AudioDeviceId, AudioDevices, AudioSettings, CallEndReason, CallIntent, CallState, Command,
-    CoreEvent, InputLevel, InputMode, ListDiff, NoiseSuppression, NsLevel, Participant, RoomId,
-    RoomSummary, UserId,
+    CoreEvent, EnhancerBackend, GpuBackend, GpuEnhancement, InputLevel, InputMode, ListDiff,
+    NoiseSuppression, NsLevel, Participant, RoomId, RoomSummary, UserId,
 };
 
 use super::{resolve_room, sanitize};
@@ -52,6 +52,8 @@ pub(crate) enum CallCmd {
     },
     /// `Some(loopback)` starts, `None` stops.
     MicTest(Option<bool>),
+    /// Probe GPU speech enhancement.
+    Gpu,
     /// Show the audio settings.
     Audio,
 }
@@ -100,6 +102,7 @@ pub(crate) fn parse(name: &str, arg: &str) -> Option<Result<CallCmd, &'static st
             _ => Err("/mictest [loopback|stop]"),
         },
         "audio" => none(arg, "/audio").map(|()| CallCmd::Audio),
+        "gpu" => none(arg, "/gpu").map(|()| CallCmd::Gpu),
         _ => return None,
     };
     Some(parsed)
@@ -125,9 +128,37 @@ fn device(arg: &str, usage: &'static str) -> Result<Option<usize>, &'static str>
     }
 }
 
+/// One line on GPU speech enhancement.
+fn gpu_line(gpu: &GpuEnhancement) -> String {
+    let name = |b: &GpuBackend| format!("{b:?}").to_lowercase();
+    let available = if gpu.available.is_empty() {
+        "none usable here".to_owned()
+    } else {
+        gpu.available
+            .iter()
+            .map(name)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let running = match gpu.running {
+        None => String::new(),
+        Some(EnhancerBackend::Cpu) => "; DeepFilterNet runs on the CPU".into(),
+        Some(EnhancerBackend::Gpu { backend }) => {
+            format!("; DeepFilterNet runs on {}", name(&backend))
+        }
+        Some(EnhancerBackend::CpuAfterGpuError) => {
+            "; DeepFilterNet moved to the CPU after a GPU error".into()
+        }
+        Some(EnhancerBackend::CpuAfterGpuTooSlow) => {
+            "; DeepFilterNet moved to the CPU: the GPU fell behind".into()
+        }
+    };
+    format!("GPU enhancement: {available}{running}.")
+}
+
 fn noise_suppression(arg: &str) -> Result<NoiseSuppression, &'static str> {
     const USAGE: &str =
-        "/ns off|rnnoise|webrtc [low|moderate|high|very_high]|deepfilter [limit dB]";
+        "/ns off|rnnoise|webrtc [low|moderate|high|very_high]|deepfilter [limit dB] [gpu]";
     let mut words = arg.split_whitespace();
     let ns = match (words.next(), words.next()) {
         (Some("off"), None) => NoiseSuppression::Off,
@@ -141,12 +172,22 @@ fn noise_suppression(arg: &str) -> Result<NoiseSuppression, &'static str> {
                 Some(_) => return Err(USAGE),
             },
         },
-        (Some("deepfilter"), limit) => NoiseSuppression::DeepFilter {
-            attenuation_limit_db: match limit {
-                None => 100.0,
-                Some(db) => db.parse().map_err(|_| USAGE)?,
-            },
-        },
+        (Some("deepfilter"), first) => {
+            let (limit, gpu) = match (first, words.next()) {
+                (None, _) => (None, false),
+                (Some("gpu"), None) => (None, true),
+                (Some(db), None) => (Some(db), false),
+                (Some(db), Some("gpu")) => (Some(db), true),
+                (Some(_), Some(_)) => return Err(USAGE),
+            };
+            NoiseSuppression::DeepFilter {
+                attenuation_limit_db: match limit {
+                    None => 100.0,
+                    Some(db) => db.parse().map_err(|_| USAGE)?,
+                },
+                gpu,
+            }
+        }
         _ => return Err(USAGE),
     };
     if words.next().is_some() {
@@ -362,6 +403,10 @@ impl Calls {
                 self.show_devices = true;
                 Reply::quiet(Command::ListAudioDevices)
             }
+            CallCmd::Gpu => Reply::send(
+                Command::ProbeGpuEnhancement,
+                "Probing GPU speech enhancement…",
+            ),
             CallCmd::Input(index) => self.pick_device(index, true),
             CallCmd::Output(index) => self.pick_device(index, false),
             CallCmd::Ns(ns) => self.edit(|s| s.processing.noise_suppression = ns),
@@ -553,7 +598,11 @@ impl Calls {
             NoiseSuppression::RnNoise => "rnnoise".to_owned(),
             NoiseSuppression::DeepFilter {
                 attenuation_limit_db,
-            } => format!("deepfilter (limit {attenuation_limit_db} dB)"),
+                gpu,
+            } => {
+                let on = if gpu { ", on the GPU" } else { "" };
+                format!("deepfilter (limit {attenuation_limit_db} dB{on})")
+            }
         };
         let gate = match s.input_mode {
             InputMode::VoiceActivity {
@@ -665,6 +714,7 @@ impl Calls {
                 sanitize(user_id.as_str()),
                 room_label(rooms, &room_id)
             )],
+            CoreEvent::GpuEnhancement(gpu) => vec![gpu_line(&gpu)],
             CoreEvent::AudioDevices(devices) => {
                 self.devices = devices;
                 if !std::mem::take(&mut self.show_devices) {
@@ -830,6 +880,17 @@ mod tests {
             cmd("/ns rnnoise"),
             Ok(CallCmd::Ns(NoiseSuppression::RnNoise))
         );
+        let deepfilter = |attenuation_limit_db, gpu| {
+            Ok(CallCmd::Ns(NoiseSuppression::DeepFilter {
+                attenuation_limit_db,
+                gpu,
+            }))
+        };
+        assert_eq!(cmd("/ns deepfilter"), deepfilter(100.0, false));
+        assert_eq!(cmd("/ns deepfilter 30"), deepfilter(30.0, false));
+        assert_eq!(cmd("/ns deepfilter gpu"), deepfilter(100.0, true));
+        assert_eq!(cmd("/ns deepfilter 30 gpu"), deepfilter(30.0, true));
+        assert_eq!(cmd("/gpu"), Ok(CallCmd::Gpu));
         assert_eq!(cmd("/aec off"), Ok(CallCmd::Aec(Some(false))));
         assert_eq!(cmd("/aec system"), Ok(CallCmd::AecSystem(None)));
         assert_eq!(cmd("/aec system on"), Ok(CallCmd::AecSystem(Some(true))));
@@ -864,10 +925,40 @@ mod tests {
             "/mictest twice",
             "/aec systems",
             "/aec system maybe",
+            "/ns deepfilter gpu 30",
+            "/ns deepfilter 30 cpu",
+            "/gpu please",
         ] {
             assert!(cmd(bad).is_err(), "{bad}");
         }
         assert_eq!(parse("rooms", ""), None, "not a call command");
+    }
+
+    #[test]
+    fn gpu_enhancement_is_reported_in_one_line() {
+        let none = GpuEnhancement {
+            available: Vec::new(),
+            running: None,
+        };
+        assert_eq!(gpu_line(&none), "GPU enhancement: none usable here.");
+        let fell_back = GpuEnhancement {
+            available: vec![GpuBackend::Cuda],
+            running: Some(EnhancerBackend::CpuAfterGpuTooSlow),
+        };
+        assert_eq!(
+            gpu_line(&fell_back),
+            "GPU enhancement: cuda; DeepFilterNet moved to the CPU: the GPU fell behind."
+        );
+        let running = GpuEnhancement {
+            available: vec![GpuBackend::Cuda],
+            running: Some(EnhancerBackend::Gpu {
+                backend: GpuBackend::Cuda,
+            }),
+        };
+        assert_eq!(
+            gpu_line(&running),
+            "GPU enhancement: cuda; DeepFilterNet runs on cuda."
+        );
     }
 
     #[test]

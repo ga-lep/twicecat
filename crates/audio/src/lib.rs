@@ -26,7 +26,9 @@ pub use chain::{
 };
 pub use denormals::flush_denormals_on_this_thread;
 pub use devices::{DeviceInfo, DeviceList, DeviceWatcher, list_devices};
-pub use dfn::{DeepFilter, default_model_dir};
+pub use dfn::{
+    DeepFilter, DeepFilterBackend, DeepFilterStatus, default_model_dir, default_stateful_model,
+};
 pub use frame::{FRAME_LEN, Frame, SAMPLE_RATE, SILENCE};
 pub use gate::GateMode;
 pub use io::{AudioIo, IoConfig, IoEvent, IoInfo, StreamInfo, VirtualDevice};

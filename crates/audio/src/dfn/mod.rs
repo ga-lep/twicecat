@@ -1,5 +1,8 @@
 //! DeepFilterNet3 noise suppression: our STFT and features ([`dsp`]) around
 //! the three pulsed networks ([`model`]), run one 10 ms frame at a time.
+//! With the `onnxruntime` feature the networks can run on a GPU instead, as
+//! one stateful graph ([`stateful`]); the CPU graphs stay loaded and take
+//! over if the GPU fails or falls behind.
 //!
 //! The models are fetched by `scripts/fetch-models.sh` (pinned SHA-256)
 //! into the cache dir, or found in `TESSERA_MODEL_DIR`. Loading takes a
@@ -9,12 +12,15 @@
 mod config;
 mod dsp;
 mod model;
+#[cfg(feature = "onnxruntime")]
+mod stateful;
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use realfft::num_complex::Complex32;
-use tract_onnx::prelude::*;
 
 use crate::AudioError;
 use crate::frame::{FRAME_LEN, Frame};
@@ -27,11 +33,11 @@ use model::Graphs;
 // clean speech, which measured much worse here (SI-SDR 4.9 dB against 18.6
 // dB on the same mix with upstream's binary; Task 13 notes).
 /// Below this local SNR (dB) a frame is noise only: its gains are zero.
-const MIN_DB: f32 = -15.0;
+pub(crate) const MIN_DB: f32 = -15.0;
 /// Above this the frame is clean speech: nothing is applied.
-const MAX_DB_ERB: f32 = 35.0;
+pub(crate) const MAX_DB_ERB: f32 = 35.0;
 /// Above this only the ERB gains are applied, not the deep filter.
-const MAX_DB_DF: f32 = 35.0;
+pub(crate) const MAX_DB_DF: f32 = 35.0;
 
 /// The model directory: `TESSERA_MODEL_DIR`, else where
 /// `scripts/fetch-models.sh` puts it.
@@ -45,15 +51,105 @@ pub fn default_model_dir() -> Option<PathBuf> {
     Some(cache.join("tessera/models/deepfilternet3"))
 }
 
+/// The stateful graph for the GPU (`scripts/export-deepfilternet.sh`):
+/// `TESSERA_STATEFUL_MODEL`, else where that script installs it.
+pub fn default_stateful_model() -> Option<PathBuf> {
+    if let Some(file) = std::env::var_os("TESSERA_STATEFUL_MODEL") {
+        return Some(PathBuf::from(file));
+    }
+    let cache = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
+    Some(cache.join("tessera/models/deepfilternet3-stateful/deepfilternet3_stateful.onnx"))
+}
+
+/// Where DeepFilterNet's networks run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeepFilterBackend {
+    /// On the CPU (tract), as asked.
+    Cpu,
+    /// On the accelerator [`DeepFilter::load_gpu`] reported.
+    Gpu,
+    /// On the CPU after the GPU failed (a driver error, a lost device).
+    CpuAfterGpuError,
+    /// On the CPU because the GPU missed its deadline (at warm-up, or
+    /// frames in a row, such as when a game takes the GPU).
+    CpuAfterGpuTooSlow,
+}
+
+/// Where a running [`DeepFilter`] is, readable from other threads.
+#[derive(Clone, Debug)]
+pub struct DeepFilterStatus(Arc<AtomicU8>);
+
+impl DeepFilterStatus {
+    fn new(backend: DeepFilterBackend) -> Self {
+        let status = Self(Arc::new(AtomicU8::new(0)));
+        status.set(backend);
+        status
+    }
+
+    fn set(&self, backend: DeepFilterBackend) {
+        let code = match backend {
+            DeepFilterBackend::Cpu => 0,
+            DeepFilterBackend::Gpu => 1,
+            DeepFilterBackend::CpuAfterGpuError => 2,
+            DeepFilterBackend::CpuAfterGpuTooSlow => 3,
+        };
+        self.0.store(code, Ordering::Relaxed);
+    }
+
+    /// The backend now.
+    pub fn get(&self) -> DeepFilterBackend {
+        match self.0.load(Ordering::Relaxed) {
+            1 => DeepFilterBackend::Gpu,
+            2 => DeepFilterBackend::CpuAfterGpuError,
+            3 => DeepFilterBackend::CpuAfterGpuTooSlow,
+            _ => DeepFilterBackend::Cpu,
+        }
+    }
+}
+
+/// A GPU frame slower than this is a missed deadline: the whole chain has
+/// 10 ms, and the GPU call must leave room for the rest.
+#[cfg(feature = "onnxruntime")]
+const GPU_DEADLINE: std::time::Duration = std::time::Duration::from_millis(4);
+/// Missed deadlines in a row that hand the frames to the CPU for good.
+#[cfg(feature = "onnxruntime")]
+const GPU_MISSES: u32 = 3;
+/// Frames run at load time, before the deadline counts (the first ones pay
+/// for kernel compilation and memory allocation on the device).
+#[cfg(feature = "onnxruntime")]
+const GPU_WARM_UP_FRAMES: usize = 50;
+
+/// Counts GPU frames over [`GPU_DEADLINE`] in a row.
+#[cfg(feature = "onnxruntime")]
+#[derive(Debug, Default)]
+struct Deadline {
+    misses: u32,
+}
+
+#[cfg(feature = "onnxruntime")]
+impl Deadline {
+    /// Records a frame's time; true once [`GPU_MISSES`] in a row missed.
+    fn gives_up(&mut self, took: std::time::Duration) -> bool {
+        self.misses = if took > GPU_DEADLINE {
+            self.misses + 1
+        } else {
+            0
+        };
+        self.misses >= GPU_MISSES
+    }
+}
+
 /// What the network decided for a frame.
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct Stages {
+pub(crate) struct Stages {
     gains: bool,
     zero_gains: bool,
     deep_filter: bool,
 }
 
-fn stages(lsnr: f32) -> Stages {
+pub(crate) fn stages(lsnr: f32) -> Stages {
     if lsnr < MIN_DB {
         Stages {
             gains: false,
@@ -86,8 +182,13 @@ fn mix_back(limit_db: f32) -> Option<f32> {
     }
 }
 
-/// One frame's ERB gains and deep-filter coefficients, each when needed.
-type Decision = (Option<Vec<f32>>, Option<Vec<Complex32>>);
+/// One frame's network outputs: the local SNR estimate, and the ERB gains
+/// and deep-filter coefficients (`[bin][tap]`) when it asks for them.
+pub(crate) struct Inference {
+    lsnr: f32,
+    gains: Option<Vec<f32>>,
+    coefs: Option<Vec<Complex32>>,
+}
 
 /// DeepFilterNet3 on 48 kHz mono 10 ms frames.
 pub struct DeepFilter {
@@ -95,9 +196,21 @@ pub struct DeepFilter {
     stft: Stft,
     features: Features,
     graphs: Graphs,
+    #[cfg(feature = "onnxruntime")]
+    gpu: Option<stateful::StatefulGraph>,
+    /// A GPU graph given up on, kept until the filter is dropped (off the
+    /// processing thread, see `crate::Enhancer`): tearing down a GPU
+    /// session there would stall the audio.
+    #[cfg(feature = "onnxruntime")]
+    _abandoned: Option<stateful::StatefulGraph>,
+    #[cfg(feature = "onnxruntime")]
+    deadline: Deadline,
+    status: DeepFilterStatus,
     spec: Vec<Complex32>,
     erb: Vec<f32>,
     cplx: Vec<Complex32>,
+    /// `cplx` as the networks take it: real parts, then imaginary ones.
+    feat_spec: Vec<f32>,
     /// Spectra for the ERB gains: the target frame is `df_order - 1`.
     enhanced: VecDeque<Vec<Complex32>>,
     /// Noisy spectra for the deep filter, oldest first.
@@ -125,9 +238,17 @@ impl DeepFilter {
         Ok(Self {
             features: Features::new(widths, cfg.nb_df, alpha),
             graphs,
+            #[cfg(feature = "onnxruntime")]
+            gpu: None,
+            #[cfg(feature = "onnxruntime")]
+            _abandoned: None,
+            #[cfg(feature = "onnxruntime")]
+            deadline: Deadline::default(),
+            status: DeepFilterStatus::new(DeepFilterBackend::Cpu),
             spec: zeros(),
             erb: vec![0.0; cfg.nb_erb],
             cplx: vec![Complex32::default(); cfg.nb_df],
+            feat_spec: vec![0.0; 2 * cfg.nb_df],
             enhanced: (0..cfg.df_order + cfg.conv_lookahead)
                 .map(|_| zeros())
                 .collect(),
@@ -139,6 +260,95 @@ impl DeepFilter {
             stft,
             cfg,
         })
+    }
+
+    /// Loads the models from `dir` (as [`load`]) and the stateful graph
+    /// `stateful_model` on the first of `prefer` that starts, then warms it
+    /// up. Returns the filter and the accelerator it runs on; `None` when
+    /// none started or the warmed-up GPU is still too slow (the
+    /// [`status`] says which), and the CPU graphs run. Slower than [`load`]
+    /// (seconds the first time on a machine): call it off the audio thread.
+    ///
+    /// [`load`]: Self::load
+    /// [`status`]: Self::status
+    #[cfg(feature = "onnxruntime")]
+    pub fn load_gpu(
+        dir: &Path,
+        stateful_model: &Path,
+        attenuation_limit_db: f32,
+        runtime: &crate::onnx::OnnxRuntime,
+        prefer: &[crate::onnx::Accelerator],
+    ) -> Result<(Self, Option<crate::onnx::Accelerator>), AudioError> {
+        let mut filter = Self::load(dir, attenuation_limit_db)?;
+        let (mut graph, accelerator) =
+            stateful::StatefulGraph::open(runtime, stateful_model, &filter.cfg, prefer)?;
+        let Some(accelerator) = accelerator else {
+            tracing::info!("no GPU backend started; DeepFilterNet runs on the CPU");
+            return Ok((filter, None));
+        };
+        let (erb, spec) = (
+            vec![0.0; filter.cfg.nb_erb],
+            vec![0.0; 2 * filter.cfg.nb_df],
+        );
+        let mut times = Vec::with_capacity(GPU_WARM_UP_FRAMES);
+        for _ in 0..GPU_WARM_UP_FRAMES {
+            let start = std::time::Instant::now();
+            graph.infer(&filter.cfg, &erb, &spec)?;
+            times.push(start.elapsed());
+        }
+        graph.reset()?;
+        let first = times[0];
+        let mut settled = times[GPU_WARM_UP_FRAMES / 2..].to_vec();
+        settled.sort();
+        let median = settled[settled.len() / 2];
+        tracing::info!(
+            "DeepFilterNet on {accelerator:?}: first frame {first:?}, then a median of {median:?}"
+        );
+        if median > GPU_DEADLINE {
+            filter.status.set(DeepFilterBackend::CpuAfterGpuTooSlow);
+            return Ok((filter, None));
+        }
+        filter.gpu = Some(graph);
+        filter.status.set(DeepFilterBackend::Gpu);
+        Ok((filter, Some(accelerator)))
+    }
+
+    /// Which of `candidates` run the stateful graph here: each is opened
+    /// and runs one frame. Slow (a second or so with CUDA); call it off the
+    /// audio thread, and not while a GPU filter runs (a CUDA graph capture
+    /// forbids other threads' CUDA calls).
+    #[cfg(feature = "onnxruntime")]
+    pub fn gpu_backends(
+        dir: &Path,
+        stateful_model: &Path,
+        runtime: &crate::onnx::OnnxRuntime,
+        candidates: &[crate::onnx::Accelerator],
+    ) -> Vec<crate::onnx::Accelerator> {
+        let Ok(text) = std::fs::read_to_string(dir.join("config.ini")) else {
+            return Vec::new();
+        };
+        let Ok(cfg) = Config::parse(&text) else {
+            return Vec::new();
+        };
+        let (erb, spec) = (vec![0.0; cfg.nb_erb], vec![0.0; 2 * cfg.nb_df]);
+        candidates
+            .iter()
+            .copied()
+            .filter(|&candidate| {
+                match stateful::StatefulGraph::open(runtime, stateful_model, &cfg, &[candidate]) {
+                    Ok((mut graph, Some(started))) if started == candidate => {
+                        graph.infer(&cfg, &erb, &spec).is_ok()
+                    }
+                    _ => false,
+                }
+            })
+            .collect()
+    }
+
+    /// Where the networks run; the handle follows a fallback to the CPU
+    /// while the filter runs.
+    pub fn status(&self) -> DeepFilterStatus {
+        self.status.clone()
     }
 
     /// How late the output is, in samples: one hop for the STFT, plus the
@@ -171,7 +381,8 @@ impl DeepFilter {
         self.features.erb(&self.spec, &mut self.erb);
         self.features
             .complex(&self.spec[..self.cfg.nb_df], &mut self.cplx);
-        let (gains, coefs) = self.infer()?;
+        let Inference { lsnr, gains, coefs } = self.infer()?;
+        self.lsnr = lsnr;
 
         let order = self.cfg.df_order;
         let target = &mut self.enhanced[order - 1];
@@ -193,61 +404,38 @@ impl DeepFilter {
         Ok(())
     }
 
-    /// Runs the networks on the current features: ERB gains and deep-filter
-    /// coefficients (`[bin][tap]`), each when the local SNR asks for it.
-    fn infer(&mut self) -> Result<Decision, AudioError> {
-        let cfg = &self.cfg;
-        let tensor = |shape: &[usize], data: &[f32]| {
-            Tensor::from_shape(shape, data)
-                .map(TValue::from)
-                .map_err(|_| AudioError::Internal)
-        };
-        let feat_erb = tensor(&[1, 1, 1, cfg.nb_erb], &self.erb)?;
-        let mut spec = Vec::with_capacity(2 * cfg.nb_df);
-        spec.extend(self.cplx.iter().map(|c| c.re));
-        spec.extend(self.cplx.iter().map(|c| c.im));
-        let feat_spec = tensor(&[1, 2, 1, cfg.nb_df], &spec)?;
-        let mut out = self.graphs.encoder.run(tvec!(feat_erb, feat_spec))?;
-        // e0, e1, e2, e3, emb, c0, lsnr
-        if out.len() != 7 {
-            return Err(AudioError::Internal);
+    /// Runs the networks on the current features, on the GPU while it
+    /// keeps up, else on the CPU.
+    fn infer(&mut self) -> Result<Inference, AudioError> {
+        let n = self.cfg.nb_df;
+        for (i, c) in self.cplx.iter().enumerate() {
+            self.feat_spec[i] = c.re;
+            self.feat_spec[n + i] = c.im;
         }
-        let floats = |t: &TValue| -> Result<Vec<f32>, AudioError> {
-            t.to_plain_array_view::<f32>()
-                .map(|a| a.iter().copied().collect())
-                .map_err(|_| AudioError::Internal)
-        };
-        self.lsnr = floats(&out[6])?.first().copied().unwrap_or(0.0);
-        let stage = stages(self.lsnr);
-        let c0 = out.remove(5);
-        let emb = out.remove(4);
-        let gains = if stage.gains {
-            let (e3, e2, e1, e0) = (out.remove(3), out.remove(2), out.remove(1), out.remove(0));
-            let m = self
-                .graphs
-                .erb_decoder
-                .run(tvec!(emb.clone(), e3, e2, e1, e0))?;
-            Some(floats(m.first().ok_or(AudioError::Internal)?)?)
-        } else if stage.zero_gains {
-            Some(vec![0.0; cfg.nb_erb])
-        } else {
-            None
-        };
-        let coefs = if stage.deep_filter {
-            let raw = self.graphs.df_decoder.run(tvec!(emb, c0))?;
-            let raw = floats(raw.first().ok_or(AudioError::Internal)?)?;
-            if raw.len() != cfg.nb_df * cfg.df_order * 2 {
-                return Err(AudioError::Internal);
+        #[cfg(feature = "onnxruntime")]
+        if let Some(gpu) = self.gpu.as_mut() {
+            let start = std::time::Instant::now();
+            match gpu.infer(&self.cfg, &self.erb, &self.feat_spec) {
+                Ok(inference) => {
+                    let took = start.elapsed();
+                    if self.deadline.gives_up(took) {
+                        tracing::warn!(
+                            "DeepFilterNet's GPU missed {GPU_MISSES} deadlines in a row \
+                             (last frame {took:?}); the CPU takes over"
+                        );
+                        self._abandoned = self.gpu.take();
+                        self.status.set(DeepFilterBackend::CpuAfterGpuTooSlow);
+                    }
+                    return Ok(inference);
+                }
+                Err(_) => {
+                    tracing::warn!("DeepFilterNet's GPU failed; the CPU takes over");
+                    self._abandoned = self.gpu.take();
+                    self.status.set(DeepFilterBackend::CpuAfterGpuError);
+                }
             }
-            Some(
-                raw.chunks_exact(2)
-                    .map(|c| Complex32::new(c[0], c[1]))
-                    .collect(),
-            )
-        } else {
-            None
-        };
-        Ok((gains, coefs))
+        }
+        self.graphs.infer(&self.cfg, &self.erb, &self.feat_spec)
     }
 }
 
@@ -258,6 +446,10 @@ impl crate::Enhancer for DeepFilter {
 
     fn latency_samples(&self) -> usize {
         DeepFilter::latency_samples(self)
+    }
+
+    fn set_attenuation_limit(&mut self, db: f32) {
+        DeepFilter::set_attenuation_limit(self, db);
     }
 }
 
@@ -285,6 +477,38 @@ mod tests {
         );
         assert!(stages(-12.0).gains && stages(-12.0).deep_filter);
         assert!(stages(30.0).gains && stages(30.0).deep_filter);
+    }
+
+    #[cfg(feature = "onnxruntime")]
+    #[test]
+    fn the_gpu_is_given_up_after_missed_deadlines_in_a_row_only() {
+        use std::time::Duration;
+        let (late, on_time) = (GPU_DEADLINE + Duration::from_micros(1), GPU_DEADLINE);
+        let mut deadline = Deadline::default();
+        assert!(!deadline.gives_up(late));
+        assert!(!deadline.gives_up(late));
+        assert!(
+            !deadline.gives_up(on_time),
+            "a frame in time resets the count"
+        );
+        assert!(!deadline.gives_up(late));
+        assert!(!deadline.gives_up(late));
+        assert!(deadline.gives_up(late), "{GPU_MISSES} in a row");
+    }
+
+    #[test]
+    fn the_status_reads_back_what_was_set() {
+        let status = DeepFilterStatus::new(DeepFilterBackend::Gpu);
+        let reader = status.clone();
+        for backend in [
+            DeepFilterBackend::Cpu,
+            DeepFilterBackend::CpuAfterGpuError,
+            DeepFilterBackend::CpuAfterGpuTooSlow,
+            DeepFilterBackend::Gpu,
+        ] {
+            status.set(backend);
+            assert_eq!(reader.get(), backend);
+        }
     }
 
     #[test]

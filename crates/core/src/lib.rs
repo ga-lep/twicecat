@@ -12,6 +12,7 @@ mod call_settings;
 mod client;
 mod drafts;
 mod engine;
+mod gpu_enhancement;
 pub mod logging;
 mod oauth;
 mod outgoing;

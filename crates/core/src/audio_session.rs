@@ -6,17 +6,18 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tessera_audio::{
-    AudioIo, ChainSettings, DeepFilter, Frame, GateMode, IoConfig, IoEvent, NoiseMode,
-    NsLevel as AudioNsLevel, Outgoing, SourceId, SourceInput, VirtualDevice, VoiceControl,
-    VoiceEngine,
+    AudioIo, ChainSettings, DeepFilter, DeepFilterStatus, Frame, GateMode, IoConfig, IoEvent,
+    NoiseMode, NsLevel as AudioNsLevel, Outgoing, SourceId, SourceInput, VirtualDevice,
+    VoiceControl, VoiceEngine,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::api::{
-    AudioBackend, AudioSettings, AudioStats, CoreError, CoreEvent, InputLevel, InputMode,
-    NoiseSuppression, NsLevel, VirtualAudio,
+    AudioBackend, AudioSettings, AudioStats, CoreError, CoreEvent, EnhancerBackend, GpuBackend,
+    GpuEnhancement, InputLevel, InputMode, NoiseSuppression, NsLevel, VirtualAudio,
 };
+use crate::gpu_enhancement;
 
 /// `InputLevel` events while a session runs (20 Hz).
 const LEVEL_INTERVAL: Duration = Duration::from_millis(50);
@@ -110,14 +111,35 @@ impl VirtualDevice for Virtual {
 /// The voice engine's control handle, shared with the media layer.
 pub(crate) type Voice = Arc<Mutex<VoiceControl>>;
 
+/// The DeepFilterNet3 a session asked for, and where it runs.
+#[derive(Default)]
+struct EnhancerState {
+    /// `(gpu, attenuation limit)` of the filter loaded or loading.
+    wanted: Option<(bool, f32)>,
+    /// Where the loaded filter runs.
+    status: Option<(DeepFilterStatus, Option<GpuBackend>)>,
+}
+
+impl EnhancerState {
+    fn running(&self) -> Option<EnhancerBackend> {
+        self.status
+            .as_ref()
+            .map(|(status, gpu)| gpu_enhancement::running(status.get(), *gpu))
+    }
+
+    fn wants_gpu(&self) -> bool {
+        matches!(self.wanted, Some((true, _)))
+    }
+}
+
 /// A running session. Stop it with [`AudioSession::stop`]; dropping it also
 /// ends the reporting task, which closes the devices.
 pub(crate) struct AudioSession {
     control: Voice,
     mode: Mode,
     io_config: IoConfig,
-    /// The attenuation limit of the DeepFilterNet loaded or loading.
-    enhancer: Arc<Mutex<Option<f32>>>,
+    /// The DeepFilterNet loaded or loading.
+    enhancer: Arc<Mutex<EnhancerState>>,
     events: mpsc::Sender<CoreEvent>,
     stop: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<()>>,
@@ -153,12 +175,20 @@ impl AudioSession {
             Mode::Call => (None, Some(outgoing)),
         };
         let (stop_tx, stop_rx) = oneshot::channel();
-        let task = tokio::spawn(report(io, drain, control.clone(), events.clone(), stop_rx));
+        let enhancer = Arc::new(Mutex::new(EnhancerState::default()));
+        let task = tokio::spawn(report(
+            io,
+            drain,
+            control.clone(),
+            enhancer.clone(),
+            events.clone(),
+            stop_rx,
+        ));
         let session = Self {
             control,
             mode,
             io_config,
-            enhancer: Arc::new(Mutex::new(None)),
+            enhancer,
             events,
             stop: Some(stop_tx),
             task: Some(task),
@@ -168,51 +198,117 @@ impl AudioSession {
     }
 
     /// Loads DeepFilterNet3 off the async threads when the settings ask for
-    /// it (and its attenuation limit changed), then plugs it in; RNNoise
-    /// runs meanwhile, and stays if the model is missing.
+    /// it, on the GPU when they say so, then plugs it in; RNNoise runs
+    /// meanwhile, and stays if the model is missing. A new attenuation limit
+    /// goes to the running filter (no reload); only the GPU choice reloads.
     fn load_enhancer(&self, settings: &AudioSettings) {
         let NoiseSuppression::DeepFilter {
             attenuation_limit_db,
+            gpu,
         } = settings.processing.noise_suppression
         else {
             return;
         };
         {
-            let mut loaded = self.enhancer.lock().expect("enhancer lock");
-            if *loaded == Some(attenuation_limit_db) {
+            let mut state = self.enhancer.lock().expect("enhancer lock");
+            if let Some((loaded_gpu, limit)) = state.wanted
+                && loaded_gpu == gpu
+            {
+                if limit != attenuation_limit_db {
+                    state.wanted = Some((gpu, attenuation_limit_db));
+                    let _ = self
+                        .control
+                        .lock()
+                        .expect("voice control lock")
+                        .set_enhancer_attenuation(attenuation_limit_db);
+                }
                 return;
             }
-            *loaded = Some(attenuation_limit_db);
+            state.wanted = Some((gpu, attenuation_limit_db));
+            state.status = None;
         }
         let control = self.control.clone();
-        let marker = self.enhancer.clone();
+        let state = self.enhancer.clone();
         let events = self.events.clone();
         tokio::spawn(async move {
             let loaded = tokio::task::spawn_blocking(move || {
-                let dir =
-                    tessera_audio::default_model_dir().ok_or(tessera_audio::AudioError::Model)?;
-                DeepFilter::load(&dir, attenuation_limit_db)
-            })
-            .await;
-            match loaded {
-                Ok(Ok(filter)) => {
-                    let _ = control
-                        .lock()
-                        .expect("voice control lock")
-                        .set_enhancer(Some(Box::new(filter)));
+                let dir = tessera_audio::default_model_dir().ok_or(None::<String>)?;
+                if gpu {
+                    match gpu_enhancement::load(&dir, attenuation_limit_db) {
+                        Ok((filter, backend)) => return Ok((filter, backend, None)),
+                        Err(reason) => {
+                            let filter = DeepFilter::load(&dir, attenuation_limit_db)
+                                .map_err(|_| Some(reason.clone()))?;
+                            return Ok((filter, None, Some(reason)));
+                        }
+                    }
                 }
-                _ => {
-                    *marker.lock().expect("enhancer lock") = None;
+                DeepFilter::load(&dir, attenuation_limit_db)
+                    .map(|filter| (filter, None, None))
+                    .map_err(|_| None::<String>)
+            })
+            .await
+            .unwrap_or(Err(None));
+            match loaded {
+                Ok((filter, backend, note)) => {
+                    let status = filter.status();
+                    let current_limit = {
+                        let mut state = state.lock().expect("enhancer lock");
+                        match state.wanted {
+                            // Still what the settings ask for (the limit may
+                            // have changed meanwhile).
+                            Some((wanted_gpu, limit)) if wanted_gpu == gpu => {
+                                state.status = Some((status.clone(), backend));
+                                Some(limit)
+                            }
+                            _ => None,
+                        }
+                    };
+                    let Some(limit) = current_limit else {
+                        // Superseded: drop it off the async threads.
+                        let _ = tokio::task::spawn_blocking(move || drop(filter)).await;
+                        return;
+                    };
+                    {
+                        let mut control = control.lock().expect("voice control lock");
+                        let _ = control.set_enhancer(Some(Box::new(filter)));
+                        if limit != attenuation_limit_db {
+                            let _ = control.set_enhancer_attenuation(limit);
+                        }
+                    }
+                    if let Some(note) = note {
+                        let message = format!("{note}; DeepFilterNet runs on the CPU");
+                        let _ = events
+                            .send(CoreEvent::Error(CoreError::Audio(message)))
+                            .await;
+                    }
+                    if gpu {
+                        let event = GpuEnhancement {
+                            available: gpu_enhancement::probed().unwrap_or_default(),
+                            running: Some(gpu_enhancement::running(status.get(), backend)),
+                        };
+                        let _ = events.send(CoreEvent::GpuEnhancement(event)).await;
+                    }
+                }
+                Err(note) => {
+                    *state.lock().expect("enhancer lock") = EnhancerState::default();
+                    let mut message = "DeepFilterNet's model could not be loaded \
+                                       (scripts/fetch-models.sh installs it); RNNoise is used instead"
+                        .to_owned();
+                    if let Some(note) = note {
+                        message = format!("{message} ({note})");
+                    }
                     let _ = events
-                        .send(CoreEvent::Error(CoreError::Audio(
-                            "DeepFilterNet's model could not be loaded (scripts/fetch-models.sh \
-                             installs it); RNNoise is used instead"
-                                .into(),
-                        )))
+                        .send(CoreEvent::Error(CoreError::Audio(message)))
                         .await;
                 }
             }
         });
+    }
+
+    /// Where DeepFilterNet3 runs in this session, when it does.
+    pub(crate) fn enhancer_running(&self) -> Option<EnhancerBackend> {
+        self.enhancer.lock().expect("enhancer lock").running()
     }
 
     /// Applies new settings. Returns false when the devices changed, so the
@@ -311,9 +407,11 @@ async fn report(
     io: AudioIo,
     mut drain: Option<Outgoing>,
     control: Arc<Mutex<VoiceControl>>,
+    enhancer: Arc<Mutex<EnhancerState>>,
     events: mpsc::Sender<CoreEvent>,
     mut stop: oneshot::Receiver<()>,
 ) {
+    let mut last_running = None;
     let mut ticker = tokio::time::interval(LEVEL_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut ticks = 0_u32;
@@ -368,6 +466,22 @@ async fn report(
             if events.send(stats).await.is_err() {
                 break;
             }
+            // A GPU filter that fell back to the CPU (checked once a second;
+            // the load itself is announced where it completes).
+            let (running, wants_gpu) = {
+                let state = enhancer.lock().expect("enhancer lock");
+                (state.running(), state.wants_gpu())
+            };
+            if wants_gpu && last_running.is_some() && running.is_some() && running != last_running {
+                let event = GpuEnhancement {
+                    available: gpu_enhancement::probed().unwrap_or_default(),
+                    running,
+                };
+                if events.send(CoreEvent::GpuEnhancement(event)).await.is_err() {
+                    break;
+                }
+            }
+            last_running = running;
         }
     }
     // Closing joins the audio thread: do it off the async threads.
@@ -409,6 +523,7 @@ mod tests {
         let mut settings = AudioSettings::default();
         settings.processing.noise_suppression = NoiseSuppression::DeepFilter {
             attenuation_limit_db: 40.0,
+            gpu: false,
         };
         assert_eq!(chain_settings(&settings).noise, NoiseMode::Enhancer);
         settings.processing.noise_suppression = NoiseSuppression::RnNoise;

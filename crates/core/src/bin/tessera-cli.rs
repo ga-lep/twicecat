@@ -77,10 +77,14 @@ AUDIO SETTINGS (saved; take effect at the next call or mic test):
     /devices              List microphones and speakers
     /input <n|default>    Choose the microphone (index from /devices)
     /output <n|default>   Choose the speakers
-    /ns off|rnnoise|webrtc [low|moderate|high|very_high]|deepfilter [dB]
+    /ns off|rnnoise|webrtc [low|moderate|high|very_high]|deepfilter [dB] [gpu]
                           Noise suppression: one of them, or off (they do
                           not stack; processing outside Tessera, such as
-                          NVIDIA Broadcast, is up to you)
+                          NVIDIA Broadcast, is up to you). DeepFilterNet with
+                          `gpu` runs on the GPU when one starts (see /gpu),
+                          else on the CPU
+    /gpu                  Which GPU backends can run speech enhancement here,
+                          and where DeepFilterNet runs
     /aec [on|off]         Echo cancellation
     /aec system [on|off]  Also cancel other apps' sound (a game) picked up by
                           the microphone (Linux with PipeWire)
@@ -759,7 +763,8 @@ impl Cli {
             | CoreEvent::AudioDevices(_)
             | CoreEvent::AudioSettings(_)
             | CoreEvent::InputLevel(_)
-            | CoreEvent::AudioStats(_) => {
+            | CoreEvent::AudioStats(_)
+            | CoreEvent::GpuEnhancement(_) => {
                 for line in self.calls.event(event, &self.rooms) {
                     println!("{line}");
                 }

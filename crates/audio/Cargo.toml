@@ -24,9 +24,14 @@ realfft = "3"
 # downloaded or linked at build time (`load-dynamic`).
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "load-dynamic", "api-28", "tracing", "cuda", "tensorrt", "directml", "coreml"], optional = true }
 
+# The CUDA runtime's copy functions for the GPU loop (src/onnx/stateful_loop.rs),
+# from the library ONNX Runtime's CUDA provider loaded; already ort's own
+# loader, same version.
+libloading = { version = "=0.9.0", optional = true }
+
 [features]
 # GPU speech enhancement through ONNX Runtime (plan Task 13b). Off by default.
-onnxruntime = ["dep:ort"]
+onnxruntime = ["dep:ort", "dep:libloading"]
 
 # Linux: our own PipeWire client (src/pw, plan decision 12): call-role
 # streams in the graph's real-time cycle, devices and changes from the

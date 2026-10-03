@@ -180,7 +180,58 @@ pub enum NoiseSuppression {
     DeepFilter {
         /// Most attenuation applied, in dB (higher removes more, 0..=100).
         attenuation_limit_db: f32,
+        /// Run the networks on a GPU (opt-in; offer it only when
+        /// [`GpuEnhancement::available`] lists a backend). The same model
+        /// and output; the CPU runs instead when no GPU starts, and takes
+        /// over if the GPU fails or falls behind (reported as
+        /// [`GpuEnhancement::running`]).
+        #[serde(default)]
+        gpu: bool,
     },
+}
+
+/// A GPU backend for speech enhancement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GpuBackend {
+    /// NVIDIA, through CUDA.
+    Cuda,
+    /// NVIDIA, through TensorRT.
+    TensorRt,
+    /// Any DirectX 12 GPU (Windows).
+    DirectMl,
+    /// Apple's GPU and Neural Engine (macOS).
+    CoreMl,
+}
+
+/// Where DeepFilterNet3 runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum EnhancerBackend {
+    /// On the CPU, as asked (or no GPU backend started).
+    Cpu,
+    /// On a GPU.
+    Gpu {
+        /// Which.
+        backend: GpuBackend,
+    },
+    /// On the CPU after the GPU failed (a driver error, a lost device).
+    CpuAfterGpuError,
+    /// On the CPU because the GPU kept missing its deadline (a game may be
+    /// using it).
+    CpuAfterGpuTooSlow,
+}
+
+/// GPU speech enhancement on this machine: answers `ProbeGpuEnhancement`,
+/// and is sent again when where DeepFilterNet3 runs changes.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GpuEnhancement {
+    /// Backends that started here (empty without a usable GPU, its runtime
+    /// or the GPU model, or in a build without GPU support). Offer the
+    /// `gpu` setting only when this is not empty.
+    pub available: Vec<GpuBackend>,
+    /// Where DeepFilterNet3 runs now, when it runs.
+    pub running: Option<EnhancerBackend>,
 }
 
 /// Microphone processing before sending, in this order: high-pass, echo
@@ -377,6 +428,7 @@ impl AudioSettings {
         }
         if let NoiseSuppression::DeepFilter {
             attenuation_limit_db,
+            ..
         } = &mut self.processing.noise_suppression
         {
             *attenuation_limit_db =
@@ -442,6 +494,7 @@ mod tests {
             processing: AudioProcessing {
                 noise_suppression: NoiseSuppression::DeepFilter {
                     attenuation_limit_db: 500.0,
+                    gpu: true,
                 },
                 ..AudioProcessing::default()
             },
@@ -463,7 +516,22 @@ mod tests {
         assert_eq!(
             s.processing.noise_suppression,
             NoiseSuppression::DeepFilter {
-                attenuation_limit_db: 100.0
+                attenuation_limit_db: 100.0,
+                gpu: true,
+            }
+        );
+    }
+
+    #[test]
+    fn deep_filter_settings_saved_before_the_gpu_option_load_on_the_cpu() {
+        let old = serde_json::json!({ "processing": { "noise_suppression": {
+            "kind": "deep_filter", "attenuation_limit_db": 30.0 } } });
+        let s: AudioSettings = serde_json::from_value(old).unwrap();
+        assert_eq!(
+            s.processing.noise_suppression,
+            NoiseSuppression::DeepFilter {
+                attenuation_limit_db: 30.0,
+                gpu: false,
             }
         );
     }

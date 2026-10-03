@@ -22,6 +22,8 @@ const SOURCE_MAX_QUEUED: usize = 4800;
 pub const OUTGOING_RING_LEN: usize = 9600;
 /// Commands waiting for the processing thread.
 const CONTROL_QUEUE_LEN: usize = 64;
+/// Enhancers waiting to be dropped by the control side.
+const RETIRED_LEN: usize = 4;
 
 /// Identifies a remote source (the core maps it to a participant).
 pub type SourceId = u64;
@@ -113,6 +115,7 @@ enum Command {
     MasterVolume(u16),
     AddSource(Box<Source>),
     Enhancer(Option<Box<dyn crate::chain::Enhancer>>),
+    EnhancerAttenuation(f32),
     SourceVolume(SourceId, u16),
     RemoveSource(SourceId),
 }
@@ -169,6 +172,8 @@ pub struct VoiceStats {
 /// The owner's handle on a running [`VoiceEngine`].
 pub struct VoiceControl {
     commands: rtrb::Producer<Command>,
+    /// Enhancers the engine let go of, dropped here.
+    retired: rtrb::Consumer<Box<dyn crate::chain::Enhancer>>,
     shared: Arc<Shared>,
     next_source: SourceId,
     last_frames: u64,
@@ -189,7 +194,26 @@ impl VoiceControl {
     /// Plugs a speech enhancer (loaded off this thread) into the chain, or
     /// removes it; it runs while the noise mode is `NoiseMode::Enhancer`.
     pub fn set_enhancer(&mut self, enhancer: Option<Box<dyn crate::Enhancer>>) -> bool {
+        self.drop_retired();
         self.send(Command::Enhancer(enhancer))
+    }
+
+    /// Sets the plugged enhancer's attenuation limit, dB, without reloading
+    /// it.
+    pub fn set_enhancer_attenuation(&mut self, db: f32) -> bool {
+        self.send(Command::EnhancerAttenuation(db))
+    }
+
+    /// Drops the enhancers the engine replaced or that failed (also done by
+    /// [`set_enhancer`](Self::set_enhancer) and [`stats`](Self::stats)).
+    /// Returns how many.
+    pub fn drop_retired(&mut self) -> usize {
+        let mut n = 0;
+        while let Ok(enhancer) = self.retired.pop() {
+            drop(enhancer);
+            n += 1;
+        }
+        n
     }
 
     /// Push-to-talk key state.
@@ -266,6 +290,7 @@ impl VoiceControl {
 
     /// Diagnostics; `processing_us` is averaged since the previous call.
     pub fn stats(&mut self) -> VoiceStats {
+        self.drop_retired();
         let s = &self.shared;
         let frames = s.frames.load(Ordering::Relaxed);
         let ns = s.processing_ns.load(Ordering::Relaxed);
@@ -300,6 +325,7 @@ impl VoiceControl {
 pub struct VoiceEngine {
     chain: CaptureChain,
     commands: rtrb::Consumer<Command>,
+    retired: rtrb::Producer<Box<dyn crate::chain::Enhancer>>,
     shared: Arc<Shared>,
     outgoing: rtrb::Producer<f32>,
     sources: Vec<Source>,
@@ -323,6 +349,7 @@ impl VoiceEngine {
     pub fn new(settings: ChainSettings) -> (Self, VoiceControl, Outgoing) {
         let (commands_tx, commands_rx) = rtrb::RingBuffer::new(CONTROL_QUEUE_LEN);
         let (out_tx, out_rx) = rtrb::RingBuffer::new(OUTGOING_RING_LEN);
+        let (retired_tx, retired_rx) = rtrb::RingBuffer::new(RETIRED_LEN);
         let transmitting = Arc::new(AtomicBool::new(false));
         let shared = Arc::new(Shared {
             input_rms_db: AtomicF32::new(LEVEL_FLOOR_DB),
@@ -339,6 +366,7 @@ impl VoiceEngine {
         let engine = Self {
             chain: CaptureChain::new(settings),
             commands: commands_rx,
+            retired: retired_tx,
             shared: shared.clone(),
             outgoing: out_tx,
             sources: Vec::with_capacity(16),
@@ -354,6 +382,7 @@ impl VoiceEngine {
         };
         let control = VoiceControl {
             commands: commands_tx,
+            retired: retired_rx,
             shared,
             next_source: 1,
             last_frames: 0,
@@ -371,6 +400,7 @@ impl VoiceEngine {
             match command {
                 Command::Configure(s) => self.chain.configure(s),
                 Command::Enhancer(e) => self.chain.set_enhancer(e),
+                Command::EnhancerAttenuation(db) => self.chain.set_enhancer_attenuation(db),
                 Command::PushToTalk(p) => self.chain.set_push_to_talk(p),
                 Command::Muted(m) => self.muted = m,
                 Command::Deafened(d) => self.deafened = d,
@@ -453,6 +483,10 @@ impl FrameProcessor for VoiceEngine {
 
         self.mic = *capture;
         let result = self.chain.capture(&mut self.mic);
+        if let Some(enhancer) = self.chain.take_retired() {
+            // Dropped here only if the control side has not collected four.
+            let _ = self.retired.push(enhancer);
+        }
         let transmit = result.transmit && !self.muted;
         if !transmit {
             self.mic = SILENCE;

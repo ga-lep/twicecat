@@ -12,9 +12,9 @@ mod types;
 
 pub use call::{
     AUDIO_FRAME_LEN, AudioBackend, AudioDevice, AudioDeviceId, AudioDevices, AudioProcessing,
-    AudioSettings, AudioStats, CallEndReason, CallIntent, CallState, InputLevel, InputMode,
-    NoiseSuppression, NsLevel, Participant, ParticipantId, PushToTalkBindings, VirtualAudio,
-    limits,
+    AudioSettings, AudioStats, CallEndReason, CallIntent, CallState, EnhancerBackend, GpuBackend,
+    GpuEnhancement, InputLevel, InputMode, NoiseSuppression, NsLevel, Participant, ParticipantId,
+    PushToTalkBindings, VirtualAudio, limits,
 };
 pub use diff::ListDiff;
 pub use security::{
@@ -278,6 +278,9 @@ pub enum Command {
     ListAudioDevices,
     /// Ask for the current settings; answered by `AudioSettings`.
     GetAudioSettings,
+    /// Find which GPU backends can run speech enhancement here (the first
+    /// time takes about a second); answered by `GpuEnhancement`.
+    ProbeGpuEnhancement,
     /// Replace all audio settings. They are validated, applied (to a running
     /// call too), saved, and echoed back as `AudioSettings`.
     UpdateAudioSettings(AudioSettings),
@@ -466,6 +469,7 @@ impl fmt::Debug for Command {
                 .finish(),
             Self::ListAudioDevices => f.write_str("ListAudioDevices"),
             Self::GetAudioSettings => f.write_str("GetAudioSettings"),
+            Self::ProbeGpuEnhancement => f.write_str("ProbeGpuEnhancement"),
             Self::UpdateAudioSettings(settings) => f
                 .debug_tuple("UpdateAudioSettings")
                 .field(settings)
@@ -668,6 +672,9 @@ pub enum CoreEvent {
     InputLevel(InputLevel),
     /// Processing statistics (about 1 Hz while the microphone is open).
     AudioStats(AudioStats),
+    /// GPU speech enhancement: answering `ProbeGpuEnhancement`, and when
+    /// where DeepFilterNet3 runs changes.
+    GpuEnhancement(GpuEnhancement),
 }
 
 #[cfg(test)]
