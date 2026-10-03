@@ -1024,6 +1024,7 @@ impl App {
             | CoreEvent::ActiveCall { .. }
             | CoreEvent::IncomingCall { .. }
             | CoreEvent::RingingStopped { .. }
+            | CoreEvent::CallDeclined { .. }
             | CoreEvent::AudioDevices(_)
             | CoreEvent::AudioSettings(_)
             | CoreEvent::InputLevel(_)

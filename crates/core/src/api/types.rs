@@ -315,6 +315,9 @@ pub struct RoomSummary {
     pub is_dm: bool,
     /// A space.
     pub is_space: bool,
+    /// A call room (MSC3417 `org.matrix.msc3417.call`): a voice room, joined
+    /// like a Discord channel.
+    pub is_call_room: bool,
     /// The user is invited and has not joined.
     pub is_invite: bool,
     /// Unread highlights (mentions and keyword matches).
@@ -350,6 +353,7 @@ impl RoomSummary {
             avatar: None,
             is_dm: false,
             is_space: false,
+            is_call_room: false,
             is_invite: false,
             highlights: 0,
             marked_unread: false,

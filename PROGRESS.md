@@ -1186,7 +1186,7 @@ Order (revised 2026-10-02, plan decision 12): 1–8, 8b, 9, 10, 11, 12, 14, 15, 
 - [x] 8. LiveKit media (publish, subscribe, reconnection; own SFU)
 - [x] 8b. Multi-SFU (subscribe to other members' SFUs; cross-homeserver calls)
 - [x] 9. Call E2EE (per-sender keys over to-device)
-- [ ] 10. Ringing and voice rooms
+- [x] 10. Ringing and voice rooms (MSC4075 notifications, MSC4310 declines, call counts, MSC3417 rooms)
 - [ ] 11. Push-to-talk service (global-hotkey, portal, gamepad, in-window)
 - [ ] 12. CLI call commands
 - [ ] 13. DeepFilterNet3 via tract-onnx (after 14 and 15)
@@ -1314,6 +1314,18 @@ Order (revised 2026-10-02, plan decision 12): 1–8, 8b, 9, 10, 11, 12, 14, 15, 
 - Open issues: a member whose key never arrives is silent without a UI hint; key material passes through `Vec<u8>` copies into the FFI and the SDK's JSON (`Raw`), which we cannot zeroize.
 - New human items: encrypted-room interop with Element Web and Element X (folded into the interop item).
 
+## Phase 6 / Task 10 notes
+- Checks run (all pass): `cargo fmt --all --check`; `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`; `cargo test --workspace --locked` (437 passed, 0 failed, per binary); `scripts/check-app-deps.sh` (and `livekit`); `scripts/check-core-api.sh`; `scripts/check-no-webrtc-download.sh`; `cargo deny check`; against a recreated stack, `cargo test -p tessera-core -p tessera-app --locked -- --ignored --skip keyring --skip hardware_`: 32/32 (call_ringing 4, call_media 4, call_signalling 2, rtc_stack 3, and the Phase 1/2 suites).
+- Element Call behaviour followed (matrix-js-sdk v43 and Element Call 0.26.1, read at those tags): the first member to join sends the notification (`MatrixRTCSession` `sendCallNotify`, after its own membership is sent), `ring` in a DM and `notification` elsewhere, `m.mentions { room: true }`, `m.reference` to the membership event, `lifetime` 90 s, `slot_id` `m.call#ROOM`; receiving follows `parseCallNotificationContent` and `getCallNotificationExpiry` (lifetime capped at 120 s, `sender_ts` ignored when more than 20 s ahead of the server's timestamp); declines are `org.matrix.msc4310.rtc.decline` with an `m.reference` to the notification. Notifications go out as regular events, js-sdk's fallback without sticky events (MSC4354).
+- **MSC ambiguity (MSC4143 slots):** js-sdk only rings while an `org.matrix.msc4143.rtc.slot` state event for `m.call#ROOM` is open, but Element Call 0.26.1 never creates one for `m.call.member` calls, so nothing would ever ring. Here a missing slot event counts as open and a closed one stops the ring. To revisit once MSC4143 settles or Element Call starts writing slots.
+- Built: `call::ringing` (content builders and the receiving rules, unit-tested), `call::watcher::CallWatch` (one per sync session: rings, declines of our notification, per-room call counts, a 2 s recheck for expiry and memberships that lapse without an event), `DeclineCall`, the notification sent by `CallSession::join` when nobody else is in the call, and `RoomSummary.is_call_room` from the SDK's `Room::is_call` (MSC3417).
+- API additions for approval (Task 3 contract): `IncomingCall.ring`, `CoreEvent::CallDeclined { room_id, user_id }`, `RoomSummary.is_call_room`.
+- Tests (`tests/call_ringing.rs`, alice and carol): a DM call rings carol (`ring: true`, alice as caller) and the room counts 1, answering stops the ring and counts 2; declining stops the ring and alice gets `CallDeclined` from carol, a second decline is refused; in a group room the notification is quiet (`ring: false`) and stops when alice leaves (count 0); an MSC3417 room is marked as a call room. Mutations, both failing as expected and reverted: no notification sent (3 of 4 fail; the call-room test does not depend on it), our sent notification not remembered (the declining test fails).
+- **Process finding (fixed):** since Task 8, `tests/call_signalling.rs` started its cores with the system audio backend, so the agent's local gate opened the real microphone and speakers, against the rule that `hardware_*` tests are human-run. The test helper now uses the silent virtual backend, and `tests/call_settings.rs`'s hardware test asks for the system backend explicitly (folded into the Task 8 commit).
+- Not covered locally: ringing with Element Web and Element X (human item); a decline from another of our own devices (handled, not tested: one account per test core); push rules for the notification event on the server.
+- Open issues: `IncomingCall.intent` is always `Audio` (we do not read `m.call.intent` yet; video is out of scope); the UI to answer or decline comes with the call UI.
+- New human items: ringing with Element Web and Element X.
+
 ## Phase 6 known limitations
 - Denormal guard (decision 7, human-approved 2026-10-02, pre-production): `crates/audio/src/denormals.rs` is the one audited `unsafe` function. It sets FTZ/DAZ (x86_64) or FZ (aarch64) on the audio processing thread, because sonora 0.2.0 AEC3 slows down on a silent far end after speech (upstream issue #34; measured 5.5× here, see Task 5). Remove it once a sonora release with upstream PR #38 ships (version bump asked first, rule 3).
 - sonora 0.2.0 allocates about 40 times per 10 ms frame in AEC3 (upstream #39/#40). The processing thread is not a device callback, so this is tolerable, but not real-time clean until upstream ships the fix.
@@ -1330,6 +1342,7 @@ Order (revised 2026-10-02, plan decision 12): 1–8, 8b, 9, 10, 11, 12, 14, 15, 
 - [ ] Interop with Element Call, both directions, in unencrypted and encrypted rooms, on a real homeserver with a real SFU. For encrypted rooms (Task 9), check both Element Web (js-sdk) and Element X (Element Call as a widget): keys arrive and media decrypts in both directions, including after someone leaves and rejoins.
 - [ ] Cross-homeserver call (Task 8b): members on two homeservers with their own call services hear each other. The subscribe-only token path for a non-full-access homeserver cannot be exercised with the single local Synapse.
 - [ ] Double talk by ear: talking while others talk, on open speakers and headphones (AEC3 cut a member's microphone to near silence in a virtual test while loud audio played on their speakers; Task 8b notes).
+- [ ] Ringing (Task 10) with Element Web and Element X, both directions: a DM call rings and shows the caller, a group call notifies quietly, declining on one side stops the ring on the other, answering on another device stops it here.
 - [ ] Global PTT hotkey on X11, Wayland (KDE/GNOME portal), Windows and macOS; gamepad PTT.
 - [ ] Steam Frame: aarch64 build runs on the device (desktop mode and game mode); built-in mic and speakers with AEC; game audio cancelled with the system-mix reference (Task 14); PipeWire device switching; CPU/battery cost of each NS mode within the Task 15 budget while a standalone VR game runs; rtkit real-time priority granted.
 - [ ] CLI call against a real account; leave by crash (kill -9) clears the membership within the delayed-event timeout.

@@ -33,6 +33,7 @@ use crate::api::{
 };
 use crate::audio_session::{AudioSession, Mode};
 use crate::avatars::{Avatars, SdkFetcher, answer_unavailable};
+use crate::call::watcher::CallWatch;
 use crate::call::{CallAudio, CallSession, MediaNotice, UserVolumes};
 use crate::call_settings;
 use crate::client::{
@@ -140,6 +141,8 @@ struct Syncing {
     room_list: JoinHandle<()>,
     /// Asks the room list forwarder to load one more page.
     more_rooms: mpsc::Sender<()>,
+    /// Rings and the calls in every room.
+    calls: CallWatch,
 }
 
 /// The room whose timeline is open, the task forwarding its diffs and the
@@ -231,6 +234,7 @@ impl Active {
         // The supervisor finishes any `stop` or `restart` it is in the middle
         // of, then ends. Only then is the service stopped here, so the store
         // is never deleted while SDK tasks still use it.
+        sync.calls.stop().await;
         sync.cancel.cancel();
         let _ = sync.supervisor.await;
         sync.room_list.abort();
@@ -1237,15 +1241,7 @@ impl Engine {
                     self.emit(CoreEvent::Error(CoreError::NotInCall)).await;
                 }
             }
-            // Ringing lands in Phase 6 Task 10.
-            Command::DeclineCall { .. } => {
-                let error = if self.active.is_none() {
-                    CoreError::NotLoggedIn
-                } else {
-                    CoreError::Call("declining calls is not available yet".into())
-                };
-                self.emit(CoreEvent::Error(error)).await;
-            }
+            Command::DeclineCall { room_id } => self.decline_call(room_id).await,
             Command::ListAudioDevices => self.list_audio_devices().await,
             Command::StartMicTest { loopback } => self.start_mic_test(loopback).await,
             Command::StopMicTest => {
@@ -1390,6 +1386,16 @@ impl Engine {
         {
             Ok(session) => {
                 let encrypted = session.encrypted;
+                if let Some(calls) = self.calls() {
+                    calls.set_sent(&room_id, session.notification.clone());
+                    if calls.take_ring(&room_id).is_some() {
+                        // Answered here.
+                        self.emit(CoreEvent::RingingStopped {
+                            room_id: room_id.clone(),
+                        })
+                        .await;
+                    }
+                }
                 self.call = Some(session);
                 self.emit(CoreEvent::CallState(CallState::Connected {
                     room_id,
@@ -1495,6 +1501,9 @@ impl Engine {
             }
             MediaNotice::Disconnected => {
                 if let Some(call) = self.call.take() {
+                    if let Some(calls) = self.calls() {
+                        calls.set_sent(&call.room_id, None);
+                    }
                     call.leave().await;
                 }
                 self.stop_call_audio().await;
@@ -1507,10 +1516,56 @@ impl Engine {
         }
     }
 
+    /// The session's call watcher, while syncing.
+    fn calls(&self) -> Option<&CallWatch> {
+        self.active.as_ref()?.sync.as_ref().map(|s| &s.calls)
+    }
+
+    /// Declines the ring in `room_id`, on every device of ours.
+    async fn decline_call(&mut self, room_id: RoomId) {
+        let Some(active) = self.active.as_ref() else {
+            self.emit(CoreEvent::Error(CoreError::NotLoggedIn)).await;
+            return;
+        };
+        let Some(notification) = self.calls().and_then(|c| c.take_ring(&room_id)) else {
+            self.emit(CoreEvent::Error(CoreError::Call(
+                "nothing is ringing in this room".into(),
+            )))
+            .await;
+            return;
+        };
+        let room = parse_room_id(&room_id)
+            .ok()
+            .and_then(|id| active.client.get_room(&id));
+        let sent = match room {
+            Some(room) => room
+                .send_raw(
+                    crate::call::ringing::DECLINE_EVENT,
+                    crate::call::ringing::decline_content(&notification),
+                )
+                .await
+                .is_ok(),
+            None => false,
+        };
+        self.emit(CoreEvent::RingingStopped {
+            room_id: room_id.clone(),
+        })
+        .await;
+        if !sent {
+            self.emit(CoreEvent::Error(CoreError::Call(
+                "could not send the decline; the caller keeps ringing".into(),
+            )))
+            .await;
+        }
+    }
+
     /// Leaves the current call, if any.
     async fn leave_call(&mut self) {
         if let Some(call) = self.call.take() {
             let room_id = call.room_id.clone();
+            if let Some(calls) = self.calls() {
+                calls.set_sent(&room_id, None);
+            }
             call.leave().await;
             self.stop_call_audio().await;
             self.emit(CoreEvent::CallState(CallState::Left {
@@ -2176,6 +2231,7 @@ impl Engine {
             more_rx,
             self.events.clone(),
         ));
+        let calls = CallWatch::start(&active.client, self.events.clone());
         service.start().await;
         if let Some(active) = self.active.as_mut() {
             active.sync = Some(Syncing {
@@ -2185,6 +2241,7 @@ impl Engine {
                 supervisor,
                 room_list,
                 more_rooms,
+                calls,
             });
         }
     }

@@ -634,7 +634,8 @@ pub enum CoreEvent {
         /// Devices in the call.
         participants: u32,
     },
-    /// Someone rings this user.
+    /// Someone rings this user, or (with `ring: false`) lets them know a
+    /// call started in a group room.
     IncomingCall {
         /// Room that rings.
         room_id: RoomId,
@@ -642,6 +643,15 @@ pub enum CoreEvent {
         caller: UserId,
         /// Voice or (later) video.
         intent: CallIntent,
+        /// A ring (a DM call); `false` for a quiet notification.
+        ring: bool,
+    },
+    /// Someone declined the ring of the call we started.
+    CallDeclined {
+        /// Room of the call.
+        room_id: RoomId,
+        /// Who declined.
+        user_id: UserId,
     },
     /// The ringing in a room stopped: declined (maybe on another device),
     /// answered, or timed out.

@@ -21,6 +21,8 @@ mod e2ee;
 mod jwt;
 mod media;
 pub(crate) mod membership;
+pub(crate) mod ringing;
+pub(crate) mod watcher;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex as StdMutex, RwLock};
@@ -68,7 +70,7 @@ type Expected = BTreeMap<String, BTreeSet<String>>;
 /// Connected SFUs of other members, by call service URL.
 type Remotes = Arc<StdMutex<HashMap<String, SfuConnection>>>;
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
@@ -93,6 +95,8 @@ pub(crate) struct CallSession {
     pub encrypted: bool,
     /// Receives the other members' call keys, in an encrypted room.
     key_handler: Option<EventHandlerHandle>,
+    /// The notification we sent as the first member, to tell its declines.
+    pub notification: Option<String>,
     /// SFU connection notices for the engine.
     pub notices: mpsc::Receiver<MediaNotice>,
     tasks: Vec<JoinHandle<()>>,
@@ -140,10 +144,15 @@ async fn schedule_delayed_leave(
     }
 }
 
-async fn send_membership(room: &Room, state_key: &str, content: Value) -> Result<(), CoreError> {
+/// Sends our membership; returns its event ID.
+async fn send_membership(
+    room: &Room,
+    state_key: &str,
+    content: Value,
+) -> Result<String, CoreError> {
     room.send_state_event_raw(CALL_MEMBER_EVENT, state_key, content)
         .await
-        .map(|_| ())
+        .map(|r| r.event_id.to_string())
         .map_err(|e| match e.client_api_error_kind() {
             // The room's power levels reserve call memberships (Element
             // creates rooms with `org.matrix.msc3401.call.member` at 0).
@@ -152,6 +161,21 @@ async fn send_membership(room: &Room, state_key: &str, content: Value) -> Result
             }
             _ => CoreError::Call("could not publish the call membership".into()),
         })
+}
+
+/// Rings the room: `ring` in a DM, a quiet `notification` elsewhere (as
+/// Element Call). Returns the notification's event ID; a failure only
+/// means nobody is rung.
+async fn send_notification(room: &Room, membership_event: &str) -> Option<String> {
+    let ring = room.is_direct().await.unwrap_or(false);
+    let content = ringing::notification_content(membership_event, ring, now_ms());
+    match room.send_raw(ringing::NOTIFICATION_EVENT, content).await {
+        Ok(sent) => Some(sent.response.event_id.to_string()),
+        Err(_) => {
+            tracing::warn!("could not send the call notification");
+            None
+        }
+    }
 }
 
 /// Our LiveKit service URL: `service_override`, or our homeserver's
@@ -201,7 +225,7 @@ async fn read_memberships(room: &Room) -> Vec<Membership> {
 }
 
 /// Active memberships, oldest first.
-async fn active_memberships(room: &Room) -> Vec<Membership> {
+pub(crate) async fn active_memberships(room: &Room) -> Vec<Membership> {
     let now = now_ms();
     let mut active: Vec<Membership> = read_memberships(room)
         .await
@@ -324,6 +348,7 @@ impl CallSession {
             own_identity: own_identity.clone(),
             encrypted,
             key_handler: None,
+            notification: None,
             notices,
             tasks: Vec::new(),
         };
@@ -366,9 +391,21 @@ impl CallSession {
                 },
             ));
         }
-        if let Err(e) = send_membership(&room, &state_key, content).await {
-            session.leave().await;
-            return Err(e);
+        // Whether anyone else is in the call before we join: the first member
+        // rings the others (js-sdk `sendCallNotify`).
+        let first = active_memberships(&room)
+            .await
+            .iter()
+            .all(|m| m.backend_identity == own_identity);
+        let membership_event = match send_membership(&room, &state_key, content).await {
+            Ok(id) => id,
+            Err(e) => {
+                session.leave().await;
+                return Err(e);
+            }
+        };
+        if first {
+            session.notification = send_notification(&room, &membership_event).await;
         }
         let shared = ConnectionShared {
             encryption: keys.as_ref().map(|provider| E2eeOptions {
