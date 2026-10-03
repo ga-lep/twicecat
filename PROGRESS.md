@@ -1192,7 +1192,7 @@ Order (revised 2026-10-02, plan decision 12; again 2026-10-03 by the human): 1�
 - [x] 13. DeepFilterNet3 via tract-onnx + tract-pulse, pluggable enhancer
 - [x] 13b. GPU speech enhancement, opt-in (part 1: pinned ONNX Runtime, `onnxruntime` feature, accelerator probing and CPU fallback; part 2: stateful DeepFilterNet3 export, CUDA graph loop, `gpu` setting, probe and status; part 3: TensorRT, preferred; batching (Task 16) and Maxine not done)
 - [x] 14. Own PipeWire client on Linux (communication role, latency, registry events, system-mix echo reference)
-- [ ] 15. Steam Frame performance (CPU budget per mode, Frame defaults, rtkit priority)
+- [ ] 15. Steam Frame performance (CPU budget per mode, Frame defaults, rtkit priority) — part 1 done: profiling harness and x86_64 per-stage numbers
 - [ ] 16. Cleaning other people's voices, opt-in (added 2026-10-03; batched on the GPU; skip voices whose clients say they are already clean)
 
 ## Phase 6 / Task 1 notes
@@ -1398,6 +1398,12 @@ Order (revised 2026-10-02, plan decision 12; again 2026-10-03 by the human): 1�
 - Open: the first build blocks the GPU load for about 20 s (RNNoise runs meanwhile; the UI should say "preparing the GPU"); old engines stay in the cache when the model changes (9 MB each); TensorRT 11 needs a newer ONNX Runtime (version question, rule 3).
 - Gate: `encrypted_room_calls_are_end_to_end_encrypted` (Task 9) failed once in the gate run: after carol rejoined, alice heard nothing from her after the fixed 6 s wait (0.0000; no partial audio). It then passed 3/3 alone, and 6/6 with the wait replaced by polling up to 20 s (both directions back within 3 s every time); the polling is folded into the Task 9 commit and prints how long the rejoin took. Not reproduced since: if it recurs, the printed time says whether the audio comes back late or never (a key-rotation race would be a Task 9 bug).
 - New human items: none beyond the GPU-by-ear item (it now runs TensorRT when fetched).
+
+## Phase 6 / Task 15 notes (part 1, profiling on x86_64)
+- Built: `crates/audio/examples/voice_profile.rs` (per-stage cost and allocations, allocation callers with `VOICE_PROFILE_TRACE`, one configuration alone for `perf`); `perf` installed (user space).
+- Measured (per 10 ms frame, desktop): default chain 97 µs (p99 111 µs), about 1 % of a core, 51.5 allocations; DeepFilterNet3 on the CPU 270 µs and 1028 allocations; mixing 0.8 µs per remote voice. Details and the ranked candidates in the plan (Task 15).
+- No bottleneck in the default path. Candidates, none applied (decisions for the human): x86-64-v3 builds (−17 %); AGC2 using RNNoise's voice probability (−12 %, needs sonora upstream); ONNX Runtime CPU for DeepFilterNet3 (same speed, 19 allocations instead of 1028, ships ONNX Runtime everywhere); upstream reports for AGC2's allocations.
+- Open: aarch64 numbers (Frame or CI arm runner), Opus cost, lateness under load and real-time priority (rest of Task 15).
 
 ## Phase 6 known limitations
 - Denormal guard (decision 7, human-approved 2026-10-02, pre-production): `crates/audio/src/denormals.rs` is the one audited `unsafe` function. It sets FTZ/DAZ (x86_64) or FZ (aarch64) on the audio processing thread, because sonora 0.2.0 AEC3 slows down on a silent far end after speech (upstream issue #34; measured 5.5× here, see Task 5). Remove it once a sonora release with upstream PR #38 ships (version bump asked first, rule 3).
