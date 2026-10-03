@@ -294,6 +294,9 @@ Each task follows the full Phase 1 gate: fmt, clippy -D warnings, tests, `check-
 
 13b. **GPU speech enhancement, opt-in** (added 2026-10-03, human request: "like NVIDIA Broadcast", optional, depending on hardware).
    - **Off by default; offered only when the hardware is there.** A capability probe at start lists the usable GPU backends; the setting is hidden without one. The CPU path stays the default everywhere, and the Steam Frame never uses the GPU (the VR game owns it).
+   - **Approved 2026-10-03 (human):** the `ort` crate and Microsoft's ONNX Runtime release, fetched and pinned like libwebrtc, behind a cargo feature.
+   - **Built (part 1, the runtime):** `scripts/fetch-onnxruntime.sh [cpu|cuda12|cuda13] [platform]` with `scripts/onnxruntime.sha256` (GitHub release digests of ONNX Runtime 1.28.3, the API level of `ort` 2.0.0-rc.13); `tessera-audio` feature `onnxruntime` (`ort` with `load-dynamic`: the library is opened at run time from the fetched directory or `TESSERA_ONNXRUNTIME_DIR`, nothing downloaded or linked at build time); `tessera_audio::onnx::{OnnxRuntime, OnnxSession, Accelerator}`: which accelerators the library has, sessions that try TensorRT/CUDA/DirectML/CoreML in the asked order and fall back to the CPU, saying which runs. Measured: DeepFilterNet3's encoder, one frame, 0.25 ms median on the CPU build; with the CUDA 13 build and no CUDA libraries installed, TensorRT and CUDA are reported as built in, fail at session start, and the CPU runs.
+   - **Remaining (part 2):** DeepFilterNet3 streaming on ONNX Runtime needs the graphs re-exported with their GRU states and convolution buffers as explicit inputs and outputs (ONNX Runtime has no tract-pulse; the published export is stateless over a time axis). That export needs PyTorch and DeepFilterNet's Python package, then a GPU `Enhancer`, the setting (off by default, offered when an accelerator starts), batching of incoming streams, and the human GPU checks. NVIDIA Maxine stays later.
    - **Vendor-neutral path:** run the Task 13 models (DeepFilterNet3, and heavier ones the CPU cannot afford: dereverberation, speech restoration) through ONNX Runtime with the CUDA/TensorRT execution provider on NVIDIA, DirectML on Windows, and ROCm/MIGraphX on AMD where available. This needs a new dependency (the `ort` crate and the ONNX Runtime library, its supply chain pinned like libwebrtc); **to be approved before the task starts** (rule 3).
    - **NVIDIA Maxine Audio Effects, Windows only, later:** the SDK behind NVIDIA Broadcast (denoise, dereverb, AEC, studio voice on RTX Tensor Cores). It is free on Windows; on Linux it is only available to NVIDIA AI Enterprise customers and meant for servers, so we cannot ship it there. Loaded at run time if the user has NVIDIA's runtime installed, behind a cargo feature and the setting; never bundled. Its licence and redistribution terms are checked before any code.
    - **Real-time rules:** the GPU call runs on the processing thread with a deadline (well under 10 ms); a missed deadline, a lost device or a driver error falls back to the CPU backend for the rest of the call and reports why. Incoming streams (cleaning other members' voices, one stream each) can be batched into one GPU call, where the GPU pays off most.
@@ -328,6 +331,8 @@ Each task follows the full Phase 1 gate: fmt, clippy -D warnings, tests, `check-
 | nnnoiseless | =0.5.2 | BSD-3-Clause | audio | 5 |
 | tract-onnx | =0.23.8 | MIT OR Apache-2.0 | audio | 13 |
 | tract-pulse (added 2026-10-03, human approval) | =0.23.8 | MIT OR Apache-2.0 | audio | 13 |
+| ort (features `std`, `load-dynamic`, `api-28`, `tracing`, `cuda`, `tensorrt`, `directml`, `coreml`; optional, feature `onnxruntime`) | =2.0.0-rc.13 | MIT OR Apache-2.0 | audio | 13b |
+| ONNX Runtime (Microsoft release, fetched by script, loaded at run time) | 1.28.3 | MIT | audio (feature) | 13b |
 | realfft (already in the tree) | 3 (3.5.0) | MIT | audio | 13 |
 | global-hotkey | =0.8.0 | Apache-2.0 OR MIT | ptt | 11 |
 | ashpd | =0.13.13 | MIT | ptt | 11 |
@@ -336,6 +341,12 @@ Each task follows the full Phase 1 gate: fmt, clippy -D warnings, tests, `check-
 | libspa (direct, format pods) | =0.10.1 | MIT | audio | 14 |
 
 Each crate is added in the task that first uses it, so no dependency sits unused. Each task records `cargo tree` and `cargo deny check` output. A newer release that appears mid-phase is asked about before bumping (rule 3).
+
+## Candidates (2026-10-03, from the human's questions; not scheduled, approval needed)
+- **Codec and transport options:** Opus "music" mode (full band, stereo) for sharing game or music audio; in-band FEC on lossy networks; DTX; the bitrate is already a setting. LiveKit's publish options decide what is reachable.
+- **Device buffer size** as an advanced setting: smaller quanta (128/256 samples) for pro interfaces, larger (20 ms) to save CPU on the Frame; separate from the fixed 10 ms processing frame. With Task 15.
+- **Sample rate and frame size stay fixed** at 48 kHz and 10 ms: Opus codes at most 48 kHz (20 kHz audio band), and AEC3, AGC2, RNNoise and DeepFilterNet3 work on 48 kHz 10 ms frames; a 96 kHz device graph is resampled by PipeWire.
+- **Component review rule:** a model or component replaces the current one only after measurements on the same fixtures (SI-SDR as in Task 13, ERLE for echo, CPU per frame) and a listening check; the `Enhancer` trait keeps noise suppression replaceable.
 
 ## Options considered and deferred (2026-10-02)
 Recorded so the reasoning is not lost; none is planned.

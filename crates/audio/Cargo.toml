@@ -19,6 +19,14 @@ tracing = "0.1"
 tract-onnx = "=0.23.8"
 tract-pulse = "=0.23.8"
 realfft = "3"
+# Opt-in GPU speech enhancement (Task 13b): ONNX Runtime, loaded at run time
+# from the pinned download of scripts/fetch-onnxruntime.sh; nothing is
+# downloaded or linked at build time (`load-dynamic`).
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "load-dynamic", "api-28", "tracing", "cuda", "tensorrt", "directml", "coreml"], optional = true }
+
+[features]
+# GPU speech enhancement through ONNX Runtime (plan Task 13b). Off by default.
+onnxruntime = ["dep:ort"]
 
 # Linux: our own PipeWire client (src/pw, plan decision 12): call-role
 # streams in the graph's real-time cycle, devices and changes from the

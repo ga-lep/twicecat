@@ -12,6 +12,8 @@ mod dfn;
 mod frame;
 mod gate;
 mod io;
+#[cfg(feature = "onnxruntime")]
+pub mod onnx;
 mod pipeline;
 #[cfg(target_os = "linux")]
 mod pw;

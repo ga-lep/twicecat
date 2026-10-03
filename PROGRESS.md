@@ -1190,7 +1190,7 @@ Order (revised 2026-10-02, plan decision 12; again 2026-10-03 by the human): 1â€
 - [x] 11. Push-to-talk service (global-hotkey, portal, gamepad, in-window)
 - [x] 12. CLI call commands
 - [x] 13. DeepFilterNet3 via tract-onnx + tract-pulse, pluggable enhancer
-- [ ] 13b. GPU speech enhancement, opt-in (ONNX Runtime GPU providers; NVIDIA Maxine on Windows later; new dependency to be approved)
+- [ ] 13b. GPU speech enhancement, opt-in (part 1 done: pinned ONNX Runtime, `onnxruntime` feature, accelerator probing and CPU fallback; part 2 pending: DeepFilterNet3 re-exported with explicit state, GPU enhancer, setting)
 - [x] 14. Own PipeWire client on Linux (communication role, latency, registry events, system-mix echo reference)
 - [ ] 15. Steam Frame performance (CPU budget per mode, Frame defaults, rtkit priority)
 
@@ -1368,6 +1368,15 @@ Order (revised 2026-10-02, plan decision 12; again 2026-10-03 by the human): 1â€
 - Open issues: the speech measurement needs local recordings (`TESSERA_SPEECH_WAV`, `TESSERA_NOISE_WAV`); the 2 dB gap to upstream on one clip is not explained (same features, local SNR and gains when traced); the networks run on silence too (no skipping); DeepFilterNet's cost on the Steam Frame is for Task 15 (RNNoise stays the default there).
 - New human items: DeepFilterNet3 by ear (keyboard, fan, voices in the room), and its 30 ms of added latency in a call.
 
+## Phase 6 / Task 13b notes (part 1)
+- Checks run (all pass): `cargo fmt --all --check`; `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` (compiles `ort`); `cargo test --workspace --locked` (468 passed, 0 failed, per binary); boundary scripts; `cargo deny check`; integration 33/33; PipeWire 4/4; DeepFilterNet 3/3; `cargo test -p tessera-audio --features onnxruntime --locked --test onnxruntime -- --ignored` 1/1; `shellcheck scripts/fetch-onnxruntime.sh` clean.
+- APIs read before use: ort 2.0.0-rc.13 (crate source: `init_from` + `EnvironmentBuilder::commit`, `ep::{CUDA, TensorRT, DirectML, CoreML}` with `build().error_on_failure()` and `is_available`, `Session::builder().with_execution_providers().commit_from_file`, `Session::run` with named inputs, `Tensor::from_array((shape, Vec))`, `try_extract_tensor`); ort-sys's build script returns before any linking or download with `disable-linking` (set by `load-dynamic`). ONNX Runtime 1.28.3 release assets and digests from the GitHub API (published 2026-10-02; `ort` targets 1.28).
+- Built: `scripts/fetch-onnxruntime.sh` + `scripts/onnxruntime.sha256` (CPU for linux-x64/aarch64, osx-arm64, win-x64/arm64; CUDA 12/13 for linux-x64 and win-x64; shellcheck clean, idempotent, refuses unknown variants), `tessera-audio` feature `onnxruntime`, `tessera_audio::onnx`, `tests/onnxruntime.rs`. Default builds do not compile `ort`; `--all-features` (clippy) does.
+- Measured: DeepFilterNet3 `enc.onnx`, one frame (time axis 1), 0.25 ms median on the CPU build (0.30 ms on the CUDA build running on the CPU). With the CUDA 13 build and no CUDA libraries on this machine (RTX 5090, driver 615.71), TensorRT and CUDA are built in, fail when the session starts, and the CPU takes over: the fallback works on a real install.
+- Dependencies: `ort` =2.0.0-rc.13 (optional), new lock entries `ort`, `ort-sys`, `libloading` 0.9; ONNX Runtime 1.28.3 fetched (CPU 9 MB; CUDA 13 240 MB, in the cache under /home/william/Data).
+- Remaining (part 2): a stateful re-export of DeepFilterNet3 (needs PyTorch and DeepFilterNet's Python package), the GPU `Enhancer`, the setting, batching incoming streams, Maxine later. `ort` is a release candidate; a stable 2.0 is a version question for later (rule 3).
+- New human items: ONNX Runtime on the RTX 5090 with CUDA installed.
+
 ## Phase 6 known limitations
 - Denormal guard (decision 7, human-approved 2026-10-02, pre-production): `crates/audio/src/denormals.rs` is the one audited `unsafe` function. It sets FTZ/DAZ (x86_64) or FZ (aarch64) on the audio processing thread, because sonora 0.2.0 AEC3 slows down on a silent far end after speech (upstream issue #34; measured 5.5Ã— here, see Task 5). Remove it once a sonora release with upstream PR #38 ships (version bump asked first, rule 3).
 - sonora 0.2.0 allocates about 40 times per 10 ms frame in AEC3 (upstream #39/#40). The processing thread is not a device callback, so this is tolerable, but not real-time clean until upstream ships the fix.
@@ -1387,6 +1396,7 @@ Order (revised 2026-10-02, plan decision 12; again 2026-10-03 by the human): 1â€
 - [ ] Cross-homeserver call (Task 8b): members on two homeservers with their own call services hear each other. The subscribe-only token path for a non-full-access homeserver cannot be exercised with the single local Synapse.
 - [ ] Double talk by ear: talking while others talk, on open speakers and headphones (AEC3 cut a member's microphone to near silence in a virtual test while loud audio played on their speakers; Task 8b notes).
 - [ ] Ringing (Task 10) with Element Web and Element X, both directions: a DM call rings and shows the caller, a group call notifies quietly, declining on one side stops the ring on the other, answering on another device stops it here.
+- [ ] ONNX Runtime on your RTX 5090 (Task 13b part 1): install the CUDA 13 and cuDNN 9 runtime libraries (Arch: `cuda`, `cudnn`), `scripts/fetch-onnxruntime.sh cuda13`, then `cargo test -p tessera-audio --features onnxruntime --test onnxruntime -- --ignored --nocapture` should say it runs on Cuda (or TensorRT with its libraries).
 - [ ] GPU enhancement (Task 13b): each offered backend on real hardware (NVIDIA, and AMD where available), by ear and with the recorded latency; the fallback when the GPU is busy with a game.
 - [ ] Global PTT hotkey on X11, Wayland (KDE/GNOME portal), Windows and macOS; gamepad PTT. On Linux: `cargo run -p tessera-ptt --example ptt_probe -- --key ctrl+shift+KeyT --button left_thumb` prints `Transmit(true)`/`Transmit(false)` while the key or button is held; on Wayland the portal's dialog appears once and the confirmed key is printed (`Ready`); on SteamOS (desktop and game mode) the Steam Input pad works. Windows and macOS keys are checked once the app starts the service (call UI).
 - [ ] Steam Frame: aarch64 build runs on the device (desktop mode and game mode); built-in mic and speakers with AEC; game audio cancelled with the system-mix reference (Task 14); PipeWire device switching; CPU/battery cost of each NS mode within the Task 15 budget while a standalone VR game runs; rtkit real-time priority granted.
