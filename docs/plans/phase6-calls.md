@@ -150,7 +150,7 @@ As built in Task 3 (`crates/core/src/api/call.rs`, commands and events in `api/m
 - **Voice rooms:** an MSC3417 call room (room type `org.matrix.msc3417.call`), or any room with an active session, can be joined like a Discord channel. Creating such a room waits for the room-creation phase (Phase 5).
 
 ## Tasks (one `feat` commit each with a `Step: phase6.<n>` trailer, gated as in Phase 1)
-Order (revised 2026-10-02, decision 12; again 2026-10-03 by the human): 1–8, 8b, 9, 10, 11, 12, 14, 13, then 15 and 13b.
+Order (revised 2026-10-02, decision 12; again 2026-10-03 by the human): 1–8, 8b, 9, 10, 11, 12, 14, 13, then 15 and 13b; Task 16 added after 15 (2026-10-03).
 
 Each task follows the full Phase 1 gate: fmt, clippy -D warnings, tests, `check-app-deps.sh`, `check-core-api.sh`, `cargo deny check`, and the ignored homeserver run, which from task 2 also needs the SFU stack.
 
@@ -327,6 +327,18 @@ Each task follows the full Phase 1 gate: fmt, clippy -D warnings, tests, `check-
    - Real-time priority for the processing thread through rtkit (D-Bus, also inside Flatpak), with a fallback to normal priority and a reported reason.
    - Human check on the device: desktop and game mode, a standalone VR game running, CPU and battery during a call, crackles under load.
    - Research note (added 2026-10-03, not planned): the Frame's counterpart to Task 13b is Qualcomm's NPU through QNN rather than the GPU, which the VR game owns. Worth measuring only if DeepFilterNet on the CPU does not fit the budget.
+
+16. **Cleaning other people's voices, opt-in** (added 2026-10-03, human request: "optional opt in", and Tessera clients say when their audio is already clean so others skip them).
+   - **What users get:** the voices they hear cleaned by DeepFilterNet3 on their side, whatever the speaker uses (Element, a phone, a headset without noise suppression): keyboards, fans, rooms. Off by default.
+   - **Where it runs:** on each remote stream before the mixer (one filter state per participant, created on join, dropped off the processing thread on leave, as the outgoing enhancer). On the GPU, all speakers in one batched call per frame (the Task 13b export takes a batch; the CUDA loop needs a batch dimension and per-stream state rows); on the CPU, a cap on the number of streams (measured in Task 15), beyond which the loudest or chosen ones are cleaned and the rest pass through, said in the status.
+   - **Settings (our stack only, as Task 13):** a global switch (off), a per-person override (always, never, automatic) kept with the per-user volume, and an attenuation limit. The status shows who is cleaned, who is skipped and why.
+   - **Skipping voices that are already clean:**
+     - **Signal:** each client says, for its own microphone, which suppressor runs (none, WebRTC, RNNoise, DeepFilterNet3, or "cleaned outside Tessera", a user setting for NVIDIA Broadcast, Krisp and similar, since we do not detect those). Candidate carriers, to verify in the pinned versions before choosing: (1) LiveKit's per-track audio features (its protocol has a list of audio processing flags on each track, which LiveKit SDKs and browsers may already fill: then non-Tessera clients that clean their audio can be skipped too); (2) LiveKit participant attributes (key-value, live, only seen by the call's participants and the SFU); (3) a namespaced field in our MatrixRTC membership event (visible to the whole room and its homeserver, changes need a new state event; least preferred). Element Call's current behaviour is checked for (1).
+     - **Policy, user-chosen:** skip voices cleaned by an ML suppressor (default), skip any cleaned voice, or never skip; the per-person override always wins. The signal is a claim (a client can say anything), so a wrong claim only costs that voice its cleaning.
+     - **Privacy:** what suppressor someone runs is shared with the call (and the SFU operator); documented, and the outgoing flag can be turned off.
+   - **Trade-offs to state in the UI:** about 30 ms more on each cleaned voice; music or game sound shared in a call is treated as noise (screen-share audio is never cleaned); cleaning an already-clean voice again can dull it, hence the skip.
+   - **Tests:** the skip policy and the overrides as unit tests; with virtual participants (Task 8 harness), a noisy remote tone and a "clean" one: the first is cleaned, the second is skipped from its flag; the batched GPU path against per-stream CPU runs; cost per extra stream on the CPU and the GPU recorded.
+   - **API additions for approval when built:** the settings (global switch, per-person override, policy, "cleaned outside Tessera"), per-participant status, and the outgoing flag.
 
 ## Dependencies (approved 2026-10-02, newest releases, exact pins)
 | Crate | Version | Licence | Used by | Added in task |
