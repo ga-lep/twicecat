@@ -14,8 +14,8 @@ use common::{set_display_name, unique_room_name};
 use tessera_core::CoreHandle;
 use tessera_core::api::{
     ActionKind, Block, Command, CoreError, CoreEvent, Inline, ListDiff, MentionRef, MentionTarget,
-    MessageKind, MessageText, OutgoingMessage, Password, RoomId, RoomSummary, SendStatus,
-    SyncState, TimelineItem, TimelineItemKind, UserId,
+    MessageKind, MessageText, OutgoingMessage, Password, PlaceholderKind, RoomId, RoomSummary,
+    SendStatus, SyncState, TimelineItem, TimelineItemKind, UserId,
 };
 use tessera_core::secrets::InMemorySecretStore;
 
@@ -474,5 +474,239 @@ async fn reply_to_an_unknown_item_or_action_in_another_room_fails() {
             ..
         }
     ));
+    p.finish().await;
+}
+
+/// The message item with this ID, if it is one.
+fn message_by_id<'a>(
+    items: &'a [TimelineItem],
+    id: &str,
+) -> Option<&'a tessera_core::api::MessageDetails> {
+    items
+        .iter()
+        .find(|i| i.id == id)
+        .and_then(|i| match &i.kind {
+            TimelineItemKind::Message { details, .. } => Some(&**details),
+            _ => None,
+        })
+}
+
+/// Alice's own sent message with this body: its item ID.
+fn own_sent(items: &[TimelineItem], body: &str) -> Option<String> {
+    items.iter().find_map(|i| match &i.kind {
+        TimelineItemKind::Message {
+            body: b,
+            is_own: true,
+            sent: SendStatus::Sent,
+            ..
+        } if b == body => Some(i.id.clone()),
+        _ => None,
+    })
+}
+
+/// Alice sends `body`; both sides have it. Returns (alice's item ID,
+/// carol's item ID).
+async fn send_and_receive(p: &mut Pair, body: &str) -> (String, String) {
+    p.alice
+        .commands
+        .send(Command::Send(outgoing(&p.room, body)))
+        .await
+        .unwrap();
+    apply_until(&mut p.alice, &p.room, &mut p.alice_items, |items| {
+        own_sent(items, body).is_some()
+    })
+    .await;
+    apply_until(&mut p.carol, &p.room, &mut p.carol_items, |items| {
+        received(items, body).is_some()
+    })
+    .await;
+    let alice_id = own_sent(&p.alice_items, body).expect("sent");
+    let carol_id = received(&p.carol_items, body)
+        .expect("arrived")
+        .0
+        .id
+        .clone();
+    (alice_id, carol_id)
+}
+
+#[tokio::test]
+#[ignore = "needs local homeserver: docker compose up -d --wait"]
+async fn edit_keeps_the_item_id_and_marks_it_edited() {
+    let mut p = pair().await;
+    let marker = unique_marker();
+    let (alice_item, carol_item) = send_and_receive(&mut p, &marker).await;
+
+    p.alice
+        .commands
+        .send(Command::Edit {
+            item_id: alice_item,
+            message: outgoing(&p.room, "**new**"),
+        })
+        .await
+        .unwrap();
+    apply_until(&mut p.carol, &p.room, &mut p.carol_items, |items| {
+        message_by_id(items, &carol_item).is_some_and(|d| d.edited)
+    })
+    .await;
+    let details = message_by_id(&p.carol_items, &carol_item).expect("same item");
+    assert!(
+        paragraph_inlines(&details.content.blocks)
+            .iter()
+            .any(|i| matches!(
+                i,
+                Inline::Text { text, style } if text == "new" && style.bold
+            )),
+        "no bold `new`"
+    );
+    p.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "needs local homeserver: docker compose up -d --wait"]
+async fn edit_of_a_message_that_is_not_the_users_is_refused() {
+    let mut p = pair().await;
+    let marker = unique_marker();
+    let (_, carol_item) = send_and_receive(&mut p, &marker).await;
+    p.carol
+        .commands
+        .send(Command::Edit {
+            item_id: carol_item,
+            message: outgoing(&p.room, "mine now"),
+        })
+        .await
+        .unwrap();
+    let event = expect_event(&mut p.carol, |e| {
+        matches!(e, CoreEvent::ActionFailed { .. })
+    })
+    .await;
+    assert!(matches!(
+        event,
+        CoreEvent::ActionFailed {
+            action: ActionKind::Edit,
+            error: CoreError::NotAllowed,
+            ..
+        }
+    ));
+    p.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "needs local homeserver: docker compose up -d --wait"]
+async fn redact_turns_the_item_into_a_placeholder() {
+    let mut p = pair().await;
+    let marker = unique_marker();
+    let (alice_item, carol_item) = send_and_receive(&mut p, &marker).await;
+
+    p.alice
+        .commands
+        .send(Command::Redact {
+            room_id: RoomId::from(p.room.as_str()),
+            item_id: alice_item,
+            reason: Some(MessageText::from("spam")),
+        })
+        .await
+        .unwrap();
+    apply_until(&mut p.carol, &p.room, &mut p.carol_items, |items| {
+        items.iter().any(|i| {
+            i.id == carol_item
+                && matches!(
+                    i.kind,
+                    TimelineItemKind::Placeholder {
+                        what: PlaceholderKind::Redacted,
+                        ..
+                    }
+                )
+        })
+    })
+    .await;
+    p.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "needs local homeserver: docker compose up -d --wait"]
+async fn reaction_toggles_on_and_off_for_both_sides() {
+    let mut p = pair().await;
+    let marker = unique_marker();
+    let (alice_item, carol_item) = send_and_receive(&mut p, &marker).await;
+    let toggle = || Command::ToggleReaction {
+        room_id: RoomId::from(p.room.as_str()),
+        item_id: carol_item.clone(),
+        key: " 👍 ".to_owned(),
+    };
+
+    p.carol.commands.send(toggle()).await.unwrap();
+    let thumbs = |own: bool| move |d: &tessera_core::api::MessageDetails| matches!(d.reactions.as_slice(), [g] if g.key == "👍" && g.count == 1 && g.own == own);
+    apply_until(&mut p.alice, &p.room, &mut p.alice_items, |items| {
+        message_by_id(items, &alice_item).is_some_and(thumbs(false))
+    })
+    .await;
+    apply_until(&mut p.carol, &p.room, &mut p.carol_items, |items| {
+        message_by_id(items, &carol_item).is_some_and(thumbs(true))
+    })
+    .await;
+
+    p.carol.commands.send(toggle()).await.unwrap();
+    apply_until(&mut p.alice, &p.room, &mut p.alice_items, |items| {
+        message_by_id(items, &alice_item).is_some_and(|d| d.reactions.is_empty())
+    })
+    .await;
+    apply_until(&mut p.carol, &p.room, &mut p.carol_items, |items| {
+        message_by_id(items, &carol_item).is_some_and(|d| d.reactions.is_empty())
+    })
+    .await;
+
+    // An empty key is refused.
+    p.carol
+        .commands
+        .send(Command::ToggleReaction {
+            room_id: RoomId::from(p.room.as_str()),
+            item_id: carol_item.clone(),
+            key: "  ".to_owned(),
+        })
+        .await
+        .unwrap();
+    let event = expect_event(&mut p.carol, |e| {
+        matches!(e, CoreEvent::ActionFailed { .. })
+    })
+    .await;
+    assert!(matches!(
+        event,
+        CoreEvent::ActionFailed {
+            action: ActionKind::React,
+            error: CoreError::NotAllowed,
+            ..
+        }
+    ));
+    p.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "needs local homeserver: docker compose up -d --wait"]
+async fn member_search_finds_carol_for_alice() {
+    let mut p = pair().await;
+    let carol_id = p.env.user_id(3);
+    p.alice
+        .commands
+        .send(Command::SearchMembers {
+            room_id: RoomId::from(p.room.as_str()),
+            query: "car".to_owned(),
+        })
+        .await
+        .unwrap();
+    let event = expect_event(&mut p.alice, |e| {
+        matches!(
+            e,
+            CoreEvent::Members { .. } | CoreEvent::ActionFailed { .. }
+        )
+    })
+    .await;
+    let CoreEvent::Members { members, .. } = event else {
+        panic!("unexpected event: {event:?}");
+    };
+    assert!(
+        members.iter().any(|m| m.user_id.as_str() == carol_id),
+        "carol not found"
+    );
+    assert!(members.len() <= 8);
     p.finish().await;
 }
