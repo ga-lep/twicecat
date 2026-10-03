@@ -10,6 +10,7 @@ mod avatars;
 mod call;
 mod call_settings;
 mod client;
+mod cpu_level;
 mod drafts;
 mod engine;
 mod gpu_enhancement;
@@ -26,4 +27,5 @@ mod sync;
 mod timeline;
 mod verification;
 
+pub use cpu_level::require_cpu_level;
 pub use engine::{Core, CoreConfig, CoreHandle, DEFAULT_ROOM_LIST_PAGE_SIZE};

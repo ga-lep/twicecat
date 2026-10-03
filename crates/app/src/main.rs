@@ -142,6 +142,7 @@ fn run(options: Options) -> Result<(), String> {
 }
 
 fn main() -> ExitCode {
+    tessera_core::require_cpu_level();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let options = match parse_args(&args) {
         Ok(Parsed::Run(options)) => options,

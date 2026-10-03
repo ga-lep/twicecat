@@ -6,6 +6,14 @@
 [env]
 LK_CUSTOM_WEBRTC = { value = "dev/libwebrtc", relative = true }
 
+# x86_64 Linux builds for x86-64-v3 (AVX2, FMA, BMI2; Intel since Haswell,
+# 2013, AMD since Excavator, 2015): the voice chain is 17 % cheaper, mostly
+# FMA (plan Task 15). tessera_core::require_cpu_level refuses older CPUs at startup
+# with a message instead of a crash. RUSTFLAGS from the environment replaces
+# this.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=x86-64-v3"]
+
 # Link flags libwebrtc needs, as in livekit/rust-sdks' own .cargo/config.toml.
 # aarch64 Linux (Steam Frame): GNU ld fails on libwebrtc.a, lld works.
 [target.aarch64-unknown-linux-gnu]
