@@ -18,6 +18,8 @@ use tokio::sync::mpsc;
 
 use crate::avatars::Avatars;
 use crate::bridge::{self, Bridge, EventsSlot};
+use crate::links::{self, LinkBar};
+use crate::rich_text::{LinkTarget, MAX_REVEALED, Revealed};
 use crate::room_list;
 use crate::screens::login::{self, BrowserUrl, LoginForm};
 use crate::screens::{self, loading, main_view};
@@ -26,6 +28,13 @@ use crate::timeline::{self, Effects, TimelineView};
 
 /// How long to wait for the core to close after `Shutdown` (plan Q18).
 pub const SHUTDOWN_WAIT: Duration = Duration::from_secs(10);
+
+/// Starts the system handler for a checked link, away from `update`.
+fn open_link_task(url: links::CheckedUrl) -> Task<Message> {
+    Task::perform(async move { links::open_link(&url) }, |ok| {
+        Message::LinkOpened { ok }
+    })
+}
 
 /// Where commands go. The [`Bridge`] in production; a plain channel sender in
 /// tests, so `update` can be tested without a runtime.
@@ -136,6 +145,17 @@ pub enum Message {
     },
     /// The timeline scrolled, or its size changed.
     TimelineScrolled(scrollable::Viewport),
+    /// The user clicked a link, pill or spoiler in a message.
+    LinkClicked(LinkTarget),
+    /// The user confirmed opening the link in the confirmation bar.
+    LinkConfirmed,
+    /// The user closed the link bar.
+    LinkDismissed,
+    /// The system handler was started (or failed to start) for a link.
+    LinkOpened {
+        /// Whether the handler started without error.
+        ok: bool,
+    },
     /// The user asked to close the window.
     CloseRequested,
     /// The core did not close in time after `Shutdown`.
@@ -201,6 +221,10 @@ pub struct App {
     pub send_error: Option<String>,
     /// The system theme mode.
     pub theme_mode: theme::Mode,
+    /// Spoilers the user revealed in the open room.
+    pub revealed: Revealed,
+    /// The bar above the composer about a clicked link.
+    pub link_bar: Option<LinkBar>,
     /// Set when the app decided to exit (the task itself is opaque to tests).
     pub exit_requested: bool,
 }
@@ -256,6 +280,8 @@ impl App {
             composer: MessageText::from(String::new()),
             send_error: None,
             theme_mode: theme::Mode::None,
+            revealed: Revealed::new(),
+            link_bar: None,
             exit_requested: false,
         };
         let restore = app.send(Command::RestoreSession);
@@ -344,6 +370,24 @@ impl App {
                 // offset is the distance from the bottom edge.
                 self.on_timeline_scrolled(viewport.absolute_offset().y, bounds.height, bounds.width)
             }
+            Message::LinkClicked(target) => self.link_clicked(target),
+            Message::LinkConfirmed => match self.link_bar.take() {
+                Some(LinkBar::Confirm(url)) => open_link_task(url),
+                other => {
+                    self.link_bar = other;
+                    Task::none()
+                }
+            },
+            Message::LinkDismissed => {
+                self.link_bar = None;
+                Task::none()
+            }
+            Message::LinkOpened { ok } => {
+                if !ok {
+                    self.link_bar = Some(LinkBar::Failed);
+                }
+                Task::none()
+            }
             Message::LogoutRequested => self.send(Command::Logout),
             Message::SelectRoom(id) => {
                 if !room_list::contains(&self.rooms, &id) {
@@ -352,6 +396,7 @@ impl App {
                 self.selected = Some(id.clone());
                 self.timeline.reset();
                 self.clear_draft();
+                self.reset_link_state();
                 self.send(Command::SelectRoom(id))
             }
             Message::TabSelected(tab) => {
@@ -704,6 +749,51 @@ impl App {
         self.selected = None;
         self.timeline.reset();
         self.clear_draft();
+        self.reset_link_state();
+    }
+
+    /// Forgets revealed spoilers and the link bar of the room left.
+    fn reset_link_state(&mut self) {
+        self.revealed.clear();
+        self.link_bar = None;
+    }
+
+    /// A click on a link, pill or spoiler (plan Q19). Nothing here opens
+    /// anything itself: opening is a `Task`.
+    fn link_clicked(&mut self, target: LinkTarget) -> Task<Message> {
+        match target {
+            LinkTarget::Url { url, confirm } => match links::check_link_url(&url) {
+                Err(_) => {
+                    self.link_bar = Some(LinkBar::Refused);
+                    Task::none()
+                }
+                Ok(checked) if confirm => {
+                    self.link_bar = Some(LinkBar::Confirm(checked));
+                    Task::none()
+                }
+                Ok(checked) => {
+                    self.link_bar = None;
+                    open_link_task(checked)
+                }
+            },
+            LinkTarget::Room(room) => {
+                let id = RoomId::from(room);
+                if room_list::contains(&self.rooms, &id) {
+                    self.update(Message::SelectRoom(id))
+                } else {
+                    Task::none()
+                }
+            }
+            // Profiles are Phase 5.
+            LinkTarget::User(_) => Task::none(),
+            LinkTarget::Spoiler { item, index } => {
+                let key = (item, index);
+                if !self.revealed.remove(&key) && self.revealed.len() < MAX_REVEALED {
+                    self.revealed.insert(key);
+                }
+                Task::none()
+            }
+        }
     }
 
     /// Applies timeline diffs of the selected room; other rooms are ignored.
@@ -1528,5 +1618,165 @@ mod tests {
             let _ = app.update(core(event.clone()));
             assert!(!app.pending_cancel, "{event:?}");
         }
+    }
+
+    fn clicked(url: &str, confirm: bool) -> Message {
+        Message::LinkClicked(LinkTarget::Url {
+            url: url.to_owned(),
+            confirm,
+        })
+    }
+
+    #[test]
+    fn a_plain_link_opens_in_a_task() {
+        let (mut app, mut rx) = main_app();
+        let task = app.update(clicked("https://example.org/a", false));
+        assert!(task.units() > 0, "the opener runs in a task");
+        assert!(app.link_bar.is_none());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_mismatched_link_asks_first_and_shows_only_the_host() {
+        let (mut app, _rx) = main_app();
+        let task = app.update(clicked("https://Evil.example:8443/path?token=1", true));
+        assert_eq!(task.units(), 0, "nothing opens before the answer");
+        let Some(LinkBar::Confirm(url)) = &app.link_bar else {
+            panic!("expected a confirmation, got {:?}", app.link_bar);
+        };
+        assert_eq!(url.host(), "evil.example");
+        assert!(app.update(Message::LinkConfirmed).units() > 0);
+        assert!(app.link_bar.is_none());
+    }
+
+    #[test]
+    fn dismissing_the_bar_opens_nothing() {
+        let (mut app, _rx) = main_app();
+        let _ = app.update(clicked("https://evil.example/", true));
+        assert_eq!(app.update(Message::LinkDismissed).units(), 0);
+        assert!(app.link_bar.is_none());
+        // Confirming with no bar does nothing either.
+        assert_eq!(app.update(Message::LinkConfirmed).units(), 0);
+    }
+
+    #[test]
+    fn unsafe_links_are_refused_without_opening() {
+        let (mut app, _rx) = main_app();
+        for url in [
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "data:text/html,x",
+            "https://user@evil.example/",
+            "https://exa mple.org/",
+            "https://exämple.org/",
+        ] {
+            for confirm in [false, true] {
+                let task = app.update(clicked(url, confirm));
+                assert_eq!(task.units(), 0, "{url}");
+                assert_eq!(app.link_bar, Some(LinkBar::Refused), "{url}");
+                let _ = app.update(Message::LinkDismissed);
+            }
+        }
+    }
+
+    #[test]
+    fn a_failed_launch_is_reported() {
+        let (mut app, _rx) = main_app();
+        let _ = app.update(Message::LinkOpened { ok: true });
+        assert!(app.link_bar.is_none());
+        let _ = app.update(Message::LinkOpened { ok: false });
+        assert_eq!(app.link_bar, Some(LinkBar::Failed));
+    }
+
+    #[test]
+    fn a_room_pill_selects_a_listed_room_only() {
+        let (mut app, mut rx) = main_app();
+        let task = app.update(Message::LinkClicked(LinkTarget::Room("!b:x".into())));
+        assert_eq!(task.units(), 0);
+        assert_eq!(app.selected, Some(RoomId::from("!b:x")));
+        assert!(matches!(rx.try_recv(), Ok(Command::SelectRoom(id)) if id == RoomId::from("!b:x")));
+        let _ = app.update(Message::LinkClicked(LinkTarget::Room("!nope:x".into())));
+        let _ = app.update(Message::LinkClicked(LinkTarget::Room("#alias:x".into())));
+        assert_eq!(app.selected, Some(RoomId::from("!b:x")));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_user_pill_does_nothing() {
+        let (mut app, mut rx) = main_app();
+        let task = app.update(Message::LinkClicked(LinkTarget::User(UserId::from("@a:x"))));
+        assert_eq!(task.units(), 0);
+        assert!(rx.try_recv().is_err());
+        assert!(app.link_bar.is_none() && app.revealed.is_empty());
+    }
+
+    #[test]
+    fn a_spoiler_click_toggles_it_per_item_and_index() {
+        let (mut app, _rx) = main_app();
+        let spoiler = |item: &str, index| {
+            Message::LinkClicked(LinkTarget::Spoiler {
+                item: item.to_owned(),
+                index,
+            })
+        };
+        let _ = app.update(spoiler("i1", 0));
+        let _ = app.update(spoiler("i1", 1));
+        let _ = app.update(spoiler("i2", 0));
+        assert_eq!(app.revealed.len(), 3);
+        let _ = app.update(spoiler("i1", 0));
+        assert!(!app.revealed.contains(&("i1".to_owned(), 0)));
+        assert!(app.revealed.contains(&("i1".to_owned(), 1)));
+        assert!(app.revealed.contains(&("i2".to_owned(), 0)));
+    }
+
+    #[test]
+    fn revealed_spoilers_are_capped() {
+        let (mut app, _rx) = main_app();
+        for index in 0..MAX_REVEALED + 50 {
+            let _ = app.update(Message::LinkClicked(LinkTarget::Spoiler {
+                item: "i".into(),
+                index,
+            }));
+        }
+        assert_eq!(app.revealed.len(), MAX_REVEALED);
+    }
+
+    #[test]
+    fn changing_room_resets_spoilers_and_the_link_bar() {
+        let (mut app, _rx) = main_app();
+        let _ = app.update(Message::LinkClicked(LinkTarget::Spoiler {
+            item: "i".into(),
+            index: 0,
+        }));
+        let _ = app.update(clicked("https://evil.example/", true));
+        let _ = app.update(Message::SelectRoom(RoomId::from("!b:x")));
+        assert!(app.revealed.is_empty());
+        assert!(app.link_bar.is_none());
+    }
+
+    #[test]
+    fn links_never_reach_debug_output() {
+        let (mut app, _rx) = main_app();
+        let message = clicked("https://sentinel-host.example/sentinel-path", true);
+        assert!(!format!("{message:?}").contains("sentinel"));
+        let _ = app.update(message);
+        let dbg = format!("{app:?} {:?}", app.link_bar);
+        assert!(!dbg.contains("sentinel"), "{dbg}");
+    }
+
+    #[test]
+    fn update_opens_links_only_through_the_links_module() {
+        let source = include_str!("state.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production code");
+        let code: String = production
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect();
+        assert!(!code.contains("open::"), "no direct launcher call");
+        assert!(code.contains("links::open_link"), "the launcher is reached");
+        assert!(code.contains("Task::perform"), "inside a task");
     }
 }

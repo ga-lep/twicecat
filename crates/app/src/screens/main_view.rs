@@ -5,7 +5,9 @@ use iced::widget::{button, column, container, row, space, text, text_input};
 use iced::{Element, Fill};
 use tessera_core::api::{MessageText, UserId};
 
+use crate::links::LinkBar;
 use crate::screens::loading::sync_label;
+use crate::screens::timeline_pane::RichEnv;
 use crate::screens::{room_list_pane, timeline_pane};
 use crate::state::{App, Message};
 use crate::text_safety::{MAX_NAME_CHARS, name_or_placeholder, one_line_capped};
@@ -39,11 +41,20 @@ fn room_pane(app: &App) -> Element<'_, Message> {
         |room| display_name(&room.name),
     );
 
+    let theme = theme::theme_for(app.theme_mode);
+    let env = RichEnv {
+        theme: &theme,
+        own_user: app.user_id.as_ref(),
+        revealed: &app.revealed,
+    };
     let mut body = column![
         text(title).size(22),
-        container(timeline_pane::view(&app.timeline)).height(Fill),
+        container(timeline_pane::view(&app.timeline, env)).height(Fill),
     ]
     .spacing(8);
+    if let Some(bar) = &app.link_bar {
+        body = body.push(link_bar(bar));
+    }
     if let Some(error) = &app.send_error {
         body = body.push(text(error.as_str()).style(text::danger));
     }
@@ -57,6 +68,41 @@ fn room_pane(app: &App) -> Element<'_, Message> {
             .padding(8),
     );
     container(body).width(Fill).height(Fill).padding(8).into()
+}
+
+/// What the link bar says. Only the host of a link is ever shown.
+pub fn link_bar_text(bar: &LinkBar) -> String {
+    match bar {
+        LinkBar::Confirm(url) => format!("Open {}?", one_line_capped(url.host(), MAX_NAME_CHARS)),
+        LinkBar::Refused => "This link cannot be opened.".to_owned(),
+        LinkBar::Failed => "The link could not be opened.".to_owned(),
+    }
+}
+
+/// The bar above the composer about a clicked link.
+fn link_bar(bar: &LinkBar) -> Element<'_, Message> {
+    let mut bar_row = row![text(link_bar_text(bar)), space().width(Fill)]
+        .spacing(8)
+        .align_y(iced::Center);
+    match bar {
+        LinkBar::Confirm(_) => {
+            bar_row = bar_row
+                .push(button(text("Open")).on_press(Message::LinkConfirmed))
+                .push(
+                    button(text("Cancel"))
+                        .on_press(Message::LinkDismissed)
+                        .style(button::secondary),
+                );
+        }
+        LinkBar::Refused | LinkBar::Failed => {
+            bar_row = bar_row.push(
+                button(text("Dismiss"))
+                    .on_press(Message::LinkDismissed)
+                    .style(button::secondary),
+            );
+        }
+    }
+    container(bar_row).padding(4).into()
 }
 
 /// The signed-in user ID for the status bar: one line, capped. It comes from
@@ -99,6 +145,16 @@ mod tests {
         assert_eq!(account_label(Some(&id)), "@a\u{FFFD}b:x");
         let long = UserId::from(format!("@{}:x", "u".repeat(1000)));
         assert_eq!(account_label(Some(&long)).chars().count(), 256);
+    }
+
+    #[test]
+    fn the_link_bar_shows_only_the_host() {
+        let url = crate::links::check_link_url("https://Evil.example:8443/secret/path?token=abc")
+            .expect("valid link");
+        let text = link_bar_text(&LinkBar::Confirm(url));
+        assert_eq!(text, "Open evil.example?");
+        assert!(!link_bar_text(&LinkBar::Refused).is_empty());
+        assert!(!link_bar_text(&LinkBar::Failed).is_empty());
     }
 
     #[test]

@@ -7,7 +7,8 @@ use iced::advanced::layout::{Limits, Node};
 use iced::advanced::renderer::Headless;
 use iced::advanced::widget::Tree;
 use iced::{Font, Pixels, Renderer, Size};
-use tessera_app::screens::timeline_pane::view_in;
+use tessera_app::rich_text::Revealed;
+use tessera_app::screens::timeline_pane::{RichEnv, view_in};
 use tessera_app::timeline::{MAX_BUILT_ROWS, TimelineView};
 use tessera_core::api::{
     ListDiff, MessageDetails, SendStatus, StateChange, TimelineItem, TimelineItemKind, UserId,
@@ -65,7 +66,14 @@ fn timeline(n: usize) -> TimelineView {
 
 /// The layout of the pane: the content column inside the scrollable.
 fn content_node(view: &TimelineView, renderer: &Renderer) -> Node {
-    let mut element = view_in(view, NOW, &Utc);
+    let theme = tessera_app::theme::theme_for(iced::theme::Mode::Light);
+    let revealed = Revealed::new();
+    let env = RichEnv {
+        theme: &theme,
+        own_user: None,
+        revealed: &revealed,
+    };
+    let mut element = view_in(view, NOW, &Utc, env);
     let mut tree = Tree::new(element.as_widget());
     let root = element.as_widget_mut().layout(
         &mut tree,

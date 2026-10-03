@@ -14,9 +14,12 @@ use chrono::{Local, TimeZone};
 use iced::font::{Style as FontStyle, Weight};
 use iced::widget::{Column, container, row, scrollable, sensor, space, stack, text};
 use iced::{Background, Element, Fill, Font, Padding, Theme};
-use tessera_core::api::{PaginationState, PlaceholderKind, StateChange, TimelineItemKind, UserId};
+use tessera_core::api::{
+    MessageDetails, PaginationState, PlaceholderKind, StateChange, TimelineItemKind, UserId,
+};
 
 use crate::dates::{day_label, time_label};
+use crate::rich_text::{Ctx, Revealed, blocks_view};
 use crate::state::Message;
 use crate::text_safety::{
     MAX_BODY_CHARS, MAX_NAME_CHARS, multi_line_capped, name_or_placeholder, one_line_capped,
@@ -33,10 +36,21 @@ pub const MAX_BODY_LINES: usize = 200;
 /// How many characters of an event type are shown.
 const MAX_EVENT_TYPE_CHARS: usize = 64;
 
+/// What the pane needs besides the timeline to draw formatted text.
+#[derive(Clone, Copy)]
+pub struct RichEnv<'a> {
+    /// The theme, for span colours (spans cannot read it while drawing).
+    pub theme: &'a Theme,
+    /// The signed-in user, whose mentions get the stronger pill.
+    pub own_user: Option<&'a UserId>,
+    /// Spoilers the user revealed.
+    pub revealed: &'a Revealed,
+}
+
 /// The pane for the selected room's timeline, in the local time zone.
-pub fn view(timeline: &TimelineView) -> Element<'_, Message> {
+pub fn view<'a>(timeline: &'a TimelineView, env: RichEnv<'_>) -> Element<'a, Message> {
     let now = Local::now().timestamp_millis();
-    view_in(timeline, u64::try_from(now).unwrap_or(0), &Local)
+    view_in(timeline, u64::try_from(now).unwrap_or(0), &Local, env)
 }
 
 /// [`view`] with the clock and the time zone given.
@@ -49,12 +63,13 @@ pub fn view_in<'a, Tz: TimeZone>(
     timeline: &'a TimelineView,
     now_ms: u64,
     tz: &Tz,
+    env: RichEnv<'_>,
 ) -> Element<'a, Message> {
     let window = timeline.window();
     let (above, below) = spacer_heights(&timeline.prefix, &window);
     let mut rows: Vec<Element<'a, Message>> = Vec::with_capacity(window.len() + 2);
     rows.push(space().height(above).into());
-    rows.extend(window.map(|i| built_row(timeline, i, now_ms, tz)));
+    rows.extend(window.map(|i| built_row(timeline, i, now_ms, tz, env)));
     rows.push(space().height(below).into());
     // `from_vec`, because `Column::push` drops zero-size children, and the
     // content is always the two spacers plus the window.
@@ -102,12 +117,13 @@ fn built_row<'a, Tz: TimeZone>(
     i: usize,
     now_ms: u64,
     tz: &Tz,
+    env: RichEnv<'_>,
 ) -> Element<'a, Message> {
     #[cfg(test)]
     BUILT_ROWS.with(|built| built.set(built.get() + 1));
     let id = timeline.items[i].id.clone();
     let on_resize_id = id.clone();
-    sensor(row_content(timeline, i, now_ms, tz))
+    sensor(row_content(timeline, i, now_ms, tz, env))
         .key(id.clone())
         .anticipate(OVERSCAN_PX)
         .on_show(move |size| Message::RowMeasured {
@@ -126,6 +142,7 @@ fn row_content<'a, Tz: TimeZone>(
     i: usize,
     now_ms: u64,
     tz: &Tz,
+    env: RichEnv<'_>,
 ) -> Element<'a, Message> {
     let items = &timeline.items;
     match &items[i].kind {
@@ -147,8 +164,9 @@ fn row_content<'a, Tz: TimeZone>(
                 content = content.push(header(name, time_label(*timestamp_ms, tz)));
             }
             // The body sits below the header in its own widget, so it cannot
-            // pass for a sender line.
-            content = content.push(text(body_text(body)).width(Fill));
+            // pass for a sender line. Rich text has no muted colour and no
+            // small size, so it cannot copy the time next to a name either.
+            content = content.push(body_widget(&items[i].id, body, details, env));
             framed(content.into(), continuation, details.highlighted)
         }
         TimelineItemKind::Placeholder {
@@ -210,6 +228,25 @@ fn row_content<'a, Tz: TimeZone>(
         ),
         TimelineItemKind::Other => space().height(0).into(),
     }
+}
+
+/// The body of a message: its formatted content, or the plain text when the
+/// core sent none.
+fn body_widget<'a>(
+    id: &str,
+    body: &str,
+    details: &MessageDetails,
+    env: RichEnv<'_>,
+) -> Element<'a, Message> {
+    if details.content.blocks.is_empty() {
+        return text(body_text(body)).width(Fill).into();
+    }
+    let ctx = Ctx {
+        own_user: env.own_user,
+        item: id,
+        revealed: env.revealed,
+    };
+    blocks_view(&details.content, &ctx, env.theme)
 }
 
 /// A message body ready to draw: line breaks kept, bidi controls replaced,
@@ -602,9 +639,26 @@ mod tests {
         timeline
     }
 
+    fn theme() -> Theme {
+        crate::theme::theme_for(iced::theme::Mode::Light)
+    }
+
+    fn env<'a>(theme: &'a Theme, revealed: &'a Revealed) -> RichEnv<'a> {
+        RichEnv {
+            theme,
+            own_user: None,
+            revealed,
+        }
+    }
+
     fn built_by(timeline: &TimelineView) -> usize {
+        let (theme, revealed) = (theme(), Revealed::new());
+        built_by_with(timeline, env(&theme, &revealed))
+    }
+
+    fn built_by_with(timeline: &TimelineView, env: RichEnv<'_>) -> usize {
         BUILT_ROWS.with(|c| c.set(0));
-        let element = view_in(timeline, NOW, &Utc);
+        let element = view_in(timeline, NOW, &Utc, env);
         drop(element);
         BUILT_ROWS.with(Cell::get)
     }
@@ -623,11 +677,12 @@ mod tests {
     #[test]
     fn building_the_view_for_10000_items_is_fast() {
         let timeline = big_timeline(10_000);
+        let (theme, revealed) = (theme(), Revealed::new());
         let _ = built_by(&timeline);
         let mut times: Vec<Duration> = (0..15)
             .map(|_| {
                 let start = Instant::now();
-                drop(view_in(&timeline, NOW, &Utc));
+                drop(view_in(&timeline, NOW, &Utc, env(&theme, &revealed)));
                 start.elapsed()
             })
             .collect();
@@ -635,6 +690,63 @@ mod tests {
         let median = times[times.len() / 2];
         println!("timeline_pane view build, median of 15: {median:?}");
         assert!(median < Duration::from_millis(16), "{median:?}");
+    }
+
+    #[test]
+    fn formatted_messages_build_in_both_themes_with_every_item_kind() {
+        use tessera_core::api::{Block, Inline, MentionTarget, RichText, TextStyle};
+        let rich = RichText {
+            blocks: vec![
+                Block::Paragraph(vec![
+                    Inline::Text {
+                        text: "hi ".into(),
+                        style: TextStyle {
+                            bold: true,
+                            ..TextStyle::default()
+                        },
+                    },
+                    Inline::Link {
+                        text: "bank.example".into(),
+                        url: "https://evil.example/".into(),
+                        style: TextStyle::default(),
+                    },
+                    Inline::Mention {
+                        target: MentionTarget::User(UserId::from("@a:x")),
+                        label: "A".into(),
+                    },
+                    Inline::Spoiler(vec![Inline::LineBreak]),
+                ]),
+                Block::Code { text: "x".into() },
+            ],
+        };
+        let mut timeline = TimelineView::default();
+        let item = |id: &str, content: RichText| {
+            TimelineItem::new(
+                id.to_owned(),
+                TimelineItemKind::Message {
+                    sender: UserId::from("@a:x"),
+                    body: "plain fallback".into(),
+                    is_own: false,
+                    timestamp_ms: NOW,
+                    sent: SendStatus::Sent,
+                    details: Box::new(MessageDetails {
+                        content,
+                        ..MessageDetails::default()
+                    }),
+                },
+            )
+        };
+        timeline.apply_diffs(vec![ListDiff::Reset {
+            values: vec![
+                item("a", rich.clone()),
+                item("b", rich),
+                item("c", RichText::default()),
+            ],
+        }]);
+        for mode in [iced::theme::Mode::Light, iced::theme::Mode::Dark] {
+            let (theme, revealed) = (crate::theme::theme_for(mode), Revealed::new());
+            assert_eq!(built_by_with(&timeline, env(&theme, &revealed)), 3);
+        }
     }
 
     #[test]

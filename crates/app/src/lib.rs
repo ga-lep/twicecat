@@ -6,6 +6,8 @@
 pub mod avatars;
 pub mod bridge;
 pub mod dates;
+pub mod links;
+pub mod rich_text;
 pub mod room_list;
 pub mod screens;
 pub mod state;
