@@ -12,6 +12,8 @@ mod frame;
 mod gate;
 mod io;
 mod pipeline;
+#[cfg(target_os = "linux")]
+mod pw;
 mod resample;
 mod voice;
 

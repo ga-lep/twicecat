@@ -80,6 +80,8 @@ AUDIO SETTINGS (saved; take effect at the next call or mic test):
     /ns off|rnnoise|webrtc [low|moderate|high|very_high]|deepfilter [dB]
                           Noise suppression
     /aec [on|off]         Echo cancellation
+    /aec system [on|off]  Also cancel other apps' sound (a game) picked up by
+                          the microphone (Linux with PipeWire)
     /agc [on|off]         Automatic gain
     /gate auto|<dB>|ptt [ms]
                           Voice activity (automatic or above a level in dBFS),

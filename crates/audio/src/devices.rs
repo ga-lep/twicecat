@@ -1,10 +1,14 @@
 //! Device enumeration and hot-plug watching.
 //!
-//! cpal has no device-change notification, so [`DeviceWatcher`] polls the
-//! device list. Default devices need no watching: cpal streams opened on the
-//! default device follow the system default by themselves.
+//! On Linux with a PipeWire daemon the list comes from its registry and
+//! changes arrive as events (`crate::pw`). Elsewhere cpal has no
+//! device-change notification, so [`DeviceWatcher`] polls the list. Default
+//! devices need no watching: streams on the default device follow the
+//! system default by themselves.
 
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -34,18 +38,6 @@ pub struct DeviceList {
     pub outputs: Vec<DeviceInfo>,
 }
 
-/// Drops the inputs that are also outputs. cpal's PipeWire backend offers
-/// every sink as an input too (capturing what plays on it): not a
-/// microphone. Only for PipeWire, where a sink and its capture share one ID;
-/// an ALSA device can really be both.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn without_sinks(inputs: Vec<DeviceInfo>, outputs: &[DeviceInfo]) -> Vec<DeviceInfo> {
-    inputs
-        .into_iter()
-        .filter(|i| !outputs.iter().any(|o| o.id == i.id))
-        .collect()
-}
-
 fn info(device: &cpal::Device, default_id: Option<&str>) -> Option<DeviceInfo> {
     let id = device.id().ok()?.to_string();
     let name = device
@@ -59,10 +51,14 @@ fn info(device: &cpal::Device, default_id: Option<&str>) -> Option<DeviceInfo> {
     })
 }
 
-/// Lists the devices of the platform's default host (PipeWire on Linux
-/// when its daemon runs, else ALSA; CoreAudio; WASAPI). Blocking. On
-/// PipeWire, inputs leave out sinks.
+/// Lists the devices: from PipeWire's registry on Linux when its daemon
+/// runs, else from the platform's default cpal host (ALSA, CoreAudio,
+/// WASAPI). Blocking.
 pub fn list_devices() -> Result<DeviceList, AudioError> {
+    #[cfg(target_os = "linux")]
+    if crate::pw::available() {
+        return crate::pw::list();
+    }
     let host = cpal::default_host();
     let default_in = host
         .default_input_device()
@@ -82,32 +78,56 @@ pub fn list_devices() -> Result<DeviceList, AudioError> {
         .map_err(|_| AudioError::Enumerate)?
         .filter_map(|d| info(&d, default_out.as_deref()))
         .collect();
-    #[cfg(target_os = "linux")]
-    let inputs = if host.id() == cpal::HostId::PipeWire {
-        without_sinks(inputs, &outputs)
-    } else {
-        inputs
-    };
     Ok(DeviceList { inputs, outputs })
 }
 
-/// Polls the device list on its own thread and reports each change.
+/// Reports each change of the device list: PipeWire registry events on
+/// Linux when its daemon runs, else a poll on its own thread.
 pub struct DeviceWatcher {
+    #[cfg(target_os = "linux")]
+    _events: Option<crate::pw::Watcher>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl DeviceWatcher {
-    /// Polls [`list_devices`] every `interval` and calls `on_change` with the
-    /// new list whenever it differs from the last one (not for the first).
+    /// Calls `on_change` with the new list whenever it differs from the
+    /// last one (not for the first): at once with PipeWire, else polling
+    /// [`list_devices`] every `interval`.
     pub fn spawn(
         interval: Duration,
         on_change: impl FnMut(DeviceList) + Send + 'static,
     ) -> std::io::Result<Self> {
+        #[cfg(target_os = "linux")]
+        if crate::pw::available() {
+            let shared = Arc::new(Mutex::new(on_change));
+            let events = shared.clone();
+            match crate::pw::Watcher::spawn(move |list| {
+                if let Ok(mut f) = events.lock() {
+                    f(list);
+                }
+            }) {
+                Ok(watcher) => {
+                    return Ok(Self {
+                        _events: Some(watcher),
+                        stop: Arc::new(AtomicBool::new(true)),
+                        thread: None,
+                    });
+                }
+                Err(_) => {
+                    return Self::spawn_with(interval, list_devices, move |list| {
+                        if let Ok(mut f) = shared.lock() {
+                            f(list);
+                        }
+                    });
+                }
+            }
+        }
         Self::spawn_with(interval, list_devices, on_change)
     }
 
-    /// Like [`spawn`](Self::spawn) with a custom enumerator (tests).
+    /// Polls `enumerate` every `interval` (tests, and systems without
+    /// PipeWire).
     pub fn spawn_with(
         interval: Duration,
         mut enumerate: impl FnMut() -> Result<DeviceList, AudioError> + Send + 'static,
@@ -134,6 +154,8 @@ impl DeviceWatcher {
                 }
             })?;
         Ok(Self {
+            #[cfg(target_os = "linux")]
+            _events: None,
             stop,
             thread: Some(thread),
         })
@@ -155,18 +177,6 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
     use std::sync::mpsc;
-
-    #[test]
-    fn sinks_are_not_microphones() {
-        let dev = |id: &str| DeviceInfo {
-            id: id.into(),
-            name: id.into(),
-            is_default: false,
-        };
-        let inputs = vec![dev("pipewire:mic"), dev("pipewire:speakers")];
-        let outputs = vec![dev("pipewire:speakers")];
-        assert_eq!(without_sinks(inputs, &outputs), vec![dev("pipewire:mic")]);
-    }
 
     fn list(inputs: &[&str]) -> DeviceList {
         DeviceList {

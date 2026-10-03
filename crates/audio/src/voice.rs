@@ -303,6 +303,9 @@ pub struct VoiceEngine {
     mix: Frame,
     mic: Frame,
     last_mic: Frame,
+    /// What the output device played this frame (all applications), when
+    /// the I/O runs an echo reference stream; else the AEC gets our mix.
+    played: Option<Frame>,
     /// Frames between stats refreshes (sonora's stats are not free).
     stats_countdown: u32,
 }
@@ -339,6 +342,7 @@ impl VoiceEngine {
             mix: SILENCE,
             mic: SILENCE,
             last_mic: SILENCE,
+            played: None,
             stats_countdown: 0,
         };
         let control = VoiceControl {
@@ -408,6 +412,10 @@ impl VoiceEngine {
 }
 
 impl FrameProcessor for VoiceEngine {
+    fn echo_reference(&mut self, played: &Frame) {
+        self.played = Some(*played);
+    }
+
     fn process(&mut self, capture: &Frame, playback: &mut Frame) {
         let started = std::time::Instant::now();
         self.apply_commands();
@@ -427,8 +435,13 @@ impl FrameProcessor for VoiceEngine {
             }
         }
 
-        // The echo reference is exactly what is about to be played.
-        self.chain.render(playback);
+        // The echo reference: what the output device played (a game's sound
+        // included) when the I/O captures it, else exactly what we are
+        // about to play.
+        match self.played.take() {
+            Some(played) => self.chain.render(&played),
+            None => self.chain.render(playback),
+        }
 
         self.mic = *capture;
         let result = self.chain.capture(&mut self.mic);

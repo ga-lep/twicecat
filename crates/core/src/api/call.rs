@@ -195,6 +195,11 @@ pub struct AudioProcessing {
     pub auto_gain: bool,
     /// Remove low-frequency rumble.
     pub high_pass: bool,
+    /// Also cancel other applications' sound (a game, a video) picked up by
+    /// the microphone: echo cancellation then uses everything the output
+    /// device plays as its reference, not only the call. Linux with
+    /// PipeWire; needs `echo_cancellation`.
+    pub cancel_system_audio: bool,
 }
 
 impl Default for AudioProcessing {
@@ -204,6 +209,7 @@ impl Default for AudioProcessing {
             noise_suppression: NoiseSuppression::RnNoise,
             auto_gain: true,
             high_pass: true,
+            cancel_system_audio: false,
         }
     }
 }
@@ -515,6 +521,7 @@ mod tests {
                     "noise_suppression": { "kind": "rn_noise" },
                     "auto_gain": true,
                     "high_pass": true,
+                    "cancel_system_audio": false,
                 },
                 "input_mode": { "kind": "voice_activity", "automatic": true, "threshold_db": -50.0 },
                 "push_to_talk": { "key": null, "gamepad_button": null },

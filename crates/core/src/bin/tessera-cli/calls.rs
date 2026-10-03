@@ -41,6 +41,8 @@ pub(crate) enum CallCmd {
     Output(Option<usize>),
     Ns(NoiseSuppression),
     Aec(Option<bool>),
+    /// Cancel other applications' sound too (`/aec system`).
+    AecSystem(Option<bool>),
     Agc(Option<bool>),
     Gate(GateArg),
     /// Participant index from `/who`, or a user ID.
@@ -82,7 +84,12 @@ pub(crate) fn parse(name: &str, arg: &str) -> Option<Result<CallCmd, &'static st
         "input" => device(arg, "/input <n|default>").map(CallCmd::Input),
         "output" => device(arg, "/output <n|default>").map(CallCmd::Output),
         "ns" => noise_suppression(arg).map(CallCmd::Ns),
-        "aec" => switch(arg, "/aec [on|off]").map(CallCmd::Aec),
+        "aec" => match arg.strip_prefix("system") {
+            Some(rest) if rest.is_empty() || rest.starts_with(' ') => {
+                switch(rest.trim(), "/aec system [on|off]").map(CallCmd::AecSystem)
+            }
+            _ => switch(arg, "/aec [on|off] | /aec system [on|off]").map(CallCmd::Aec),
+        },
         "agc" => switch(arg, "/agc [on|off]").map(CallCmd::Agc),
         "gate" => gate(arg).map(CallCmd::Gate),
         "vol" => volume(arg),
@@ -362,6 +369,13 @@ impl Calls {
                 let p = &mut s.processing;
                 p.echo_cancellation = on.unwrap_or(!p.echo_cancellation);
             }),
+            CallCmd::AecSystem(on) => self.edit(|s| {
+                let p = &mut s.processing;
+                p.cancel_system_audio = on.unwrap_or(!p.cancel_system_audio);
+                if p.cancel_system_audio {
+                    p.echo_cancellation = true;
+                }
+            }),
             CallCmd::Agc(on) => self.edit(|s| {
                 let p = &mut s.processing;
                 p.auto_gain = on.unwrap_or(!p.auto_gain);
@@ -559,8 +573,13 @@ impl Calls {
                 self.device_name(s.output_device.as_ref(), false)
             ),
             format!(
-                "Echo cancellation {}, noise suppression {ns}, auto gain {}, high-pass {}.",
+                "Echo cancellation {}{}, noise suppression {ns}, auto gain {}, high-pass {}.",
                 on_off(s.processing.echo_cancellation),
+                if s.processing.cancel_system_audio {
+                    " (other apps' sound too)"
+                } else {
+                    ""
+                },
                 on_off(s.processing.auto_gain),
                 on_off(s.processing.high_pass)
             ),
@@ -812,6 +831,8 @@ mod tests {
             Ok(CallCmd::Ns(NoiseSuppression::RnNoise))
         );
         assert_eq!(cmd("/aec off"), Ok(CallCmd::Aec(Some(false))));
+        assert_eq!(cmd("/aec system"), Ok(CallCmd::AecSystem(None)));
+        assert_eq!(cmd("/aec system on"), Ok(CallCmd::AecSystem(Some(true))));
         assert_eq!(
             cmd("/gate -42.5"),
             Ok(CallCmd::Gate(GateArg::Threshold(-42.5)))
@@ -841,6 +862,8 @@ mod tests {
             "/vol 1",
             "/vol 1 -5",
             "/mictest twice",
+            "/aec systems",
+            "/aec system maybe",
         ] {
             assert!(cmd(bad).is_err(), "{bad}");
         }

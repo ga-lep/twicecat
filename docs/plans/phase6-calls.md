@@ -133,7 +133,7 @@ As built in Task 3 (`crates/core/src/api/call.rs`, commands and events in `api/m
   - `StartMicTest { loopback }`, `StopMicTest`.
 - **`AudioSettings`** (also the `call_settings.json` format, versioned wrapper, atomic write, 0o600):
   - `input_device` and `output_device` (`None` follows the system default);
-  - `processing { echo_cancellation, noise_suppression: Off | WebRtc { level } | RnNoise | DeepFilter { attenuation_limit_db }, auto_gain, high_pass }`;
+  - `processing { echo_cancellation, noise_suppression: Off | WebRtc { level } | RnNoise | DeepFilter { attenuation_limit_db }, auto_gain, high_pass, cancel_system_audio }` (`cancel_system_audio`: Task 14);
   - `input_mode: VoiceActivity { automatic, threshold_db } | PushToTalk { release_delay_ms }`, and `push_to_talk { key, gamepad_button }` (Task 11);
   - `input_gain_db`, `output_volume_percent`, `voice_bitrate_kbps` (default 64), and `user_volumes`.
 
@@ -300,13 +300,15 @@ Each task follows the full Phase 1 gate: fmt, clippy -D warnings, tests, `check-
    - **Tests:** the probe and fallback logic as unit tests with a fake backend; SNR and per-frame latency on the same fixture as Task 13, recorded per backend; the GPU runs are human items (no GPU in CI).
    - **Frame analogue (research only):** Qualcomm's NPU through QNN instead of the GPU; recorded under Task 15, not planned.
 
-14. **Own PipeWire client on Linux** (decision 12; replaces cpal there).
-   - A `pw_stream` per direction on the `pipewire` crate (`=0.10.1`, MIT, already in the tree through cpal), driven by PipeWire's real-time data loop. The callbacks only move samples through the existing rings; the processing thread stays as it is (sonora allocates per frame, so no DSP in the RT callback).
-   - Stream properties: `media.role = Communication` (WirePlumber policy: Bluetooth headset profile, ducking), `node.latency = 480/48000`, our `application.name`, `node.rate` 48 kHz when the graph allows, so nothing resamples.
-   - Enumeration from the registry by `media.class`: `Audio/Source` and `Audio/Sink` (plus the Internal variants) only, so other applications' streams are no longer listed (Task 4's known limitation). Stable IDs stay the node names (`pipewire:<node.name>`), so saved settings keep working.
-   - Device and default changes from registry and metadata events instead of the 2 s poll.
-   - Optional system-mix echo reference: capture the playing sink (`stream.capture.sink`) and feed it to AEC3 as the render reference, so game audio is cancelled too. Measured with a fixture (game-like noise plus speech on a loopback sink): echo suppression with and without it.
-   - Tests: registry filtering and the property set as unit tests; the ignored output-only stream test from Task 4 runs against it; the real-device behaviour is a human item.
+14. **Own PipeWire client on Linux** (decision 12; as built, `crates/audio/src/pw`, pipewire-rs 0.10.1 and cpal 0.18.2's PipeWire backend read in the registry).
+   - **Streams:** one PipeWire thread runs the main loop; each stream's `process` callback runs in PipeWire's real-time data loop (`RT_PROCESS`) and only moves samples between the graph's buffers and the existing lock-free rings. The processing thread is unchanged. The format is 48 kHz mono `f32` (PipeWire's adapter converts), so nothing resamples on our side on Linux.
+   - **Properties** (`graph::stream_properties`): `media.role = Communication`, `node.latency = 480/48000`, `node.rate = 1/48000`, `application.name = Tessera`, node names `tessera-capture`/`tessera-playback`/`tessera-echo-reference`, one `node.group` per process, `target.object` when a device is chosen (else the session manager follows the default). A chosen device that is gone falls back to the default with `FellBackToDefault`.
+   - **Devices from the registry** (`graph::node_kind`): `Audio/Source`, `Audio/Source/Virtual` (noise-cancelling filters, EasyEffects), `Audio/Sink`, `Audio/Duplex`; other applications' streams and `…/Internal` nodes are left out. **Deviation:** the plan said "plus the Internal variants"; the session manager hides those from device pickers, so virtual sources are offered instead. IDs stay `pipewire:<node.name>`. Defaults come from the `default` metadata.
+   - **Changes as events:** `DeviceWatcher` follows registry and metadata events with PipeWire (the 2 s poll remains for other systems).
+   - **cpal** is used only without a PipeWire daemon (ALSA then): its `pipewire` feature is dropped, so its PipeWire host (which deinitialises libpipewire when dropped) never runs next to ours.
+   - **System-mix echo reference:** `IoConfig::echo_reference` opens a third stream on the output device's monitor (`stream.capture.sink`); `FrameProcessor::echo_reference` hands each frame to the voice engine, whose AEC then uses it instead of the call's own mix, so a game's or a video's sound is cancelled too. Setting `AudioProcessing.cancel_system_audio` (default off; needs echo cancellation; API addition for approval); CLI `/aec system`.
+   - **Tests:** pure parts as unit tests (classes, defaults, list, properties); `crates/audio/tests/pipewire.rs` runs each test against a private PipeWire daemon (null devices only, its own socket, no session manager, nothing of the user's graph): the list leaves out streams and marks defaults; a device created and destroyed with `pw-cli` is reported by the watcher at once; a 1 kHz tone goes out and comes back through the graph at 0.3000; and a "game" playing on the speakers the microphone hears is sent at −20.6 dBFS with the call's own reference and at −73.3 dBFS with the system mix (52.7 dB less, a perfect digital echo path). The Task 4 output test (300 ms of silence) passes on the real PipeWire through the new client.
+
 15. **Steam Frame performance.**
    - A benchmark binary measures per-10 ms-frame cost of each stage (capture conversion, HPF, AEC3, each NS mode, AGC2, gate, mixer, Opus through LiveKit's encoder, playback) on x86_64 and on the CI aarch64 runner, recorded in PROGRESS.md. Budget target: the whole call path under 5 % of one core on the Frame (to be confirmed on the device).
    - Frame defaults from the measurements: RNNoise (DeepFilterNet opt-in), AEC3 on, 10 ms buffers, Opus at 32 kb/s with DTX; a "low power" profile if the budget is not met.

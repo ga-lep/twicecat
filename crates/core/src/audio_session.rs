@@ -71,6 +71,9 @@ pub(crate) fn io_config(settings: &AudioSettings, playback: bool) -> IoConfig {
             .output_device
             .as_ref()
             .map(|d| d.as_str().to_owned()),
+        echo_reference: playback
+            && settings.processing.echo_cancellation
+            && settings.processing.cancel_system_audio,
     }
 }
 
@@ -329,6 +332,7 @@ mod tests {
                 },
                 auto_gain: false,
                 high_pass: true,
+                cancel_system_audio: false,
             },
             input_mode: InputMode::PushToTalk {
                 release_delay_ms: 300,
@@ -365,5 +369,19 @@ mod tests {
             ..AudioSettings::default()
         };
         assert_eq!(io_config(&a, true), io_config(&c, true));
+    }
+
+    #[test]
+    fn system_audio_is_cancelled_only_with_echo_cancellation_and_playback() {
+        let mut s = AudioSettings::default();
+        assert!(!io_config(&s, true).echo_reference, "off by default");
+        s.processing.cancel_system_audio = true;
+        assert!(io_config(&s, true).echo_reference);
+        assert!(
+            !io_config(&s, false).echo_reference,
+            "mic test without playback"
+        );
+        s.processing.echo_cancellation = false;
+        assert!(!io_config(&s, true).echo_reference);
     }
 }

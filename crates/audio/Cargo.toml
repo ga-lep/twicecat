@@ -15,10 +15,11 @@ nnnoiseless = { version = "=0.5.2", default-features = false }
 thiserror = "2"
 tracing = "0.1"
 
-# Native PipeWire on Linux (SteamOS, desktops): the stream runs in the
-# graph's real-time cycle, with no extra hop through pipewire-pulse. cpal
-# falls back to ALSA when no PipeWire daemon runs. libwebrtc's weak pw_*
-# stubs, which would take libpipewire's place, are renamed by
-# scripts/fetch-libwebrtc.sh.
+# Linux: our own PipeWire client (src/pw, plan decision 12): call-role
+# streams in the graph's real-time cycle, devices and changes from the
+# registry. cpal is used only without a PipeWire daemon (ALSA then). The
+# pw_* stubs in libwebrtc, which would take libpipewire's place, are renamed
+# by scripts/fetch-libwebrtc.sh.
 [target.'cfg(target_os = "linux")'.dependencies]
-cpal = { version = "=0.18.2", features = ["pipewire"] }
+pipewire = { version = "=0.10.1", features = ["v0_3_53"] }
+serde_json = "1"

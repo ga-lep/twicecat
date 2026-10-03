@@ -1265,7 +1265,6 @@ dependencies = [
  "objc2-core-audio-types",
  "objc2-core-foundation",
  "objc2-foundation 0.3.2",
- "pipewire",
  "web-sys",
  "windows 0.62.2",
  "windows-core 0.62.2",
@@ -7326,8 +7325,10 @@ version = "0.1.0"
 dependencies = [
  "cpal",
  "nnnoiseless",
+ "pipewire",
  "rtrb 0.4.0",
  "rubato",
+ "serde_json",
  "sonora",
  "thiserror 2.0.21",
  "tracing",

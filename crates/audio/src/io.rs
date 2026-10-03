@@ -1,8 +1,10 @@
-//! Device streams (cpal) and the processing thread.
+//! Device streams and the processing thread.
 //!
-//! [`AudioIo::start`] opens the capture and playback devices on a dedicated
-//! thread (cpal streams are not `Send` on every platform, so they live and
-//! die there), then runs the [`Pipeline`] on that same thread. The device
+//! [`AudioIo::start`] opens the capture and playback streams, then runs the
+//! [`Pipeline`] on a dedicated thread. On Linux with a PipeWire daemon the
+//! streams are our own PipeWire client's (`crate::pw`), on their own thread;
+//! elsewhere they are cpal's, opened on the processing thread (cpal streams
+//! are not `Send` on every platform, so they live and die there). The device
 //! callbacks only convert samples and move them through lock-free rings.
 
 use std::sync::Arc;
@@ -34,6 +36,11 @@ pub struct IoConfig {
     pub playback: bool,
     /// Playback device.
     pub output_device: Option<String>,
+    /// Also capture what the output device plays (every application's
+    /// sound, a game's included) and hand it to the processor as the echo
+    /// reference ([`FrameProcessor::echo_reference`]). PipeWire only;
+    /// ignored elsewhere.
+    pub echo_reference: bool,
 }
 
 /// What was opened.
@@ -56,6 +63,8 @@ pub struct IoInfo {
     pub input: Option<StreamInfo>,
     /// Playback stream, if opened.
     pub output: Option<StreamInfo>,
+    /// The echo reference stream (what the output device plays), if opened.
+    pub echo_reference: Option<StreamInfo>,
 }
 
 /// Something the owner should know about; read with [`AudioIo::try_event`].
@@ -185,6 +194,7 @@ impl AudioIo {
             info: IoInfo {
                 input: Some(virtual_info.clone()),
                 output: Some(virtual_info),
+                echo_reference: None,
             },
         })
     }
@@ -225,6 +235,23 @@ fn run(
     // Everything that runs on this thread (the processor included) treats
     // denormals as zero; see `denormals`.
     crate::denormals::flush_denormals_on_this_thread();
+    #[cfg(target_os = "linux")]
+    if crate::pw::available() {
+        let opened = match crate::pw::open(&config, &counters, &events) {
+            Ok(opened) => opened,
+            Err(e) => {
+                let _ = ready.send(Err(e));
+                return;
+            }
+        };
+        let _ = ready.send(Ok(opened.info));
+        let mut pipeline = Pipeline::new(opened.capture, opened.playback, processor, counters);
+        pipeline.set_echo_reference(opened.reference);
+        process(pipeline, &stop, &events);
+        // The streams stop when dropped (their own thread).
+        drop(opened.streams);
+        return;
+    }
     let host = cpal::default_host();
     let mut info = IoInfo::default();
     let mut streams = Vec::new();
@@ -255,8 +282,19 @@ fn run(
         return;
     }
     let _ = ready.send(Ok(info));
+    let pipeline = Pipeline::new(capture, playback, processor, counters);
+    process(pipeline, &stop, &events);
+    // The streams stop when dropped, on the thread that created them.
+    drop(streams);
+}
 
-    let mut pipeline = Pipeline::new(capture, playback, processor, counters);
+/// Runs the pipeline until `stop`: paced by the capture stream, or by a
+/// 10 ms timer without one.
+fn process<P: FrameProcessor>(
+    mut pipeline: Pipeline<P>,
+    stop: &AtomicBool,
+    events: &mpsc::Sender<IoEvent>,
+) {
     let tick = Duration::from_millis(10);
     let mut next_tick = Instant::now() + tick;
     while !stop.load(Ordering::Acquire) {
@@ -277,8 +315,6 @@ fn run(
             }
         }
     }
-    // The streams stop when dropped, on the thread that created them.
-    drop(streams);
 }
 
 fn map_error(e: &cpal::Error) -> AudioError {

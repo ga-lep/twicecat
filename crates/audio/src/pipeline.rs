@@ -21,6 +21,12 @@ pub trait FrameProcessor: Send + 'static {
     /// `capture` is the microphone frame (silence without a microphone);
     /// `playback` starts silent and is what the speakers will play.
     fn process(&mut self, capture: &Frame, playback: &mut Frame);
+
+    /// What the output device played in this frame, all applications
+    /// included, when an echo reference stream runs
+    /// ([`crate::IoConfig::echo_reference`]); called right before
+    /// [`process`](Self::process). Silence when the stream had nothing.
+    fn echo_reference(&mut self, _played: &Frame) {}
 }
 
 impl<F> FrameProcessor for F
@@ -120,6 +126,8 @@ impl PlaybackSide {
 
 pub(crate) struct Pipeline<P> {
     capture: Option<CaptureSide>,
+    reference: Option<CaptureSide>,
+    frame_ref: Frame,
     playback: Option<PlaybackSide>,
     processor: P,
     scratch: Vec<f32>,
@@ -140,6 +148,8 @@ impl<P: FrameProcessor> Pipeline<P> {
             .map_or(FRAME_LEN, |c| c.converter.input_frames_max());
         Self {
             capture,
+            reference: None,
+            frame_ref: SILENCE,
             playback,
             processor,
             scratch: vec![0.0; scratch_len],
@@ -147,6 +157,17 @@ impl<P: FrameProcessor> Pipeline<P> {
             frame_out: SILENCE,
             counters,
         }
+    }
+
+    /// Adds the echo reference stream (what the output device plays).
+    pub(crate) fn set_echo_reference(&mut self, reference: Option<CaptureSide>) {
+        if let Some(r) = &reference {
+            let need = r.converter.input_frames_max();
+            if need > self.scratch.len() {
+                self.scratch.resize(need, 0.0);
+            }
+        }
+        self.reference = reference;
     }
 
     pub(crate) fn has_capture(&self) -> bool {
@@ -172,9 +193,31 @@ impl<P: FrameProcessor> Pipeline<P> {
                 .pop_entire_slice(input)
                 .map_err(|_| AudioError::Internal)?;
             capture.converter.process(input, &mut self.frame_in)?;
+            self.pull_reference()?;
             self.run_frame()?;
             ran += 1;
         }
+    }
+
+    /// Hands the processor one frame of the echo reference, silence when the
+    /// stream has none yet (it runs on the same graph clock as capture).
+    fn pull_reference(&mut self) -> Result<(), AudioError> {
+        let Some(reference) = self.reference.as_mut() else {
+            return Ok(());
+        };
+        let need = reference.converter.input_frames_next();
+        if reference.ring.slots() >= need {
+            let input = &mut self.scratch[..need];
+            reference
+                .ring
+                .pop_entire_slice(input)
+                .map_err(|_| AudioError::Internal)?;
+            reference.converter.process(input, &mut self.frame_ref)?;
+        } else {
+            self.frame_ref = SILENCE;
+        }
+        self.processor.echo_reference(&self.frame_ref);
+        Ok(())
     }
 
     /// Runs one frame of silence through the processor (no microphone; the
