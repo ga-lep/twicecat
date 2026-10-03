@@ -17,7 +17,7 @@
 - [x] 4. HTML to rich text mapper in the core (roadmap step 4, core side)
 - [x] 5. Sending: markdown, mentions, replies, local echo retry and discard (roadmap steps 6, 7, 9, core side) (phase3.5)
 - [x] 6. Edit, redact, react and member search in the core (roadmap steps 6, 7, core side) (phase3.6)
-- [ ] 7. Back-pagination, room subscription, receipts and typing in the core (roadmap steps 3, 8, core side)
+- [x] 7. Back-pagination, room subscription, receipts and typing in the core (roadmap steps 3, 8, core side) (phase3.7)
 - [ ] 8. Timeline state and virtualization model in the app, 10,000-item timing test (roadmap step 2, model)
 - [ ] 9. Timeline pane rendering, measurement and visible-only layout test (roadmap steps 1, 2, 3, UI)
 - [ ] 10. Rich text rendering, link handling and pills (roadmap steps 4, 5, UI)
@@ -84,9 +84,20 @@
 - APIs confirmed in `~/.cargo/registry/src/*/`: matrix-sdk-ui 0.19.1 `timeline/mod.rs` (`Timeline::edit` :556, `toggle_reaction` :643, `redact` :724), `event_item/mod.rs` (`identifier` :254, `is_editable` :355); matrix-sdk 0.19.1 `room/mod.rs` (`sync_members` :1169, `members_no_sync` :1246).
 - Open issues: none new. Human items: none.
 
+## Phase 3 / Task 7 notes
+- `SelectRoom` now calls `room_list_service().set_room_subscriptions(&[id])` (only when sync runs), and spawns two forwarders into the selection's `JoinSet`, so they end with the selection: `forward_pagination` (current `live_back_pagination_status` value at once, then the stream, mapped by `pagination_state`) and `forward_typing` (`subscribe_to_typing_notifications`, names from `get_member_no_sync`, at most 16 users per event). `PaginateBackwards` runs `paginate_backwards(20)` in the set behind a `PaginationPermit` (an `AtomicBool` per selection; a request that finds it taken is dropped). `MarkRead` sends `Read`, plus `FullyRead` when asked. `SetTyping` calls `typing_notice`. The Task 2 "not implemented" fallbacks (`command_action`, `action_error`, `unfinished_action_event`) are gone; the handle-level tests for no session and no selected room still cover all ten action commands.
+- TDD: unit tests (`pagination_runs_at_most_one_at_a_time`, `sdk_pagination_status_maps_to_the_api_state`, `typing_users_take_names_from_members`) failed to compile first, then passed. Integration tests (`crates/core/tests/timeline_live.rs`) were written after the code.
+- Findings for Tasks 8, 9 and 13: (1) `Pagination { ReachedStart }` and the diff that inserts `TimelineStart` come from different forwarders, so the status can arrive first; the app must not assume the item is already there. (2) A `PaginateBackwards` sent in reaction to `Idle` can, in a tiny window, find the previous run's permit still held and be dropped silently (no event); the app must ask again on its next scroll or `Idle` (the test re-sends after 3 s of quiet). (3) `TimelineStart` is the first item, ahead of the date divider and state items. (4) In the first run a typing test timed out once (carol's subscription is applied after `SelectRoom` returns, so a one-shot notice can pass first); the test now re-sends, and 6 later runs passed. The app's typing sends repeat while the composer is non-empty (Q13), so this is a test-only concern.
+- Integration tests: pagination (60 numbered messages, fresh alice core, repeated `PaginateBackwards` on `Idle`, `ReachedStart`, all 60 in order, `TimelineStart` first), receipts (carol `MarkRead { fully_read: false }`, alice's newest message has carol in `read_by`), typing (alice `SetTyping`, carol sees `[alice]`, then `[]`).
+- `crates/core/examples/seed_big_room.rs` (Q25) compiles under `cargo test`. Human step, after `docker compose up -d --wait && scripts/create-test-users.sh`: `cargo run -p tessera-core --example seed_big_room -- 10000` (count optional, default 10,000). It reads `.env.test`, refuses a non-loopback `HOMESERVER_URL`, logs in as test user 1, invites test user 3, sends 20 messages at a time and prints only the room ID.
+- Checks: fmt, clippy (`--workspace --all-targets --all-features --locked -D warnings`), `cargo test --workspace --locked`, `check-app-deps.sh`, `check-core-api.sh`, `cargo deny check` pass. Ignored run (`--ignored --skip keyring`, after `create-test-users.sh`): all pass, 2 min 37 s including build, then `docker compose stop`.
+- APIs confirmed in `~/.cargo/registry/src/*/`: matrix-sdk-ui 0.19.1 `room_list_service/mod.rs` (`set_room_subscriptions` :485), `sync_service.rs` (`room_list_service` :612), `timeline/pagination.rs` (`paginate_backwards` :30, `live_back_pagination_status` :124), `timeline/mod.rs` (`mark_as_read` :984); matrix-sdk 0.19.1 `room/mod.rs` (`subscribe_to_typing_notifications` :661, `get_member_no_sync` :1217, `typing_notice` :2104), `event_cache/caches/pagination.rs` (`PaginationStatus` :379, re-exported as `matrix_sdk::event_cache::PaginationStatus`), `event_handler/mod.rs` (`EventHandlerDropGuard` :552).
+- Open issues: none beyond the findings above. Human items: run the seed example before the Phase 3 checkpoint.
+
 ## Phase 3 human checkpoint
 - [ ] CI green on Linux, Windows and macOS with the new dependencies (matrix-sdk `markdown`, emojis, chrono, dev-only iced `advanced`).
 - [ ] Revisit plan decisions Q1-Q25.
+- [ ] Seed the 10,000-message room (`cargo run -p tessera-core --example seed_big_room -- 10000`, local homeserver only) and scroll it (Tasks 9 and 13).
 - [ ] Link and mention label spoofing (Task 4 audit): check that the app shows the real URL, or the real user/room ID, before opening a link or acting on a pill, so a label like `https://bank.example` cannot hide another target (Task 10).
 
 ## Phase 0 steps

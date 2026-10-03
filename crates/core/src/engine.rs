@@ -2,12 +2,16 @@
 //!
 //! Only plain API types cross the public boundary. SDK types stay in here.
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures_util::{Stream, StreamExt as _, pin_mut};
+use matrix_sdk::event_cache::PaginationStatus;
 use matrix_sdk::room::edit::EditedContent;
 use matrix_sdk::ruma::OwnedUserId;
+use matrix_sdk::ruma::api::client::receipt::create_receipt::v3::ReceiptType;
 use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
 use matrix_sdk::send_queue::SendHandle;
 use matrix_sdk::{Client, RoomMemberships, SessionChange};
@@ -23,7 +27,7 @@ use zeroize::Zeroizing;
 
 use crate::api::{
     ActionKind, Command, CoreError, CoreEvent, DeviceId, ListDiff, Member, MessageText,
-    OutgoingMessage, Password, RoomId, RoomListQuery, UserId,
+    OutgoingMessage, PaginationState, Password, RoomId, RoomListQuery, TypingUser, UserId,
 };
 use crate::avatars::{Avatars, SdkFetcher, answer_unavailable};
 use crate::client::{
@@ -40,6 +44,12 @@ use crate::session::{
 };
 use crate::sync::{CancelTrigger, SyncControl, cancel_pair, run_supervised};
 use crate::timeline::{map_item, normalize_reaction_key, parse_room_id, rank_members};
+
+/// Events loaded by one back-pagination.
+const PAGINATION_BATCH: u16 = 20;
+
+/// Most typing users reported at once (a hostile room could list thousands).
+const MAX_TYPING_USERS: usize = 16;
 
 /// Default number of rooms the room list loads per page.
 pub const DEFAULT_ROOM_LIST_PAGE_SIZE: usize = 500;
@@ -117,6 +127,8 @@ struct Selected {
     tasks: JoinSet<()>,
     /// Set once the full member list has been fetched for this selection.
     members_synced: Arc<OnceCell<()>>,
+    /// Set while a back-pagination of this room runs.
+    paginating: Arc<AtomicBool>,
 }
 
 impl Selected {
@@ -442,25 +454,6 @@ async fn next_change(active: &mut Option<Active>) -> Change {
     }
 }
 
-/// The room and action kind of a Phase 3 action command; `None` for any
-/// other command.
-fn command_action(cmd: &Command) -> Option<(RoomId, ActionKind)> {
-    let (room_id, kind) = match cmd {
-        Command::Send(m) => (&m.room_id, ActionKind::Send),
-        Command::Edit { message, .. } => (&message.room_id, ActionKind::Edit),
-        Command::Redact { room_id, .. } => (room_id, ActionKind::Redact),
-        Command::ToggleReaction { room_id, .. } => (room_id, ActionKind::React),
-        Command::RetrySend { room_id, .. } => (room_id, ActionKind::Retry),
-        Command::DiscardSend { room_id, .. } => (room_id, ActionKind::Discard),
-        Command::PaginateBackwards { room_id } => (room_id, ActionKind::Paginate),
-        Command::MarkRead { room_id, .. } => (room_id, ActionKind::Receipt),
-        Command::SetTyping { room_id, .. } => (room_id, ActionKind::Typing),
-        Command::SearchMembers { room_id, .. } => (room_id, ActionKind::Members),
-        _ => return None,
-    };
-    Some((room_id.clone(), kind))
-}
-
 /// Finds the timeline item with this `TimelineItem::id`.
 async fn find_item(timeline: &Timeline, item_id: &str) -> Result<Arc<SdkTimelineItem>, CoreError> {
     timeline
@@ -634,32 +627,140 @@ async fn discard_task(timeline: Arc<Timeline>, item_id: String) -> Result<(), Co
         .map_err(|_| CoreError::Internal("the message could not be discarded".into()))
 }
 
-/// Why an action on `room` cannot run: no session, the room is not the
-/// selected one, or (for now) the handler does not exist yet.
-fn action_error(logged_in: bool, selected: Option<&RoomId>, room: &RoomId) -> CoreError {
-    if !logged_in {
-        CoreError::NotLoggedIn
-    } else if selected != Some(room) {
-        CoreError::NoRoomSelected
-    } else {
-        CoreError::Internal("not implemented yet".into())
+/// Marks a back-pagination as running; at most one runs per selection.
+/// Dropping the permit frees the slot.
+struct PaginationPermit(Arc<AtomicBool>);
+
+impl PaginationPermit {
+    /// Takes the slot, or `None` while another pagination holds it.
+    fn try_acquire(flag: &Arc<AtomicBool>) -> Option<Self> {
+        flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self(flag.clone()))
     }
 }
 
-/// The answer to an action command whose handler does not exist yet; `None`
-/// for a command that is not an action.
-fn unfinished_action_event(
-    logged_in: bool,
-    selected: Option<&RoomId>,
-    cmd: &Command,
-) -> Option<CoreEvent> {
-    let (room_id, action) = command_action(cmd)?;
-    let error = action_error(logged_in, selected, &room_id);
-    Some(CoreEvent::ActionFailed {
-        room_id,
-        action,
-        error,
-    })
+impl Drop for PaginationPermit {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// Loads 20 older events, unless a pagination of this room is already
+/// running (then the request is dropped: the app asks again when idle).
+async fn paginate_task(timeline: Arc<Timeline>, flag: Arc<AtomicBool>) -> Result<(), CoreError> {
+    let Some(_permit) = PaginationPermit::try_acquire(&flag) else {
+        return Ok(());
+    };
+    timeline
+        .paginate_backwards(PAGINATION_BATCH)
+        .await
+        .map(drop)
+        .map_err(|_| CoreError::Internal("older messages could not be loaded".into()))
+}
+
+/// Sends a read receipt for the newest event, and moves the read marker when
+/// asked.
+async fn mark_read_task(timeline: Arc<Timeline>, fully_read: bool) -> Result<(), CoreError> {
+    let fail = |_| CoreError::Internal("the read receipt could not be sent".into());
+    timeline
+        .mark_as_read(ReceiptType::Read)
+        .await
+        .map_err(fail)?;
+    if fully_read {
+        timeline
+            .mark_as_read(ReceiptType::FullyRead)
+            .await
+            .map_err(fail)?;
+    }
+    Ok(())
+}
+
+/// Tells the room whether the user is typing.
+async fn typing_task(timeline: Arc<Timeline>, typing: bool) -> Result<(), CoreError> {
+    timeline
+        .room()
+        .typing_notice(typing)
+        .await
+        .map_err(|_| CoreError::Internal("the typing notice could not be sent".into()))
+}
+
+/// The API state for an SDK back-pagination status.
+fn pagination_state(status: PaginationStatus) -> PaginationState {
+    match status {
+        PaginationStatus::Idle {
+            hit_timeline_start: true,
+        } => PaginationState::ReachedStart,
+        PaginationStatus::Idle { .. } => PaginationState::Idle,
+        PaginationStatus::Paginating => PaginationState::Loading,
+    }
+}
+
+/// Forwards the back-pagination status of the room as `Pagination` events,
+/// the current value first. Ends with the selection (it is aborted) or when
+/// the receiver is gone.
+async fn forward_pagination(
+    room_id: RoomId,
+    timeline: Arc<Timeline>,
+    events: mpsc::Sender<CoreEvent>,
+) {
+    let Some((current, stream)) = timeline.live_back_pagination_status().await else {
+        return;
+    };
+    pin_mut!(stream);
+    let mut next = Some(current);
+    while let Some(status) = next {
+        let event = CoreEvent::Pagination {
+            room_id: room_id.clone(),
+            state: pagination_state(status),
+        };
+        if events.send(event).await.is_err() {
+            return;
+        }
+        next = stream.next().await;
+    }
+}
+
+/// The typing users with the names the room's members have, if known.
+fn typing_users(ids: Vec<OwnedUserId>, names: &HashMap<OwnedUserId, String>) -> Vec<TypingUser> {
+    ids.into_iter()
+        .take(MAX_TYPING_USERS)
+        .map(|id| TypingUser {
+            name: names.get(&id).cloned(),
+            user_id: UserId::from(id.as_str()),
+        })
+        .collect()
+}
+
+/// Forwards who else is typing in the room as `Typing` events. Ends with the
+/// selection (it is aborted); the SDK event handler goes with the guard.
+async fn forward_typing(room_id: RoomId, timeline: Arc<Timeline>, events: mpsc::Sender<CoreEvent>) {
+    let room = timeline.room();
+    let (_guard, mut receiver) = room.subscribe_to_typing_notifications();
+    loop {
+        let ids = match receiver.recv().await {
+            Ok(ids) => ids,
+            // Only the latest list matters; wait for the next one.
+            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(broadcast::error::RecvError::Closed) => return,
+        };
+        let mut names = HashMap::new();
+        for id in ids.iter().take(MAX_TYPING_USERS) {
+            // A failed lookup just leaves the name out.
+            if let Ok(Some(member)) = room.get_member_no_sync(id).await
+                && let Some(name) = member.display_name()
+            {
+                names.insert(id.clone(), name.to_owned());
+            }
+        }
+        let event = CoreEvent::Typing {
+            room_id: room_id.clone(),
+            users: typing_users(ids, &names),
+        };
+        if events.send(event).await.is_err() {
+            return;
+        }
+    }
 }
 
 impl Engine {
@@ -823,20 +924,32 @@ impl Engine {
                 })
                 .await;
             }
-            // The real handlers land in later tasks; until then each answers
-            // without touching the network.
-            Command::PaginateBackwards { .. }
-            | Command::MarkRead { .. }
-            | Command::SetTyping { .. } => {
-                let selected = self
+            Command::PaginateBackwards { room_id } => {
+                let flag = self
                     .active
                     .as_ref()
                     .and_then(|a| a.selected.as_ref())
-                    .map(|s| &s.room_id);
-                if let Some(event) = unfinished_action_event(self.active.is_some(), selected, &cmd)
-                {
-                    self.emit(event).await;
-                }
+                    .map(|s| s.paginating.clone())
+                    .unwrap_or_default();
+                self.run_action(room_id, ActionKind::Paginate, |timeline| {
+                    paginate_task(timeline, flag)
+                })
+                .await;
+            }
+            Command::MarkRead {
+                room_id,
+                fully_read,
+            } => {
+                self.run_action(room_id, ActionKind::Receipt, |timeline| {
+                    mark_read_task(timeline, fully_read)
+                })
+                .await;
+            }
+            Command::SetTyping { room_id, typing } => {
+                self.run_action(room_id, ActionKind::Typing, |timeline| {
+                    typing_task(timeline, typing)
+                })
+                .await;
             }
             // Handled in `run`.
             Command::Shutdown => {}
@@ -1000,6 +1113,14 @@ impl Engine {
             .timeline()
             .await
             .map_err(|_| CoreError::Internal("could not open the room timeline".into()))?;
+        // Typing and receipts of the open room arrive through sliding sync
+        // only when the room is subscribed.
+        if let Some(sync) = active.sync.as_ref() {
+            sync.service
+                .room_list_service()
+                .set_room_subscriptions(&[&sdk_id])
+                .await;
+        }
         let (items, stream) = timeline.subscribe().await;
         let task = tokio::spawn(forward_timeline(
             room_id.clone(),
@@ -1008,12 +1129,27 @@ impl Engine {
             self.events.clone(),
             active.client.user_id().map(ToOwned::to_owned),
         ));
+        let timeline = Arc::new(timeline);
+        // Both forwarders live in the action set, so they end with the
+        // selection.
+        let mut tasks = JoinSet::new();
+        tasks.spawn(forward_pagination(
+            room_id.clone(),
+            timeline.clone(),
+            self.events.clone(),
+        ));
+        tasks.spawn(forward_typing(
+            room_id.clone(),
+            timeline.clone(),
+            self.events.clone(),
+        ));
         active.selected = Some(Selected {
             room_id,
-            timeline: Arc::new(timeline),
+            timeline,
             task,
-            tasks: JoinSet::new(),
+            tasks,
             members_synced: Arc::new(OnceCell::new()),
+            paginating: Arc::new(AtomicBool::new(false)),
         });
         Ok(())
     }
@@ -1782,50 +1918,53 @@ mod tests {
     }
 
     #[test]
-    fn every_new_command_names_its_room_and_action() {
-        let room = rid("a");
-        for (cmd, kind) in action_commands(&room) {
-            assert_eq!(command_action(&cmd), Some((room.clone(), kind)), "{cmd:?}");
-        }
-        assert_eq!(command_action(&Command::LoadMoreRooms), None);
-        assert_eq!(command_action(&Command::Logout), None);
+    fn pagination_runs_at_most_one_at_a_time() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let first = PaginationPermit::try_acquire(&flag).expect("free");
+        assert!(PaginationPermit::try_acquire(&flag).is_none(), "busy");
+        drop(first);
+        let again = PaginationPermit::try_acquire(&flag);
+        assert!(again.is_some(), "released on drop");
     }
 
     #[test]
-    fn unfinished_action_errors_follow_session_and_selection() {
-        let a = rid("a");
-        let b = rid("b");
+    fn sdk_pagination_status_maps_to_the_api_state() {
+        use matrix_sdk::event_cache::PaginationStatus as S;
         assert_eq!(
-            action_error(false, Some(&a), &a),
-            CoreError::NotLoggedIn,
-            "no session wins"
+            pagination_state(S::Idle {
+                hit_timeline_start: false
+            }),
+            PaginationState::Idle
         );
-        assert_eq!(action_error(true, None, &a), CoreError::NoRoomSelected);
-        assert_eq!(action_error(true, Some(&b), &a), CoreError::NoRoomSelected);
         assert_eq!(
-            action_error(true, Some(&a), &a),
-            CoreError::Internal("not implemented yet".into())
+            pagination_state(S::Idle {
+                hit_timeline_start: true
+            }),
+            PaginationState::ReachedStart
         );
+        assert_eq!(pagination_state(S::Paginating), PaginationState::Loading);
     }
 
     #[test]
-    fn unfinished_actions_with_a_matching_room_answer_not_implemented() {
-        let room = rid("a");
-        for (cmd, kind) in action_commands(&room) {
-            match unfinished_action_event(true, Some(&room), &cmd) {
-                Some(CoreEvent::ActionFailed {
-                    room_id,
-                    action,
-                    error,
-                }) => {
-                    assert_eq!(room_id, room);
-                    assert_eq!(action, kind);
-                    assert_eq!(error, CoreError::Internal("not implemented yet".into()));
-                }
-                other => panic!("{kind:?}: {other:?}"),
-            }
-        }
-        assert!(unfinished_action_event(true, Some(&room), &Command::Logout).is_none());
+    fn typing_users_take_names_from_members() {
+        let alice: OwnedUserId = "@alice:x".try_into().unwrap();
+        let bob: OwnedUserId = "@bob:x".try_into().unwrap();
+        let names = HashMap::from([(alice.clone(), "Alice".to_owned())]);
+        let users = typing_users(vec![alice, bob], &names);
+        assert_eq!(
+            users,
+            vec![
+                TypingUser {
+                    user_id: UserId::from("@alice:x"),
+                    name: Some("Alice".into())
+                },
+                TypingUser {
+                    user_id: UserId::from("@bob:x"),
+                    name: None
+                },
+            ]
+        );
+        assert!(typing_users(Vec::new(), &names).is_empty());
     }
 
     async fn drain(rx: &mut mpsc::Receiver<CoreEvent>) -> Vec<CoreEvent> {
