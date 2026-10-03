@@ -86,7 +86,7 @@ fn room_pane(app: &App) -> Element<'_, Message> {
         weight: Weight::Bold,
         ..Font::DEFAULT
     };
-    let lines = display_lines(&app.timeline).into_iter().map(|line| {
+    let lines = display_lines(&app.timeline.items).into_iter().map(|line| {
         row![text(line.sender).font(bold), text(line.body).width(Fill)]
             .spacing(8)
             .into()

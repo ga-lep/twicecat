@@ -8,6 +8,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use iced::theme;
+use iced::widget::{operation, scrollable};
 use iced::{Element, Subscription, Task, Theme, clipboard, system, window};
 use tessera_core::api::{
     Command, CoreError, CoreEvent, ListDiff, MessageText, Password, RoomId, RoomListQuery,
@@ -21,6 +22,7 @@ use crate::room_list;
 use crate::screens::login::{self, BrowserUrl, LoginForm};
 use crate::screens::{self, loading, main_view};
 use crate::text_safety;
+use crate::timeline::{self, Effects, TimelineView};
 
 /// How long to wait for the core to close after `Shutdown` (plan Q18).
 pub const SHUTDOWN_WAIT: Duration = Duration::from_secs(10);
@@ -125,6 +127,15 @@ pub enum Message {
         /// Height of the visible part, in pixels.
         viewport_h: f32,
     },
+    /// The pane measured a timeline row.
+    RowMeasured {
+        /// The item's ID.
+        id: String,
+        /// Its height in pixels.
+        height: f32,
+    },
+    /// The timeline scrolled, or its size changed.
+    TimelineScrolled(scrollable::Viewport),
     /// The user asked to close the window.
     CloseRequested,
     /// The core did not close in time after `Shutdown`.
@@ -164,7 +175,7 @@ pub struct App {
     /// The room whose timeline is open.
     pub selected: Option<RoomId>,
     /// The selected room's timeline, kept in step with the core's diffs.
-    pub timeline: Vec<TimelineItem>,
+    pub timeline: TimelineView,
     /// The signed-in account.
     pub user_id: Option<UserId>,
     /// The last sync state.
@@ -201,7 +212,7 @@ impl std::fmt::Debug for App {
         f.debug_struct("App")
             .field("screen", &self.screen)
             .field("rooms", &self.rooms.len())
-            .field("timeline", &self.timeline.len())
+            .field("timeline", &self.timeline)
             .field("selected", &self.selected)
             .field("login", &self.login)
             .field("login_in_flight", &self.login_in_flight)
@@ -233,7 +244,7 @@ impl App {
             load_more_at: None,
             avatars: Avatars::default(),
             selected: None,
-            timeline: Vec::new(),
+            timeline: TimelineView::default(),
             user_id: None,
             sync_state: SyncState::Idle,
             login: LoginForm::new(),
@@ -323,13 +334,23 @@ impl App {
                 Task::none()
             }
             Message::ComposerSubmitted => self.submit_composer(),
+            Message::RowMeasured { id, height } => {
+                let effects = self.timeline.row_measured(&id, height);
+                self.timeline_effects(effects)
+            }
+            Message::TimelineScrolled(viewport) => {
+                let bounds = viewport.bounds();
+                // The scrollable is anchored at the bottom, so its stored
+                // offset is the distance from the bottom edge.
+                self.on_timeline_scrolled(viewport.absolute_offset().y, bounds.height, bounds.width)
+            }
             Message::LogoutRequested => self.send(Command::Logout),
             Message::SelectRoom(id) => {
                 if !room_list::contains(&self.rooms, &id) {
                     return Task::none();
                 }
                 self.selected = Some(id.clone());
-                self.timeline.clear();
+                self.timeline.reset();
                 self.clear_draft();
                 self.send(Command::SelectRoom(id))
             }
@@ -455,7 +476,13 @@ impl App {
                 task = self.check_paging();
             }
             CoreEvent::TimelineDiff { room_id, diffs } => {
-                self.apply_timeline(&room_id, &diffs);
+                task = self.apply_timeline(&room_id, diffs);
+            }
+            CoreEvent::Pagination { room_id, state } => {
+                if self.selected.as_ref() == Some(&room_id) {
+                    let effects = self.timeline.pagination_changed(state);
+                    task = self.timeline_effects(effects);
+                }
             }
             CoreEvent::SendFailed { room_id, error } => {
                 if self.selected.as_ref() == Some(&room_id) {
@@ -464,9 +491,8 @@ impl App {
             }
             CoreEvent::Error(error) => task = self.on_core_error(&error),
             CoreEvent::Avatar { id, image } => self.avatars.answer(&id, image),
-            // Shown by the Phase 3 timeline and composer; ignored until then.
-            CoreEvent::Pagination { .. }
-            | CoreEvent::Typing { .. }
+            // Shown by the Phase 3 composer and pane; ignored until then.
+            CoreEvent::Typing { .. }
             | CoreEvent::Members { .. }
             | CoreEvent::ActionFailed { .. } => {}
         }
@@ -676,18 +702,56 @@ impl App {
 
     fn deselect(&mut self) {
         self.selected = None;
-        self.timeline.clear();
+        self.timeline.reset();
         self.clear_draft();
     }
 
     /// Applies timeline diffs of the selected room; other rooms are ignored.
-    fn apply_timeline(&mut self, room_id: &RoomId, diffs: &[ListDiff<TimelineItem>]) {
+    fn apply_timeline(
+        &mut self,
+        room_id: &RoomId,
+        diffs: Vec<ListDiff<TimelineItem>>,
+    ) -> Task<Message> {
         if self.selected.as_ref() != Some(room_id) {
-            return;
+            return Task::none();
         }
-        for diff in diffs {
-            diff.apply(&mut self.timeline);
+        let effects = self.timeline.apply_diffs(diffs);
+        self.timeline_effects(effects)
+    }
+
+    /// The timeline scrolled to `offset_from_bottom` pixels from the bottom
+    /// in a viewport of `viewport_h` by `width` pixels.
+    pub fn on_timeline_scrolled(
+        &mut self,
+        offset_from_bottom: f32,
+        viewport_h: f32,
+        width: f32,
+    ) -> Task<Message> {
+        let effects = self
+            .timeline
+            .scrolled(offset_from_bottom, viewport_h, width);
+        self.timeline_effects(effects)
+    }
+
+    /// Turns what the timeline model asks for into a scroll task and a
+    /// `PaginateBackwards` command (plan Q14, Q16).
+    fn timeline_effects(&mut self, effects: Effects) -> Task<Message> {
+        let mut tasks = Vec::new();
+        if let Some(y) = effects.scroll_to {
+            tasks.push(operation::scroll_to(
+                timeline::TIMELINE_ID,
+                scrollable::AbsoluteOffset {
+                    x: None,
+                    y: Some(y),
+                },
+            ));
         }
+        if effects.paginate
+            && let Some(room_id) = self.selected.clone()
+        {
+            tasks.push(self.send(Command::PaginateBackwards { room_id }));
+        }
+        Task::batch(tasks)
     }
 
     /// The window content.
