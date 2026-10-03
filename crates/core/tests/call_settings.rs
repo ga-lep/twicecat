@@ -9,7 +9,8 @@ use std::sync::Arc;
 use common::{expect_event, start_core, start_core_with_audio};
 use tessera_core::CoreHandle;
 use tessera_core::api::{
-    AudioSettings, CallIntent, Command, CoreError, CoreEvent, InputMode, RoomId, UserId,
+    AudioSettings, CallIntent, Command, CoreError, CoreEvent, InputMode, PushToTalkBindings,
+    RoomId, UserId,
 };
 use tessera_core::paths::DataPaths;
 use tessera_core::secrets::InMemorySecretStore;
@@ -47,6 +48,10 @@ async fn update_is_validated_saved_and_survives_a_restart() {
             release_delay_ms: 99_999,
         },
         voice_bitrate_kbps: 96,
+        push_to_talk: PushToTalkBindings {
+            key: Some("ctrl+shift+KeyT".into()),
+            gamepad_button: Some("left_thumb".into()),
+        },
         ..AudioSettings::default()
     };
     send(&handle, Command::UpdateAudioSettings(wanted.clone())).await;

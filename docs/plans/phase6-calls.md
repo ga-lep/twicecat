@@ -134,7 +134,7 @@ As built in Task 3 (`crates/core/src/api/call.rs`, commands and events in `api/m
 - **`AudioSettings`** (also the `call_settings.json` format, versioned wrapper, atomic write, 0o600):
   - `input_device` and `output_device` (`None` follows the system default);
   - `processing { echo_cancellation, noise_suppression: Off | WebRtc { level } | RnNoise | DeepFilter { attenuation_limit_db }, auto_gain, high_pass }`;
-  - `input_mode: VoiceActivity { automatic, threshold_db } | PushToTalk { release_delay_ms }`;
+  - `input_mode: VoiceActivity { automatic, threshold_db } | PushToTalk { release_delay_ms }`, and `push_to_talk { key, gamepad_button }` (Task 11);
   - `input_gain_db`, `output_volume_percent`, `voice_bitrate_kbps` (default 64), and `user_volumes`.
 
   `validated()` clamps every field (`api::limits`).
@@ -267,7 +267,16 @@ Each task follows the full Phase 1 gate: fmt, clippy -D warnings, tests, `check-
    - **Voice rooms:** `RoomSummary.is_call_room` for MSC3417 rooms (`org.matrix.msc3417.call` room type, the SDK's `Room::is_call`); `ActiveCall { participants }` counts the devices in every room's call while syncing (re-counted every 2 s, as memberships expire without an event).
    - API additions for approval: `IncomingCall.ring`, `CoreEvent::CallDeclined`, `RoomSummary.is_call_room`.
    - Integration tests (`tests/call_ringing.rs`): a DM call rings carol, answering stops it and counts 2; declining stops it and tells alice, a second decline is refused; a group call notifies quietly and stops when it ends; an MSC3417 room is marked.
-11. **Push-to-talk service** (`tessera-ptt`). Backends: `global-hotkey` on X11/Windows/macOS, the xdg-desktop-portal GlobalShortcuts backend (`ashpd`) on KDE/GNOME Wayland, a gamepad-button source (`gilrs`; Steam Frame and Steam Deck controllers via Steam Input), and the in-window key the app forwards (gamescope game mode). The binding is part of the settings. Unit tests cover the press/release state machine, merging several sources (any held means transmit), and the release tail. Real hotkeys and controllers are human items.
+11. **Push-to-talk service** (`tessera-ptt`, as built; global-hotkey 0.8.0, ashpd 0.13.13, gilrs 0.11.2 read in the registry).
+   - **Sources, merged** (any held means transmit; transitions only on change): a global keyboard shortcut, a gamepad button on any pad (a pad that disconnects lets go), and the bound key in Tessera's own window, which the app forwards (`PttService::window_key`). The release tail stays the audio gate's (`release_delay_ms`), so releases are reported at once. Dropping the service lets go.
+   - **Keyboard mechanism per session** (`KeyboardBackend::detect`): gamescope (SteamOS game mode) → window key only; Wayland (`WAYLAND_DISPLAY` or `XDG_SESSION_TYPE=wayland`) → the GlobalShortcuts portal; X11 (`DISPLAY`) → global-hotkey; Windows and macOS → global-hotkey.
+   - **global-hotkey:** the key is grabbed (other applications stop receiving it while it is bound); release is polled every 50 ms on X11 and Windows; the manager must be created on the main thread (macOS) or the event-loop thread (Windows), so the service is started and dropped there. Supports one key plus modifiers; no modifier-only or mouse-button bindings.
+   - **Portal:** registers the host app ID `io.github.ga_lep.Tessera` (`register_host_app`, best effort), creates a session, binds `push-to-talk` with a preferred trigger in the XDG shortcuts format (`CTRL+SHIFT+t`; the compositor may let the user change it), and maps `Activated`/`Deactivated` to press and release. The confirmed trigger is reported (`PttEvent::Ready`).
+   - **Settings:** `AudioSettings.push_to_talk { key, gamepad_button }`, strings in global-hotkey syntax (`ctrl+shift+KeyT`) and by button position (`left_thumb`); the core only checks they are short printable ASCII. API addition for approval.
+   - **Probe:** `cargo run -p tessera-ptt --example ptt_probe -- --key <binding> --button <name>` prints transitions, for the human checks on real desktops (keys on Linux; gamepads everywhere).
+   - **Not in this task:** the app starting the service from the settings and forwarding `Transmit` comes with the call UI (the app has no call yet); the CLI's `/ptt` is Task 12.
+   - Unit tests: merging and transitions, pads and disconnects, binding parsing and portal triggers, the session table, the window-key service end to end and its release on drop, settings validation and persistence.
+
 12. **CLI.** `/call`, `/leave`, `/mute`, `/deafen`, `/ptt` (hold-to-talk through a terminal key is limited; documented), `/devices`, `/input`, `/output`, `/ns`, `/aec`, `/agc`, `/gate`, `/vol <user> <pct>` and `/mictest`. CLI integration test: join, then leave.
 
 13. **DeepFilterNet3 via tract-onnx.**

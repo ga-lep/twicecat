@@ -226,6 +226,18 @@ pub enum InputMode {
     },
 }
 
+/// What push-to-talk listens to. The strings are parsed by `tessera-ptt`
+/// (the core only stores them); kept when the input mode changes.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PushToTalkBindings {
+    /// Global keyboard shortcut in global-hotkey syntax: modifiers, then one
+    /// key (`ctrl+shift+KeyT`, `F13`).
+    pub key: Option<String>,
+    /// Gamepad button by position (`south`, `left_thumb`, `right_trigger2`).
+    pub gamepad_button: Option<String>,
+}
+
 /// All persistent audio settings. Send the whole value with
 /// `Command::UpdateAudioSettings`; the core validates it (see
 /// [`AudioSettings::validated`]) and echoes the effective value back as
@@ -241,6 +253,8 @@ pub struct AudioSettings {
     pub processing: AudioProcessing,
     /// Voice activity or push-to-talk.
     pub input_mode: InputMode,
+    /// Push-to-talk key and gamepad button.
+    pub push_to_talk: PushToTalkBindings,
     /// Gain after processing, in dB (-20..=20).
     pub input_gain_db: f32,
     /// Master playback volume, percent (0..=200).
@@ -261,6 +275,7 @@ impl Default for AudioSettings {
                 automatic: true,
                 threshold_db: -50.0,
             },
+            push_to_talk: PushToTalkBindings::default(),
             input_gain_db: 0.0,
             output_volume_percent: 100,
             // Opus voice is near-transparent here; Discord's default is 64.
@@ -284,6 +299,8 @@ pub mod limits {
     pub const VOICE_BITRATE_KBPS: (u16, u16) = (16, 510);
     /// `NoiseSuppression::DeepFilter::attenuation_limit_db`.
     pub const DF_ATTENUATION_DB: (f32, f32) = (0.0, 100.0);
+    /// Length of a push-to-talk binding string, bytes.
+    pub const PTT_BINDING_LEN: usize = 64;
 }
 
 /// Clamps `v` into `range`; NaN becomes `fallback`.
@@ -325,6 +342,19 @@ impl AudioSettings {
             }
             InputMode::PushToTalk { release_delay_ms } => {
                 *release_delay_ms = (*release_delay_ms).min(limits::PTT_RELEASE_DELAY_MS);
+            }
+        }
+        // Bindings are short ASCII names; anything else is dropped.
+        for binding in [
+            &mut self.push_to_talk.key,
+            &mut self.push_to_talk.gamepad_button,
+        ] {
+            if binding.as_ref().is_some_and(|b| {
+                b.is_empty()
+                    || b.len() > limits::PTT_BINDING_LEN
+                    || !b.bytes().all(|c| c.is_ascii_graphic())
+            }) {
+                *binding = None;
             }
         }
         if let NoiseSuppression::DeepFilter {
@@ -421,6 +451,37 @@ mod tests {
     }
 
     #[test]
+    fn validated_drops_malformed_push_to_talk_bindings() {
+        let keep = PushToTalkBindings {
+            key: Some("ctrl+shift+KeyT".into()),
+            gamepad_button: Some("left_thumb".into()),
+        };
+        let s = AudioSettings {
+            push_to_talk: keep.clone(),
+            ..AudioSettings::default()
+        };
+        assert_eq!(s.validated().push_to_talk, keep, "valid bindings stay");
+        for bad in ["", "ctrl+ KeyT", "ctrl+\u{202e}KeyT", &"F".repeat(65)] {
+            let s = AudioSettings {
+                push_to_talk: PushToTalkBindings {
+                    key: Some(bad.to_owned()),
+                    gamepad_button: Some(bad.to_owned()),
+                },
+                ..AudioSettings::default()
+            }
+            .validated();
+            assert_eq!(s.push_to_talk, PushToTalkBindings::default(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn settings_without_bindings_still_load() {
+        let old = serde_json::json!({ "input_mode": { "kind": "push_to_talk", "release_delay_ms": 200 } });
+        let s: AudioSettings = serde_json::from_value(old).unwrap();
+        assert_eq!(s.push_to_talk, PushToTalkBindings::default());
+    }
+
+    #[test]
     fn validated_replaces_nan() {
         let s = AudioSettings {
             input_gain_db: f32::NAN,
@@ -456,6 +517,7 @@ mod tests {
                     "high_pass": true,
                 },
                 "input_mode": { "kind": "voice_activity", "automatic": true, "threshold_db": -50.0 },
+                "push_to_talk": { "key": null, "gamepad_button": null },
                 "input_gain_db": 0.0,
                 "output_volume_percent": 100,
                 "voice_bitrate_kbps": 64,
