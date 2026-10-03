@@ -150,7 +150,7 @@ As built in Task 3 (`crates/core/src/api/call.rs`, commands and events in `api/m
 - **Voice rooms:** an MSC3417 call room (room type `org.matrix.msc3417.call`), or any room with an active session, can be joined like a Discord channel. Creating such a room waits for the room-creation phase (Phase 5).
 
 ## Tasks (one `feat` commit each with a `Step: phase6.<n>` trailer, gated as in Phase 1)
-Order (revised 2026-10-02, decision 12): 1–8, 8b, 9, 10, 11, 12, 14, 15, then 13.
+Order (revised 2026-10-02, decision 12; again 2026-10-03 by the human): 1–8, 8b, 9, 10, 11, 12, 14, 13, then 15 and 13b.
 
 Each task follows the full Phase 1 gate: fmt, clippy -D warnings, tests, `check-app-deps.sh`, `check-core-api.sh`, `cargo deny check`, and the ignored homeserver run, which from task 2 also needs the SFU stack.
 
@@ -274,7 +274,17 @@ Each task follows the full Phase 1 gate: fmt, clippy -D warnings, tests, `check-
    - `scripts/fetch-models.sh` fetches the DeepFilterNet3 ONNX export, pinned by SHA-256 like libwebrtc, with the MIT/Apache licence recorded.
    - `tessera-audio` implements the DF3 pipeline: STFT (960/480 at 48 kHz), ERB and complex features with the normalisation, the encoder/ERB-decoder/DF-decoder graphs in tract, ERB gain application, the deep-filter stage, and ISTFT with an overlap-add hop of 480. The math is studied from upstream libDF (MIT/Apache), not copied wholesale; any copied block keeps its licence header.
    - Exposed as `NoiseSuppression::DeepFilter { attenuation_limit_db }`.
+   - **Pluggable enhancer** (added 2026-10-03, for Task 13b): the noise-suppression stage sits behind one trait (`process(&mut [f32; 480])`, a reported per-frame cost, a fallback), so a GPU or vendor backend slots in without touching the chain. RNNoise, WebRTC NS and DeepFilterNet on the CPU are the first implementations.
+   - **Already-processed inputs** (added 2026-10-03): an input that is known to be processed already (NVIDIA Broadcast's virtual microphone on Windows, matched by device name) skips our noise suppression by default, so the voice is not cleaned twice. Whether AEC3 stays on for it is decided by ear (human item).
    - Tests: the model loads; output on speech plus noise improves SNR by at least the RNNoise result on the same fixture; the per-frame cost is recorded on x86_64 and aarch64; the fallback is RNNoise if the model files are missing.
+
+13b. **GPU speech enhancement, opt-in** (added 2026-10-03, human request: "like NVIDIA Broadcast", optional, depending on hardware).
+   - **Off by default; offered only when the hardware is there.** A capability probe at start lists the usable GPU backends; the setting is hidden without one. The CPU path stays the default everywhere, and the Steam Frame never uses the GPU (the VR game owns it).
+   - **Vendor-neutral path:** run the Task 13 models (DeepFilterNet3, and heavier ones the CPU cannot afford: dereverberation, speech restoration) through ONNX Runtime with the CUDA/TensorRT execution provider on NVIDIA, DirectML on Windows, and ROCm/MIGraphX on AMD where available. This needs a new dependency (the `ort` crate and the ONNX Runtime library, its supply chain pinned like libwebrtc); **to be approved before the task starts** (rule 3).
+   - **NVIDIA Maxine Audio Effects, Windows only, later:** the SDK behind NVIDIA Broadcast (denoise, dereverb, AEC, studio voice on RTX Tensor Cores). It is free on Windows; on Linux it is only available to NVIDIA AI Enterprise customers and meant for servers, so we cannot ship it there. Loaded at run time if the user has NVIDIA's runtime installed, behind a cargo feature and the setting; never bundled. Its licence and redistribution terms are checked before any code.
+   - **Real-time rules:** the GPU call runs on the processing thread with a deadline (well under 10 ms); a missed deadline, a lost device or a driver error falls back to the CPU backend for the rest of the call and reports why. Incoming streams (cleaning other members' voices, one stream each) can be batched into one GPU call, where the GPU pays off most.
+   - **Tests:** the probe and fallback logic as unit tests with a fake backend; SNR and per-frame latency on the same fixture as Task 13, recorded per backend; the GPU runs are human items (no GPU in CI).
+   - **Frame analogue (research only):** Qualcomm's NPU through QNN instead of the GPU; recorded under Task 15, not planned.
 
 14. **Own PipeWire client on Linux** (decision 12; replaces cpal there).
    - A `pw_stream` per direction on the `pipewire` crate (`=0.10.1`, MIT, already in the tree through cpal), driven by PipeWire's real-time data loop. The callbacks only move samples through the existing rings; the processing thread stays as it is (sonora allocates per frame, so no DSP in the RT callback).
@@ -288,6 +298,7 @@ Each task follows the full Phase 1 gate: fmt, clippy -D warnings, tests, `check-
    - Frame defaults from the measurements: RNNoise (DeepFilterNet opt-in), AEC3 on, 10 ms buffers, Opus at 32 kb/s with DTX; a "low power" profile if the budget is not met.
    - Real-time priority for the processing thread through rtkit (D-Bus, also inside Flatpak), with a fallback to normal priority and a reported reason.
    - Human check on the device: desktop and game mode, a standalone VR game running, CPU and battery during a call, crackles under load.
+   - Research note (added 2026-10-03, not planned): the Frame's counterpart to Task 13b is Qualcomm's NPU through QNN rather than the GPU, which the VR game owns. Worth measuring only if DeepFilterNet on the CPU does not fit the budget.
 
 ## Dependencies (approved 2026-10-02, newest releases, exact pins)
 | Crate | Version | Licence | Used by | Added in task |
@@ -323,6 +334,7 @@ Recorded so the reasoning is not lost; none is planned.
 - [ ] Cross-homeserver call (Task 8b): members on two homeservers with their own call services hear each other (the subscribe-only token path for a non-full-access homeserver cannot be exercised with the single local Synapse).
 - [ ] Double talk by ear: talking while others talk, on open speakers and headphones. In a virtual test without any echo path, AEC3 cut a member's microphone to near silence while loud audio played on their speakers (Task 8b notes).
 - [ ] Ringing (Task 10) with Element Web and Element X, both directions: a DM call rings and shows the caller, a group call notifies quietly, declining on one side stops the ring on the other, answering on another device stops it here.
+- [ ] GPU enhancement (Task 13b): each offered backend on real hardware (NVIDIA, and AMD where available), by ear and with the recorded latency; the fallback when the GPU is busy with a game; NVIDIA Broadcast's microphone detected on Windows (Task 13).
 - [ ] Global PTT hotkey on X11, Wayland (KDE/GNOME portal), Windows and macOS; gamepad PTT.
 - [ ] Steam Frame: aarch64 build runs on the device (desktop mode and game mode); built-in mic and speakers with AEC; game audio cancelled with the system-mix reference (Task 14); PipeWire device switching; CPU/battery cost of each NS mode within the Task 15 budget while a standalone VR game runs; rtkit real-time priority granted.
 - [ ] CLI call against a real account; leave by crash (kill -9) clears the membership within the delayed-event timeout.

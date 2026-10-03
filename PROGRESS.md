@@ -1175,7 +1175,7 @@ Phase 2 signed off by the human on 2026-10-02 (merge of PR #3). Every other unti
 - Fix round (phase4.10): on close, exit now waits until the clipboard read has been answered and the clear write issued (`flushes_pending`, `core_closed`, `App::exit_if_flushed`); `ShutdownDeadline` still exits at once. The restore field is emptied on **Back** and whenever `on_status` closes the Restore screen. Tests first (both failed before the code).
 
 ## Phase 6 steps (calls: MatrixRTC, LiveKit SFU, native audio; plan docs/plans/phase6-calls.md)
-Order (revised 2026-10-02, plan decision 12): 1–8, 8b, 9, 10, 11, 12, 14, 15, then 13. Deferred options (audio-only libwebrtc build, pure-Rust WebRTC stack, PulseAudio backend) are recorded in the plan.
+Order (revised 2026-10-02, plan decision 12; again 2026-10-03 by the human): 1–8, 8b, 9, 10, 11, 12, 14, 13, then 15 and 13b. Deferred options (audio-only libwebrtc build, pure-Rust WebRTC stack, PulseAudio backend) are recorded in the plan.
 - [x] 1. libwebrtc supply chain (pinned SHA-256 fetch script, fail-closed build) and livekit dependency (phase6.1)
 - [x] 2. Local SFU stack (LiveKit server, lk-jwt-service, Synapse MatrixRTC config)
 - [x] 3. Call API contract and settings persistence
@@ -1189,7 +1189,8 @@ Order (revised 2026-10-02, plan decision 12): 1–8, 8b, 9, 10, 11, 12, 14, 15, 
 - [x] 10. Ringing and voice rooms (MSC4075 notifications, MSC4310 declines, call counts, MSC3417 rooms)
 - [ ] 11. Push-to-talk service (global-hotkey, portal, gamepad, in-window)
 - [ ] 12. CLI call commands
-- [ ] 13. DeepFilterNet3 via tract-onnx (after 14 and 15)
+- [ ] 13. DeepFilterNet3 via tract-onnx, pluggable enhancer, already-processed inputs (after 14)
+- [ ] 13b. GPU speech enhancement, opt-in (ONNX Runtime GPU providers; NVIDIA Maxine on Windows later; new dependency to be approved)
 - [ ] 14. Own PipeWire client on Linux (communication role, latency, registry events, system-mix echo reference)
 - [ ] 15. Steam Frame performance (CPU budget per mode, Frame defaults, rtkit priority)
 
@@ -1343,6 +1344,7 @@ Order (revised 2026-10-02, plan decision 12): 1–8, 8b, 9, 10, 11, 12, 14, 15, 
 - [ ] Cross-homeserver call (Task 8b): members on two homeservers with their own call services hear each other. The subscribe-only token path for a non-full-access homeserver cannot be exercised with the single local Synapse.
 - [ ] Double talk by ear: talking while others talk, on open speakers and headphones (AEC3 cut a member's microphone to near silence in a virtual test while loud audio played on their speakers; Task 8b notes).
 - [ ] Ringing (Task 10) with Element Web and Element X, both directions: a DM call rings and shows the caller, a group call notifies quietly, declining on one side stops the ring on the other, answering on another device stops it here.
+- [ ] GPU enhancement (Task 13b): each offered backend on real hardware (NVIDIA, and AMD where available), by ear and with the recorded latency; the fallback when the GPU is busy with a game; NVIDIA Broadcast's microphone detected on Windows (Task 13).
 - [ ] Global PTT hotkey on X11, Wayland (KDE/GNOME portal), Windows and macOS; gamepad PTT.
 - [ ] Steam Frame: aarch64 build runs on the device (desktop mode and game mode); built-in mic and speakers with AEC; game audio cancelled with the system-mix reference (Task 14); PipeWire device switching; CPU/battery cost of each NS mode within the Task 15 budget while a standalone VR game runs; rtkit real-time priority granted.
 - [ ] CLI call against a real account; leave by crash (kill -9) clears the membership within the delayed-event timeout.
