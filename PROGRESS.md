@@ -1188,7 +1188,7 @@ Order (revised 2026-10-02, plan decision 12; again 2026-10-03 by the human): 1â€
 - [x] 9. Call E2EE (per-sender keys over to-device)
 - [x] 10. Ringing and voice rooms (MSC4075 notifications, MSC4310 declines, call counts, MSC3417 rooms)
 - [x] 11. Push-to-talk service (global-hotkey, portal, gamepad, in-window)
-- [ ] 12. CLI call commands
+- [x] 12. CLI call commands
 - [ ] 13. DeepFilterNet3 via tract-onnx, pluggable enhancer, already-processed inputs (after 14)
 - [ ] 13b. GPU speech enhancement, opt-in (ONNX Runtime GPU providers; NVIDIA Maxine on Windows later; new dependency to be approved)
 - [ ] 14. Own PipeWire client on Linux (communication role, latency, registry events, system-mix echo reference)
@@ -1337,6 +1337,14 @@ Order (revised 2026-10-02, plan decision 12; again 2026-10-03 by the human): 1â€
 - Not in this task: the app starting the service from the settings and forwarding `Transmit` comes with the call UI; the CLI's `/ptt` is Task 12. The agent did not run the probe: binding a global key or opening the portal dialog on the human's desktop is a human check.
 - New human items: the probe on X11, KDE/GNOME Wayland and SteamOS (folded into the PTT item).
 
+## Phase 6 / Task 12 notes
+- Checks run (all pass): `cargo fmt --all --check`; `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`; `cargo test --workspace --locked` (455 passed, 0 failed, per binary); `scripts/check-app-deps.sh` (and `livekit`); `scripts/check-core-api.sh`; `scripts/check-no-webrtc-download.sh`; `cargo deny check`; against a recreated stack, `cargo test -p tessera-core -p tessera-app --locked -- --ignored --skip keyring --skip hardware_`: 33/33 (cli 2).
+- Built: `crates/core/src/bin/tessera-cli/calls.rs` (parser, settings edits, call state and messages; a module of the CLI binary, kept in a subdirectory so Cargo does not take it for a second binary), the call commands and `--silent-audio` in `tessera-cli.rs`, and the CLI now asks for the audio settings at start. The source check in `tests/cli.rs` covers both files.
+- Tests: 8 unit tests in `calls.rs` and the parser flag test; `tests/cli.rs::cli_joins_mutes_and_leaves_a_call` against the local stack: login, `/leave` refused outside a call, `/call <room ID>`, connected "(not encrypted)", `/mute`, `/who` lists us as `[you, muted]`, `/leave`, `/quit`, and no non-empty `call.member` state is left in the room. Mutations, failing as expected and reverted: `Left` not clearing the call (a unit test fails); calling a room ID not in the list yet refused (the new unit test fails; the integration test waits for the room in `/rooms`, so it does not cover this).
+- Found while testing: (1) a `/call` right after login, before the sync knows the room, fails with "unknown room"; the test waits for `/rooms` to list the room, and a user sees the reason printed. (2) libwebrtc prints `VAAPI is supported.` to stdout when a call starts (its video stack probes VA-API); it shows up in the CLI's output and cannot be silenced from our side (recorded, harmless).
+- Limitations: `/ptt` toggles (no key-release events in a terminal); device and processing changes apply at the next call or mic test (Task 8 open issue); `/vol` takes a `/who` index or a full user ID.
+- New human items: the CLI call steps folded into the existing CLI item.
+
 ## Phase 6 known limitations
 - Denormal guard (decision 7, human-approved 2026-10-02, pre-production): `crates/audio/src/denormals.rs` is the one audited `unsafe` function. It sets FTZ/DAZ (x86_64) or FZ (aarch64) on the audio processing thread, because sonora 0.2.0 AEC3 slows down on a silent far end after speech (upstream issue #34; measured 5.5Ã— here, see Task 5). Remove it once a sonora release with upstream PR #38 ships (version bump asked first, rule 3).
 - sonora 0.2.0 allocates about 40 times per 10 ms frame in AEC3 (upstream #39/#40). The processing thread is not a device callback, so this is tolerable, but not real-time clean until upstream ships the fix.
@@ -1357,4 +1365,4 @@ Order (revised 2026-10-02, plan decision 12; again 2026-10-03 by the human): 1â€
 - [ ] GPU enhancement (Task 13b): each offered backend on real hardware (NVIDIA, and AMD where available), by ear and with the recorded latency; the fallback when the GPU is busy with a game; NVIDIA Broadcast's microphone detected on Windows (Task 13).
 - [ ] Global PTT hotkey on X11, Wayland (KDE/GNOME portal), Windows and macOS; gamepad PTT. On Linux: `cargo run -p tessera-ptt --example ptt_probe -- --key ctrl+shift+KeyT --button left_thumb` prints `Transmit(true)`/`Transmit(false)` while the key or button is held; on Wayland the portal's dialog appears once and the confirmed key is printed (`Ready`); on SteamOS (desktop and game mode) the Steam Input pad works. Windows and macOS keys are checked once the app starts the service (call UI).
 - [ ] Steam Frame: aarch64 build runs on the device (desktop mode and game mode); built-in mic and speakers with AEC; game audio cancelled with the system-mix reference (Task 14); PipeWire device switching; CPU/battery cost of each NS mode within the Task 15 budget while a standalone VR game runs; rtkit real-time priority granted.
-- [ ] CLI call against a real account; leave by crash (kill -9) clears the membership within the delayed-event timeout.
+- [ ] CLI call against a real account (`tessera-cli`, then `/rooms`, `/call <n>`, `/who`, `/mute`, `/leave`; Element users hear you and you hear them); leave by crash (kill -9) clears the membership within the delayed-event timeout; `/mictest loopback` sounds right on headphones.

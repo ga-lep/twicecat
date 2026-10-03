@@ -277,7 +277,12 @@ Each task follows the full Phase 1 gate: fmt, clippy -D warnings, tests, `check-
    - **Not in this task:** the app starting the service from the settings and forwarding `Transmit` comes with the call UI (the app has no call yet); the CLI's `/ptt` is Task 12.
    - Unit tests: merging and transitions, pads and disconnects, binding parsing and portal triggers, the session table, the window-key service end to end and its release on drop, settings validation and persistence.
 
-12. **CLI.** `/call`, `/leave`, `/mute`, `/deafen`, `/ptt` (hold-to-talk through a terminal key is limited; documented), `/devices`, `/input`, `/output`, `/ns`, `/aec`, `/agc`, `/gate`, `/vol <user> <pct>` and `/mictest`. CLI integration test: join, then leave.
+12. **CLI** (as built; `crates/core/src/bin/tessera-cli/calls.rs`, only the public core API).
+   - **Calls:** `/call [n|id]` (the open room, a `/rooms` index, any room ID, or the last ring), `/leave`, `/decline [n|id]`, `/who` (participants with you/muted/speaking/volume), `/mute` and `/deafen` (`on|off`, toggle without), `/vol <n|@user> <percent>`, `/ptt [on|off]`. A terminal sees key presses but not releases, so `/ptt` toggles transmitting instead of holding (the global hotkeys of Task 11 need the app).
+   - **Audio settings:** `/audio` (summary), `/devices`, `/input <n|default>`, `/output <n|default>`, `/ns off|rnnoise|webrtc [level]|deepfilter [dB]`, `/aec`, `/agc`, `/gate auto|<dB>|ptt [ms]`, `/mictest [loopback|stop]` (a level line every second). Each edit sends the whole settings value; the core's echo is printed.
+   - **Shown as it happens:** joining, connected (encrypted or not), reconnecting, left or failed; others joining and leaving; incoming rings and quiet call notifications, ringing stopped, declines; `/rooms` marks voice rooms and the number of devices in each room's call. Names, devices and reasons go through the CLI's control-character filter.
+   - `--silent-audio` runs calls on silent virtual devices (tests, scripts); without it a call opens the system microphone and speakers.
+   - Tests: the parser, settings edits, devices, the in-call state, push-to-talk and rings as unit tests (`calls.rs`); `tests/cli.rs` joins a call from the CLI against the local stack, mutes (and sees itself muted in `/who`), leaves, quits, and checks that the membership is gone.
 
 13. **DeepFilterNet3 via tract-onnx.**
    - `scripts/fetch-models.sh` fetches the DeepFilterNet3 ONNX export, pinned by SHA-256 like libwebrtc, with the MIT/Apache licence recorded.

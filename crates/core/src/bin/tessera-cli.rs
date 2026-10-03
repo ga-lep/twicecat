@@ -4,6 +4,9 @@
 //! Message bodies are printed to stdout because that is the program's output;
 //! nothing here sends a token, password, or message body to the log.
 
+#[path = "tessera-cli/calls.rs"]
+mod calls;
+
 use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -12,8 +15,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tessera_core::api::{
-    Command, CoreEvent, ListDiff, MessageText, Password, RoomId, RoomSummary, SecurityStatus,
-    SyncState, TimelineItem, TimelineItemKind,
+    AUDIO_FRAME_LEN, AudioBackend, Command, CoreEvent, ListDiff, MessageText, Password, RoomId,
+    RoomSummary, SecurityStatus, SyncState, TimelineItem, TimelineItemKind, VirtualAudio,
 };
 use tessera_core::logging;
 use tessera_core::paths::DataPaths;
@@ -28,6 +31,7 @@ tessera-cli: headless Matrix client on the Tessera core
 
 USAGE:
     tessera-cli [--data-dir <path> | --ephemeral] [--homeserver <url>] [--password-stdin]
+                [--silent-audio]
 
 OPTIONS:
     --data-dir <path>     Store session data here (default: the OS data directory;
@@ -42,6 +46,8 @@ OPTIONS:
                           prompting on the terminal. If stdin is a terminal the
                           password is echoed; the CLI warns about that. Use it
                           only with piped input.
+    --silent-audio        Calls send silence and play nothing; the microphone
+                          and speakers are never opened (tests, scripts)
     --help                Show this help
 
 COMMANDS (type them at the prompt):
@@ -52,6 +58,35 @@ COMMANDS (type them at the prompt):
     /send <text>          Send a message to the open room
     /logout               Log out and delete the stored session
     /quit                 Shut down
+
+CALLS (voice, MatrixRTC; joining opens the microphone and speakers):
+    /call [n|id]          Join the call in the open room (or the given one, or
+                          answer the last ring)
+    /leave                Hang up
+    /decline [n|id]       Decline the ring (the last one by default)
+    /who                  List the call's participants
+    /mute [on|off]        Mute the microphone (toggles without an argument)
+    /deafen [on|off]      Hear nothing and mute the microphone
+    /ptt [on|off]         In push-to-talk mode, start or stop transmitting.
+                          A terminal cannot see a key being released, so this
+                          toggles instead of holding
+    /vol <n|user> <pct>   Playback volume of a participant (0-200 %, kept)
+
+AUDIO SETTINGS (saved; take effect at the next call or mic test):
+    /audio                Show the audio settings
+    /devices              List microphones and speakers
+    /input <n|default>    Choose the microphone (index from /devices)
+    /output <n|default>   Choose the speakers
+    /ns off|rnnoise|webrtc [low|moderate|high|very_high]|deepfilter [dB]
+                          Noise suppression
+    /aec [on|off]         Echo cancellation
+    /agc [on|off]         Automatic gain
+    /gate auto|<dB>|ptt [ms]
+                          Voice activity (automatic or above a level in dBFS),
+                          or push-to-talk with a release tail in ms
+    /mictest [loopback|stop]
+                          Test the microphone: levels every second, and with
+                          loopback hear yourself
 
 LOGGING:
     Logs go to stderr; the default filter is `warn,tessera_core=info`.
@@ -64,8 +99,8 @@ A login that is cancelled or aborted during OAuth may leave a session on the
 server; revoke stray sessions from your account settings.
 ";
 
-const REPL_HINT: &str =
-    "Commands: /login /oauth <server> /rooms /select <n|id> /send <text> /logout /quit";
+const REPL_HINT: &str = "Commands: /login /oauth <server> /rooms /select <n|id> /send <text> \
+     /logout /quit; calls: /call /leave /mute /deafen /ptt /who /audio (see --help)";
 
 const START_FAILED_HINT: &str =
     "Could not restore or start a session. Use /login to log in, or /quit to exit.";
@@ -82,6 +117,7 @@ struct Options {
     homeserver: Option<String>,
     ephemeral: bool,
     password_stdin: bool,
+    silent_audio: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -90,7 +126,7 @@ enum Parsed {
     Help,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 enum Repl {
     Login,
     OAuth(String),
@@ -99,6 +135,8 @@ enum Repl {
     Send(String),
     Logout,
     Quit,
+    /// A call or audio command, or its usage when the arguments are wrong.
+    Call(Result<calls::CallCmd, &'static str>),
     Unknown(String),
     Text(String),
 }
@@ -109,6 +147,7 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
         homeserver: None,
         ephemeral: false,
         password_stdin: false,
+        silent_audio: false,
     };
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -116,6 +155,7 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
             "--help" | "-h" => return Ok(Parsed::Help),
             "--ephemeral" => options.ephemeral = true,
             "--password-stdin" => options.password_stdin = true,
+            "--silent-audio" => options.silent_audio = true,
             "--data-dir" => {
                 let value = iter.next().ok_or("--data-dir needs a path")?;
                 options.data_dir = Some(value.clone());
@@ -149,7 +189,10 @@ fn parse_repl(line: &str) -> Repl {
         "oauth" if !arg.trim().is_empty() => Repl::OAuth(arg.trim().to_owned()),
         "select" if !arg.trim().is_empty() => Repl::Select(arg.trim().to_owned()),
         "send" if !arg.is_empty() => Repl::Send(arg.to_owned()),
-        _ => Repl::Unknown(format!("/{name}")),
+        _ => match calls::parse(name, arg) {
+            Some(parsed) => Repl::Call(parsed),
+            None => Repl::Unknown(format!("/{name}")),
+        },
     }
 }
 
@@ -378,6 +421,7 @@ struct Cli {
     selected: Option<Selected>,
     timeline: Vec<TimelineItem>,
     printed: HashSet<String>,
+    calls: calls::Calls,
 }
 
 /// What the loop should do after handling one input.
@@ -388,14 +432,11 @@ enum Flow {
 
 impl Cli {
     async fn run(&mut self) {
-        if self
-            .core
-            .commands
-            .send(Command::RestoreSession)
-            .await
-            .is_err()
-        {
-            return;
+        // The audio settings first, so call commands can edit them.
+        for command in [Command::GetAudioSettings, Command::RestoreSession] {
+            if self.core.commands.send(command).await.is_err() {
+                return;
+            }
         }
         self.mode = Mode::Busy;
         loop {
@@ -555,6 +596,23 @@ impl Cli {
             }
             Repl::Logout => self.send(Command::Logout).await,
             Repl::Quit => Flow::Quit,
+            Repl::Call(Ok(cmd)) => {
+                let selected = self.selected.as_ref().map(|s| &s.id);
+                let reply = self.calls.command(cmd, &self.rooms, selected);
+                for line in reply.lines {
+                    println!("{line}");
+                }
+                for command in reply.commands {
+                    if matches!(self.send(command).await, Flow::Quit) {
+                        return Flow::Quit;
+                    }
+                }
+                Flow::Continue
+            }
+            Repl::Call(Err(usage)) => {
+                println!("Usage: {usage}");
+                Flow::Continue
+            }
             Repl::Unknown(name) => {
                 println!(
                     "Unknown or incomplete command {}. {REPL_HINT}",
@@ -595,8 +653,13 @@ impl Cli {
             println!("No rooms.");
         }
         for (index, room) in self.rooms.iter().enumerate() {
+            let in_call = match self.calls.count(&room.id) {
+                0 => String::new(),
+                n => format!(", {n} in call"),
+            };
+            let voice = if room.is_call_room { "  [voice]" } else { "" };
             println!(
-                "{index}  {}  (unread {}, mentions {}, notifications {})",
+                "{index}  {}{voice}  (unread {}, mentions {}, notifications {}{in_call})",
                 sanitize(&room.name),
                 room.unread_messages,
                 room.unread_mentions,
@@ -683,7 +746,6 @@ impl Cli {
                     self.mode = Mode::Idle;
                 }
             }
-            // Call commands arrive in Phase 6 Task 12.
             CoreEvent::CallState(_)
             | CoreEvent::CallParticipants { .. }
             | CoreEvent::ActiveCall { .. }
@@ -693,7 +755,11 @@ impl Cli {
             | CoreEvent::AudioDevices(_)
             | CoreEvent::AudioSettings(_)
             | CoreEvent::InputLevel(_)
-            | CoreEvent::AudioStats(_) => {}
+            | CoreEvent::AudioStats(_) => {
+                for line in self.calls.event(event, &self.rooms) {
+                    println!("{line}");
+                }
+            }
         }
     }
 
@@ -715,6 +781,17 @@ impl Cli {
             }
         }
     }
+}
+
+/// `--silent-audio`: captures silence and drops what it would play.
+struct Silence;
+
+impl VirtualAudio for Silence {
+    fn capture(&self, frame: &mut [f32; AUDIO_FRAME_LEN]) {
+        frame.fill(0.0);
+    }
+
+    fn playback(&self, _: &[f32; AUDIO_FRAME_LEN]) {}
 }
 
 /// A fresh, unpredictable path under the system temp dir; the core creates it
@@ -775,7 +852,11 @@ async fn main() -> ExitCode {
             data,
             homeserver_override: options.homeserver,
             room_list_page_size: DEFAULT_ROOM_LIST_PAGE_SIZE,
-            audio: Default::default(),
+            audio: if options.silent_audio {
+                AudioBackend::Virtual(Arc::new(Silence))
+            } else {
+                AudioBackend::System
+            },
             call_service_override: None,
         },
         secrets,
@@ -818,6 +899,7 @@ async fn main() -> ExitCode {
         selected: None,
         timeline: Vec::new(),
         printed: HashSet::new(),
+        calls: calls::Calls::default(),
     };
     cli.run().await;
 
@@ -859,6 +941,7 @@ mod tests {
             "http://h",
             "--ephemeral",
             "--password-stdin",
+            "--silent-audio",
         ]));
         assert_eq!(
             parsed,
@@ -867,6 +950,7 @@ mod tests {
                 homeserver: Some("http://h".into()),
                 ephemeral: true,
                 password_stdin: true,
+                silent_audio: true,
             }))
         );
     }
@@ -881,6 +965,7 @@ mod tests {
                 homeserver: None,
                 ephemeral: false,
                 password_stdin: false,
+                silent_audio: false,
             }))
         );
     }
@@ -893,7 +978,8 @@ mod tests {
                 data_dir: None,
                 homeserver: None,
                 ephemeral: false,
-                password_stdin: false
+                password_stdin: false,
+                silent_audio: false,
             }))
         );
         assert_eq!(parse_args(&args(&["--help"])), Ok(Parsed::Help));
@@ -1077,6 +1163,7 @@ mod tests {
             selected: None,
             timeline: Vec::new(),
             printed: HashSet::new(),
+            calls: calls::Calls::default(),
         };
         (cli, interrupt_tx)
     }
