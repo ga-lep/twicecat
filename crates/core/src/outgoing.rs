@@ -10,7 +10,7 @@ use matrix_sdk::ruma::events::Mentions;
 use matrix_sdk::ruma::events::room::message::{
     FormattedBody, MessageType, RoomMessageEventContentWithoutRelation,
 };
-use matrix_sdk::ruma::html::{Html, SanitizerConfig};
+use matrix_sdk::ruma::html::SanitizerConfig;
 
 use crate::api::{MentionRef, MessageKind, OutgoingMessage};
 
@@ -91,7 +91,7 @@ fn sanitize_formatted(formatted: &mut Option<FormattedBody>) {
         *formatted = None;
         return;
     }
-    let html = Html::parse(&f.body);
+    let html = crate::rich_text::ParsedHtml::parse(&f.body);
     html.sanitize_with(&SanitizerConfig::strict().remove_elements(REMOVED_ELEMENTS));
     f.body = html.to_string();
 }
@@ -467,6 +467,20 @@ mod tests {
         });
         // The sanitizer also caps the depth (100, from the spec).
         assert!(html.contains("<div>"), "{html}");
+    }
+
+    #[test]
+    fn implicit_table_elements_at_the_tag_cap_are_sent_on_a_small_stack() {
+        // `<table><td>` also opens a tbody and a tr: the tree is about four
+        // times as deep as the tag count.
+        let source = format!("{}y", "<table><td>".repeat(MAX_TAGS / 2 - 5));
+        let html = on_small_stack(move || {
+            let c = outgoing_content(&message(&source, vec![], MessageKind::Text));
+            let html = text_parts(&c).1.expect("formatted");
+            let _ = crate::rich_text::from_html(&html, "y");
+            html
+        });
+        assert!(html.contains("<table>"), "{html}");
     }
 
     #[test]

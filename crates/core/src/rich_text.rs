@@ -116,7 +116,7 @@ pub(crate) fn from_html(html: &str, body: &str) -> RichText {
     if too_many_tags(html, MAX_TAGS) {
         return from_plain(body);
     }
-    let dom = Html::parse(html);
+    let dom = ParsedHtml::parse(html);
     let mut builder = Builder::new();
     for node in dom.children() {
         builder.walk(&node, TextStyle::default(), 1);
@@ -126,6 +126,50 @@ pub(crate) fn from_html(html: &str, body: &str) -> RichText {
         mapped
     } else {
         from_plain(body)
+    }
+}
+
+/// A parsed HTML tree that is torn down without recursion.
+///
+/// `ruma-html`'s tree drops recursively, one stack frame set per level, and
+/// the parser adds implicit elements (`<table><td>` also opens a `tbody` and
+/// a `tr`), so a tree within the tag cap can still be deep enough to
+/// overflow a 2 MiB stack when dropped. The nodes are collected breadth-first
+/// instead, the tree is dropped (its top level only), and then the nodes are
+/// dropped parents first, so each drop frees one node whose children are
+/// still held by the list.
+pub(crate) struct ParsedHtml(Option<Html>);
+
+impl ParsedHtml {
+    /// Parses `html` (infallible).
+    pub(crate) fn parse(html: &str) -> Self {
+        Self(Some(Html::parse(html)))
+    }
+}
+
+impl std::ops::Deref for ParsedHtml {
+    type Target = Html;
+
+    fn deref(&self) -> &Html {
+        self.0.as_ref().expect("the tree is only taken on drop")
+    }
+}
+
+impl Drop for ParsedHtml {
+    fn drop(&mut self) {
+        let Some(html) = self.0.take() else {
+            return;
+        };
+        let mut nodes: Vec<NodeRef> = html.children().collect();
+        let mut next = 0;
+        while let Some(node) = nodes.get(next) {
+            let children: Vec<NodeRef> = node.children().collect();
+            nodes.extend(children);
+            next += 1;
+        }
+        drop(html);
+        // Front to back: a parent goes before its children.
+        drop(nodes);
     }
 }
 
@@ -1438,6 +1482,25 @@ mod tests {
         // Normal messages are untouched.
         let ok = format!("{}ok{}", "<div>".repeat(30), "</div>".repeat(30));
         assert_ne!(from_html(&ok, "fallback"), want);
+    }
+
+    /// Runs `f` on a 2 MiB thread, the smallest stack we run on.
+    fn on_small_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(f)
+            .expect("spawn")
+            .join()
+            .expect("no crash on a 2 MiB stack")
+    }
+
+    #[test]
+    fn implicit_table_elements_at_the_tag_cap_drop_on_a_small_stack() {
+        // Each `<table><td>` also opens an implicit tbody and tr: the tree is
+        // about four times as deep as the tag count.
+        let html = format!("{}x", "<table><td>".repeat(MAX_TAGS / 2));
+        let rt = on_small_stack(move || from_html(&html, "fallback"));
+        assert!(has_text(&rt.blocks));
     }
 
     #[test]
