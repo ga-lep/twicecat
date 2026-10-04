@@ -2,7 +2,7 @@
 //! Systems) and prints the frame times.
 //!
 //! `cargo run --release -p tessera-audio --features onnxruntime --example
-//! dfn_profile -- <cpu|gpu|trt> [frames]`; the models from
+//! dfn_profile -- <cpu|gpu|trt|webgpu> [frames]`; the models from
 //! `scripts/fetch-models.sh` and, for `gpu`, `scripts/export-deepfilternet.sh`,
 //! `scripts/fetch-onnxruntime.sh cuda13` (and NVIDIA's libraries).
 
@@ -36,22 +36,22 @@ fn load(mode: &str) -> DeepFilter {
     match mode {
         "cpu" => DeepFilter::load(&dir, 100.0).expect("run scripts/fetch-models.sh"),
         #[cfg(feature = "onnxruntime")]
-        "gpu" | "trt" => {
+        "gpu" | "trt" | "webgpu" => {
             use tessera_audio::onnx::{Accelerator, OnnxRuntime, default_runtime_dir};
             let runtime = OnnxRuntime::load(&default_runtime_dir().expect("ONNX Runtime"))
                 .expect("load ONNX Runtime");
             let model = tessera_audio::default_stateful_model().expect("stateful model");
-            let prefer = if mode == "trt" {
-                Accelerator::TensorRt
-            } else {
-                Accelerator::Cuda
+            let prefer = match mode {
+                "trt" => Accelerator::TensorRt,
+                "webgpu" => Accelerator::WebGpu,
+                _ => Accelerator::Cuda,
             };
             let (filter, accelerator) =
                 DeepFilter::load_gpu(&dir, &model, 100.0, &runtime, &[prefer]).expect("load");
             eprintln!("running on {accelerator:?}");
             filter
         }
-        other => panic!("unknown mode {other} (cpu; gpu, trt with --features onnxruntime)"),
+        other => panic!("unknown mode {other} (cpu; gpu, trt, webgpu with --features onnxruntime)"),
     }
 }
 

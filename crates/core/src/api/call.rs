@@ -198,6 +198,9 @@ pub enum GpuBackend {
     Cuda,
     /// NVIDIA, through TensorRT.
     TensorRt,
+    /// Any vendor's GPU through WebGPU (Vulkan on Linux, Direct3D 12 on
+    /// Windows, Metal on macOS).
+    WebGpu,
     /// Any DirectX 12 GPU (Windows).
     DirectMl,
     /// Apple's GPU and Neural Engine (macOS).

@@ -9,7 +9,11 @@ time are explicit inputs and outputs, and the encoder and both decoders are
 one graph, so a frame is one call (one GPU launch sequence).
 
 The graph is the same network with the same weights as upstream's export;
-`--check` runs both on the same features and compares every frame.
+`--check` runs both on the same features and compares every frame. One
+convolution with two groups (df_convp) is written as an ungrouped one with
+block-diagonal weights, the same arithmetic: ONNX Runtime's WebGPU provider
+(plugin 0.4.0) computed that grouped convolution wrongly on some inputs
+(single coefficients off by up to 0.12), and is exact on the ungrouped form.
 
 Needs DeepFilterNet's Python sources at the release the models come from
 (v0.5.6, commit 978576aa), its pretrained DeepFilterNet3 checkpoint
@@ -267,6 +271,38 @@ def load(df_src: Path, checkpoint: Path):
     return nets, p
 
 
+def ungroup_convolutions(onnx_path: Path):
+    """Rewrites each grouped convolution that is not depthwise (more than one
+    input channel per group) as an ungrouped one whose weights are zero
+    between groups: the same results, and twice the multiply-adds of a small
+    layer. See the module docs for why."""
+    import onnx
+    from onnx import numpy_helper
+
+    model = onnx.load(str(onnx_path))
+    weights = {i.name: i for i in model.graph.initializer}
+    for node in model.graph.node:
+        if node.op_type != "Conv":
+            continue
+        group = next((a for a in node.attribute if a.name == "group"), None)
+        if group is None or group.i == 1:
+            continue
+        w = numpy_helper.to_array(weights[node.input[1]])
+        out_channels, per_group, *kernel = w.shape
+        if per_group == 1:
+            continue
+        full = np.zeros((out_channels, per_group * group.i, *kernel), w.dtype)
+        outs = out_channels // group.i
+        for g in range(group.i):
+            full[g * outs : (g + 1) * outs, g * per_group : (g + 1) * per_group] = w[
+                g * outs : (g + 1) * outs
+            ]
+        weights[node.input[1]].CopyFrom(numpy_helper.from_array(full, node.input[1]))
+        group.i = 1
+        print(f"ungrouped {node.name}: weights {list(w.shape)} -> {list(full.shape)}")
+    onnx.save(model, str(onnx_path))
+
+
 def check(p, size: int, upstream: Path, onnx_path: Path):
     """Runs upstream's stateless graphs over 200 frames of random features and
     this graph frame by frame in ONNX Runtime: the gains, coefficients and
@@ -353,6 +389,7 @@ def main():
     )
     import onnx
 
+    ungroup_convolutions(args.out)
     onnx.checker.check_model(onnx.load(str(args.out)), full_check=True)
     print(f"wrote {args.out}")
     if args.check:

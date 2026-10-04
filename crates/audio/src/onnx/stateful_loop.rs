@@ -16,6 +16,10 @@
 //! two state buffers would save the device copy, but replays of a session's
 //! second graph read wrong data with ONNX Runtime 1.28; one graph is exact.)
 //!
+//! On WebGPU likewise: the state stays in GPU buffers and each call replays
+//! the graph captured on the first one, the copies made with the providers'
+//! own data transfer (ONNX Runtime's `CopyTensors`).
+//!
 //! Elsewhere (other accelerators, the CPU, or when capture fails) the state
 //! goes through the host on each call.
 
@@ -55,6 +59,7 @@ pub struct OnnxLoop {
 enum Backend {
     Host(HostLoop),
     Cuda(Box<CudaLoop>),
+    WebGpu(Box<WebGpuLoop>),
 }
 
 impl OnnxRuntime {
@@ -90,6 +95,18 @@ impl OnnxRuntime {
                     }
                 }
             }
+            if accelerator == Accelerator::WebGpu && graphs {
+                match WebGpuLoop::open(model, spec) {
+                    Ok(webgpu) => {
+                        return Ok((make(Backend::WebGpu(Box::new(webgpu))), Some(accelerator)));
+                    }
+                    Err(e) => {
+                        tracing::info!(
+                            "WebGPU with graph capture unavailable ({e}); trying without"
+                        )
+                    }
+                }
+            }
             match HostLoop::open(model, Some(accelerator), spec) {
                 Ok(host) => return Ok((make(Backend::Host(host)), Some(accelerator))),
                 Err(e) => tracing::info!("{accelerator:?} unavailable, trying the next: {e}"),
@@ -112,6 +129,7 @@ impl OnnxLoop {
         let result = match &mut self.backend {
             Backend::Host(host) => host.run(input, &mut self.output),
             Backend::Cuda(cuda) => cuda.run(input, &mut self.output),
+            Backend::WebGpu(webgpu) => webgpu.run(input, &mut self.output),
         };
         result.map_err(|e| {
             tracing::warn!("ONNX inference failed: {e}");
@@ -131,12 +149,17 @@ impl OnnxLoop {
                 tracing::warn!("ONNX state reset failed: {e}");
                 AudioError::Internal
             }),
+            Backend::WebGpu(webgpu) => webgpu.reset().map_err(|e| {
+                tracing::warn!("ONNX state reset failed: {e}");
+                AudioError::Internal
+            }),
         }
     }
 
-    /// Whether the state stays on the device and calls replay a CUDA graph.
-    pub fn uses_cuda_graphs(&self) -> bool {
-        matches!(self.backend, Backend::Cuda(_))
+    /// Whether the state stays on the device and calls replay a captured
+    /// graph (a CUDA graph, or WebGPU's graph capture).
+    pub fn replays_a_graph(&self) -> bool {
+        matches!(self.backend, Backend::Cuda(_) | Backend::WebGpu(_))
     }
 }
 
@@ -513,5 +536,145 @@ impl CudaLoop {
             0 => self.cudart.wait(&self.stream),
             code => Err(format!("cudaMemsetAsync failed ({code})")),
         }
+    }
+}
+
+/// A value's raw pointer, for [`copy_tensors`].
+type OrtValuePointer = dyn ort::AsPointer<Sys = ort::sys::OrtValue>;
+
+/// Copies each of `pairs` (source, target) with the providers' own data
+/// transfer (ONNX Runtime's `CopyTensors`), and returns when they are done.
+fn copy_tensors(pairs: &[(&OrtValuePointer, &OrtValuePointer)]) -> Result<(), String> {
+    let env = ort::environment::Environment::current().map_err(|e| e.to_string())?;
+    let env_ptr = ort::AsPointer::ptr(&*env).cast_mut();
+    let sources: Vec<*const ort::sys::OrtValue> = pairs.iter().map(|(s, _)| s.ptr()).collect();
+    let mut targets: Vec<*const ort::sys::OrtValue> = pairs.iter().map(|(_, t)| t.ptr()).collect();
+    // SAFETY: live tensors of the same shapes (made from one spec) and type;
+    // no stream, so the copies are done when the call returns, and nothing
+    // else touches the targets meanwhile (this loop owns them).
+    let status = unsafe {
+        (ort::api().CopyTensors)(
+            env_ptr,
+            sources.as_ptr(),
+            targets.as_mut_ptr(),
+            std::ptr::null_mut(),
+            pairs.len(),
+        )
+    };
+    // SAFETY: a status from the API, owned from here on.
+    unsafe { ort::Error::result_from_status(status) }.map_err(|e| e.to_string())
+}
+
+/// WebGPU: the state stays in GPU buffers and each call replays the graph
+/// captured on the first one (`enableGraphCapture`): recording ~240 small
+/// dispatches cost about 6 µs of CPU each per call, 1.4 ms in all.
+struct WebGpuLoop {
+    binding: IoBinding,
+    no_wait: RunOptions,
+    /// Host staging tensors: the input, the output, zeros for a reset.
+    host_input: Tensor<f32>,
+    host_output: Tensor<f32>,
+    zeros: Tensor<f32>,
+    /// Device buffers: the input and the state; the binding owns the output
+    /// and the next state, which each run returns.
+    input: Tensor<f32>,
+    state: Tensor<f32>,
+    /// The output's and the next state's names.
+    outputs: [String; 2],
+    _constants: Vec<Tensor<f32>>,
+    _allocator: Allocator,
+    session: Session,
+}
+
+impl WebGpuLoop {
+    fn open(model: &Path, spec: &LoopSpec<'_>) -> Result<Self, String> {
+        let text = |e: ort::Error| e.to_string();
+        let session = open_session(
+            model,
+            Some(Accelerator::WebGpu),
+            &session_config(spec, true),
+            None,
+        )?;
+        let state_len = state_len(&session, spec)?;
+        let info = MemoryInfo::new(
+            AllocationDevice::WEBGPU_BUFFER,
+            0,
+            AllocatorType::Device,
+            MemoryType::Default,
+        )
+        .map_err(text)?;
+        let allocator = Allocator::new(&session, info).map_err(text)?;
+        let device = |shape: Vec<usize>| Tensor::<f32>::new(&allocator, shape).map_err(text);
+        let host = |data: Vec<f32>| Tensor::from_array(([1, data.len()], data)).map_err(text);
+
+        let mut binding = session.create_binding().map_err(text)?;
+        let input = device(vec![1, spec.input.1])?;
+        let state = device(vec![1, state_len])?;
+        binding.bind_input(spec.input.0, &input).map_err(text)?;
+        binding.bind_input(spec.state.0, &state).map_err(text)?;
+        let mut constants = Vec::new();
+        for (name, value) in spec.constants {
+            let tensor = device(vec![value.len()])?;
+            let staged = Tensor::from_array(([value.len()], value.to_vec())).map_err(text)?;
+            copy_tensors(&[(&staged, &tensor)])?;
+            binding.bind_input(*name, &tensor).map_err(text)?;
+            constants.push(tensor);
+        }
+        binding
+            .bind_output(spec.output.0, device(vec![1, spec.output.1])?)
+            .map_err(text)?;
+        binding
+            .bind_output(spec.state.1, device(vec![1, state_len])?)
+            .map_err(text)?;
+        let mut no_wait = RunOptions::new().map_err(text)?;
+        no_wait.disable_device_sync().map_err(text)?;
+        let mut this = Self {
+            binding,
+            no_wait,
+            host_input: host(vec![0.0; spec.input.1])?,
+            host_output: host(vec![0.0; spec.output.1])?,
+            zeros: host(vec![0.0; state_len])?,
+            input,
+            state,
+            outputs: [spec.output.0.to_owned(), spec.state.1.to_owned()],
+            _constants: constants,
+            _allocator: allocator,
+            session,
+        };
+        // The first call captures the graph: here, not on the audio thread.
+        this.reset()?;
+        let mut scratch = vec![0.0; spec.output.1];
+        let zeros = vec![0.0; spec.input.1];
+        this.run(&zeros, &mut scratch)?;
+        this.reset()?;
+        Ok(this)
+    }
+
+    fn run(&mut self, input: &[f32], output: &mut [f32]) -> Result<(), String> {
+        let text = |e: ort::Error| e.to_string();
+        self.host_input
+            .extract_tensor_mut()
+            .1
+            .copy_from_slice(input);
+        copy_tensors(&[(&self.host_input, &self.input)])?;
+        let outputs = self
+            .session
+            .run_binding_with_options(&self.binding, &self.no_wait)
+            .map_err(text)?;
+        let (Some(out), Some(next)) = (
+            outputs.get(self.outputs[0].as_str()),
+            outputs.get(self.outputs[1].as_str()),
+        ) else {
+            return Err("bound outputs missing".into());
+        };
+        copy_tensors(&[(next, &self.state)])?;
+        copy_tensors(&[(out, &self.host_output)])?;
+        drop(outputs);
+        output.copy_from_slice(self.host_output.extract_tensor().1);
+        Ok(())
+    }
+
+    fn reset(&mut self) -> Result<(), String> {
+        copy_tensors(&[(&self.zeros, &self.state)])
     }
 }

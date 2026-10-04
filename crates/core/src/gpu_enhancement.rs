@@ -38,9 +38,13 @@ mod imp {
     /// 0.13 ms for 16 µs of CPU, against 0.36 ms and 76 µs with CUDA. Its
     /// first use on a machine builds an engine for the GPU (about 20 s,
     /// cached after); without its libraries it fails at once and CUDA runs.
-    const PREFER: [Accelerator; 4] = [
+    ///
+    /// WebGPU (any vendor; on the RTX 5090 0.59 ms for 0.42 ms of CPU) is
+    /// for the GPUs those do not reach.
+    const PREFER: [Accelerator; 5] = [
         Accelerator::TensorRt,
         Accelerator::Cuda,
+        Accelerator::WebGpu,
         Accelerator::DirectMl,
         Accelerator::CoreMl,
     ];
@@ -49,6 +53,7 @@ mod imp {
         match accelerator {
             Accelerator::Cuda => GpuBackend::Cuda,
             Accelerator::TensorRt => GpuBackend::TensorRt,
+            Accelerator::WebGpu => GpuBackend::WebGpu,
             Accelerator::DirectMl => GpuBackend::DirectMl,
             Accelerator::CoreMl => GpuBackend::CoreMl,
         }

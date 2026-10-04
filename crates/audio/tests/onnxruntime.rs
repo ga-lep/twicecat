@@ -142,11 +142,13 @@ fn deepfilternet_on_the_gpu_sounds_like_on_the_cpu() {
     );
 
     // Each GPU backend this runtime has (TensorRT needs scripts/fetch-tensorrt.sh;
-    // its first engine build takes about 20 s, cached after).
+    // its first engine build takes about 20 s, cached after; WebGPU needs
+    // scripts/fetch-webgpu-ep.sh).
     let mut compared = 0;
     for candidate in [
         Accelerator::Cuda,
         Accelerator::TensorRt,
+        Accelerator::WebGpu,
         Accelerator::DirectMl,
         Accelerator::CoreMl,
     ] {
@@ -177,10 +179,14 @@ fn deepfilternet_on_the_gpu_sounds_like_on_the_cpu() {
         );
         // Measured: CUDA 91 dB from the CPU's output, TensorRT 86 to 88 dB
         // (it times kernels when it builds an engine, so builds differ a
-        // little). The bar for them sits well above the 26 to 40 dB that a
-        // race between our copies and TensorRT's replay gave; providers not
-        // measured yet get a looser one, still far below anything audible.
-        let bar = if matches!(candidate, Accelerator::Cuda | Accelerator::TensorRt) {
+        // little), WebGPU 133 dB. The bar for them sits well above the 26 to
+        // 40 dB that a race between our copies and TensorRT's replay gave;
+        // providers not measured yet get a looser one, still far below
+        // anything audible.
+        let bar = if matches!(
+            candidate,
+            Accelerator::Cuda | Accelerator::TensorRt | Accelerator::WebGpu
+        ) {
             60.0
         } else {
             40.0
@@ -211,7 +217,11 @@ fn the_gpu_loops_match_the_host_loop_frame_by_frame() {
         state: ("state", "state_out"),
         dimensions: &[("batch", 1)],
     };
-    for candidate in [Accelerator::Cuda, Accelerator::TensorRt] {
+    for candidate in [
+        Accelerator::Cuda,
+        Accelerator::TensorRt,
+        Accelerator::WebGpu,
+    ] {
         if !runtime.accelerators().contains(&candidate) {
             continue;
         }
@@ -249,8 +259,8 @@ fn the_gpu_loops_match_the_host_loop_frame_by_frame() {
                 .fold(worst, f32::max);
         }
         eprintln!(
-            "{candidate:?} (CUDA graphs: {}): largest difference over 300 frames: {worst}",
-            gpu.uses_cuda_graphs()
+            "{candidate:?} (replayed graph: {}): largest difference over 300 frames: {worst}",
+            gpu.replays_a_graph()
         );
         assert!(worst < 0.05, "{candidate:?}: {worst}");
     }

@@ -1,0 +1,8 @@
+# ONNX Runtime's WebGPU plugin execution provider for scripts/fetch-webgpu-ep.sh
+# (PyPI onnxruntime-ep-webgpu 0.4.0, Microsoft, MIT; needs ONNX Runtime
+# 1.24.4 or later). <sha256> <platform> <url>; digests from PyPI.
+5d8c961eda91a88961cad1fb7621f389f006b18497d6ea9ecf96f729f066cbfb  linux-x64  https://files.pythonhosted.org/packages/c1/96/2a18a45079250afcd825687aef2895de266d5abc1cff9f52d2dede7598f2/onnxruntime_ep_webgpu-0.4.0-py3-none-manylinux_2_28_x86_64.whl
+17f660db53b1a509c63e721ac6784a2daa1c4e91a968523ee9986505ee5b0a55  linux-aarch64  https://files.pythonhosted.org/packages/4e/ca/00c70322c19913c81a6bb2239aca83781b97a818b55c2ec3d25cec72dc4c/onnxruntime_ep_webgpu-0.4.0-py3-none-manylinux_2_28_aarch64.whl
+7db646669d1a2390551da675115ea125e68cb3d4d2c3a2d6e463372bf8d6ea87  win-x64  https://files.pythonhosted.org/packages/d7/a4/c98a9e9433b3eeb576977b26c5c1cd0364f15ba9d198bb16101e7563ab06/onnxruntime_ep_webgpu-0.4.0-py3-none-win_amd64.whl
+a9586f6744370776059edd794c11bca2f563258a5bd2707864aefff31d3af39f  win-arm64  https://files.pythonhosted.org/packages/cd/35/e1b1b12e596354d05af43cea09cd9fbd8a24b6df3853c527307b5cfb8d4b/onnxruntime_ep_webgpu-0.4.0-py3-none-win_arm64.whl
+8d0a91d44b43d931c3068b9134aed9770f27803e353c2b58c93e1700bb68bcca  osx-arm64  https://files.pythonhosted.org/packages/c3/9f/1e09865bbe4c9202ff1334545535be32dfdbeffc46e7d4c36c5de67ffafe/onnxruntime_ep_webgpu-0.4.0-py3-none-macosx_14_0_universal2.whl

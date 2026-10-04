@@ -43,8 +43,8 @@ impl StatefulGraph {
         };
         let (model, accelerator) = runtime.open_loop(model, prefer, &spec)?;
         tracing::info!(
-            "DeepFilterNet's stateful graph on {accelerator:?} (CUDA graphs: {})",
-            model.uses_cuda_graphs()
+            "DeepFilterNet's stateful graph on {accelerator:?} (replayed graph: {})",
+            model.replays_a_graph()
         );
         Ok((
             Self {

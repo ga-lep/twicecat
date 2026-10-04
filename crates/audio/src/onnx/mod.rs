@@ -4,14 +4,19 @@
 //! time from that directory (or `TESSERA_ONNXRUNTIME_DIR`); nothing is
 //! downloaded or linked at build time.
 //!
-//! Sessions try the requested accelerators in order (CUDA, TensorRT,
-//! DirectML, CoreML) and fall back to the CPU, reporting what runs: an
-//! accelerator can be compiled in and still fail at run time (missing CUDA
-//! or cuDNN libraries, an unsupported operator).
+//! Sessions try the requested accelerators in order (TensorRT, CUDA,
+//! WebGPU, DirectML, CoreML) and fall back to the CPU, reporting what runs:
+//! an accelerator can be compiled in and still fail at run time (missing
+//! CUDA or cuDNN libraries, an unsupported operator).
+//!
+//! WebGPU is a plugin provider (Microsoft's `onnxruntime-ep-webgpu`, fetched
+//! by `scripts/fetch-webgpu-ep.sh`): registered with the environment when the
+//! runtime loads, and available when it lists a device (a Vulkan, Direct3D
+//! 12 or Metal adapter).
 //!
 //! Stateful models (one frame per call, their state carried from call to
-//! call) run through [`OnnxLoop`]: on CUDA the state never leaves the GPU
-//! and each call replays one captured CUDA graph ([`stateful_loop`]).
+//! call) run through [`OnnxLoop`]: on CUDA and WebGPU the state never leaves
+//! the GPU and each call replays one captured graph ([`stateful_loop`]).
 //!
 //! On Linux the CUDA build's libraries (CUDA 13, cuDNN 9) come from the
 //! system, or from `scripts/fetch-cuda-runtime.sh` (or `TESSERA_CUDA_DIR`):
@@ -40,6 +45,10 @@ pub enum Accelerator {
     Cuda,
     /// NVIDIA GPUs through TensorRT (its libraries needed).
     TensorRt,
+    /// Any GPU with Vulkan (Linux), Direct3D 12 (Windows) or Metal (macOS),
+    /// through ONNX Runtime's WebGPU plugin provider (Dawn inside), fetched
+    /// by `scripts/fetch-webgpu-ep.sh`.
+    WebGpu,
     /// Any DirectX 12 GPU on Windows.
     DirectMl,
     /// Apple's Neural Engine and GPU on macOS.
@@ -48,14 +57,22 @@ pub enum Accelerator {
 
 impl Accelerator {
     /// Every accelerator, preferred first.
-    pub const ALL: [Self; 4] = [Self::TensorRt, Self::Cuda, Self::DirectMl, Self::CoreMl];
+    pub const ALL: [Self; 5] = [
+        Self::TensorRt,
+        Self::Cuda,
+        Self::WebGpu,
+        Self::DirectMl,
+        Self::CoreMl,
+    ];
 
+    /// The provider to append; `None` for a plugin provider, which is
+    /// appended by device instead (`open_session`).
     fn dispatch(
         self,
         config: &SessionConfig<'_>,
         stream: Option<ComputeStream>,
-    ) -> ExecutionProviderDispatch {
-        match self {
+    ) -> Option<ExecutionProviderDispatch> {
+        Some(match self {
             // The heuristic picks convolution algorithms at once; the default
             // exhaustive search benchmarks them on the first frame (seconds).
             Self::Cuda => {
@@ -87,15 +104,17 @@ impl Accelerator {
                 }
                 trt.build().error_on_failure()
             }
+            Self::WebGpu => return None,
             Self::DirectMl => ep::DirectML::default().build().error_on_failure(),
             Self::CoreMl => ep::CoreML::default().build().error_on_failure(),
-        }
+        })
     }
 
     fn compiled_in(self) -> bool {
         let available = match self {
             Self::Cuda => ep::CUDA::default().is_available(),
             Self::TensorRt => ep::TensorRT::default().is_available(),
+            Self::WebGpu => return webgpu_device_listed(),
             Self::DirectMl => ep::DirectML::default().is_available(),
             Self::CoreMl => ep::CoreML::default().is_available(),
         };
@@ -138,6 +157,56 @@ pub fn default_runtime_dir() -> Option<PathBuf> {
         .iter()
         .map(|flavour| base.join(format!("{platform}{flavour}")).join("lib"))
         .find(|dir| dir.join(library_name()).exists())
+}
+
+/// The WebGPU plugin provider release `scripts/fetch-webgpu-ep.sh` pins
+/// (PyPI `onnxruntime-ep-webgpu`, MIT; needs ONNX Runtime 1.24.4 or later).
+pub const WEBGPU_EP_VERSION: &str = "0.4.0";
+
+/// The provider's name, as the plugin registers it.
+const WEBGPU_EP_NAME: &str = "WebGpuExecutionProvider";
+
+fn webgpu_library_name() -> &'static str {
+    match std::env::consts::OS {
+        "windows" => "onnxruntime_providers_webgpu.dll",
+        "macos" => "libonnxruntime_providers_webgpu.dylib",
+        _ => "libonnxruntime_providers_webgpu.so",
+    }
+}
+
+/// Where `scripts/fetch-webgpu-ep.sh` put the WebGPU plugin provider, or
+/// `TESSERA_WEBGPU_EP_DIR`; `None` when neither exists.
+pub fn default_webgpu_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("TESSERA_WEBGPU_EP_DIR") {
+        return Some(PathBuf::from(dir));
+    }
+    let dir = cache_root()?
+        .join("tessera/onnxruntime")
+        .join(format!("webgpu-ep-{WEBGPU_EP_VERSION}"));
+    dir.is_dir().then_some(dir)
+}
+
+/// Registers the WebGPU plugin provider from `dir` with the environment;
+/// its device is listed if it found a GPU it can use.
+fn register_webgpu(dir: &Path) {
+    let library = dir.join(webgpu_library_name());
+    if !library.exists() {
+        return;
+    }
+    let registered = ort::environment::Environment::current()
+        .and_then(|env| env.register_ep_library("webgpu", &library));
+    if let Err(e) = registered {
+        tracing::info!("WebGPU provider not registered: {e}");
+    }
+}
+
+/// Whether the environment lists a WebGPU device (the plugin registered and
+/// found an adapter).
+fn webgpu_device_listed() -> bool {
+    ort::environment::Environment::current().is_ok_and(|env| {
+        env.devices()
+            .any(|d| d.ep().is_ok_and(|n| n == WEBGPU_EP_NAME))
+    })
 }
 
 /// Where `scripts/fetch-cuda-runtime.sh` put NVIDIA's libraries, or
@@ -275,6 +344,9 @@ impl OnnxRuntime {
             if !builder.with_name("tessera").commit() {
                 tracing::debug!("ONNX Runtime environment was already set up");
             }
+            if let Some(webgpu) = default_webgpu_dir() {
+                register_webgpu(&webgpu);
+            }
             Ok(Accelerator::ALL
                 .into_iter()
                 .filter(|a| a.compiled_in())
@@ -363,12 +435,42 @@ pub(crate) fn open_session(
     builder = builder.with_inter_threads(1).map_err(text)?;
     builder = builder.with_intra_op_spinning(false).map_err(text)?;
     builder = builder.with_inter_op_spinning(false).map_err(text)?;
+    // ONNX Runtime's profiler, for profiling a backend: a trace of every run
+    // and node, with the provider each ran on, written to
+    // `<prefix>_<date>.json` when the session ends.
+    if let Some(prefix) = std::env::var_os("TESSERA_ONNX_PROFILE") {
+        builder = builder.with_profiling(prefix).map_err(text)?;
+    }
     for (name, size) in config.dimensions {
         builder = builder
             .with_dimension_override(*name, *size)
             .map_err(|e| e.to_string())?;
     }
-    if let Some(accelerator) = accelerator {
+    if accelerator == Some(Accelerator::WebGpu) {
+        // The plugin takes one device and picks the adapter itself.
+        let env = ort::environment::Environment::current().map_err(|e| e.to_string())?;
+        let device = env
+            .devices()
+            .find(|d| d.ep().is_ok_and(|n| n == WEBGPU_EP_NAME))
+            .ok_or("no WebGPU device")?;
+        let capture = if config.cuda_graph { "1" } else { "0" };
+        let mut options = vec![(
+            format!("{WEBGPU_EP_NAME}.enableGraphCapture"),
+            capture.to_owned(),
+        )];
+        // More provider options, for measuring on other GPUs:
+        // `TESSERA_WEBGPU_EP_OPTIONS="maxNumPendingDispatches=512;..."`.
+        for (key, value) in std::env::var("TESSERA_WEBGPU_EP_OPTIONS")
+            .unwrap_or_default()
+            .split(';')
+            .filter_map(|kv| kv.split_once('='))
+        {
+            options.push((format!("{WEBGPU_EP_NAME}.{key}"), value.to_owned()));
+        }
+        builder = builder
+            .with_devices([device], Some(&options))
+            .map_err(text)?;
+    } else if let Some(accelerator) = accelerator {
         // TensorRT runs what it supports; CUDA takes any node it does not.
         let fallback = (accelerator == Accelerator::TensorRt).then(|| {
             Accelerator::Cuda.dispatch(
@@ -381,8 +483,10 @@ pub(crate) fn open_session(
         });
         builder = builder
             .with_execution_providers(
-                std::iter::once(accelerator.dispatch(config, stream))
-                    .chain(fallback)
+                accelerator
+                    .dispatch(config, stream)
+                    .into_iter()
+                    .chain(fallback.flatten())
                     .collect::<Vec<_>>(),
             )
             .map_err(|e| e.to_string())?;
