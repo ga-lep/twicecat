@@ -5,19 +5,20 @@
 //! type.
 
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use iced::theme;
 use iced::widget::{operation, scrollable};
 use iced::{Element, Subscription, Task, Theme, clipboard, system, window};
 use tessera_core::api::{
-    Command, CoreError, CoreEvent, ListDiff, MessageText, Password, RoomId, RoomListQuery,
+    ActionKind, Command, CoreError, CoreEvent, ListDiff, Password, RoomId, RoomListQuery,
     RoomListTab, RoomSummary, SyncState, TimelineItem, UserId,
 };
 use tokio::sync::mpsc;
 
 use crate::avatars::Avatars;
 use crate::bridge::{self, Bridge, EventsSlot};
+use crate::composer::{self, Composer, ComposerKey, EditorAction, SearchStep};
 use crate::links::{self, LinkBar};
 use crate::rich_text::{LinkTarget, MAX_REVEALED, Revealed};
 use crate::room_list;
@@ -45,6 +46,9 @@ pub trait CommandSink: Send {
 
     /// A task that yields [`Message::ShutdownDeadline`] after `after`.
     fn deadline(&self, after: Duration) -> Task<Message>;
+
+    /// A task that yields `message` after `after`.
+    fn timer(&self, after: Duration, message: Message) -> Task<Message>;
 }
 
 impl CommandSink for Bridge {
@@ -54,6 +58,10 @@ impl CommandSink for Bridge {
 
     fn deadline(&self, after: Duration) -> Task<Message> {
         Bridge::deadline(self, after)
+    }
+
+    fn timer(&self, after: Duration, message: Message) -> Task<Message> {
+        Bridge::timer(self, after, message)
     }
 }
 
@@ -66,6 +74,11 @@ impl CommandSink for mpsc::Sender<Command> {
 
     /// Tests have no runtime to time on: no deadline.
     fn deadline(&self, _after: Duration) -> Task<Message> {
+        Task::none()
+    }
+
+    /// Likewise: tests call the timer's handler themselves.
+    fn timer(&self, _after: Duration, _message: Message) -> Task<Message> {
         Task::none()
     }
 }
@@ -117,10 +130,15 @@ pub enum Message {
     },
     /// The user pressed **Copy link**.
     CopyLink,
-    /// The composer text changed; its `Debug` is redacted.
-    ComposerChanged(MessageText),
-    /// The user pressed Enter in the composer.
-    ComposerSubmitted,
+    /// An action in the composer's text editor; its `Debug` shows only the
+    /// kind of action.
+    Composer(EditorAction),
+    /// A key command in the composer (send, suggestion keys, escape).
+    ComposerKey(ComposerKey),
+    /// The user clicked suggestion `index` under the composer.
+    SuggestionPicked(usize),
+    /// The member search timer fired.
+    MembersDue,
     /// The user pressed **Log out**.
     LogoutRequested,
     /// The user picked a room in the list.
@@ -215,8 +233,8 @@ pub struct App {
     pub browser_link: Option<BrowserUrl>,
     /// `None` while the browser launcher runs, then whether it worked.
     pub browser_opened: Option<bool>,
-    /// The composer text of the selected room.
-    pub composer: MessageText,
+    /// The composer of the selected room.
+    pub composer: Composer,
     /// A non-secret line about the last failed send.
     pub send_error: Option<String>,
     /// The system theme mode.
@@ -277,7 +295,7 @@ impl App {
             notice: None,
             browser_link: None,
             browser_opened: None,
-            composer: MessageText::from(String::new()),
+            composer: Composer::new(),
             send_error: None,
             theme_mode: theme::Mode::None,
             revealed: Revealed::new(),
@@ -353,13 +371,14 @@ impl App {
                 Some(link) => clipboard::write(link.as_str().to_owned()),
                 None => Task::none(),
             },
-            Message::ComposerChanged(text) => {
-                if self.selected.is_some() {
-                    self.composer = text;
-                }
-                Task::none()
+            Message::Composer(EditorAction(action)) => {
+                self.composer_action_at(action, Instant::now())
             }
-            Message::ComposerSubmitted => self.submit_composer(),
+            Message::ComposerKey(key) => self.composer_key_at(key, Instant::now()),
+            Message::SuggestionPicked(index) => {
+                self.pick_suggestion_at(Some(index), Instant::now())
+            }
+            Message::MembersDue => self.members_due_at(Instant::now()),
             Message::RowMeasured { id, height } => {
                 let effects = self.timeline.row_measured(&id, height);
                 self.timeline_effects(effects)
@@ -393,11 +412,12 @@ impl App {
                 if !room_list::contains(&self.rooms, &id) {
                     return Task::none();
                 }
+                let stop_typing = self.stop_typing();
                 self.selected = Some(id.clone());
                 self.timeline.reset();
                 self.clear_draft();
                 self.reset_link_state();
-                self.send(Command::SelectRoom(id))
+                Task::batch([stop_typing, self.send(Command::SelectRoom(id))])
             }
             Message::TabSelected(tab) => {
                 let query = RoomListQuery {
@@ -536,10 +556,26 @@ impl App {
             }
             CoreEvent::Error(error) => task = self.on_core_error(&error),
             CoreEvent::Avatar { id, image } => self.avatars.answer(&id, image),
-            // Shown by the Phase 3 composer and pane; ignored until then.
-            CoreEvent::Typing { .. }
-            | CoreEvent::Members { .. }
-            | CoreEvent::ActionFailed { .. } => {}
+            CoreEvent::Members {
+                room_id,
+                query,
+                members,
+            } => {
+                if self.selected.as_ref() == Some(&room_id) {
+                    self.composer.set_members(query.expose(), members);
+                }
+            }
+            CoreEvent::ActionFailed {
+                room_id,
+                action: ActionKind::Send | ActionKind::Edit,
+                error,
+            } => {
+                if self.selected.as_ref() == Some(&room_id) {
+                    self.send_error = Some(safe_line(&error.to_string()));
+                }
+            }
+            // Shown by the Phase 3 timeline pane; ignored until then.
+            CoreEvent::Typing { .. } | CoreEvent::ActionFailed { .. } => {}
         }
         task
     }
@@ -706,14 +742,105 @@ impl App {
         self.send(Command::LoadMoreRooms)
     }
 
-    /// Sends the composer text to the selected room and clears the field.
-    fn submit_composer(&mut self) -> Task<Message> {
-        if self.selected.is_none() || self.composer.expose().trim().is_empty() {
+    /// Applies an editor action to the composer of the open room and sends
+    /// what that asks for: typing notices and member searches.
+    fn composer_action_at(
+        &mut self,
+        action: iced::widget::text_editor::Action,
+        now: Instant,
+    ) -> Task<Message> {
+        if self.selected.is_none() {
             return Task::none();
         }
-        let text = std::mem::replace(&mut self.composer, MessageText::from(String::new()));
+        let effects = self.composer.apply(action, now);
+        self.run_effects(effects.search, effects.typing)
+    }
+
+    /// Sends a `SetTyping` and starts or runs a member search step.
+    fn run_effects(&self, search: SearchStep, typing: Option<bool>) -> Task<Message> {
+        let Some(room_id) = self.selected.clone() else {
+            return Task::none();
+        };
+        let mut tasks = Vec::new();
+        if let Some(typing) = typing {
+            tasks.push(self.send(Command::SetTyping {
+                room_id: room_id.clone(),
+                typing,
+            }));
+        }
+        match search {
+            SearchStep::Idle => {}
+            SearchStep::Send(query) => {
+                tasks.push(self.send(Command::SearchMembers { room_id, query }));
+            }
+            SearchStep::Arm(after) => tasks.push(self.sink.timer(after, Message::MembersDue)),
+        }
+        Task::batch(tasks)
+    }
+
+    fn members_due_at(&mut self, now: Instant) -> Task<Message> {
+        let step = self.composer.search.timer_fired(now);
+        self.run_effects(step, None)
+    }
+
+    fn pick_suggestion_at(&mut self, index: Option<usize>, now: Instant) -> Task<Message> {
+        match self.composer.pick(index, now) {
+            Some(effects) if self.selected.is_some() => {
+                self.run_effects(effects.search, effects.typing)
+            }
+            _ => Task::none(),
+        }
+    }
+
+    fn composer_key_at(&mut self, key: ComposerKey, now: Instant) -> Task<Message> {
+        match key {
+            ComposerKey::Send => self.submit_composer(),
+            ComposerKey::Pick => self.pick_suggestion_at(None, now),
+            ComposerKey::Next => {
+                self.composer.step(1);
+                Task::none()
+            }
+            ComposerKey::Previous => {
+                self.composer.step(-1);
+                Task::none()
+            }
+            ComposerKey::Escape => {
+                self.composer.escape();
+                Task::none()
+            }
+        }
+    }
+
+    /// `SetTyping(false)` for the open room when a notice is outstanding.
+    fn stop_typing(&mut self) -> Task<Message> {
+        match &self.selected {
+            Some(room_id) if self.composer.typing.stop() => self.send(Command::SetTyping {
+                room_id: room_id.clone(),
+                typing: false,
+            }),
+            _ => Task::none(),
+        }
+    }
+
+    /// Sends the composer text to the selected room (a new message, a reply
+    /// or an edit) and resets the composer. A blank text sends nothing.
+    fn submit_composer(&mut self) -> Task<Message> {
+        let Some(room_id) = self.selected.clone() else {
+            return Task::none();
+        };
+        let Some(message) = composer::outgoing(&self.composer, &room_id) else {
+            return Task::none();
+        };
+        let command = match &self.composer.mode {
+            composer::Mode::Edit(item_id) => Command::Edit {
+                item_id: item_id.clone(),
+                message,
+            },
+            composer::Mode::Normal | composer::Mode::Reply(_) => Command::Send(message),
+        };
+        self.composer.clear();
         self.send_error = None;
-        self.send(Command::SendMessage { text })
+        Task::batch([self.send(command), self.stop_typing()])
     }
 
     /// Forgets everything about a login attempt: the flag, the browser link
@@ -725,8 +852,11 @@ impl App {
         self.login.password = Password::from(String::new());
     }
 
+    /// Empties the composer without telling the room (the caller does that
+    /// where the room is still open and reachable).
     fn clear_draft(&mut self) {
-        self.composer = MessageText::from(String::new());
+        self.composer.clear();
+        self.composer.typing.reset();
         self.send_error = None;
     }
 
@@ -874,8 +1004,9 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
+    use std::sync::Arc;
 
+    use iced::widget::text_editor::{Action, Edit};
     use tessera_core::api::{DeviceId, ListDiff, RoomId};
 
     use super::*;
@@ -1311,14 +1442,16 @@ mod tests {
         let _ = app.update(message);
         assert!(!format!("{app:?}").contains("hunter2-x"));
 
-        let message = Message::ComposerChanged(MessageText::from("secret-body-x"));
-        assert!(!format!("{message:?}").contains("secret-body-x"));
+        let paste = Message::Composer(EditorAction(Action::Edit(Edit::Paste(Arc::new(
+            "secret-body-x".to_owned(),
+        )))));
+        assert!(!format!("{paste:?}").contains("secret-body-x"));
         let _ = app.update(core(CoreEvent::LoggedOut));
         logged_in(&mut app);
         let _ = app.update(core(room_event(&["a"])));
         let _ = app.update(Message::SelectRoom(RoomId::from("!a:x")));
-        let _ = app.update(message);
-        assert_eq!(app.composer.expose(), "secret-body-x");
+        let _ = app.update(paste);
+        assert_eq!(app.composer.text(), "secret-body-x");
         let dbg = format!("{app:?}");
         assert!(!dbg.contains("secret-body-x"), "{dbg}");
         assert!(dbg.contains("Main"), "the app Debug still says something");
@@ -1334,38 +1467,262 @@ mod tests {
         (app, rx)
     }
 
-    #[test]
-    fn composer_enter_sends_the_message_and_clears_the_field() {
-        let (mut app, mut rx) = main_app();
-        let _ = app.update(Message::ComposerChanged(MessageText::from("hello")));
-        let _ = app.update(Message::ComposerSubmitted);
-        match rx.try_recv() {
-            Ok(Command::SendMessage { text }) => assert_eq!(text.expose(), "hello"),
-            other => panic!("unexpected {other:?}"),
+    /// Types `text` into the composer through `update`, like the editor does.
+    fn type_in(app: &mut App, text: &str) {
+        for c in text.chars() {
+            let edit = if c == '\n' {
+                Edit::Enter
+            } else {
+                Edit::Insert(c)
+            };
+            let _ = app.update(Message::Composer(EditorAction(Action::Edit(edit))));
         }
-        assert_eq!(app.composer.expose(), "");
-        let _ = app.update(Message::ComposerSubmitted);
-        assert!(rx.try_recv().is_err(), "an empty composer sends nothing");
-        let _ = app.update(Message::ComposerChanged(MessageText::from("  \t ")));
-        let _ = app.update(Message::ComposerSubmitted);
-        assert!(rx.try_recv().is_err(), "blank text sends nothing");
+    }
+
+    /// Everything queued so far.
+    fn drain(rx: &mut mpsc::Receiver<Command>) -> Vec<Command> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    fn send_commands(commands: &[Command]) -> Vec<&Command> {
+        commands
+            .iter()
+            .filter(|c| matches!(c, Command::Send(_) | Command::Edit { .. }))
+            .collect()
     }
 
     #[test]
-    fn composer_is_disabled_without_a_selected_room() {
+    fn composer_enter_sends_the_message_and_clears_the_field() {
+        let (mut app, mut rx) = main_app();
+        type_in(&mut app, "hello");
+        let _ = drain(&mut rx);
+        let _ = app.update(Message::ComposerKey(ComposerKey::Send));
+        let commands = drain(&mut rx);
+        match send_commands(&commands).as_slice() {
+            [Command::Send(message)] => {
+                assert_eq!(message.text.expose(), "hello");
+                assert_eq!(message.room_id, RoomId::from("!a:x"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(
+            commands
+                .iter()
+                .any(|c| matches!(c, Command::SetTyping { typing: false, .. })),
+            "sending stops the typing notice"
+        );
+        assert_eq!(app.composer.text(), "");
+        let _ = app.update(Message::ComposerKey(ComposerKey::Send));
+        assert!(drain(&mut rx).is_empty(), "an empty composer sends nothing");
+        type_in(&mut app, "  \t \n");
+        let _ = drain(&mut rx);
+        let _ = app.update(Message::ComposerKey(ComposerKey::Send));
+        assert!(
+            send_commands(&drain(&mut rx)).is_empty(),
+            "blank text sends nothing"
+        );
+    }
+
+    #[test]
+    fn the_composer_is_disabled_without_a_selected_room() {
         let (mut app, mut rx) = login_app();
         logged_in(&mut app);
         let _ = app.update(core(room_event(&["a"])));
-        let _ = app.update(Message::ComposerChanged(MessageText::from("hello")));
-        assert_eq!(app.composer.expose(), "", "input ignored");
-        let _ = app.update(Message::ComposerSubmitted);
+        let _ = drain(&mut rx);
+        type_in(&mut app, "hello");
+        assert_eq!(app.composer.text(), "", "input ignored");
+        let _ = app.update(Message::ComposerKey(ComposerKey::Send));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn edit_mode_sends_an_edit_and_reply_mode_a_reply() {
+        let (mut app, mut rx) = main_app();
+        app.composer.mode = composer::Mode::Reply("item-1".into());
+        type_in(&mut app, "answer");
+        let _ = drain(&mut rx);
+        let _ = app.update(Message::ComposerKey(ComposerKey::Send));
+        match send_commands(&drain(&mut rx)).as_slice() {
+            [Command::Send(m)] => assert_eq!(m.reply_to.as_deref(), Some("item-1")),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(app.composer.mode, composer::Mode::Normal);
+
+        app.composer.mode = composer::Mode::Edit("item-2".into());
+        type_in(&mut app, "fixed");
+        let _ = drain(&mut rx);
+        let _ = app.update(Message::ComposerKey(ComposerKey::Send));
+        match send_commands(&drain(&mut rx)).as_slice() {
+            [Command::Edit { item_id, message }] => {
+                assert_eq!(item_id, "item-2");
+                assert_eq!(message.text.expose(), "fixed");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(app.composer.mode, composer::Mode::Normal);
+    }
+
+    #[test]
+    fn typing_notices_are_throttled_and_stop_on_clear_and_room_switch() {
+        let (mut app, mut rx) = main_app();
+        let t0 = Instant::now();
+        let key = |c| Action::Edit(Edit::Insert(c));
+        let _ = app.composer_action_at(key('a'), t0);
+        let _ = app.composer_action_at(key('b'), t0 + Duration::from_secs(1));
+        let _ = app.composer_action_at(key('c'), t0 + Duration::from_secs(3));
+        let typing: Vec<bool> = drain(&mut rx)
+            .into_iter()
+            .filter_map(|c| match c {
+                Command::SetTyping { typing, room_id } => {
+                    assert_eq!(room_id, RoomId::from("!a:x"));
+                    Some(typing)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(typing, [true, true]);
+
+        // Emptying the buffer stops it.
+        for _ in 0..3 {
+            let _ =
+                app.composer_action_at(Action::Edit(Edit::Backspace), t0 + Duration::from_secs(4));
+        }
+        assert!(matches!(
+            drain(&mut rx).last(),
+            Some(Command::SetTyping { typing: false, .. })
+        ));
+
+        // Switching room stops it in the room left.
+        let _ = app.composer_action_at(key('x'), t0 + Duration::from_secs(5));
+        let _ = drain(&mut rx);
+        let _ = app.update(Message::SelectRoom(RoomId::from("!b:x")));
+        let commands = drain(&mut rx);
+        assert!(
+            matches!(
+                commands.first(),
+                Some(Command::SetTyping { room_id, typing: false }) if *room_id == RoomId::from("!a:x")
+            ),
+            "{commands:?}"
+        );
+        assert!(matches!(commands.last(), Some(Command::SelectRoom(_))));
+        // Nothing outstanding: another switch sends no stop.
+        let _ = app.update(Message::SelectRoom(RoomId::from("!a:x")));
+        assert!(
+            !drain(&mut rx)
+                .iter()
+                .any(|c| matches!(c, Command::SetTyping { .. }))
+        );
+    }
+
+    #[test]
+    fn mention_queries_are_rate_limited_and_the_answer_fills_the_list() {
+        let (mut app, mut rx) = main_app();
+        let t0 = Instant::now();
+        let key = |c| Action::Edit(Edit::Insert(c));
+        let ms = |n| t0 + Duration::from_millis(n);
+        let _ = app.composer_action_at(key('@'), ms(0));
+        let _ = app.composer_action_at(key('a'), ms(0));
+        let _ = app.composer_action_at(key('l'), ms(40));
+        let _ = app.composer_action_at(key('i'), ms(80));
+        let queries = |commands: Vec<Command>| -> Vec<String> {
+            commands
+                .into_iter()
+                .filter_map(|c| match c {
+                    Command::SearchMembers { query, .. } => Some(query),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(
+            queries(drain(&mut rx)),
+            ["a"],
+            "the burst waits for the timer"
+        );
+        let _ = app.members_due_at(ms(150));
+        assert_eq!(queries(drain(&mut rx)), ["ali"]);
+
+        let answer = |query: &str| {
+            core(CoreEvent::Members {
+                room_id: RoomId::from("!a:x"),
+                query: tessera_core::api::MessageText::from(query),
+                members: vec![tessera_core::api::Member {
+                    user_id: UserId::from("@alice:x"),
+                    display_name: Some("Alice".into()),
+                }],
+            })
+        };
+        let _ = app.update(answer("al"));
+        assert!(
+            !app.composer.suggestions.is_open(),
+            "a stale answer is ignored"
+        );
+        let _ = app.update(answer("ali"));
+        assert!(app.composer.suggestions.is_open());
+        let _ = app.update(Message::SuggestionPicked(0));
+        assert_eq!(app.composer.text(), "@Alice ");
+        assert_eq!(app.composer.mentions.len(), 1);
+    }
+
+    #[test]
+    fn a_members_answer_for_another_room_is_ignored() {
+        let (mut app, _rx) = main_app();
+        type_in(&mut app, "@a");
+        let _ = app.update(core(CoreEvent::Members {
+            room_id: RoomId::from("!b:x"),
+            query: tessera_core::api::MessageText::from("a"),
+            members: vec![tessera_core::api::Member {
+                user_id: UserId::from("@alice:x"),
+                display_name: None,
+            }],
+        }));
+        assert!(!app.composer.suggestions.is_open());
+    }
+
+    #[test]
+    fn suggestion_keys_pick_move_and_escape() {
+        let (mut app, _rx) = main_app();
+        type_in(&mut app, ":smi");
+        assert!(app.composer.suggestions.is_open());
+        let _ = app.update(Message::ComposerKey(ComposerKey::Next));
+        assert_eq!(app.composer.suggestions.selected(), 1);
+        let _ = app.update(Message::ComposerKey(ComposerKey::Previous));
+        assert_eq!(app.composer.suggestions.selected(), 0);
+        let _ = app.update(Message::ComposerKey(ComposerKey::Escape));
+        assert!(!app.composer.suggestions.is_open());
+        type_in(&mut app, "l");
+        let _ = app.update(Message::ComposerKey(ComposerKey::Pick));
+        assert!(!app.composer.suggestions.is_open());
+        assert!(
+            app.composer
+                .text()
+                .chars()
+                .last()
+                .is_some_and(|c| !c.is_ascii())
+        );
+    }
+
+    #[test]
+    fn a_failed_send_or_edit_shows_a_line_for_the_open_room() {
+        let (mut app, _rx) = main_app();
+        let failed = |room: &str, action| {
+            core(CoreEvent::ActionFailed {
+                room_id: RoomId::from(room),
+                action,
+                error: CoreError::Network("offline".into()),
+            })
+        };
+        let _ = app.update(failed("!b:x", ActionKind::Send));
+        assert!(app.send_error.is_none());
+        let _ = app.update(failed("!a:x", ActionKind::Redact));
+        assert!(app.send_error.is_none());
+        let _ = app.update(failed("!a:x", ActionKind::Edit));
+        assert!(app.send_error.is_some());
     }
 
     #[test]
     fn send_failed_shows_a_non_secret_error_for_the_selected_room() {
         let (mut app, _rx) = main_app();
-        let _ = app.update(Message::ComposerChanged(MessageText::from("secret-body-x")));
+        type_in(&mut app, "secret-body-x");
         let _ = app.update(core(CoreEvent::SendFailed {
             room_id: RoomId::from("!b:x"),
             error: CoreError::Network("offline".into()),
@@ -1387,9 +1744,9 @@ mod tests {
     #[test]
     fn changing_room_keeps_no_stale_composer_text() {
         let (mut app, _rx) = main_app();
-        let _ = app.update(Message::ComposerChanged(MessageText::from("draft")));
+        type_in(&mut app, "draft");
         let _ = app.update(Message::SelectRoom(RoomId::from("!b:x")));
-        assert_eq!(app.composer.expose(), "");
+        assert_eq!(app.composer.text(), "");
     }
 
     #[test]
@@ -1402,9 +1759,9 @@ mod tests {
     #[test]
     fn logged_out_clears_the_composer_and_errors() {
         let (mut app, _rx) = main_app();
-        let _ = app.update(Message::ComposerChanged(MessageText::from("draft")));
+        type_in(&mut app, "draft");
         let _ = app.update(core(CoreEvent::LoggedOut));
-        assert_eq!(app.composer.expose(), "");
+        assert_eq!(app.composer.text(), "");
         assert!(app.send_error.is_none());
     }
 
@@ -1553,35 +1910,35 @@ mod tests {
     #[test]
     fn search_keeps_the_open_room_and_its_draft_when_the_filtered_list_lacks_it() {
         let (mut app, _rx) = main_app();
-        let _ = app.update(Message::ComposerChanged(MessageText::from("unsent")));
+        type_in(&mut app, "unsent");
         let _ = app.update(Message::SearchChanged("zzz".into()));
         let _ = app.update(core(room_event(&["z"])));
         assert_eq!(app.selected, Some(RoomId::from("!a:x")));
-        assert_eq!(app.composer.expose(), "unsent");
+        assert_eq!(app.composer.text(), "unsent");
         // Emptied list, too.
         let _ = app.update(core(CoreEvent::RoomListChanged(vec![ListDiff::Clear])));
         assert_eq!(app.selected, Some(RoomId::from("!a:x")));
-        assert_eq!(app.composer.expose(), "unsent");
+        assert_eq!(app.composer.text(), "unsent");
     }
 
     #[test]
     fn switching_tabs_keeps_the_open_room_and_its_draft() {
         let (mut app, _rx) = main_app();
-        let _ = app.update(Message::ComposerChanged(MessageText::from("unsent")));
+        type_in(&mut app, "unsent");
         let _ = app.update(Message::TabSelected(RoomListTab::People));
         let _ = app.update(core(room_event(&["z"])));
         assert_eq!(app.selected, Some(RoomId::from("!a:x")));
-        assert_eq!(app.composer.expose(), "unsent");
+        assert_eq!(app.composer.text(), "unsent");
     }
 
     #[test]
     fn the_open_room_is_deselected_when_the_default_query_loses_it() {
         let (mut app, _rx) = main_app();
-        let _ = app.update(Message::ComposerChanged(MessageText::from("unsent")));
+        type_in(&mut app, "unsent");
         assert_eq!(app.query, RoomListQuery::default());
         let _ = app.update(core(room_event(&["b"])));
         assert_eq!(app.selected, None);
-        assert_eq!(app.composer.expose(), "");
+        assert_eq!(app.composer.text(), "");
 
         // Also after returning to the default query.
         let (mut app, _rx) = main_app();

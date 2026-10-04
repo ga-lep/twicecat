@@ -163,11 +163,17 @@ impl Bridge {
     /// A task that yields [`Message::ShutdownDeadline`] after `after`. The
     /// timer runs on the core's runtime.
     pub fn deadline(&self, after: Duration) -> Task<Message> {
+        self.timer(after, Message::ShutdownDeadline)
+    }
+
+    /// A task that yields `message` after `after`. The timer runs on the
+    /// core's runtime.
+    pub fn timer(&self, after: Duration, message: Message) -> Task<Message> {
         let timer = spawn_timer(&self.handle, after);
         Task::future(async move {
             // The timer ends either way (done, or runtime gone).
             let _ = timer.await;
-            Message::ShutdownDeadline
+            message
         })
     }
 }

@@ -5,7 +5,9 @@
 
 pub mod avatars;
 pub mod bridge;
+pub mod composer;
 pub mod dates;
+pub mod emoji;
 pub mod links;
 pub mod rich_text;
 pub mod room_list;

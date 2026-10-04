@@ -234,6 +234,132 @@ fn login_reaches_main_with_rooms_and_shutdown_closes_the_bridge() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Types `text` into the composer through `update`, one editor action per
+/// character, like the text editor widget publishes them.
+fn type_into_composer(app: &mut App, text: &str) {
+    use iced::widget::text_editor::{Action, Edit};
+    use tessera_app::composer::EditorAction;
+    for c in text.chars() {
+        let _ = app.update(Message::Composer(EditorAction(Action::Edit(Edit::Insert(
+            c,
+        )))));
+    }
+}
+
+/// Whether the applied timeline holds a message whose rich text is exactly
+/// the bold word `word`.
+fn timeline_has_bold_message(app: &App, word: &str) -> bool {
+    use tessera_core::api::{Block, Inline, TimelineItemKind};
+    app.timeline.items.iter().any(|item| match &item.kind {
+        TimelineItemKind::Message { details, .. } => matches!(
+            details.content.blocks.as_slice(),
+            [Block::Paragraph(inlines)] if matches!(
+                inlines.as_slice(),
+                [Inline::Text { text, style }] if text == word && style.bold
+            )
+        ),
+        _ => false,
+    })
+}
+
+#[test]
+#[ignore = "needs local homeserver: docker compose up -d --wait"]
+fn typing_markdown_and_pressing_enter_shows_a_bold_message_in_the_timeline() {
+    use tessera_app::composer::{Key, KeyInput, bind};
+    let env = TestEnv::load();
+    let base = env.get("HOMESERVER_URL").to_owned();
+    let user = env.get("TEST_USER_1").to_owned();
+    let password = env.get("TEST_PASSWORD_1").to_owned();
+    ensure_one_room(&base, &user, &password);
+
+    let dir = scratch_dir();
+    let (bridge, slot) = Bridge::start(
+        CoreConfig {
+            data: DataPaths::at(&dir),
+            homeserver_override: Some(base),
+            room_list_page_size: tessera_core::DEFAULT_ROOM_LIST_PAGE_SIZE,
+        },
+        Arc::new(InMemorySecretStore::new()),
+    )
+    .expect("start the bridge");
+    let (mut app, _boot) = App::new(Startup {
+        sink: Box::new(bridge),
+        events: slot.clone(),
+    });
+    let pump = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("pump runtime");
+    let mut events = events_stream(&slot).boxed();
+    let mut next = |app: &mut App, wait: Duration| {
+        pump.block_on(async {
+            match tokio::time::timeout(wait, events.next()).await {
+                Ok(Some(BridgeEvent::Core(event))) => {
+                    let _ = app.update(Message::Core(Box::new(event)));
+                    true
+                }
+                Ok(Some(BridgeEvent::Closed)) => {
+                    let _ = app.update(Message::CoreClosed);
+                    true
+                }
+                Ok(None) | Err(_) => false,
+            }
+        })
+    };
+    let deadline = |secs| std::time::Instant::now() + Duration::from_secs(secs);
+
+    let limit = deadline(60);
+    while app.screen != Screen::Login {
+        assert!(std::time::Instant::now() < limit, "no login screen in 60 s");
+        next(&mut app, Duration::from_secs(5));
+    }
+    let _ = app.update(Message::UsernameChanged(user));
+    let _ = app.update(Message::PasswordChanged(tessera_core::api::Password::from(
+        password,
+    )));
+    let _ = app.update(Message::LoginSubmitted);
+    let limit = deadline(60);
+    while !(app.screen == Screen::Main && !app.rooms.is_empty()) {
+        assert!(
+            std::time::Instant::now() < limit,
+            "not in Main with a room within 60 s"
+        );
+        next(&mut app, Duration::from_secs(5));
+    }
+
+    // Select a room, type markdown and press Enter, all through `update`.
+    let room = app.rooms[0].id.clone();
+    let _ = app.update(Message::SelectRoom(room));
+    type_into_composer(&mut app, "**hi**");
+    let enter = KeyInput {
+        key: Key::Enter,
+        shift: false,
+    };
+    let message = bind(enter, app.composer.suggestions.is_open())
+        .message()
+        .expect("Enter sends when no suggestion list is open");
+    let _ = app.update(message);
+    assert_eq!(app.composer.text(), "", "the composer resets after sending");
+
+    let limit = deadline(30);
+    while !timeline_has_bold_message(&app, "hi") {
+        assert!(
+            std::time::Instant::now() < limit,
+            "no bold `hi` message in the timeline within 30 s"
+        );
+        next(&mut app, Duration::from_secs(1));
+    }
+
+    let _ = app.update(Message::CloseRequested);
+    let limit = deadline(10);
+    while !app.exit_requested {
+        assert!(std::time::Instant::now() < limit, "no CoreClosed in 10 s");
+        next(&mut app, Duration::from_secs(1));
+    }
+    drop(app);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn only_loopback_http_urls_count_as_local() {
     for ok in [

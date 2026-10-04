@@ -1,10 +1,11 @@
 //! The two-pane main layout: the room list pane on the left and the room view
 //! (timeline pane and composer) on the right.
 
-use iced::widget::{button, column, container, row, space, text, text_input};
+use iced::widget::{button, column, container, row, space, text, text_editor};
 use iced::{Element, Fill};
-use tessera_core::api::{MessageText, UserId};
+use tessera_core::api::UserId;
 
+use crate::composer::{self, EditorAction, Mode, Suggestions};
 use crate::links::LinkBar;
 use crate::screens::loading::sync_label;
 use crate::screens::timeline_pane::RichEnv;
@@ -59,15 +60,111 @@ fn room_pane(app: &App) -> Element<'_, Message> {
         body = body.push(text(error.as_str()).style(text::danger));
     }
     let enabled = selected.is_some();
-    body = body.push(
-        text_input("Message", app.composer.expose())
-            .on_input_maybe(
-                enabled.then_some(|s: String| Message::ComposerChanged(MessageText::from(s))),
-            )
-            .on_submit_maybe(enabled.then_some(Message::ComposerSubmitted))
-            .padding(8),
-    );
+    if let Some(list) = suggestion_list(&app.composer.suggestions) {
+        body = body.push(list);
+    }
+    if let Some(bar) = mode_bar(&app.composer.mode) {
+        body = body.push(bar);
+    }
+    body = body.push(editor(app, enabled));
     container(body).width(Fill).height(Fill).padding(8).into()
+}
+
+/// Tallest the editor grows before it scrolls, in pixels.
+const EDITOR_MAX_HEIGHT: f32 = 160.0;
+
+/// The composer's text editor. Without a selected room it has no `on_action`,
+/// which disables it.
+fn editor(app: &App, enabled: bool) -> Element<'_, Message> {
+    let open = app.composer.suggestions.is_open();
+    let mut editor = text_editor(app.composer.content())
+        .placeholder("Message")
+        .padding(8)
+        .max_height(EDITOR_MAX_HEIGHT)
+        .key_binding(move |press| composer::binding(press, open));
+    if enabled {
+        editor = editor.on_action(|action| Message::Composer(EditorAction(action)));
+    }
+    editor.into()
+}
+
+/// The reply or edit bar above the editor.
+fn mode_bar(mode: &Mode) -> Option<Element<'_, Message>> {
+    let label = match mode {
+        Mode::Normal => return None,
+        Mode::Reply(_) => "Replying to a message",
+        Mode::Edit(_) => "Editing a message",
+    };
+    Some(
+        container(
+            row![
+                text(label),
+                space().width(Fill),
+                button(text("Cancel"))
+                    .on_press(Message::ComposerKey(composer::ComposerKey::Escape))
+                    .style(button::secondary),
+            ]
+            .spacing(8)
+            .align_y(iced::Center),
+        )
+        .padding(4)
+        .into(),
+    )
+}
+
+/// The autocomplete rows (members or emojis) above the editor, or `None`
+/// while there is nothing to pick.
+fn suggestion_list(suggestions: &Suggestions) -> Option<Element<'_, Message>> {
+    let rows: Vec<(String, bool)> = match suggestions {
+        Suggestions::Closed => return None,
+        Suggestions::Mentions {
+            members, selected, ..
+        } => members
+            .iter()
+            .enumerate()
+            .map(|(i, member)| (member_row_label(member), i == *selected))
+            .collect(),
+        Suggestions::Emoji {
+            items, selected, ..
+        } => items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| {
+                (
+                    format!("{} :{}:", item.glyph, item.shortcode),
+                    i == *selected,
+                )
+            })
+            .collect(),
+    };
+    if rows.is_empty() {
+        return None;
+    }
+    let mut list = column![].spacing(2);
+    for (index, (label, selected)) in rows.into_iter().enumerate() {
+        list = list.push(
+            button(text(label))
+                .on_press(Message::SuggestionPicked(index))
+                .width(Fill)
+                .style(if selected {
+                    button::primary
+                } else {
+                    button::text
+                }),
+        );
+    }
+    Some(container(list).padding(4).into())
+}
+
+/// One member row: the display name and the user ID, sanitised and capped.
+pub fn member_row_label(member: &tessera_core::api::Member) -> String {
+    let id = one_line_capped(member.user_id.as_str(), MAX_NAME_CHARS);
+    match member.display_name.as_deref() {
+        Some(name) if !name.trim().is_empty() => {
+            format!("{} ({id})", one_line_capped(name, MAX_NAME_CHARS))
+        }
+        _ => id,
+    }
 }
 
 /// What the link bar says. Only the host of a link is ever shown.
