@@ -1462,6 +1462,7 @@ impl Engine {
         {
             Ok((session, outgoing)) => {
                 let voice = Some(session.voice());
+                let cleaning_backend = Some(session.remote_cleaning());
                 self.audio_session = Some(session);
                 CallAudio {
                     voice,
@@ -1469,6 +1470,7 @@ impl Engine {
                     bitrate_kbps,
                     cleaning,
                     announce,
+                    cleaning_backend,
                 }
             }
             Err(e) => {
@@ -1479,6 +1481,7 @@ impl Engine {
                     bitrate_kbps,
                     cleaning,
                     announce,
+                    cleaning_backend: None,
                 }
             }
         }

@@ -33,9 +33,9 @@ use tessera_audio::{FRAME_LEN, Outgoing, SAMPLE_RATE, SILENCE, SourceId};
 use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 
-use super::UserVolumes;
 use super::cleaning::{ANNOUNCE_KEY, Claim, Cleaning};
 use super::jwt::SfuAccess;
+use super::{UserVolumes, user_volume};
 use crate::api::{CleaningStatus, CoreError, UserId};
 use crate::audio_session::{self, Voice};
 
@@ -121,19 +121,15 @@ pub(crate) fn user_of(identity: &str) -> &str {
     identity.rsplit_once(':').map_or(identity, |(user, _)| user)
 }
 
-fn to_i16(frame: &tessera_audio::Frame) -> Vec<i16> {
-    frame
-        .iter()
-        .map(|s| (s.clamp(-1.0, 1.0) * f32::from(i16::MAX)) as i16)
-        .collect()
+/// `frame` as 16-bit samples, clipped, into `out`.
+fn to_i16(frame: &tessera_audio::Frame, out: &mut [i16; FRAME_LEN]) {
+    for (o, s) in out.iter_mut().zip(frame) {
+        *o = (s.clamp(-1.0, 1.0) * f32::from(i16::MAX)) as i16;
+    }
 }
 
 fn volume_of(volumes: &UserVolumes, identity: &str) -> u16 {
-    volumes
-        .read()
-        .ok()
-        .and_then(|v| v.get(&UserId::from(user_of(identity))).copied())
-        .unwrap_or(100)
+    user_volume(volumes, &UserId::from(user_of(identity)))
 }
 
 /// The subscribed remote audio tracks of one connection and the ones
@@ -152,7 +148,7 @@ impl Players {
         if let Some((id, task)) = self.playing.remove(identity) {
             task.abort();
             if let Some(voice) = voice {
-                audio_session::remove_source(voice, id);
+                audio_session::voice_control(voice).remove_source(id);
             }
             if let Some(cleaning) = &self.cleaning {
                 cleaning.remove(identity);
@@ -179,7 +175,8 @@ impl Players {
             if self.playing.contains_key(identity) || !self.expected.contains(identity) {
                 continue;
             }
-            let Some((id, input)) = audio_session::add_source(voice, volume_of(volumes, identity))
+            let Some((id, input)) =
+                audio_session::voice_control(voice).add_source(volume_of(volumes, identity))
             else {
                 tracing::warn!("mixer queue full; a participant is not played");
                 continue;
@@ -218,6 +215,7 @@ pub(crate) struct SfuConnection {
 }
 
 /// What a connection needs besides its SFU access.
+#[derive(Clone)]
 pub(crate) struct ConnectionShared {
     /// The call's frame encryption (one key provider for all SFUs), in an
     /// encrypted room.
@@ -354,7 +352,7 @@ impl SfuConnection {
         let players = self.players.lock().expect("players lock");
         for (identity, (id, _)) in &players.playing {
             if user_of(identity) == user.as_str() {
-                audio_session::set_source_volume(voice, *id, percent);
+                audio_session::voice_control(voice).set_source_volume(*id, percent);
             }
         }
     }
@@ -424,13 +422,15 @@ async fn announce(
 /// Moves processed microphone frames into the LiveKit source as they come.
 async fn send_microphone(mut outgoing: Outgoing, source: NativeAudioSource) {
     let mut frame = SILENCE;
+    let mut samples = [0_i16; FRAME_LEN];
     let mut ticker = tokio::time::interval(Duration::from_millis(5));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticker.tick().await;
         while outgoing.pop_frame(&mut frame) {
+            to_i16(&frame, &mut samples);
             let audio = AudioFrame {
-                data: to_i16(&frame).into(),
+                data: samples[..].into(),
                 sample_rate: SAMPLE_RATE,
                 num_channels: 1,
                 samples_per_channel: FRAME_LEN as u32,
@@ -710,8 +710,8 @@ mod tests {
         f[0] = 1.0;
         f[1] = -2.0;
         f[2] = 0.5;
-        let s = to_i16(&f);
-        assert_eq!(s.len(), FRAME_LEN);
+        let mut s = [0; FRAME_LEN];
+        to_i16(&f, &mut s);
         assert_eq!(s[0], i16::MAX);
         assert_eq!(s[1], -i16::MAX);
         assert_eq!(s[2], i16::MAX / 2);

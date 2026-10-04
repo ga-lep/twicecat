@@ -4,7 +4,7 @@
 //! Message bodies are printed to stdout because that is the program's output;
 //! nothing here sends a token, password, or message body to the log.
 
-#[path = "tessera-cli/calls.rs"]
+#[path = "tessera-cli/calls/mod.rs"]
 mod calls;
 
 use std::collections::HashSet;
@@ -85,6 +85,9 @@ CALLS (voice, MatrixRTC; joining opens the microphone and speakers):
     /clean outside on|off
                           Your microphone is cleaned before Tessera (NVIDIA
                           Broadcast, a Krisp app): announced as cleaned
+    /clean gpu on|off     Clean them on a GPU (needs a gpu-enhancement build;
+                          every talker at once, little CPU; the CPU takes
+                          over if no GPU keeps up)
 
 AUDIO SETTINGS (saved; take effect at the next call or mic test):
     /audio                Show the audio settings

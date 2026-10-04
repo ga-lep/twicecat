@@ -2,13 +2,13 @@
 //! a task that reports levels and statistics. Used by the mic test now and
 //! by calls (Phase 6 Task 8).
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use tessera_audio::{
     AudioIo, ChainSettings, DeepFilter, DeepFilterStatus, Frame, GateMode, IoConfig, IoEvent,
-    NoiseMode, NsLevel as AudioNsLevel, Outgoing, Realtime, SourceId, SourceInput, VirtualDevice,
-    VoiceControl, VoiceEngine,
+    NoiseMode, NsLevel as AudioNsLevel, Outgoing, Realtime, VirtualDevice, VoiceControl,
+    VoiceEngine,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -111,6 +111,16 @@ impl VirtualDevice for Virtual {
 /// The voice engine's control handle, shared with the media layer.
 pub(crate) type Voice = Arc<Mutex<VoiceControl>>;
 
+/// Locks the voice engine's control handle. Its methods only queue commands
+/// and never panic, so a poisoned lock is used as it is.
+pub(crate) fn voice_control(voice: &Voice) -> MutexGuard<'_, VoiceControl> {
+    voice.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Where other people's voices are cleaned: set by the call's cleaning
+/// manager, reported in `AudioStats::remote_cleaning`.
+pub(crate) type CleaningBackend = Arc<Mutex<Option<EnhancerBackend>>>;
+
 /// The DeepFilterNet3 a session asked for, and where it runs.
 #[derive(Default)]
 struct EnhancerState {
@@ -140,6 +150,7 @@ pub(crate) struct AudioSession {
     io_config: IoConfig,
     /// The DeepFilterNet loaded or loading.
     enhancer: Arc<Mutex<EnhancerState>>,
+    remote_cleaning: CleaningBackend,
     events: mpsc::Sender<CoreEvent>,
     stop: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<()>>,
@@ -188,11 +199,12 @@ impl AudioSession {
         };
         let (stop_tx, stop_rx) = oneshot::channel();
         let enhancer = Arc::new(Mutex::new(EnhancerState::default()));
+        let remote_cleaning = CleaningBackend::default();
         let task = tokio::spawn(report(
             io,
             drain,
             control.clone(),
-            enhancer.clone(),
+            (enhancer.clone(), remote_cleaning.clone()),
             events.clone(),
             stop_rx,
         ));
@@ -201,6 +213,7 @@ impl AudioSession {
             mode,
             io_config,
             enhancer,
+            remote_cleaning,
             events,
             stop: Some(stop_tx),
             task: Some(task),
@@ -228,11 +241,8 @@ impl AudioSession {
             {
                 if limit != attenuation_limit_db {
                     state.wanted = Some((gpu, attenuation_limit_db));
-                    let _ = self
-                        .control
-                        .lock()
-                        .expect("voice control lock")
-                        .set_enhancer_attenuation(attenuation_limit_db);
+                    let _ =
+                        voice_control(&self.control).set_enhancer_attenuation(attenuation_limit_db);
                 }
                 return;
             }
@@ -282,7 +292,7 @@ impl AudioSession {
                         return;
                     };
                     {
-                        let mut control = control.lock().expect("voice control lock");
+                        let mut control = voice_control(&control);
                         let _ = control.set_enhancer(Some(Box::new(filter)));
                         if limit != attenuation_limit_db {
                             let _ = control.set_enhancer_attenuation(limit);
@@ -330,7 +340,7 @@ impl AudioSession {
             return false;
         }
         {
-            let mut control = self.control.lock().expect("voice control lock");
+            let mut control = voice_control(&self.control);
             control.configure(chain_settings(settings));
             control.set_master_volume(settings.output_volume_percent);
         }
@@ -340,31 +350,27 @@ impl AudioSession {
 
     /// Push-to-talk key state.
     pub(crate) fn push_to_talk(&self, pressed: bool) {
-        self.control
-            .lock()
-            .expect("voice control lock")
-            .push_to_talk(pressed);
+        voice_control(&self.control).push_to_talk(pressed);
     }
 
     /// Mute the microphone (the meter keeps working).
     pub(crate) fn set_muted(&self, muted: bool) {
-        self.control
-            .lock()
-            .expect("voice control lock")
-            .set_muted(muted);
+        voice_control(&self.control).set_muted(muted);
     }
 
     /// Play nothing.
     pub(crate) fn set_deafened(&self, deafened: bool) {
-        self.control
-            .lock()
-            .expect("voice control lock")
-            .set_deafened(deafened);
+        voice_control(&self.control).set_deafened(deafened);
     }
 
     /// The control handle, for the media layer's sources.
     pub(crate) fn voice(&self) -> Voice {
         self.control.clone()
+    }
+
+    /// Where the call says other voices are cleaned.
+    pub(crate) fn remote_cleaning(&self) -> CleaningBackend {
+        self.remote_cleaning.clone()
     }
 
     /// What this session is for.
@@ -383,28 +389,6 @@ impl AudioSession {
     }
 }
 
-/// Adds a remote source at the user's volume.
-pub(crate) fn add_source(voice: &Voice, volume_percent: u16) -> Option<(SourceId, SourceInput)> {
-    voice
-        .lock()
-        .ok()
-        .and_then(|mut c| c.add_source(volume_percent))
-}
-
-/// Removes a remote source.
-pub(crate) fn remove_source(voice: &Voice, id: SourceId) {
-    if let Ok(mut c) = voice.lock() {
-        c.remove_source(id);
-    }
-}
-
-/// Changes a remote source's volume.
-pub(crate) fn set_source_volume(voice: &Voice, id: SourceId, percent: u16) {
-    if let Ok(mut c) = voice.lock() {
-        c.set_source_volume(id, percent);
-    }
-}
-
 impl Drop for AudioSession {
     fn drop(&mut self) {
         // Without `stop`, the reporting task still ends: its stop channel
@@ -418,8 +402,8 @@ impl Drop for AudioSession {
 async fn report(
     io: AudioIo,
     mut drain: Option<Outgoing>,
-    control: Arc<Mutex<VoiceControl>>,
-    enhancer: Arc<Mutex<EnhancerState>>,
+    control: Voice,
+    (enhancer, remote_cleaning): (Arc<Mutex<EnhancerState>>, CleaningBackend),
     events: mpsc::Sender<CoreEvent>,
     mut stop: oneshot::Receiver<()>,
 ) {
@@ -455,7 +439,7 @@ async fn report(
             }
         }
         let (meters, stats) = {
-            let mut control = control.lock().expect("voice control lock");
+            let mut control = voice_control(&control);
             let meters = control.meters();
             ticks += 1;
             let stats = ticks.is_multiple_of(STATS_EVERY).then(|| control.stats());
@@ -482,6 +466,7 @@ async fn report(
                 max_wake_us: u32::try_from(io.take_recent_max_wake_us()).unwrap_or(u32::MAX),
                 capture_overruns: since(now.capture_overruns, last_io.capture_overruns),
                 playback_underruns: since(now.playback_underruns, last_io.playback_underruns),
+                remote_cleaning: remote_cleaning.lock().ok().and_then(|r| *r),
             });
             last_io = now;
             if events.send(stats).await.is_err() {

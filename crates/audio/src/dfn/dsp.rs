@@ -121,6 +121,13 @@ impl Stft {
         }
     }
 
+    /// Back to silence before the first frame.
+    #[cfg(feature = "onnxruntime")]
+    pub(crate) fn reset(&mut self) {
+        self.analysis_mem.fill(0.0);
+        self.synthesis_mem.fill(0.0);
+    }
+
     /// Number of frequency bins (`fft_size / 2 + 1`).
     pub(crate) fn bins(&self) -> usize {
         self.spec.len()
@@ -183,8 +190,16 @@ pub(crate) struct Features {
 }
 
 fn ramp(from: f32, to: f32, n: usize) -> Vec<f32> {
-    let step = (to - from) / (n - 1) as f32;
-    (0..n).map(|i| from + i as f32 * step).collect()
+    let mut out = vec![0.0; n];
+    ramp_into((from, to), &mut out);
+    out
+}
+
+fn ramp_into((from, to): (f32, f32), out: &mut [f32]) {
+    let step = (to - from) / (out.len() - 1) as f32;
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = from + i as f32 * step;
+    }
 }
 
 impl Features {
@@ -196,6 +211,13 @@ impl Features {
             mean_norm: ramp(MEAN_NORM_INIT.0, MEAN_NORM_INIT.1, bands),
             unit_norm: ramp(UNIT_NORM_INIT.0, UNIT_NORM_INIT.1, df_bins),
         }
+    }
+
+    /// Back to the initial normalisation, without allocating.
+    #[cfg(feature = "onnxruntime")]
+    pub(crate) fn reset(&mut self) {
+        ramp_into(MEAN_NORM_INIT, &mut self.mean_norm);
+        ramp_into(UNIT_NORM_INIT, &mut self.unit_norm);
     }
 
     pub(crate) fn widths(&self) -> &[usize] {
@@ -236,22 +258,22 @@ pub(crate) fn apply_gains(spec: &mut [Complex32], gains: &[f32], widths: &[usize
     }
 }
 
-/// The deep filter: each of the lowest `coefs.len() / order` bins of `out`
-/// becomes the sum over the frames in `history` (oldest first) of that bin
-/// times its complex coefficient. `coefs` is `[bin][frame]`.
-pub(crate) fn deep_filter(
-    history: &[&[Complex32]],
-    coefs: &[Complex32],
+/// The deep filter: each of the lowest `coefs.len() / (2 * order)` bins of
+/// `out` becomes the sum over the frames of `history` (oldest first, `order`
+/// of them) of that bin times its complex coefficient. `coefs` is
+/// `[bin][frame]`, each an interleaved real and imaginary part.
+pub(crate) fn deep_filter<'a>(
+    history: impl Iterator<Item = &'a [Complex32]> + Clone,
+    coefs: &[f32],
     order: usize,
     out: &mut [Complex32],
 ) {
-    let bins = coefs.len() / order;
-    for (f, o) in out.iter_mut().take(bins).enumerate() {
-        let taps = &coefs[f * order..(f + 1) * order];
+    let bins = out.iter_mut().zip(coefs.chunks_exact(2 * order));
+    for (bin, (o, taps)) in bins.enumerate() {
         *o = history
-            .iter()
-            .zip(taps)
-            .map(|(frame, c)| frame[f] * c)
+            .clone()
+            .zip(taps.chunks_exact(2))
+            .map(|(frame, c)| frame[bin] * Complex32::new(c[0], c[1]))
             .sum();
     }
 }
@@ -330,14 +352,9 @@ mod tests {
         let b = [Complex32::new(0.0, 1.0); 4];
         let history: [&[Complex32]; 2] = [&a, &b];
         // Two bins, order 2: bin 0 takes 2·a + 1·b, bin 1 takes i·a.
-        let coefs = [
-            Complex32::new(2.0, 0.0),
-            Complex32::new(1.0, 0.0),
-            Complex32::new(0.0, 1.0),
-            Complex32::new(0.0, 0.0),
-        ];
+        let coefs = [2.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
         let mut out = [Complex32::new(9.0, 9.0); 4];
-        deep_filter(&history, &coefs, 2, &mut out);
+        deep_filter(history.into_iter(), &coefs, 2, &mut out);
         assert_eq!(out[0], Complex32::new(2.0, 1.0));
         assert_eq!(out[1], Complex32::new(0.0, 1.0));
         assert_eq!(out[2], Complex32::new(9.0, 9.0), "higher bins untouched");

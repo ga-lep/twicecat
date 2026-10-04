@@ -377,7 +377,12 @@ Each task follows the full Phase 1 gate: fmt, clippy -D warnings, tests, `check-
      - Policy `skip_cleaned`: neural (default), any suppressor, never. The per-person choice wins.
      - Outgoing setting `announce_cleaning { enabled, cleaned_outside }`; status `Skipped(AlreadyClean)`.
      - Test: carol's tone, announced as cleaned outside Tessera, is skipped at alice (0.287). Once carol stops announcing, or alice sets her to always, it is cleaned (0.0001).
-   - **Not done:** batched GPU (part 3), the Frame's limit, a browser client's flags checked by a human.
+   - **Part 3 (built 2026-10-04): batched GPU.**
+     - The model runner runs several rows (the export's batch axis), each with its own state and a per-row reset. DeepFilterNet's signal side is split from its networks.
+     - `DeepFilterBank` makes one GPU call per frame for every voice. The voice engine gives voices rows of a bank (`BatchCleaner`). The core loads a bank of 16 rows per call with the `gpu` setting, and the CPU filters take over when no GPU keeps up or the bank gives up. `AudioStats::remote_cleaning` says where the cleaning runs.
+     - Measured on an RTX 5090: a call for 1 / 16 rows costs 120 / 150 µs on TensorRT, 340 / 430 µs on CUDA and 590 / 650 µs on WebGPU. The whole engine cleaning 16 talking voices costs 296 µs per frame on TensorRT, against 1.17 ms for 4 on the CPU. Each voice agrees with its own CPU filter within 63 dB or better.
+     - Found on the way: TensorRT's engine cache now carries the batch size; CUDA threads running a loop use the thread-local capture mode (a session opened beside a running loop broke it); WebGPU work is kept to one thread at a time (two threads crashed the process).
+   - **Not done:** the Frame's limit, a browser client's flags and the GPU path by ear (human items). Found by its checks and fixed: a WebGPU device left alive at exit crashed the process in NVIDIA's Vulkan driver (since Task 13b part 4); the plugin is now registered only while a WebGPU session lives.
 
 ## Dependencies (approved 2026-10-02, newest releases, exact pins)
 | Crate | Version | Licence | Used by | Added in task |

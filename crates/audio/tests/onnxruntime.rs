@@ -4,6 +4,10 @@
 //! from `scripts/export-deepfilternet.sh` on the GPU against the CPU graphs.
 //! The CUDA build finds NVIDIA's libraries installed system-wide or fetched
 //! by `scripts/fetch-cuda-runtime.sh`.
+//!
+//! Run together, these tests also check that the process exits cleanly: a
+//! WebGPU device still alive at exit crashed it inside NVIDIA's Vulkan driver
+//! (`crate::onnx` now releases the device with the last WebGPU session).
 
 #![cfg(feature = "onnxruntime")]
 
@@ -12,8 +16,8 @@ use std::time::{Duration, Instant};
 
 use tessera_audio::onnx::{Accelerator, OnnxRuntime, default_runtime_dir};
 use tessera_audio::{
-    DeepFilter, DeepFilterBackend, FRAME_LEN, Frame, default_model_dir, default_stateful_model,
-    flush_denormals_on_this_thread,
+    BatchCleaner, DeepFilter, DeepFilterBackend, DeepFilterBank, FRAME_LEN, Frame,
+    default_model_dir, default_stateful_model, flush_denormals_on_this_thread,
 };
 
 #[test]
@@ -88,13 +92,17 @@ static GPU: Mutex<()> = Mutex::new(());
 /// 4 Hz) in white noise, repeated: deterministic, and it makes every stage
 /// of the filter run (noise-only, mixed and clean-ish frames).
 fn voice_in_noise(frames: usize) -> Vec<f32> {
-    let mut seed = 0x9e37_79b9_u32;
+    voice_in_noise_at(frames, 140.0, 0x9e37_79b9)
+}
+
+/// As [`voice_in_noise`], at another pitch and with other noise.
+fn voice_in_noise_at(frames: usize, pitch: f32, mut seed: u32) -> Vec<f32> {
     (0..frames * FRAME_LEN)
         .map(|n| {
             let t = n as f32 / 48_000.0;
             let syllable = (std::f32::consts::TAU * 4.0 * t).sin().max(0.0);
             let voice: f32 = (1..=12)
-                .map(|h| (std::f32::consts::TAU * 140.0 * h as f32 * t).sin() / h as f32)
+                .map(|h| (std::f32::consts::TAU * pitch * h as f32 * t).sin() / h as f32)
                 .sum();
             seed ^= seed << 13;
             seed ^= seed >> 17;
@@ -203,6 +211,189 @@ fn deepfilternet_on_the_gpu_sounds_like_on_the_cpu() {
     }
 }
 
+/// How close `b` is to `a`, dB (signal over difference).
+fn agreement_db(a: &[f32], b: &[f32]) -> f32 {
+    let energy = |x: &mut dyn Iterator<Item = f32>| x.map(|s| s * s).sum::<f32>();
+    let signal = energy(&mut a.iter().copied());
+    let difference = energy(&mut a.iter().zip(b).map(|(x, y)| x - y));
+    10.0 * (signal / difference.max(1e-20)).log10()
+}
+
+/// Several voices in one batched GPU call per frame (plan Task 16): each
+/// comes out as its own CPU filter makes it, in any row, and a row given to
+/// a new voice halfway starts afresh while the others go on. Also prints
+/// what a call costs for 1, 4 and 16 rows.
+#[test]
+#[ignore = "needs scripts/fetch-onnxruntime.sh cuda13, fetch-models.sh, export-deepfilternet.sh and a GPU"]
+fn a_bank_cleans_each_voice_as_its_own_filter_would() {
+    let _gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    flush_denormals_on_this_thread();
+    let runtime =
+        OnnxRuntime::load(&default_runtime_dir().expect("run scripts/fetch-onnxruntime.sh"))
+            .expect("load ONNX Runtime");
+    let dir = default_model_dir().unwrap();
+    let model = default_stateful_model().unwrap();
+    assert!(model.exists(), "run scripts/export-deepfilternet.sh");
+    const FRAMES: usize = 600;
+    const SWAP: usize = 300;
+    let voices: Vec<Vec<f32>> = [(110.0, 1), (140.0, 2), (180.0, 3), (220.0, 4), (95.0, 5)]
+        .iter()
+        .map(|&(pitch, seed)| voice_in_noise_at(FRAMES, pitch, 0x9e37_79b9 ^ seed))
+        .collect();
+    // Voices 0 to 3 in rows 0, 5, 9, 15; voice 4 takes row 9 at `SWAP`.
+    let rows = [0, 5, 9, 15];
+    let reference = |voice: usize, from: usize| {
+        let mut cpu = DeepFilter::load(&dir, 100.0).expect("load the CPU graphs");
+        filter(&voices[voice][from * FRAME_LEN..], &mut cpu).0
+    };
+    let expected: Vec<Vec<f32>> = (0..4).map(|v| reference(v, 0)).collect();
+    let newcomer = reference(4, SWAP);
+
+    let mut compared = 0;
+    for candidate in [
+        Accelerator::Cuda,
+        Accelerator::TensorRt,
+        Accelerator::WebGpu,
+    ] {
+        if !runtime.accelerators().contains(&candidate) {
+            continue;
+        }
+        let mut costs = Vec::new();
+        for size in [1, 4] {
+            if let Some(small) =
+                DeepFilterBank::load(&dir, &model, size, 100.0, &runtime, &[candidate]).unwrap()
+            {
+                costs.push((size, small.call_time()));
+            }
+        }
+        let Some(mut bank) =
+            DeepFilterBank::load(&dir, &model, 16, 100.0, &runtime, &[candidate]).unwrap()
+        else {
+            eprintln!("{candidate:?} did not start here, or is too slow for 16 rows");
+            continue;
+        };
+        costs.push((16, bank.call_time()));
+        for &row in &rows {
+            bank.reset_row(row).unwrap();
+        }
+        let mut outputs = vec![Vec::new(); 5];
+        let mut times = Vec::new();
+        for frame in 0..FRAMES {
+            if frame == SWAP {
+                bank.reset_row(9).unwrap();
+            }
+            let playing = if frame < SWAP {
+                [0, 1, 2, 3]
+            } else {
+                [0, 1, 4, 3]
+            };
+            let mut frames: Vec<Frame> = playing
+                .iter()
+                .map(|&v| {
+                    voices[v][frame * FRAME_LEN..][..FRAME_LEN]
+                        .try_into()
+                        .unwrap()
+                })
+                .collect();
+            let start = Instant::now();
+            bank.clean(&mut frames, &rows).expect("clean");
+            times.push(start.elapsed());
+            for (&v, out) in playing.iter().zip(&frames) {
+                outputs[v].extend_from_slice(out);
+            }
+        }
+        times.sort();
+        let agreements: Vec<f32> = (0..4)
+            .map(|v| {
+                let len = outputs[v].len();
+                agreement_db(&expected[v][..len], &outputs[v])
+            })
+            .chain([agreement_db(&newcomer, &outputs[4])])
+            .collect();
+        eprintln!(
+            "{candidate:?}, 16 rows, 4 voices: agreement with each voice's CPU filter {agreements:.1?} dB; \
+             per frame (4 voices' signal side and the call) median {:?}, p99 {:?}; \
+             a call at warm-up: {costs:?}",
+            times[times.len() / 2],
+            times[times.len() * 99 / 100],
+        );
+        // As the single-voice GPU filter against the CPU (60 dB there).
+        for (v, a) in agreements.iter().enumerate() {
+            assert!(*a > 60.0, "{candidate:?}, voice {v}: {a:.1} dB");
+        }
+        compared += 1;
+    }
+    if compared == 0 {
+        eprintln!("no GPU backend started here: nothing to compare");
+    }
+}
+
+/// A bank loads (and captures its graph) while the microphone's GPU filter
+/// runs on another thread, as in a call: neither may fail or fall back.
+#[test]
+#[ignore = "needs scripts/fetch-onnxruntime.sh cuda13, fetch-models.sh, export-deepfilternet.sh and a GPU"]
+fn a_bank_loads_while_a_gpu_filter_runs() {
+    let _gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    let runtime =
+        OnnxRuntime::load(&default_runtime_dir().expect("run scripts/fetch-onnxruntime.sh"))
+            .expect("load ONNX Runtime");
+    let dir = default_model_dir().unwrap();
+    let model = default_stateful_model().unwrap();
+    for candidate in [
+        Accelerator::Cuda,
+        Accelerator::TensorRt,
+        Accelerator::WebGpu,
+    ] {
+        if !runtime.accelerators().contains(&candidate) {
+            continue;
+        }
+        let (mut mic, accelerator) =
+            DeepFilter::load_gpu(&dir, &model, 100.0, &runtime, &[candidate]).unwrap();
+        if accelerator != Some(candidate) {
+            continue;
+        }
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let running = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let input = voice_in_noise(100);
+                let mut frames = 0_usize;
+                let mut slowest = Duration::ZERO;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    for chunk in input.chunks_exact(FRAME_LEN) {
+                        let mut frame: Frame = chunk.try_into().unwrap();
+                        let start = Instant::now();
+                        mic.process(&mut frame).expect("the microphone's filter");
+                        slowest = slowest.max(start.elapsed());
+                        frames += 1;
+                        // About real time: a frame every 10 ms at most.
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                }
+                (mic.status().get(), frames, slowest)
+            })
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        let mut banks = 0;
+        for rows in [16, 4, 16] {
+            let bank = DeepFilterBank::load(&dir, &model, rows, 100.0, &runtime, &[candidate])
+                .expect("load a bank");
+            assert!(bank.is_some(), "{candidate:?}: the bank did not start");
+            banks += 1;
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (status, frames, slowest) = running.join().unwrap();
+        eprintln!(
+            "{candidate:?}: {banks} banks loaded beside the microphone's filter ({frames} frames, slowest {slowest:?}); it ends {status:?}"
+        );
+        assert_eq!(
+            status,
+            DeepFilterBackend::Gpu,
+            "{candidate:?}: the microphone's filter fell back"
+        );
+    }
+}
+
 #[test]
 #[ignore = "needs scripts/fetch-onnxruntime.sh cuda13, export-deepfilternet.sh and a GPU"]
 fn the_gpu_loops_match_the_host_loop_frame_by_frame() {
@@ -216,6 +407,7 @@ fn the_gpu_loops_match_the_host_loop_frame_by_frame() {
         constants: &[("thresholds", &[-15.0, 35.0, 35.0])],
         state: ("state", "state_out"),
         dimensions: &[("batch", 1)],
+        rows: 1,
     };
     for candidate in [
         Accelerator::Cuda,

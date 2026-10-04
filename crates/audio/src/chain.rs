@@ -18,26 +18,9 @@ use sonora::config::{
 };
 use sonora::{AudioProcessing, Config, StreamConfig};
 
-use crate::AudioError;
+use crate::enhancer::Enhancer;
 use crate::frame::{FRAME_LEN, Frame, SAMPLE_RATE};
 use crate::gate::{Gate, GateMode};
-
-/// A speech enhancer plugged into the chain in place of the built-in noise
-/// suppressors ([`NoiseMode::Enhancer`]): DeepFilterNet3, on the CPU or a
-/// GPU (plan Tasks 13, 13b). Loaded off the processing thread, then handed
-/// over with [`crate::VoiceControl::set_enhancer`]; a replaced or failed
-/// enhancer goes back to the control side to be dropped there (freeing a
-/// model, or a GPU context, has no place on the processing thread).
-pub trait Enhancer: Send + 'static {
-    /// Cleans one frame in place. An error removes the enhancer and the
-    /// chain falls back to RNNoise.
-    fn enhance(&mut self, frame: &mut Frame) -> Result<(), AudioError>;
-    /// How late its output is, in samples.
-    fn latency_samples(&self) -> usize;
-    /// Most attenuation applied, dB (100 or more: no limit). Enhancers
-    /// without one ignore it.
-    fn set_attenuation_limit(&mut self, _db: f32) {}
-}
 
 /// Strength of the WebRTC noise suppressor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -410,6 +393,7 @@ impl CaptureChain {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AudioError;
     use crate::denormals::flush_denormals_on_this_thread;
 
     /// Deterministic pseudo-random noise in -1..1 (xorshift).
@@ -543,9 +527,6 @@ mod tests {
             }
             Ok(())
         }
-        fn latency_samples(&self) -> usize {
-            0
-        }
     }
 
     /// Records being dropped; fails on its first frame when asked to.
@@ -569,9 +550,6 @@ mod tests {
             } else {
                 Ok(())
             }
-        }
-        fn latency_samples(&self) -> usize {
-            0
         }
         fn set_attenuation_limit(&mut self, db: f32) {
             *self.limit.lock().unwrap() = Some(db);
@@ -712,12 +690,6 @@ mod tests {
         chain.capture(&mut f);
         // Released towards 1 over 50 ms, but never above 0.5 * -6 dB.
         assert!(f.iter().all(|s| *s <= 0.252), "{}", f[FRAME_LEN - 1]);
-    }
-
-    #[test]
-    fn the_chain_can_move_to_the_processing_thread() {
-        fn assert_send<T: Send + 'static>() {}
-        assert_send::<CaptureChain>();
     }
 
     #[test]

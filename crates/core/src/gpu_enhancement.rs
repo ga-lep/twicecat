@@ -1,12 +1,13 @@
 //! GPU speech enhancement (plan Task 13b; cargo feature `gpu-enhancement`):
-//! which GPU backends run DeepFilterNet3 here, and loading it on one. Off by
-//! default; without the feature nothing is available and a `gpu` setting
+//! which GPU backends run DeepFilterNet3 here, and loading it on one, for the
+//! microphone or (as a bank of rows) for the voices of a call (Task 16). Off
+//! by default; without the feature nothing is available and a `gpu` setting
 //! runs on the CPU.
 
 use std::path::Path;
 use std::sync::Mutex;
 
-use tessera_audio::{DeepFilter, DeepFilterBackend};
+use tessera_audio::{BatchCleaner, DeepFilter, DeepFilterBackend, DeepFilterStatus};
 
 use crate::api::{EnhancerBackend, GpuBackend};
 
@@ -18,6 +19,10 @@ static AVAILABLE: Mutex<Option<Vec<GpuBackend>>> = Mutex::new(None);
 pub(crate) fn probed() -> Option<Vec<GpuBackend>> {
     AVAILABLE.lock().ok().and_then(|a| a.clone())
 }
+
+/// A bank cleaning several voices on a GPU, where it runs, and its status
+/// (which says why once it gave up).
+pub(crate) type Bank = (Box<dyn BatchCleaner>, GpuBackend, DeepFilterStatus);
 
 /// Where a running filter is, for the API.
 pub(crate) fn running(backend: DeepFilterBackend, gpu: Option<GpuBackend>) -> EnhancerBackend {
@@ -31,23 +36,18 @@ pub(crate) fn running(backend: DeepFilterBackend, gpu: Option<GpuBackend>) -> En
 
 #[cfg(feature = "gpu-enhancement")]
 mod imp {
+    use std::path::PathBuf;
+
     use super::*;
     use tessera_audio::onnx::{Accelerator, OnnxRuntime, default_runtime_dir};
 
-    /// Tried in this order. TensorRT first: on an RTX 5090 it runs a frame in
-    /// 0.13 ms for 16 µs of CPU, against 0.36 ms and 76 µs with CUDA. Its
-    /// first use on a machine builds an engine for the GPU (about 20 s,
-    /// cached after); without its libraries it fails at once and CUDA runs.
-    ///
-    /// WebGPU (any vendor; on the RTX 5090 0.59 ms for 0.42 ms of CPU) is
-    /// for the GPUs those do not reach.
-    const PREFER: [Accelerator; 5] = [
-        Accelerator::TensorRt,
-        Accelerator::Cuda,
-        Accelerator::WebGpu,
-        Accelerator::DirectMl,
-        Accelerator::CoreMl,
-    ];
+    /// Tried in this order ([`Accelerator::ALL`]'s). TensorRT first: on an
+    /// RTX 5090 it runs a frame in 0.13 ms for 16 µs of CPU, against 0.36 ms
+    /// and 76 µs with CUDA. Its first use on a machine builds an engine for
+    /// the GPU (about 20 s, cached after); without its libraries it fails
+    /// at once and CUDA runs. WebGPU (any vendor; on the RTX 5090 0.59 ms
+    /// for 0.42 ms of CPU) is for the GPUs those do not reach.
+    const PREFER: [Accelerator; 5] = Accelerator::ALL;
 
     fn backend(accelerator: Accelerator) -> GpuBackend {
         match accelerator {
@@ -61,6 +61,16 @@ mod imp {
 
     fn runtime() -> Option<OnnxRuntime> {
         OnnxRuntime::load(&default_runtime_dir()?).ok()
+    }
+
+    /// The runtime and the stateful model, or what is missing.
+    fn gpu_parts() -> Result<(OnnxRuntime, PathBuf), String> {
+        let runtime = runtime()
+            .ok_or("ONNX Runtime is not installed (scripts/fetch-onnxruntime.sh cuda13)")?;
+        let model = tessera_audio::default_stateful_model()
+            .filter(|m| m.exists())
+            .ok_or("the GPU model is not installed (scripts/export-deepfilternet.sh)")?;
+        Ok((runtime, model))
     }
 
     fn remember(backends: &[GpuBackend]) {
@@ -84,14 +94,12 @@ mod imp {
         if let Some(found) = probed() {
             return found;
         }
-        let found: Vec<GpuBackend> = match (runtime(), tessera_audio::default_stateful_model()) {
-            (Some(runtime), Some(model)) if model.exists() => {
-                DeepFilter::gpu_backends(models, &model, &runtime, &PREFER)
-                    .into_iter()
-                    .map(backend)
-                    .collect()
-            }
-            _ => Vec::new(),
+        let found: Vec<GpuBackend> = match gpu_parts() {
+            Ok((runtime, model)) => DeepFilter::gpu_backends(models, &model, &runtime, &PREFER)
+                .into_iter()
+                .map(backend)
+                .collect(),
+            Err(_) => Vec::new(),
         };
         if let Ok(mut available) = AVAILABLE.lock() {
             *available = Some(found.clone());
@@ -107,11 +115,7 @@ mod imp {
         attenuation_limit_db: f32,
     ) -> Result<(DeepFilter, Option<GpuBackend>), String> {
         let _work = GPU_WORK.lock().unwrap_or_else(|e| e.into_inner());
-        let runtime = runtime()
-            .ok_or("ONNX Runtime is not installed (scripts/fetch-onnxruntime.sh cuda13)")?;
-        let model = tessera_audio::default_stateful_model()
-            .filter(|m| m.exists())
-            .ok_or("the GPU model is not installed (scripts/export-deepfilternet.sh)")?;
+        let (runtime, model) = gpu_parts()?;
         let (filter, accelerator) =
             DeepFilter::load_gpu(models, &model, attenuation_limit_db, &runtime, &PREFER)
                 .map_err(|e: tessera_audio::AudioError| e.to_string())?;
@@ -121,11 +125,41 @@ mod imp {
         }
         Ok((filter, gpu))
     }
+
+    /// Loads a bank cleaning `rows` voices at once on the first backend that
+    /// starts and keeps up (blocking; seconds, more for TensorRT's first
+    /// engine at this size). `Ok(None)`: no GPU started or it was too slow;
+    /// `Err(reason)` when the GPU parts are missing.
+    pub(crate) fn load_bank(
+        models: &Path,
+        rows: usize,
+        attenuation_limit_db: f32,
+    ) -> Result<Option<Bank>, String> {
+        let _work = GPU_WORK.lock().unwrap_or_else(|e| e.into_inner());
+        let (runtime, model) = gpu_parts()?;
+        let bank = tessera_audio::DeepFilterBank::load(
+            models,
+            &model,
+            rows,
+            attenuation_limit_db,
+            &runtime,
+            &PREFER,
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(bank.map(|bank| {
+            let gpu = backend(bank.accelerator());
+            remember(&[gpu]);
+            let status = bank.status();
+            (Box::new(bank) as Box<dyn BatchCleaner>, gpu, status)
+        }))
+    }
 }
 
 #[cfg(not(feature = "gpu-enhancement"))]
 mod imp {
     use super::*;
+
+    const NOT_BUILT: &str = "this build has no GPU support (cargo feature gpu-enhancement)";
 
     pub(crate) fn probe(_models: &Path) -> Vec<GpuBackend> {
         Vec::new()
@@ -135,11 +169,19 @@ mod imp {
         _models: &Path,
         _attenuation_limit_db: f32,
     ) -> Result<(DeepFilter, Option<GpuBackend>), String> {
-        Err("this build has no GPU support (cargo feature gpu-enhancement)".into())
+        Err(NOT_BUILT.into())
+    }
+
+    pub(crate) fn load_bank(
+        _models: &Path,
+        _rows: usize,
+        _attenuation_limit_db: f32,
+    ) -> Result<Option<Bank>, String> {
+        Err(NOT_BUILT.into())
     }
 }
 
-pub(crate) use imp::{load, probe};
+pub(crate) use imp::{load, load_bank, probe};
 
 #[cfg(test)]
 mod tests {

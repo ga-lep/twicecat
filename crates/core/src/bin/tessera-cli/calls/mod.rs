@@ -5,291 +5,25 @@
 //! A terminal reports key presses, not releases, so `/ptt` toggles
 //! transmitting instead of holding it.
 
+mod parse;
+mod show;
+
 use std::collections::{BTreeSet, HashMap};
 use std::time::{Duration, Instant};
 
 use tessera_core::api::{
-    AudioDeviceId, AudioDevices, AudioSettings, CallEndReason, CallIntent, CallState,
-    CleaningStatus, Command, CoreEvent, EnhancerBackend, GpuBackend, GpuEnhancement, InputLevel,
-    InputMode, ListDiff, NoiseSuppression, NsLevel, Participant, RoomId, RoomSummary, SkipCleaned,
-    SkipReason, UserId, VoiceCleaning,
+    AudioDevices, AudioSettings, CallEndReason, CallIntent, CallState, Command, CoreEvent,
+    EnhancerBackend, InputLevel, InputMode, ListDiff, Participant, RoomId, RoomSummary, UserId,
 };
 
+pub(crate) use self::parse::{CallCmd, CleanArg, GateArg, parse};
+use self::show::{person, room_label};
 use super::{resolve_room, sanitize};
 
 /// Push-to-talk release tail when `/gate ptt` gives none and none is set.
 const DEFAULT_RELEASE_MS: u32 = 200;
 /// How often the mic test prints a level line.
 const LEVEL_EVERY: Duration = Duration::from_secs(1);
-
-/// A parsed call or audio command.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) enum CallCmd {
-    /// Join the call in the given room, or the open one.
-    Call(Option<String>),
-    Leave,
-    /// Decline the ring in the given room, or the last one that rang.
-    Decline(Option<String>),
-    /// List the call's participants.
-    Who,
-    /// `None` toggles.
-    Mute(Option<bool>),
-    Deafen(Option<bool>),
-    Ptt(Option<bool>),
-    Devices,
-    /// Device index from `/devices`; `None` follows the system default.
-    Input(Option<usize>),
-    Output(Option<usize>),
-    Ns(NoiseSuppression),
-    Aec(Option<bool>),
-    /// Cancel other applications' sound too (`/aec system`).
-    AecSystem(Option<bool>),
-    Agc(Option<bool>),
-    Gate(GateArg),
-    /// Participant index from `/who`, or a user ID.
-    Vol {
-        who: String,
-        percent: u16,
-    },
-    /// Cleaning other people's voices.
-    Clean(CleanArg),
-    /// `Some(loopback)` starts, `None` stops.
-    MicTest(Option<bool>),
-    /// Probe GPU speech enhancement.
-    Gpu,
-    /// Show the audio settings.
-    Audio,
-}
-
-/// `/clean` arguments.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) enum CleanArg {
-    /// `None` toggles.
-    Switch(Option<bool>),
-    /// Attenuation limit, dB.
-    Limit(f32),
-    /// One person (index from `/who`, or a user ID).
-    Person { who: String, choice: VoiceCleaning },
-    /// Which voices cleaned at their source are left alone.
-    Skip(SkipCleaned),
-    /// Announce our suppressor.
-    Announce(bool),
-    /// Our microphone is cleaned before Tessera.
-    Outside(bool),
-}
-
-/// `/gate` arguments.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) enum GateArg {
-    /// Voice activity, threshold picked automatically.
-    Auto,
-    /// Voice activity above this level, dBFS.
-    Threshold(f32),
-    /// Push-to-talk with this release tail, ms (`None` keeps the current).
-    Ptt(Option<u32>),
-}
-
-/// Parses `/name arg` if it is a call or audio command: `None` when it is
-/// not one, `Err(usage)` when its arguments are wrong.
-pub(crate) fn parse(name: &str, arg: &str) -> Option<Result<CallCmd, &'static str>> {
-    let arg = arg.trim();
-    let optional = || (!arg.is_empty()).then(|| arg.to_owned());
-    let parsed = match name {
-        "call" => Ok(CallCmd::Call(optional())),
-        "leave" => none(arg, "/leave").map(|()| CallCmd::Leave),
-        "decline" => Ok(CallCmd::Decline(optional())),
-        "who" => none(arg, "/who").map(|()| CallCmd::Who),
-        "mute" => switch(arg, "/mute [on|off]").map(CallCmd::Mute),
-        "deafen" => switch(arg, "/deafen [on|off]").map(CallCmd::Deafen),
-        "ptt" => switch(arg, "/ptt [on|off]").map(CallCmd::Ptt),
-        "devices" => none(arg, "/devices").map(|()| CallCmd::Devices),
-        "input" => device(arg, "/input <n|default>").map(CallCmd::Input),
-        "output" => device(arg, "/output <n|default>").map(CallCmd::Output),
-        "ns" => noise_suppression(arg).map(CallCmd::Ns),
-        "aec" => match arg.strip_prefix("system") {
-            Some(rest) if rest.is_empty() || rest.starts_with(' ') => {
-                switch(rest.trim(), "/aec system [on|off]").map(CallCmd::AecSystem)
-            }
-            _ => switch(arg, "/aec [on|off] | /aec system [on|off]").map(CallCmd::Aec),
-        },
-        "agc" => switch(arg, "/agc [on|off]").map(CallCmd::Agc),
-        "gate" => gate(arg).map(CallCmd::Gate),
-        "vol" => volume(arg),
-        "clean" => clean(arg).map(CallCmd::Clean),
-        "mictest" => match arg {
-            "" => Ok(CallCmd::MicTest(Some(false))),
-            "loopback" => Ok(CallCmd::MicTest(Some(true))),
-            "stop" => Ok(CallCmd::MicTest(None)),
-            _ => Err("/mictest [loopback|stop]"),
-        },
-        "audio" => none(arg, "/audio").map(|()| CallCmd::Audio),
-        "gpu" => none(arg, "/gpu").map(|()| CallCmd::Gpu),
-        _ => return None,
-    };
-    Some(parsed)
-}
-
-fn none(arg: &str, usage: &'static str) -> Result<(), &'static str> {
-    if arg.is_empty() { Ok(()) } else { Err(usage) }
-}
-
-fn switch(arg: &str, usage: &'static str) -> Result<Option<bool>, &'static str> {
-    match arg {
-        "" => Ok(None),
-        "on" => Ok(Some(true)),
-        "off" => Ok(Some(false)),
-        _ => Err(usage),
-    }
-}
-
-fn device(arg: &str, usage: &'static str) -> Result<Option<usize>, &'static str> {
-    match arg {
-        "default" => Ok(None),
-        n => n.parse().map(Some).map_err(|_| usage),
-    }
-}
-
-/// One line on GPU speech enhancement.
-fn gpu_line(gpu: &GpuEnhancement) -> String {
-    let name = |b: &GpuBackend| format!("{b:?}").to_lowercase();
-    let available = if gpu.available.is_empty() {
-        "none usable here".to_owned()
-    } else {
-        gpu.available
-            .iter()
-            .map(name)
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    let running = match gpu.running {
-        None => String::new(),
-        Some(EnhancerBackend::Cpu) => "; DeepFilterNet runs on the CPU".into(),
-        Some(EnhancerBackend::Gpu { backend }) => {
-            format!("; DeepFilterNet runs on {}", name(&backend))
-        }
-        Some(EnhancerBackend::CpuAfterGpuError) => {
-            "; DeepFilterNet moved to the CPU after a GPU error".into()
-        }
-        Some(EnhancerBackend::CpuAfterGpuTooSlow) => {
-            "; DeepFilterNet moved to the CPU: the GPU fell behind".into()
-        }
-    };
-    format!("GPU enhancement: {available}{running}.")
-}
-
-fn noise_suppression(arg: &str) -> Result<NoiseSuppression, &'static str> {
-    const USAGE: &str =
-        "/ns off|rnnoise|webrtc [low|moderate|high|very_high]|deepfilter [limit dB] [gpu]";
-    let mut words = arg.split_whitespace();
-    let ns = match (words.next(), words.next()) {
-        (Some("off"), None) => NoiseSuppression::Off,
-        (Some("rnnoise"), None) => NoiseSuppression::RnNoise,
-        (Some("webrtc"), level) => NoiseSuppression::WebRtc {
-            level: match level {
-                None | Some("moderate") => NsLevel::Moderate,
-                Some("low") => NsLevel::Low,
-                Some("high") => NsLevel::High,
-                Some("very_high") => NsLevel::VeryHigh,
-                Some(_) => return Err(USAGE),
-            },
-        },
-        (Some("deepfilter"), first) => {
-            let (limit, gpu) = match (first, words.next()) {
-                (None, _) => (None, false),
-                (Some("gpu"), None) => (None, true),
-                (Some(db), None) => (Some(db), false),
-                (Some(db), Some("gpu")) => (Some(db), true),
-                (Some(_), Some(_)) => return Err(USAGE),
-            };
-            NoiseSuppression::DeepFilter {
-                attenuation_limit_db: match limit {
-                    None => 100.0,
-                    Some(db) => db.parse().map_err(|_| USAGE)?,
-                },
-                gpu,
-            }
-        }
-        _ => return Err(USAGE),
-    };
-    if words.next().is_some() {
-        return Err(USAGE);
-    }
-    Ok(ns)
-}
-
-fn gate(arg: &str) -> Result<GateArg, &'static str> {
-    const USAGE: &str = "/gate auto|<threshold dB>|ptt [release ms]";
-    let mut words = arg.split_whitespace();
-    let gate = match (words.next(), words.next()) {
-        (Some("auto"), None) => GateArg::Auto,
-        (Some("ptt"), None) => GateArg::Ptt(None),
-        (Some("ptt"), Some(ms)) => GateArg::Ptt(Some(ms.parse().map_err(|_| USAGE)?)),
-        (Some(db), None) => GateArg::Threshold(
-            db.parse::<f32>()
-                .ok()
-                .filter(|v| v.is_finite())
-                .ok_or(USAGE)?,
-        ),
-        _ => return Err(USAGE),
-    };
-    if words.next().is_some() {
-        return Err(USAGE);
-    }
-    Ok(gate)
-}
-
-fn volume(arg: &str) -> Result<CallCmd, &'static str> {
-    const USAGE: &str = "/vol <n|@user:server> <percent>";
-    let mut words = arg.split_whitespace();
-    match (words.next(), words.next(), words.next()) {
-        (Some(who), Some(percent), None) => Ok(CallCmd::Vol {
-            who: who.to_owned(),
-            percent: percent.trim_end_matches('%').parse().map_err(|_| USAGE)?,
-        }),
-        _ => Err(USAGE),
-    }
-}
-
-fn clean(arg: &str) -> Result<CleanArg, &'static str> {
-    const USAGE: &str = "/clean [on|off] | /clean limit <dB> | /clean <n|@user:server> always|never|auto | /clean skip neural|any|never | /clean announce|outside on|off";
-    let on_off = |word| match word {
-        "on" => Ok(true),
-        "off" => Ok(false),
-        _ => Err(USAGE),
-    };
-    let mut words = arg.split_whitespace();
-    match (words.next(), words.next(), words.next()) {
-        (Some("skip"), Some(policy), None) => match policy {
-            "neural" => Ok(CleanArg::Skip(SkipCleaned::Neural)),
-            "any" => Ok(CleanArg::Skip(SkipCleaned::AnySuppressor)),
-            "never" => Ok(CleanArg::Skip(SkipCleaned::Never)),
-            _ => Err(USAGE),
-        },
-        (Some("announce"), Some(on), None) => on_off(on).map(CleanArg::Announce),
-        (Some("outside"), Some(on), None) => on_off(on).map(CleanArg::Outside),
-        (None, ..) => Ok(CleanArg::Switch(None)),
-        (Some("on"), None, _) => Ok(CleanArg::Switch(Some(true))),
-        (Some("off"), None, _) => Ok(CleanArg::Switch(Some(false))),
-        (Some("limit"), Some(db), None) => db
-            .trim_end_matches("dB")
-            .parse()
-            .map(CleanArg::Limit)
-            .map_err(|_| USAGE),
-        (Some(who), Some(choice), None) => {
-            let choice = match choice {
-                "always" => VoiceCleaning::Always,
-                "never" => VoiceCleaning::Never,
-                "auto" => VoiceCleaning::Automatic,
-                _ => return Err(USAGE),
-            };
-            Ok(CleanArg::Person {
-                who: who.to_owned(),
-                choice,
-            })
-        }
-        _ => Err(USAGE),
-    }
-}
 
 /// What the CLI knows about calls and audio.
 #[derive(Default)]
@@ -311,6 +45,8 @@ pub(crate) struct Calls {
     transmitting: bool,
     mic_test: bool,
     last_level: Option<Instant>,
+    /// Where other voices were cleaned, from the last stats.
+    remote_cleaning: Option<EnhancerBackend>,
 }
 
 /// The commands to send and the lines to print for one input or event.
@@ -347,28 +83,6 @@ impl Reply {
 /// given, so a room can be called before it shows up in the list.
 fn pick_room(rooms: &[RoomSummary], arg: &str) -> Option<RoomId> {
     resolve_room(rooms, arg).or_else(|| arg.starts_with('!').then(|| RoomId::from(arg)))
-}
-
-/// A room's printable name.
-fn room_label(rooms: &[RoomSummary], id: &RoomId) -> String {
-    let name = rooms
-        .iter()
-        .find(|room| &room.id == id)
-        .map_or(id.as_str(), |room| room.name.as_str());
-    sanitize(name)
-}
-
-fn person(p: &Participant) -> String {
-    match &p.display_name {
-        Some(name) if !name.trim().is_empty() => {
-            format!("{} ({})", sanitize(name), sanitize(p.user_id.as_str()))
-        }
-        _ => sanitize(p.user_id.as_str()),
-    }
-}
-
-fn on_off(on: bool) -> &'static str {
-    if on { "on" } else { "off" }
 }
 
 impl Calls {
@@ -414,7 +128,11 @@ impl Calls {
             }
             CallCmd::Who => Reply {
                 commands: Vec::new(),
-                lines: self.who(),
+                lines: if self.call.is_some() {
+                    show::who(&self.participants)
+                } else {
+                    vec!["Not in a call.".into()]
+                },
             },
             CallCmd::Mute(on) => {
                 if self.call.is_none() {
@@ -545,6 +263,7 @@ impl Calls {
             CallCmd::Clean(CleanArg::Outside(on)) => {
                 self.edit(|s| s.announce_cleaning.cleaned_outside = on)
             }
+            CallCmd::Clean(CleanArg::Gpu(on)) => self.edit(|s| s.remote_cleaning.gpu = on),
             CallCmd::Clean(CleanArg::Person { who, choice }) => match self.user_of(&who) {
                 Some(user_id) => Reply::send(
                     Command::SetUserCleaning {
@@ -576,7 +295,7 @@ impl Calls {
             CallCmd::Audio => match &self.settings {
                 Some(settings) => Reply {
                     commands: Vec::new(),
-                    lines: self.describe(settings),
+                    lines: show::describe(settings, &self.devices),
                 },
                 None => {
                     self.show_settings = true;
@@ -631,147 +350,6 @@ impl Calls {
                 s.output_device = id;
             }
         })
-    }
-
-    fn who(&self) -> Vec<String> {
-        if self.call.is_none() {
-            return vec!["Not in a call.".into()];
-        }
-        if self.participants.is_empty() {
-            return vec!["Nobody else is here yet.".into()];
-        }
-        self.participants
-            .iter()
-            .enumerate()
-            .map(|(i, p)| {
-                let mut flags = Vec::new();
-                if p.is_local {
-                    flags.push("you".to_owned());
-                }
-                if p.muted {
-                    flags.push("muted".to_owned());
-                }
-                if p.speaking {
-                    flags.push("speaking".to_owned());
-                }
-                if p.volume_percent != 100 {
-                    flags.push(format!("volume {} %", p.volume_percent));
-                }
-                match p.cleaning {
-                    CleaningStatus::Off => {}
-                    CleaningStatus::Starting => flags.push("cleaning soon".to_owned()),
-                    CleaningStatus::Cleaned => flags.push("cleaned".to_owned()),
-                    CleaningStatus::Skipped(SkipReason::Never) => {
-                        flags.push("not cleaned (never)".to_owned());
-                    }
-                    CleaningStatus::Skipped(SkipReason::Limit) => {
-                        flags.push("not cleaned (limit reached)".to_owned());
-                    }
-                    CleaningStatus::Skipped(SkipReason::AlreadyClean) => {
-                        flags.push("not cleaned (cleaned at their end)".to_owned());
-                    }
-                    CleaningStatus::Skipped(SkipReason::Unavailable) => {
-                        flags.push("not cleaned (no model)".to_owned());
-                    }
-                }
-                let flags = if flags.is_empty() {
-                    String::new()
-                } else {
-                    format!("  [{}]", flags.join(", "))
-                };
-                format!(
-                    "{i}  {}  {}{flags}",
-                    person(p),
-                    sanitize(p.device_id.as_str())
-                )
-            })
-            .collect()
-    }
-
-    fn device_name(&self, id: Option<&AudioDeviceId>, input: bool) -> String {
-        let Some(id) = id else {
-            return "system default".into();
-        };
-        let list = if input {
-            &self.devices.inputs
-        } else {
-            &self.devices.outputs
-        };
-        list.iter()
-            .find(|d| &d.id == id)
-            .map_or_else(|| sanitize(id.as_str()), |d| sanitize(&d.name))
-    }
-
-    fn describe(&self, s: &AudioSettings) -> Vec<String> {
-        let ns = match s.processing.noise_suppression {
-            NoiseSuppression::Off => "off".to_owned(),
-            NoiseSuppression::WebRtc { level } => format!("webrtc {level:?}").to_lowercase(),
-            NoiseSuppression::RnNoise => "rnnoise".to_owned(),
-            NoiseSuppression::DeepFilter {
-                attenuation_limit_db,
-                gpu,
-            } => {
-                let on = if gpu { ", on the GPU" } else { "" };
-                format!("deepfilter (limit {attenuation_limit_db} dB{on})")
-            }
-        };
-        let gate = match s.input_mode {
-            InputMode::VoiceActivity {
-                automatic: true, ..
-            } => "voice activity, automatic threshold".to_owned(),
-            InputMode::VoiceActivity { threshold_db, .. } => {
-                format!("voice activity above {threshold_db} dB")
-            }
-            InputMode::PushToTalk { release_delay_ms } => {
-                format!("push-to-talk, {release_delay_ms} ms release")
-            }
-        };
-        vec![
-            format!(
-                "Input: {}. Output: {}.",
-                self.device_name(s.input_device.as_ref(), true),
-                self.device_name(s.output_device.as_ref(), false)
-            ),
-            format!(
-                "Echo cancellation {}{}, noise suppression {ns}, auto gain {}, high-pass {}.",
-                on_off(s.processing.echo_cancellation),
-                if s.processing.cancel_system_audio {
-                    " (other apps' sound too)"
-                } else {
-                    ""
-                },
-                on_off(s.processing.auto_gain),
-                on_off(s.processing.high_pass)
-            ),
-            format!("Gate: {gate}."),
-            format!(
-                "Gain {} dB, volume {} %, voice bitrate {} kb/s.",
-                s.input_gain_db, s.output_volume_percent, s.voice_bitrate_kbps
-            ),
-            if s.remote_cleaning.enabled {
-                format!(
-                    "Other voices cleaned (DeepFilterNet3, up to {} dB removed), {}.",
-                    s.remote_cleaning.attenuation_limit_db,
-                    match s.remote_cleaning.skip_cleaned {
-                        SkipCleaned::Neural => "not those a neural suppressor cleans at their end",
-                        SkipCleaned::AnySuppressor =>
-                            "not those any suppressor cleans at their end",
-                        SkipCleaned::Never => "even those cleaned at their end",
-                    }
-                )
-            } else {
-                "Other voices not cleaned.".to_owned()
-            },
-            match (
-                s.announce_cleaning.enabled,
-                s.announce_cleaning.cleaned_outside,
-            ) {
-                (false, _) => "Your cleaning is not announced.",
-                (true, false) => "Your suppressor is announced to the call.",
-                (true, true) => "Your voice is announced as cleaned before Tessera.",
-            }
-            .to_owned(),
-        ]
     }
 
     /// Handles a call or audio event; returns the lines to print. Other
@@ -848,27 +426,17 @@ impl Calls {
                 sanitize(user_id.as_str()),
                 room_label(rooms, &room_id)
             )],
-            CoreEvent::GpuEnhancement(gpu) => vec![gpu_line(&gpu)],
+            CoreEvent::GpuEnhancement(gpu) => vec![show::gpu_line(&gpu)],
             CoreEvent::AudioDevices(devices) => {
                 self.devices = devices;
                 if !std::mem::take(&mut self.show_devices) {
                     return Vec::new();
                 }
-                let mut lines = vec!["Inputs:".to_owned()];
-                for (i, d) in self.devices.inputs.iter().enumerate() {
-                    let default = if d.is_default { "  (default)" } else { "" };
-                    lines.push(format!("  {i}  {}{default}", sanitize(&d.name)));
-                }
-                lines.push("Outputs:".into());
-                for (i, d) in self.devices.outputs.iter().enumerate() {
-                    let default = if d.is_default { "  (default)" } else { "" };
-                    lines.push(format!("  {i}  {}{default}", sanitize(&d.name)));
-                }
-                lines
+                show::device_list(&self.devices)
             }
             CoreEvent::AudioSettings(settings) => {
                 let lines = if std::mem::take(&mut self.show_settings) {
-                    self.describe(&settings)
+                    show::describe(&settings, &self.devices)
                 } else {
                     Vec::new()
                 };
@@ -879,6 +447,13 @@ impl Calls {
                 lines
             }
             CoreEvent::InputLevel(level) => self.level(level),
+            CoreEvent::AudioStats(stats) => {
+                let now = stats.remote_cleaning;
+                if std::mem::replace(&mut self.remote_cleaning, now) == now {
+                    return Vec::new();
+                }
+                now.map(show::remote_cleaning_line).into_iter().collect()
+            }
             _ => Vec::new(),
         }
     }
@@ -940,28 +515,14 @@ impl Calls {
             return Vec::new();
         }
         self.last_level = Some(now);
-        let gate = if level.transmitting {
-            "sending"
-        } else {
-            "gated"
-        };
-        vec![format!(
-            "[mic] {:.1} dB rms, {:.1} dB peak, {gate}",
-            level.rms_db, level.peak_db
-        )]
+        vec![show::level_line(level)]
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tessera_core::api::{AudioDevice, DeviceId, ParticipantId};
-
-    fn cmd(line: &str) -> Result<CallCmd, &'static str> {
-        let rest = line.strip_prefix('/').unwrap();
-        let (name, arg) = rest.split_once(' ').unwrap_or((rest, ""));
-        parse(name, arg).expect("a call command")
-    }
+    use tessera_core::api::{AudioDevice, AudioDeviceId, CleaningStatus, DeviceId, ParticipantId};
 
     /// Commands have no `PartialEq` (passwords); compare their debug form.
     fn sent(commands: &[Command]) -> String {
@@ -993,149 +554,6 @@ mod tests {
             volume_percent: 100,
             cleaning: CleaningStatus::Off,
         }
-    }
-
-    #[test]
-    fn parses_every_command_and_refuses_bad_arguments() {
-        assert_eq!(cmd("/call"), Ok(CallCmd::Call(None)));
-        assert_eq!(cmd("/call 2"), Ok(CallCmd::Call(Some("2".into()))));
-        assert_eq!(cmd("/leave"), Ok(CallCmd::Leave));
-        assert_eq!(cmd("/mute"), Ok(CallCmd::Mute(None)));
-        assert_eq!(cmd("/deafen off"), Ok(CallCmd::Deafen(Some(false))));
-        assert_eq!(cmd("/ptt on"), Ok(CallCmd::Ptt(Some(true))));
-        assert_eq!(cmd("/input default"), Ok(CallCmd::Input(None)));
-        assert_eq!(cmd("/output 1"), Ok(CallCmd::Output(Some(1))));
-        assert_eq!(
-            cmd("/ns webrtc high"),
-            Ok(CallCmd::Ns(NoiseSuppression::WebRtc {
-                level: NsLevel::High
-            }))
-        );
-        assert_eq!(
-            cmd("/ns rnnoise"),
-            Ok(CallCmd::Ns(NoiseSuppression::RnNoise))
-        );
-        let deepfilter = |attenuation_limit_db, gpu| {
-            Ok(CallCmd::Ns(NoiseSuppression::DeepFilter {
-                attenuation_limit_db,
-                gpu,
-            }))
-        };
-        assert_eq!(cmd("/ns deepfilter"), deepfilter(100.0, false));
-        assert_eq!(cmd("/ns deepfilter 30"), deepfilter(30.0, false));
-        assert_eq!(cmd("/ns deepfilter gpu"), deepfilter(100.0, true));
-        assert_eq!(cmd("/ns deepfilter 30 gpu"), deepfilter(30.0, true));
-        assert_eq!(cmd("/gpu"), Ok(CallCmd::Gpu));
-        assert_eq!(cmd("/aec off"), Ok(CallCmd::Aec(Some(false))));
-        assert_eq!(cmd("/aec system"), Ok(CallCmd::AecSystem(None)));
-        assert_eq!(cmd("/aec system on"), Ok(CallCmd::AecSystem(Some(true))));
-        assert_eq!(
-            cmd("/gate -42.5"),
-            Ok(CallCmd::Gate(GateArg::Threshold(-42.5)))
-        );
-        assert_eq!(
-            cmd("/gate ptt 300"),
-            Ok(CallCmd::Gate(GateArg::Ptt(Some(300))))
-        );
-        assert_eq!(
-            cmd("/vol 1 150%"),
-            Ok(CallCmd::Vol {
-                who: "1".into(),
-                percent: 150
-            })
-        );
-        assert_eq!(cmd("/clean"), Ok(CallCmd::Clean(CleanArg::Switch(None))));
-        assert_eq!(
-            cmd("/clean on"),
-            Ok(CallCmd::Clean(CleanArg::Switch(Some(true))))
-        );
-        assert_eq!(
-            cmd("/clean limit 30"),
-            Ok(CallCmd::Clean(CleanArg::Limit(30.0)))
-        );
-        assert_eq!(
-            cmd("/clean @a:x never"),
-            Ok(CallCmd::Clean(CleanArg::Person {
-                who: "@a:x".into(),
-                choice: VoiceCleaning::Never
-            }))
-        );
-        assert_eq!(
-            cmd("/clean 2 auto"),
-            Ok(CallCmd::Clean(CleanArg::Person {
-                who: "2".into(),
-                choice: VoiceCleaning::Automatic
-            }))
-        );
-        assert_eq!(
-            cmd("/clean skip any"),
-            Ok(CallCmd::Clean(CleanArg::Skip(SkipCleaned::AnySuppressor)))
-        );
-        assert_eq!(
-            cmd("/clean announce off"),
-            Ok(CallCmd::Clean(CleanArg::Announce(false)))
-        );
-        assert_eq!(
-            cmd("/clean outside on"),
-            Ok(CallCmd::Clean(CleanArg::Outside(true)))
-        );
-        assert_eq!(cmd("/mictest loopback"), Ok(CallCmd::MicTest(Some(true))));
-        assert_eq!(cmd("/mictest stop"), Ok(CallCmd::MicTest(None)));
-        for bad in [
-            "/leave now",
-            "/mute maybe",
-            "/input x",
-            "/ns loud",
-            "/ns webrtc max",
-            "/ns off please",
-            "/gate NaN",
-            "/gate ptt soon",
-            "/vol 1",
-            "/vol 1 -5",
-            "/mictest twice",
-            "/aec systems",
-            "/aec system maybe",
-            "/ns deepfilter gpu 30",
-            "/ns deepfilter 30 cpu",
-            "/gpu please",
-            "/clean maybe",
-            "/clean limit loud",
-            "/clean 2 sometimes",
-            "/clean 2 never please",
-            "/clean skip some",
-            "/clean announce maybe",
-            "/clean outside",
-        ] {
-            assert!(cmd(bad).is_err(), "{bad}");
-        }
-        assert_eq!(parse("rooms", ""), None, "not a call command");
-    }
-
-    #[test]
-    fn gpu_enhancement_is_reported_in_one_line() {
-        let none = GpuEnhancement {
-            available: Vec::new(),
-            running: None,
-        };
-        assert_eq!(gpu_line(&none), "GPU enhancement: none usable here.");
-        let fell_back = GpuEnhancement {
-            available: vec![GpuBackend::Cuda],
-            running: Some(EnhancerBackend::CpuAfterGpuTooSlow),
-        };
-        assert_eq!(
-            gpu_line(&fell_back),
-            "GPU enhancement: cuda; DeepFilterNet moved to the CPU: the GPU fell behind."
-        );
-        let running = GpuEnhancement {
-            available: vec![GpuBackend::Cuda],
-            running: Some(EnhancerBackend::Gpu {
-                backend: GpuBackend::Cuda,
-            }),
-        };
-        assert_eq!(
-            gpu_line(&running),
-            "GPU enhancement: cuda; DeepFilterNet runs on cuda."
-        );
     }
 
     #[test]
@@ -1387,6 +805,195 @@ mod tests {
             calls
                 .event(CoreEvent::RingingStopped { room_id: room }, &[])
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn each_settings_command_changes_its_setting() {
+        use tessera_core::api::{NoiseSuppression, SkipCleaned};
+        let ptt = InputMode::PushToTalk {
+            release_delay_ms: 300,
+        };
+        type Check = fn(&AudioSettings) -> bool;
+        let cases: [(CallCmd, Check); 12] = [
+            (CallCmd::Ns(NoiseSuppression::Off), |s| {
+                s.processing.noise_suppression == NoiseSuppression::Off
+            }),
+            (CallCmd::AecSystem(Some(true)), |s| {
+                s.processing.cancel_system_audio && s.processing.echo_cancellation
+            }),
+            (CallCmd::Agc(None), |s| !s.processing.auto_gain),
+            (CallCmd::Gate(GateArg::Auto), |s| {
+                s.input_mode
+                    == InputMode::VoiceActivity {
+                        automatic: true,
+                        threshold_db: -50.0,
+                    }
+            }),
+            (CallCmd::Gate(GateArg::Threshold(-40.0)), |s| {
+                s.input_mode
+                    == InputMode::VoiceActivity {
+                        automatic: false,
+                        threshold_db: -40.0,
+                    }
+            }),
+            (CallCmd::Gate(GateArg::Ptt(None)), |s| {
+                s.input_mode
+                    == InputMode::PushToTalk {
+                        release_delay_ms: 300,
+                    }
+            }),
+            (CallCmd::Clean(CleanArg::Switch(None)), |s| {
+                s.remote_cleaning.enabled
+            }),
+            (CallCmd::Clean(CleanArg::Limit(12.0)), |s| {
+                s.remote_cleaning.attenuation_limit_db == 12.0
+            }),
+            (CallCmd::Clean(CleanArg::Skip(SkipCleaned::Never)), |s| {
+                s.remote_cleaning.skip_cleaned == SkipCleaned::Never
+            }),
+            (CallCmd::Clean(CleanArg::Announce(false)), |s| {
+                !s.announce_cleaning.enabled
+            }),
+            (CallCmd::Clean(CleanArg::Outside(true)), |s| {
+                s.announce_cleaning.cleaned_outside
+            }),
+            (CallCmd::Clean(CleanArg::Gpu(true)), |s| {
+                s.remote_cleaning.gpu
+            }),
+        ];
+        for (cmd, check) in cases {
+            let mut calls = Calls::default();
+            // From push-to-talk without echo cancellation: `/gate auto` takes
+            // the default threshold, `/gate ptt` keeps the release delay,
+            // `/aec system on` turns echo cancellation on.
+            let mut start = AudioSettings {
+                input_mode: ptt,
+                ..AudioSettings::default()
+            };
+            start.processing.echo_cancellation = false;
+            calls.event(CoreEvent::AudioSettings(start), &[]);
+            let name = format!("{cmd:?}");
+            let reply = calls.command(cmd, &[], None);
+            assert!(check(update(&reply)), "{name}: {:?}", update(&reply));
+        }
+    }
+
+    #[test]
+    fn people_are_cleaned_by_choice_and_call_events_are_reported() {
+        use tessera_core::api::{GpuEnhancement, VoiceCleaning};
+        let room = RoomId::from("!r:x");
+        let mut calls = loaded();
+        assert_eq!(
+            calls.command(CallCmd::Deafen(None), &[], None).lines,
+            ["Not in a call."]
+        );
+        calls.event(
+            CoreEvent::CallState(CallState::Connected {
+                room_id: room.clone(),
+                encrypted: false,
+            }),
+            &[],
+        );
+        calls.event(
+            CoreEvent::CallParticipants {
+                room_id: room.clone(),
+                diffs: vec![ListDiff::Reset {
+                    values: vec![participant("a", "@carol:x", false)],
+                }],
+            },
+            &[],
+        );
+        let clean = |calls: &mut Calls, who: &str| {
+            calls.command(
+                CallCmd::Clean(CleanArg::Person {
+                    who: who.into(),
+                    choice: VoiceCleaning::Never,
+                }),
+                &[],
+                None,
+            )
+        };
+        let by_index = clean(&mut calls, "0");
+        assert_eq!(
+            sent(&by_index.commands),
+            sent(&[Command::SetUserCleaning {
+                user_id: UserId::from("@carol:x"),
+                cleaning: VoiceCleaning::Never,
+            }])
+        );
+        assert_eq!(by_index.lines, ["Cleaning of @carol:x: never."]);
+        assert_eq!(
+            clean(&mut calls, "@dave:y").commands.len(),
+            1,
+            "any user ID"
+        );
+        assert_eq!(
+            clean(&mut calls, "5").lines,
+            ["No such participant. Use /who to list them."]
+        );
+
+        let deafen = calls.command(CallCmd::Deafen(None), &[], None);
+        assert_eq!(sent(&deafen.commands), sent(&[Command::SetDeafened(true)]));
+        let test = calls.command(CallCmd::MicTest(Some(false)), &[], None);
+        assert_eq!(
+            sent(&test.commands),
+            sent(&[Command::StartMicTest { loopback: false }])
+        );
+        let level = InputLevel {
+            rms_db: -30.0,
+            peak_db: -10.0,
+            transmitting: true,
+        };
+        assert_eq!(calls.event(CoreEvent::InputLevel(level), &[]).len(), 1);
+        assert!(
+            calls.event(CoreEvent::InputLevel(level), &[]).is_empty(),
+            "one level line a second"
+        );
+
+        let gpu = GpuEnhancement {
+            available: Vec::new(),
+            running: None,
+        };
+        let lines = |calls: &mut Calls, event| calls.event(event, &[]);
+        assert_eq!(
+            lines(&mut calls, CoreEvent::GpuEnhancement(gpu)),
+            ["GPU enhancement: none usable here."]
+        );
+        assert_eq!(
+            lines(
+                &mut calls,
+                CoreEvent::CallDeclined {
+                    room_id: room.clone(),
+                    user_id: UserId::from("@carol:x"),
+                }
+            ),
+            ["@carol:x declined the call in !r:x."]
+        );
+        assert_eq!(
+            lines(
+                &mut calls,
+                CoreEvent::CallState(CallState::Reconnecting {
+                    room_id: room.clone(),
+                    attempt: 2,
+                })
+            ),
+            ["Call in !r:x lost its connection; reconnecting (attempt 2)."]
+        );
+        assert_eq!(
+            lines(
+                &mut calls,
+                CoreEvent::CallState(CallState::Left {
+                    room_id: room,
+                    reason: CallEndReason::Failed("the server went away".into()),
+                })
+            ),
+            ["The call in !r:x ended: the server went away."]
+        );
+        assert_eq!(
+            calls.command(CallCmd::Deafen(None), &[], None).lines,
+            ["Not in a call."],
+            "left"
         );
     }
 }

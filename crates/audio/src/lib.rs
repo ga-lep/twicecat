@@ -9,11 +9,13 @@ mod convert;
 mod denormals;
 mod devices;
 mod dfn;
+mod enhancer;
 mod frame;
 mod gate;
 mod io;
 #[cfg(feature = "onnxruntime")]
 pub mod onnx;
+mod paths;
 mod pipeline;
 #[cfg(target_os = "linux")]
 mod pw;
@@ -21,15 +23,17 @@ mod resample;
 mod voice;
 
 pub use chain::{
-    CaptureChain, CaptureResult, ChainSettings, ChainStats, Enhancer, LEVEL_FLOOR_DB, NoiseMode,
-    NsLevel,
+    CaptureChain, CaptureResult, ChainSettings, ChainStats, LEVEL_FLOOR_DB, NoiseMode, NsLevel,
 };
 pub use denormals::flush_denormals_on_this_thread;
 pub use devices::{DeviceInfo, DeviceList, DeviceWatcher, list_devices};
+#[cfg(feature = "onnxruntime")]
+pub use dfn::DeepFilterBank;
 pub use dfn::{
     DeepFilter, DeepFilterBackend, DeepFilterModel, DeepFilterStatus, default_model_dir,
     default_stateful_model,
 };
+pub use enhancer::{BatchCleaner, Enhancer};
 pub use frame::{FRAME_LEN, Frame, SAMPLE_RATE, SILENCE};
 pub use gate::GateMode;
 pub use io::{AudioIo, IoConfig, IoEvent, IoInfo, Realtime, StreamInfo, VirtualDevice};
@@ -76,4 +80,8 @@ pub enum AudioError {
     /// Unexpected internal failure.
     #[error("internal audio error")]
     Internal,
+    /// The GPU was not used for this frame (another thread was opening or
+    /// closing a WebGPU session); the next frame tries again.
+    #[error("the GPU was busy for this frame")]
+    GpuBusy,
 }

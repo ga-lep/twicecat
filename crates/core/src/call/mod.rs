@@ -22,57 +22,43 @@ mod e2ee;
 mod jwt;
 mod media;
 pub(crate) mod membership;
+mod own_membership;
+mod participants;
 pub(crate) mod ringing;
+mod sfus;
 pub(crate) mod watcher;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::{Arc, Mutex as StdMutex, RwLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, RwLock};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use livekit::e2ee::key_provider::KeyProvider;
 use livekit::e2ee::{E2eeOptions, EncryptionType};
 use livekit::id::ParticipantIdentity;
-use matrix_sdk::deserialized_responses::{EncryptionInfo, RawAnySyncOrStrippedState};
+use matrix_sdk::deserialized_responses::EncryptionInfo;
 use matrix_sdk::event_handler::EventHandlerHandle;
-use matrix_sdk::ruma::api::client::delayed_events::update_delayed_event::UpdateAction;
-use matrix_sdk::ruma::api::client::delayed_events::update_delayed_event::unstable_v2 as update_delayed;
-use matrix_sdk::ruma::api::client::delayed_events::{DelayParameters, delayed_state_event};
 use matrix_sdk::ruma::api::client::rtc::RtcTransport;
-use matrix_sdk::ruma::api::error::ErrorKind;
 use matrix_sdk::ruma::events::AnyToDeviceEvent;
-use matrix_sdk::ruma::events::StateEventType;
 use matrix_sdk::ruma::serde::Raw;
 use matrix_sdk::{Client, Room, RoomState};
-use serde_json::{Value, json};
 use tokio::sync::{Mutex, Notify, mpsc, watch};
-use tokio::task::{AbortHandle, JoinHandle, JoinSet};
+use tokio::task::JoinHandle;
 
 use self::cleaning::Cleaning;
 pub(crate) use self::cleaning::announcement;
-use self::e2ee::{KeyPlanner, Recipient};
+use self::e2ee::KeyPlanner;
 pub(crate) use self::media::MediaNotice;
 use self::media::{ConnectionShared, Publish, SfuConnection, SharedFlags};
-use self::membership::{
-    CALL_MEMBER_EVENT, DELAYED_LEAVE, DELAYED_LEAVE_RESTART, MEMBERSHIP_EXPIRES, Membership,
+use self::membership::MEMBERSHIP_EXPIRES;
+use self::own_membership::{
+    OwnMembership, keep_membership, schedule_delayed_leave, send_membership,
 };
+pub(crate) use self::participants::active_memberships;
+use self::participants::{Ours, watch_participants};
+use self::sfus::{Expected, Remotes, SfuManager, manage_sfus};
 use crate::api::{
-    AudioSettings, CoreError, CoreEvent, DeviceId, ListDiff, Participant, ParticipantId,
-    RemoteCleaning, RoomId, UserId, VoiceCleaning,
+    AudioSettings, CoreError, CoreEvent, RemoteCleaning, RoomId, UserId, VoiceCleaning,
 };
-
-/// How often participants are re-read even without a state change, so that
-/// expired memberships disappear.
-const PARTICIPANT_RECHECK: Duration = Duration::from_secs(5);
-/// Refresh our membership this long before it would expire.
-const REFRESH_MARGIN: Duration = Duration::from_secs(10 * 60);
-/// Retry delays for another member's SFU: doubling from the first, capped.
-const REMOTE_RETRY_FIRST: Duration = Duration::from_secs(2);
-const REMOTE_RETRY_MAX: Duration = Duration::from_secs(60);
-
-/// Call service URL → LiveKit identities expected on its SFU.
-type Expected = BTreeMap<String, BTreeSet<String>>;
-/// Connected SFUs of other members, by call service URL.
-type Remotes = Arc<StdMutex<HashMap<String, SfuConnection>>>;
 
 pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
@@ -83,6 +69,15 @@ pub(crate) fn now_ms() -> u64 {
 /// Per-user playback volumes, shared with the engine so participants carry
 /// the current value.
 pub(crate) type UserVolumes = Arc<RwLock<BTreeMap<UserId, u16>>>;
+
+/// `user`'s playback volume, percent (100 when not set).
+pub(crate) fn user_volume(volumes: &UserVolumes, user: &UserId) -> u16 {
+    volumes
+        .read()
+        .ok()
+        .and_then(|v| v.get(user).copied())
+        .unwrap_or(100)
+}
 
 /// The local user's call.
 pub(crate) struct CallSession {
@@ -118,60 +113,8 @@ pub(crate) struct CallAudio {
     pub cleaning: (RemoteCleaning, BTreeMap<UserId, VoiceCleaning>),
     /// What we announce about our microphone's cleaning ([`announcement`]).
     pub announce: Option<&'static str>,
-}
-
-/// Schedules the empty membership that fires if we stop restarting it.
-/// `Ok(None)` when the server has no delayed events (MSC4140): the call
-/// still works, but a crash leaves a stale membership until it expires.
-async fn schedule_delayed_leave(
-    client: &Client,
-    room: &Room,
-    state_key: &str,
-) -> Result<Option<String>, CoreError> {
-    let empty: Raw<_> = Raw::new(&json!({}))
-        .map_err(|_| CoreError::Internal("empty membership".into()))?
-        .cast_unchecked();
-    let request = delayed_state_event::unstable::Request::new_raw(
-        room.room_id().to_owned(),
-        state_key.to_owned(),
-        StateEventType::from(CALL_MEMBER_EVENT),
-        DelayParameters::Timeout {
-            timeout: DELAYED_LEAVE,
-        },
-        empty,
-    );
-    match client.send(request).await {
-        Ok(reply) => Ok(Some(reply.delay_id)),
-        Err(e)
-            if matches!(
-                e.client_api_error_kind(),
-                Some(ErrorKind::Unrecognized | ErrorKind::NotFound)
-            ) =>
-        {
-            tracing::warn!("homeserver has no delayed events; crash-safe leave disabled");
-            Ok(None)
-        }
-        Err(_) => Err(CoreError::Call("could not schedule the call leave".into())),
-    }
-}
-
-/// Sends our membership; returns its event ID.
-async fn send_membership(
-    room: &Room,
-    state_key: &str,
-    content: Value,
-) -> Result<String, CoreError> {
-    room.send_state_event_raw(CALL_MEMBER_EVENT, state_key, content)
-        .await
-        .map(|r| r.event_id.to_string())
-        .map_err(|e| match e.client_api_error_kind() {
-            // The room's power levels reserve call memberships (Element
-            // creates rooms with `org.matrix.msc3401.call.member` at 0).
-            Some(ErrorKind::Forbidden) => {
-                CoreError::Call("you are not allowed to join calls in this room".into())
-            }
-            _ => CoreError::Call("could not publish the call membership".into()),
-        })
+    /// Where other voices are cleaned, for the audio stats.
+    pub cleaning_backend: Option<crate::audio_session::CleaningBackend>,
 }
 
 /// Rings the room: `ring` in a DM, a quiet `notification` elsewhere (as
@@ -210,99 +153,6 @@ async fn own_livekit_service(
             _ => None,
         })
         .ok_or_else(|| CoreError::Call("this homeserver offers no call service".into()))
-}
-
-/// Every membership in the room's state, active or not.
-async fn read_memberships(room: &Room) -> Vec<Membership> {
-    let Ok(events) = room
-        .get_state_events(StateEventType::from(CALL_MEMBER_EVENT))
-        .await
-    else {
-        return Vec::new();
-    };
-    events
-        .into_iter()
-        .filter_map(|raw| match raw {
-            RawAnySyncOrStrippedState::Sync(raw) => raw.deserialize_as::<Value>().ok(),
-            RawAnySyncOrStrippedState::Stripped(_) => None,
-        })
-        .filter_map(|event| {
-            let sender = event.get("sender")?.as_str()?;
-            let state_key = event.get("state_key")?.as_str()?;
-            let ts = event.get("origin_server_ts")?.as_u64()?;
-            membership::parse(sender, state_key, ts, event.get("content")?)
-        })
-        .collect()
-}
-
-/// Active memberships, oldest first.
-pub(crate) async fn active_memberships(room: &Room) -> Vec<Membership> {
-    let now = now_ms();
-    let mut active: Vec<Membership> = read_memberships(room)
-        .await
-        .into_iter()
-        .filter(|m| m.is_active(now))
-        .collect();
-    active.sort_by(|a, b| (a.joined_ms, &a.member_id).cmp(&(b.joined_ms, &b.member_id)));
-    active
-}
-
-/// Active memberships (oldest first) as API participants.
-async fn participants(
-    room: &Room,
-    active: &[Membership],
-    volumes: &UserVolumes,
-    flags: &SharedFlags,
-) -> Vec<Participant> {
-    let own_user = room.own_user_id().as_str().to_owned();
-    let own_device = room
-        .client()
-        .device_id()
-        .map(|d| d.as_str().to_owned())
-        .unwrap_or_default();
-    let mut out = Vec::with_capacity(active.len());
-    for m in active {
-        let display_name = match matrix_sdk::ruma::UserId::parse(&m.user_id) {
-            Ok(uid) => room
-                .get_member_no_sync(&uid)
-                .await
-                .ok()
-                .flatten()
-                .and_then(|member| member.display_name().map(str::to_owned)),
-            Err(_) => None,
-        };
-        let user_id = UserId::from(m.user_id.as_str());
-        let volume_percent = volumes
-            .read()
-            .map(|v| v.get(&user_id).copied().unwrap_or(100))
-            .unwrap_or(100);
-        let (speaking, muted, cleaning) = flags
-            .flags
-            .read()
-            .map(|f| {
-                (
-                    f.is_speaking(&m.backend_identity),
-                    f.muted.contains(&m.backend_identity),
-                    f.cleaning
-                        .get(&m.backend_identity)
-                        .copied()
-                        .unwrap_or_default(),
-                )
-            })
-            .unwrap_or_default();
-        out.push(Participant {
-            id: ParticipantId::from(m.member_id.as_str()),
-            is_local: m.user_id == own_user && m.device_id == own_device,
-            user_id,
-            device_id: DeviceId::from(m.device_id.as_str()),
-            display_name,
-            muted,
-            speaking,
-            volume_percent,
-            cleaning,
-        });
-    }
-    out
 }
 
 impl CallSession {
@@ -355,6 +205,7 @@ impl CallSession {
             cleaning_settings,
             cleaning_choices,
             flags.clone(),
+            audio.cleaning_backend.clone(),
         );
         let (announce, announce_rx) = watch::channel(audio.announce);
         let (to_engine, notices) = mpsc::channel(8);
@@ -413,7 +264,7 @@ impl CallSession {
                 move |event: Raw<AnyToDeviceEvent>, info: Option<EncryptionInfo>| {
                     let provider = provider.clone();
                     let room_id = room_id.clone();
-                    async move { receive_key(&event, info.as_ref(), &room_id, &provider) }
+                    async move { e2ee::receive_key(&event, info.as_ref(), &room_id, &provider) }
                 },
             ));
         }
@@ -474,7 +325,7 @@ impl CallSession {
         let (expected_tx, expected_rx) = watch::channel(Expected::new());
         let (recipients, recipients_rx) = watch::channel(Vec::new());
         if let (Some(provider), Some(planner)) = (keys, planner) {
-            session.tasks.push(tokio::spawn(distribute_keys(
+            session.tasks.push(tokio::spawn(e2ee::distribute_keys(
                 client.clone(),
                 room_id.as_str().to_owned(),
                 own_identity.clone(),
@@ -577,438 +428,6 @@ impl CallSession {
             remote.close().await;
         }
         let delay_id = self.delay_id.lock().await.take();
-        let client = self.room.client();
-        let fired = match delay_id {
-            Some(id) => client
-                .send(update_delayed::Request::new(id, UpdateAction::Send))
-                .await
-                .is_ok(),
-            None => false,
-        };
-        if !fired
-            && send_membership(&self.room, &self.state_key, json!({}))
-                .await
-                .is_err()
-        {
-            tracing::warn!("could not remove the call membership; it expires by itself");
-        }
-    }
-}
-
-/// What [`keep_membership`] needs.
-struct OwnMembership {
-    client: Client,
-    room: Room,
-    state_key: String,
-    user_id: String,
-    device_id: String,
-    service_url: String,
-    delay_id: Arc<Mutex<Option<String>>>,
-    /// Woken by `watch_participants` when our membership is gone from the
-    /// room state.
-    gone: Arc<Notify>,
-}
-
-impl OwnMembership {
-    /// Restarts the delayed leave so it never fires while we are alive. If
-    /// the server lost it (restart, cancelled) or already sent it, schedules
-    /// a new one.
-    async fn restart_delayed_leave(&self) {
-        let mut guard = self.delay_id.lock().await;
-        let Some(id) = guard.clone() else {
-            // The homeserver has no delayed events.
-            return;
-        };
-        match self
-            .client
-            .send(update_delayed::Request::new(id, UpdateAction::Restart))
-            .await
-        {
-            Ok(_) => {}
-            Err(e) if matches!(e.client_api_error_kind(), Some(ErrorKind::NotFound)) => {
-                if let Ok(Some(new)) =
-                    schedule_delayed_leave(&self.client, &self.room, &self.state_key).await
-                {
-                    *guard = Some(new);
-                }
-            }
-            // Network trouble: try again next tick; the server sends the
-            // leave if we stay away longer than the delay.
-            Err(_) => {}
-        }
-    }
-
-    /// Sends our membership, valid for `validity` from `created_ts` (`None`:
-    /// from now, a fresh membership).
-    async fn publish(&self, created_ts: Option<u64>, validity: Duration) -> Result<(), CoreError> {
-        let content = membership::join_content(
-            &self.user_id,
-            &self.device_id,
-            &self.service_url,
-            self.room.room_id().as_str(),
-            created_ts,
-            validity,
-        );
-        send_membership(&self.room, &self.state_key, content)
-            .await
-            .map(|_| ())
-    }
-
-    /// Joins again from scratch, as at the start (js-sdk
-    /// `MembershipManager`, "missing own membership"): a new delayed leave,
-    /// the old one cancelled first (left alone, it would fire and remove the
-    /// new membership), then a fresh membership.
-    async fn rejoin(&self) -> Result<(), CoreError> {
-        let mut guard = self.delay_id.lock().await;
-        if let Some(old) = guard.clone() {
-            match self
-                .client
-                .send(update_delayed::Request::new(old, UpdateAction::Cancel))
-                .await
-            {
-                Ok(_) => {}
-                Err(e) if matches!(e.client_api_error_kind(), Some(ErrorKind::NotFound)) => {}
-                Err(_) => return Err(CoreError::Call("could not cancel the call leave".into())),
-            }
-            *guard = None;
-        }
-        *guard = schedule_delayed_leave(&self.client, &self.room, &self.state_key).await?;
-        drop(guard);
-        self.publish(None, MEMBERSHIP_EXPIRES).await
-    }
-}
-
-/// Keeps our membership in the room state: restarts the delayed leave,
-/// re-publishes the membership with a longer validity before it expires,
-/// and joins again from scratch when it is gone (the server sent our leave
-/// during a stall longer than the delay, or it expired).
-async fn keep_membership(own: OwnMembership, joined_ms: u64) {
-    let refresh_after =
-        |validity: Duration| tokio::time::Instant::now() + validity.saturating_sub(REFRESH_MARGIN);
-    let mut ticker = tokio::time::interval(DELAYED_LEAVE_RESTART);
-    ticker.tick().await;
-    let mut created_ts = joined_ms;
-    let mut validity = MEMBERSHIP_EXPIRES;
-    let mut refresh_at = refresh_after(validity);
-    let mut rejoin = false;
-    loop {
-        tokio::select! {
-            _ = ticker.tick() => own.restart_delayed_leave().await,
-            () = tokio::time::sleep_until(refresh_at) => {
-                validity += MEMBERSHIP_EXPIRES;
-                // Counted from the first join, so the next refresh comes
-                // a whole validity later.
-                refresh_at = refresh_after(MEMBERSHIP_EXPIRES);
-                if own.publish(Some(created_ts), validity).await.is_err() {
-                    tracing::warn!("could not refresh the call membership");
-                }
-            }
-            () = own.gone.notified() => rejoin = true,
-        }
-        if rejoin {
-            let started = now_ms();
-            match own.rejoin().await {
-                Ok(()) => {
-                    rejoin = false;
-                    created_ts = started;
-                    validity = MEMBERSHIP_EXPIRES;
-                    refresh_at = refresh_after(validity);
-                }
-                // Tried again on the next tick.
-                Err(_) => tracing::warn!("could not join the call again; retrying"),
-            }
-        }
-    }
-}
-
-/// Our side, for the participant watcher.
-struct Ours {
-    identity: String,
-    service: String,
-    /// Who to play on which SFU, for `manage_sfus`.
-    expected: watch::Sender<Expected>,
-    /// The other members' devices, for our key (`distribute_keys`).
-    recipients: watch::Sender<Vec<Recipient>>,
-    /// Told when our membership, once seen, is gone (`keep_membership`).
-    gone: Arc<Notify>,
-}
-
-/// Emits `CallParticipants` (a full reset) whenever the active set changes,
-/// and tells the SFU manager who publishes where.
-async fn watch_participants(
-    room: Room,
-    room_id: RoomId,
-    events: mpsc::Sender<CoreEvent>,
-    volumes: UserVolumes,
-    flags: SharedFlags,
-    ours: Ours,
-) {
-    let mut info = room.subscribe_info();
-    let mut ticker = tokio::time::interval(PARTICIPANT_RECHECK);
-    let mut last: Option<Vec<Participant>> = None;
-    // Our membership reaches the store some time after we send it: only its
-    // disappearance after that counts.
-    let mut seen_own = false;
-    loop {
-        let active = active_memberships(&room).await;
-        if active.iter().any(|m| m.backend_identity == ours.identity) {
-            seen_own = true;
-        } else if seen_own {
-            seen_own = false;
-            tracing::warn!("our call membership is gone; joining again");
-            ours.gone.notify_one();
-        }
-        let expected = membership::expected_by_sfu(&active, &ours.identity, &ours.service);
-        ours.expected.send_if_modified(|e| {
-            let changed = *e != expected;
-            *e = expected;
-            changed
-        });
-        let recipients: Vec<Recipient> = active
-            .iter()
-            .filter(|m| m.backend_identity != ours.identity)
-            .map(|m| Recipient {
-                user_id: m.user_id.clone(),
-                device_id: m.device_id.clone(),
-                since: m.joined_ms,
-            })
-            .collect();
-        ours.recipients.send_if_modified(|r| {
-            let changed = *r != recipients;
-            *r = recipients;
-            changed
-        });
-        let now = participants(&room, &active, &volumes, &flags).await;
-        if last.as_ref() != Some(&now) {
-            let event = CoreEvent::CallParticipants {
-                room_id: room_id.clone(),
-                diffs: vec![ListDiff::Reset {
-                    values: now.clone(),
-                }],
-            };
-            if events.send(event).await.is_err() {
-                return;
-            }
-            last = Some(now);
-        }
-        tokio::select! {
-            changed = info.next() => if changed.is_none() { return },
-            () = flags.changed.notified() => {}
-            _ = ticker.tick() => {}
-        }
-    }
-}
-
-/// What the SFU manager needs.
-struct SfuManager {
-    client: Client,
-    room_id: String,
-    own_service: String,
-    shared: ConnectionShared,
-    remotes: Remotes,
-}
-
-/// One other member's SFU we want.
-struct Remote {
-    /// Who to play there.
-    expected: watch::Sender<BTreeSet<String>>,
-    /// A connection attempt in flight.
-    connecting: Option<AbortHandle>,
-    /// After a failure: when to try again, and how many attempts failed.
-    retry: Option<(Instant, u32)>,
-}
-
-fn retry_delay(failures: u32) -> Duration {
-    REMOTE_RETRY_FIRST
-        .saturating_mul(1 << failures.min(6))
-        .min(REMOTE_RETRY_MAX)
-}
-
-/// Keeps one subscribe-only connection per other member's SFU: opens them
-/// as members appear, retries failures with backoff, closes the ones nobody
-/// publishes to any more, and tells each connection who to play. Notices
-/// from our own SFU go to the engine; a lost remote SFU is reconnected.
-async fn manage_sfus(
-    m: SfuManager,
-    own_expected: watch::Sender<BTreeSet<String>>,
-    mut expected: watch::Receiver<Expected>,
-    mut notices: mpsc::Receiver<(String, MediaNotice)>,
-    to_engine: mpsc::Sender<MediaNotice>,
-) {
-    let mut wanted: HashMap<String, Remote> = HashMap::new();
-    let mut attempts: JoinSet<(String, Result<SfuConnection, CoreError>)> = JoinSet::new();
-    let mut ticker = tokio::time::interval(Duration::from_secs(1));
-    loop {
-        let now = expected.borrow_and_update().clone();
-        let own = now.get(&m.own_service).cloned().unwrap_or_default();
-        own_expected.send_if_modified(|e| {
-            let changed = *e != own;
-            *e = own;
-            changed
-        });
-        // SFUs nobody publishes to any more.
-        let gone: Vec<String> = wanted
-            .keys()
-            .filter(|url| !now.contains_key(*url))
-            .cloned()
-            .collect();
-        for url in gone {
-            if let Some(handle) = wanted.remove(&url).and_then(|r| r.connecting) {
-                handle.abort();
-            }
-            let closed = m.remotes.lock().expect("remotes lock").remove(&url);
-            if let Some(connection) = closed {
-                connection.close().await;
-            }
-        }
-        for (url, ids) in now.iter().filter(|(url, _)| **url != m.own_service) {
-            let remote = wanted.entry(url.clone()).or_insert_with(|| Remote {
-                expected: watch::channel(BTreeSet::new()).0,
-                connecting: None,
-                retry: None,
-            });
-            remote.expected.send_if_modified(|e| {
-                let changed = e != ids;
-                e.clone_from(ids);
-                changed
-            });
-            let connected = m.remotes.lock().expect("remotes lock").contains_key(url);
-            let due = remote.retry.is_none_or(|(at, _)| at <= Instant::now());
-            if !connected && remote.connecting.is_none() && due {
-                let client = m.client.clone();
-                let room_id = m.room_id.clone();
-                let url = url.clone();
-                let rx = remote.expected.subscribe();
-                let shared = ConnectionShared {
-                    encryption: m.shared.encryption.clone(),
-                    voice: m.shared.voice.clone(),
-                    volumes: m.shared.volumes.clone(),
-                    flags: m.shared.flags.clone(),
-                    cleaning: m.shared.cleaning.clone(),
-                    notices: m.shared.notices.clone(),
-                };
-                remote.connecting = Some(attempts.spawn(async move {
-                    let result = match jwt::subscribe_access(&client, &url, &room_id).await {
-                        Ok(sfu) => {
-                            SfuConnection::connect(url.clone(), &sfu, None, rx, &shared).await
-                        }
-                        Err(e) => Err(e),
-                    };
-                    (url, result)
-                }));
-            }
-        }
-        tokio::select! {
-            changed = expected.changed() => if changed.is_err() { return },
-            Some(done) = attempts.join_next() => {
-                // An aborted attempt (its SFU no longer wanted) ends here too.
-                if let Ok((url, result)) = done {
-                    match (wanted.get_mut(&url), result) {
-                        (Some(remote), Ok(connection)) => {
-                            remote.connecting = None;
-                            remote.retry = None;
-                            m.remotes.lock().expect("remotes lock").insert(url, connection);
-                        }
-                        (Some(remote), Err(_)) => {
-                            remote.connecting = None;
-                            let failures = remote.retry.map_or(0, |(_, n)| n);
-                            remote.retry = Some((Instant::now() + retry_delay(failures), failures + 1));
-                            tracing::warn!("could not connect to another member's call server; retrying");
-                        }
-                        (None, Ok(connection)) => connection.close().await,
-                        (None, Err(_)) => {}
-                    }
-                }
-            }
-            Some((url, notice)) = notices.recv() => {
-                if url == m.own_service {
-                    let _ = to_engine.send(notice).await;
-                } else if notice == MediaNotice::Disconnected {
-                    let lost = m.remotes.lock().expect("remotes lock").remove(&url);
-                    if let Some(connection) = lost {
-                        connection.close().await;
-                    }
-                    if let Some(remote) = wanted.get_mut(&url) {
-                        remote.retry = Some((Instant::now() + REMOTE_RETRY_FIRST, 1));
-                    }
-                }
-            }
-            _ = ticker.tick() => {}
-        }
-    }
-}
-
-/// Takes a member's call key from a decrypted to-device event. Keys sent
-/// in clear, for another room, or claiming another device than the Olm
-/// session's are ignored.
-fn receive_key(
-    event: &Raw<AnyToDeviceEvent>,
-    info: Option<&EncryptionInfo>,
-    room_id: &str,
-    provider: &KeyProvider,
-) {
-    let Ok(event) = event.deserialize_as::<Value>() else {
-        return;
-    };
-    if event.get("type").and_then(Value::as_str) != Some(e2ee::KEYS_EVENT) {
-        return;
-    }
-    let Some(info) = info else {
-        tracing::warn!("call key sent unencrypted; ignored");
-        return;
-    };
-    let Some(key) = event.get("content").and_then(|content| {
-        e2ee::parse_key(
-            content,
-            info.sender.as_str(),
-            info.sender_device.as_deref().map(|d| d.as_str()),
-            room_id,
-        )
-    }) else {
-        return;
-    };
-    provider.set_key(
-        &ParticipantIdentity(membership::member_id(&key.user_id, &key.device_id)),
-        i32::from(key.index),
-        key.key.to_vec(),
-    );
-}
-
-/// Shares our key with the members as they come, rotates it as they go,
-/// and retries devices it could not reach. A new key is used after
-/// `USE_KEY_DELAY`, once the others have it (also when some could not be
-/// reached: they get it on the next try), or at once with nobody to send
-/// it to.
-async fn distribute_keys(
-    client: Client,
-    room_id: String,
-    own_identity: String,
-    mut planner: KeyPlanner,
-    provider: KeyProvider,
-    key_index: watch::Sender<i32>,
-    mut members: watch::Receiver<Vec<Recipient>>,
-) {
-    let own = ParticipantIdentity(own_identity.clone());
-    let mut retry = tokio::time::interval(PARTICIPANT_RECHECK);
-    loop {
-        let now = members.borrow_and_update().clone();
-        if let Some(rollout) = planner.plan(&now, Instant::now(), e2ee::random_key) {
-            if !rollout.to.is_empty() {
-                let got =
-                    e2ee::send_key(&client, &room_id, &own_identity, &rollout, now_ms()).await;
-                planner.shared(&got);
-                if rollout.rotated {
-                    tokio::time::sleep(e2ee::USE_KEY_DELAY).await;
-                }
-            }
-            if rollout.rotated {
-                provider.set_key(&own, i32::from(rollout.index), rollout.key.to_vec());
-                key_index.send_replace(i32::from(rollout.index));
-            }
-        }
-        tokio::select! {
-            changed = members.changed() => if changed.is_err() { return },
-            _ = retry.tick() => {}
-        }
+        own_membership::remove(&self.room, &self.state_key, delay_id).await;
     }
 }

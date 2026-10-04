@@ -4,14 +4,13 @@
 
 use std::path::Path;
 
-use realfft::num_complex::Complex32;
 use tract_onnx::prelude::*;
 use tract_onnx::tract_hir::infer::ShapeFactoid;
 use tract_onnx::tract_hir::shapefactoid;
 use tract_pulse::internal::{PulsedModel, PulsedModelExt, ToDim};
 
 use super::config::Config;
-use super::{Inference, stages};
+use super::signal::{NetIo, fill};
 use crate::AudioError;
 
 type State = TypedSimpleState;
@@ -172,67 +171,45 @@ pub(crate) fn load(dir: &Path, cfg: &Config) -> Result<Plans, AudioError> {
 }
 
 impl Graphs {
-    /// Runs the networks on one frame's features (`spec`: the real parts,
-    /// then the imaginary ones): the encoder always, each decoder only when
-    /// the local SNR asks for its output, so a skipped decoder's state stays
-    /// where it was (as upstream's runtime does).
-    pub(crate) fn infer(
-        &mut self,
-        cfg: &Config,
-        erb: &[f32],
-        spec: &[f32],
-    ) -> Result<Inference, AudioError> {
+    /// Runs the networks on one frame's features in `net`, and writes their
+    /// outputs there: the encoder always, each decoder only when the local
+    /// SNR asks for its output, so a skipped decoder's state stays where it
+    /// was (as upstream's runtime does).
+    pub(crate) fn infer(&mut self, cfg: &Config, net: &mut NetIo) -> Result<(), AudioError> {
         let tensor = |shape: &[usize], data: &[f32]| {
             Tensor::from_shape(shape, data)
                 .map(TValue::from)
                 .map_err(|_| AudioError::Internal)
         };
-        let feat_erb = tensor(&[1, 1, 1, cfg.nb_erb], erb)?;
-        let feat_spec = tensor(&[1, 2, 1, cfg.nb_df], spec)?;
+        let feat_erb = tensor(&[1, 1, 1, cfg.nb_erb], &net.erb)?;
+        let feat_spec = tensor(&[1, 2, 1, cfg.nb_df], &net.feat_spec)?;
         let mut out = self.encoder.run(tvec!(feat_erb, feat_spec))?;
         // e0, e1, e2, e3, emb, c0, lsnr
         if out.len() != 7 {
             return Err(AudioError::Internal);
         }
-        let floats = |t: &TValue| -> Result<Vec<f32>, AudioError> {
-            t.to_plain_array_view::<f32>()
-                .map(|a| a.iter().copied().collect())
-                .map_err(|_| AudioError::Internal)
+        let copy = |t: Option<&TValue>, out: &mut [f32]| {
+            let view = t
+                .ok_or(AudioError::Internal)?
+                .to_plain_array_view::<f32>()
+                .map_err(|_| AudioError::Internal)?;
+            fill(out, view.iter().copied())
         };
-        let lsnr = floats(&out[6])?.first().copied().unwrap_or(0.0);
-        let stage = stages(lsnr);
+        let mut lsnr = [0.0];
+        copy(out.get(6), &mut lsnr)?;
+        net.lsnr = lsnr[0];
+        let stages = net.stages();
         let c0 = out.remove(5);
         let emb = out.remove(4);
-        let gains = if stage.gains {
+        if stages.gains {
             let (e3, e2, e1, e0) = (out.remove(3), out.remove(2), out.remove(1), out.remove(0));
             let m = self.erb_decoder.run(tvec!(emb.clone(), e3, e2, e1, e0))?;
-            Some(floats(m.first().ok_or(AudioError::Internal)?)?)
-        } else if stage.zero_gains {
-            Some(vec![0.0; cfg.nb_erb])
-        } else {
-            None
-        };
-        let coefs = if stage.deep_filter {
+            copy(m.first(), &mut net.gains)?;
+        }
+        if stages.deep_filter {
             let raw = self.df_decoder.run(tvec!(emb, c0))?;
-            Some(coefficients(
-                cfg,
-                &floats(raw.first().ok_or(AudioError::Internal)?)?,
-            )?)
-        } else {
-            None
-        };
-        Ok(Inference { lsnr, gains, coefs })
+            copy(raw.first(), &mut net.coefs)?;
+        }
+        Ok(())
     }
-}
-
-/// The deep filter's coefficients (`[bin][tap]`, complex) from the
-/// decoder's interleaved output.
-pub(crate) fn coefficients(cfg: &Config, raw: &[f32]) -> Result<Vec<Complex32>, AudioError> {
-    if raw.len() != cfg.nb_df * cfg.df_order * 2 {
-        return Err(AudioError::Internal);
-    }
-    Ok(raw
-        .chunks_exact(2)
-        .map(|c| Complex32::new(c[0], c[1]))
-        .collect())
 }

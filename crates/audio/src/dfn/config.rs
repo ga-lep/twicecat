@@ -2,6 +2,7 @@
 //! against what our pipeline is built for.
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use crate::AudioError;
 
@@ -36,6 +37,13 @@ fn parse_ini(text: &str) -> HashMap<String, String> {
 }
 
 impl Config {
+    /// Reads and checks `config.ini` in the model directory `dir`.
+    pub(crate) fn load(dir: &Path) -> Result<Self, AudioError> {
+        let text =
+            std::fs::read_to_string(dir.join("config.ini")).map_err(|_| AudioError::Model)?;
+        Self::parse(&text)
+    }
+
     /// Parses and checks a DeepFilterNet3 config for 48 kHz, 960/480 STFT.
     pub(crate) fn parse(text: &str) -> Result<Self, AudioError> {
         let ini = parse_ini(text);

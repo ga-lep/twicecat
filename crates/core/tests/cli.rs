@@ -13,11 +13,30 @@ use common::TestEnv;
 /// The bin files must reach the engine only through the public core API.
 #[test]
 fn cli_source_names_no_sdk_crate() {
-    let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin");
-    for file in ["tessera-cli.rs", "tessera-cli/calls.rs"] {
-        let text = std::fs::read_to_string(bin.join(file)).expect("read the CLI source");
+    fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("list the CLI sources") {
+            let path = entry.expect("a directory entry").path();
+            if path.is_dir() {
+                sources(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    sources(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin"),
+        &mut files,
+    );
+    assert!(files.len() >= 4, "{files:?}");
+    for file in files {
+        let text = std::fs::read_to_string(&file).expect("read the CLI source");
         for needle in ["matrix_sdk", "ruma", "eyeball", "imbl"] {
-            assert!(!text.contains(needle), "{file} mentions {needle}");
+            assert!(
+                !text.contains(needle),
+                "{} mentions {needle}",
+                file.display()
+            );
         }
     }
 }

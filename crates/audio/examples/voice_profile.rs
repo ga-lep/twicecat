@@ -8,7 +8,10 @@
 //! `cargo run --release -p tessera-audio --example voice_profile -- [name]
 //! [frames]` (no name: every configuration). DeepFilterNet rows need
 //! `scripts/fetch-models.sh`. On a hybrid CPU, run it on an efficiency core
-//! too (`taskset -c <cpu>`): the processing thread often runs there.
+//! too (`taskset -c <cpu>`): the processing thread often runs there. With
+//! `--features onnxruntime` (and the GPU parts of Task 13b installed), the
+//! "GPU bank" rows clean the remote voices in one batched GPU call per
+//! frame (Task 16).
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -68,6 +71,7 @@ fn trace_allocation() {
             "tessera_audio",
             "realfft",
             "rustfft",
+            "ort",
         ];
         let caller = frames
             .iter()
@@ -267,10 +271,11 @@ fn engine(
     name: &str,
     s: ChainSettings,
     (sources, cleaned, talking): (usize, usize, usize),
+    gpu: bool,
     mic: &[f32],
     frames: usize,
 ) {
-    let model = if cleaned > 0 {
+    let model = if cleaned > 0 && !gpu {
         let Some(model) = default_model_dir().and_then(|d| DeepFilterModel::load(&d).ok()) else {
             println!("{name:<34} (no DeepFilterNet model)");
             return;
@@ -280,12 +285,30 @@ fn engine(
         None
     };
     let (mut engine, mut control, mut outgoing) = VoiceEngine::new(s);
+    let mut name = name.to_owned();
+    if gpu {
+        match gpu_bank() {
+            Some((bank, on)) => {
+                name = format!("{name} ({on})");
+                control.set_cleaner_bank(Some(bank));
+            }
+            None => {
+                println!(
+                    "{name:<34} (no GPU bank: needs --features onnxruntime and the GPU parts)"
+                );
+                return;
+            }
+        }
+    }
     let mut inputs: Vec<_> = (0..sources)
         .map(|k| {
             let (id, input) = control.add_source(100).expect("a source");
             if let Some(model) = model.as_ref().filter(|_| k < cleaned) {
                 let filter = model.filter(100.0).expect("a filter");
                 control.set_source_cleaner(id, Some(Box::new(filter)));
+            }
+            if gpu && k < cleaned {
+                control.set_source_row(id, Some(k));
             }
             input
         })
@@ -316,8 +339,35 @@ fn engine(
         while outgoing.pop_frame(&mut sent) {}
         std::hint::black_box((&playback, &sent));
     });
-    result.print(name);
+    result.print(&name);
     control.drop_retired();
+}
+
+/// A bank of 16 rows on the first GPU backend that starts, and its name.
+#[cfg(feature = "onnxruntime")]
+fn gpu_bank() -> Option<(Box<dyn tessera_audio::BatchCleaner>, String)> {
+    use tessera_audio::onnx::{Accelerator, OnnxRuntime, default_runtime_dir};
+    let runtime = OnnxRuntime::load(&default_runtime_dir()?).ok()?;
+    let bank = tessera_audio::DeepFilterBank::load(
+        &default_model_dir()?,
+        &tessera_audio::default_stateful_model()?,
+        16,
+        100.0,
+        &runtime,
+        &[
+            Accelerator::TensorRt,
+            Accelerator::Cuda,
+            Accelerator::WebGpu,
+        ],
+    )
+    .ok()??;
+    let on = format!("{:?}", bank.accelerator());
+    Some((Box::new(bank), on))
+}
+
+#[cfg(not(feature = "onnxruntime"))]
+fn gpu_bank() -> Option<(Box<dyn tessera_audio::BatchCleaner>, String)> {
+    None
 }
 
 /// DeepFilterNet3's network alone (one frame of features in, gains and
@@ -340,6 +390,7 @@ fn onnx_cpu_network(name: &str, frames: usize) {
         constants: &[("thresholds", &[-15.0, 35.0, 35.0])],
         state: ("state", "state_out"),
         dimensions: &[("batch", 1)],
+        rows: 1,
     };
     let (mut network, _) = runtime.open_loop(&model, &[], &spec).expect("open");
     let features: Vec<f32> = (0..spec.input.1)
@@ -413,23 +464,36 @@ fn main() {
         onnx_cpu_network("network: ONNX Runtime CPU", frames);
     }
     let default = settings(true, true, true, NoiseMode::RnNoise);
-    for (sources, cleaned, talking) in [
-        (0, 0, 0),
-        (4, 0, 4),
-        (16, 0, 16),
-        (4, 1, 4),
-        (4, 4, 4),
-        (8, 8, 8),
-        (8, 8, 2),
-        (16, 16, 1),
+    for (sources, cleaned, talking, gpu) in [
+        (0, 0, 0, false),
+        (4, 0, 4, false),
+        (16, 0, 16, false),
+        (4, 1, 4, false),
+        (4, 4, 4, false),
+        (8, 8, 8, false),
+        (8, 8, 2, false),
+        (16, 16, 1, false),
+        (1, 1, 1, true),
+        (4, 4, 4, true),
+        (16, 16, 16, true),
+        (16, 16, 1, true),
     ] {
-        let name = match (cleaned, talking) {
-            (0, _) => format!("engine: default, {sources} voices mixed"),
-            (c, t) if t == sources => format!("engine: default, {sources} voices, {c} cleaned"),
-            (c, t) => format!("engine: {sources} voices, {c} cleaned, {t} talk"),
+        let name = match (cleaned, talking, gpu) {
+            (0, ..) => format!("engine: default, {sources} voices mixed"),
+            (c, t, true) => format!("engine: GPU bank, {sources} voices, {c} cleaned, {t} talk"),
+            (c, t, _) if t == sources => format!("engine: default, {sources} voices, {c} cleaned"),
+            (c, t, _) => format!("engine: {sources} voices, {c} cleaned, {t} talk"),
         };
         if only.as_deref().is_none_or(|o| name.contains(o)) {
-            engine(&name, default, (sources, cleaned, talking), &mic, frames);
+            engine(
+                &name,
+                default,
+                (sources, cleaned, talking),
+                gpu,
+                &mic,
+                frames,
+            );
+            print_traces(trace);
         }
     }
 }

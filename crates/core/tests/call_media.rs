@@ -851,6 +851,167 @@ async fn remote_voices_are_cleaned_when_asked() {
     }
 }
 
+/// Cleaning on the GPU (feature `gpu-enhancement`, and the GPU parts of
+/// Task 13b installed): carol's steady tone (noise to the network) is cleaned
+/// at alice by the call's bank, and the stats say on which GPU.
+#[cfg(feature = "gpu-enhancement")]
+#[tokio::test]
+#[ignore = "needs local homeserver, scripts/fetch-models.sh, the GPU parts and a GPU"]
+async fn remote_voices_are_cleaned_on_the_gpu() {
+    const CAROL_HZ: f32 = 600.0;
+    let env = TestEnv::load();
+    let alice_raw = raw_login(1).await;
+    let carol_raw = raw_login(3).await;
+    let room_id = create_room(&alice_raw, &unique_room_name(), Some(&env.user_id(3)))
+        .await
+        .to_string();
+    allow_calls(&alice_raw, &room_id).await;
+    carol_raw
+        .join_room_by_id(room_id.as_str().try_into().unwrap())
+        .await
+        .unwrap();
+
+    let alice_audio = Arc::new(Duplex::new(TONE_HZ));
+    let (dir_a, dir_c) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let mut alice = logged_in(dir_a.path(), 1, AudioBackend::Virtual(alice_audio.clone())).await;
+    let mut carol = logged_in(
+        dir_c.path(),
+        3,
+        AudioBackend::Virtual(Arc::new(Duplex::new(CAROL_HZ))),
+    )
+    .await;
+    wait_for_room(&mut alice, &room_id).await;
+    wait_for_room(&mut carol, &room_id).await;
+    let mut gpu = AudioSettings::default();
+    gpu.remote_cleaning.enabled = true;
+    gpu.remote_cleaning.gpu = true;
+    alice
+        .commands
+        .send(Command::UpdateAudioSettings(gpu))
+        .await
+        .unwrap();
+    expect_event(&mut alice, |e| matches!(e, CoreEvent::AudioSettings(_))).await;
+    carol
+        .commands
+        .send(Command::UpdateAudioSettings(tone_settings()))
+        .await
+        .unwrap();
+    expect_event(&mut carol, |e| matches!(e, CoreEvent::AudioSettings(_))).await;
+    join(&mut alice, &room_id).await;
+    join(&mut carol, &room_id).await;
+    let carol_id = env.user_id(3);
+    alice_as_seen_by(&mut alice, &carol_id, |p| {
+        p.speaking && p.cleaning == CleaningStatus::Cleaned
+    })
+    .await;
+    let on = expect_event(&mut alice, |e| {
+        matches!(
+            e,
+            CoreEvent::AudioStats(tessera_core::api::AudioStats {
+                remote_cleaning: Some(_),
+                ..
+            })
+        )
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let cleaned = alice_audio.level(CAROL_HZ, 2.0);
+    let CoreEvent::AudioStats(stats) = on else {
+        unreachable!()
+    };
+    eprintln!(
+        "carol's tone at alice, cleaned on {:?}: {cleaned:.5}",
+        stats.remote_cleaning
+    );
+    assert!(
+        matches!(
+            stats.remote_cleaning,
+            Some(tessera_core::api::EnhancerBackend::Gpu { .. })
+        ),
+        "{:?}",
+        stats.remote_cleaning
+    );
+    assert!(cleaned < 0.01, "cleaned: {cleaned:.5}");
+
+    for core in [&alice, &carol] {
+        core.commands.send(Command::LeaveCall).await.unwrap();
+        core.commands.send(Command::Shutdown).await.unwrap();
+    }
+}
+
+/// Asking for the GPU in a build without it: carol's voice is cleaned on
+/// the CPU all the same, and the stats say so.
+#[cfg(not(feature = "gpu-enhancement"))]
+#[tokio::test]
+#[ignore = "needs local homeserver and scripts/fetch-models.sh"]
+async fn without_a_gpu_voices_are_cleaned_on_the_cpu() {
+    const CAROL_HZ: f32 = 600.0;
+    let env = TestEnv::load();
+    let alice_raw = raw_login(1).await;
+    let carol_raw = raw_login(3).await;
+    let room_id = create_room(&alice_raw, &unique_room_name(), Some(&env.user_id(3)))
+        .await
+        .to_string();
+    allow_calls(&alice_raw, &room_id).await;
+    carol_raw
+        .join_room_by_id(room_id.as_str().try_into().unwrap())
+        .await
+        .unwrap();
+
+    let alice_audio = Arc::new(Duplex::new(TONE_HZ));
+    let (dir_a, dir_c) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let mut alice = logged_in(dir_a.path(), 1, AudioBackend::Virtual(alice_audio.clone())).await;
+    let mut carol = logged_in(
+        dir_c.path(),
+        3,
+        AudioBackend::Virtual(Arc::new(Duplex::new(CAROL_HZ))),
+    )
+    .await;
+    wait_for_room(&mut alice, &room_id).await;
+    wait_for_room(&mut carol, &room_id).await;
+    let mut gpu = AudioSettings::default();
+    gpu.remote_cleaning.enabled = true;
+    gpu.remote_cleaning.gpu = true;
+    alice
+        .commands
+        .send(Command::UpdateAudioSettings(gpu))
+        .await
+        .unwrap();
+    expect_event(&mut alice, |e| matches!(e, CoreEvent::AudioSettings(_))).await;
+    carol
+        .commands
+        .send(Command::UpdateAudioSettings(tone_settings()))
+        .await
+        .unwrap();
+    expect_event(&mut carol, |e| matches!(e, CoreEvent::AudioSettings(_))).await;
+    join(&mut alice, &room_id).await;
+    join(&mut carol, &room_id).await;
+    let carol_id = env.user_id(3);
+    alice_as_seen_by(&mut alice, &carol_id, |p| {
+        p.speaking && p.cleaning == CleaningStatus::Cleaned
+    })
+    .await;
+    expect_event(&mut alice, |e| {
+        matches!(
+            e,
+            CoreEvent::AudioStats(tessera_core::api::AudioStats {
+                remote_cleaning: Some(tessera_core::api::EnhancerBackend::Cpu),
+                ..
+            })
+        )
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let cleaned = alice_audio.level(CAROL_HZ, 2.0);
+    eprintln!("carol's tone at alice, the GPU asked for and the CPU cleaning: {cleaned:.5}");
+    assert!(cleaned < 0.01, "cleaned: {cleaned:.5}");
+
+    for core in [&alice, &carol] {
+        core.commands.send(Command::LeaveCall).await.unwrap();
+        core.commands.send(Command::Shutdown).await.unwrap();
+    }
+}
+
 /// Carol says her microphone is cleaned before Tessera: alice, cleaning the
 /// voices she hears, leaves carol's alone; once carol stops saying so (or
 /// alice sets her to always), alice cleans it.

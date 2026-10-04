@@ -24,14 +24,19 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use livekit::e2ee::key_provider::{KeyDerivationAlgorithm, KeyProviderOptions};
+use livekit::e2ee::key_provider::{KeyDerivationAlgorithm, KeyProvider, KeyProviderOptions};
+use livekit::id::ParticipantIdentity;
 use matrix_sdk::Client;
-use matrix_sdk::ruma::events::{AnyToDeviceEventContent, ToDeviceEventType};
+use matrix_sdk::deserialized_responses::EncryptionInfo;
+use matrix_sdk::ruma::events::{AnyToDeviceEvent, AnyToDeviceEventContent, ToDeviceEventType};
 use matrix_sdk::ruma::serde::{Base64, Raw};
 use matrix_sdk::ruma::to_device::DeviceIdOrAllDevices;
 use matrix_sdk::ruma::{OwnedDeviceId, OwnedUserId};
 use serde_json::{Value, json};
+use tokio::sync::watch;
 use zeroize::Zeroizing;
+
+use super::{membership, now_ms};
 
 /// The to-device event type carrying call keys.
 pub(crate) const KEYS_EVENT: &str = "io.element.call.encryption_keys";
@@ -292,6 +297,83 @@ pub(crate) async fn send_key(
         Err(_) => {
             tracing::warn!("could not send the call key; retrying");
             Vec::new()
+        }
+    }
+}
+
+/// How often keys that did not reach every device are sent again.
+const KEY_RETRY: Duration = Duration::from_secs(5);
+
+/// Takes a member's call key from a decrypted to-device event. Keys sent
+/// in clear, for another room, or claiming another device than the Olm
+/// session's are ignored.
+pub(super) fn receive_key(
+    event: &Raw<AnyToDeviceEvent>,
+    info: Option<&EncryptionInfo>,
+    room_id: &str,
+    provider: &KeyProvider,
+) {
+    let Ok(event) = event.deserialize_as::<Value>() else {
+        return;
+    };
+    if event.get("type").and_then(Value::as_str) != Some(KEYS_EVENT) {
+        return;
+    }
+    let Some(info) = info else {
+        tracing::warn!("call key sent unencrypted; ignored");
+        return;
+    };
+    let Some(key) = event.get("content").and_then(|content| {
+        parse_key(
+            content,
+            info.sender.as_str(),
+            info.sender_device.as_deref().map(|d| d.as_str()),
+            room_id,
+        )
+    }) else {
+        return;
+    };
+    provider.set_key(
+        &ParticipantIdentity(membership::member_id(&key.user_id, &key.device_id)),
+        i32::from(key.index),
+        key.key.to_vec(),
+    );
+}
+
+/// Shares our key with the members as they come, rotates it as they go,
+/// and retries devices it could not reach. A new key is used after
+/// `USE_KEY_DELAY`, once the others have it (also when some could not be
+/// reached: they get it on the next try), or at once with nobody to send
+/// it to.
+pub(super) async fn distribute_keys(
+    client: Client,
+    room_id: String,
+    own_identity: String,
+    mut planner: KeyPlanner,
+    provider: KeyProvider,
+    key_index: watch::Sender<i32>,
+    mut members: watch::Receiver<Vec<Recipient>>,
+) {
+    let own = ParticipantIdentity(own_identity.clone());
+    let mut retry = tokio::time::interval(KEY_RETRY);
+    loop {
+        let now = members.borrow_and_update().clone();
+        if let Some(rollout) = planner.plan(&now, Instant::now(), random_key) {
+            if !rollout.to.is_empty() {
+                let got = send_key(&client, &room_id, &own_identity, &rollout, now_ms()).await;
+                planner.shared(&got);
+                if rollout.rotated {
+                    tokio::time::sleep(USE_KEY_DELAY).await;
+                }
+            }
+            if rollout.rotated {
+                provider.set_key(&own, i32::from(rollout.index), rollout.key.to_vec());
+                key_index.send_replace(i32::from(rollout.index));
+            }
+        }
+        tokio::select! {
+            changed = members.changed() => if changed.is_err() { return },
+            _ = retry.tick() => {}
         }
     }
 }
