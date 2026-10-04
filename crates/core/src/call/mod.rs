@@ -48,6 +48,7 @@ use tokio::sync::{Mutex, Notify, mpsc, watch};
 use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 
 use self::cleaning::Cleaning;
+pub(crate) use self::cleaning::announcement;
 use self::e2ee::{KeyPlanner, Recipient};
 pub(crate) use self::media::MediaNotice;
 use self::media::{ConnectionShared, Publish, SfuConnection, SharedFlags};
@@ -55,8 +56,8 @@ use self::membership::{
     CALL_MEMBER_EVENT, DELAYED_LEAVE, DELAYED_LEAVE_RESTART, MEMBERSHIP_EXPIRES, Membership,
 };
 use crate::api::{
-    CoreError, CoreEvent, DeviceId, ListDiff, Participant, ParticipantId, RemoteCleaning, RoomId,
-    UserId, VoiceCleaning,
+    AudioSettings, CoreError, CoreEvent, DeviceId, ListDiff, Participant, ParticipantId,
+    RemoteCleaning, RoomId, UserId, VoiceCleaning,
 };
 
 /// How often participants are re-read even without a state change, so that
@@ -94,6 +95,8 @@ pub(crate) struct CallSession {
     remotes: Remotes,
     flags: SharedFlags,
     cleaning: Cleaning,
+    /// What our SFU connection announces about our microphone's cleaning.
+    announce: watch::Sender<Option<&'static str>>,
     own_identity: String,
     /// Media is end-to-end encrypted (the room is).
     pub encrypted: bool,
@@ -113,6 +116,8 @@ pub(crate) struct CallAudio {
     pub bitrate_kbps: u16,
     /// Cleaning other people's voices, and the per-user choices.
     pub cleaning: (RemoteCleaning, BTreeMap<UserId, VoiceCleaning>),
+    /// What we announce about our microphone's cleaning ([`announcement`]).
+    pub announce: Option<&'static str>,
 }
 
 /// Schedules the empty membership that fires if we stop restarting it.
@@ -351,6 +356,7 @@ impl CallSession {
             cleaning_choices,
             flags.clone(),
         );
+        let (announce, announce_rx) = watch::channel(audio.announce);
         let (to_engine, notices) = mpsc::channel(8);
         let (notices_all, from_connections) = mpsc::channel(16);
         let own_identity = membership::member_id(&user_id, &device_id);
@@ -364,6 +370,7 @@ impl CallSession {
             remotes: remotes.clone(),
             flags: flags.clone(),
             cleaning: cleaning.clone(),
+            announce,
             own_identity: own_identity.clone(),
             encrypted,
             key_handler: None,
@@ -448,6 +455,7 @@ impl CallSession {
                         outgoing: audio.outgoing,
                         bitrate_kbps: audio.bitrate_kbps,
                         key_index: encrypted.then_some(key_index_rx),
+                        announce: announce_rx,
                     }),
                     own_expected_rx,
                     &shared,
@@ -533,13 +541,17 @@ impl CallSession {
         self.flags.changed.notify_one();
     }
 
-    /// Applies new settings for cleaning other people's voices.
-    pub(crate) fn set_cleaning(
-        &self,
-        settings: RemoteCleaning,
-        choices: BTreeMap<UserId, VoiceCleaning>,
-    ) {
-        self.cleaning.set_settings(settings, choices);
+    /// Applies new settings for cleaning: other people's voices, and what
+    /// we announce about ours.
+    pub(crate) fn set_cleaning(&self, settings: &AudioSettings) {
+        self.cleaning
+            .set_settings(settings.remote_cleaning, settings.user_cleaning.clone());
+        self.announce.send_if_modified(|announced| {
+            let now = announcement(settings);
+            let changed = *announced != now;
+            *announced = now;
+            changed
+        });
     }
 
     /// Leaves: stops the tasks and removes our membership.

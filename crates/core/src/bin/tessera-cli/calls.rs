@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use tessera_core::api::{
     AudioDeviceId, AudioDevices, AudioSettings, CallEndReason, CallIntent, CallState,
     CleaningStatus, Command, CoreEvent, EnhancerBackend, GpuBackend, GpuEnhancement, InputLevel,
-    InputMode, ListDiff, NoiseSuppression, NsLevel, Participant, RoomId, RoomSummary, SkipReason,
-    UserId, VoiceCleaning,
+    InputMode, ListDiff, NoiseSuppression, NsLevel, Participant, RoomId, RoomSummary, SkipCleaned,
+    SkipReason, UserId, VoiceCleaning,
 };
 
 use super::{resolve_room, sanitize};
@@ -70,6 +70,12 @@ pub(crate) enum CleanArg {
     Limit(f32),
     /// One person (index from `/who`, or a user ID).
     Person { who: String, choice: VoiceCleaning },
+    /// Which voices cleaned at their source are left alone.
+    Skip(SkipCleaned),
+    /// Announce our suppressor.
+    Announce(bool),
+    /// Our microphone is cleaned before Tessera.
+    Outside(bool),
 }
 
 /// `/gate` arguments.
@@ -245,10 +251,22 @@ fn volume(arg: &str) -> Result<CallCmd, &'static str> {
 }
 
 fn clean(arg: &str) -> Result<CleanArg, &'static str> {
-    const USAGE: &str =
-        "/clean [on|off] | /clean limit <dB> | /clean <n|@user:server> always|never|auto";
+    const USAGE: &str = "/clean [on|off] | /clean limit <dB> | /clean <n|@user:server> always|never|auto | /clean skip neural|any|never | /clean announce|outside on|off";
+    let on_off = |word| match word {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        _ => Err(USAGE),
+    };
     let mut words = arg.split_whitespace();
     match (words.next(), words.next(), words.next()) {
+        (Some("skip"), Some(policy), None) => match policy {
+            "neural" => Ok(CleanArg::Skip(SkipCleaned::Neural)),
+            "any" => Ok(CleanArg::Skip(SkipCleaned::AnySuppressor)),
+            "never" => Ok(CleanArg::Skip(SkipCleaned::Never)),
+            _ => Err(USAGE),
+        },
+        (Some("announce"), Some(on), None) => on_off(on).map(CleanArg::Announce),
+        (Some("outside"), Some(on), None) => on_off(on).map(CleanArg::Outside),
         (None, ..) => Ok(CleanArg::Switch(None)),
         (Some("on"), None, _) => Ok(CleanArg::Switch(Some(true))),
         (Some("off"), None, _) => Ok(CleanArg::Switch(Some(false))),
@@ -518,6 +536,15 @@ impl Calls {
             CallCmd::Clean(CleanArg::Limit(db)) => {
                 self.edit(|s| s.remote_cleaning.attenuation_limit_db = db)
             }
+            CallCmd::Clean(CleanArg::Skip(policy)) => {
+                self.edit(|s| s.remote_cleaning.skip_cleaned = policy)
+            }
+            CallCmd::Clean(CleanArg::Announce(on)) => {
+                self.edit(|s| s.announce_cleaning.enabled = on)
+            }
+            CallCmd::Clean(CleanArg::Outside(on)) => {
+                self.edit(|s| s.announce_cleaning.cleaned_outside = on)
+            }
             CallCmd::Clean(CleanArg::Person { who, choice }) => match self.user_of(&who) {
                 Some(user_id) => Reply::send(
                     Command::SetUserCleaning {
@@ -640,6 +667,9 @@ impl Calls {
                     CleaningStatus::Skipped(SkipReason::Limit) => {
                         flags.push("not cleaned (limit reached)".to_owned());
                     }
+                    CleaningStatus::Skipped(SkipReason::AlreadyClean) => {
+                        flags.push("not cleaned (cleaned at their end)".to_owned());
+                    }
                     CleaningStatus::Skipped(SkipReason::Unavailable) => {
                         flags.push("not cleaned (no model)".to_owned());
                     }
@@ -720,12 +750,27 @@ impl Calls {
             ),
             if s.remote_cleaning.enabled {
                 format!(
-                    "Other voices cleaned (DeepFilterNet3, up to {} dB removed).",
-                    s.remote_cleaning.attenuation_limit_db
+                    "Other voices cleaned (DeepFilterNet3, up to {} dB removed), {}.",
+                    s.remote_cleaning.attenuation_limit_db,
+                    match s.remote_cleaning.skip_cleaned {
+                        SkipCleaned::Neural => "not those a neural suppressor cleans at their end",
+                        SkipCleaned::AnySuppressor =>
+                            "not those any suppressor cleans at their end",
+                        SkipCleaned::Never => "even those cleaned at their end",
+                    }
                 )
             } else {
                 "Other voices not cleaned.".to_owned()
             },
+            match (
+                s.announce_cleaning.enabled,
+                s.announce_cleaning.cleaned_outside,
+            ) {
+                (false, _) => "Your cleaning is not announced.",
+                (true, false) => "Your suppressor is announced to the call.",
+                (true, true) => "Your voice is announced as cleaned before Tessera.",
+            }
+            .to_owned(),
         ]
     }
 
@@ -1022,6 +1067,18 @@ mod tests {
                 choice: VoiceCleaning::Automatic
             }))
         );
+        assert_eq!(
+            cmd("/clean skip any"),
+            Ok(CallCmd::Clean(CleanArg::Skip(SkipCleaned::AnySuppressor)))
+        );
+        assert_eq!(
+            cmd("/clean announce off"),
+            Ok(CallCmd::Clean(CleanArg::Announce(false)))
+        );
+        assert_eq!(
+            cmd("/clean outside on"),
+            Ok(CallCmd::Clean(CleanArg::Outside(true)))
+        );
         assert_eq!(cmd("/mictest loopback"), Ok(CallCmd::MicTest(Some(true))));
         assert_eq!(cmd("/mictest stop"), Ok(CallCmd::MicTest(None)));
         for bad in [
@@ -1045,6 +1102,9 @@ mod tests {
             "/clean limit loud",
             "/clean 2 sometimes",
             "/clean 2 never please",
+            "/clean skip some",
+            "/clean announce maybe",
+            "/clean outside",
         ] {
             assert!(cmd(bad).is_err(), "{bad}");
         }

@@ -12,10 +12,10 @@ mod types;
 
 pub use call::{
     AUDIO_FRAME_LEN, AudioBackend, AudioDevice, AudioDeviceId, AudioDevices, AudioProcessing,
-    AudioSettings, AudioStats, CallEndReason, CallIntent, CallState, CleaningStatus,
-    EnhancerBackend, GpuBackend, GpuEnhancement, InputLevel, InputMode, NoiseSuppression, NsLevel,
-    Participant, ParticipantId, PushToTalkBindings, RemoteCleaning, SkipReason, VirtualAudio,
-    VoiceCleaning, limits,
+    AudioSettings, AudioStats, CallEndReason, CallIntent, CallState, CleaningAnnouncement,
+    CleaningStatus, EnhancerBackend, GpuBackend, GpuEnhancement, InputLevel, InputMode,
+    NoiseSuppression, NsLevel, Participant, ParticipantId, PushToTalkBindings, RemoteCleaning,
+    SkipCleaned, SkipReason, VirtualAudio, VoiceCleaning, limits,
 };
 pub use diff::ListDiff;
 pub use security::{

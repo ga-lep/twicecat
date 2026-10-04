@@ -76,6 +76,15 @@ CALLS (voice, MatrixRTC; joining opens the microphone and speakers):
     /clean limit <dB>     Most noise removed from them (0-100)
     /clean <n|user> always|never|auto
                           Per person (kept); always comes first
+    /clean skip neural|any|never
+                          Leave alone voices their sender cleans already:
+                          with a neural suppressor (default), any, or none
+    /clean announce on|off
+                          Tell others which suppressor cleans your voice
+                          (default on), so they need not clean it again
+    /clean outside on|off
+                          Your microphone is cleaned before Tessera (NVIDIA
+                          Broadcast, a Krisp app): announced as cleaned
 
 AUDIO SETTINGS (saved; take effect at the next call or mic test):
     /audio                Show the audio settings

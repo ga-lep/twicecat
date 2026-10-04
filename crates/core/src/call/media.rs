@@ -2,7 +2,9 @@
 //! multi-SFU mode): ours publishes the processed microphone, on the others
 //! we only subscribe. Each connection plays the remote audio tracks of the
 //! members expected there through the voice engine's mixer, and tracks who
-//! speaks and who is muted.
+//! speaks and who is muted. Ours also announces our microphone's cleaning
+//! ([`super::cleaning::ANNOUNCE_KEY`]), and each reads what the others say
+//! about theirs.
 //!
 //! A LiveKit identity is the member's `user:device` (session memberships).
 //! A participant that is not an active member on that SFU is not played:
@@ -19,8 +21,9 @@ use livekit::e2ee::manager::E2eeManager;
 use livekit::id::ParticipantIdentity;
 use livekit::options::{AudioEncoding, TrackPublishOptions};
 use livekit::prelude::{
-    LocalAudioTrack, LocalTrack, Participant, RemoteAudioTrack, RemoteTrack, Room, RoomEvent,
-    RoomOptions, TrackKind, TrackSource,
+    LocalAudioTrack, LocalParticipant, LocalTrack, Participant, RemoteAudioTrack,
+    RemoteParticipant, RemoteTrack, RemoteTrackPublication, Room, RoomEvent, RoomOptions,
+    TrackKind, TrackSource,
 };
 use livekit::webrtc::audio_frame::AudioFrame;
 use livekit::webrtc::audio_source::native::NativeAudioSource;
@@ -31,7 +34,7 @@ use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 
 use super::UserVolumes;
-use super::cleaning::Cleaning;
+use super::cleaning::{ANNOUNCE_KEY, Claim, Cleaning};
 use super::jwt::SfuAccess;
 use crate::api::{CleaningStatus, CoreError, UserId};
 use crate::audio_session::{self, Voice};
@@ -40,6 +43,11 @@ use crate::audio_session::{self, Voice};
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 /// Buffer inside the LiveKit audio source, ms (multiple of 10).
 const SOURCE_QUEUE_MS: u32 = 50;
+/// How often what senders say about their voice is read again: a track's
+/// flags change without an event.
+const CLAIM_RECHECK: Duration = Duration::from_secs(2);
+/// Wait before announcing again after the SFU refused or timed out.
+const ANNOUNCE_RETRY: Duration = Duration::from_secs(5);
 
 /// Who speaks, who is muted and whose voice is cleaned, by LiveKit
 /// identity (`user:device`).
@@ -86,6 +94,8 @@ pub(crate) struct Publish {
     /// encryptor uses the index it was given (0 by default), not the latest
     /// key set, so a rotation has to be applied to our track's cryptor.
     pub key_index: Option<watch::Receiver<i32>>,
+    /// What we announce under [`ANNOUNCE_KEY`] (`None`: nothing).
+    pub announce: watch::Receiver<Option<&'static str>>,
 }
 
 /// Keeps our published tracks' encryptors on our current key index.
@@ -241,6 +251,7 @@ impl SfuConnection {
         let mut tasks = Vec::new();
         let mut track = None;
         let mut key_index = None;
+        let mut reannounce = None;
         if let Some(publish) = publish {
             key_index = publish.key_index.map(|index| KeyIndex {
                 e2ee: room.e2ee_manager().clone(),
@@ -283,6 +294,13 @@ impl SfuConnection {
             if let Some(outgoing) = publish.outgoing {
                 tasks.push(spawn_audio_task(send_microphone(outgoing, source)));
             }
+            let reconnected = Arc::new(Notify::new());
+            tasks.push(tokio::spawn(announce(
+                room.local_participant(),
+                publish.announce,
+                reconnected.clone(),
+            )));
+            reannounce = Some(reconnected);
             track = Some(local);
         }
 
@@ -298,6 +316,8 @@ impl SfuConnection {
                 players: players.clone(),
                 volumes: shared.volumes.clone(),
                 flags: shared.flags.clone(),
+                cleaning: shared.cleaning.clone(),
+                reannounce,
                 notices: shared.notices.clone(),
             },
             room_events,
@@ -362,6 +382,42 @@ impl SfuConnection {
         }
         self.flags.changed.notify_one();
         let _ = self.room.close().await;
+    }
+}
+
+/// Keeps our cleaning announcement on the SFU: set once we publish, again
+/// when it changes and after a reconnection (a full one starts a new
+/// session, without it), retried while the SFU refuses.
+async fn announce(
+    local: LocalParticipant,
+    mut value: watch::Receiver<Option<&'static str>>,
+    reconnected: Arc<Notify>,
+) {
+    // What the SFU holds, if known: nothing at first.
+    let mut sent = Some(None);
+    loop {
+        let now = *value.borrow_and_update();
+        if sent != Some(now) {
+            // An empty value removes the attribute.
+            let attributes =
+                HashMap::from([(ANNOUNCE_KEY.to_owned(), now.unwrap_or_default().to_owned())]);
+            sent = match local.set_attributes(attributes).await {
+                Ok(()) => Some(now),
+                Err(_) => {
+                    tracing::debug!("the call server did not take our cleaning announcement");
+                    None
+                }
+            };
+        }
+        tokio::select! {
+            changed = value.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+            () = reconnected.notified() => sent = None,
+            () = tokio::time::sleep(ANNOUNCE_RETRY), if sent.is_none() => {}
+        }
     }
 }
 
@@ -439,10 +495,24 @@ struct EventContext {
     players: Arc<StdMutex<Players>>,
     volumes: UserVolumes,
     flags: SharedFlags,
+    cleaning: Cleaning,
+    /// On the connection that publishes: announce again.
+    reannounce: Option<Arc<Notify>>,
     notices: mpsc::Sender<(String, MediaNotice)>,
 }
 
 impl EventContext {
+    /// Passes on what `participant` says about the voice on `publication`.
+    fn read_claim(&self, participant: &RemoteParticipant, publication: &RemoteTrackPublication) {
+        let attributes = participant.attributes();
+        let claim = Claim::of(
+            attributes.get(ANNOUNCE_KEY).map(String::as_str),
+            &publication.audio_features(),
+        );
+        self.cleaning
+            .set_claim(participant.identity().as_str(), claim);
+    }
+
     fn with_players(&self, change: impl FnOnce(&mut Players)) {
         let mut players = self.players.lock().expect("players lock");
         change(&mut players);
@@ -472,8 +542,18 @@ async fn handle_events(
     // Who speaks on this SFU, as last seen starting (see
     // `ActiveSpeakersChanged` below).
     let mut talkers: HashMap<String, Participant> = HashMap::new();
+    // The voices we play, to read what their senders say about them.
+    let mut heard: HashMap<String, (RemoteParticipant, RemoteTrackPublication)> = HashMap::new();
+    let mut recheck = tokio::time::interval(CLAIM_RECHECK);
+    recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         let event = tokio::select! {
+            _ = recheck.tick() => {
+                for (participant, publication) in heard.values() {
+                    cx.read_claim(participant, publication);
+                }
+                continue;
+            }
             changed = async {
                 match key_index.as_mut() {
                     Some(k) => k.index.changed().await,
@@ -515,10 +595,12 @@ async fn handle_events(
             }
             RoomEvent::TrackSubscribed {
                 track: RemoteTrack::Audio(track),
+                publication,
                 participant,
-                ..
             } => {
                 let identity = participant.identity().as_str().to_owned();
+                cx.read_claim(&participant, &publication);
+                heard.insert(identity.clone(), (participant, publication));
                 cx.with_players(|p| {
                     // A new track of the same identity replaces the old one.
                     p.stop(&identity, cx.voice.as_ref());
@@ -531,13 +613,25 @@ async fn handle_events(
                 ..
             } => {
                 let identity = participant.identity().as_str().to_owned();
+                heard.remove(&identity);
+                cx.cleaning.set_claim(&identity, Claim::None);
                 cx.with_players(|p| {
                     p.tracks.remove(&identity);
                 });
             }
+            RoomEvent::ParticipantAttributesChanged {
+                participant: Participant::Remote(participant),
+                ..
+            } => {
+                if let Some((_, publication)) = heard.get(participant.identity().as_str()) {
+                    cx.read_claim(&participant, publication);
+                }
+            }
             RoomEvent::ParticipantDisconnected(participant) => {
                 let identity = participant.identity().as_str().to_owned();
                 talkers.remove(&identity);
+                heard.remove(&identity);
+                cx.cleaning.set_claim(&identity, Claim::None);
                 cx.with_players(|p| {
                     p.tracks.remove(&identity);
                 });
@@ -581,7 +675,12 @@ async fn handle_events(
                 });
             }
             RoomEvent::Reconnecting => cx.notice(MediaNotice::Reconnecting).await,
-            RoomEvent::Reconnected => cx.notice(MediaNotice::Reconnected).await,
+            RoomEvent::Reconnected => {
+                if let Some(reannounce) = &cx.reannounce {
+                    reannounce.notify_one();
+                }
+                cx.notice(MediaNotice::Reconnected).await;
+            }
             RoomEvent::Disconnected { .. } => {
                 cx.notice(MediaNotice::Disconnected).await;
                 return;

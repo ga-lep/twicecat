@@ -1346,7 +1346,7 @@ impl Engine {
             shared.clone_from(&settings.user_volumes);
         }
         if let Some(call) = &self.call {
-            call.set_cleaning(settings.remote_cleaning, settings.user_cleaning.clone());
+            call.set_cleaning(&settings);
         }
         if let Err(e) = saved {
             self.emit(CoreEvent::Error(e)).await;
@@ -1451,6 +1451,7 @@ impl Engine {
         let settings = self.audio_settings().await.clone();
         let bitrate_kbps = settings.voice_bitrate_kbps;
         let cleaning = (settings.remote_cleaning, settings.user_cleaning.clone());
+        let announce = crate::call::announcement(&settings);
         match AudioSession::start(
             &settings,
             Mode::Call,
@@ -1467,6 +1468,7 @@ impl Engine {
                     outgoing,
                     bitrate_kbps,
                     cleaning,
+                    announce,
                 }
             }
             Err(e) => {
@@ -1476,6 +1478,7 @@ impl Engine {
                     outgoing: None,
                     bitrate_kbps,
                     cleaning,
+                    announce,
                 }
             }
         }

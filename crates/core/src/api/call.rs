@@ -156,6 +156,10 @@ pub enum SkipReason {
     Limit,
     /// DeepFilterNet's model is not installed, or the filter failed.
     Unavailable,
+    /// Their device says it cleans their voice already
+    /// ([`RemoteCleaning::skip_cleaned`]); set them to
+    /// [`VoiceCleaning::Always`] to clean it here too.
+    AlreadyClean,
 }
 
 /// Cleaning other people's voices: DeepFilterNet3 on this device, on each
@@ -170,6 +174,8 @@ pub struct RemoteCleaning {
     /// Most attenuation applied, dB (0..=100, as
     /// `NoiseSuppression::DeepFilter`).
     pub attenuation_limit_db: f32,
+    /// Voices their sender's device already cleans, left as they come.
+    pub skip_cleaned: SkipCleaned,
 }
 
 impl Default for RemoteCleaning {
@@ -177,6 +183,52 @@ impl Default for RemoteCleaning {
         Self {
             enabled: false,
             attenuation_limit_db: 100.0,
+            skip_cleaned: SkipCleaned::default(),
+        }
+    }
+}
+
+/// Which voices [`RemoteCleaning`] leaves alone because their sender's
+/// device says it cleans them already: Tessera announces its suppressor
+/// ([`CleaningAnnouncement`]), and LiveKit's web and mobile clients flag
+/// their tracks (the browser's noise suppression, Krisp). Your per-person
+/// choice wins over this.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkipCleaned {
+    /// Voices cleaned by a neural suppressor at their source (RNNoise,
+    /// DeepFilterNet, Krisp, or cleaned before their client, as they say):
+    /// cleaning them again gains little (the default).
+    #[default]
+    Neural,
+    /// Also voices with a classic suppressor (WebRTC's, a browser's), which
+    /// leaves more noise.
+    AnySuppressor,
+    /// Clean every voice, whatever their sender says.
+    Never,
+}
+
+/// What others in a call learn about your microphone's cleaning, so their
+/// Tessera need not clean your voice again ([`SkipCleaned`]). Sent as a
+/// LiveKit participant attribute, seen by everyone in the call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CleaningAnnouncement {
+    /// Tell others which suppressor runs on your microphone (default on).
+    /// Off, others may clean your voice a second time.
+    pub enabled: bool,
+    /// Your microphone is cleaned before Tessera (NVIDIA Broadcast, a
+    /// Krisp app, a headset's own processing): announced as cleaned by a
+    /// neural suppressor, whatever [`AudioProcessing::noise_suppression`]
+    /// says.
+    pub cleaned_outside: bool,
+}
+
+impl Default for CleaningAnnouncement {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            cleaned_outside: false,
         }
     }
 }
@@ -406,6 +458,8 @@ pub struct AudioSettings {
     pub remote_cleaning: RemoteCleaning,
     /// Per-user cleaning choice, kept across calls (absent: automatic).
     pub user_cleaning: BTreeMap<UserId, VoiceCleaning>,
+    /// What others learn about your microphone's cleaning.
+    pub announce_cleaning: CleaningAnnouncement,
 }
 
 impl Default for AudioSettings {
@@ -426,6 +480,7 @@ impl Default for AudioSettings {
             user_volumes: BTreeMap::new(),
             remote_cleaning: RemoteCleaning::default(),
             user_cleaning: BTreeMap::new(),
+            announce_cleaning: CleaningAnnouncement::default(),
         }
     }
 }
@@ -604,6 +659,7 @@ mod tests {
             remote_cleaning: RemoteCleaning {
                 enabled: true,
                 attenuation_limit_db: f32::NAN,
+                ..RemoteCleaning::default()
             },
             input_mode: InputMode::PushToTalk {
                 release_delay_ms: 60_000,
@@ -736,8 +792,13 @@ mod tests {
                 "output_volume_percent": 100,
                 "voice_bitrate_kbps": 64,
                 "user_volumes": {},
-                "remote_cleaning": { "enabled": false, "attenuation_limit_db": 100.0 },
+                "remote_cleaning": {
+                    "enabled": false,
+                    "attenuation_limit_db": 100.0,
+                    "skip_cleaned": "neural",
+                },
                 "user_cleaning": {},
+                "announce_cleaning": { "enabled": true, "cleaned_outside": false },
             })
         );
     }
@@ -757,5 +818,8 @@ mod tests {
         assert!(s.remote_cleaning.enabled);
         assert_eq!(s.remote_cleaning.attenuation_limit_db, 100.0);
         assert_eq!(s.user_cleaning(&UserId::from("@a:x")), VoiceCleaning::Never);
+        assert_eq!(s.remote_cleaning.skip_cleaned, SkipCleaned::Neural);
+        assert_eq!(s.announce_cleaning, CleaningAnnouncement::default());
+        assert!(s.announce_cleaning.enabled, "announced unless turned off");
     }
 }
