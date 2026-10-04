@@ -178,6 +178,9 @@ impl fmt::Debug for EditorAction {
     }
 }
 
+/// Widget ID of the composer's editor, focused after Reply and Edit.
+pub const COMPOSER_ID: &str = "composer";
+
 /// What the next send does.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Mode {
@@ -449,6 +452,9 @@ pub struct Composer {
     pub search: SearchGate,
     /// Typing notice throttle.
     pub typing: TypingGate,
+    /// The draft that an edit replaced in the buffer; kept in memory only,
+    /// never logged (`Debug` shows no text).
+    saved_draft: Option<String>,
 }
 
 // Manual impl: `Content`'s `Debug` dumps the whole buffer.
@@ -477,6 +483,7 @@ impl Composer {
             suggestions: Suggestions::Closed,
             search: SearchGate::default(),
             typing: TypingGate::default(),
+            saved_draft: None,
         }
     }
 
@@ -697,10 +704,69 @@ impl Composer {
             }
             Mode::Edit(_) => {
                 // The buffer holds the old message, not a draft.
-                self.clear();
+                self.restore_draft();
                 true
             }
         }
+    }
+
+    /// Leaves reply or edit mode, whatever the suggestion list does (the
+    /// reply bar's ✕). A reply keeps the draft; an edit gives the previous
+    /// draft back. `true` when a mode was left.
+    pub fn cancel_mode(&mut self) -> bool {
+        match self.mode {
+            Mode::Normal => false,
+            Mode::Reply(_) => {
+                self.mode = Mode::Normal;
+                true
+            }
+            Mode::Edit(_) => {
+                self.restore_draft();
+                true
+            }
+        }
+    }
+
+    /// Loads the plain `body` of message `item_id` into the buffer in edit
+    /// mode, keeping the current draft for later. Editing another message
+    /// while an edit is open keeps the first draft.
+    pub fn begin_edit(&mut self, item_id: String, body: &str) {
+        let draft = self.text();
+        if !matches!(self.mode, Mode::Edit(_)) {
+            self.saved_draft = Some(draft);
+        }
+        self.set_text(body);
+        self.mentions.clear();
+        self.suggestions = Suggestions::Closed;
+        self.search.cancel();
+        self.mode = Mode::Edit(item_id);
+    }
+
+    /// Resets the composer after a send: an edit gives the previous draft
+    /// back, anything else empties the buffer. The typing throttle is the
+    /// caller's to stop.
+    pub fn finish_send(&mut self) {
+        if matches!(self.mode, Mode::Edit(_)) {
+            self.restore_draft();
+        } else {
+            self.clear();
+        }
+    }
+
+    /// Empties the buffer, then puts back the draft an edit replaced.
+    fn restore_draft(&mut self) {
+        let draft = self.saved_draft.take();
+        self.clear();
+        if let Some(draft) = draft {
+            self.set_text(&draft);
+        }
+    }
+
+    /// Replaces the buffer with `text`, the cursor at its end.
+    fn set_text(&mut self, text: &str) {
+        self.content = text_editor::Content::with_text(text);
+        self.content
+            .perform(Action::Move(text_editor::Motion::DocumentEnd));
     }
 
     /// The core's answer to a member search.
@@ -727,6 +793,7 @@ impl Composer {
         self.mode = Mode::Normal;
         self.suggestions = Suggestions::Closed;
         self.search.cancel();
+        self.saved_draft = None;
     }
 }
 
@@ -1297,5 +1364,58 @@ mod tests {
         assert_eq!(c.suggestions, Suggestions::Closed);
         assert!(c.mentions.is_empty());
         let _ = now;
+    }
+
+    #[test]
+    fn an_edit_loads_the_body_and_escape_gives_the_draft_back() {
+        let mut c = composer_with("my draft");
+        c.begin_edit("item".into(), "old text\nline two");
+        assert_eq!(c.mode, Mode::Edit("item".into()));
+        assert_eq!(c.text(), "old text\nline two");
+        let cursor = c.content().cursor().position;
+        assert_eq!((cursor.line, cursor.column), (1, 8), "cursor at the end");
+        assert!(c.escape());
+        assert_eq!(c.mode, Mode::Normal);
+        assert_eq!(c.text(), "my draft");
+        assert!(!c.escape());
+    }
+
+    #[test]
+    fn editing_another_message_keeps_the_first_draft() {
+        let mut c = composer_with("draft");
+        c.begin_edit("a".into(), "one");
+        c.begin_edit("b".into(), "two");
+        assert_eq!(c.mode, Mode::Edit("b".into()));
+        assert!(c.cancel_mode());
+        assert_eq!(c.text(), "draft");
+    }
+
+    #[test]
+    fn finishing_an_edit_restores_the_draft_and_other_sends_empty_the_buffer() {
+        let mut c = composer_with("draft");
+        c.begin_edit("a".into(), "one");
+        c.finish_send();
+        assert_eq!((c.mode.clone(), c.text()), (Mode::Normal, "draft".into()));
+        c.mode = Mode::Reply("r".into());
+        c.finish_send();
+        assert_eq!((c.mode.clone(), c.text()), (Mode::Normal, String::new()));
+    }
+
+    #[test]
+    fn cancel_mode_keeps_the_draft_of_a_reply_and_clear_drops_the_saved_one() {
+        let mut c = composer_with("keep");
+        c.mode = Mode::Reply("r".into());
+        assert!(c.cancel_mode());
+        assert_eq!((c.mode.clone(), c.text()), (Mode::Normal, "keep".into()));
+        assert!(!c.cancel_mode());
+
+        c.begin_edit("a".into(), "one");
+        c.clear();
+        c.begin_edit("b".into(), "two");
+        c.clear();
+        assert!(c.is_empty());
+        c.begin_edit("c".into(), "three");
+        assert!(c.cancel_mode());
+        assert_eq!(c.text(), "", "clear() forgot the earlier draft");
     }
 }

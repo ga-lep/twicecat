@@ -11,14 +11,17 @@ use iced::theme;
 use iced::widget::{operation, scrollable};
 use iced::{Element, Subscription, Task, Theme, clipboard, system, window};
 use tessera_core::api::{
-    ActionKind, Command, CoreError, CoreEvent, ListDiff, Password, RoomId, RoomListQuery,
-    RoomListTab, RoomSummary, SyncState, TimelineItem, UserId,
+    ActionKind, Command, CoreError, CoreEvent, ListDiff, MessageDetails, MessageText, Password,
+    RoomId, RoomListQuery, RoomListTab, RoomSummary, SyncState, TimelineItem, TimelineItemKind,
+    UserId,
 };
 use tokio::sync::mpsc;
 
+use crate::actions::{self, ActionButtons, ActionState, NOTICE_DURATION, Notice, Picker};
 use crate::avatars::Avatars;
 use crate::bridge::{self, Bridge, EventsSlot};
 use crate::composer::{self, Composer, ComposerKey, EditorAction, SearchStep};
+use crate::emoji;
 use crate::links::{self, LinkBar};
 use crate::rich_text::{LinkTarget, MAX_REVEALED, Revealed};
 use crate::room_list;
@@ -139,6 +142,43 @@ pub enum Message {
     SuggestionPicked(usize),
     /// The member search timer fired.
     MembersDue,
+    /// The pointer entered a message.
+    HoverEnter(String),
+    /// The pointer left a message.
+    HoverExit(String),
+    /// **Reply** on a message.
+    ReplyRequested(String),
+    /// **Edit** on a message.
+    EditRequested(String),
+    /// **Copy** on a message.
+    CopyRequested(String),
+    /// **Delete** on a message (asks for confirmation).
+    DeleteRequested(String),
+    /// The user confirmed the pending delete.
+    DeleteConfirmed,
+    /// The user backed out of the pending delete.
+    DeleteCancelled,
+    /// The user pressed the reply bar's cross (reply or edit mode).
+    ModeCancelled,
+    /// **React** on a message opens the picker.
+    PickerOpened(String),
+    /// The picker's search field changed; the text is not logged.
+    PickerQuery(MessageText),
+    /// The user pressed Enter in the picker's search field.
+    PickerSubmitted,
+    /// The user picked an emoji in the picker; the key is not logged.
+    PickerPicked(MessageText),
+    /// The user closed the picker.
+    PickerClosed,
+    /// The user clicked a reaction chip; the key is not logged.
+    ReactionToggled {
+        /// The message.
+        item: String,
+        /// The reaction.
+        key: MessageText,
+    },
+    /// The failure notice with this sequence number timed out.
+    NoticeExpired(u64),
     /// The user pressed **Log out**.
     LogoutRequested,
     /// The user picked a room in the list.
@@ -237,6 +277,8 @@ pub struct App {
     pub composer: Composer,
     /// A non-secret line about the last failed send.
     pub send_error: Option<String>,
+    /// Hover, delete confirmation, reaction picker and failure notice.
+    pub actions: ActionState,
     /// The system theme mode.
     pub theme_mode: theme::Mode,
     /// Spoilers the user revealed in the open room.
@@ -259,6 +301,7 @@ impl std::fmt::Debug for App {
             .field("login", &self.login)
             .field("login_in_flight", &self.login_in_flight)
             .field("composer", &self.composer)
+            .field("actions", &self.actions)
             .finish_non_exhaustive()
     }
 }
@@ -297,6 +340,7 @@ impl App {
             browser_opened: None,
             composer: Composer::new(),
             send_error: None,
+            actions: ActionState::default(),
             theme_mode: theme::Mode::None,
             revealed: Revealed::new(),
             link_bar: None,
@@ -407,6 +451,77 @@ impl App {
                 }
                 Task::none()
             }
+            Message::HoverEnter(id) => {
+                self.actions.hovered = Some(id);
+                Task::none()
+            }
+            Message::HoverExit(id) => {
+                if self.actions.hovered.as_deref() == Some(id.as_str()) {
+                    self.actions.hovered = None;
+                }
+                Task::none()
+            }
+            Message::ReplyRequested(id) => self.request_reply(id),
+            Message::EditRequested(id) => self.request_edit(id),
+            Message::CopyRequested(id) => match self.copy_source(&id) {
+                Some(body) => clipboard::write(body.to_owned()),
+                None => Task::none(),
+            },
+            Message::DeleteRequested(id) => {
+                if self.buttons_for(&id).is_some_and(|b| b.delete) {
+                    self.actions.confirm_delete = Some(id);
+                }
+                Task::none()
+            }
+            Message::DeleteConfirmed => self.confirm_delete(),
+            Message::DeleteCancelled => {
+                self.actions.confirm_delete = None;
+                Task::none()
+            }
+            Message::ModeCancelled => {
+                let was_edit = matches!(self.composer.mode, composer::Mode::Edit(_));
+                self.composer.cancel_mode();
+                self.after_edit_left(was_edit)
+            }
+            Message::PickerOpened(id) => {
+                if self.buttons_for(&id).is_some_and(|b| b.react) {
+                    self.actions.picker = Some(Picker {
+                        target: id,
+                        query: String::new(),
+                    });
+                    return operation::focus(actions::PICKER_INPUT_ID);
+                }
+                Task::none()
+            }
+            Message::PickerQuery(query) => {
+                if let Some(picker) = &mut self.actions.picker {
+                    query.expose().clone_into(&mut picker.query);
+                }
+                Task::none()
+            }
+            Message::PickerSubmitted => {
+                let first = self
+                    .actions
+                    .picker
+                    .as_ref()
+                    .and_then(|p| emoji::picker_results(&p.query).first().copied());
+                match first {
+                    Some(glyph) => self.pick_reaction(glyph),
+                    None => Task::none(),
+                }
+            }
+            Message::PickerPicked(key) => self.pick_reaction(key.expose()),
+            Message::PickerClosed => {
+                self.actions.picker = None;
+                Task::none()
+            }
+            Message::ReactionToggled { item, key } => self.toggle_reaction(&item, key.expose()),
+            Message::NoticeExpired(seq) => {
+                if self.actions.notice.as_ref().is_some_and(|n| n.seq == seq) {
+                    self.actions.notice = None;
+                }
+                Task::none()
+            }
             Message::LogoutRequested => self.send(Command::Logout),
             Message::SelectRoom(id) => {
                 if !room_list::contains(&self.rooms, &id) {
@@ -415,6 +530,7 @@ impl App {
                 let stop_typing = self.stop_typing();
                 self.selected = Some(id.clone());
                 self.timeline.reset();
+                self.actions.reset();
                 self.clear_draft();
                 self.reset_link_state();
                 Task::batch([stop_typing, self.send(Command::SelectRoom(id))])
@@ -574,7 +690,16 @@ impl App {
                     self.send_error = Some(safe_line(&error.to_string()));
                 }
             }
-            // Shown by the Phase 3 timeline pane; ignored until then.
+            CoreEvent::ActionFailed {
+                room_id,
+                action: action @ (ActionKind::Redact | ActionKind::React),
+                error,
+            } => {
+                if self.selected.as_ref() == Some(&room_id) {
+                    task = self.show_notice(action, &error);
+                }
+            }
+            // Shown by the Phase 3 timeline pane (Task 13); ignored until then.
             CoreEvent::Typing { .. } | CoreEvent::ActionFailed { .. } => {}
         }
         task
@@ -805,10 +930,139 @@ impl App {
                 Task::none()
             }
             ComposerKey::Escape => {
+                let was_edit = matches!(self.composer.mode, composer::Mode::Edit(_));
                 self.composer.escape();
-                Task::none()
+                self.after_edit_left(was_edit)
             }
         }
+    }
+
+    /// The message `id` of the open timeline: its plain body, whether it is
+    /// the user's own, and its details. `None` for other kinds of item.
+    fn find_message(&self, id: &str) -> Option<(&str, bool, &MessageDetails)> {
+        self.timeline
+            .items
+            .iter()
+            .find(|item| item.id == id)
+            .and_then(|item| match &item.kind {
+                TimelineItemKind::Message {
+                    body,
+                    is_own,
+                    details,
+                    ..
+                } => Some((body.as_str(), *is_own, details.as_ref())),
+                _ => None,
+            })
+    }
+
+    /// The buttons message `id` offers right now, or `None` when it is gone.
+    fn buttons_for(&self, id: &str) -> Option<ActionButtons> {
+        self.find_message(id)
+            .map(|(_, is_own, details)| actions::action_buttons(details, is_own))
+    }
+
+    /// The text **Copy** puts on the clipboard: the plain body, when the core
+    /// allows copying.
+    pub fn copy_source(&self, id: &str) -> Option<&str> {
+        let (body, is_own, details) = self.find_message(id)?;
+        actions::action_buttons(details, is_own)
+            .copy
+            .then_some(body)
+    }
+
+    /// After a reply or an edit mode ended: an edit that leaves an empty
+    /// composer ends the typing notice it started.
+    fn after_edit_left(&mut self, was_edit: bool) -> Task<Message> {
+        if was_edit
+            && matches!(self.composer.mode, composer::Mode::Normal)
+            && self.composer.is_empty()
+        {
+            self.stop_typing()
+        } else {
+            Task::none()
+        }
+    }
+
+    /// **Reply**: quote message `id` in the next send.
+    fn request_reply(&mut self, id: String) -> Task<Message> {
+        if self.selected.is_none() || !self.buttons_for(&id).is_some_and(|b| b.reply) {
+            return Task::none();
+        }
+        let was_edit = matches!(self.composer.mode, composer::Mode::Edit(_));
+        if was_edit {
+            self.composer.cancel_mode();
+        }
+        self.composer.mode = composer::Mode::Reply(id);
+        Task::batch([
+            self.after_edit_left(was_edit),
+            operation::focus(composer::COMPOSER_ID),
+        ])
+    }
+
+    /// **Edit**: load the plain body of the user's own message `id`.
+    fn request_edit(&mut self, id: String) -> Task<Message> {
+        if self.selected.is_none() || !self.buttons_for(&id).is_some_and(|b| b.edit) {
+            return Task::none();
+        }
+        let Some(body) = self.find_message(&id).map(|(body, ..)| body.to_owned()) else {
+            return Task::none();
+        };
+        self.composer.begin_edit(id, &body);
+        operation::focus(composer::COMPOSER_ID)
+    }
+
+    /// The user confirmed **Delete**: redact the message, if it is still
+    /// there and the core still allows it.
+    fn confirm_delete(&mut self) -> Task<Message> {
+        let Some(id) = self.actions.confirm_delete.take() else {
+            return Task::none();
+        };
+        let Some(room_id) = self.selected.clone() else {
+            return Task::none();
+        };
+        if !self.buttons_for(&id).is_some_and(|b| b.delete) {
+            return Task::none();
+        }
+        self.send(Command::Redact {
+            room_id,
+            item_id: id,
+            reason: None,
+        })
+    }
+
+    /// Sends `ToggleReaction` for message `id` when the core allows reacting.
+    fn toggle_reaction(&self, id: &str, key: &str) -> Task<Message> {
+        let Some(room_id) = self.selected.clone() else {
+            return Task::none();
+        };
+        if !self.buttons_for(id).is_some_and(|b| b.react) {
+            return Task::none();
+        }
+        self.send(Command::ToggleReaction {
+            room_id,
+            item_id: id.to_owned(),
+            key: key.to_owned(),
+        })
+    }
+
+    /// An emoji was picked: react with it and close the picker.
+    fn pick_reaction(&mut self, key: &str) -> Task<Message> {
+        match self.actions.picker.take() {
+            Some(picker) => self.toggle_reaction(&picker.target, key),
+            None => Task::none(),
+        }
+    }
+
+    /// Shows the failure line of a delete or reaction for 5 seconds.
+    fn show_notice(&mut self, action: ActionKind, error: &CoreError) -> Task<Message> {
+        let Some(text) = actions::notice_text(action, &safe_line(&error.to_string())) else {
+            return Task::none();
+        };
+        let seq = self.actions.notice_seq.saturating_add(1);
+        self.actions.notice_seq = seq;
+        self.actions.notice = Some(Notice { seq, text });
+        self.sink
+            .timer(NOTICE_DURATION, Message::NoticeExpired(seq))
     }
 
     /// `SetTyping(false)` for the open room when a notice is outstanding.
@@ -838,7 +1092,7 @@ impl App {
             },
             composer::Mode::Normal | composer::Mode::Reply(_) => Command::Send(message),
         };
-        self.composer.clear();
+        self.composer.finish_send();
         self.send_error = None;
         Task::batch([self.send(command), self.stop_typing()])
     }
@@ -878,6 +1132,7 @@ impl App {
     fn deselect(&mut self) {
         self.selected = None;
         self.timeline.reset();
+        self.actions.reset();
         self.clear_draft();
         self.reset_link_state();
     }
@@ -2135,5 +2390,366 @@ mod tests {
         assert!(!code.contains("open::"), "no direct launcher call");
         assert!(code.contains("links::open_link"), "the launcher is reached");
         assert!(code.contains("Task::perform"), "inside a task");
+    }
+
+    // ---- Task 12: message actions ----
+
+    use crate::actions::NOTICE_DURATION;
+    use tessera_core::api::{
+        ItemActions, MessageDetails, MessageText, ReactionGroup, SendStatus, TimelineItemKind,
+    };
+
+    const ALL_ACTIONS: ItemActions = ItemActions {
+        can_reply: true,
+        can_edit: true,
+        can_redact: true,
+        can_react: true,
+        can_copy: true,
+    };
+
+    fn message_item(id: &str, body: &str, is_own: bool, actions: ItemActions) -> TimelineItem {
+        TimelineItem::new(
+            id.to_owned(),
+            TimelineItemKind::Message {
+                sender: UserId::from(if is_own { "@me:x" } else { "@them:x" }),
+                body: body.to_owned(),
+                is_own,
+                timestamp_ms: 1,
+                sent: SendStatus::Sent,
+                details: Box::new(MessageDetails {
+                    actions,
+                    reactions: vec![ReactionGroup {
+                        key: "\u{1F44D}".into(),
+                        count: 1,
+                        own: false,
+                        senders: Vec::new(),
+                    }],
+                    ..MessageDetails::default()
+                }),
+            },
+        )
+    }
+
+    /// `main_app` with an own message `mine`, someone else's `theirs`, and a
+    /// message `locked` that allows nothing.
+    fn actions_app() -> (App, mpsc::Receiver<Command>) {
+        let (mut app, mut rx) = main_app();
+        let _ = app.update(core(CoreEvent::TimelineDiff {
+            room_id: RoomId::from("!a:x"),
+            diffs: vec![ListDiff::Append {
+                values: vec![
+                    message_item("mine", "my words\nsecond line", true, ALL_ACTIONS),
+                    message_item("theirs", "their words", false, ALL_ACTIONS),
+                    message_item("locked", "locked words", false, ItemActions::default()),
+                ],
+            }],
+        }));
+        while rx.try_recv().is_ok() {}
+        (app, rx)
+    }
+
+    fn key(glyph: &str) -> MessageText {
+        MessageText::from(glyph)
+    }
+
+    #[test]
+    fn hover_tracks_one_message_and_a_stale_exit_changes_nothing() {
+        let (mut app, _rx) = actions_app();
+        let _ = app.update(Message::HoverEnter("mine".into()));
+        assert_eq!(app.actions.hovered.as_deref(), Some("mine"));
+        let _ = app.update(Message::HoverEnter("theirs".into()));
+        let _ = app.update(Message::HoverExit("mine".into()));
+        assert_eq!(app.actions.hovered.as_deref(), Some("theirs"));
+        let _ = app.update(Message::HoverExit("theirs".into()));
+        assert_eq!(app.actions.hovered, None);
+    }
+
+    #[test]
+    fn reply_sets_the_mode_only_where_the_core_allows_it() {
+        let (mut app, mut rx) = actions_app();
+        let _ = app.update(Message::ReplyRequested("locked".into()));
+        assert_eq!(app.composer.mode, composer::Mode::Normal);
+        let _ = app.update(Message::ReplyRequested("gone".into()));
+        assert_eq!(app.composer.mode, composer::Mode::Normal);
+        let _ = app.update(Message::ReplyRequested("theirs".into()));
+        assert_eq!(app.composer.mode, composer::Mode::Reply("theirs".into()));
+        assert!(drain(&mut rx).is_empty(), "nothing is sent yet");
+
+        // The reply bar's cross leaves reply mode and keeps the draft.
+        type_in(&mut app, "draft");
+        let _ = app.update(Message::ModeCancelled);
+        assert_eq!(app.composer.mode, composer::Mode::Normal);
+        assert_eq!(app.composer.text(), "draft");
+
+        // Escape leaves it as well.
+        let _ = app.update(Message::ReplyRequested("theirs".into()));
+        let _ = app.update(Message::ComposerKey(ComposerKey::Escape));
+        assert_eq!(app.composer.mode, composer::Mode::Normal);
+    }
+
+    #[test]
+    fn edit_loads_the_body_of_an_own_message_and_escape_restores_the_draft() {
+        let (mut app, mut rx) = actions_app();
+        let _ = app.update(Message::EditRequested("theirs".into()));
+        assert_eq!(app.composer.mode, composer::Mode::Normal, "not own");
+        let _ = app.update(Message::EditRequested("locked".into()));
+        assert_eq!(app.composer.mode, composer::Mode::Normal);
+
+        type_in(&mut app, "my draft");
+        let _ = drain(&mut rx);
+        let _ = app.update(Message::EditRequested("mine".into()));
+        assert_eq!(app.composer.mode, composer::Mode::Edit("mine".into()));
+        assert_eq!(app.composer.text(), "my words\nsecond line");
+
+        let _ = app.update(Message::ComposerKey(ComposerKey::Escape));
+        assert_eq!(app.composer.mode, composer::Mode::Normal);
+        assert_eq!(app.composer.text(), "my draft");
+    }
+
+    #[test]
+    fn leaving_an_edit_to_an_empty_composer_stops_the_typing_notice() {
+        let (mut app, mut rx) = actions_app();
+        let _ = app.update(Message::EditRequested("mine".into()));
+        type_in(&mut app, "!");
+        assert!(
+            drain(&mut rx)
+                .iter()
+                .any(|c| matches!(c, Command::SetTyping { typing: true, .. }))
+        );
+        let _ = app.update(Message::ComposerKey(ComposerKey::Escape));
+        assert_eq!(app.composer.text(), "");
+        assert!(
+            drain(&mut rx)
+                .iter()
+                .any(|c| matches!(c, Command::SetTyping { typing: false, .. })),
+            "the notice must not linger"
+        );
+
+        let _ = app.update(Message::EditRequested("mine".into()));
+        type_in(&mut app, "!");
+        let _ = drain(&mut rx);
+        let _ = app.update(Message::ModeCancelled);
+        assert!(
+            drain(&mut rx)
+                .iter()
+                .any(|c| matches!(c, Command::SetTyping { typing: false, .. }))
+        );
+    }
+
+    #[test]
+    fn sending_an_edit_gives_command_edit_and_brings_the_draft_back() {
+        let (mut app, mut rx) = actions_app();
+        type_in(&mut app, "draft");
+        let _ = app.update(Message::EditRequested("mine".into()));
+        let _ = drain(&mut rx);
+        let _ = app.update(Message::ComposerKey(ComposerKey::Send));
+        match send_commands(&drain(&mut rx)).as_slice() {
+            [Command::Edit { item_id, message }] => {
+                assert_eq!(item_id, "mine");
+                assert_eq!(message.text.expose(), "my words\nsecond line");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(app.composer.mode, composer::Mode::Normal);
+        assert_eq!(app.composer.text(), "draft");
+    }
+
+    #[test]
+    fn reply_while_editing_leaves_the_edit_first() {
+        let (mut app, _rx) = actions_app();
+        type_in(&mut app, "draft");
+        let _ = app.update(Message::EditRequested("mine".into()));
+        let _ = app.update(Message::ReplyRequested("theirs".into()));
+        assert_eq!(app.composer.mode, composer::Mode::Reply("theirs".into()));
+        assert_eq!(app.composer.text(), "draft");
+    }
+
+    #[test]
+    fn delete_asks_first_and_then_redacts_without_a_reason() {
+        let (mut app, mut rx) = actions_app();
+        let _ = app.update(Message::DeleteRequested("theirs".into()));
+        assert_eq!(app.actions.confirm_delete.as_deref(), Some("theirs"));
+        assert!(drain(&mut rx).is_empty(), "no command before confirming");
+
+        let _ = app.update(Message::DeleteCancelled);
+        assert_eq!(app.actions.confirm_delete, None);
+        let _ = app.update(Message::DeleteConfirmed);
+        assert!(drain(&mut rx).is_empty(), "nothing to confirm");
+
+        let _ = app.update(Message::DeleteRequested("theirs".into()));
+        let _ = app.update(Message::DeleteConfirmed);
+        match drain(&mut rx).as_slice() {
+            [
+                Command::Redact {
+                    room_id,
+                    item_id,
+                    reason: None,
+                },
+            ] => {
+                assert_eq!(*room_id, RoomId::from("!a:x"));
+                assert_eq!(item_id, "theirs");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(app.actions.confirm_delete, None);
+    }
+
+    #[test]
+    fn delete_is_refused_where_the_core_does_not_allow_it() {
+        let (mut app, mut rx) = actions_app();
+        let _ = app.update(Message::DeleteRequested("locked".into()));
+        assert_eq!(app.actions.confirm_delete, None);
+        let _ = app.update(Message::DeleteRequested("gone".into()));
+        assert_eq!(app.actions.confirm_delete, None);
+
+        // The message vanished between the question and the answer.
+        let _ = app.update(Message::DeleteRequested("theirs".into()));
+        let _ = app.update(core(CoreEvent::TimelineDiff {
+            room_id: RoomId::from("!a:x"),
+            diffs: vec![ListDiff::Clear],
+        }));
+        let _ = app.update(Message::DeleteConfirmed);
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn copy_uses_the_plain_body_and_only_where_allowed() {
+        let (mut app, mut rx) = actions_app();
+        assert_eq!(app.copy_source("theirs"), Some("their words"));
+        assert_eq!(app.copy_source("locked"), None);
+        assert_eq!(app.copy_source("gone"), None);
+        let _ = app.update(Message::CopyRequested("theirs".into()));
+        assert!(drain(&mut rx).is_empty(), "copying sends no command");
+    }
+
+    #[test]
+    fn a_pick_in_the_picker_toggles_the_reaction_and_closes_it() {
+        let (mut app, mut rx) = actions_app();
+        let _ = app.update(Message::PickerOpened("locked".into()));
+        assert!(app.actions.picker.is_none(), "react not allowed");
+        let _ = app.update(Message::PickerOpened("theirs".into()));
+        let picker = app.actions.picker.clone().expect("open");
+        assert_eq!(picker.target, "theirs");
+        let _ = app.update(Message::PickerQuery(key("smile")));
+        assert_eq!(
+            app.actions.picker.as_ref().map(|p| p.query.as_str()),
+            Some("smile")
+        );
+
+        let _ = app.update(Message::PickerPicked(key("\u{1F604}")));
+        match drain(&mut rx).as_slice() {
+            [
+                Command::ToggleReaction {
+                    room_id,
+                    item_id,
+                    key,
+                },
+            ] => {
+                assert_eq!(*room_id, RoomId::from("!a:x"));
+                assert_eq!(item_id, "theirs");
+                assert_eq!(key, "\u{1F604}");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(app.actions.picker.is_none());
+    }
+
+    #[test]
+    fn enter_in_the_picker_picks_the_first_result() {
+        let (mut app, mut rx) = actions_app();
+        let _ = app.update(Message::PickerOpened("theirs".into()));
+        let _ = app.update(Message::PickerSubmitted);
+        match drain(&mut rx).as_slice() {
+            [Command::ToggleReaction { key, .. }] => assert_eq!(key, "\u{1F44D}"),
+            other => panic!("unexpected {other:?}"),
+        }
+        let _ = app.update(Message::PickerOpened("theirs".into()));
+        let _ = app.update(Message::PickerQuery(key("zzzzqqqq")));
+        let _ = app.update(Message::PickerSubmitted);
+        assert!(drain(&mut rx).is_empty(), "no result, nothing sent");
+        let _ = app.update(Message::PickerClosed);
+        assert!(app.actions.picker.is_none());
+    }
+
+    #[test]
+    fn a_reaction_chip_toggles_and_a_pick_for_a_vanished_message_sends_nothing() {
+        let (mut app, mut rx) = actions_app();
+        let _ = app.update(Message::ReactionToggled {
+            item: "theirs".into(),
+            key: key("\u{1F44D}"),
+        });
+        assert!(matches!(
+            drain(&mut rx).as_slice(),
+            [Command::ToggleReaction { .. }]
+        ));
+        let _ = app.update(Message::ReactionToggled {
+            item: "locked".into(),
+            key: key("\u{1F44D}"),
+        });
+        assert!(drain(&mut rx).is_empty());
+
+        let _ = app.update(Message::PickerOpened("theirs".into()));
+        let _ = app.update(core(CoreEvent::TimelineDiff {
+            room_id: RoomId::from("!a:x"),
+            diffs: vec![ListDiff::Clear],
+        }));
+        let _ = app.update(Message::PickerPicked(key("\u{1F604}")));
+        assert!(drain(&mut rx).is_empty());
+        assert!(app.actions.picker.is_none());
+    }
+
+    #[test]
+    fn a_failed_delete_or_reaction_shows_a_notice_that_expires() {
+        let (mut app, _rx) = actions_app();
+        let failed = |room: &str, action| {
+            core(CoreEvent::ActionFailed {
+                room_id: RoomId::from(room),
+                action,
+                error: CoreError::Network("offline".into()),
+            })
+        };
+        let _ = app.update(failed("!b:x", ActionKind::Redact));
+        assert!(app.actions.notice.is_none(), "another room");
+        let _ = app.update(failed("!a:x", ActionKind::Typing));
+        assert!(app.actions.notice.is_none(), "not reported");
+        let _ = app.update(failed("!a:x", ActionKind::Redact));
+        let first = app.actions.notice.clone().expect("a notice");
+        assert!(first.text.contains("offline"));
+        assert!(NOTICE_DURATION.as_secs() == 5);
+
+        let _ = app.update(failed("!a:x", ActionKind::React));
+        let second = app.actions.notice.clone().expect("a newer notice");
+        assert_ne!(first.seq, second.seq);
+        let _ = app.update(Message::NoticeExpired(first.seq));
+        assert!(app.actions.notice.is_some(), "an old timer is stale");
+        let _ = app.update(Message::NoticeExpired(second.seq));
+        assert!(app.actions.notice.is_none());
+    }
+
+    #[test]
+    fn changing_room_resets_the_action_state() {
+        let (mut app, _rx) = actions_app();
+        let _ = app.update(Message::HoverEnter("mine".into()));
+        let _ = app.update(Message::DeleteRequested("mine".into()));
+        let _ = app.update(Message::PickerOpened("mine".into()));
+        let _ = app.update(Message::SelectRoom(RoomId::from("!b:x")));
+        assert!(app.actions.hovered.is_none());
+        assert!(app.actions.confirm_delete.is_none());
+        assert!(app.actions.picker.is_none());
+    }
+
+    #[test]
+    fn action_messages_never_print_reactions_or_queries() {
+        let m = Message::ReactionToggled {
+            item: "i".into(),
+            key: key("secret-key-x"),
+        };
+        assert!(!format!("{m:?}").contains("secret-key-x"));
+        let m = Message::PickerQuery(key("secret-query-x"));
+        assert!(!format!("{m:?}").contains("secret-query-x"));
+        let (mut app, _rx) = actions_app();
+        let _ = app.update(Message::PickerOpened("theirs".into()));
+        let _ = app.update(Message::PickerQuery(key("secret-query-x")));
+        assert!(!format!("{app:?}").contains("secret-query-x"));
     }
 }

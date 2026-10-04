@@ -60,9 +60,92 @@ pub fn exact(token: &str) -> Option<&'static str> {
     emojis::get_by_shortcode(code).map(emojis::Emoji::as_str)
 }
 
+/// Most entries the reaction picker lists at once.
+pub const MAX_PICKER_RESULTS: usize = 64;
+
+/// Longest picker query that is matched; the rest is ignored.
+const MAX_PICKER_QUERY: usize = 64;
+
+/// The quick row of the reaction picker (plan Q18).
+pub const QUICK_REACTIONS: [&str; 8] = [
+    "\u{1F44D}",
+    "\u{2764}\u{FE0F}",
+    "\u{1F602}",
+    "\u{1F62E}",
+    "\u{1F622}",
+    "\u{1F389}",
+    "\u{1F440}",
+    "\u{2705}",
+];
+
+/// What the reaction picker lists for `query`, at most
+/// [`MAX_PICKER_RESULTS`], each emoji once.
+///
+/// An empty (or blank) query gives the quick row followed by the first
+/// group. Otherwise an emoji matches when the query (trimmed, lowercase) is
+/// part of its name or of one of its shortcodes, in CLDR order.
+pub fn picker_results(query: &str) -> Vec<&'static str> {
+    let query: String = query
+        .trim()
+        .chars()
+        .take(MAX_PICKER_QUERY)
+        .flat_map(char::to_lowercase)
+        .collect();
+    let mut found: Vec<&'static str> = Vec::with_capacity(MAX_PICKER_RESULTS);
+    if query.is_empty() {
+        found.extend(QUICK_REACTIONS);
+        for emoji in emojis::Group::SmileysAndEmotion.emojis() {
+            if found.len() == MAX_PICKER_RESULTS {
+                break;
+            }
+            if !found.contains(&emoji.as_str()) {
+                found.push(emoji.as_str());
+            }
+        }
+        return found;
+    }
+    for emoji in emojis::iter() {
+        if found.len() == MAX_PICKER_RESULTS {
+            break;
+        }
+        if emoji.name().to_lowercase().contains(&query)
+            || emoji.shortcodes().any(|code| code.contains(&query))
+        {
+            found.push(emoji.as_str());
+        }
+    }
+    found
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_empty_picker_query_gives_the_quick_row_then_the_first_group() {
+        let found = picker_results("");
+        assert_eq!(found[..8], QUICK_REACTIONS);
+        assert!(found.len() > 8 && found.len() <= MAX_PICKER_RESULTS);
+        assert!(found.contains(&"\u{1F600}"), "group 1 starts with grinning");
+        let mut sorted = found.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), found.len(), "each emoji once");
+        assert_eq!(picker_results("  "), found, "blank is empty");
+    }
+
+    #[test]
+    fn a_picker_query_matches_names_and_shortcodes_and_is_capped() {
+        assert!(picker_results("smile").contains(&"\u{1F604}"));
+        assert!(
+            picker_results("  THUMBS ").contains(&"\u{1F44D}"),
+            "by name"
+        );
+        assert!(picker_results("e").len() == MAX_PICKER_RESULTS);
+        assert!(picker_results("zzzzqqqq").is_empty());
+        let long = "e".repeat(10_000);
+        assert!(picker_results(&long).len() <= MAX_PICKER_RESULTS);
+    }
 
     #[test]
     fn a_prefix_finds_the_emoji_by_shortcode() {

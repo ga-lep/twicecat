@@ -1,11 +1,15 @@
 //! The two-pane main layout: the room list pane on the left and the room view
 //! (timeline pane and composer) on the right.
 
-use iced::widget::{button, column, container, row, space, text, text_editor};
+use iced::widget::{
+    Row, button, column, container, opaque, row, space, stack, text, text_editor, text_input,
+};
 use iced::{Element, Fill};
-use tessera_core::api::UserId;
+use tessera_core::api::{MessageText, UserId};
 
+use crate::actions::{self, Picker};
 use crate::composer::{self, EditorAction, Mode, Suggestions};
+use crate::emoji;
 use crate::links::LinkBar;
 use crate::screens::loading::sync_label;
 use crate::screens::timeline_pane::RichEnv;
@@ -47,23 +51,39 @@ fn room_pane(app: &App) -> Element<'_, Message> {
         theme: &theme,
         own_user: app.user_id.as_ref(),
         revealed: &app.revealed,
+        actions: &app.actions,
     };
-    let mut body = column![
-        text(title).size(22),
-        container(timeline_pane::view(&app.timeline, env)).height(Fill),
-    ]
-    .spacing(8);
+    let timeline = container(timeline_pane::view(&app.timeline, env)).height(Fill);
+    // The picker floats over the timeline's bottom right corner.
+    let timeline: Element<'_, Message> = match &app.actions.picker {
+        Some(picker) => stack([
+            timeline.into(),
+            container(opaque(picker_panel(picker)))
+                .width(Fill)
+                .height(Fill)
+                .align_right(Fill)
+                .align_bottom(Fill)
+                .padding(8)
+                .into(),
+        ])
+        .into(),
+        None => timeline.into(),
+    };
+    let mut body = column![text(title).size(22), timeline].spacing(8);
     if let Some(bar) = &app.link_bar {
         body = body.push(link_bar(bar));
     }
     if let Some(error) = &app.send_error {
         body = body.push(text(error.as_str()).style(text::danger));
     }
+    if let Some(notice) = &app.actions.notice {
+        body = body.push(text(notice.text.as_str()).style(text::danger));
+    }
     let enabled = selected.is_some();
     if let Some(list) = suggestion_list(&app.composer.suggestions) {
         body = body.push(list);
     }
-    if let Some(bar) = mode_bar(&app.composer.mode) {
+    if let Some(bar) = mode_bar(app) {
         body = body.push(bar);
     }
     body = body.push(editor(app, enabled));
@@ -78,6 +98,7 @@ const EDITOR_MAX_HEIGHT: f32 = 160.0;
 fn editor(app: &App, enabled: bool) -> Element<'_, Message> {
     let open = app.composer.suggestions.is_open();
     let mut editor = text_editor(app.composer.content())
+        .id(composer::COMPOSER_ID)
         .placeholder("Message")
         .padding(8)
         .max_height(EDITOR_MAX_HEIGHT)
@@ -88,28 +109,75 @@ fn editor(app: &App, enabled: bool) -> Element<'_, Message> {
     editor.into()
 }
 
-/// The reply or edit bar above the editor.
-fn mode_bar(mode: &Mode) -> Option<Element<'_, Message>> {
-    let label = match mode {
-        Mode::Normal => return None,
-        Mode::Reply(_) => "Replying to a message",
-        Mode::Edit(_) => "Editing a message",
-    };
+/// The text of the bar above the editor: the quote of the message being
+/// replied to, or a note about the edit. `None` in the normal mode.
+pub fn mode_text(app: &App) -> Option<String> {
+    match &app.composer.mode {
+        Mode::Normal => None,
+        Mode::Reply(id) => Some(format!(
+            "Replying to {}",
+            actions::quote_for(&app.timeline.items, id).unwrap_or_else(|| "a message".to_owned())
+        )),
+        Mode::Edit(_) => Some("Editing a message".to_owned()),
+    }
+}
+
+/// The reply or edit bar above the editor, with a cross that leaves the mode.
+fn mode_bar(app: &App) -> Option<Element<'_, Message>> {
+    let label = mode_text(app)?;
     Some(
         container(
             row![
                 text(label),
                 space().width(Fill),
-                button(text("Cancel"))
-                    .on_press(Message::ComposerKey(composer::ComposerKey::Escape))
+                button(text("\u{2715}"))
+                    .on_press(Message::ModeCancelled)
                     .style(button::secondary),
             ]
             .spacing(8)
             .align_y(iced::Center),
         )
         .padding(4)
+        .style(container::bordered_box)
         .into(),
     )
+}
+
+/// Width of the reaction picker, in pixels.
+const PICKER_WIDTH: f32 = 360.0;
+
+/// The reaction picker: a search field and the emoji it finds, the quick row
+/// first while the search is empty.
+fn picker_panel(picker: &Picker) -> Element<'_, Message> {
+    let mut grid: Row<'_, Message> = Row::new();
+    for glyph in emoji::picker_results(&picker.query) {
+        grid = grid.push(
+            button(text(glyph).size(22))
+                .padding(4)
+                .style(button::text)
+                .on_press(Message::PickerPicked(MessageText::from(glyph))),
+        );
+    }
+    container(
+        column![
+            row![
+                text_input("Search emoji", &picker.query)
+                    .id(actions::PICKER_INPUT_ID)
+                    .on_input(|query| Message::PickerQuery(MessageText::from(query)))
+                    .on_submit(Message::PickerSubmitted),
+                button(text("\u{2715}"))
+                    .on_press(Message::PickerClosed)
+                    .style(button::secondary),
+            ]
+            .spacing(8),
+            grid.wrap(),
+        ]
+        .spacing(8),
+    )
+    .width(PICKER_WIDTH)
+    .padding(8)
+    .style(container::bordered_box)
+    .into()
 }
 
 /// The autocomplete rows (members or emojis) above the editor, or `None`
@@ -261,5 +329,39 @@ mod tests {
         let out = display_name(&"n".repeat(1000));
         assert_eq!(out.chars().count(), 256);
         assert!(out.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn the_mode_bar_quotes_the_replied_message() {
+        use crate::state::Startup;
+        use tessera_core::api::{
+            ListDiff, MessageDetails, SendStatus, TimelineItem, TimelineItemKind,
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let (_etx, erx) = tokio::sync::mpsc::channel(1);
+        let (mut app, _boot) = App::new(Startup {
+            sink: Box::new(tx),
+            events: crate::bridge::EventsSlot::new(erx),
+        });
+        assert_eq!(mode_text(&app), None);
+        app.timeline.apply_diffs(vec![ListDiff::Append {
+            values: vec![TimelineItem::new(
+                "m".to_owned(),
+                TimelineItemKind::Message {
+                    sender: UserId::from("@a:x"),
+                    body: "hello\nthere".into(),
+                    is_own: false,
+                    timestamp_ms: 1,
+                    sent: SendStatus::Sent,
+                    details: Box::new(MessageDetails::default()),
+                },
+            )],
+        }]);
+        app.composer.mode = Mode::Reply("m".into());
+        assert_eq!(mode_text(&app).as_deref(), Some("Replying to @a:x: hello"));
+        app.composer.mode = Mode::Reply("gone".into());
+        assert_eq!(mode_text(&app).as_deref(), Some("Replying to a message"));
+        app.composer.mode = Mode::Edit("m".into());
+        assert_eq!(mode_text(&app).as_deref(), Some("Editing a message"));
     }
 }

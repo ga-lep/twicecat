@@ -12,12 +12,16 @@ use std::cell::Cell;
 
 use chrono::{Local, TimeZone};
 use iced::font::{Style as FontStyle, Weight};
-use iced::widget::{Column, container, row, scrollable, sensor, space, stack, text};
+use iced::widget::{
+    Column, Row, button, container, mouse_area, row, scrollable, sensor, space, stack, text,
+};
 use iced::{Background, Element, Fill, Font, Padding, Theme};
 use tessera_core::api::{
-    MessageDetails, PaginationState, PlaceholderKind, StateChange, TimelineItemKind, UserId,
+    MessageDetails, MessageText, PaginationState, PlaceholderKind, ReactionGroup, StateChange,
+    TimelineItemKind, UserId,
 };
 
+use crate::actions::{self, ActionButtons, ActionState};
 use crate::dates::{day_label, time_label};
 use crate::rich_text::{Ctx, Revealed, blocks_view};
 use crate::state::Message;
@@ -45,6 +49,8 @@ pub struct RichEnv<'a> {
     pub own_user: Option<&'a UserId>,
     /// Spoilers the user revealed.
     pub revealed: &'a Revealed,
+    /// Hover and delete confirmation, for the action bar of a message.
+    pub actions: &'a ActionState,
 }
 
 /// The pane for the selected room's timeline, in the local time zone.
@@ -149,6 +155,7 @@ fn row_content<'a, Tz: TimeZone>(
         TimelineItemKind::Message {
             sender,
             body,
+            is_own,
             timestamp_ms,
             details,
             ..
@@ -167,7 +174,12 @@ fn row_content<'a, Tz: TimeZone>(
             // pass for a sender line. Rich text has no muted colour and no
             // small size, so it cannot copy the time next to a name either.
             content = content.push(body_widget(&items[i].id, body, details, env));
-            framed(content.into(), continuation, details.highlighted)
+            let buttons = actions::action_buttons(details, *is_own);
+            if !details.reactions.is_empty() {
+                content = content.push(reactions_row(&items[i].id, &details.reactions, buttons));
+            }
+            let framed = framed(content.into(), continuation, details.highlighted);
+            with_actions(&items[i].id, framed, buttons, env.actions)
         }
         TimelineItemKind::Placeholder {
             sender,
@@ -228,6 +240,133 @@ fn row_content<'a, Tz: TimeZone>(
         ),
         TimelineItemKind::Other => space().height(0).into(),
     }
+}
+
+/// Whether the action bar of message `id` is drawn: the pointer is over it,
+/// or its delete question is open.
+pub fn bar_visible(state: &ActionState, id: &str) -> bool {
+    state.hovered.as_deref() == Some(id) || state.confirm_delete.as_deref() == Some(id)
+}
+
+/// The text of a reaction chip: the key (one line, capped) and the count.
+pub fn chip_label(group: &ReactionGroup) -> String {
+    format!("{} {}", actions::key_label(&group.key), group.count)
+}
+
+/// The `key count` chips under a message, then a "+" chip. Chips toggle only
+/// where the core allows reacting.
+fn reactions_row<'a>(
+    id: &str,
+    groups: &[ReactionGroup],
+    buttons: ActionButtons,
+) -> Element<'a, Message> {
+    let mut chips: Row<'a, Message> = Row::new();
+    for group in groups {
+        let mut chip = button(text(chip_label(group)).size(13))
+            .padding([2, 6])
+            .style(if group.own {
+                button::primary
+            } else {
+                button::secondary
+            });
+        if buttons.react {
+            chip = chip.on_press(Message::ReactionToggled {
+                item: id.to_owned(),
+                key: MessageText::from(group.key.as_str()),
+            });
+        }
+        chips = chips.push(chip);
+    }
+    if buttons.react {
+        chips = chips.push(
+            button(text("+").size(13))
+                .padding([2, 6])
+                .style(button::secondary)
+                .on_press(Message::PickerOpened(id.to_owned())),
+        );
+    }
+    container(chips.spacing(4).wrap().vertical_spacing(4))
+        .padding(Padding {
+            top: 2.0,
+            ..Padding::ZERO
+        })
+        .into()
+}
+
+/// A small text button of the action bar.
+fn bar_button<'a>(label: &'static str, message: Message) -> Element<'a, Message> {
+    button(text(label).size(13))
+        .padding([2, 6])
+        .style(button::secondary)
+        .on_press(message)
+        .into()
+}
+
+/// The hover bar of message `id`, or the delete question.
+fn action_bar<'a>(id: &str, buttons: ActionButtons, confirming: bool) -> Element<'a, Message> {
+    let mut bar = Row::new().spacing(4).align_y(iced::Center);
+    if confirming {
+        bar = bar
+            .push(text("Delete this message?").size(13))
+            .push(
+                button(text("Delete").size(13))
+                    .padding([2, 6])
+                    .style(button::danger)
+                    .on_press(Message::DeleteConfirmed),
+            )
+            .push(bar_button("Cancel", Message::DeleteCancelled));
+    } else {
+        if buttons.reply {
+            bar = bar.push(bar_button("Reply", Message::ReplyRequested(id.to_owned())));
+        }
+        if buttons.edit {
+            bar = bar.push(bar_button("Edit", Message::EditRequested(id.to_owned())));
+        }
+        if buttons.react {
+            bar = bar.push(bar_button("React", Message::PickerOpened(id.to_owned())));
+        }
+        if buttons.copy {
+            bar = bar.push(bar_button("Copy", Message::CopyRequested(id.to_owned())));
+        }
+        if buttons.delete {
+            bar = bar.push(bar_button(
+                "Delete",
+                Message::DeleteRequested(id.to_owned()),
+            ));
+        }
+    }
+    container(bar)
+        .padding(2)
+        .style(container::bordered_box)
+        .into()
+}
+
+/// Wraps a message row so that hovering it shows the action bar. The bar is
+/// a stack layer over the row's top right corner: it never changes the row's
+/// height, so the measurements stay valid.
+fn with_actions<'a>(
+    id: &str,
+    row: Element<'a, Message>,
+    buttons: ActionButtons,
+    state: &ActionState,
+) -> Element<'a, Message> {
+    let confirming = state.confirm_delete.as_deref() == Some(id);
+    let content = if bar_visible(state, id) && (buttons.any() || confirming) {
+        let bar = container(action_bar(id, buttons, confirming))
+            .width(Fill)
+            .align_right(Fill)
+            .padding(Padding {
+                right: SIDE_PAD_PX,
+                ..Padding::ZERO
+            });
+        stack([row, bar.into()]).into()
+    } else {
+        row
+    };
+    mouse_area(content)
+        .on_enter(Message::HoverEnter(id.to_owned()))
+        .on_exit(Message::HoverExit(id.to_owned()))
+        .into()
 }
 
 /// The body of a message: its formatted content, or the plain text when the
@@ -648,8 +787,12 @@ mod tests {
             theme,
             own_user: None,
             revealed,
+            actions: &NO_ACTIONS,
         }
     }
+
+    static NO_ACTIONS: std::sync::LazyLock<ActionState> =
+        std::sync::LazyLock::new(ActionState::default);
 
     fn built_by(timeline: &TimelineView) -> usize {
         let (theme, revealed) = (theme(), Revealed::new());
@@ -763,5 +906,81 @@ mod tests {
         assert_eq!(body_text(&long).chars().count(), MAX_BODY_CHARS);
         let lines = "x\n".repeat(1000);
         assert_eq!(body_text(&lines).lines().count(), MAX_BODY_LINES);
+    }
+
+    fn group(key: &str, count: u32, own: bool) -> ReactionGroup {
+        ReactionGroup {
+            key: key.to_owned(),
+            count,
+            own,
+            senders: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_chip_shows_a_sanitised_capped_key_and_the_count() {
+        assert_eq!(chip_label(&group("\u{1F44D}", 3, false)), "\u{1F44D} 3");
+        assert_eq!(
+            chip_label(&group("a\nb\u{202E}", 1, true)),
+            "a\u{23CE}b\u{FFFD} 1"
+        );
+        let long = chip_label(&group(&"k".repeat(500), 2, false));
+        assert_eq!(long.chars().count(), actions::MAX_KEY_CHARS + 2);
+    }
+
+    #[test]
+    fn the_bar_shows_for_the_hovered_message_or_a_pending_delete() {
+        let mut state = ActionState::default();
+        assert!(!bar_visible(&state, "a"));
+        state.hovered = Some("a".into());
+        assert!(bar_visible(&state, "a") && !bar_visible(&state, "b"));
+        state.confirm_delete = Some("b".into());
+        assert!(bar_visible(&state, "b"));
+    }
+
+    #[test]
+    fn rows_with_actions_and_reactions_build_without_changing_the_window() {
+        use tessera_core::api::ItemActions;
+        let details = MessageDetails {
+            actions: ItemActions {
+                can_reply: true,
+                can_edit: true,
+                can_redact: true,
+                can_react: true,
+                can_copy: true,
+            },
+            reactions: vec![group("\u{1F44D}", 2, true), group("x", 1, false)],
+            ..MessageDetails::default()
+        };
+        let mut timeline = TimelineView::default();
+        timeline.apply_diffs(vec![ListDiff::Reset {
+            values: vec![TimelineItem::new(
+                "m".to_owned(),
+                TimelineItemKind::Message {
+                    sender: UserId::from("@a:x"),
+                    body: "hi".into(),
+                    is_own: true,
+                    timestamp_ms: NOW,
+                    sent: SendStatus::Sent,
+                    details: Box::new(details),
+                },
+            )],
+        }]);
+        let (theme, revealed) = (theme(), Revealed::new());
+        let hovered = ActionState {
+            hovered: Some("m".into()),
+            ..ActionState::default()
+        };
+        let confirming = ActionState {
+            confirm_delete: Some("m".into()),
+            ..ActionState::default()
+        };
+        for state in [&ActionState::default(), &hovered, &confirming] {
+            let env = RichEnv {
+                actions: state,
+                ..env(&theme, &revealed)
+            };
+            assert_eq!(built_by_with(&timeline, env), 1);
+        }
     }
 }

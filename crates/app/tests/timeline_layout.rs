@@ -68,10 +68,12 @@ fn timeline(n: usize) -> TimelineView {
 fn content_node(view: &TimelineView, renderer: &Renderer) -> Node {
     let theme = tessera_app::theme::theme_for(iced::theme::Mode::Light);
     let revealed = Revealed::new();
+    let actions = tessera_app::actions::ActionState::default();
     let env = RichEnv {
         theme: &theme,
         own_user: None,
         revealed: &revealed,
+        actions: &actions,
     };
     let mut element = view_in(view, NOW, &Utc, env);
     let mut tree = Tree::new(element.as_widget());
