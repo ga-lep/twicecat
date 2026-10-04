@@ -10,11 +10,23 @@ use crate::screens::login::host_of;
 /// Longest URL accepted, in bytes (the core's limit too).
 pub const MAX_URL_BYTES: usize = 2048;
 
+/// The kind of a checked link, which decides what the confirmation says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkKind {
+    /// `https`.
+    Https,
+    /// Plain `http`, not encrypted.
+    Http,
+    /// `mailto`, which starts an email draft.
+    Mailto,
+}
+
 /// A URL that passed [`check_link_url`]. `Debug` hides it.
 #[derive(Clone, PartialEq, Eq)]
 pub struct CheckedUrl {
     url: String,
     host: String,
+    kind: LinkKind,
 }
 
 impl CheckedUrl {
@@ -28,6 +40,11 @@ impl CheckedUrl {
     /// without port. This is what the confirmation bar shows.
     pub fn host(&self) -> &str {
         &self.host
+    }
+
+    /// Whether this is an https, http or mailto link.
+    pub fn kind(&self) -> LinkKind {
+        self.kind
     }
 }
 
@@ -78,6 +95,11 @@ pub fn check_link_url(url: &str) -> Result<CheckedUrl, LinkRefused> {
     Ok(CheckedUrl {
         url: url.to_owned(),
         host: host.to_ascii_lowercase(),
+        kind: if scheme.eq_ignore_ascii_case("http") {
+            LinkKind::Http
+        } else {
+            LinkKind::Https
+        },
     })
 }
 
@@ -96,6 +118,7 @@ fn check_mailto(rest: &str) -> Result<CheckedUrl, LinkRefused> {
     Ok(CheckedUrl {
         url: format!("mailto:{address}"),
         host: domain.to_ascii_lowercase(),
+        kind: LinkKind::Mailto,
     })
 }
 

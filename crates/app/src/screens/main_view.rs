@@ -10,7 +10,7 @@ use tessera_core::api::{MessageText, UserId};
 use crate::actions::{self, Picker};
 use crate::composer::{self, EditorAction, Mode, Suggestions};
 use crate::emoji;
-use crate::links::LinkBar;
+use crate::links::{CheckedUrl, LinkBar, LinkKind};
 use crate::screens::loading::sync_label;
 use crate::screens::timeline_pane::RichEnv;
 use crate::screens::{room_list_pane, timeline_pane};
@@ -244,10 +244,21 @@ pub fn member_row_label(member: &tessera_core::api::Member) -> String {
     }
 }
 
+/// The confirmation question for a link. It depends on the link kind and
+/// shows only the sanitised host (for `mailto`, the domain), never the URL.
+pub fn confirm_text(url: &CheckedUrl) -> String {
+    let host = one_line_capped(url.host(), MAX_NAME_CHARS);
+    match url.kind() {
+        LinkKind::Https => format!("Open {host}?"),
+        LinkKind::Http => format!("Open {host}? (not encrypted)"),
+        LinkKind::Mailto => format!("Write an email to {host}?"),
+    }
+}
+
 /// What the link bar says. Only the host of a link is ever shown.
 pub fn link_bar_text(bar: &LinkBar) -> String {
     match bar {
-        LinkBar::Confirm(url) => format!("Open {}?", one_line_capped(url.host(), MAX_NAME_CHARS)),
+        LinkBar::Confirm(url) => confirm_text(url),
         LinkBar::Refused => "This link cannot be opened.".to_owned(),
         LinkBar::Failed => "The link could not be opened.".to_owned(),
     }
@@ -329,6 +340,20 @@ mod tests {
         assert_eq!(text, "Open evil.example?");
         assert!(!link_bar_text(&LinkBar::Refused).is_empty());
         assert!(!link_bar_text(&LinkBar::Failed).is_empty());
+    }
+
+    #[test]
+    fn the_confirm_text_names_the_link_kind() {
+        let text = |u: &str| confirm_text(&crate::links::check_link_url(u).expect("valid link"));
+        assert_eq!(text("https://Evil.example/x?t=1"), "Open evil.example?");
+        assert_eq!(
+            text("http://Evil.example:8080/x?t=1"),
+            "Open evil.example? (not encrypted)"
+        );
+        assert_eq!(
+            text("mailto:Bob@Mail.Example?body=secret"),
+            "Write an email to mail.example?"
+        );
     }
 
     #[test]
