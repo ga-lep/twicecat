@@ -17,8 +17,8 @@ use iced::widget::{
 };
 use iced::{Background, Element, Fill, Font, Padding, Theme};
 use tessera_core::api::{
-    MessageDetails, MessageText, PaginationState, PlaceholderKind, ReactionGroup, StateChange,
-    TimelineItemKind, UserId,
+    MessageDetails, MessageText, PaginationState, PlaceholderKind, ReactionGroup, SendStatus,
+    StateChange, TimelineItem, TimelineItemKind, TypingUser, UserId,
 };
 
 use crate::actions::{self, ActionButtons, ActionState};
@@ -157,9 +157,11 @@ fn row_content<'a, Tz: TimeZone>(
             body,
             is_own,
             timestamp_ms,
+            sent,
             details,
             ..
         } => {
+            let echo = echo_of(*sent, details);
             let continuation = is_continuation(items, i);
             let mut content = Column::new().width(Fill);
             if !continuation {
@@ -173,10 +175,22 @@ fn row_content<'a, Tz: TimeZone>(
             // The body sits below the header in its own widget, so it cannot
             // pass for a sender line. Rich text has no muted colour and no
             // small size, so it cannot copy the time next to a name either.
-            content = content.push(body_widget(&items[i].id, body, details, env));
+            content = content.push(body_widget(
+                &items[i].id,
+                body,
+                details,
+                echo == Echo::Sending,
+                env,
+            ));
             let buttons = actions::action_buttons(details, *is_own);
             if !details.reactions.is_empty() {
                 content = content.push(reactions_row(&items[i].id, &details.reactions, buttons));
+            }
+            if let Some(line) = echo_row(&items[i].id, echo) {
+                content = content.push(line);
+            }
+            if let Some(line) = receipts_row(items, i) {
+                content = content.push(line);
             }
             let framed = framed(content.into(), continuation, details.highlighted);
             with_actions(&items[i].id, framed, buttons, env.actions)
@@ -200,6 +214,9 @@ fn row_content<'a, Tz: TimeZone>(
                     .style(muted)
                     .width(Fill),
             );
+            if let Some(line) = receipts_row(items, i) {
+                content = content.push(line);
+            }
             framed(content.into(), continuation, false)
         }
         TimelineItemKind::State {
@@ -209,19 +226,23 @@ fn row_content<'a, Tz: TimeZone>(
             ..
         } => {
             let actor = sender_label(sender_name.as_deref(), false, sender);
-            container(
+            let mut line = Column::new().width(Fill).push(
                 text(state_text(&actor, change))
                     .size(13)
                     .style(muted)
                     .width(Fill),
-            )
-            .padding(Padding {
-                top: 4.0,
-                right: SIDE_PAD_PX,
-                bottom: 4.0,
-                left: INDENT_PX,
-            })
-            .into()
+            );
+            if let Some(receipts) = receipts_row(items, i) {
+                line = line.push(receipts);
+            }
+            container(line)
+                .padding(Padding {
+                    top: 4.0,
+                    right: SIDE_PAD_PX,
+                    bottom: 4.0,
+                    left: INDENT_PX,
+                })
+                .into()
         }
         TimelineItemKind::DateDivider { timestamp_ms } => fixed_height(
             text(day_label(*timestamp_ms, now_ms, tz))
@@ -375,10 +396,16 @@ fn body_widget<'a>(
     id: &str,
     body: &str,
     details: &MessageDetails,
+    dim: bool,
     env: RichEnv<'_>,
 ) -> Element<'a, Message> {
     if details.content.blocks.is_empty() {
-        return text(body_text(body)).width(Fill).into();
+        let plain = text(body_text(body)).width(Fill);
+        return if dim {
+            plain.style(muted).into()
+        } else {
+            plain.into()
+        };
     }
     let ctx = Ctx {
         own_user: env.own_user,
@@ -386,6 +413,30 @@ fn body_widget<'a>(
         revealed: env.revealed,
     };
     blocks_view(&details.content, &ctx, env.theme)
+}
+
+/// The status line of a local echo: muted while sending, in the danger
+/// colour when failed, with **Retry** and **Discard**.
+fn echo_row<'a>(id: &str, echo: Echo) -> Option<Element<'a, Message>> {
+    let label = echo_text(echo)?;
+    Some(match echo {
+        Echo::Delivered => return None,
+        Echo::Sending => text(label).size(12).style(muted).into(),
+        Echo::Failed { .. } => row![
+            text(label).size(13).style(text::danger),
+            bar_button("Retry", Message::RetryRequested(id.to_owned())),
+            bar_button("Discard", Message::DiscardRequested(id.to_owned())),
+        ]
+        .spacing(8)
+        .align_y(iced::Center)
+        .into(),
+    })
+}
+
+/// "Seen by" under item `i`, when other users' receipts point at it.
+fn receipts_row<'a>(items: &[TimelineItem], i: usize) -> Option<Element<'a, Message>> {
+    let line = seen_by_line(&items[i].read_by, |user| known_name(&items[..=i], user))?;
+    Some(text(line).size(12).style(muted).width(Fill).into())
 }
 
 /// A message body ready to draw: line breaks kept, bidi controls replaced,
@@ -566,6 +617,151 @@ pub fn state_text(actor: &str, change: &StateChange) -> String {
     }
 }
 
+/// How many characters of a name in "Seen by" and the typing line are shown.
+pub const MAX_SHORT_NAME_CHARS: usize = 24;
+/// How many characters of a user ID are shown next to an ambiguous name.
+const MAX_SHORT_ID_CHARS: usize = 48;
+/// How many names "Seen by" lists before "+N".
+pub const MAX_SEEN_NAMES: usize = 3;
+/// How many earlier items are searched for the name of a user.
+const NAME_SEARCH_REACH: usize = 500;
+
+/// The part of a user ID between `@` and the first `:`, sanitised and
+/// capped; the whole ID when that part is empty.
+fn localpart(id: &UserId) -> String {
+    let full = id.to_string();
+    let local = full
+        .strip_prefix('@')
+        .and_then(|rest| rest.split(':').next())
+        .filter(|l| !l.is_empty())
+        .unwrap_or(&full);
+    name_or_placeholder(local, MAX_SHORT_NAME_CHARS)
+}
+
+/// A short name: the display name (sanitised, capped), followed by the user
+/// ID when the name is ambiguous; the localpart when there is no usable name.
+fn short_name(name: Option<&str>, ambiguous: bool, id: &UserId) -> String {
+    let clean = name
+        .map(|n| one_line_capped(n, MAX_SHORT_NAME_CHARS))
+        .filter(|n| !n.trim().is_empty());
+    match clean {
+        Some(clean) if ambiguous => {
+            format!(
+                "{clean} ({})",
+                name_or_placeholder(&id.to_string(), MAX_SHORT_ID_CHARS)
+            )
+        }
+        Some(clean) => clean,
+        None => localpart(id),
+    }
+}
+
+/// The text above the composer about who is typing (plan Q13), or `None`
+/// when nobody is. Names with the same text show the user ID too.
+pub fn typing_line(users: &[TypingUser]) -> Option<String> {
+    let label = |user: &TypingUser| {
+        let clean = user
+            .name
+            .as_deref()
+            .map(|n| one_line_capped(n, MAX_SHORT_NAME_CHARS));
+        let twin = clean.as_ref().is_some_and(|c| {
+            users.iter().any(|other| {
+                other.user_id != user.user_id
+                    && other
+                        .name
+                        .as_deref()
+                        .is_some_and(|n| one_line_capped(n, MAX_SHORT_NAME_CHARS) == *c)
+            })
+        });
+        short_name(user.name.as_deref(), twin, &user.user_id)
+    };
+    match users {
+        [] => None,
+        [one] => Some(format!("{} is typing\u{2026}", label(one))),
+        [a, b] => Some(format!("{} and {} are typing\u{2026}", label(a), label(b))),
+        _ => Some("Several people are typing\u{2026}".to_owned()),
+    }
+}
+
+/// "Seen by A, B, C +N" for the users whose receipt points at an item
+/// (plan Q12). `known` gives a user's display name and whether it is
+/// ambiguous, when the timeline knows it.
+pub fn seen_by_line(
+    read_by: &[UserId],
+    known: impl Fn(&UserId) -> Option<(String, bool)>,
+) -> Option<String> {
+    if read_by.is_empty() {
+        return None;
+    }
+    let names: Vec<String> = read_by
+        .iter()
+        .take(MAX_SEEN_NAMES)
+        .map(|id| match known(id) {
+            Some((name, ambiguous)) => short_name(Some(&name), ambiguous, id),
+            None => short_name(None, false, id),
+        })
+        .collect();
+    let rest = read_by.len().saturating_sub(MAX_SEEN_NAMES);
+    Some(if rest > 0 {
+        format!("Seen by {} +{rest}", names.join(", "))
+    } else {
+        format!("Seen by {}", names.join(", "))
+    })
+}
+
+/// The display name a message in `items` gave for `user`, searching the
+/// newest items first, and whether it is ambiguous.
+pub fn known_name(items: &[TimelineItem], user: &UserId) -> Option<(String, bool)> {
+    items
+        .iter()
+        .rev()
+        .take(NAME_SEARCH_REACH)
+        .find_map(|item| match &item.kind {
+            TimelineItemKind::Message {
+                sender, details, ..
+            } if *sender == *user => details
+                .sender_name
+                .clone()
+                .map(|n| (n, details.sender_name_ambiguous)),
+            _ => None,
+        })
+}
+
+/// The delivery state of a message, for its row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Echo {
+    /// Confirmed by the server, or received from it.
+    Delivered,
+    /// Queued or in flight.
+    Sending,
+    /// Failed; Retry and Discard are offered.
+    Failed {
+        /// The queue retries by itself when the network returns.
+        recoverable: bool,
+    },
+}
+
+/// The [`Echo`] of a message (plan Q11).
+pub fn echo_of(sent: SendStatus, details: &MessageDetails) -> Echo {
+    match sent {
+        SendStatus::Sent => Echo::Delivered,
+        SendStatus::Sending => Echo::Sending,
+        SendStatus::Failed => Echo::Failed {
+            recoverable: details.send_failure.is_some_and(|f| f.recoverable),
+        },
+    }
+}
+
+/// The status line under a local echo.
+pub fn echo_text(echo: Echo) -> Option<&'static str> {
+    match echo {
+        Echo::Delivered => None,
+        Echo::Sending => Some("\u{25F7} Sending\u{2026}"),
+        Echo::Failed { recoverable: false } => Some("Failed to send"),
+        Echo::Failed { recoverable: true } => Some("Failed to send. Will retry when back online"),
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     /// Rows built on this thread, for the virtualization test.
@@ -737,10 +933,196 @@ mod tests {
         }
     }
 
+    // ---- Task 13: receipts, typing, local echoes ----
+
+    fn typist(id: &str, name: Option<&str>) -> TypingUser {
+        TypingUser {
+            user_id: UserId::from(id),
+            name: name.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn typing_line_for_zero_one_two_and_many_users() {
+        assert_eq!(typing_line(&[]), None);
+        assert_eq!(
+            typing_line(&[typist("@a:x", Some("Alice"))]).as_deref(),
+            Some("Alice is typing\u{2026}")
+        );
+        assert_eq!(
+            typing_line(&[typist("@a:x", Some("Alice")), typist("@b:x", None)]).as_deref(),
+            Some("Alice and b are typing\u{2026}")
+        );
+        let three = [
+            typist("@a:x", Some("Alice")),
+            typist("@b:x", Some("Bob")),
+            typist("@c:x", Some("Cy")),
+        ];
+        assert_eq!(
+            typing_line(&three).as_deref(),
+            Some("Several people are typing\u{2026}")
+        );
+    }
+
+    #[test]
+    fn typing_names_are_sanitised_capped_and_disambiguated() {
+        let line = typing_line(&[typist("@a:x", Some("Al\nice\u{202E}"))]).expect("a line");
+        assert!(!line.contains(['\n', '\u{202E}']), "{line:?}");
+        let long = "n".repeat(500);
+        let line = typing_line(&[typist("@a:x", Some(&long))]).expect("a line");
+        assert!(line.chars().count() < 60, "{}", line.chars().count());
+        // Two users with the same name: the IDs tell them apart.
+        let line = typing_line(&[typist("@a:x", Some("Sam")), typist("@b:x", Some("Sam"))])
+            .expect("a line");
+        assert_eq!(line, "Sam (@a:x) and Sam (@b:x) are typing\u{2026}");
+        // A blank name falls back to the localpart.
+        let line = typing_line(&[typist("@carol:x", Some("  "))]).expect("a line");
+        assert_eq!(line, "carol is typing\u{2026}");
+    }
+
+    fn ids(list: &[&str]) -> Vec<UserId> {
+        list.iter().map(|u| UserId::from(*u)).collect()
+    }
+
+    #[test]
+    fn seen_by_lists_three_names_then_a_count() {
+        let known = |id: &UserId| match id.as_str() {
+            "@a:x" => Some(("Alice".to_owned(), false)),
+            "@d:x" => Some(("Dan".to_owned(), true)),
+            _ => None,
+        };
+        assert_eq!(seen_by_line(&[], known), None);
+        assert_eq!(
+            seen_by_line(&ids(&["@a:x"]), known).as_deref(),
+            Some("Seen by Alice")
+        );
+        assert_eq!(
+            seen_by_line(&ids(&["@a:x", "@bob:x", "@d:x"]), known).as_deref(),
+            Some("Seen by Alice, bob, Dan (@d:x)")
+        );
+        assert_eq!(
+            seen_by_line(&ids(&["@a:x", "@b:x", "@c:x", "@e:x", "@f:x"]), known).as_deref(),
+            Some("Seen by Alice, b, c +2")
+        );
+    }
+
+    #[test]
+    fn seen_by_names_are_sanitised_and_capped() {
+        let evil = |_: &UserId| Some(("Bo\nb\u{202E}".to_owned(), false));
+        let line = seen_by_line(&ids(&["@b:x"]), evil).expect("a line");
+        assert!(!line.contains(['\n', '\u{202E}']), "{line:?}");
+        let long = |_: &UserId| Some(("n".repeat(500), false));
+        let line = seen_by_line(&ids(&["@b:x"]), long).expect("a line");
+        assert!(line.chars().count() < 60);
+        let odd = seen_by_line(&ids(&["@:x"]), |_| None).expect("a line");
+        assert_eq!(odd, "Seen by @:x");
+    }
+
+    #[test]
+    fn known_names_come_from_the_senders_before_the_item() {
+        let mut named = TimelineItem::new(
+            "m".to_owned(),
+            TimelineItemKind::Message {
+                sender: UserId::from("@a:x"),
+                body: String::new(),
+                is_own: false,
+                timestamp_ms: 0,
+                sent: SendStatus::Sent,
+                details: Box::new(MessageDetails {
+                    sender_name: Some("Alice".into()),
+                    sender_name_ambiguous: true,
+                    ..MessageDetails::default()
+                }),
+            },
+        );
+        named.read_by = ids(&["@a:x"]);
+        let items = vec![named];
+        assert_eq!(
+            known_name(&items, &UserId::from("@a:x")),
+            Some(("Alice".to_owned(), true))
+        );
+        assert_eq!(known_name(&items, &UserId::from("@z:x")), None);
+    }
+
+    #[test]
+    fn echo_state_follows_the_delivery_status_and_failure() {
+        let plain = MessageDetails::default();
+        assert_eq!(echo_of(SendStatus::Sent, &plain), Echo::Delivered);
+        assert_eq!(echo_of(SendStatus::Sending, &plain), Echo::Sending);
+        assert_eq!(
+            echo_of(SendStatus::Failed, &plain),
+            Echo::Failed { recoverable: false }
+        );
+        let recoverable = MessageDetails {
+            send_failure: Some(SendFailure { recoverable: true }),
+            ..MessageDetails::default()
+        };
+        assert_eq!(
+            echo_of(SendStatus::Failed, &recoverable),
+            Echo::Failed { recoverable: true }
+        );
+    }
+
+    #[test]
+    fn echo_texts() {
+        assert_eq!(echo_text(Echo::Delivered), None);
+        assert!(echo_text(Echo::Sending).is_some_and(|t| t.contains("Sending")));
+        let failed = echo_text(Echo::Failed { recoverable: false }).expect("text");
+        assert!(!failed.contains("back online"));
+        let again = echo_text(Echo::Failed { recoverable: true }).expect("text");
+        assert!(again.contains("Will retry when back online"));
+    }
+
+    #[test]
+    fn rows_with_echo_states_and_receipts_build() {
+        let mut view = TimelineView::default();
+        let echo = |id: &str, sent, failure| {
+            TimelineItem::new(
+                id.to_owned(),
+                TimelineItemKind::Message {
+                    sender: UserId::from("@me:x"),
+                    body: "hello".into(),
+                    is_own: true,
+                    timestamp_ms: 0,
+                    sent,
+                    details: Box::new(MessageDetails {
+                        send_failure: failure,
+                        ..MessageDetails::default()
+                    }),
+                },
+            )
+        };
+        let mut seen = echo("seen", SendStatus::Sent, None);
+        seen.read_by = ids(&["@a:x", "@b:x", "@c:x", "@d:x"]);
+        let _ = view.apply_diffs(vec![ListDiff::Append {
+            values: vec![
+                seen,
+                echo("sending", SendStatus::Sending, None),
+                echo(
+                    "failed",
+                    SendStatus::Failed,
+                    Some(SendFailure { recoverable: true }),
+                ),
+            ],
+        }]);
+        let theme = Theme::Light;
+        let revealed = Revealed::new();
+        let actions = ActionState::default();
+        let env = RichEnv {
+            theme: &theme,
+            own_user: None,
+            revealed: &revealed,
+            actions: &actions,
+        };
+        BUILT_ROWS.with(|built| built.set(0));
+        let _ = view_in(&view, 0, &chrono::Utc, env);
+        assert_eq!(BUILT_ROWS.with(Cell::get), 3);
+    }
+
     use std::time::{Duration, Instant};
 
     use chrono::Utc;
-    use tessera_core::api::{ListDiff, MessageDetails, SendStatus, TimelineItem};
+    use tessera_core::api::{ListDiff, SendFailure};
 
     use crate::timeline::MAX_BUILT_ROWS;
 

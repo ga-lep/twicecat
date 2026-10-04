@@ -13,7 +13,7 @@ use iced::{Element, Subscription, Task, Theme, clipboard, system, window};
 use tessera_core::api::{
     ActionKind, Command, CoreError, CoreEvent, ListDiff, MessageDetails, MessageText, Password,
     RoomId, RoomListQuery, RoomListTab, RoomSummary, SyncState, TimelineItem, TimelineItemKind,
-    UserId,
+    TypingUser, UserId,
 };
 use tokio::sync::mpsc;
 
@@ -214,6 +214,14 @@ pub enum Message {
         /// Whether the handler started without error.
         ok: bool,
     },
+    /// The window gained or lost focus.
+    WindowFocus(bool),
+    /// The timer of a delayed read receipt ended.
+    ReadDue,
+    /// **Retry** on a failed local echo.
+    RetryRequested(String),
+    /// **Discard** on a failed local echo.
+    DiscardRequested(String),
     /// The user asked to close the window.
     CloseRequested,
     /// The core did not close in time after `Shutdown`.
@@ -283,6 +291,11 @@ pub struct App {
     pub theme_mode: theme::Mode,
     /// Spoilers the user revealed in the open room.
     pub revealed: Revealed,
+    /// Who is typing in the open room (other users, at most
+    /// [`timeline::MAX_TYPING_KEPT`]).
+    pub typing: Vec<TypingUser>,
+    /// The window has focus (read receipts wait for it).
+    pub window_focused: bool,
     /// The bar above the composer about a clicked link.
     pub link_bar: Option<LinkBar>,
     /// Set when the app decided to exit (the task itself is opaque to tests).
@@ -343,6 +356,8 @@ impl App {
             actions: ActionState::default(),
             theme_mode: theme::Mode::None,
             revealed: Revealed::new(),
+            typing: Vec::new(),
+            window_focused: true,
             link_bar: None,
             exit_requested: false,
         };
@@ -461,6 +476,16 @@ impl App {
                 }
                 Task::none()
             }
+            Message::WindowFocus(focused) => {
+                self.window_focused = focused;
+                self.read_receipt(Instant::now())
+            }
+            Message::ReadDue => {
+                self.timeline.read_timer_fired();
+                self.read_receipt(Instant::now())
+            }
+            Message::RetryRequested(id) => self.echo_command(id, false),
+            Message::DiscardRequested(id) => self.echo_command(id, true),
             Message::ReplyRequested(id) => self.request_reply(id),
             Message::EditRequested(id) => self.request_edit(id),
             Message::CopyRequested(id) => match self.copy_source(&id) {
@@ -528,12 +553,14 @@ impl App {
                     return Task::none();
                 }
                 let stop_typing = self.stop_typing();
+                let marker = self.move_read_marker();
                 self.selected = Some(id.clone());
                 self.timeline.reset();
+                self.typing.clear();
                 self.actions.reset();
                 self.clear_draft();
                 self.reset_link_state();
-                Task::batch([stop_typing, self.send(Command::SelectRoom(id))])
+                Task::batch([stop_typing, marker, self.send(Command::SelectRoom(id))])
             }
             Message::TabSelected(tab) => {
                 let query = RoomListQuery {
@@ -699,8 +726,13 @@ impl App {
                     task = self.show_notice(action, &error);
                 }
             }
-            // Shown by the Phase 3 timeline pane (Task 13); ignored until then.
-            CoreEvent::Typing { .. } | CoreEvent::ActionFailed { .. } => {}
+            CoreEvent::Typing { room_id, mut users } => {
+                if self.selected.as_ref() == Some(&room_id) {
+                    users.truncate(timeline::MAX_TYPING_KEPT);
+                    self.typing = users;
+                }
+            }
+            CoreEvent::ActionFailed { .. } => {}
         }
         task
     }
@@ -1132,6 +1164,7 @@ impl App {
     fn deselect(&mut self) {
         self.selected = None;
         self.timeline.reset();
+        self.typing.clear();
         self.actions.reset();
         self.clear_draft();
         self.reset_link_state();
@@ -1226,7 +1259,52 @@ impl App {
         {
             tasks.push(self.send(Command::PaginateBackwards { room_id }));
         }
+        tasks.push(self.read_receipt(Instant::now()));
         Task::batch(tasks)
+    }
+
+    /// Sends the read receipt when one is due, or starts the timer that
+    /// asks again (plan Q12). `now` is a parameter for the tests.
+    fn read_receipt(&mut self, now: Instant) -> Task<Message> {
+        let Some(room_id) = self.selected.clone() else {
+            return Task::none();
+        };
+        match self.timeline.read_step(self.window_focused, now) {
+            timeline::ReadStep::Idle => Task::none(),
+            timeline::ReadStep::Send => self.send(Command::MarkRead {
+                room_id,
+                fully_read: false,
+            }),
+            timeline::ReadStep::Wait(after) => self.sink.timer(after, Message::ReadDue),
+        }
+    }
+
+    /// `MarkRead { fully_read: true }` for the room being left, when its
+    /// bottom was seen.
+    fn move_read_marker(&mut self) -> Task<Message> {
+        match &self.selected {
+            Some(room_id) if self.timeline.bottom_seen => self.send(Command::MarkRead {
+                room_id: room_id.clone(),
+                fully_read: true,
+            }),
+            _ => Task::none(),
+        }
+    }
+
+    /// **Retry** or **Discard** for item `id`, only while it is a failed
+    /// local echo.
+    fn echo_command(&mut self, item_id: String, discard: bool) -> Task<Message> {
+        let failed = self
+            .find_message(&item_id)
+            .is_some_and(|(_, _, details)| details.send_failure.is_some());
+        let Some(room_id) = self.selected.clone().filter(|_| failed) else {
+            return Task::none();
+        };
+        self.send(if discard {
+            Command::DiscardSend { room_id, item_id }
+        } else {
+            Command::RetrySend { room_id, item_id }
+        })
     }
 
     /// The window content.
@@ -1247,6 +1325,11 @@ impl App {
         Subscription::batch([
             bridge::events_subscription(self.events.clone()),
             window::close_requests().map(|_| Message::CloseRequested),
+            iced::event::listen_with(|event, _status, _id| match event {
+                iced::Event::Window(window::Event::Focused) => Some(Message::WindowFocus(true)),
+                iced::Event::Window(window::Event::Unfocused) => Some(Message::WindowFocus(false)),
+                _ => None,
+            }),
             system::theme_changes().map(Message::ThemeMode),
         ])
     }
@@ -2751,5 +2834,144 @@ mod tests {
         let _ = app.update(Message::PickerOpened("theirs".into()));
         let _ = app.update(Message::PickerQuery(key("secret-query-x")));
         assert!(!format!("{app:?}").contains("secret-query-x"));
+    }
+
+    // ---- Task 13: receipts, typing and local echoes ----
+
+    fn append(app: &mut App, items: Vec<TimelineItem>) {
+        let _ = app.update(core(CoreEvent::TimelineDiff {
+            room_id: RoomId::from("!a:x"),
+            diffs: vec![ListDiff::Append { values: items }],
+        }));
+    }
+
+    fn marks(commands: &[Command]) -> Vec<bool> {
+        commands
+            .iter()
+            .filter_map(|c| match c {
+                Command::MarkRead { fully_read, .. } => Some(*fully_read),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_receipt_follows_the_bottom_item_and_never_repeats() {
+        let (mut app, mut rx) = main_app();
+        append(&mut app, vec![message_item("a", "hi", false, ALL_ACTIONS)]);
+        assert_eq!(marks(&drain(&mut rx)), [false]);
+        // The same item again (a re-measure, a scroll to the same place).
+        let _ = app.update(Message::RowMeasured {
+            id: "a".into(),
+            height: 40.0,
+        });
+        let _ = app.on_timeline_scrolled(0.0, 600.0, 800.0);
+        assert_eq!(marks(&drain(&mut rx)), Vec::<bool>::new());
+    }
+
+    #[test]
+    fn no_receipt_while_scrolled_up_until_the_bottom_is_reached() {
+        let (mut app, mut rx) = main_app();
+        let _ = app.on_timeline_scrolled(500.0, 600.0, 800.0);
+        append(&mut app, vec![message_item("a", "hi", false, ALL_ACTIONS)]);
+        assert_eq!(marks(&drain(&mut rx)), Vec::<bool>::new());
+        let _ = app.on_timeline_scrolled(0.0, 600.0, 800.0);
+        assert_eq!(marks(&drain(&mut rx)), [false]);
+    }
+
+    #[test]
+    fn no_receipt_without_window_focus_until_it_returns() {
+        let (mut app, mut rx) = main_app();
+        let _ = app.update(Message::WindowFocus(false));
+        append(&mut app, vec![message_item("a", "hi", false, ALL_ACTIONS)]);
+        assert_eq!(marks(&drain(&mut rx)), Vec::<bool>::new());
+        let _ = app.update(Message::WindowFocus(true));
+        assert_eq!(marks(&drain(&mut rx)), [false]);
+    }
+
+    #[test]
+    fn leaving_a_room_whose_bottom_was_seen_moves_the_read_marker() {
+        let (mut app, mut rx) = main_app();
+        append(&mut app, vec![message_item("a", "hi", false, ALL_ACTIONS)]);
+        let _ = drain(&mut rx);
+        let _ = app.update(Message::SelectRoom(RoomId::from("!b:x")));
+        let commands = drain(&mut rx);
+        assert!(commands.iter().any(|c| matches!(
+            c,
+            Command::MarkRead { room_id, fully_read: true } if *room_id == RoomId::from("!a:x")
+        )));
+        // Leaving again without having seen any bottom sends nothing.
+        let _ = app.update(Message::SelectRoom(RoomId::from("!a:x")));
+        assert_eq!(marks(&drain(&mut rx)), Vec::<bool>::new());
+    }
+
+    #[test]
+    fn leaving_a_room_scrolled_up_never_seen_sends_no_marker() {
+        let (mut app, mut rx) = main_app();
+        let _ = app.on_timeline_scrolled(500.0, 600.0, 800.0);
+        append(&mut app, vec![message_item("a", "hi", false, ALL_ACTIONS)]);
+        let _ = app.update(Message::SelectRoom(RoomId::from("!b:x")));
+        assert_eq!(marks(&drain(&mut rx)), Vec::<bool>::new());
+    }
+
+    fn typist(id: &str, name: Option<&str>) -> tessera_core::api::TypingUser {
+        tessera_core::api::TypingUser {
+            user_id: UserId::from(id),
+            name: name.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn typing_events_apply_to_the_open_room_and_reset_on_switch() {
+        let (mut app, _rx) = main_app();
+        let _ = app.update(core(CoreEvent::Typing {
+            room_id: RoomId::from("!b:x"),
+            users: vec![typist("@x:x", None)],
+        }));
+        assert!(app.typing.is_empty(), "another room");
+        let users: Vec<_> = (0..10).map(|i| typist(&format!("@u{i}:x"), None)).collect();
+        let _ = app.update(core(CoreEvent::Typing {
+            room_id: RoomId::from("!a:x"),
+            users,
+        }));
+        assert_eq!(app.typing.len(), crate::timeline::MAX_TYPING_KEPT);
+        let _ = app.update(Message::SelectRoom(RoomId::from("!b:x")));
+        assert!(app.typing.is_empty());
+    }
+
+    fn failed_item(id: &str, recoverable: bool) -> TimelineItem {
+        let mut item = message_item(id, "x", true, ALL_ACTIONS);
+        if let TimelineItemKind::Message { sent, details, .. } = &mut item.kind {
+            *sent = SendStatus::Failed;
+            details.send_failure = Some(tessera_core::api::SendFailure { recoverable });
+        }
+        item
+    }
+
+    #[test]
+    fn retry_and_discard_send_commands_for_failed_echoes_only() {
+        let (mut app, mut rx) = main_app();
+        append(
+            &mut app,
+            vec![
+                failed_item("bad", true),
+                message_item("ok", "fine", true, ALL_ACTIONS),
+            ],
+        );
+        let _ = drain(&mut rx);
+        let _ = app.update(Message::RetryRequested("bad".into()));
+        let _ = app.update(Message::DiscardRequested("bad".into()));
+        let _ = app.update(Message::RetryRequested("ok".into()));
+        let _ = app.update(Message::DiscardRequested("gone".into()));
+        let commands = drain(&mut rx);
+        assert_eq!(commands.len(), 2, "{commands:?}");
+        assert!(matches!(
+            &commands[0],
+            Command::RetrySend { room_id, item_id } if *room_id == RoomId::from("!a:x") && item_id == "bad"
+        ));
+        assert!(matches!(
+            &commands[1],
+            Command::DiscardSend { room_id, item_id } if *room_id == RoomId::from("!a:x") && item_id == "bad"
+        ));
     }
 }

@@ -80,6 +80,15 @@ fn room_pane(app: &App) -> Element<'_, Message> {
         body = body.push(text(notice.text.as_str()).style(text::danger));
     }
     let enabled = selected.is_some();
+    if let Some(line) = timeline_pane::typing_line(&app.typing) {
+        body = body.push(
+            text(line)
+                .size(13)
+                .style(|theme: &iced::Theme| text::Style {
+                    color: Some(theme::semantic(theme).muted),
+                }),
+        );
+    }
     if let Some(list) = suggestion_list(&app.composer.suggestions) {
         body = body.push(list);
     }

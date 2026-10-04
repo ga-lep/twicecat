@@ -12,9 +12,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+use std::time::{Duration, Instant};
 
 use tessera_core::api::{
-    Block, Inline, ListDiff, PaginationState, RichText, TimelineItem, TimelineItemKind,
+    Block, Inline, ListDiff, PaginationState, RichText, SendStatus, TimelineItem, TimelineItemKind,
 };
 
 /// How far outside the viewport rows are built, in pixels.
@@ -37,6 +38,10 @@ pub const RETRY_SCROLL_PX: f32 = 100.0;
 pub const DEFAULT_VIEWPORT_H: f32 = 600.0;
 /// Pane width assumed until the pane reports one.
 pub const DEFAULT_WIDTH: f32 = 800.0;
+/// Least time between two read receipts (plan Q12).
+pub const RECEIPT_MIN_INTERVAL: Duration = Duration::from_secs(1);
+/// Typing users kept for display: three are enough to tell "several".
+pub const MAX_TYPING_KEPT: usize = 3;
 /// The id of the timeline's scrollable.
 pub const TIMELINE_ID: &str = "timeline";
 
@@ -185,7 +190,12 @@ fn estimate_unclamped(item: &TimelineItem, continuation: bool, width: f32) -> f3
     };
     let cpl = chars_per_line(width, 0);
     match &item.kind {
-        TimelineItemKind::Message { body, details, .. } => {
+        TimelineItemKind::Message {
+            body,
+            details,
+            sent,
+            ..
+        } => {
             let mut h = lead + rich_height(&details.content, body, cpl);
             if details.reply_to.is_some() {
                 h += REPLY_H;
@@ -193,7 +203,7 @@ fn estimate_unclamped(item: &TimelineItem, continuation: bool, width: f32) -> f3
             if !details.reactions.is_empty() {
                 h += REACTIONS_H;
             }
-            if details.send_failure.is_some() {
+            if details.send_failure.is_some() || *sent != SendStatus::Sent {
                 h += FAILURE_H;
             }
             h + receipts
@@ -433,6 +443,17 @@ pub fn should_paginate(
         && top_gap_px <= viewport_h
 }
 
+/// What to do about the read receipt now (see [`TimelineView::read_step`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadStep {
+    /// Nothing.
+    Idle,
+    /// Send `MarkRead { fully_read: false }` now.
+    Send,
+    /// Too soon after the last one: ask again after this long.
+    Wait(Duration),
+}
+
 /// What the app has to do after a change of the view.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Effects {
@@ -498,8 +519,15 @@ pub struct TimelineView {
     pub anchor: Option<(String, f32)>,
     /// Back-pagination state of this room.
     pub pagination: PaginationState,
-    /// The event for which a read receipt was last sent.
+    /// The item for which a read receipt was last sent.
     pub last_marked: Option<String>,
+    /// The bottom of the timeline was in view at some point since the room
+    /// was opened, so the read marker may move when the room is left.
+    pub bottom_seen: bool,
+    /// When the last receipt was sent.
+    last_receipt_at: Option<Instant>,
+    /// A timer for a delayed receipt is running.
+    receipt_timer_armed: bool,
     /// The offset of the last scroll operation the model asked for. Tasks are
     /// opaque, so tests read it here.
     pub last_scroll_request: Option<f32>,
@@ -520,6 +548,9 @@ impl Default for TimelineView {
             anchor: None,
             pagination: PaginationState::Idle,
             last_marked: None,
+            bottom_seen: false,
+            last_receipt_at: None,
+            receipt_timer_armed: false,
             last_scroll_request: None,
             requested_at: None,
         }
@@ -556,6 +587,65 @@ impl TimelineView {
             self.viewport_h,
             OVERSCAN_PX,
         )
+    }
+
+    /// The item a read receipt should point at: the newest event from
+    /// another user that the server has. Dividers, markers, local echoes and
+    /// the user's own messages are skipped.
+    pub fn newest_receipt_target(&self) -> Option<&str> {
+        self.items
+            .iter()
+            .rev()
+            .find(|item| match &item.kind {
+                TimelineItemKind::Message { sent, is_own, .. } => {
+                    *sent == SendStatus::Sent && !*is_own
+                }
+                TimelineItemKind::Placeholder { is_own, .. } => !*is_own,
+                TimelineItemKind::State { .. } => true,
+                TimelineItemKind::DateDivider { .. }
+                | TimelineItemKind::ReadMarker
+                | TimelineItemKind::TimelineStart
+                | TimelineItemKind::Other => false,
+            })
+            .map(|item| item.id.as_str())
+    }
+
+    /// Decides about the read receipt (plan Q12): one is due when the window
+    /// has focus, the bottom is in view and the newest target differs from
+    /// the last one marked. At most one is sent per
+    /// [`RECEIPT_MIN_INTERVAL`]; a receipt that comes too early asks for a
+    /// timer once, and the caller calls [`TimelineView::read_timer_fired`]
+    /// and asks again when it ends.
+    pub fn read_step(&mut self, focused: bool, now: Instant) -> ReadStep {
+        let at_bottom = self.offset_from_bottom <= BOTTOM_EPS_PX;
+        let Some(target) = self.newest_receipt_target().map(str::to_owned) else {
+            return ReadStep::Idle;
+        };
+        if !at_bottom {
+            return ReadStep::Idle;
+        }
+        self.bottom_seen = true;
+        if !focused || self.last_marked.as_deref() == Some(target.as_str()) {
+            return ReadStep::Idle;
+        }
+        if let Some(sent) = self.last_receipt_at {
+            let waited = now.saturating_duration_since(sent);
+            if waited < RECEIPT_MIN_INTERVAL {
+                if self.receipt_timer_armed {
+                    return ReadStep::Idle;
+                }
+                self.receipt_timer_armed = true;
+                return ReadStep::Wait(RECEIPT_MIN_INTERVAL - waited);
+            }
+        }
+        self.last_marked = Some(target);
+        self.last_receipt_at = Some(now);
+        ReadStep::Send
+    }
+
+    /// The timer asked for by [`ReadStep::Wait`] ended.
+    pub fn read_timer_fired(&mut self) {
+        self.receipt_timer_armed = false;
     }
 
     /// Whether the first item is the start of the room.
@@ -1427,10 +1517,11 @@ mod tests {
         let _ = app.update(reset(many(2)));
         let sent = drain(&mut rx);
         assert_eq!(paginations(&sent), 1);
-        assert!(matches!(
-            sent.last(),
-            Some(Command::PaginateBackwards { room_id }) if *room_id == rid("a")
-        ));
+        assert!(
+            sent.iter().any(
+                |c| matches!(c, Command::PaginateBackwards { room_id } if *room_id == rid("a"))
+            )
+        );
         // Further batches in the same Idle period do not ask again.
         let _ = app.update(diff("a", vec![ListDiff::PopBack]));
         assert_eq!(paginations(&drain(&mut rx)), 0);
@@ -1661,5 +1752,128 @@ mod tests {
         let blocks = (0..5_000).map(|_| text_block(10_000)).collect();
         let item = msg_with("a", "@a:x", 0, rich(blocks));
         assert_eq!(estimate_height(&item, false, 800.0), MAX_MEASURED_PX);
+    }
+
+    // ---- read receipts (plan Q12) -------------------------------------------
+
+    fn own_msg(id: &str) -> TimelineItem {
+        let mut item = msg(id, "@me:x", 0);
+        if let TimelineItemKind::Message { is_own, .. } = &mut item.kind {
+            *is_own = true;
+        }
+        item
+    }
+
+    fn sending_msg(id: &str) -> TimelineItem {
+        let mut item = msg(id, "@them:x", 0);
+        if let TimelineItemKind::Message { sent, .. } = &mut item.kind {
+            *sent = SendStatus::Sending;
+        }
+        item
+    }
+
+    fn view_with(items: Vec<TimelineItem>) -> TimelineView {
+        let mut view = TimelineView::default();
+        let _ = view.apply_diffs(vec![ListDiff::Reset { values: items }]);
+        view
+    }
+
+    #[test]
+    fn the_newest_receipt_target_skips_dividers_echoes_and_own_messages() {
+        let view = view_with(vec![
+            msg("a", "@a:x", 0),
+            msg("b", "@b:x", 0),
+            own_msg("mine"),
+            sending_msg("echo"),
+            divider("d"),
+            plain(TimelineItemKind::ReadMarker),
+        ]);
+        assert_eq!(view.newest_receipt_target(), Some("b"));
+        assert_eq!(view_with(vec![divider("d")]).newest_receipt_target(), None);
+        assert_eq!(
+            view_with(vec![state_item("s")]).newest_receipt_target(),
+            Some("s")
+        );
+        assert_eq!(
+            view_with(vec![placeholder("p", "@a:x", 0)]).newest_receipt_target(),
+            Some("p")
+        );
+    }
+
+    #[test]
+    fn a_receipt_is_sent_once_per_new_bottom_item() {
+        let t0 = Instant::now();
+        let mut view = view_with(vec![msg("a", "@a:x", 0)]);
+        assert_eq!(view.read_step(true, t0), ReadStep::Send);
+        assert_eq!(view.last_marked.as_deref(), Some("a"));
+        // Same item again, at any later time: nothing.
+        assert_eq!(
+            view.read_step(true, t0 + Duration::from_secs(5)),
+            ReadStep::Idle
+        );
+        // A new item, after the debounce: one more.
+        let _ = view.apply_diffs(vec![ListDiff::Append {
+            values: vec![msg("b", "@a:x", 0)],
+        }]);
+        assert_eq!(
+            view.read_step(true, t0 + Duration::from_secs(5)),
+            ReadStep::Send
+        );
+        assert_eq!(view.last_marked.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn no_receipt_while_scrolled_up_or_unfocused() {
+        let t0 = Instant::now();
+        let mut view = view_with(vec![msg("a", "@a:x", 0)]);
+        let _ = view.scrolled(300.0, 600.0, 800.0);
+        assert_eq!(view.read_step(true, t0), ReadStep::Idle);
+        assert!(!view.bottom_seen);
+        let _ = view.scrolled(0.0, 600.0, 800.0);
+        assert_eq!(view.read_step(false, t0), ReadStep::Idle);
+        assert!(view.bottom_seen, "the bottom was seen even without focus");
+        // Focus returns: now it is sent.
+        assert_eq!(view.read_step(true, t0), ReadStep::Send);
+    }
+
+    #[test]
+    fn receipts_are_debounced_to_one_per_second() {
+        let t0 = Instant::now();
+        let mut view = view_with(vec![msg("a", "@a:x", 0)]);
+        assert_eq!(view.read_step(true, t0), ReadStep::Send);
+        let _ = view.apply_diffs(vec![ListDiff::Append {
+            values: vec![msg("b", "@a:x", 0)],
+        }]);
+        let at = t0 + Duration::from_millis(300);
+        assert_eq!(
+            view.read_step(true, at),
+            ReadStep::Wait(Duration::from_millis(700))
+        );
+        // The timer is already armed: no second timer, no send.
+        assert_eq!(view.read_step(true, at), ReadStep::Idle);
+        view.read_timer_fired();
+        assert_eq!(
+            view.read_step(true, t0 + Duration::from_secs(1)),
+            ReadStep::Send
+        );
+        assert_eq!(view.last_marked.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn a_new_room_starts_fresh() {
+        let t0 = Instant::now();
+        let mut view = view_with(vec![msg("a", "@a:x", 0)]);
+        assert_eq!(view.read_step(true, t0), ReadStep::Send);
+        assert!(view.bottom_seen);
+        view.reset();
+        assert!(!view.bottom_seen);
+        assert_eq!(view.last_marked, None);
+    }
+
+    #[test]
+    fn a_local_echo_estimate_has_room_for_its_status_line() {
+        let sent = estimate_height(&msg("a", "@a:x", 0), false, 800.0);
+        let sending = estimate_height(&sending_msg("a"), false, 800.0);
+        assert!(sending > sent);
     }
 }
