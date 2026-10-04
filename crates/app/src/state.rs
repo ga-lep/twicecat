@@ -1183,20 +1183,14 @@ impl App {
     /// anything itself: opening is a `Task`.
     fn link_clicked(&mut self, target: LinkTarget) -> Task<Message> {
         match target {
-            LinkTarget::Url { url, confirm } => match links::check_link_url(&url) {
-                Err(_) => {
-                    self.link_bar = Some(LinkBar::Refused);
-                    Task::none()
-                }
-                Ok(checked) if confirm => {
-                    self.link_bar = Some(LinkBar::Confirm(checked));
-                    Task::none()
-                }
-                Ok(checked) => {
-                    self.link_bar = None;
-                    open_link_task(checked)
-                }
-            },
+            // Every link asks first; opening happens on `LinkConfirmed`.
+            LinkTarget::Url(url) => {
+                self.link_bar = Some(match links::check_link_url(&url) {
+                    Ok(checked) => LinkBar::Confirm(checked),
+                    Err(_) => LinkBar::Refused,
+                });
+                Task::none()
+            }
             LinkTarget::Room(room) => {
                 let id = RoomId::from(room);
                 if room_list::contains(&self.rooms, &id) {
@@ -2317,39 +2311,53 @@ mod tests {
         }
     }
 
-    fn clicked(url: &str, confirm: bool) -> Message {
-        Message::LinkClicked(LinkTarget::Url {
-            url: url.to_owned(),
-            confirm,
-        })
+    fn clicked(url: &str) -> Message {
+        Message::LinkClicked(LinkTarget::Url(url.to_owned()))
     }
 
     #[test]
-    fn a_plain_link_opens_in_a_task() {
-        let (mut app, mut rx) = main_app();
-        let task = app.update(clicked("https://example.org/a", false));
-        assert!(task.units() > 0, "the opener runs in a task");
-        assert!(app.link_bar.is_none());
-        assert!(rx.try_recv().is_err());
+    fn every_url_click_asks_first_and_opens_nothing_until_confirmed() {
+        // Labels do not matter to the app: plain-word, matching,
+        // mismatching, spoiler-wrapped and split-anchor links all reach
+        // `update` as the same click (see the `rich_text` tests).
+        for url in [
+            "https://example.org/a",
+            "http://example.org/",
+            "https://Evil.example:8443/path?token=1",
+            "mailto:alice@example.org",
+        ] {
+            let (mut app, mut rx) = main_app();
+            let task = app.update(clicked(url));
+            assert_eq!(task.units(), 0, "nothing opens before the answer: {url}");
+            let Some(LinkBar::Confirm(checked)) = &app.link_bar else {
+                panic!("expected a confirmation, got {:?}", app.link_bar);
+            };
+            assert!(!checked.host().is_empty());
+            assert!(rx.try_recv().is_err());
+            assert!(app.update(Message::LinkConfirmed).units() > 0, "{url}");
+            assert!(app.link_bar.is_none());
+        }
     }
 
     #[test]
-    fn a_mismatched_link_asks_first_and_shows_only_the_host() {
+    fn the_confirmation_names_the_host_or_mail_domain() {
         let (mut app, _rx) = main_app();
-        let task = app.update(clicked("https://Evil.example:8443/path?token=1", true));
-        assert_eq!(task.units(), 0, "nothing opens before the answer");
+        let _ = app.update(clicked("https://Evil.example:8443/path?token=1"));
         let Some(LinkBar::Confirm(url)) = &app.link_bar else {
-            panic!("expected a confirmation, got {:?}", app.link_bar);
+            panic!("expected a confirmation");
         };
         assert_eq!(url.host(), "evil.example");
-        assert!(app.update(Message::LinkConfirmed).units() > 0);
-        assert!(app.link_bar.is_none());
+        let _ = app.update(clicked("mailto:alice@Mail.example"));
+        let Some(LinkBar::Confirm(url)) = &app.link_bar else {
+            panic!("expected a confirmation");
+        };
+        assert_eq!(url.host(), "mail.example");
     }
 
     #[test]
     fn dismissing_the_bar_opens_nothing() {
         let (mut app, _rx) = main_app();
-        let _ = app.update(clicked("https://evil.example/", true));
+        let _ = app.update(clicked("https://evil.example/"));
         assert_eq!(app.update(Message::LinkDismissed).units(), 0);
         assert!(app.link_bar.is_none());
         // Confirming with no bar does nothing either.
@@ -2367,12 +2375,11 @@ mod tests {
             "https://exa mple.org/",
             "https://exämple.org/",
         ] {
-            for confirm in [false, true] {
-                let task = app.update(clicked(url, confirm));
-                assert_eq!(task.units(), 0, "{url}");
-                assert_eq!(app.link_bar, Some(LinkBar::Refused), "{url}");
-                let _ = app.update(Message::LinkDismissed);
-            }
+            let task = app.update(clicked(url));
+            assert_eq!(task.units(), 0, "{url}");
+            assert_eq!(app.link_bar, Some(LinkBar::Refused), "{url}");
+            assert_eq!(app.update(Message::LinkConfirmed).units(), 0, "{url}");
+            let _ = app.update(Message::LinkDismissed);
         }
     }
 
@@ -2445,7 +2452,7 @@ mod tests {
             item: "i".into(),
             index: 0,
         }));
-        let _ = app.update(clicked("https://evil.example/", true));
+        let _ = app.update(clicked("https://evil.example/"));
         let _ = app.update(Message::SelectRoom(RoomId::from("!b:x")));
         assert!(app.revealed.is_empty());
         assert!(app.link_bar.is_none());
@@ -2454,7 +2461,7 @@ mod tests {
     #[test]
     fn links_never_reach_debug_output() {
         let (mut app, _rx) = main_app();
-        let message = clicked("https://sentinel-host.example/sentinel-path", true);
+        let message = clicked("https://sentinel-host.example/sentinel-path");
         assert!(!format!("{message:?}").contains("sentinel"));
         let _ = app.update(message);
         let dbg = format!("{app:?} {:?}", app.link_bar);

@@ -19,7 +19,6 @@ use iced::widget::{Column, container, rich_text, row, rule, text};
 use iced::{Background, Border, Color, Element, Fill, Font, Length, Pixels, Shrink, Theme};
 use tessera_core::api::{Block, Inline, MentionTarget, RichText, TextStyle, UserId};
 
-use crate::links::needs_confirmation;
 use crate::state::Message;
 use crate::text_safety::{
     ELLIPSIS, MAX_BODY_CHARS, MAX_NAME_CHARS, multi_line_capped, name_or_placeholder,
@@ -45,12 +44,10 @@ pub const MAX_DEPTH: usize = 32;
 #[derive(Clone, PartialEq, Eq)]
 pub enum LinkTarget {
     /// A web or mail link.
-    Url {
-        /// The target, still to be checked by `check_link_url`.
-        url: String,
-        /// The visible text names another host than the target.
-        confirm: bool,
-    },
+    ///
+    /// The target is still to be checked by `check_link_url`; every click
+    /// asks the user first, whatever the visible text says.
+    Url(String),
     /// A user pill.
     User(UserId),
     /// A room pill: an ID or an alias.
@@ -68,7 +65,7 @@ pub enum LinkTarget {
 impl fmt::Debug for LinkTarget {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::Url { .. } => "LinkTarget::Url(<redacted>)",
+            Self::Url(_) => "LinkTarget::Url(<redacted>)",
             Self::User(_) => "LinkTarget::User(<redacted>)",
             Self::Room(_) => "LinkTarget::Room(<redacted>)",
             Self::Spoiler { .. } => "LinkTarget::Spoiler",
@@ -200,7 +197,7 @@ pub fn spans_for(inlines: &[Inline], ctx: &Ctx<'_>, walk: &mut Walk) -> Vec<Span
 }
 
 fn push_spans(inlines: &[Inline], ctx: &Ctx<'_>, walk: &mut Walk, out: &mut Vec<SpanModel>) {
-    for (index, inline) in inlines.iter().enumerate() {
+    for inline in inlines {
         match inline {
             Inline::Text { text, style } => {
                 let text = walk.take(text);
@@ -214,25 +211,13 @@ fn push_spans(inlines: &[Inline], ctx: &Ctx<'_>, walk: &mut Walk, out: &mut Vec<
                 }
             }
             Inline::Link { text, url, style } => {
-                // Judge the text the user will see, not the raw one.
-                let shown = walk.take(text);
-                if !shown.is_empty() {
-                    // The budget may cut the label (`bank.example` + more):
-                    // judge the whole text as well as what is shown.
-                    // The text it sits in counts too: `bank.` + `example`.
-                    let token = visible_token(inlines, index, text);
-                    let confirm = needs_confirmation(&shown, url)
-                        || needs_confirmation(text, url)
-                        || needs_confirmation(&token, url);
-                    let text = shown;
+                let text = walk.take(text);
+                if !text.is_empty() {
                     out.push(SpanModel {
                         text,
                         style: *style,
                         look: Look::Link,
-                        link: Some(LinkTarget::Url {
-                            url: url.clone(),
-                            confirm,
-                        }),
+                        link: Some(LinkTarget::Url(url.clone())),
                     });
                 }
             }
@@ -294,45 +279,6 @@ fn push_spans(inlines: &[Inline], ctx: &Ctx<'_>, walk: &mut Walk, out: &mut Vec<
             }
         }
     }
-}
-
-/// Longest neighbour text joined to a link label, in characters.
-const TOKEN_REACH: usize = 256;
-
-/// The raw text of the link at `inlines[index]` joined with the
-/// non-whitespace text directly before and after it in its neighbours (text
-/// and link labels, at most [`TOKEN_REACH`] characters each side).
-fn visible_token(inlines: &[Inline], index: usize, label: &str) -> String {
-    let raw = |inline: &Inline| match inline {
-        Inline::Text { text, .. } | Inline::Link { text, .. } => Some(text.clone()),
-        Inline::LineBreak => Some("\n".to_owned()),
-        _ => None,
-    };
-    let mut before: Vec<char> = Vec::new();
-    'back: for inline in inlines[..index].iter().rev() {
-        let Some(text) = raw(inline) else { break };
-        for c in text.chars().rev() {
-            if c.is_whitespace() || before.len() >= TOKEN_REACH {
-                break 'back;
-            }
-            before.push(c);
-        }
-    }
-    before.reverse();
-    let mut token: String = before.into_iter().collect();
-    token.push_str(label);
-    let mut taken = 0;
-    'forward: for inline in &inlines[index + 1..] {
-        let Some(text) = raw(inline) else { break };
-        for c in text.chars() {
-            if c.is_whitespace() || taken >= TOKEN_REACH {
-                break 'forward;
-            }
-            token.push(c);
-            taken += 1;
-        }
-    }
-    token
 }
 
 /// The font for a style: bold and italic combine, code is monospace.
@@ -612,50 +558,8 @@ mod tests {
         assert_eq!(out[0].look, Look::Link);
         assert_eq!(
             out[0].link,
-            Some(LinkTarget::Url {
-                url: "https://example.org/".into(),
-                confirm: false
-            })
+            Some(LinkTarget::Url("https://example.org/".into()))
         );
-    }
-
-    #[test]
-    fn a_link_whose_text_names_another_host_asks_first() {
-        let out = spans(&[Inline::Link {
-            text: "bank.example".into(),
-            url: "https://evil.example/".into(),
-            style: TextStyle::default(),
-        }]);
-        assert!(matches!(
-            out[0].link,
-            Some(LinkTarget::Url { confirm: true, .. })
-        ));
-    }
-
-    #[test]
-    fn a_label_cut_by_the_budget_is_judged_whole() {
-        let mut walk = Walk {
-            chars_left: 4,
-            ..Walk::default()
-        };
-        let out = spans_for(
-            &[Inline::Link {
-                text: "evil.example".into(),
-                url: "https://bank.example/".into(),
-                style: TextStyle::default(),
-            }],
-            &ctx(&Revealed::new(), None),
-            &mut walk,
-        );
-        assert!(
-            !out[0].text.contains('.'),
-            "cut before the dot: {:?}",
-            out[0].text
-        );
-        assert!(matches!(
-            out[0].link,
-            Some(LinkTarget::Url { confirm: true, .. })
-        ));
     }
 
     #[test]
@@ -895,10 +799,7 @@ mod tests {
     #[test]
     fn link_targets_never_print_their_content() {
         let targets = [
-            LinkTarget::Url {
-                url: "https://sentinel.example/".into(),
-                confirm: true,
-            },
+            LinkTarget::Url("https://sentinel.example/".into()),
             LinkTarget::User(UserId::from("@sentinel:x")),
             LinkTarget::Room("#sentinel:x".into()),
             LinkTarget::Spoiler {
@@ -983,37 +884,65 @@ mod tests {
         }
     }
 
-    fn asks(out: &[SpanModel]) -> bool {
+    /// The URLs of the link spans, in order.
+    fn urls(out: &[SpanModel]) -> Vec<&str> {
         out.iter()
-            .any(|s| matches!(s.link, Some(LinkTarget::Url { confirm: true, .. })))
+            .filter_map(|s| match &s.link {
+                Some(LinkTarget::Url(url)) => Some(url.as_str()),
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]
-    fn the_first_half_of_a_split_address_asks() {
+    fn every_link_span_carries_its_url_whatever_the_label() {
         let evil = "https://evil.example/";
-        assert!(asks(&spans(&[link("bank.", evil), plain("example")])));
-        assert!(asks(&spans(&[link("bank", evil), plain(".example")])));
-        assert!(asks(&spans(&[
-            plain("see bank"),
-            link(".", evil),
-            plain("example")
-        ])));
-        assert!(asks(&spans(&[
-            plain("go "),
-            link("bank", evil),
-            link(".example", evil)
-        ])));
+        // Plain word, matching, mismatching and cut labels, and split anchors.
+        for label in ["click here", "evil.example", "bank.example", ""] {
+            let out = spans(&[link(label, evil)]);
+            assert_eq!(
+                urls(&out),
+                if label.is_empty() { vec![] } else { vec![evil] }
+            );
+        }
+        assert_eq!(
+            urls(&spans(&[link("bank.", evil), plain("example")])),
+            [evil]
+        );
+        assert_eq!(
+            urls(&spans(&[
+                plain("go "),
+                link("bank", evil),
+                link(".example", evil)
+            ])),
+            [evil, evil]
+        );
     }
 
     #[test]
-    fn a_link_beside_ordinary_text_does_not_ask() {
-        let url = "https://example.org/";
-        assert!(!asks(&spans(&[
-            plain("see "),
-            link("docs", url),
-            plain(" now")
-        ])));
-        assert!(!asks(&spans(&[plain("("), link("docs", url), plain(").")])));
-        assert!(!asks(&spans(&[link("bank.", url), plain(" next")])));
+    fn a_link_inside_a_revealed_spoiler_keeps_its_url() {
+        let evil = "https://evil.example/";
+        let mut revealed = Revealed::new();
+        revealed.insert(("item1".to_owned(), 0));
+        let out = spans_for(
+            &[Inline::Spoiler(vec![plain("x "), link("here", evil)])],
+            &ctx(&revealed, None),
+            &mut Walk::default(),
+        );
+        assert_eq!(urls(&out), [evil]);
+    }
+
+    #[test]
+    fn a_label_cut_by_the_budget_still_carries_its_url() {
+        let mut walk = Walk {
+            chars_left: 4,
+            ..Walk::default()
+        };
+        let out = spans_for(
+            &[link("evil.example", "https://bank.example/")],
+            &ctx(&Revealed::new(), None),
+            &mut walk,
+        );
+        assert_eq!(urls(&out), ["https://bank.example/"]);
     }
 }
