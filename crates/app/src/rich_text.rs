@@ -215,9 +215,12 @@ fn push_spans(inlines: &[Inline], ctx: &Ctx<'_>, walk: &mut Walk, out: &mut Vec<
             }
             Inline::Link { text, url, style } => {
                 // Judge the text the user will see, not the raw one.
-                let text = walk.take(text);
-                if !text.is_empty() {
-                    let confirm = needs_confirmation(&text, url);
+                let shown = walk.take(text);
+                if !shown.is_empty() {
+                    // The budget may cut the label (`bank.example` + more):
+                    // judge the whole text as well as what is shown.
+                    let confirm = needs_confirmation(&shown, url) || needs_confirmation(text, url);
+                    let text = shown;
                     out.push(SpanModel {
                         text,
                         style: *style,
@@ -580,6 +583,32 @@ mod tests {
             url: "https://evil.example/".into(),
             style: TextStyle::default(),
         }]);
+        assert!(matches!(
+            out[0].link,
+            Some(LinkTarget::Url { confirm: true, .. })
+        ));
+    }
+
+    #[test]
+    fn a_label_cut_by_the_budget_is_judged_whole() {
+        let mut walk = Walk {
+            chars_left: 4,
+            ..Walk::default()
+        };
+        let out = spans_for(
+            &[Inline::Link {
+                text: "evil.example".into(),
+                url: "https://bank.example/".into(),
+                style: TextStyle::default(),
+            }],
+            &ctx(&Revealed::new(), None),
+            &mut walk,
+        );
+        assert!(
+            !out[0].text.contains('.'),
+            "cut before the dot: {:?}",
+            out[0].text
+        );
         assert!(matches!(
             out[0].link,
             Some(LinkTarget::Url { confirm: true, .. })

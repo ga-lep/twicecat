@@ -111,16 +111,51 @@ fn is_dns_label_like(label: &str) -> bool {
 
 /// Whether a link whose visible text is `text` and whose target is `url`
 /// needs the user's confirmation: the text looks like a web address with a
-/// different host than the target. Plain words, `mailto` targets and equal
-/// hosts never need it.
+/// different host than the target, or like a piece of one (a split anchor
+/// such as `bank<a href=..>.example</a>`) that names no host at all. Plain
+/// words, `mailto` targets and equal hosts never need it.
+///
+/// Look-alike dots (U+3002, U+FF0E, U+FF61) read as `.` and trailing
+/// `.,;:!?)` is ignored. A caller that shortens the text for display should
+/// also ask about the whole text and combine the answers with "or".
 pub fn needs_confirmation(text: &str, url: &str) -> bool {
     let Some(target) = web_host(url, true) else {
         return false;
     };
-    match web_host(text.trim(), false) {
+    let shown = normalize_text(text);
+    match web_host(&shown, false) {
         Some(shown) => shown != target,
-        None => false,
+        None => is_address_fragment(&shown),
     }
+}
+
+/// `text` trimmed, with look-alike dots turned into `.` and without
+/// trailing sentence punctuation.
+fn normalize_text(text: &str) -> String {
+    let dotted: String = text
+        .trim()
+        .chars()
+        .map(|c| match c {
+            '\u{3002}' | '\u{FF0E}' | '\u{FF61}' => '.',
+            c => c,
+        })
+        .collect();
+    dotted
+        .trim_end_matches(['.', ',', ';', ':', '!', '?', ')'])
+        .to_owned()
+}
+
+/// Text without whitespace that has a dot, a slash or a scheme but no
+/// parsable host: the rest of an address cut in two. Version numbers
+/// (`v1.2.3`) are not addresses.
+fn is_address_fragment(text: &str) -> bool {
+    if text.is_empty() || text.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let digits = text.strip_prefix(['v', 'V']).unwrap_or(text);
+    let version_like =
+        !digits.starts_with('.') && digits.chars().all(|c| c.is_ascii_digit() || c == '.');
+    !version_like && text.contains(['.', '/', ':'])
 }
 
 /// The comparable host of something that looks like a web address.
@@ -130,7 +165,8 @@ pub fn needs_confirmation(text: &str, url: &str) -> bool {
 /// is read as the address it pretends to be. Text with whitespace never
 /// does. The host is lower case, without userinfo, port and a leading
 /// `www.`; non-ASCII hosts are kept as they are, so they never equal an
-/// ASCII target.
+/// ASCII target. `text` is normalised by [`normalize_text`] first when it
+/// is visible text; a trailing dot of a host is dropped on both sides.
 fn web_host(text: &str, scheme_required: bool) -> Option<String> {
     if text.is_empty() || text.chars().any(char::is_whitespace) {
         return None;
@@ -156,7 +192,8 @@ fn web_host(text: &str, scheme_required: bool) -> Option<String> {
         authority.split(':').next().unwrap_or_default()
     };
     let host = host.to_lowercase();
-    let host = host.strip_prefix("www.").unwrap_or(&host);
+    let host = host.trim_end_matches('.');
+    let host = host.strip_prefix("www.").unwrap_or(host);
     if host.is_empty() {
         return None;
     }
@@ -368,5 +405,56 @@ mod tests {
         ));
         // An unparsable target is refused at click time, not here.
         assert!(!needs_confirmation("bank.example", "javascript:x"));
+    }
+
+    #[test]
+    fn a_split_anchor_fragment_asks() {
+        // `bank<a href="https://evil.example/">.example</a>`: the link text
+        // is only the second half.
+        assert!(needs_confirmation(".example", "https://evil.example/"));
+        assert!(needs_confirmation("/login", "https://evil.example/"));
+        assert!(needs_confirmation("https://", "https://evil.example/"));
+        assert!(needs_confirmation("ftp://bank", "https://evil.example/"));
+    }
+
+    #[test]
+    fn look_alike_dots_count_as_dots() {
+        for dot in ['\u{3002}', '\u{FF0E}', '\u{FF61}'] {
+            let shown = format!("bank{dot}example");
+            assert!(needs_confirmation(&shown, "https://evil.example/"), "{dot}");
+            assert!(
+                !needs_confirmation(&shown, "https://bank.example/"),
+                "{dot}"
+            );
+            let fragment = format!("{dot}example");
+            assert!(needs_confirmation(&fragment, "https://evil.example/"));
+        }
+    }
+
+    #[test]
+    fn trailing_punctuation_does_not_hide_the_host() {
+        for tail in [".", ",", ";", ":", "!", "?", ")", ").", "\u{3002}"] {
+            let shown = format!("bank.example{tail}");
+            assert!(
+                needs_confirmation(&shown, "https://evil.example/"),
+                "{tail}"
+            );
+            assert!(
+                !needs_confirmation(&shown, "https://bank.example/"),
+                "{tail}"
+            );
+        }
+        assert!(needs_confirmation(
+            "(https://bank.example/x).",
+            "https://evil.example/"
+        ));
+    }
+
+    #[test]
+    fn plain_words_and_versions_still_do_not_ask() {
+        assert!(!needs_confirmation("click here", "https://evil.example/"));
+        assert!(!needs_confirmation("here", "https://evil.example/"));
+        assert!(!needs_confirmation("v1.2.3", "https://evil.example/"));
+        assert!(!needs_confirmation("3.14", "https://evil.example/"));
     }
 }
