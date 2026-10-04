@@ -9,8 +9,8 @@
 use std::time::{Duration, Instant};
 
 use tessera_audio::{
-    CaptureChain, ChainSettings, DeepFilter, FRAME_LEN, Frame, GateMode, LEVEL_FLOOR_DB, NoiseMode,
-    default_model_dir, flush_denormals_on_this_thread,
+    CaptureChain, ChainSettings, DeepFilter, DeepFilterModel, FRAME_LEN, Frame, GateMode,
+    LEVEL_FLOOR_DB, NoiseMode, default_model_dir, flush_denormals_on_this_thread,
 };
 
 fn load() -> DeepFilter {
@@ -225,4 +225,24 @@ fn plugged_into_the_chain_it_replaces_rnnoise() {
     eprintln!("chain: RNNoise standing in {rn:.1} dB, DeepFilterNet3 plugged in {df:.1} dB");
     assert!((rn - 15.0).abs() < 5.0, "RNNoise fallback {rn:.1} dB");
     assert!(df > rn + 10.0, "DeepFilterNet3 {df:.1} dB");
+}
+
+#[test]
+#[ignore = "needs scripts/fetch-models.sh"]
+fn filters_from_one_model_keep_their_own_state() {
+    let dir = default_model_dir().expect("a model directory");
+    let model = DeepFilterModel::load(&dir).expect("run scripts/fetch-models.sh");
+    let (mut a, mut b) = (model.filter(100.0).unwrap(), model.filter(100.0).unwrap());
+    let mut alone = DeepFilter::load(&dir, 100.0).unwrap();
+    let (mut x, mut y) = (Noise(1), Noise(7));
+    for _ in 0..100 {
+        let mut fa: Frame = std::array::from_fn(|_| 0.1 * x.next());
+        let mut fb: Frame = std::array::from_fn(|_| 0.3 * y.next());
+        let mut fc = fa;
+        a.process(&mut fa).unwrap();
+        b.process(&mut fb).unwrap();
+        alone.process(&mut fc).unwrap();
+        // `b` running in between changes nothing in `a`.
+        assert_eq!(fa, fc);
+    }
 }

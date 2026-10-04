@@ -126,6 +126,71 @@ pub struct Participant {
     pub speaking: bool,
     /// Local playback volume for this user, percent (100 = unchanged).
     pub volume_percent: u16,
+    /// Whether this device cleans their voice ([`AudioSettings::remote_cleaning`]).
+    pub cleaning: CleaningStatus,
+}
+
+/// Whether this device cleans a participant's voice with DeepFilterNet3.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CleaningStatus {
+    /// Not cleaned: cleaning other voices is off, or this is you.
+    #[default]
+    Off,
+    /// Getting ready (the model loads once per call).
+    Starting,
+    /// Cleaned here, about 30 ms later than it would play otherwise.
+    Cleaned,
+    /// Not cleaned, and why.
+    Skipped(SkipReason),
+}
+
+/// Why a voice is not cleaned while cleaning is on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SkipReason {
+    /// Your per-person setting says never ([`VoiceCleaning::Never`]).
+    Never,
+    /// This device already cleans as many voices as it can
+    /// ([`limits::CLEANED_VOICES`]); voices set to always come first, then
+    /// the earliest to join.
+    Limit,
+    /// DeepFilterNet's model is not installed, or the filter failed.
+    Unavailable,
+}
+
+/// Cleaning other people's voices: DeepFilterNet3 on this device, on each
+/// voice before it is mixed (off by default). Costs CPU per voice and about
+/// 30 ms of delay on each cleaned voice; music or game sound someone shares
+/// through their microphone is treated as noise.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RemoteCleaning {
+    /// Clean the voices you hear.
+    pub enabled: bool,
+    /// Most attenuation applied, dB (0..=100, as
+    /// `NoiseSuppression::DeepFilter`).
+    pub attenuation_limit_db: f32,
+}
+
+impl Default for RemoteCleaning {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            attenuation_limit_db: 100.0,
+        }
+    }
+}
+
+/// Per-person choice for [`RemoteCleaning`], kept across calls.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceCleaning {
+    /// As the global switch says (the default; not stored).
+    #[default]
+    Automatic,
+    /// Clean this person's voice whenever cleaning is on, before others.
+    Always,
+    /// Never clean this person's voice.
+    Never,
 }
 
 /// An input or output device.
@@ -335,6 +400,10 @@ pub struct AudioSettings {
     pub voice_bitrate_kbps: u16,
     /// Per-user playback volume, percent (0..=200), kept across calls.
     pub user_volumes: BTreeMap<UserId, u16>,
+    /// Cleaning other people's voices on this device.
+    pub remote_cleaning: RemoteCleaning,
+    /// Per-user cleaning choice, kept across calls (absent: automatic).
+    pub user_cleaning: BTreeMap<UserId, VoiceCleaning>,
 }
 
 impl Default for AudioSettings {
@@ -353,6 +422,8 @@ impl Default for AudioSettings {
             // Opus voice is near-transparent here; Discord's default is 64.
             voice_bitrate_kbps: 64,
             user_volumes: BTreeMap::new(),
+            remote_cleaning: RemoteCleaning::default(),
+            user_cleaning: BTreeMap::new(),
         }
     }
 }
@@ -373,6 +444,10 @@ pub mod limits {
     pub const DF_ATTENUATION_DB: (f32, f32) = (0.0, 100.0);
     /// Length of a push-to-talk binding string, bytes.
     pub const PTT_BINDING_LEN: usize = 64;
+    /// Remote voices cleaned at once on the CPU (`RemoteCleaning`): each
+    /// costs about 0.3 ms per 10 ms frame on a desktop performance core and
+    /// 0.55 ms on an efficiency core, on the audio thread (Task 16).
+    pub const CLEANED_VOICES: usize = 4;
 }
 
 /// Clamps `v` into `range`; NaN becomes `fallback`.
@@ -408,6 +483,13 @@ impl AudioSettings {
         }
         // 100 % is the default; storing it would only grow the file.
         self.user_volumes.retain(|_, v| *v != 100);
+        self.remote_cleaning.attenuation_limit_db = clamp_f32(
+            self.remote_cleaning.attenuation_limit_db,
+            limits::DF_ATTENUATION_DB,
+            100.0,
+        );
+        self.user_cleaning
+            .retain(|_, c| *c != VoiceCleaning::Automatic);
         match &mut self.input_mode {
             InputMode::VoiceActivity { threshold_db, .. } => {
                 *threshold_db = clamp_f32(*threshold_db, limits::VAD_THRESHOLD_DB, -50.0);
@@ -443,6 +525,11 @@ impl AudioSettings {
     /// Playback volume for `user`, percent.
     pub fn user_volume(&self, user: &UserId) -> u16 {
         self.user_volumes.get(user).copied().unwrap_or(100)
+    }
+
+    /// The cleaning choice for one user.
+    pub fn user_cleaning(&self, user: &UserId) -> VoiceCleaning {
+        self.user_cleaning.get(user).copied().unwrap_or_default()
     }
 }
 
@@ -499,11 +586,19 @@ mod tests {
         let mut user_volumes = BTreeMap::new();
         user_volumes.insert(UserId::from("@loud:x"), 900);
         user_volumes.insert(UserId::from("@same:x"), 100);
+        let mut user_cleaning = BTreeMap::new();
+        user_cleaning.insert(UserId::from("@noisy:x"), VoiceCleaning::Always);
+        user_cleaning.insert(UserId::from("@plain:x"), VoiceCleaning::Automatic);
         let s = AudioSettings {
             input_gain_db: -99.0,
             output_volume_percent: 500,
             voice_bitrate_kbps: 2,
             user_volumes,
+            user_cleaning,
+            remote_cleaning: RemoteCleaning {
+                enabled: true,
+                attenuation_limit_db: f32::NAN,
+            },
             input_mode: InputMode::PushToTalk {
                 release_delay_ms: 60_000,
             },
@@ -523,6 +618,16 @@ mod tests {
         assert_eq!(s.user_volume(&UserId::from("@loud:x")), 200);
         assert!(!s.user_volumes.contains_key(&UserId::from("@same:x")));
         assert_eq!(s.user_volume(&UserId::from("@same:x")), 100);
+        assert_eq!(s.remote_cleaning.attenuation_limit_db, 100.0);
+        assert_eq!(
+            s.user_cleaning(&UserId::from("@noisy:x")),
+            VoiceCleaning::Always
+        );
+        assert_eq!(
+            s.user_cleaning.len(),
+            1,
+            "automatic is the default, not stored"
+        );
         assert_eq!(
             s.input_mode,
             InputMode::PushToTalk {
@@ -625,6 +730,8 @@ mod tests {
                 "output_volume_percent": 100,
                 "voice_bitrate_kbps": 64,
                 "user_volumes": {},
+                "remote_cleaning": { "enabled": false, "attenuation_limit_db": 100.0 },
+                "user_cleaning": {},
             })
         );
     }
@@ -636,5 +743,13 @@ mod tests {
         assert!(!s.processing.auto_gain);
         assert!(s.processing.echo_cancellation);
         assert_eq!(s.voice_bitrate_kbps, 64);
+        assert_eq!(s.remote_cleaning, RemoteCleaning::default());
+        let s: AudioSettings = serde_json::from_str(
+            r#"{ "remote_cleaning": { "enabled": true }, "user_cleaning": { "@a:x": "never" } }"#,
+        )
+        .unwrap();
+        assert!(s.remote_cleaning.enabled);
+        assert_eq!(s.remote_cleaning.attenuation_limit_db, 100.0);
+        assert_eq!(s.user_cleaning(&UserId::from("@a:x")), VoiceCleaning::Never);
     }
 }

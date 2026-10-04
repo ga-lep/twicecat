@@ -7,15 +7,17 @@
 //!
 //! `cargo run --release -p tessera-audio --example voice_profile -- [name]
 //! [frames]` (no name: every configuration). DeepFilterNet rows need
-//! `scripts/fetch-models.sh`.
+//! `scripts/fetch-models.sh`. On a hybrid CPU, run it on an efficiency core
+//! too (`taskset -c <cpu>`): the processing thread often runs there.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tessera_audio::{
-    CaptureChain, ChainSettings, DeepFilter, FRAME_LEN, Frame, FrameProcessor, GateMode, NoiseMode,
-    NsLevel, SILENCE, VoiceEngine, default_model_dir, flush_denormals_on_this_thread,
+    CaptureChain, ChainSettings, DeepFilter, DeepFilterModel, FRAME_LEN, Frame, FrameProcessor,
+    GateMode, NoiseMode, NsLevel, SILENCE, VoiceEngine, default_model_dir,
+    flush_denormals_on_this_thread,
 };
 
 /// Counts heap allocations (and reallocations), process-wide; the harness
@@ -257,12 +259,35 @@ fn chain(name: &str, s: ChainSettings, mic: &[f32], far: &[f32], frames: usize) 
     result.print(name);
 }
 
-/// The whole engine: commands, the mix of `sources` remote voices, the
-/// chain on the microphone, the outgoing ring.
-fn engine(name: &str, s: ChainSettings, sources: usize, mic: &[f32], frames: usize) {
+/// The whole engine: commands, the mix of `sources` remote voices (the
+/// first `cleaned` of them cleaned by DeepFilterNet3, Task 16), the chain on
+/// the microphone, the outgoing ring.
+fn engine(
+    name: &str,
+    s: ChainSettings,
+    (sources, cleaned): (usize, usize),
+    mic: &[f32],
+    frames: usize,
+) {
+    let model = if cleaned > 0 {
+        let Some(model) = default_model_dir().and_then(|d| DeepFilterModel::load(&d).ok()) else {
+            println!("{name:<34} (no DeepFilterNet model)");
+            return;
+        };
+        Some(model)
+    } else {
+        None
+    };
     let (mut engine, mut control, mut outgoing) = VoiceEngine::new(s);
     let mut inputs: Vec<_> = (0..sources)
-        .map(|_| control.add_source(100).expect("a source").1)
+        .map(|k| {
+            let (id, input) = control.add_source(100).expect("a source");
+            if let Some(model) = model.as_ref().filter(|_| k < cleaned) {
+                let filter = model.filter(100.0).expect("a filter");
+                control.set_source_cleaner(id, Some(Box::new(filter)));
+            }
+            input
+        })
         .collect();
     let remote: Vec<Vec<f32>> = (0..sources)
         .map(|k| {
@@ -381,10 +406,14 @@ fn main() {
         onnx_cpu_network("network: ONNX Runtime CPU", frames);
     }
     let default = settings(true, true, true, NoiseMode::RnNoise);
-    for sources in [0, 4, 16] {
-        let name = format!("engine: default, {sources} voices mixed");
+    for (sources, cleaned) in [(0, 0), (4, 0), (16, 0), (4, 1), (4, 4), (8, 8)] {
+        let name = if cleaned == 0 {
+            format!("engine: default, {sources} voices mixed")
+        } else {
+            format!("engine: default, {sources} voices, {cleaned} cleaned")
+        };
         if only.as_deref().is_none_or(|o| name.contains(o)) {
-            engine(&name, default, sources, &mic, frames);
+            engine(&name, default, (sources, cleaned), &mic, frames);
         }
     }
 }

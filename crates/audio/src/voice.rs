@@ -22,8 +22,9 @@ const SOURCE_MAX_QUEUED: usize = 4800;
 pub const OUTGOING_RING_LEN: usize = 9600;
 /// Commands waiting for the processing thread.
 const CONTROL_QUEUE_LEN: usize = 64;
-/// Enhancers waiting to be dropped by the control side.
-const RETIRED_LEN: usize = 4;
+/// Enhancers waiting to be dropped by the control side (the outgoing one
+/// and the remote voices' cleaners).
+const RETIRED_LEN: usize = 32;
 
 /// Identifies a remote source (the core maps it to a participant).
 pub type SourceId = u64;
@@ -63,6 +64,7 @@ pub struct SourceInput {
     ring: rtrb::Producer<f32>,
     level: Arc<AtomicF32>,
     dropped: Arc<AtomicU64>,
+    cleaned: Arc<AtomicBool>,
 }
 
 impl SourceInput {
@@ -84,6 +86,29 @@ impl SourceInput {
     /// Samples dropped because the source was too far ahead.
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
+    }
+
+    /// A cleaner runs on this voice (set with
+    /// [`VoiceControl::set_source_cleaner`]; false again if it failed).
+    pub fn cleaned(&self) -> bool {
+        self.cleaned.load(Ordering::Relaxed)
+    }
+
+    /// [`cleaned`](Self::cleaned), readable by whoever manages the cleaners.
+    pub fn cleaned_flag(&self) -> CleanedFlag {
+        CleanedFlag(self.cleaned.clone())
+    }
+}
+
+/// Whether a cleaner runs on one remote voice; see
+/// [`SourceInput::cleaned_flag`].
+#[derive(Clone, Debug)]
+pub struct CleanedFlag(Arc<AtomicBool>);
+
+impl CleanedFlag {
+    /// A cleaner runs (false before one is set and after one failed).
+    pub fn get(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
     }
 }
 
@@ -117,6 +142,8 @@ enum Command {
     Enhancer(Option<Box<dyn crate::chain::Enhancer>>),
     EnhancerAttenuation(f32),
     SourceVolume(SourceId, u16),
+    SourceCleaner(SourceId, Option<Box<dyn crate::chain::Enhancer>>),
+    CleanerAttenuation(f32),
     RemoveSource(SourceId),
 }
 
@@ -126,6 +153,9 @@ struct Source {
     gain: f32,
     level: Arc<AtomicF32>,
     dropped: Arc<AtomicU64>,
+    /// Cleans this voice before it is mixed (DeepFilterNet3, Task 16).
+    cleaner: Option<Box<dyn crate::chain::Enhancer>>,
+    cleaned: Arc<AtomicBool>,
 }
 
 /// Levels and counters shared with [`VoiceControl`].
@@ -248,12 +278,15 @@ impl VoiceControl {
         let (producer, consumer) = rtrb::RingBuffer::new(SOURCE_RING_LEN);
         let level = Arc::new(AtomicF32::new(LEVEL_FLOOR_DB));
         let dropped = Arc::new(AtomicU64::new(0));
+        let cleaned = Arc::new(AtomicBool::new(false));
         let source = Source {
             id,
             ring: consumer,
             gain: gain_from_percent(volume_percent),
             level: level.clone(),
             dropped: dropped.clone(),
+            cleaner: None,
+            cleaned: cleaned.clone(),
         };
         if !self.send(Command::AddSource(Box::new(source))) {
             return None;
@@ -265,6 +298,7 @@ impl VoiceControl {
                 ring: producer,
                 level,
                 dropped,
+                cleaned,
             },
         ))
     }
@@ -272,6 +306,23 @@ impl VoiceControl {
     /// Changes one source's volume, percent.
     pub fn set_source_volume(&mut self, id: SourceId, percent: u16) -> bool {
         self.send(Command::SourceVolume(id, percent))
+    }
+
+    /// Cleans one remote voice with `cleaner` (made off this thread) before
+    /// it is mixed, or stops cleaning it. A replaced or failing cleaner comes
+    /// back here to be dropped; a failing one leaves the voice as it is.
+    pub fn set_source_cleaner(
+        &mut self,
+        id: SourceId,
+        cleaner: Option<Box<dyn crate::Enhancer>>,
+    ) -> bool {
+        self.drop_retired();
+        self.send(Command::SourceCleaner(id, cleaner))
+    }
+
+    /// Sets every remote voice cleaner's attenuation limit, dB.
+    pub fn set_cleaner_attenuation(&mut self, db: f32) -> bool {
+        self.send(Command::CleanerAttenuation(db))
     }
 
     /// Removes a source (its [`SourceInput`] may be dropped too).
@@ -412,7 +463,30 @@ impl VoiceEngine {
                         s.gain = gain_from_percent(p);
                     }
                 }
-                Command::RemoveSource(id) => self.sources.retain(|s| s.id != id),
+                Command::SourceCleaner(id, cleaner) => {
+                    if let Some(s) = self.sources.iter_mut().find(|s| s.id == id) {
+                        s.cleaned.store(cleaner.is_some(), Ordering::Relaxed);
+                        if let Some(old) = std::mem::replace(&mut s.cleaner, cleaner) {
+                            retire(&mut self.retired, old);
+                        }
+                    } else if let Some(cleaner) = cleaner {
+                        // The voice left meanwhile.
+                        retire(&mut self.retired, cleaner);
+                    }
+                }
+                Command::CleanerAttenuation(db) => {
+                    for cleaner in self.sources.iter_mut().filter_map(|s| s.cleaner.as_mut()) {
+                        cleaner.set_attenuation_limit(db);
+                    }
+                }
+                Command::RemoveSource(id) => {
+                    if let Some(i) = self.sources.iter().position(|s| s.id == id) {
+                        let mut source = self.sources.remove(i);
+                        if let Some(cleaner) = source.cleaner.take() {
+                            retire(&mut self.retired, cleaner);
+                        }
+                    }
+                }
             }
         }
     }
@@ -438,6 +512,15 @@ impl VoiceEngine {
                     .source_underruns
                     .fetch_add((FRAME_LEN - got) as u64, Ordering::Relaxed);
             }
+            if let Some(cleaner) = source.cleaner.as_mut()
+                && cleaner.enhance(&mut chunk).is_err()
+            {
+                // The voice plays as it came; the owner sees `cleaned` drop.
+                source.cleaned.store(false, Ordering::Relaxed);
+                if let Some(cleaner) = source.cleaner.take() {
+                    retire(&mut self.retired, cleaner);
+                }
+            }
             for s in &mut chunk {
                 *s *= source.gain;
             }
@@ -447,6 +530,16 @@ impl VoiceEngine {
             }
         }
     }
+}
+
+/// Hands an enhancer back to the control side to drop (freeing a model on
+/// this thread would stall the audio); dropped here only if the control side
+/// has not collected [`RETIRED_LEN`] of them.
+fn retire(
+    retired: &mut rtrb::Producer<Box<dyn crate::chain::Enhancer>>,
+    enhancer: Box<dyn crate::chain::Enhancer>,
+) {
+    let _ = retired.push(enhancer);
 }
 
 impl FrameProcessor for VoiceEngine {
@@ -484,8 +577,7 @@ impl FrameProcessor for VoiceEngine {
         self.mic = *capture;
         let result = self.chain.capture(&mut self.mic);
         if let Some(enhancer) = self.chain.take_retired() {
-            // Dropped here only if the control side has not collected four.
-            let _ = self.retired.push(enhancer);
+            retire(&mut self.retired, enhancer);
         }
         let transmit = result.transmit && !self.muted;
         if !transmit {
@@ -578,6 +670,110 @@ mod tests {
         a.push(&[0.6; FRAME_LEN]);
         let played = run(&mut engine, &SILENCE);
         assert!(played.iter().all(|s| *s == 1.0), "clamped at full scale");
+    }
+
+    /// Scales by `gain`, or fails; counts drops and records its limit.
+    struct Scale {
+        gain: f32,
+        fail: bool,
+        limit: Arc<AtomicU32>,
+        dropped: Arc<AtomicU64>,
+    }
+
+    impl Scale {
+        fn new(gain: f32, fail: bool) -> (Box<Self>, Arc<AtomicU32>, Arc<AtomicU64>) {
+            let (limit, dropped) = (Arc::new(AtomicU32::new(0)), Arc::new(AtomicU64::new(0)));
+            let scale = Self {
+                gain,
+                fail,
+                limit: limit.clone(),
+                dropped: dropped.clone(),
+            };
+            (Box::new(scale), limit, dropped)
+        }
+    }
+
+    impl crate::Enhancer for Scale {
+        fn enhance(&mut self, frame: &mut Frame) -> Result<(), crate::AudioError> {
+            if self.fail {
+                return Err(crate::AudioError::Internal);
+            }
+            frame.iter_mut().for_each(|s| *s *= self.gain);
+            Ok(())
+        }
+        fn latency_samples(&self) -> usize {
+            0
+        }
+        fn set_attenuation_limit(&mut self, db: f32) {
+            self.limit.store(db as u32, Ordering::Relaxed);
+        }
+    }
+
+    impl Drop for Scale {
+        fn drop(&mut self) {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn a_cleaner_works_on_its_own_voice_before_the_volume() {
+        let (mut engine, mut control, _out) = VoiceEngine::new(plain());
+        let (a_id, mut a) = control.add_source(200).unwrap();
+        let (_, mut b) = control.add_source(100).unwrap();
+        let (half, limit, _) = Scale::new(0.5, false);
+        control.set_source_cleaner(a_id, Some(half));
+        control.set_cleaner_attenuation(30.0);
+        a.push(&[0.1; FRAME_LEN]);
+        b.push(&[0.2; FRAME_LEN]);
+        let played = run(&mut engine, &SILENCE);
+        // a: 0.1 halved, then doubled by its volume; b as it came.
+        assert!(
+            played.iter().all(|s| (s - 0.3).abs() < 1e-6),
+            "{}",
+            played[0]
+        );
+        assert!(a.cleaned() && !b.cleaned());
+        assert_eq!(limit.load(Ordering::Relaxed), 30);
+    }
+
+    #[test]
+    fn cleaners_come_back_to_the_control_side_to_be_dropped() {
+        let (mut engine, mut control, _out) = VoiceEngine::new(plain());
+        let (a_id, mut a) = control.add_source(100).unwrap();
+        let (first, _, first_dropped) = Scale::new(0.5, false);
+        control.set_source_cleaner(a_id, Some(first));
+        run(&mut engine, &SILENCE);
+
+        // Replaced: the old one is handed back, not dropped on this thread.
+        let (second, _, second_dropped) = Scale::new(0.5, false);
+        control.set_source_cleaner(a_id, Some(second));
+        run(&mut engine, &SILENCE);
+        assert_eq!(first_dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(control.drop_retired(), 1);
+        assert_eq!(first_dropped.load(Ordering::Relaxed), 1);
+
+        // Failing: the voice plays as it came, and the cleaner comes back.
+        let (failing, _, failing_dropped) = Scale::new(0.5, true);
+        control.set_source_cleaner(a_id, Some(failing));
+        a.push(&[0.25; FRAME_LEN]);
+        let played = run(&mut engine, &SILENCE);
+        assert!(played.iter().all(|s| *s == 0.25));
+        assert!(!a.cleaned());
+        assert_eq!(
+            control.drop_retired(),
+            2,
+            "the replaced one and the failed one"
+        );
+        assert_eq!(second_dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(failing_dropped.load(Ordering::Relaxed), 1);
+
+        // Removed with its voice.
+        let (last, _, last_dropped) = Scale::new(0.5, false);
+        control.set_source_cleaner(a_id, Some(last));
+        control.remove_source(a_id);
+        run(&mut engine, &SILENCE);
+        assert_eq!(control.drop_retired(), 1);
+        assert_eq!(last_dropped.load(Ordering::Relaxed), 1);
     }
 
     #[test]

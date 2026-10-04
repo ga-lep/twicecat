@@ -9,9 +9,10 @@ use std::collections::{BTreeSet, HashMap};
 use std::time::{Duration, Instant};
 
 use tessera_core::api::{
-    AudioDeviceId, AudioDevices, AudioSettings, CallEndReason, CallIntent, CallState, Command,
-    CoreEvent, EnhancerBackend, GpuBackend, GpuEnhancement, InputLevel, InputMode, ListDiff,
-    NoiseSuppression, NsLevel, Participant, RoomId, RoomSummary, UserId,
+    AudioDeviceId, AudioDevices, AudioSettings, CallEndReason, CallIntent, CallState,
+    CleaningStatus, Command, CoreEvent, EnhancerBackend, GpuBackend, GpuEnhancement, InputLevel,
+    InputMode, ListDiff, NoiseSuppression, NsLevel, Participant, RoomId, RoomSummary, SkipReason,
+    UserId, VoiceCleaning,
 };
 
 use super::{resolve_room, sanitize};
@@ -50,12 +51,25 @@ pub(crate) enum CallCmd {
         who: String,
         percent: u16,
     },
+    /// Cleaning other people's voices.
+    Clean(CleanArg),
     /// `Some(loopback)` starts, `None` stops.
     MicTest(Option<bool>),
     /// Probe GPU speech enhancement.
     Gpu,
     /// Show the audio settings.
     Audio,
+}
+
+/// `/clean` arguments.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum CleanArg {
+    /// `None` toggles.
+    Switch(Option<bool>),
+    /// Attenuation limit, dB.
+    Limit(f32),
+    /// One person (index from `/who`, or a user ID).
+    Person { who: String, choice: VoiceCleaning },
 }
 
 /// `/gate` arguments.
@@ -95,6 +109,7 @@ pub(crate) fn parse(name: &str, arg: &str) -> Option<Result<CallCmd, &'static st
         "agc" => switch(arg, "/agc [on|off]").map(CallCmd::Agc),
         "gate" => gate(arg).map(CallCmd::Gate),
         "vol" => volume(arg),
+        "clean" => clean(arg).map(CallCmd::Clean),
         "mictest" => match arg {
             "" => Ok(CallCmd::MicTest(Some(false))),
             "loopback" => Ok(CallCmd::MicTest(Some(true))),
@@ -225,6 +240,35 @@ fn volume(arg: &str) -> Result<CallCmd, &'static str> {
             who: who.to_owned(),
             percent: percent.trim_end_matches('%').parse().map_err(|_| USAGE)?,
         }),
+        _ => Err(USAGE),
+    }
+}
+
+fn clean(arg: &str) -> Result<CleanArg, &'static str> {
+    const USAGE: &str =
+        "/clean [on|off] | /clean limit <dB> | /clean <n|@user:server> always|never|auto";
+    let mut words = arg.split_whitespace();
+    match (words.next(), words.next(), words.next()) {
+        (None, ..) => Ok(CleanArg::Switch(None)),
+        (Some("on"), None, _) => Ok(CleanArg::Switch(Some(true))),
+        (Some("off"), None, _) => Ok(CleanArg::Switch(Some(false))),
+        (Some("limit"), Some(db), None) => db
+            .trim_end_matches("dB")
+            .parse()
+            .map(CleanArg::Limit)
+            .map_err(|_| USAGE),
+        (Some(who), Some(choice), None) => {
+            let choice = match choice {
+                "always" => VoiceCleaning::Always,
+                "never" => VoiceCleaning::Never,
+                "auto" => VoiceCleaning::Automatic,
+                _ => return Err(USAGE),
+            };
+            Ok(CleanArg::Person {
+                who: who.to_owned(),
+                choice,
+            })
+        }
         _ => Err(USAGE),
     }
 }
@@ -454,26 +498,40 @@ impl Calls {
                     }
                 };
             }),
-            CallCmd::Vol { who, percent } => {
-                let user = match who.parse::<usize>() {
-                    Ok(index) => self.participants.get(index).map(|p| p.user_id.clone()),
-                    Err(_) if who.starts_with('@') => Some(UserId::from(who.as_str())),
-                    Err(_) => None,
-                };
-                match user {
-                    Some(user_id) => Reply::send(
-                        Command::SetUserVolume {
-                            user_id: user_id.clone(),
-                            percent,
-                        },
-                        format!(
-                            "Volume of {} set to {percent} %.",
-                            sanitize(user_id.as_str())
-                        ),
+            CallCmd::Vol { who, percent } => match self.user_of(&who) {
+                Some(user_id) => Reply::send(
+                    Command::SetUserVolume {
+                        user_id: user_id.clone(),
+                        percent,
+                    },
+                    format!(
+                        "Volume of {} set to {percent} %.",
+                        sanitize(user_id.as_str())
                     ),
-                    None => Reply::line("No such participant. Use /who to list them."),
-                }
+                ),
+                None => Reply::line("No such participant. Use /who to list them."),
+            },
+            CallCmd::Clean(CleanArg::Switch(on)) => self.edit(|s| {
+                let c = &mut s.remote_cleaning;
+                c.enabled = on.unwrap_or(!c.enabled);
+            }),
+            CallCmd::Clean(CleanArg::Limit(db)) => {
+                self.edit(|s| s.remote_cleaning.attenuation_limit_db = db)
             }
+            CallCmd::Clean(CleanArg::Person { who, choice }) => match self.user_of(&who) {
+                Some(user_id) => Reply::send(
+                    Command::SetUserCleaning {
+                        user_id: user_id.clone(),
+                        cleaning: choice,
+                    },
+                    format!(
+                        "Cleaning of {}: {}.",
+                        sanitize(user_id.as_str()),
+                        format!("{choice:?}").to_lowercase()
+                    ),
+                ),
+                None => Reply::line("No such participant. Use /who to list them."),
+            },
             CallCmd::MicTest(Some(loopback)) => {
                 self.mic_test = true;
                 self.last_level = None;
@@ -498,6 +556,15 @@ impl Calls {
                     Reply::quiet(Command::GetAudioSettings)
                 }
             },
+        }
+    }
+
+    /// A participant index from `/who`, or a user ID.
+    fn user_of(&self, who: &str) -> Option<UserId> {
+        match who.parse::<usize>() {
+            Ok(index) => self.participants.get(index).map(|p| p.user_id.clone()),
+            Err(_) if who.starts_with('@') => Some(UserId::from(who)),
+            Err(_) => None,
         }
     }
 
@@ -562,6 +629,20 @@ impl Calls {
                 }
                 if p.volume_percent != 100 {
                     flags.push(format!("volume {} %", p.volume_percent));
+                }
+                match p.cleaning {
+                    CleaningStatus::Off => {}
+                    CleaningStatus::Starting => flags.push("cleaning soon".to_owned()),
+                    CleaningStatus::Cleaned => flags.push("cleaned".to_owned()),
+                    CleaningStatus::Skipped(SkipReason::Never) => {
+                        flags.push("not cleaned (never)".to_owned());
+                    }
+                    CleaningStatus::Skipped(SkipReason::Limit) => {
+                        flags.push("not cleaned (limit reached)".to_owned());
+                    }
+                    CleaningStatus::Skipped(SkipReason::Unavailable) => {
+                        flags.push("not cleaned (no model)".to_owned());
+                    }
                 }
                 let flags = if flags.is_empty() {
                     String::new()
@@ -637,6 +718,14 @@ impl Calls {
                 "Gain {} dB, volume {} %, voice bitrate {} kb/s.",
                 s.input_gain_db, s.output_volume_percent, s.voice_bitrate_kbps
             ),
+            if s.remote_cleaning.enabled {
+                format!(
+                    "Other voices cleaned (DeepFilterNet3, up to {} dB removed).",
+                    s.remote_cleaning.attenuation_limit_db
+                )
+            } else {
+                "Other voices not cleaned.".to_owned()
+            },
         ]
     }
 
@@ -857,6 +946,7 @@ mod tests {
             muted: false,
             speaking: false,
             volume_percent: 100,
+            cleaning: CleaningStatus::Off,
         }
     }
 
@@ -909,6 +999,29 @@ mod tests {
                 percent: 150
             })
         );
+        assert_eq!(cmd("/clean"), Ok(CallCmd::Clean(CleanArg::Switch(None))));
+        assert_eq!(
+            cmd("/clean on"),
+            Ok(CallCmd::Clean(CleanArg::Switch(Some(true))))
+        );
+        assert_eq!(
+            cmd("/clean limit 30"),
+            Ok(CallCmd::Clean(CleanArg::Limit(30.0)))
+        );
+        assert_eq!(
+            cmd("/clean @a:x never"),
+            Ok(CallCmd::Clean(CleanArg::Person {
+                who: "@a:x".into(),
+                choice: VoiceCleaning::Never
+            }))
+        );
+        assert_eq!(
+            cmd("/clean 2 auto"),
+            Ok(CallCmd::Clean(CleanArg::Person {
+                who: "2".into(),
+                choice: VoiceCleaning::Automatic
+            }))
+        );
         assert_eq!(cmd("/mictest loopback"), Ok(CallCmd::MicTest(Some(true))));
         assert_eq!(cmd("/mictest stop"), Ok(CallCmd::MicTest(None)));
         for bad in [
@@ -928,6 +1041,10 @@ mod tests {
             "/ns deepfilter gpu 30",
             "/ns deepfilter 30 cpu",
             "/gpu please",
+            "/clean maybe",
+            "/clean limit loud",
+            "/clean 2 sometimes",
+            "/clean 2 never please",
         ] {
             assert!(cmd(bad).is_err(), "{bad}");
         }

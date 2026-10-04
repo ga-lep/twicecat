@@ -15,6 +15,8 @@ use super::{Inference, stages};
 use crate::AudioError;
 
 type State = TypedSimpleState;
+/// A compiled network, shared by every filter made from it.
+type Plan = Arc<TypedRunnableModel>;
 
 /// A graph that runs one frame per call, keeping its state.
 pub(crate) struct Graph {
@@ -41,7 +43,7 @@ fn pulsed(
     file: &Path,
     inputs: impl Fn(&Symbol) -> Vec<(&'static str, InferenceFact)>,
     outputs: &[&str],
-) -> Result<Graph, AudioError> {
+) -> Result<Plan, AudioError> {
     let what = file.file_name().and_then(|n| n.to_str()).unwrap_or("model");
     let mut model = tract_onnx::onnx()
         .with_ignore_output_shapes(true)
@@ -81,24 +83,46 @@ fn pulsed(
     let mut typed = model.into_typed().map_err(|e| load_err(what, e))?;
     typed.declutter().map_err(|e| load_err(what, e))?;
     let pulsed = PulsedModel::new(&typed, s, &1.to_dim()).map_err(|e| load_err(what, e))?;
-    let plan = pulsed
+    pulsed
         .into_typed()
         .and_then(TypedModel::into_optimized)
         .and_then(|m| m.into_runnable())
-        .map_err(|e| load_err(what, e))?;
-    let state = plan.spawn().map_err(|e| load_err(what, e))?;
-    Ok(Graph { state })
+        .map_err(|e| load_err(what, e))
 }
 
-/// The three graphs.
+/// The three networks, compiled.
+pub(crate) struct Plans {
+    encoder: Plan,
+    erb_decoder: Plan,
+    df_decoder: Plan,
+}
+
+impl Plans {
+    /// Fresh state for one filter (cheap: the networks are shared).
+    pub(crate) fn spawn(&self) -> Result<Graphs, AudioError> {
+        let graph = |plan: &Plan| {
+            plan.spawn()
+                .map(|state| Graph { state })
+                .map_err(|e| load_err("state", e))
+        };
+        Ok(Graphs {
+            encoder: graph(&self.encoder)?,
+            erb_decoder: graph(&self.erb_decoder)?,
+            df_decoder: graph(&self.df_decoder)?,
+        })
+    }
+}
+
+/// The three graphs, with one filter's state.
 pub(crate) struct Graphs {
     pub encoder: Graph,
     pub erb_decoder: Graph,
     pub df_decoder: Graph,
 }
 
-/// Loads the graphs from `dir` (`enc.onnx`, `erb_dec.onnx`, `df_dec.onnx`).
-pub(crate) fn load(dir: &Path, cfg: &Config) -> Result<Graphs, AudioError> {
+/// Loads and compiles the networks from `dir` (`enc.onnx`, `erb_dec.onnx`,
+/// `df_dec.onnx`).
+pub(crate) fn load(dir: &Path, cfg: &Config) -> Result<Plans, AudioError> {
     let f32t = f32::datum_type();
     let erb = cfg.nb_erb;
     let df = cfg.nb_df;
@@ -140,7 +164,7 @@ pub(crate) fn load(dir: &Path, cfg: &Config) -> Result<Graphs, AudioError> {
         },
         &["coefs"],
     )?;
-    Ok(Graphs {
+    Ok(Plans {
         encoder,
         erb_decoder,
         df_decoder,

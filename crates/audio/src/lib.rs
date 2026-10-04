@@ -27,15 +27,16 @@ pub use chain::{
 pub use denormals::flush_denormals_on_this_thread;
 pub use devices::{DeviceInfo, DeviceList, DeviceWatcher, list_devices};
 pub use dfn::{
-    DeepFilter, DeepFilterBackend, DeepFilterStatus, default_model_dir, default_stateful_model,
+    DeepFilter, DeepFilterBackend, DeepFilterModel, DeepFilterStatus, default_model_dir,
+    default_stateful_model,
 };
 pub use frame::{FRAME_LEN, Frame, SAMPLE_RATE, SILENCE};
 pub use gate::GateMode;
 pub use io::{AudioIo, IoConfig, IoEvent, IoInfo, Realtime, StreamInfo, VirtualDevice};
 pub use pipeline::{FrameProcessor, IoCounters, IoStats};
 pub use voice::{
-    Meters, OUTGOING_RING_LEN, Outgoing, SOURCE_RING_LEN, SourceId, SourceInput, VoiceControl,
-    VoiceEngine, VoiceStats,
+    CleanedFlag, Meters, OUTGOING_RING_LEN, Outgoing, SOURCE_RING_LEN, SourceId, SourceInput,
+    VoiceControl, VoiceEngine, VoiceStats,
 };
 
 /// Audio errors. Messages are fixed text: backend error text is not

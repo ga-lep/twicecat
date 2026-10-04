@@ -221,21 +221,39 @@ pub struct DeepFilter {
     lsnr: f32,
 }
 
-impl DeepFilter {
-    /// Loads the models from `dir`. Slow (seconds in a debug build): call
-    /// it off the audio thread.
-    pub fn load(dir: &Path, attenuation_limit_db: f32) -> Result<Self, AudioError> {
+/// DeepFilterNet3's networks, compiled once: every [`DeepFilter`] made from
+/// it (one per voice) shares them and keeps only its own state.
+#[derive(Clone)]
+pub struct DeepFilterModel {
+    cfg: Config,
+    plans: Arc<model::Plans>,
+}
+
+impl DeepFilterModel {
+    /// Loads and compiles the models from `dir`. Slow (seconds in a debug
+    /// build): call it off the audio thread.
+    pub fn load(dir: &Path) -> Result<Self, AudioError> {
         let text =
             std::fs::read_to_string(dir.join("config.ini")).map_err(|_| AudioError::Model)?;
         let cfg = Config::parse(&text)?;
-        let graphs = model::load(dir, &cfg)?;
+        let plans = Arc::new(model::load(dir, &cfg)?);
+        Ok(Self { cfg, plans })
+    }
+
+    /// A filter with its own state, on the CPU. Cheap next to [`load`]
+    /// (no compilation), but it allocates: not on the audio thread.
+    ///
+    /// [`load`]: Self::load
+    pub fn filter(&self, attenuation_limit_db: f32) -> Result<DeepFilter, AudioError> {
+        let cfg = self.cfg.clone();
+        let graphs = self.plans.spawn()?;
         let stft = Stft::new(960, FRAME_LEN);
         let bins = stft.bins();
         let widths = dsp::erb_widths(48_000, 960, cfg.nb_erb, cfg.min_nb_erb_freqs);
         let alpha = dsp::norm_alpha(48_000, FRAME_LEN, cfg.norm_tau);
         let lookahead = cfg.conv_lookahead.max(cfg.df_lookahead);
         let zeros = || vec![Complex32::default(); bins];
-        Ok(Self {
+        Ok(DeepFilter {
             features: Features::new(widths, cfg.nb_df, alpha),
             graphs,
             #[cfg(feature = "onnxruntime")]
@@ -260,6 +278,15 @@ impl DeepFilter {
             stft,
             cfg,
         })
+    }
+}
+
+impl DeepFilter {
+    /// Loads the models from `dir` for one filter (see [`DeepFilterModel`]
+    /// to make several). Slow (seconds in a debug build): call it off the
+    /// audio thread.
+    pub fn load(dir: &Path, attenuation_limit_db: f32) -> Result<Self, AudioError> {
+        DeepFilterModel::load(dir)?.filter(attenuation_limit_db)
     }
 
     /// Loads the models from `dir` (as [`load`]) and the stateful graph

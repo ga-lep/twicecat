@@ -31,8 +31,9 @@ use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 
 use super::UserVolumes;
+use super::cleaning::Cleaning;
 use super::jwt::SfuAccess;
-use crate::api::{CoreError, UserId};
+use crate::api::{CleaningStatus, CoreError, UserId};
 use crate::audio_session::{self, Voice};
 
 /// How long `Room::connect` may take.
@@ -40,12 +41,15 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 /// Buffer inside the LiveKit audio source, ms (multiple of 10).
 const SOURCE_QUEUE_MS: u32 = 50;
 
-/// Who speaks and who is muted, by LiveKit identity (`user:device`).
+/// Who speaks, who is muted and whose voice is cleaned, by LiveKit
+/// identity (`user:device`).
 #[derive(Debug, Default)]
 pub(crate) struct MediaFlags {
     /// Active speakers per SFU connection: each room reports only its own.
     pub speaking: HashMap<String, HashSet<String>>,
     pub muted: HashSet<String>,
+    /// Set by [`super::cleaning::Cleaning`]; absent: not cleaned.
+    pub cleaning: HashMap<String, CleaningStatus>,
 }
 
 impl MediaFlags {
@@ -103,7 +107,7 @@ impl KeyIndex {
 }
 
 /// The user of a `user:device` identity.
-fn user_of(identity: &str) -> &str {
+pub(crate) fn user_of(identity: &str) -> &str {
     identity.rsplit_once(':').map_or(identity, |(user, _)| user)
 }
 
@@ -129,6 +133,8 @@ struct Players {
     tracks: HashMap<String, RemoteAudioTrack>,
     playing: HashMap<String, (SourceId, JoinHandle<()>)>,
     expected: BTreeSet<String>,
+    /// Cleans the voices that play (shared by the call's connections).
+    cleaning: Option<Cleaning>,
 }
 
 impl Players {
@@ -137,6 +143,9 @@ impl Players {
             task.abort();
             if let Some(voice) = voice {
                 audio_session::remove_source(voice, id);
+            }
+            if let Some(cleaning) = &self.cleaning {
+                cleaning.remove(identity);
             }
         }
     }
@@ -166,10 +175,14 @@ impl Players {
                 continue;
             };
             let stream = NativeAudioStream::new(track.rtc_track(), SAMPLE_RATE as i32, 1);
+            let flag = input.cleaned_flag();
             self.playing.insert(
                 identity.clone(),
                 (id, spawn_audio_task(read_track(stream, input))),
             );
+            if let Some(cleaning) = &self.cleaning {
+                cleaning.add(identity, id, flag);
+            }
         }
     }
 
@@ -202,6 +215,7 @@ pub(crate) struct ConnectionShared {
     pub voice: Option<Voice>,
     pub volumes: UserVolumes,
     pub flags: SharedFlags,
+    pub cleaning: Cleaning,
     pub notices: mpsc::Sender<(String, MediaNotice)>,
 }
 
@@ -274,6 +288,7 @@ impl SfuConnection {
 
         let players = Arc::new(StdMutex::new(Players {
             expected: expected.borrow_and_update().clone(),
+            cleaning: Some(shared.cleaning.clone()),
             ..Players::default()
         }));
         tasks.push(tokio::spawn(handle_events(

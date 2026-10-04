@@ -12,9 +12,10 @@ mod types;
 
 pub use call::{
     AUDIO_FRAME_LEN, AudioBackend, AudioDevice, AudioDeviceId, AudioDevices, AudioProcessing,
-    AudioSettings, AudioStats, CallEndReason, CallIntent, CallState, EnhancerBackend, GpuBackend,
-    GpuEnhancement, InputLevel, InputMode, NoiseSuppression, NsLevel, Participant, ParticipantId,
-    PushToTalkBindings, VirtualAudio, limits,
+    AudioSettings, AudioStats, CallEndReason, CallIntent, CallState, CleaningStatus,
+    EnhancerBackend, GpuBackend, GpuEnhancement, InputLevel, InputMode, NoiseSuppression, NsLevel,
+    Participant, ParticipantId, PushToTalkBindings, RemoteCleaning, SkipReason, VirtualAudio,
+    VoiceCleaning, limits,
 };
 pub use diff::ListDiff;
 pub use security::{
@@ -274,6 +275,13 @@ pub enum Command {
         /// Percent; 100 is unchanged.
         percent: u16,
     },
+    /// Whether to clean one user's voice ([`RemoteCleaning`]); remembered.
+    SetUserCleaning {
+        /// Account.
+        user_id: UserId,
+        /// Automatic follows the global switch.
+        cleaning: VoiceCleaning,
+    },
     /// Re-enumerate audio devices; answered by `AudioDevices`.
     ListAudioDevices,
     /// Ask for the current settings; answered by `AudioSettings`.
@@ -466,6 +474,11 @@ impl fmt::Debug for Command {
                 .debug_struct("SetUserVolume")
                 .field("user_id", user_id)
                 .field("percent", percent)
+                .finish(),
+            Self::SetUserCleaning { user_id, cleaning } => f
+                .debug_struct("SetUserCleaning")
+                .field("user_id", user_id)
+                .field("cleaning", cleaning)
                 .finish(),
             Self::ListAudioDevices => f.write_str("ListAudioDevices"),
             Self::GetAudioSettings => f.write_str("GetAudioSettings"),

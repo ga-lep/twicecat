@@ -20,9 +20,9 @@ use common::{
 use serde_json::Value;
 use tessera_core::CoreHandle;
 use tessera_core::api::{
-    AUDIO_FRAME_LEN, AudioBackend, AudioProcessing, AudioSettings, CallIntent, CallState, Command,
-    CoreEvent, InputMode, ListDiff, NoiseSuppression, Participant, Password, RoomId, SyncState,
-    VirtualAudio,
+    AUDIO_FRAME_LEN, AudioBackend, AudioProcessing, AudioSettings, CallIntent, CallState,
+    CleaningStatus, Command, CoreEvent, InputMode, ListDiff, NoiseSuppression, Participant,
+    Password, RoomId, SkipReason, SyncState, UserId, VirtualAudio, VoiceCleaning,
 };
 use tessera_core::secrets::InMemorySecretStore;
 
@@ -757,6 +757,93 @@ async fn encrypted_room_calls_are_end_to_end_encrypted() {
         carol_hears > HEARD,
         "after rejoin, carol hears alice (rotated key): {carol_hears:.4}"
     );
+
+    for core in [&alice, &carol] {
+        core.commands.send(Command::LeaveCall).await.unwrap();
+        core.commands.send(Command::Shutdown).await.unwrap();
+    }
+}
+
+/// Cleaning other people's voices (Task 16): with it on, alice's device
+/// runs DeepFilterNet3 on carol's voice, which takes her steady tone for
+/// noise; set to never for carol, her voice plays as it came.
+#[tokio::test]
+#[ignore = "needs local homeserver and scripts/fetch-models.sh"]
+async fn remote_voices_are_cleaned_when_asked() {
+    const CAROL_HZ: f32 = 600.0;
+    let env = TestEnv::load();
+    let alice_raw = raw_login(1).await;
+    let carol_raw = raw_login(3).await;
+    let room_id = create_room(&alice_raw, &unique_room_name(), Some(&env.user_id(3)))
+        .await
+        .to_string();
+    allow_calls(&alice_raw, &room_id).await;
+    carol_raw
+        .join_room_by_id(room_id.as_str().try_into().unwrap())
+        .await
+        .unwrap();
+
+    let alice_audio = Arc::new(Duplex::new(TONE_HZ));
+    let (dir_a, dir_c) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let mut alice = logged_in(dir_a.path(), 1, AudioBackend::Virtual(alice_audio.clone())).await;
+    let mut carol = logged_in(
+        dir_c.path(),
+        3,
+        AudioBackend::Virtual(Arc::new(Duplex::new(CAROL_HZ))),
+    )
+    .await;
+    wait_for_room(&mut alice, &room_id).await;
+    wait_for_room(&mut carol, &room_id).await;
+    carol
+        .commands
+        .send(Command::UpdateAudioSettings(tone_settings()))
+        .await
+        .unwrap();
+    expect_event(&mut carol, |e| matches!(e, CoreEvent::AudioSettings(_))).await;
+    join(&mut alice, &room_id).await;
+    join(&mut carol, &room_id).await;
+    let carol_id = env.user_id(3);
+    alice_as_seen_by(&mut alice, &carol_id, |p| {
+        p.speaking && p.cleaning == CleaningStatus::Off
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let plain = alice_audio.level(CAROL_HZ, 2.0);
+
+    let mut settings = AudioSettings::default();
+    settings.remote_cleaning.enabled = true;
+    alice
+        .commands
+        .send(Command::UpdateAudioSettings(settings))
+        .await
+        .unwrap();
+    alice_as_seen_by(&mut alice, &carol_id, |p| {
+        p.cleaning == CleaningStatus::Cleaned
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let cleaned = alice_audio.level(CAROL_HZ, 2.0);
+
+    alice
+        .commands
+        .send(Command::SetUserCleaning {
+            user_id: UserId::from(carol_id.as_str()),
+            cleaning: VoiceCleaning::Never,
+        })
+        .await
+        .unwrap();
+    alice_as_seen_by(&mut alice, &carol_id, |p| {
+        p.cleaning == CleaningStatus::Skipped(SkipReason::Never)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let skipped = alice_audio.level(CAROL_HZ, 2.0);
+    eprintln!(
+        "carol's tone at alice: {plain:.4} plain, {cleaned:.5} cleaned, {skipped:.4} set to never"
+    );
+    assert!(plain > HEARD, "plain: {plain:.4}");
+    assert!(cleaned < plain / 10.0, "cleaned: {cleaned:.5}");
+    assert!(skipped > HEARD, "set to never: {skipped:.4}");
 
     for core in [&alice, &carol] {
         core.commands.send(Command::LeaveCall).await.unwrap();

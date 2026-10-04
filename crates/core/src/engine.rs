@@ -1235,6 +1235,12 @@ impl Engine {
                     call.set_user_volume(&user_id, applied);
                 }
             }
+            Command::SetUserCleaning { user_id, cleaning } => {
+                let mut settings = self.audio_settings().await.clone();
+                settings.user_cleaning.insert(user_id, cleaning);
+                // Stored, echoed and applied to the call like any change.
+                self.store_audio_settings(settings.validated()).await;
+            }
             Command::JoinCall { room_id, intent: _ } => self.join_call(room_id).await,
             Command::LeaveCall => {
                 if self.call.is_some() {
@@ -1339,6 +1345,9 @@ impl Engine {
         if let Ok(mut shared) = self.user_volumes.write() {
             shared.clone_from(&settings.user_volumes);
         }
+        if let Some(call) = &self.call {
+            call.set_cleaning(settings.remote_cleaning, settings.user_cleaning.clone());
+        }
         if let Err(e) = saved {
             self.emit(CoreEvent::Error(e)).await;
         }
@@ -1441,6 +1450,7 @@ impl Engine {
         }
         let settings = self.audio_settings().await.clone();
         let bitrate_kbps = settings.voice_bitrate_kbps;
+        let cleaning = (settings.remote_cleaning, settings.user_cleaning.clone());
         match AudioSession::start(
             &settings,
             Mode::Call,
@@ -1456,6 +1466,7 @@ impl Engine {
                     voice,
                     outgoing,
                     bitrate_kbps,
+                    cleaning,
                 }
             }
             Err(e) => {
@@ -1464,6 +1475,7 @@ impl Engine {
                     voice: None,
                     outgoing: None,
                     bitrate_kbps,
+                    cleaning,
                 }
             }
         }
