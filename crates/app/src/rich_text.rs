@@ -200,7 +200,7 @@ pub fn spans_for(inlines: &[Inline], ctx: &Ctx<'_>, walk: &mut Walk) -> Vec<Span
 }
 
 fn push_spans(inlines: &[Inline], ctx: &Ctx<'_>, walk: &mut Walk, out: &mut Vec<SpanModel>) {
-    for inline in inlines {
+    for (index, inline) in inlines.iter().enumerate() {
         match inline {
             Inline::Text { text, style } => {
                 let text = walk.take(text);
@@ -219,7 +219,11 @@ fn push_spans(inlines: &[Inline], ctx: &Ctx<'_>, walk: &mut Walk, out: &mut Vec<
                 if !shown.is_empty() {
                     // The budget may cut the label (`bank.example` + more):
                     // judge the whole text as well as what is shown.
-                    let confirm = needs_confirmation(&shown, url) || needs_confirmation(text, url);
+                    // The text it sits in counts too: `bank.` + `example`.
+                    let token = visible_token(inlines, index, text);
+                    let confirm = needs_confirmation(&shown, url)
+                        || needs_confirmation(text, url)
+                        || needs_confirmation(&token, url);
                     let text = shown;
                     out.push(SpanModel {
                         text,
@@ -290,6 +294,45 @@ fn push_spans(inlines: &[Inline], ctx: &Ctx<'_>, walk: &mut Walk, out: &mut Vec<
             }
         }
     }
+}
+
+/// Longest neighbour text joined to a link label, in characters.
+const TOKEN_REACH: usize = 256;
+
+/// The raw text of the link at `inlines[index]` joined with the
+/// non-whitespace text directly before and after it in its neighbours (text
+/// and link labels, at most [`TOKEN_REACH`] characters each side).
+fn visible_token(inlines: &[Inline], index: usize, label: &str) -> String {
+    let raw = |inline: &Inline| match inline {
+        Inline::Text { text, .. } | Inline::Link { text, .. } => Some(text.clone()),
+        Inline::LineBreak => Some("\n".to_owned()),
+        _ => None,
+    };
+    let mut before: Vec<char> = Vec::new();
+    'back: for inline in inlines[..index].iter().rev() {
+        let Some(text) = raw(inline) else { break };
+        for c in text.chars().rev() {
+            if c.is_whitespace() || before.len() >= TOKEN_REACH {
+                break 'back;
+            }
+            before.push(c);
+        }
+    }
+    before.reverse();
+    let mut token: String = before.into_iter().collect();
+    token.push_str(label);
+    let mut taken = 0;
+    'forward: for inline in &inlines[index + 1..] {
+        let Some(text) = raw(inline) else { break };
+        for c in text.chars() {
+            if c.is_whitespace() || taken >= TOKEN_REACH {
+                break 'forward;
+            }
+            token.push(c);
+            taken += 1;
+        }
+    }
+    token
 }
 
 /// The font for a style: bold and italic combine, code is monospace.
@@ -930,5 +973,47 @@ mod tests {
         assert!(heading_size(1) > heading_size(2));
         assert!(heading_size(9) > 16.0);
         assert!(heading_size(0) > 16.0);
+    }
+
+    fn link(text: &str, url: &str) -> Inline {
+        Inline::Link {
+            text: text.into(),
+            url: url.into(),
+            style: TextStyle::default(),
+        }
+    }
+
+    fn asks(out: &[SpanModel]) -> bool {
+        out.iter()
+            .any(|s| matches!(s.link, Some(LinkTarget::Url { confirm: true, .. })))
+    }
+
+    #[test]
+    fn the_first_half_of_a_split_address_asks() {
+        let evil = "https://evil.example/";
+        assert!(asks(&spans(&[link("bank.", evil), plain("example")])));
+        assert!(asks(&spans(&[link("bank", evil), plain(".example")])));
+        assert!(asks(&spans(&[
+            plain("see bank"),
+            link(".", evil),
+            plain("example")
+        ])));
+        assert!(asks(&spans(&[
+            plain("go "),
+            link("bank", evil),
+            link(".example", evil)
+        ])));
+    }
+
+    #[test]
+    fn a_link_beside_ordinary_text_does_not_ask() {
+        let url = "https://example.org/";
+        assert!(!asks(&spans(&[
+            plain("see "),
+            link("docs", url),
+            plain(" now")
+        ])));
+        assert!(!asks(&spans(&[plain("("), link("docs", url), plain(").")])));
+        assert!(!asks(&spans(&[link("bank.", url), plain(" next")])));
     }
 }

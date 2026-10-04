@@ -115,14 +115,24 @@ fn is_dns_label_like(label: &str) -> bool {
 /// such as `bank<a href=..>.example</a>`) that names no host at all. Plain
 /// words, `mailto` targets and equal hosts never need it.
 ///
-/// Look-alike dots (U+3002, U+FF0E, U+FF61) read as `.` and trailing
-/// `.,;:!?)` is ignored. A caller that shortens the text for display should
+/// Look-alike dots (U+3002, U+FF0E, U+FF61) read as `.`; leading `([<"'` and
+/// trailing `.,;:!?)]>"'` are ignored. Any other non-ASCII character in the
+/// text, against an ASCII target, and any whitespace but U+0020 ask too
+/// (other dot look-alikes, thin and zero-width gaps). A caller that shortens the text for display should
 /// also ask about the whole text and combine the answers with "or".
 pub fn needs_confirmation(text: &str, url: &str) -> bool {
     let Some(target) = web_host(url, true) else {
         return false;
     };
     let shown = normalize_text(text);
+    // Fail closed: any whitespace but a plain space (thin spaces, zero-width
+    // and format characters, tabs, line breaks) or any non-ASCII character
+    // against an ASCII target may be a look-alike dot or a hidden gap.
+    if shown.chars().any(|c| c != ' ' && c.is_whitespace())
+        || (!shown.is_ascii() && target.is_ascii())
+    {
+        return true;
+    }
     match web_host(&shown, false) {
         Some(shown) => shown != target,
         None => is_address_fragment(&shown),
@@ -130,7 +140,7 @@ pub fn needs_confirmation(text: &str, url: &str) -> bool {
 }
 
 /// `text` trimmed, with look-alike dots turned into `.` and without
-/// trailing sentence punctuation.
+/// leading brackets and quotes or trailing sentence punctuation.
 fn normalize_text(text: &str) -> String {
     let dotted: String = text
         .trim()
@@ -141,7 +151,8 @@ fn normalize_text(text: &str) -> String {
         })
         .collect();
     dotted
-        .trim_end_matches(['.', ',', ';', ':', '!', '?', ')'])
+        .trim_start_matches(['(', '[', '<', '"', '\''])
+        .trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']', '>', '"', '\''])
         .to_owned()
 }
 
@@ -456,5 +467,51 @@ mod tests {
         assert!(!needs_confirmation("here", "https://evil.example/"));
         assert!(!needs_confirmation("v1.2.3", "https://evil.example/"));
         assert!(!needs_confirmation("3.14", "https://evil.example/"));
+    }
+
+    #[test]
+    fn non_ascii_look_alike_dots_ask_when_the_target_is_ascii() {
+        for dot in [
+            '\u{2024}', '\u{FE52}', '\u{2E31}', '\u{00B7}', '\u{0701}', '\u{0702}',
+        ] {
+            let shown = format!("bank{dot}example");
+            assert!(needs_confirmation(&shown, "https://bank.example/"), "{dot}");
+            assert!(needs_confirmation(&shown, "https://evil.example/"), "{dot}");
+        }
+        // Plain ASCII words are unchanged.
+        assert!(!needs_confirmation("click here", "https://evil.example/"));
+    }
+
+    #[test]
+    fn thin_and_invisible_whitespace_in_a_label_asks() {
+        for gap in [
+            '\u{200A}', '\u{2006}', '\u{2009}', '\u{202F}', '\u{205F}', '\u{200B}', '\u{2060}',
+            '\u{FEFF}', '\u{00A0}', '\t', '\n',
+        ] {
+            let shown = format!("bank{gap}.{gap}example");
+            assert!(
+                needs_confirmation(&shown, "https://evil.example/"),
+                "{gap:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn leading_punctuation_is_ignored() {
+        for head in ["(", "[", "<", "\"", "'", "(\""] {
+            let shown = format!("{head}bank.example");
+            assert!(
+                !needs_confirmation(&shown, "https://bank.example/"),
+                "{head}"
+            );
+            assert!(
+                needs_confirmation(&shown, "https://evil.example/"),
+                "{head}"
+            );
+        }
+        assert!(!needs_confirmation(
+            "(bank.example)",
+            "https://bank.example/"
+        ));
     }
 }
