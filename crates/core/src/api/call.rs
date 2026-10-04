@@ -469,6 +469,19 @@ pub struct AudioStats {
     pub echo_delay_ms: Option<u32>,
     /// Processing time per 10 ms frame, microseconds (mean over the second).
     pub processing_us: u32,
+    /// Since the previous stats: times processing started more than 1 ms
+    /// after a frame of microphone audio was complete (a busy CPU; real-time
+    /// priority keeps this at 0).
+    pub late_wakes: u32,
+    /// Since the previous stats: the longest wait from a complete microphone
+    /// frame to processing it, microseconds (0 without a microphone).
+    pub max_wake_us: u32,
+    /// Since the previous stats: microphone samples lost because processing
+    /// fell behind (heard by others as a gap).
+    pub capture_overruns: u32,
+    /// Since the previous stats: samples the speakers wanted and did not get
+    /// (heard as a click).
+    pub playback_underruns: u32,
 }
 
 #[cfg(test)]

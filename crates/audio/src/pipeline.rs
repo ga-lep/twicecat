@@ -58,6 +58,9 @@ pub struct IoCounters {
     pub late_wakes: AtomicU64,
     /// The longest time from captured audio to processing it, nanoseconds.
     pub max_wake_ns: AtomicU64,
+    /// The same since the owner last read it
+    /// ([`take_recent_max_wake_us`](Self::take_recent_max_wake_us)).
+    recent_max_wake_ns: AtomicU64,
     /// When the capture callback completed the oldest frame not yet
     /// processed ([`now_ns`]; 0: none waiting).
     captured_at_ns: AtomicU64,
@@ -113,6 +116,12 @@ impl IoCounters {
         }
     }
 
+    /// The longest time from captured audio to processing it since the
+    /// previous call, microseconds (0: no wake since).
+    pub fn take_recent_max_wake_us(&self) -> u64 {
+        self.recent_max_wake_ns.swap(0, Ordering::Relaxed) / 1000
+    }
+
     /// Called by the capture callback after it delivered audio, with the
     /// ring's fill: notes the time when that completes a frame (unless an
     /// older one is still waiting) and wakes the processing thread.
@@ -160,6 +169,7 @@ impl IoCounters {
             self.late_wakes.fetch_add(1, Ordering::Relaxed);
         }
         self.max_wake_ns.fetch_max(late, Ordering::Relaxed);
+        self.recent_max_wake_ns.fetch_max(late, Ordering::Relaxed);
     }
 }
 
@@ -245,7 +255,9 @@ impl<P: FrameProcessor> Pipeline<P> {
         }
     }
 
-    /// Adds the echo reference stream (what the output device plays).
+    /// Adds the echo reference stream (what the output device plays; only
+    /// our PipeWire client has one).
+    #[cfg(target_os = "linux")]
     pub(crate) fn set_echo_reference(&mut self, reference: Option<CaptureSide>) {
         if let Some(r) = &reference {
             let need = r.converter.input_frames_max();
@@ -417,6 +429,26 @@ mod tests {
             "{queued}"
         );
         assert!(counters.snapshot().playback_drops > 0);
+    }
+
+    #[test]
+    fn the_recent_worst_wake_restarts_when_read() {
+        let counters = IoCounters::default();
+        let wake = |late_ns: u64| {
+            counters.captured_at_ns.store(1_000, Ordering::Relaxed);
+            counters.note_wake(1_000 + late_ns);
+        };
+        wake(3_000_000);
+        wake(200_000);
+        assert_eq!(counters.take_recent_max_wake_us(), 3_000);
+        assert_eq!(counters.take_recent_max_wake_us(), 0, "nothing since");
+        wake(400_000);
+        assert_eq!(counters.take_recent_max_wake_us(), 400);
+        let stats = counters.snapshot();
+        assert_eq!(
+            (stats.wakes, stats.late_wakes, stats.max_wake_us),
+            (3, 1, 3_000)
+        );
     }
 
     #[test]

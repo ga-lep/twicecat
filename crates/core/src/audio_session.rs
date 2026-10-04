@@ -173,6 +173,9 @@ impl AudioSession {
             Realtime::Granted { priority } => {
                 tracing::info!("audio processing runs at real-time priority {priority}")
             }
+            Realtime::GrantedBy(class) => {
+                tracing::info!("audio processing runs at real-time priority ({class})")
+            }
             Realtime::Refused(why) => {
                 tracing::warn!("audio processing runs at normal priority: {why}")
             }
@@ -425,6 +428,7 @@ async fn report(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut ticks = 0_u32;
     let mut scratch = tessera_audio::SILENCE;
+    let mut last_io = io.stats();
     loop {
         tokio::select! {
             _ = &mut stop => break,
@@ -466,12 +470,20 @@ async fn report(
             break;
         }
         if let Some(s) = stats {
+            let now = io.stats();
+            let since =
+                |now: u64, then: u64| u32::try_from(now.saturating_sub(then)).unwrap_or(u32::MAX);
             let stats = CoreEvent::AudioStats(AudioStats {
                 echo_return_loss_enhancement_db: s.chain.erle_db,
                 residual_echo_likelihood: s.chain.residual_echo_likelihood,
                 echo_delay_ms: s.chain.delay_ms,
                 processing_us: s.processing_us,
+                late_wakes: since(now.late_wakes, last_io.late_wakes),
+                max_wake_us: u32::try_from(io.take_recent_max_wake_us()).unwrap_or(u32::MAX),
+                capture_overruns: since(now.capture_overruns, last_io.capture_overruns),
+                playback_underruns: since(now.playback_underruns, last_io.playback_underruns),
             });
+            last_io = now;
             if events.send(stats).await.is_err() {
                 break;
             }

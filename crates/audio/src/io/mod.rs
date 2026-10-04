@@ -13,16 +13,11 @@ use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig, SupportedStreamConfig};
+mod cpal;
 
 use crate::AudioError;
-use crate::convert::{downmix, upmix};
 use crate::frame::{Frame, SAMPLE_RATE, SILENCE};
-use crate::pipeline::{
-    CaptureSide, FrameProcessor, IoCounters, IoStats, Pipeline, PlaybackSide, capture_ring_len,
-    playback_ring_len,
-};
+use crate::pipeline::{FrameProcessor, IoCounters, IoStats, Pipeline};
 
 /// Which devices to open. A device ID comes from [`crate::DeviceInfo::id`];
 /// `None` follows the system default.
@@ -70,11 +65,14 @@ pub struct IoInfo {
 }
 
 /// Whether the processing thread runs with real-time priority, which keeps
-/// it on time when the CPU is busy (a game). Asked for through PipeWire
-/// (Linux); `TESSERA_AUDIO_REALTIME=0` turns the request off.
+/// it on time when the CPU is busy (a game). Asked for through PipeWire on
+/// Linux, through the system's audio scheduling on Windows (MMCSS) and macOS
+/// (the time-constraint policy); `TESSERA_AUDIO_REALTIME=0` turns the
+/// request off.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum Realtime {
-    /// Not asked for: no PipeWire, a virtual device, or turned off.
+    /// Not asked for: Linux without PipeWire, a virtual device, or turned
+    /// off.
     #[default]
     NotRequested,
     /// Granted, at this priority.
@@ -82,6 +80,9 @@ pub enum Realtime {
         /// The thread's real-time priority (`SCHED_FIFO`/`SCHED_RR`).
         priority: u32,
     },
+    /// Granted by a scheduling class with no single priority number, named
+    /// here (Windows' MMCSS, macOS's time-constraint policy).
+    GrantedBy(&'static str),
     /// Asked for and refused; why. Processing runs at normal priority.
     Refused(String),
 }
@@ -146,7 +147,7 @@ impl AudioIo {
             let counters = counters.clone();
             std::thread::Builder::new()
                 .name("tessera-audio-io".into())
-                .spawn(move || run(config, processor, stop, counters, events_tx, ready_tx))
+                .spawn(move || cpal::run(config, processor, stop, counters, events_tx, ready_tx))
                 .map_err(|_| AudioError::Internal)?
         };
         let info = match ready_rx.recv() {
@@ -194,8 +195,7 @@ impl AudioIo {
             crate::pw::spawn_thread(utils, "tessera-voice", move || {
                 crate::denormals::flush_denormals_on_this_thread();
                 counters.set_processing_thread();
-                let wanted = std::env::var_os("TESSERA_AUDIO_REALTIME").is_none_or(|v| v != "0");
-                let realtime = if wanted {
+                let realtime = if realtime_wanted() {
                     crate::pw::make_current_realtime(utils)
                 } else {
                     Realtime::NotRequested
@@ -286,6 +286,12 @@ impl AudioIo {
         self.counters.snapshot()
     }
 
+    /// The longest time from captured audio to processing it since the
+    /// previous call, microseconds (0: no wake since).
+    pub fn take_recent_max_wake_us(&self) -> u64 {
+        self.counters.take_recent_max_wake_us()
+    }
+
     /// The next pending event, if any.
     pub fn try_event(&self) -> Option<IoEvent> {
         self.events.try_recv().ok()
@@ -325,52 +331,10 @@ impl Worker {
     }
 }
 
-fn run(
-    config: IoConfig,
-    processor: impl FrameProcessor,
-    stop: Arc<AtomicBool>,
-    counters: Arc<IoCounters>,
-    events: mpsc::Sender<IoEvent>,
-    ready: mpsc::SyncSender<Result<IoInfo, AudioError>>,
-) {
-    // Everything that runs on this thread (the processor included) treats
-    // denormals as zero; see `denormals`.
-    crate::denormals::flush_denormals_on_this_thread();
-    counters.set_processing_thread();
-    let host = cpal::default_host();
-    let mut info = IoInfo::default();
-    let mut streams = Vec::new();
-    let mut capture = None;
-    let mut playback = None;
-    let opened = (|| {
-        if config.capture {
-            let (stream, side, stream_info) =
-                open_input(&host, config.input_device.as_deref(), &counters, &events)?;
-            streams.push(stream);
-            capture = Some(side);
-            info.input = Some(stream_info);
-        }
-        if config.playback {
-            let (stream, side, stream_info) =
-                open_output(&host, config.output_device.as_deref(), &counters, &events)?;
-            streams.push(stream);
-            playback = Some(side);
-            info.output = Some(stream_info);
-        }
-        for stream in &streams {
-            stream.play().map_err(|e| map_error(&e))?;
-        }
-        Ok(())
-    })();
-    if let Err(e) = opened {
-        let _ = ready.send(Err(e));
-        return;
-    }
-    let _ = ready.send(Ok(info));
-    let pipeline = Pipeline::new(capture, playback, processor, counters);
-    process(pipeline, &stop, &events);
-    // The streams stop when dropped, on the thread that created them.
-    drop(streams);
+/// Whether to ask for real-time priority (`TESSERA_AUDIO_REALTIME=0` says
+/// no).
+pub(super) fn realtime_wanted() -> bool {
+    std::env::var_os("TESSERA_AUDIO_REALTIME").is_none_or(|v| v != "0")
 }
 
 /// Runs the pipeline until `stop`: paced by the capture stream (its
@@ -409,256 +373,9 @@ fn process<P: FrameProcessor>(
 /// The longest the processing thread sleeps without being woken.
 const CAPTURE_WAIT: Duration = Duration::from_millis(50);
 
-fn map_error(e: &cpal::Error) -> AudioError {
-    match e.kind() {
-        cpal::ErrorKind::PermissionDenied => AudioError::PermissionDenied,
-        cpal::ErrorKind::DeviceNotAvailable => AudioError::DeviceNotFound,
-        cpal::ErrorKind::DeviceBusy => AudioError::DeviceBusy,
-        cpal::ErrorKind::UnsupportedConfig => AudioError::UnsupportedFormat,
-        _ => AudioError::Backend,
-    }
-}
-
-/// The configured device, else the default (reporting the fallback).
-fn pick(
-    host: &cpal::Host,
-    id: Option<&str>,
-    input: bool,
-    events: &mpsc::Sender<IoEvent>,
-) -> Result<cpal::Device, AudioError> {
-    if let Some(id) = id {
-        let found = id
-            .parse::<cpal::DeviceId>()
-            .ok()
-            .and_then(|id| host.device_by_id(&id))
-            .filter(|d| {
-                if input {
-                    d.supports_input()
-                } else {
-                    d.supports_output()
-                }
-            });
-        if let Some(device) = found {
-            return Ok(device);
-        }
-        let _ = events.send(IoEvent::FellBackToDefault { input });
-    }
-    let default = if input {
-        host.default_input_device()
-    } else {
-        host.default_output_device()
-    };
-    default.ok_or(AudioError::NoDevice)
-}
-
-/// 10 ms device buffers (one frame) when the device reports its range;
-/// PipeWire turns this into the stream's `node.latency`. The host's default
-/// otherwise, which can be far larger.
-fn ten_ms_buffer(range: &cpal::SupportedBufferSize, rate: u32) -> cpal::BufferSize {
-    match *range {
-        cpal::SupportedBufferSize::Range { min, max } if min <= max => {
-            cpal::BufferSize::Fixed((rate / 100).clamp(min, max))
-        }
-        _ => cpal::BufferSize::Default,
-    }
-}
-
-/// The device's default format, moved to 48 kHz when the device supports
-/// that rate with the same format and channels (no resampling then).
-fn prefer_48k(
-    default: SupportedStreamConfig,
-    supported: impl Iterator<Item = cpal::SupportedStreamConfigRange>,
-) -> SupportedStreamConfig {
-    if default.sample_rate() == SAMPLE_RATE {
-        return default;
-    }
-    supported
-        .filter(|r| {
-            r.sample_format() == default.sample_format() && r.channels() == default.channels()
-        })
-        .find(|r| r.min_sample_rate() <= SAMPLE_RATE && SAMPLE_RATE <= r.max_sample_rate())
-        .map(|r| r.with_sample_rate(SAMPLE_RATE))
-        .unwrap_or(default)
-}
-
-fn stream_info(device: &cpal::Device, config: &StreamConfig) -> StreamInfo {
-    let device_id = device.id().map(|id| id.to_string()).unwrap_or_default();
-    let device_name = device
-        .description()
-        .map(|d| d.name().to_owned())
-        .unwrap_or_else(|_| device_id.clone());
-    StreamInfo {
-        device_id,
-        device_name,
-        sample_rate: config.sample_rate,
-        channels: config.channels,
-    }
-}
-
-type Opened<S> = (cpal::Stream, S, StreamInfo);
-
-fn open_input(
-    host: &cpal::Host,
-    id: Option<&str>,
-    counters: &Arc<IoCounters>,
-    events: &mpsc::Sender<IoEvent>,
-) -> Result<Opened<CaptureSide>, AudioError> {
-    let device = pick(host, id, true, events)?;
-    let default = device.default_input_config().map_err(|e| map_error(&e))?;
-    let supported = device
-        .supported_input_configs()
-        .map_err(|e| map_error(&e))?;
-    let chosen = prefer_48k(default, supported);
-    let mut config = chosen.config();
-    config.buffer_size = ten_ms_buffer(chosen.buffer_size(), config.sample_rate);
-    let (producer, consumer) = rtrb::RingBuffer::new(capture_ring_len(config.sample_rate));
-    macro_rules! build {
-        ($t:ty) => {
-            build_input::<$t>(&device, config, producer, counters.clone(), events.clone())
-        };
-    }
-    let stream = match chosen.sample_format() {
-        SampleFormat::F32 => build!(f32),
-        SampleFormat::I16 => build!(i16),
-        SampleFormat::I32 => build!(i32),
-        SampleFormat::U16 => build!(u16),
-        SampleFormat::I8 => build!(i8),
-        SampleFormat::U8 => build!(u8),
-        _ => Err(AudioError::UnsupportedFormat),
-    }?;
-    let side = CaptureSide::new(consumer, config.sample_rate)?;
-    Ok((stream, side, stream_info(&device, &config)))
-}
-
-fn open_output(
-    host: &cpal::Host,
-    id: Option<&str>,
-    counters: &Arc<IoCounters>,
-    events: &mpsc::Sender<IoEvent>,
-) -> Result<Opened<PlaybackSide>, AudioError> {
-    let device = pick(host, id, false, events)?;
-    let default = device.default_output_config().map_err(|e| map_error(&e))?;
-    let supported = device
-        .supported_output_configs()
-        .map_err(|e| map_error(&e))?;
-    let chosen = prefer_48k(default, supported);
-    let mut config = chosen.config();
-    config.buffer_size = ten_ms_buffer(chosen.buffer_size(), config.sample_rate);
-    let (producer, consumer) = rtrb::RingBuffer::new(playback_ring_len(config.sample_rate));
-    macro_rules! build {
-        ($t:ty) => {
-            build_output::<$t>(&device, config, consumer, counters.clone(), events.clone())
-        };
-    }
-    let stream = match chosen.sample_format() {
-        SampleFormat::F32 => build!(f32),
-        SampleFormat::I16 => build!(i16),
-        SampleFormat::I32 => build!(i32),
-        SampleFormat::U16 => build!(u16),
-        SampleFormat::I8 => build!(i8),
-        SampleFormat::U8 => build!(u8),
-        _ => Err(AudioError::UnsupportedFormat),
-    }?;
-    let side = PlaybackSide::new(producer, config.sample_rate)?;
-    Ok((stream, side, stream_info(&device, &config)))
-}
-
-fn build_input<T>(
-    device: &cpal::Device,
-    config: StreamConfig,
-    mut ring: rtrb::Producer<f32>,
-    counters: Arc<IoCounters>,
-    events: mpsc::Sender<IoEvent>,
-) -> Result<cpal::Stream, AudioError>
-where
-    T: SizedSample,
-    f32: FromSample<T>,
-{
-    let channels = usize::from(config.channels);
-    device
-        .build_input_stream::<T, _, _>(
-            config,
-            // Real-time: no allocation, no locks.
-            move |data: &[T], _| {
-                downmix(data, channels, |s| {
-                    if ring.push(s).is_err() {
-                        counters.capture_overruns.fetch_add(1, Ordering::Relaxed);
-                    }
-                });
-                counters.captured(ring.buffer().capacity() - ring.slots());
-            },
-            move |e| {
-                let _ = events.send(IoEvent::StreamError {
-                    input: true,
-                    message: e.to_string(),
-                });
-            },
-            None,
-        )
-        .map_err(|e| map_error(&e))
-}
-
-fn build_output<T>(
-    device: &cpal::Device,
-    config: StreamConfig,
-    mut ring: rtrb::Consumer<f32>,
-    counters: Arc<IoCounters>,
-    events: mpsc::Sender<IoEvent>,
-) -> Result<cpal::Stream, AudioError>
-where
-    T: SizedSample + FromSample<f32>,
-{
-    let channels = usize::from(config.channels);
-    device
-        .build_output_stream::<T, _, _>(
-            config,
-            // Real-time: no allocation, no locks.
-            move |out: &mut [T], _| {
-                upmix(out, channels, || {
-                    ring.pop().unwrap_or_else(|_| {
-                        counters.playback_underruns.fetch_add(1, Ordering::Relaxed);
-                        0.0
-                    })
-                });
-            },
-            move |e| {
-                let _ = events.send(IoEvent::StreamError {
-                    input: false,
-                    message: e.to_string(),
-                });
-            },
-            None,
-        )
-        .map_err(|e| map_error(&e))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn device_buffers_are_ten_ms_within_the_range() {
-        use cpal::{BufferSize, SupportedBufferSize as R};
-        let range = |min, max| R::Range { min, max };
-        assert_eq!(
-            ten_ms_buffer(&range(16, 8192), 48_000),
-            BufferSize::Fixed(480)
-        );
-        assert_eq!(
-            ten_ms_buffer(&range(16, 8192), 44_100),
-            BufferSize::Fixed(441)
-        );
-        assert_eq!(
-            ten_ms_buffer(&range(1024, 8192), 48_000),
-            BufferSize::Fixed(1024)
-        );
-        assert_eq!(
-            ten_ms_buffer(&range(64, 256), 48_000),
-            BufferSize::Fixed(256)
-        );
-        assert_eq!(ten_ms_buffer(&R::Unknown, 48_000), BufferSize::Default);
-        assert_eq!(ten_ms_buffer(&range(512, 256), 48_000), BufferSize::Default);
-    }
 
     #[test]
     fn nothing_to_open_is_an_error() {
@@ -693,23 +410,5 @@ mod tests {
         let frames = sent.len() / crate::FRAME_LEN;
         assert!((10..=30).contains(&frames), "{frames} frames in 200 ms");
         assert!(sent.iter().all(|s| *s == 0.5));
-    }
-
-    #[test]
-    #[ignore = "needs an audio output device; plays 300 ms of silence"]
-    fn opens_the_default_output_and_processes_frames() {
-        let io = AudioIo::start(
-            IoConfig {
-                playback: true,
-                ..IoConfig::default()
-            },
-            |_: &_, _: &mut _| {},
-        )
-        .expect("default output device");
-        std::thread::sleep(Duration::from_millis(300));
-        let stats = io.stats();
-        assert!(stats.frames >= 20, "{stats:?}");
-        assert!(io.info().output.is_some());
-        assert!(io.info().input.is_none());
     }
 }

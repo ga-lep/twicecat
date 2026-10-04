@@ -621,8 +621,10 @@ fn on_time_under_load() {
         })
         .collect();
     let before = io.stats();
+    io.take_recent_max_wake_us();
     std::thread::sleep(Duration::from_secs(5));
     let after = io.stats();
+    let worst_loaded = io.take_recent_max_wake_us();
     busy.store(false, Ordering::Relaxed);
     for thread in load {
         thread.join().unwrap();
@@ -635,13 +637,15 @@ fn on_time_under_load() {
     let frames = after.frames - before.frames;
     eprintln!(
         "{realtime:?}, {} busy threads: {frames} frames, {wakes} wakes, {late} over 1 ms, \
-         worst {} µs (whole run), capture overruns {}, playback underruns {}",
+         worst {worst_loaded} µs under load ({} µs whole run), capture overruns {}, \
+         playback underruns {}",
         cores * 2,
         after.max_wake_us,
         after.capture_overruns - before.capture_overruns,
         after.playback_underruns - before.playback_underruns,
     );
     assert!(frames > 400, "processing stalled: {after:?}");
+    assert!(worst_loaded > 0 && worst_loaded <= after.max_wake_us);
     if let Realtime::Granted { .. } = realtime {
         assert!(late * 100 <= wakes, "{late} of {wakes} wakes over 1 ms");
         assert_eq!(after.capture_overruns, before.capture_overruns);
