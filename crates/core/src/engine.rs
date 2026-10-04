@@ -676,6 +676,15 @@ async fn mark_read_task(timeline: Arc<Timeline>, fully_read: bool) -> Result<(),
     Ok(())
 }
 
+/// Moves only the private fully-read marker; no public receipt is sent.
+async fn move_marker_task(timeline: Arc<Timeline>) -> Result<(), CoreError> {
+    timeline
+        .mark_as_read(ReceiptType::FullyRead)
+        .await
+        .map(drop)
+        .map_err(|_| CoreError::Internal("the read marker could not be moved".into()))
+}
+
 /// Tells the room whether the user is typing.
 async fn typing_task(timeline: Arc<Timeline>, typing: bool) -> Result<(), CoreError> {
     timeline
@@ -944,6 +953,10 @@ impl Engine {
                     mark_read_task(timeline, fully_read)
                 })
                 .await;
+            }
+            Command::MoveReadMarker { room_id } => {
+                self.run_action(room_id, ActionKind::Receipt, move_marker_task)
+                    .await;
             }
             Command::SetTyping { room_id, typing } => {
                 self.run_action(room_id, ActionKind::Typing, |timeline| {
@@ -1897,6 +1910,12 @@ mod tests {
                 Command::MarkRead {
                     room_id: room.clone(),
                     fully_read: false,
+                },
+                ActionKind::Receipt,
+            ),
+            (
+                Command::MoveReadMarker {
+                    room_id: room.clone(),
                 },
                 ActionKind::Receipt,
             ),

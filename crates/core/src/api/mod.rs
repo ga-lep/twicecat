@@ -108,6 +108,12 @@ pub enum Command {
         /// Also move the read marker.
         fully_read: bool,
     },
+    /// Move only the private fully-read marker to the newest event, without
+    /// sending a public read receipt.
+    MoveReadMarker {
+        /// Room.
+        room_id: RoomId,
+    },
     /// Tell the room whether the user is typing.
     SetTyping {
         /// Room.
@@ -205,6 +211,10 @@ impl fmt::Debug for Command {
                 .debug_struct("MarkRead")
                 .field("room_id", room_id)
                 .field("fully_read", fully_read)
+                .finish(),
+            Self::MoveReadMarker { room_id } => f
+                .debug_struct("MoveReadMarker")
+                .field("room_id", room_id)
                 .finish(),
             Self::SetTyping { room_id, typing } => f
                 .debug_struct("SetTyping")
@@ -656,12 +666,13 @@ mod tests {
                 room_id: r.clone(),
                 fully_read: true,
             },
+            Command::MoveReadMarker { room_id: r.clone() },
             Command::SetTyping {
                 room_id: r,
                 typing: false,
             },
         ];
-        assert_eq!(cmds.len(), 5);
+        assert_eq!(cmds.len(), 6);
     }
 
     #[test]

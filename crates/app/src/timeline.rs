@@ -527,7 +527,7 @@ pub struct TimelineView {
     /// When the last receipt was sent.
     last_receipt_at: Option<Instant>,
     /// A timer for a delayed receipt is running.
-    receipt_timer_armed: bool,
+    pub(crate) receipt_timer_armed: bool,
     /// The offset of the last scroll operation the model asked for. Tasks are
     /// opaque, so tests read it here.
     pub last_scroll_request: Option<f32>,
@@ -624,8 +624,11 @@ impl TimelineView {
         if !at_bottom {
             return ReadStep::Idle;
         }
+        if !focused {
+            return ReadStep::Idle;
+        }
         self.bottom_seen = true;
-        if !focused || self.last_marked.as_deref() == Some(target.as_str()) {
+        if self.last_marked.as_deref() == Some(target.as_str()) {
             return ReadStep::Idle;
         }
         if let Some(sent) = self.last_receipt_at {
@@ -1831,9 +1834,13 @@ mod tests {
         assert!(!view.bottom_seen);
         let _ = view.scrolled(0.0, 600.0, 800.0);
         assert_eq!(view.read_step(false, t0), ReadStep::Idle);
-        assert!(view.bottom_seen, "the bottom was seen even without focus");
+        assert!(
+            !view.bottom_seen,
+            "an unfocused window has not seen the bottom"
+        );
         // Focus returns: now it is sent.
         assert_eq!(view.read_step(true, t0), ReadStep::Send);
+        assert!(view.bottom_seen);
     }
 
     #[test]

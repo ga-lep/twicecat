@@ -217,7 +217,7 @@ pub enum Message {
     /// The window gained or lost focus.
     WindowFocus(bool),
     /// The timer of a delayed read receipt ended.
-    ReadDue,
+    ReadDue(RoomId),
     /// **Retry** on a failed local echo.
     RetryRequested(String),
     /// **Discard** on a failed local echo.
@@ -480,7 +480,10 @@ impl App {
                 self.window_focused = focused;
                 self.read_receipt(Instant::now())
             }
-            Message::ReadDue => {
+            Message::ReadDue(room_id) => {
+                if self.selected.as_ref() != Some(&room_id) {
+                    return Task::none();
+                }
                 self.timeline.read_timer_fired();
                 self.read_receipt(Instant::now())
             }
@@ -1275,17 +1278,16 @@ impl App {
                 room_id,
                 fully_read: false,
             }),
-            timeline::ReadStep::Wait(after) => self.sink.timer(after, Message::ReadDue),
+            timeline::ReadStep::Wait(after) => self.sink.timer(after, Message::ReadDue(room_id)),
         }
     }
 
-    /// `MarkRead { fully_read: true }` for the room being left, when its
-    /// bottom was seen.
+    /// `MoveReadMarker` for the room being left, when its bottom was seen
+    /// with the window focused. Never a public receipt.
     fn move_read_marker(&mut self) -> Task<Message> {
         match &self.selected {
-            Some(room_id) if self.timeline.bottom_seen => self.send(Command::MarkRead {
+            Some(room_id) if self.timeline.bottom_seen => self.send(Command::MoveReadMarker {
                 room_id: room_id.clone(),
-                fully_read: true,
             }),
             _ => Task::none(),
         }
@@ -2898,11 +2900,45 @@ mod tests {
         let commands = drain(&mut rx);
         assert!(commands.iter().any(|c| matches!(
             c,
-            Command::MarkRead { room_id, fully_read: true } if *room_id == RoomId::from("!a:x")
+            Command::MoveReadMarker { room_id } if *room_id == RoomId::from("!a:x")
         )));
+        // Never a public receipt on the way out.
+        assert!(
+            !commands
+                .iter()
+                .any(|c| matches!(c, Command::MarkRead { .. }))
+        );
         // Leaving again without having seen any bottom sends nothing.
         let _ = app.update(Message::SelectRoom(RoomId::from("!a:x")));
         assert_eq!(marks(&drain(&mut rx)), Vec::<bool>::new());
+    }
+
+    #[test]
+    fn leaving_an_unfocused_room_sends_no_marker() {
+        let (mut app, mut rx) = main_app();
+        let _ = app.update(Message::WindowFocus(false));
+        append(&mut app, vec![message_item("a", "hi", false, ALL_ACTIONS)]);
+        let _ = app.update(Message::SelectRoom(RoomId::from("!b:x")));
+        let commands = drain(&mut rx);
+        assert!(
+            !commands
+                .iter()
+                .any(|c| matches!(c, Command::MarkRead { .. } | Command::MoveReadMarker { .. }))
+        );
+    }
+
+    #[test]
+    fn a_stale_read_timer_is_ignored() {
+        let (mut app, mut rx) = main_app();
+        append(&mut app, vec![message_item("a", "hi", false, ALL_ACTIONS)]);
+        let _ = drain(&mut rx);
+        let _ = app.update(Message::SelectRoom(RoomId::from("!b:x")));
+        let _ = drain(&mut rx);
+        app.timeline.receipt_timer_armed = true;
+        let _ = app.update(Message::ReadDue(RoomId::from("!a:x")));
+        assert!(app.timeline.receipt_timer_armed, "another room's timer");
+        let _ = app.update(Message::ReadDue(RoomId::from("!b:x")));
+        assert!(!app.timeline.receipt_timer_armed);
     }
 
     #[test]
