@@ -1,15 +1,17 @@
 //! Cleaning other people's voices (plan Task 16): which remote voices get a
-//! DeepFilterNet3 filter of their own on this device, within its limit, and
-//! each voice's status for the participant list. One per call, shared by its
-//! SFU connections (they feed one voice engine). The model is compiled once
-//! per call and each voice gets its own state; both are made off the audio
-//! thread, which only runs the filters.
+//! DeepFilterNet3 filter of their own on this device (at most
+//! `limits::CLEANING_FILTERS`), and each voice's status for the participant
+//! list. One per call, shared by its SFU connections (they feed one voice
+//! engine). The model is compiled once per call and each voice gets its own
+//! state; both are made off the audio thread. The engine runs the filters
+//! of voices that talk, at most `limits::CLEANED_VOICES` at once (voices set
+//! to always first, then the loudest), and rests those of quiet voices.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
-use tessera_audio::{CleanedFlag, DeepFilter, DeepFilterModel, SourceId};
+use tessera_audio::{CleaningFlag, DeepFilter, DeepFilterModel, SourceCleaning, SourceId};
 
 use super::media::{SharedFlags, user_of};
 use crate::api::{CleaningStatus, RemoteCleaning, SkipReason, UserId, VoiceCleaning, limits};
@@ -80,9 +82,11 @@ enum State {
 
 struct Entry {
     source: SourceId,
-    flag: CleanedFlag,
+    flag: CleaningFlag,
     joined: u64,
     state: State,
+    /// Told to the engine: cleaned first when too many talk at once.
+    priority: bool,
     /// When its filter was handed to the engine, which plugs it in on its
     /// next frame: before that the flag is still down.
     handed_over: Option<Instant>,
@@ -121,6 +125,12 @@ impl Cleaning {
         choices: BTreeMap<UserId, VoiceCleaning>,
         flags: SharedFlags,
     ) -> Self {
+        if let Some(voice) = &voice {
+            let _ = voice
+                .lock()
+                .expect("voice control lock")
+                .set_cleaning_slots(limits::CLEANED_VOICES);
+        }
         Self(Arc::new(Mutex::new(Inner {
             settings,
             choices,
@@ -138,7 +148,7 @@ impl Cleaning {
     }
 
     /// A remote voice started playing as `source`.
-    pub(crate) fn add(&self, identity: &str, source: SourceId, flag: CleanedFlag) {
+    pub(crate) fn add(&self, identity: &str, source: SourceId, flag: CleaningFlag) {
         {
             let mut inner = self.lock();
             let joined = inner.next_joined;
@@ -150,6 +160,7 @@ impl Cleaning {
                     flag,
                     joined,
                     state: State::Plain,
+                    priority: false,
                     handed_over: None,
                 },
             );
@@ -205,7 +216,7 @@ impl Cleaning {
             &inner.settings,
             &inner.choices,
             &voices,
-            limits::CLEANED_VOICES,
+            limits::CLEANING_FILTERS,
         );
         let ready = match &inner.model {
             Model::Ready(model) => Some(model.clone()),
@@ -214,7 +225,21 @@ impl Cleaning {
         let limit = inner.settings.attenuation_limit_db;
         let mut load_model = false;
         let mut create = Vec::new();
-        for (identity, entry) in &mut inner.voices {
+        let always: Vec<bool> = inner
+            .voices
+            .keys()
+            .map(|identity| {
+                inner.choices.get(&UserId::from(user_of(identity))) == Some(&VoiceCleaning::Always)
+            })
+            .collect();
+        for ((identity, entry), always) in inner.voices.iter_mut().zip(always) {
+            if entry.priority != always {
+                entry.priority = always;
+                let _ = voice
+                    .lock()
+                    .expect("voice control lock")
+                    .set_source_priority(entry.source, always);
+            }
             let clean = decisions.get(identity) == Some(&Decision::Clean);
             entry.state = match (clean, entry.state) {
                 (true, State::Plain | State::AwaitingModel) => match &ready {
@@ -343,8 +368,10 @@ impl Cleaning {
         None
     }
 
-    /// Notices filters that failed on the audio thread (it plays the voice
-    /// as it came and clears its flag), about once a second while any runs.
+    /// About once a second while any filter is plugged in: notices filters
+    /// that failed on the audio thread (it plays the voice as it came and
+    /// clears its flag), and republishes the statuses (a voice over the
+    /// limit of talkers shows it).
     fn watch_failures(&self) {
         let weak = Arc::downgrade(&self.0);
         tokio::spawn(async move {
@@ -362,7 +389,10 @@ impl Cleaning {
                     let mut failed = false;
                     for entry in inner.voices.values_mut() {
                         let started = entry.handed_over.is_none_or(|t| t.elapsed() >= START_GRACE);
-                        if entry.state == State::Cleaned && started && !entry.flag.get() {
+                        if entry.state == State::Cleaned
+                            && started
+                            && entry.flag.get() == SourceCleaning::None
+                        {
                             entry.state = State::Failed;
                             failed = true;
                         }
@@ -373,8 +403,8 @@ impl Cleaning {
                 };
                 if failed {
                     tracing::warn!("a voice's DeepFilterNet filter failed; it plays as it came");
-                    this.reconcile();
                 }
+                this.reconcile();
                 if !running {
                     return;
                 }
@@ -399,7 +429,12 @@ fn publish(inner: &Inner, decisions: &HashMap<String, Decision>) {
                 Decision::Off => CleaningStatus::Off,
                 Decision::Skip(reason) => CleaningStatus::Skipped(reason),
                 Decision::Clean => match entry.state {
-                    State::Cleaned => CleaningStatus::Cleaned,
+                    State::Cleaned => match entry.flag.get() {
+                        SourceCleaning::Running | SourceCleaning::Quiet => CleaningStatus::Cleaned,
+                        SourceCleaning::OverLimit => CleaningStatus::Skipped(SkipReason::Limit),
+                        // Handed over, not plugged in yet.
+                        SourceCleaning::None => CleaningStatus::Starting,
+                    },
                     State::Failed => CleaningStatus::Skipped(SkipReason::Unavailable),
                     State::AwaitingModel if missing => {
                         CleaningStatus::Skipped(SkipReason::Unavailable)

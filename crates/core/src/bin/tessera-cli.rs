@@ -72,7 +72,7 @@ CALLS (voice, MatrixRTC; joining opens the microphone and speakers):
                           toggles instead of holding
     /vol <n|user> <pct>   Playback volume of a participant (0-200 %, kept)
     /clean [on|off]       Clean the voices you hear with DeepFilterNet3 (up to
-                          4 at once; about 30 ms later; off by default)
+                          4 talking at once; about 30 ms later; off by default)
     /clean limit <dB>     Most noise removed from them (0-100)
     /clean <n|user> always|never|auto
                           Per person (kept); always comes first

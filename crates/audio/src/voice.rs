@@ -7,7 +7,7 @@
 //! levels, the transmit flag and counters come back through atomics.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use crate::chain::{CaptureChain, ChainSettings, ChainStats, LEVEL_FLOOR_DB};
 use crate::frame::{FRAME_LEN, Frame, SILENCE};
@@ -28,6 +28,42 @@ const RETIRED_LEN: usize = 32;
 
 /// Identifies a remote source (the core maps it to a participant).
 pub type SourceId = u64;
+
+/// A remote voice quieter than this (RMS, about -60 dBFS)...
+const QUIET_ENERGY: f32 = 1e-6;
+/// ...for this many frames in a row (300 ms) stops running its cleaner,
+/// until it is louder again: most voices in a call are silent most of the
+/// time, and the network is the cost.
+const QUIET_FRAMES: u32 = 30;
+/// Cleaners that run at once by default (voices talking at the same time).
+pub const CLEANING_SLOTS: usize = 4;
+
+/// What a remote voice's cleaner does, frame by frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SourceCleaning {
+    /// No cleaner (none set, or it failed).
+    None = 0,
+    /// The cleaner runs on this voice.
+    Running = 1,
+    /// The voice is quiet: its cleaner rests and the voice plays at the
+    /// cleaner's floor (its attenuation limit).
+    Quiet = 2,
+    /// More voices talk at once than cleaners may run
+    /// ([`VoiceControl::set_cleaning_slots`]): this one plays as it came.
+    OverLimit = 3,
+}
+
+impl SourceCleaning {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Running,
+            2 => Self::Quiet,
+            3 => Self::OverLimit,
+            _ => Self::None,
+        }
+    }
+}
 
 /// An `f32` in an atomic.
 #[derive(Debug, Default)]
@@ -64,7 +100,7 @@ pub struct SourceInput {
     ring: rtrb::Producer<f32>,
     level: Arc<AtomicF32>,
     dropped: Arc<AtomicU64>,
-    cleaned: Arc<AtomicBool>,
+    cleaning: Arc<AtomicU8>,
 }
 
 impl SourceInput {
@@ -88,27 +124,28 @@ impl SourceInput {
         self.dropped.load(Ordering::Relaxed)
     }
 
-    /// A cleaner runs on this voice (set with
-    /// [`VoiceControl::set_source_cleaner`]; false again if it failed).
-    pub fn cleaned(&self) -> bool {
-        self.cleaned.load(Ordering::Relaxed)
+    /// What this voice's cleaner did in the last frame (set with
+    /// [`VoiceControl::set_source_cleaner`]; `None` again if it failed).
+    pub fn cleaning(&self) -> SourceCleaning {
+        SourceCleaning::from_u8(self.cleaning.load(Ordering::Relaxed))
     }
 
-    /// [`cleaned`](Self::cleaned), readable by whoever manages the cleaners.
-    pub fn cleaned_flag(&self) -> CleanedFlag {
-        CleanedFlag(self.cleaned.clone())
+    /// [`cleaning`](Self::cleaning), readable by whoever manages the
+    /// cleaners.
+    pub fn cleaning_flag(&self) -> CleaningFlag {
+        CleaningFlag(self.cleaning.clone())
     }
 }
 
-/// Whether a cleaner runs on one remote voice; see
-/// [`SourceInput::cleaned_flag`].
+/// What one remote voice's cleaner does; see [`SourceInput::cleaning_flag`].
 #[derive(Clone, Debug)]
-pub struct CleanedFlag(Arc<AtomicBool>);
+pub struct CleaningFlag(Arc<AtomicU8>);
 
-impl CleanedFlag {
-    /// A cleaner runs (false before one is set and after one failed).
-    pub fn get(&self) -> bool {
-        self.0.load(Ordering::Relaxed)
+impl CleaningFlag {
+    /// As of the last frame (`None` before a cleaner is plugged in and after
+    /// one failed).
+    pub fn get(&self) -> SourceCleaning {
+        SourceCleaning::from_u8(self.0.load(Ordering::Relaxed))
     }
 }
 
@@ -143,7 +180,9 @@ enum Command {
     EnhancerAttenuation(f32),
     SourceVolume(SourceId, u16),
     SourceCleaner(SourceId, Option<Box<dyn crate::chain::Enhancer>>),
+    SourcePriority(SourceId, bool),
     CleanerAttenuation(f32),
+    CleaningSlots(usize),
     RemoveSource(SourceId),
 }
 
@@ -155,7 +194,19 @@ struct Source {
     dropped: Arc<AtomicU64>,
     /// Cleans this voice before it is mixed (DeepFilterNet3, Task 16).
     cleaner: Option<Box<dyn crate::chain::Enhancer>>,
-    cleaned: Arc<AtomicBool>,
+    cleaning: Arc<AtomicU8>,
+    /// Cleaned before others when too many talk at once.
+    priority: bool,
+    /// This frame's audio.
+    chunk: Frame,
+    /// Frames in a row below [`QUIET_ENERGY`].
+    quiet_frames: u32,
+    /// Smoothed energy (about 100 ms), to pick the loudest.
+    loudness: f32,
+    /// Its cleaner ran in the last frame (kept running while it talks).
+    running: bool,
+    /// Picked to run this frame.
+    selected: bool,
 }
 
 /// Levels and counters shared with [`VoiceControl`].
@@ -278,7 +329,7 @@ impl VoiceControl {
         let (producer, consumer) = rtrb::RingBuffer::new(SOURCE_RING_LEN);
         let level = Arc::new(AtomicF32::new(LEVEL_FLOOR_DB));
         let dropped = Arc::new(AtomicU64::new(0));
-        let cleaned = Arc::new(AtomicBool::new(false));
+        let cleaning = Arc::new(AtomicU8::new(0));
         let source = Source {
             id,
             ring: consumer,
@@ -286,7 +337,13 @@ impl VoiceControl {
             level: level.clone(),
             dropped: dropped.clone(),
             cleaner: None,
-            cleaned: cleaned.clone(),
+            cleaning: cleaning.clone(),
+            priority: false,
+            chunk: SILENCE,
+            quiet_frames: 0,
+            loudness: 0.0,
+            running: false,
+            selected: false,
         };
         if !self.send(Command::AddSource(Box::new(source))) {
             return None;
@@ -298,7 +355,7 @@ impl VoiceControl {
                 ring: producer,
                 level,
                 dropped,
-                cleaned,
+                cleaning,
             },
         ))
     }
@@ -323,6 +380,19 @@ impl VoiceControl {
     /// Sets every remote voice cleaner's attenuation limit, dB.
     pub fn set_cleaner_attenuation(&mut self, db: f32) -> bool {
         self.send(Command::CleanerAttenuation(db))
+    }
+
+    /// Cleans this voice before the others when more talk at once than
+    /// cleaners may run.
+    pub fn set_source_priority(&mut self, id: SourceId, priority: bool) -> bool {
+        self.send(Command::SourcePriority(id, priority))
+    }
+
+    /// How many cleaners run at once (voices talking at the same time;
+    /// default [`CLEANING_SLOTS`]). Quiet voices' cleaners rest and do not
+    /// count.
+    pub fn set_cleaning_slots(&mut self, slots: usize) -> bool {
+        self.send(Command::CleaningSlots(slots))
     }
 
     /// Removes a source (its [`SourceInput`] may be dropped too).
@@ -380,6 +450,12 @@ pub struct VoiceEngine {
     shared: Arc<Shared>,
     outgoing: rtrb::Producer<f32>,
     sources: Vec<Source>,
+    /// Scratch: the talking voices with a cleaner, this frame.
+    talking: Vec<usize>,
+    /// Cleaners that may run at once.
+    cleaning_slots: usize,
+    /// What a resting cleaner leaves of a quiet voice.
+    cleaner_floor: f32,
     muted: bool,
     deafened: bool,
     loopback: bool,
@@ -421,6 +497,9 @@ impl VoiceEngine {
             shared: shared.clone(),
             outgoing: out_tx,
             sources: Vec::with_capacity(16),
+            talking: Vec::with_capacity(16),
+            cleaning_slots: CLEANING_SLOTS,
+            cleaner_floor: floor_gain(100.0),
             muted: false,
             deafened: false,
             loopback: false,
@@ -465,7 +544,11 @@ impl VoiceEngine {
                 }
                 Command::SourceCleaner(id, cleaner) => {
                     if let Some(s) = self.sources.iter_mut().find(|s| s.id == id) {
-                        s.cleaned.store(cleaner.is_some(), Ordering::Relaxed);
+                        if cleaner.is_none() {
+                            s.cleaning
+                                .store(SourceCleaning::None as u8, Ordering::Relaxed);
+                        }
+                        s.running = false;
                         if let Some(old) = std::mem::replace(&mut s.cleaner, cleaner) {
                             retire(&mut self.retired, old);
                         }
@@ -474,11 +557,18 @@ impl VoiceEngine {
                         retire(&mut self.retired, cleaner);
                     }
                 }
+                Command::SourcePriority(id, priority) => {
+                    if let Some(s) = self.sources.iter_mut().find(|s| s.id == id) {
+                        s.priority = priority;
+                    }
+                }
                 Command::CleanerAttenuation(db) => {
+                    self.cleaner_floor = floor_gain(db);
                     for cleaner in self.sources.iter_mut().filter_map(|s| s.cleaner.as_mut()) {
                         cleaner.set_attenuation_limit(db);
                     }
                 }
+                Command::CleaningSlots(slots) => self.cleaning_slots = slots,
                 Command::RemoveSource(id) => {
                     if let Some(i) = self.sources.iter().position(|s| s.id == id) {
                         let mut source = self.sources.remove(i);
@@ -493,7 +583,7 @@ impl VoiceEngine {
 
     fn mix_sources(&mut self) {
         self.mix = SILENCE;
-        let mut chunk = SILENCE;
+        // This frame of every voice, and how loud it is.
         for source in &mut self.sources {
             // Trim a source that runs ahead of our clock.
             let queued = source.ring.slots();
@@ -504,7 +594,7 @@ impl VoiceEngine {
                 }
                 source.dropped.fetch_add(excess as u64, Ordering::Relaxed);
             }
-            let (filled, missing) = source.ring.pop_partial_slice(&mut chunk[..]);
+            let (filled, missing) = source.ring.pop_partial_slice(&mut source.chunk[..]);
             let got = filled.len();
             missing.fill(0.0);
             if got < FRAME_LEN {
@@ -512,23 +602,88 @@ impl VoiceEngine {
                     .source_underruns
                     .fetch_add((FRAME_LEN - got) as u64, Ordering::Relaxed);
             }
-            if let Some(cleaner) = source.cleaner.as_mut()
-                && cleaner.enhance(&mut chunk).is_err()
-            {
-                // The voice plays as it came; the owner sees `cleaned` drop.
-                source.cleaned.store(false, Ordering::Relaxed);
-                if let Some(cleaner) = source.cleaner.take() {
-                    retire(&mut self.retired, cleaner);
+            let energy = source.chunk.iter().map(|s| s * s).sum::<f32>() / FRAME_LEN as f32;
+            source.loudness = 0.9 * source.loudness + 0.1 * energy;
+            source.quiet_frames = if energy < QUIET_ENERGY {
+                source.quiet_frames.saturating_add(1)
+            } else {
+                0
+            };
+            source.selected = false;
+        }
+
+        // Which cleaners run: those of voices that talk, at most
+        // `cleaning_slots`; priority first, then those already running (no
+        // switching back and forth), then the loudest.
+        self.talking.clear();
+        self.talking.extend(
+            self.sources
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.cleaner.is_some() && s.quiet_frames < QUIET_FRAMES)
+                .map(|(i, _)| i),
+        );
+        if self.talking.len() > self.cleaning_slots {
+            let sources = &self.sources;
+            self.talking.sort_unstable_by(|&a, &b| {
+                let (a, b) = (&sources[a], &sources[b]);
+                (b.priority, b.running)
+                    .cmp(&(a.priority, a.running))
+                    .then(b.loudness.total_cmp(&a.loudness))
+            });
+            self.talking.truncate(self.cleaning_slots);
+        }
+        for &i in &self.talking {
+            self.sources[i].selected = true;
+        }
+
+        for source in &mut self.sources {
+            let state = match &source.cleaner {
+                None => SourceCleaning::None,
+                Some(_) if source.selected => SourceCleaning::Running,
+                Some(_) if source.quiet_frames >= QUIET_FRAMES => SourceCleaning::Quiet,
+                Some(_) => SourceCleaning::OverLimit,
+            };
+            let state = match (state, source.cleaner.as_mut()) {
+                (SourceCleaning::Running, Some(cleaner)) => {
+                    if cleaner.enhance(&mut source.chunk).is_ok() {
+                        SourceCleaning::Running
+                    } else {
+                        // The voice plays as it came; the owner sees it.
+                        if let Some(cleaner) = source.cleaner.take() {
+                            retire(&mut self.retired, cleaner);
+                        }
+                        SourceCleaning::None
+                    }
                 }
-            }
-            for s in &mut chunk {
+                (SourceCleaning::Quiet, _) => {
+                    // What the cleaner would leave of a quiet voice.
+                    for s in &mut source.chunk {
+                        *s *= self.cleaner_floor;
+                    }
+                    SourceCleaning::Quiet
+                }
+                (state, _) => state,
+            };
+            source.running = state == SourceCleaning::Running;
+            source.cleaning.store(state as u8, Ordering::Relaxed);
+            for s in &mut source.chunk {
                 *s *= source.gain;
             }
-            source.level.store(rms_db(&chunk));
-            for (m, s) in self.mix.iter_mut().zip(chunk.iter()) {
+            source.level.store(rms_db(&source.chunk));
+            for (m, s) in self.mix.iter_mut().zip(source.chunk.iter()) {
                 *m += s;
             }
         }
+    }
+}
+
+/// The gain that an attenuation limit of `db` leaves (100 dB or more: none).
+fn floor_gain(db: f32) -> f32 {
+    if db >= 100.0 {
+        0.0
+    } else {
+        10_f32.powf(-db.max(0.0) / 20.0)
     }
 }
 
@@ -732,7 +887,8 @@ mod tests {
             "{}",
             played[0]
         );
-        assert!(a.cleaned() && !b.cleaned());
+        assert_eq!(a.cleaning(), SourceCleaning::Running);
+        assert_eq!(b.cleaning(), SourceCleaning::None);
         assert_eq!(limit.load(Ordering::Relaxed), 30);
     }
 
@@ -758,7 +914,7 @@ mod tests {
         a.push(&[0.25; FRAME_LEN]);
         let played = run(&mut engine, &SILENCE);
         assert!(played.iter().all(|s| *s == 0.25));
-        assert!(!a.cleaned());
+        assert_eq!(a.cleaning(), SourceCleaning::None);
         assert_eq!(
             control.drop_retired(),
             2,
@@ -774,6 +930,103 @@ mod tests {
         run(&mut engine, &SILENCE);
         assert_eq!(control.drop_retired(), 1);
         assert_eq!(last_dropped.load(Ordering::Relaxed), 1);
+    }
+
+    /// Halves, and counts its calls.
+    struct Counting(Arc<AtomicU64>);
+
+    impl crate::Enhancer for Counting {
+        fn enhance(&mut self, frame: &mut Frame) -> Result<(), crate::AudioError> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            frame.iter_mut().for_each(|s| *s *= 0.5);
+            Ok(())
+        }
+        fn latency_samples(&self) -> usize {
+            0
+        }
+    }
+
+    fn counting() -> (Box<Counting>, Arc<AtomicU64>) {
+        let calls = Arc::new(AtomicU64::new(0));
+        (Box::new(Counting(calls.clone())), calls)
+    }
+
+    #[test]
+    fn a_quiet_voice_rests_its_cleaner_until_it_talks_again() {
+        let (mut engine, mut control, _out) = VoiceEngine::new(plain());
+        let (id, mut a) = control.add_source(100).unwrap();
+        let (cleaner, calls) = counting();
+        control.set_source_cleaner(id, Some(cleaner));
+        for _ in 0..5 {
+            a.push(&[0.1; FRAME_LEN]);
+            run(&mut engine, &SILENCE);
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 5);
+        // Quiet (-80 dBFS): the cleaner keeps running for 300 ms, then rests.
+        for _ in 0..40 {
+            a.push(&[1e-4; FRAME_LEN]);
+            run(&mut engine, &SILENCE);
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 5 + 29);
+        assert_eq!(a.cleaning(), SourceCleaning::Quiet);
+        a.push(&[1e-4; FRAME_LEN]);
+        let played = run(&mut engine, &SILENCE);
+        assert!(
+            played.iter().all(|s| *s == 0.0),
+            "the floor at a 100 dB limit"
+        );
+        control.set_cleaner_attenuation(20.0);
+        a.push(&[1e-4; FRAME_LEN]);
+        let played = run(&mut engine, &SILENCE);
+        assert!((played[0] - 1e-5).abs() < 1e-9, "-20 dB: {}", played[0]);
+        // Talking again: cleaned from the first loud frame.
+        a.push(&[0.1; FRAME_LEN]);
+        let played = run(&mut engine, &SILENCE);
+        assert_eq!(calls.load(Ordering::Relaxed), 5 + 29 + 1);
+        assert_eq!(a.cleaning(), SourceCleaning::Running);
+        assert!((played[0] - 0.05).abs() < 1e-6);
+    }
+
+    #[test]
+    fn over_the_limit_the_loudest_and_priority_voices_are_cleaned() {
+        let (mut engine, mut control, _out) = VoiceEngine::new(plain());
+        control.set_cleaning_slots(1);
+        let (a_id, mut a) = control.add_source(100).unwrap();
+        let (b_id, mut b) = control.add_source(100).unwrap();
+        let (ca, a_calls) = counting();
+        let (cb, b_calls) = counting();
+        control.set_source_cleaner(a_id, Some(ca));
+        control.set_source_cleaner(b_id, Some(cb));
+        let frame = |engine: &mut VoiceEngine, a: &mut SourceInput, b: &mut SourceInput, la, lb| {
+            a.push(&[la; FRAME_LEN]);
+            b.push(&[lb; FRAME_LEN]);
+            run(engine, &SILENCE);
+        };
+        // b is louder: it gets the one cleaner slot; a plays as it came.
+        frame(&mut engine, &mut a, &mut b, 0.1, 0.3);
+        assert_eq!(b.cleaning(), SourceCleaning::Running);
+        assert_eq!(a.cleaning(), SourceCleaning::OverLimit);
+        assert_eq!(a.level_db(), rms_db(&[0.1; FRAME_LEN]), "not cleaned");
+        // a gets louder, but b keeps its slot while it talks.
+        for _ in 0..20 {
+            frame(&mut engine, &mut a, &mut b, 0.5, 0.3);
+        }
+        assert_eq!(b.cleaning(), SourceCleaning::Running);
+        assert_eq!(a_calls.load(Ordering::Relaxed), 0);
+        // Priority wins at once.
+        control.set_source_priority(a_id, true);
+        frame(&mut engine, &mut a, &mut b, 0.1, 0.3);
+        assert_eq!(a.cleaning(), SourceCleaning::Running);
+        assert_eq!(b.cleaning(), SourceCleaning::OverLimit);
+        // b goes quiet: its rest does not count, and a keeps running.
+        for _ in 0..40 {
+            frame(&mut engine, &mut a, &mut b, 0.1, 0.0);
+        }
+        assert_eq!(b.cleaning(), SourceCleaning::Quiet);
+        assert_eq!(a.cleaning(), SourceCleaning::Running);
+        let b_before = b_calls.load(Ordering::Relaxed);
+        frame(&mut engine, &mut a, &mut b, 0.1, 0.0);
+        assert_eq!(b_calls.load(Ordering::Relaxed), b_before);
     }
 
     #[test]

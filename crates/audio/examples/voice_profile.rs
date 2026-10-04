@@ -260,12 +260,13 @@ fn chain(name: &str, s: ChainSettings, mic: &[f32], far: &[f32], frames: usize) 
 }
 
 /// The whole engine: commands, the mix of `sources` remote voices (the
-/// first `cleaned` of them cleaned by DeepFilterNet3, Task 16), the chain on
-/// the microphone, the outgoing ring.
+/// first `cleaned` of them cleaned by DeepFilterNet3, Task 16; only the
+/// first `talking` talk, the others send silence as a muted or gated voice
+/// does), the chain on the microphone, the outgoing ring.
 fn engine(
     name: &str,
     s: ChainSettings,
-    (sources, cleaned): (usize, usize),
+    (sources, cleaned, talking): (usize, usize, usize),
     mic: &[f32],
     frames: usize,
 ) {
@@ -292,7 +293,13 @@ fn engine(
     let remote: Vec<Vec<f32>> = (0..sources)
         .map(|k| {
             (0..FRAME_LEN * 50)
-                .map(|n| voice(n, 120.0 + 15.0 * k as f32, 3.0 + k as f32 * 0.3, 0.05))
+                .map(|n| {
+                    if k < talking {
+                        voice(n, 120.0 + 15.0 * k as f32, 3.0 + k as f32 * 0.3, 0.05)
+                    } else {
+                        0.0
+                    }
+                })
                 .collect()
         })
         .collect();
@@ -406,14 +413,23 @@ fn main() {
         onnx_cpu_network("network: ONNX Runtime CPU", frames);
     }
     let default = settings(true, true, true, NoiseMode::RnNoise);
-    for (sources, cleaned) in [(0, 0), (4, 0), (16, 0), (4, 1), (4, 4), (8, 8)] {
-        let name = if cleaned == 0 {
-            format!("engine: default, {sources} voices mixed")
-        } else {
-            format!("engine: default, {sources} voices, {cleaned} cleaned")
+    for (sources, cleaned, talking) in [
+        (0, 0, 0),
+        (4, 0, 4),
+        (16, 0, 16),
+        (4, 1, 4),
+        (4, 4, 4),
+        (8, 8, 8),
+        (8, 8, 2),
+        (16, 16, 1),
+    ] {
+        let name = match (cleaned, talking) {
+            (0, _) => format!("engine: default, {sources} voices mixed"),
+            (c, t) if t == sources => format!("engine: default, {sources} voices, {c} cleaned"),
+            (c, t) => format!("engine: {sources} voices, {c} cleaned, {t} talk"),
         };
         if only.as_deref().is_none_or(|o| name.contains(o)) {
-            engine(&name, default, (sources, cleaned), &mic, frames);
+            engine(&name, default, (sources, cleaned, talking), &mic, frames);
         }
     }
 }

@@ -175,7 +175,7 @@ impl Players {
                 continue;
             };
             let stream = NativeAudioStream::new(track.rtc_track(), SAMPLE_RATE as i32, 1);
-            let flag = input.cleaned_flag();
+            let flag = input.cleaning_flag();
             self.playing.insert(
                 identity.clone(),
                 (id, spawn_audio_task(read_track(stream, input))),

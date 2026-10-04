@@ -35,8 +35,8 @@ pub use gate::GateMode;
 pub use io::{AudioIo, IoConfig, IoEvent, IoInfo, Realtime, StreamInfo, VirtualDevice};
 pub use pipeline::{FrameProcessor, IoCounters, IoStats};
 pub use voice::{
-    CleanedFlag, Meters, OUTGOING_RING_LEN, Outgoing, SOURCE_RING_LEN, SourceId, SourceInput,
-    VoiceControl, VoiceEngine, VoiceStats,
+    CLEANING_SLOTS, CleaningFlag, Meters, OUTGOING_RING_LEN, Outgoing, SOURCE_RING_LEN,
+    SourceCleaning, SourceId, SourceInput, VoiceControl, VoiceEngine, VoiceStats,
 };
 
 /// Audio errors. Messages are fixed text: backend error text is not

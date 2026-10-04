@@ -149,9 +149,10 @@ pub enum CleaningStatus {
 pub enum SkipReason {
     /// Your per-person setting says never ([`VoiceCleaning::Never`]).
     Never,
-    /// This device already cleans as many voices as it can
-    /// ([`limits::CLEANED_VOICES`]); voices set to always come first, then
-    /// the earliest to join.
+    /// More people talk at once than this device cleans
+    /// ([`limits::CLEANED_VOICES`]; voices set to always come first, then the
+    /// loudest), or more voices are in the call than it keeps filters for
+    /// ([`limits::CLEANING_FILTERS`]; the earliest to join keep theirs).
     Limit,
     /// DeepFilterNet's model is not installed, or the filter failed.
     Unavailable,
@@ -187,7 +188,8 @@ pub enum VoiceCleaning {
     /// As the global switch says (the default; not stored).
     #[default]
     Automatic,
-    /// Clean this person's voice whenever cleaning is on, before others.
+    /// Clean this person's voice whenever cleaning is on, before others
+    /// when too many talk at once.
     Always,
     /// Never clean this person's voice.
     Never,
@@ -444,10 +446,14 @@ pub mod limits {
     pub const DF_ATTENUATION_DB: (f32, f32) = (0.0, 100.0);
     /// Length of a push-to-talk binding string, bytes.
     pub const PTT_BINDING_LEN: usize = 64;
-    /// Remote voices cleaned at once on the CPU (`RemoteCleaning`): each
-    /// costs about 0.3 ms per 10 ms frame on a desktop performance core and
-    /// 0.55 ms on an efficiency core, on the audio thread (Task 16).
+    /// Remote voices cleaned at the same time on the CPU (`RemoteCleaning`):
+    /// those talking at once; quiet voices' filters rest. Each running
+    /// filter costs about 0.3 ms per 10 ms frame on a desktop performance
+    /// core and 0.55 ms on an efficiency core, on the audio thread (Task 16).
     pub const CLEANED_VOICES: usize = 4;
+    /// Remote voices given a filter in one call (memory, and the time to
+    /// make each); beyond them, voices are not cleaned.
+    pub const CLEANING_FILTERS: usize = 16;
 }
 
 /// Clamps `v` into `range`; NaN becomes `fallback`.
