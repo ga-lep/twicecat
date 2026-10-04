@@ -33,6 +33,11 @@ pub(crate) struct Session {
 }
 
 impl Session {
+    /// The real-time module's thread utilities, if the context loaded it.
+    pub(crate) fn thread_utils(&self) -> Option<super::thread::ThreadUtils> {
+        super::thread::ThreadUtils::of(&self._context)
+    }
+
     pub(crate) fn connect() -> Result<Self, AudioError> {
         pw::init();
         let mainloop = MainLoopRc::new(None).map_err(|_| AudioError::Backend)?;

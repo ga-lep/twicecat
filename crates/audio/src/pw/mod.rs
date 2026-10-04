@@ -6,11 +6,13 @@
 mod graph;
 mod registry;
 mod streams;
+mod thread;
 
 use std::path::Path;
 
 pub(crate) use registry::{Watcher, list};
-pub(crate) use streams::open;
+pub(crate) use streams::{Streams, open};
+pub(crate) use thread::{PwThread, make_current_realtime, spawn as spawn_thread};
 
 /// Whether a PipeWire daemon's socket exists for this session.
 pub(crate) fn available() -> bool {

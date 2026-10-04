@@ -31,7 +31,7 @@ pub use dfn::{
 };
 pub use frame::{FRAME_LEN, Frame, SAMPLE_RATE, SILENCE};
 pub use gate::GateMode;
-pub use io::{AudioIo, IoConfig, IoEvent, IoInfo, StreamInfo, VirtualDevice};
+pub use io::{AudioIo, IoConfig, IoEvent, IoInfo, Realtime, StreamInfo, VirtualDevice};
 pub use pipeline::{FrameProcessor, IoCounters, IoStats};
 pub use voice::{
     Meters, OUTGOING_RING_LEN, Outgoing, SOURCE_RING_LEN, SourceId, SourceInput, VoiceControl,

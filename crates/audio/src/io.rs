@@ -65,6 +65,25 @@ pub struct IoInfo {
     pub output: Option<StreamInfo>,
     /// The echo reference stream (what the output device plays), if opened.
     pub echo_reference: Option<StreamInfo>,
+    /// The processing thread's scheduling.
+    pub realtime: Realtime,
+}
+
+/// Whether the processing thread runs with real-time priority, which keeps
+/// it on time when the CPU is busy (a game). Asked for through PipeWire
+/// (Linux); `TESSERA_AUDIO_REALTIME=0` turns the request off.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Realtime {
+    /// Not asked for: no PipeWire, a virtual device, or turned off.
+    #[default]
+    NotRequested,
+    /// Granted, at this priority.
+    Granted {
+        /// The thread's real-time priority (`SCHED_FIFO`/`SCHED_RR`).
+        priority: u32,
+    },
+    /// Asked for and refused; why. Processing runs at normal priority.
+    Refused(String),
 }
 
 /// Something the owner should know about; read with [`AudioIo::try_event`].
@@ -98,7 +117,10 @@ pub trait VirtualDevice: Send + 'static {
 /// Running audio I/O. Dropping it stops the streams and the thread.
 pub struct AudioIo {
     stop: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
+    thread: Option<Worker>,
+    /// Our PipeWire streams (their own thread), stopped after processing.
+    #[cfg(target_os = "linux")]
+    streams: Option<crate::pw::Streams>,
     counters: Arc<IoCounters>,
     events: mpsc::Receiver<IoEvent>,
     info: IoInfo,
@@ -110,6 +132,10 @@ impl AudioIo {
     pub fn start(config: IoConfig, processor: impl FrameProcessor) -> Result<Self, AudioError> {
         if !config.capture && !config.playback {
             return Err(AudioError::NothingToOpen);
+        }
+        #[cfg(target_os = "linux")]
+        if crate::pw::available() {
+            return Self::start_pipewire(&config, processor);
         }
         let stop = Arc::new(AtomicBool::new(false));
         let counters = Arc::new(IoCounters::default());
@@ -136,7 +162,55 @@ impl AudioIo {
         };
         Ok(Self {
             stop,
-            thread: Some(thread),
+            thread: Some(Worker::Std(thread)),
+            #[cfg(target_os = "linux")]
+            streams: None,
+            counters,
+            events,
+            info,
+        })
+    }
+
+    /// PipeWire: the streams first (their context loads PipeWire's
+    /// real-time module), then the processing thread, made through PipeWire
+    /// so that module can raise its priority.
+    #[cfg(target_os = "linux")]
+    fn start_pipewire(
+        config: &IoConfig,
+        processor: impl FrameProcessor,
+    ) -> Result<Self, AudioError> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let counters = Arc::new(IoCounters::default());
+        let (events_tx, events) = mpsc::channel();
+        let opened = crate::pw::open(config, &counters, &events_tx)?;
+        let mut info = opened.info;
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let thread = {
+            let stop = stop.clone();
+            let counters = counters.clone();
+            let (capture, playback, reference) =
+                (opened.capture, opened.playback, opened.reference);
+            let utils = opened.thread_utils;
+            crate::pw::spawn_thread(utils, "tessera-voice", move || {
+                crate::denormals::flush_denormals_on_this_thread();
+                counters.set_processing_thread();
+                let wanted = std::env::var_os("TESSERA_AUDIO_REALTIME").is_none_or(|v| v != "0");
+                let realtime = if wanted {
+                    crate::pw::make_current_realtime(utils)
+                } else {
+                    Realtime::NotRequested
+                };
+                let _ = ready_tx.send(realtime);
+                let mut pipeline = Pipeline::new(capture, playback, processor, counters);
+                pipeline.set_echo_reference(reference);
+                process(pipeline, &stop, &events_tx);
+            })?
+        };
+        info.realtime = ready_rx.recv().map_err(|_| AudioError::Internal)?;
+        Ok(Self {
+            stop,
+            thread: Some(Worker::PipeWire(thread)),
+            streams: Some(opened.streams),
             counters,
             events,
             info,
@@ -188,13 +262,16 @@ impl AudioIo {
         };
         Ok(Self {
             stop,
-            thread: Some(thread),
+            thread: Some(Worker::Std(thread)),
+            #[cfg(target_os = "linux")]
+            streams: None,
             counters,
             events,
             info: IoInfo {
                 input: Some(virtual_info.clone()),
                 output: Some(virtual_info),
                 echo_reference: None,
+                realtime: Realtime::NotRequested,
             },
         })
     }
@@ -218,8 +295,32 @@ impl AudioIo {
 impl Drop for AudioIo {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
+        self.counters.wake();
         if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+            thread.join();
+        }
+        // The streams stop after the thread that reads them (and, on
+        // PipeWire, after the processing thread the real-time module knows).
+        #[cfg(target_os = "linux")]
+        drop(self.streams.take());
+    }
+}
+
+/// The processing thread.
+enum Worker {
+    Std(JoinHandle<()>),
+    #[cfg(target_os = "linux")]
+    PipeWire(crate::pw::PwThread),
+}
+
+impl Worker {
+    fn join(self) {
+        match self {
+            Self::Std(thread) => {
+                let _ = thread.join();
+            }
+            #[cfg(target_os = "linux")]
+            Self::PipeWire(thread) => thread.join(),
         }
     }
 }
@@ -235,23 +336,7 @@ fn run(
     // Everything that runs on this thread (the processor included) treats
     // denormals as zero; see `denormals`.
     crate::denormals::flush_denormals_on_this_thread();
-    #[cfg(target_os = "linux")]
-    if crate::pw::available() {
-        let opened = match crate::pw::open(&config, &counters, &events) {
-            Ok(opened) => opened,
-            Err(e) => {
-                let _ = ready.send(Err(e));
-                return;
-            }
-        };
-        let _ = ready.send(Ok(opened.info));
-        let mut pipeline = Pipeline::new(opened.capture, opened.playback, processor, counters);
-        pipeline.set_echo_reference(opened.reference);
-        process(pipeline, &stop, &events);
-        // The streams stop when dropped (their own thread).
-        drop(opened.streams);
-        return;
-    }
+    counters.set_processing_thread();
     let host = cpal::default_host();
     let mut info = IoInfo::default();
     let mut streams = Vec::new();
@@ -288,8 +373,9 @@ fn run(
     drop(streams);
 }
 
-/// Runs the pipeline until `stop`: paced by the capture stream, or by a
-/// 10 ms timer without one.
+/// Runs the pipeline until `stop`: paced by the capture stream (its
+/// callback wakes this thread when audio comes), or by a 10 ms timer
+/// without one.
 fn process<P: FrameProcessor>(
     mut pipeline: Pipeline<P>,
     stop: &AtomicBool,
@@ -307,7 +393,10 @@ fn process<P: FrameProcessor>(
             Ok(0)
         };
         match ran {
-            Ok(0) => std::thread::sleep(Duration::from_millis(2)),
+            // Asleep until the capture callback wakes us; the timeout only
+            // bounds a missed wake (a stream that stopped delivering).
+            Ok(0) if pipeline.has_capture() => std::thread::park_timeout(CAPTURE_WAIT),
+            Ok(0) => std::thread::sleep(next_tick.saturating_duration_since(Instant::now())),
             Ok(_) => {}
             Err(e) => {
                 let _ = events.send(IoEvent::Stopped(e));
@@ -316,6 +405,9 @@ fn process<P: FrameProcessor>(
         }
     }
 }
+
+/// The longest the processing thread sleeps without being woken.
+const CAPTURE_WAIT: Duration = Duration::from_millis(50);
 
 fn map_error(e: &cpal::Error) -> AudioError {
     match e.kind() {
@@ -493,6 +585,7 @@ where
                         counters.capture_overruns.fetch_add(1, Ordering::Relaxed);
                     }
                 });
+                counters.captured(ring.buffer().capacity() - ring.slots());
             },
             move |e| {
                 let _ = events.send(IoEvent::StreamError {

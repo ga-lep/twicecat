@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use tessera_audio::{
     AudioIo, ChainSettings, DeepFilter, DeepFilterStatus, Frame, GateMode, IoConfig, IoEvent,
-    NoiseMode, NsLevel as AudioNsLevel, Outgoing, SourceId, SourceInput, VirtualDevice,
+    NoiseMode, NsLevel as AudioNsLevel, Outgoing, Realtime, SourceId, SourceInput, VirtualDevice,
     VoiceControl, VoiceEngine,
 };
 use tokio::sync::{mpsc, oneshot};
@@ -169,6 +169,15 @@ impl AudioSession {
         .await
         .map_err(|_| CoreError::Internal("audio start task failed".into()))?
         .map_err(audio_error)?;
+        match &io.info().realtime {
+            Realtime::Granted { priority } => {
+                tracing::info!("audio processing runs at real-time priority {priority}")
+            }
+            Realtime::Refused(why) => {
+                tracing::warn!("audio processing runs at normal priority: {why}")
+            }
+            Realtime::NotRequested => {}
+        }
         let control = Arc::new(Mutex::new(control));
         let (drain, handed_out) = match mode {
             Mode::MicTest { .. } => (Some(outgoing), None),

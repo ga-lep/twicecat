@@ -8,8 +8,10 @@
 //! The capture clock paces processing; without a microphone a 10 ms timer
 //! does.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::thread::Thread;
+use std::time::Instant;
 
 use crate::AudioError;
 use crate::frame::{FRAME_LEN, Frame, SILENCE};
@@ -50,7 +52,33 @@ pub struct IoCounters {
     pub playback_underruns: AtomicU64,
     /// Playback frames dropped: ring full, or ahead of the device clock.
     pub playback_drops: AtomicU64,
+    /// Times the processing thread woke to captured audio and ran frames.
+    pub wakes: AtomicU64,
+    /// Of those, the ones that started more than 1 ms after the audio came.
+    pub late_wakes: AtomicU64,
+    /// The longest time from captured audio to processing it, nanoseconds.
+    pub max_wake_ns: AtomicU64,
+    /// When the capture callback completed the oldest frame not yet
+    /// processed ([`now_ns`]; 0: none waiting).
+    captured_at_ns: AtomicU64,
+    /// Capture samples (at the device rate) the next frame needs, set by
+    /// the processing thread: the callback stamps the time a frame is
+    /// complete, not when part of one comes (device quanta are often not
+    /// 10 ms: 256 samples in the test daemon).
+    frame_need: AtomicUsize,
+    /// The processing thread, woken by the capture callback.
+    processing: OnceLock<Thread>,
 }
+
+/// Nanoseconds on a clock shared by the callbacks and the processing thread.
+fn now_ns() -> u64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    let nanos = EPOCH.get_or_init(Instant::now).elapsed().as_nanos();
+    u64::try_from(nanos).unwrap_or(u64::MAX)
+}
+
+/// A wake that starts this long after the audio came counts as late.
+const LATE_WAKE_NS: u64 = 1_000_000;
 
 /// A copy of [`IoCounters`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -63,6 +91,12 @@ pub struct IoStats {
     pub playback_underruns: u64,
     /// See [`IoCounters::playback_drops`].
     pub playback_drops: u64,
+    /// See [`IoCounters::wakes`].
+    pub wakes: u64,
+    /// See [`IoCounters::late_wakes`].
+    pub late_wakes: u64,
+    /// See [`IoCounters::max_wake_ns`], in microseconds.
+    pub max_wake_us: u64,
 }
 
 impl IoCounters {
@@ -73,7 +107,59 @@ impl IoCounters {
             capture_overruns: self.capture_overruns.load(Ordering::Relaxed),
             playback_underruns: self.playback_underruns.load(Ordering::Relaxed),
             playback_drops: self.playback_drops.load(Ordering::Relaxed),
+            wakes: self.wakes.load(Ordering::Relaxed),
+            late_wakes: self.late_wakes.load(Ordering::Relaxed),
+            max_wake_us: self.max_wake_ns.load(Ordering::Relaxed) / 1000,
         }
+    }
+
+    /// Called by the capture callback after it delivered audio, with the
+    /// ring's fill: notes the time when that completes a frame (unless an
+    /// older one is still waiting) and wakes the processing thread.
+    /// Real-time safe: atomics and, if the thread sleeps, one futex wake (no
+    /// allocation, no lock).
+    pub(crate) fn captured(&self, filled: usize) {
+        if filled < self.frame_need.load(Ordering::Relaxed) {
+            return;
+        }
+        let _ = self.captured_at_ns.compare_exchange(
+            0,
+            now_ns().max(1),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+        if let Some(thread) = self.processing.get() {
+            thread.unpark();
+        }
+    }
+
+    /// Wakes the processing thread (to see a stop).
+    pub(crate) fn wake(&self) {
+        if let Some(thread) = self.processing.get() {
+            thread.unpark();
+        }
+    }
+
+    /// Makes the calling thread the one [`captured`](Self::captured) wakes.
+    pub(crate) fn set_processing_thread(&self) {
+        let _ = self.processing.set(std::thread::current());
+    }
+
+    /// The processing thread woke at `woke_ns` and ran every frame waiting:
+    /// how long after the oldest of that audio came. (Audio delivered while
+    /// it ran may lose its stamp here: that wake then goes uncounted, never
+    /// counted wrong.)
+    fn note_wake(&self, woke_ns: u64) {
+        let at = self.captured_at_ns.swap(0, Ordering::Relaxed);
+        if at == 0 {
+            return;
+        }
+        let late = woke_ns.saturating_sub(at);
+        self.wakes.fetch_add(1, Ordering::Relaxed);
+        if late > LATE_WAKE_NS {
+            self.late_wakes.fetch_add(1, Ordering::Relaxed);
+        }
+        self.max_wake_ns.fetch_max(late, Ordering::Relaxed);
     }
 }
 
@@ -178,6 +264,7 @@ impl<P: FrameProcessor> Pipeline<P> {
     /// how many ran. Without a capture side it runs nothing (see
     /// [`tick`](Self::tick)).
     pub(crate) fn pump(&mut self) -> Result<usize, AudioError> {
+        let woke = now_ns();
         let mut ran = 0;
         loop {
             let Some(capture) = self.capture.as_mut() else {
@@ -185,6 +272,10 @@ impl<P: FrameProcessor> Pipeline<P> {
             };
             let need = capture.converter.input_frames_next();
             if capture.ring.slots() < need {
+                self.counters.frame_need.store(need, Ordering::Relaxed);
+                if ran > 0 {
+                    self.counters.note_wake(woke);
+                }
                 return Ok(ran);
             }
             let input = &mut self.scratch[..need];

@@ -38,6 +38,7 @@ context.spa-libs = {
     support.*       = support/libspa-support
 }
 context.modules = [
+    { name = libpipewire-module-rt flags = [ ifexists nofail ] }
     { name = libpipewire-module-protocol-native }
     { name = libpipewire-module-metadata }
     { name = libpipewire-module-spa-node-factory }
@@ -89,7 +90,8 @@ context.objects = [
 "#;
 
 /// The clients' configuration: without a session manager nobody configures
-/// stream ports, so the streams do it themselves (`auto-port-config`).
+/// stream ports, so the streams do it themselves (`auto-port-config`). The
+/// real-time module is loaded as in PipeWire's own `client.conf`.
 const CLIENT_CONFIG: &str = r#"
 context.properties = { log.level = 0 }
 context.spa-libs = {
@@ -97,6 +99,7 @@ context.spa-libs = {
     support.*       = support/libspa-support
 }
 context.modules = [
+    { name = libpipewire-module-rt flags = [ ifexists nofail ] }
     { name = libpipewire-module-protocol-native }
     { name = libpipewire-module-client-node }
     { name = libpipewire-module-adapter }
@@ -157,11 +160,17 @@ impl Daemon {
 /// In the outer run: starts a daemon, runs `test` again in a child pointed
 /// at it, and returns `true` (the caller returns). In the child: `false`.
 fn outer(test: &str) -> bool {
+    outer_with(test, &[])
+}
+
+/// [`outer`], with more environment for the child.
+fn outer_with(test: &str, env: &[(&str, &str)]) -> bool {
     if std::env::var_os(CHILD).is_some() {
         return false;
     }
     let daemon = Daemon::start();
     let status = Command::new(std::env::current_exe().unwrap())
+        .envs(env.iter().copied())
         .args([
             test,
             "--exact",
@@ -564,4 +573,98 @@ fn the_system_mix_reference_cancels_a_games_sound() {
         "the game reaches the microphone: {without}"
     );
     assert!(without - with > 20.0, "only {:.1} dB less", without - with);
+}
+
+/// Every core busy (twice over, at normal priority, as a game and its
+/// compilers might), while a call-like processor (about 150 µs per frame)
+/// runs for 5 s: how late the processing thread starts after the audio
+/// comes. Prints the numbers; asserts only that a granted real-time
+/// thread stays on time.
+fn on_time_under_load() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tessera_audio::Realtime;
+
+    let io = AudioIo::start(
+        IoConfig {
+            capture: true,
+            input_device: Some("pipewire:tessera-test-mic".into()),
+            playback: true,
+            output_device: Some("pipewire:tessera-test-mic".into()),
+            echo_reference: false,
+        },
+        move |capture: &Frame, playback: &mut Frame| {
+            let started = Instant::now();
+            let mut x = capture[0];
+            while started.elapsed() < Duration::from_micros(150) {
+                x = std::hint::black_box(x * 0.999 + 0.001);
+            }
+            playback[0] = x * 0.0;
+        },
+    )
+    .unwrap();
+    link("tessera-playback", "tessera-test-mic");
+    link("tessera-test-mic", "tessera-capture");
+    std::thread::sleep(Duration::from_millis(1000));
+
+    let busy = Arc::new(AtomicBool::new(true));
+    let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let load: Vec<_> = (0..cores * 2)
+        .map(|i| {
+            let busy = busy.clone();
+            std::thread::spawn(move || {
+                let mut x = i as f64;
+                while busy.load(Ordering::Relaxed) {
+                    x = std::hint::black_box(x.mul_add(1.000_001, 1e-9));
+                }
+            })
+        })
+        .collect();
+    let before = io.stats();
+    std::thread::sleep(Duration::from_secs(5));
+    let after = io.stats();
+    busy.store(false, Ordering::Relaxed);
+    for thread in load {
+        thread.join().unwrap();
+    }
+    let realtime = io.info().realtime.clone();
+    drop(io);
+
+    let wakes = after.wakes - before.wakes;
+    let late = after.late_wakes - before.late_wakes;
+    let frames = after.frames - before.frames;
+    eprintln!(
+        "{realtime:?}, {} busy threads: {frames} frames, {wakes} wakes, {late} over 1 ms, \
+         worst {} µs (whole run), capture overruns {}, playback underruns {}",
+        cores * 2,
+        after.max_wake_us,
+        after.capture_overruns - before.capture_overruns,
+        after.playback_underruns - before.playback_underruns,
+    );
+    assert!(frames > 400, "processing stalled: {after:?}");
+    if let Realtime::Granted { .. } = realtime {
+        assert!(late * 100 <= wakes, "{late} of {wakes} wakes over 1 ms");
+        assert_eq!(after.capture_overruns, before.capture_overruns);
+    }
+}
+
+#[test]
+#[ignore = "needs the pipewire binaries; runs a private daemon"]
+fn processing_stays_on_time_under_load_with_real_time_priority() {
+    if outer("processing_stays_on_time_under_load_with_real_time_priority") {
+        return;
+    }
+    on_time_under_load();
+}
+
+#[test]
+#[ignore = "needs the pipewire binaries; runs a private daemon"]
+fn processing_under_load_at_normal_priority_for_comparison() {
+    if outer_with(
+        "processing_under_load_at_normal_priority_for_comparison",
+        &[("TESSERA_AUDIO_REALTIME", "0")],
+    ) {
+        return;
+    }
+    on_time_under_load();
 }

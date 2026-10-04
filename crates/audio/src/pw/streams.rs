@@ -20,6 +20,7 @@ use pw::stream::{StreamFlags, StreamListener, StreamRc, StreamState};
 
 use super::graph::{self, StreamKind};
 use super::registry::{self, Session};
+use super::thread::ThreadUtils;
 use crate::AudioError;
 use crate::devices::{DeviceInfo, DeviceList};
 use crate::frame::SAMPLE_RATE;
@@ -51,6 +52,8 @@ pub(crate) struct Opened {
     /// What the output device plays, when asked for.
     pub reference: Option<CaptureSide>,
     pub info: IoInfo,
+    /// The real-time module's thread utilities, if the context loaded it.
+    pub thread_utils: Option<ThreadUtils>,
 }
 
 /// One direction to open.
@@ -170,7 +173,8 @@ pub(crate) fn open(
         })
         .map_err(|_| AudioError::Internal)?;
     match ready.recv() {
-        Ok(Ok(())) => Ok(Opened {
+        Ok(Ok(thread_utils)) => Ok(Opened {
+            thread_utils,
             streams: Streams {
                 stop,
                 thread: Some(thread),
@@ -205,6 +209,8 @@ enum Side {
 
 struct StreamData {
     side: Side,
+    /// The microphone: its audio paces (wakes) the processing thread.
+    paces: bool,
     counters: Arc<IoCounters>,
     events: mpsc::Sender<IoEvent>,
     streaming: bool,
@@ -261,6 +267,10 @@ fn capture(stream: &pw::stream::Stream, data: &mut StreamData) {
                 .capture_overruns
                 .fetch_add(1, Ordering::Relaxed);
         }
+    }
+    if data.paces && end > start {
+        data.counters
+            .captured(ring.buffer().capacity() - ring.slots());
     }
 }
 
@@ -337,7 +347,7 @@ fn run(
     counters: Arc<IoCounters>,
     events: mpsc::Sender<IoEvent>,
     stopped: pw::channel::Receiver<()>,
-    ready: mpsc::SyncSender<Result<(), AudioError>>,
+    ready: mpsc::SyncSender<Result<Option<ThreadUtils>, AudioError>>,
 ) {
     let session = match Session::connect() {
         Ok(session) => session,
@@ -388,6 +398,7 @@ fn run(
             .map_err(|_| AudioError::Backend)?;
             let data = StreamData {
                 side,
+                paces: plan.kind == StreamKind::Capture,
                 counters: counters.clone(),
                 events: events.clone(),
                 streaming: false,
@@ -419,7 +430,7 @@ fn run(
             }
         }
     }
-    let _ = ready.send(Ok(()));
+    let _ = ready.send(Ok(session.thread_utils()));
     let mainloop = session.mainloop.clone();
     let _stop = stopped.attach(session.mainloop.loop_(), move |()| mainloop.quit());
     session.mainloop.run();
