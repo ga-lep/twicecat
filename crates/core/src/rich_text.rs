@@ -283,6 +283,16 @@ fn mention_target(href: &str) -> Option<MentionTarget> {
     }
 }
 
+/// `#rrggbb` (either case) as red, green, blue; anything else is `None`.
+fn parse_hex_color(value: &str) -> Option<[u8; 3]> {
+    let hex = value.strip_prefix('#')?;
+    if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let byte = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
+    Some([byte(0)?, byte(2)?, byte(4)?])
+}
+
 /// The label of a mention with no text of its own: the user ID, or the room
 /// ID or alias (the app shows a known room's name instead).
 fn id_label(target: &MentionTarget) -> String {
@@ -772,6 +782,22 @@ impl Builder {
             "span" if blocks_ok && attr(el, "data-mx-spoiler").is_some() => {
                 self.spoiler(node, style, depth);
             }
+            // Text colour, as Element sends it (`/rainbow`, the colour
+            // picker): `data-mx-color` on `span` or `font`, or the older
+            // `font color`.
+            "span" | "font" => {
+                let color = attr(el, "data-mx-color")
+                    .or_else(|| (name == "font").then(|| attr(el, "color")).flatten())
+                    .and_then(|value| parse_hex_color(&value));
+                self.walk_children(
+                    node,
+                    TextStyle {
+                        color: color.or(style.color),
+                        ..style
+                    },
+                    depth,
+                );
+            }
             "pre" if blocks_ok => {
                 self.flush(true);
                 let mut code = collect_text(node, true);
@@ -1226,9 +1252,17 @@ mod tests {
     }
 
     #[test]
-    fn unknown_elements_are_unwrapped_and_colours_ignored() {
+    fn unknown_elements_are_unwrapped_and_only_matrix_colours_kept() {
+        // `data-mx-color` is kept (human decision at the Phase 3 checkpoint,
+        // replacing plan Q-"colours ignored"); a CSS `style` colour is not.
         let rt = from_html(include_str!("../tests/fixtures/html/unwrapped.html"), "x");
-        assert_rt(&rt, &[p(vec![t("red unknown nested blue")])]);
+        assert_rt(
+            &rt,
+            &[p(vec![
+                coloured("red", [0xff, 0x00, 0x00]),
+                t(" unknown nested blue"),
+            ])],
+        );
     }
 
     #[test]
@@ -1265,6 +1299,75 @@ mod tests {
             target,
             label: label.to_owned(),
         }
+    }
+
+    fn coloured(text: &str, rgb: [u8; 3]) -> Inline {
+        Inline::Text {
+            text: text.to_owned(),
+            style: TextStyle {
+                color: Some(rgb),
+                ..TextStyle::default()
+            },
+        }
+    }
+
+    #[test]
+    fn text_colours_are_kept_like_element() {
+        let rt = from_html(
+            r##"a<span data-mx-color="#FF0080">b<b>c</b></span><font color="#00e371">d</font><font data-mx-color="#102030">e</font>"##,
+            "abcde",
+        );
+        let bold_pink = Inline::Text {
+            text: "c".into(),
+            style: TextStyle {
+                bold: true,
+                color: Some([0xff, 0x00, 0x80]),
+                ..TextStyle::default()
+            },
+        };
+        assert_eq!(
+            first_inlines(&rt),
+            [
+                t("a"),
+                coloured("b", [0xff, 0x00, 0x80]),
+                bold_pink,
+                coloured("d", [0x00, 0xe3, 0x71]),
+                coloured("e", [0x10, 0x20, 0x30]),
+            ]
+            .as_slice()
+        );
+    }
+
+    #[test]
+    fn only_six_digit_hex_colours_are_kept() {
+        for bad in [
+            "red",
+            "#abc",
+            "#12345g",
+            "#1234567",
+            "javascript:x",
+            " #102030",
+            "",
+        ] {
+            let rt = from_html(&format!(r#"<span data-mx-color="{bad}">x</span>"#), "x");
+            assert_eq!(first_inlines(&rt), [t("x")].as_slice(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn elements_rainbow_arrives_in_colour() {
+        let rt = from_html(
+            &crate::outgoing::rainbow_html("this is a test message"),
+            "this is a test message",
+        );
+        let colours: std::collections::HashSet<_> = first_inlines(&rt)
+            .iter()
+            .filter_map(|i| match i {
+                Inline::Text { style, .. } => style.color,
+                _ => None,
+            })
+            .collect();
+        assert_eq!(colours.len(), 18, "one colour per letter");
     }
 
     #[test]

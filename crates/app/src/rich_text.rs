@@ -355,6 +355,13 @@ pub fn to_span(model: &SpanModel, theme: &Theme) -> Span<'static, LinkTarget> {
         let (background, border) = pill(weak, 3.0);
         span = span.background(background).border(border);
     }
+    // A sender's colour, made readable; links and pills set their own below.
+    if let Some([r, g, b]) = model.style.color {
+        span = span.color(theme::readable_on(
+            iced::Color::from_rgb8(r, g, b),
+            theme.palette().background,
+        ));
+    }
     match model.look {
         Look::Plain => {}
         Look::Link => {
@@ -824,6 +831,27 @@ mod tests {
         };
         assert_ne!(own.highlight, to_span(&other, &theme).highlight);
         assert!(to_span(by(Look::SpoilerPill), &theme).highlight.is_some());
+    }
+
+    #[test]
+    fn sender_colours_are_drawn_readably_but_not_on_links_or_pills() {
+        let theme = theme::theme_for(iced::theme::Mode::Dark);
+        let navy = SpanModel {
+            text: "x".into(),
+            style: TextStyle {
+                color: Some([0x00, 0x00, 0x80]),
+                ..TextStyle::default()
+            },
+            look: Look::Plain,
+            link: None,
+        };
+        let shown = to_span(&navy, &theme).color.expect("a colour");
+        assert!(theme::contrast(shown, theme.palette().background) >= 4.5);
+        let link = SpanModel {
+            look: Look::Link,
+            ..navy.clone()
+        };
+        assert_eq!(to_span(&link, &theme).color, Some(theme.palette().primary));
     }
 
     #[test]

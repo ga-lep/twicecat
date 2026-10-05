@@ -95,6 +95,35 @@ pub fn semantic(theme: &Theme) -> Semantic {
     }
 }
 
+/// Least contrast of text against its background, as every app colour meets.
+pub const MIN_TEXT_CONTRAST: f32 = 4.5;
+
+/// A colour set by a sender, made readable on `background`: kept as sent when
+/// it reaches [`MIN_TEXT_CONTRAST`], otherwise mixed toward white (on a dark
+/// background) or black (on a light one) in 5 % steps until it does.
+pub fn readable_on(color: Color, background: Color) -> Color {
+    if contrast(color, background) >= MIN_TEXT_CONTRAST {
+        return color;
+    }
+    let target = if luminance(background) < 0.18 {
+        Color::WHITE
+    } else {
+        Color::BLACK
+    };
+    for step in 1..=20u8 {
+        let t = f32::from(step) / 20.0;
+        let mixed = Color::from_rgb(
+            color.r + (target.r - color.r) * t,
+            color.g + (target.g - color.g) * t,
+            color.b + (target.b - color.b) * t,
+        );
+        if contrast(mixed, background) >= MIN_TEXT_CONTRAST {
+            return mixed;
+        }
+    }
+    target
+}
+
 /// WCAG 2.1 contrast ratio of two opaque colours, from 1.0 to 21.0.
 pub fn contrast(a: Color, b: Color) -> f32 {
     let (la, lb) = (luminance(a), luminance(b));
@@ -185,6 +214,32 @@ mod tests {
             assert_ne!(sem.message_hover, sem.message_highlight);
             assert_ne!(sem.message_hover, sem.selection);
         }
+    }
+
+    #[test]
+    fn sender_colours_are_made_readable_on_both_themes() {
+        for palette in [LIGHT, DARK] {
+            let bg = palette.background;
+            // Every rainbow hue plus the worst cases: white, black, near-bg.
+            let mut samples: Vec<Color> = (0..=255u8)
+                .step_by(15)
+                .flat_map(|v| {
+                    [
+                        Color::from_rgb8(v, 0, 255 - v),
+                        Color::from_rgb8(255, v, 0),
+                        Color::from_rgb8(0, 255 - v, v),
+                    ]
+                })
+                .collect();
+            samples.extend([Color::WHITE, Color::BLACK, bg]);
+            for c in samples {
+                let shown = readable_on(c, bg);
+                assert!(contrast(shown, bg) >= 4.5, "{c:?} on {bg:?} -> {shown:?}");
+            }
+        }
+        // A colour that is already readable is kept exactly.
+        let dark_red = Color::from_rgb8(0x9b, 0x00, 0x00);
+        assert_eq!(readable_on(dark_red, LIGHT.background), dark_red);
     }
 
     #[test]

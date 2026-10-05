@@ -367,6 +367,9 @@ pub struct TextStyle {
     pub underline: bool,
     /// Inline code.
     pub code: bool,
+    /// Text colour set by the sender (`data-mx-color` or `<font color>`), as
+    /// red, green, blue. The app may adjust it for readability.
+    pub color: Option<[u8; 3]>,
 }
 
 /// What a mention points at.
