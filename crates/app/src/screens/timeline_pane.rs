@@ -15,7 +15,7 @@ use iced::font::{Style as FontStyle, Weight};
 use iced::widget::{
     Column, Row, button, container, mouse_area, row, scrollable, sensor, space, stack, text,
 };
-use iced::{Background, Element, Fill, Font, Padding, Theme};
+use iced::{Background, Color, Element, Fill, Font, Padding, Theme};
 use tessera_core::api::{
     MessageDetails, MessageText, PaginationState, PlaceholderKind, ReactionGroup, SendStatus,
     StateChange, TimelineItem, TimelineItemKind, TypingUser, UserId,
@@ -200,7 +200,8 @@ fn row_content<'a, Tz: TimeZone>(
             if let Some(line) = receipts_row(items, i) {
                 content = content.push(line);
             }
-            let framed = framed(content.into(), continuation, details.highlighted);
+            let hovered = bar_visible(env.actions, &items[i].id);
+            let framed = framed(content.into(), continuation, details.highlighted, hovered);
             with_actions(&items[i].id, framed, buttons, env.actions)
         }
         TimelineItemKind::Placeholder {
@@ -225,7 +226,7 @@ fn row_content<'a, Tz: TimeZone>(
             if let Some(line) = receipts_row(items, i) {
                 content = content.push(line);
             }
-            framed(content.into(), continuation, false)
+            framed(content.into(), continuation, false, false)
         }
         TimelineItemKind::State {
             sender,
@@ -471,12 +472,26 @@ fn header<'a>(name: String, time: String) -> Element<'a, Message> {
         .into()
 }
 
-/// Pads a message row: indented, with less space above a continuation, on a
-/// highlight background when it mentions the user.
+/// The background of a message row: the mention highlight, else the hover
+/// background under the pointer (so each message of a run from one sender
+/// shows where it starts and ends), else none.
+pub fn row_background(sem: &theme::Semantic, highlighted: bool, hovered: bool) -> Option<Color> {
+    if highlighted {
+        Some(sem.message_highlight)
+    } else if hovered {
+        Some(sem.message_hover)
+    } else {
+        None
+    }
+}
+
+/// Pads a message row: indented, with less space above a continuation, on
+/// the [`row_background`].
 fn framed(
     content: Element<'_, Message>,
     continuation: bool,
     highlighted: bool,
+    hovered: bool,
 ) -> Element<'_, Message> {
     let padded = container(content).width(Fill).padding(Padding {
         top: if continuation {
@@ -488,16 +503,16 @@ fn framed(
         bottom: 0.0,
         left: INDENT_PX,
     });
-    if highlighted {
-        padded
-            .style(|theme: &Theme| container::Style {
-                background: Some(Background::Color(theme::semantic(theme).message_highlight)),
-                ..container::Style::default()
-            })
-            .into()
-    } else {
-        padded.into()
+    if !highlighted && !hovered {
+        return padded.into();
     }
+    padded
+        .style(move |theme: &Theme| container::Style {
+            background: row_background(&theme::semantic(theme), highlighted, hovered)
+                .map(Background::Color),
+            ..container::Style::default()
+        })
+        .into()
 }
 
 /// The name to show for a sender: the display name, sanitised and capped, or
@@ -1073,6 +1088,21 @@ mod tests {
         assert_eq!(
             echo_of(SendStatus::Failed, &recoverable),
             Echo::Failed { recoverable: true }
+        );
+    }
+
+    #[test]
+    fn a_hovered_row_gets_the_hover_background_and_a_mention_keeps_its_own() {
+        let sem = theme::LIGHT_SEMANTIC;
+        assert_eq!(row_background(&sem, false, false), None);
+        assert_eq!(row_background(&sem, false, true), Some(sem.message_hover));
+        assert_eq!(
+            row_background(&sem, true, false),
+            Some(sem.message_highlight)
+        );
+        assert_eq!(
+            row_background(&sem, true, true),
+            Some(sem.message_highlight)
         );
     }
 

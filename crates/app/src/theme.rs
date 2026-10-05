@@ -50,6 +50,8 @@ pub struct Semantic {
     pub selection: Color,
     /// Background of a timeline message that mentions the user.
     pub message_highlight: Color,
+    /// Background of the timeline message under the pointer.
+    pub message_hover: Color,
 }
 
 /// Semantic colours of the light theme.
@@ -61,6 +63,7 @@ pub const LIGHT_SEMANTIC: Semantic = Semantic {
     muted: color!(0x59636E),
     selection: color!(0xDDE1FA),
     message_highlight: color!(0xFFF1B8),
+    message_hover: color!(0xF3F4F6),
 };
 
 /// Semantic colours of the dark theme.
@@ -72,6 +75,7 @@ pub const DARK_SEMANTIC: Semantic = Semantic {
     muted: color!(0xA0A4AB),
     selection: color!(0x35385A),
     message_highlight: color!(0x3D3519),
+    message_hover: color!(0x2B2D31),
 };
 
 /// The theme for a system mode. `Mode::None` is light.
@@ -163,12 +167,23 @@ mod tests {
                     sem.message_highlight,
                 ),
                 ("muted/message highlight", sem.muted, sem.message_highlight),
+                ("text/message hover", palette.text, sem.message_hover),
+                ("muted/message hover", sem.muted, sem.message_hover),
                 ("primary/background", palette.primary, palette.background),
             ];
             for (what, fg, bg) in checks {
                 let ratio = contrast(fg, bg);
                 assert!(ratio >= 4.5, "{name} {what}: {ratio}");
             }
+        }
+    }
+
+    #[test]
+    fn the_hover_background_differs_from_the_others() {
+        for (palette, sem) in [(LIGHT, LIGHT_SEMANTIC), (DARK, DARK_SEMANTIC)] {
+            assert_ne!(sem.message_hover, palette.background);
+            assert_ne!(sem.message_hover, sem.message_highlight);
+            assert_ne!(sem.message_hover, sem.selection);
         }
     }
 
