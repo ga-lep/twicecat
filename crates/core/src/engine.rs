@@ -1845,7 +1845,7 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
-    use crate::api::{MessageKind, OutgoingMessage};
+    use crate::api::{MessageKind, OutgoingMessage, TextFormat};
 
     fn rid(n: &str) -> RoomId {
         RoomId::from(format!("!{n}:x"))
@@ -1859,6 +1859,7 @@ mod tests {
             mentions: Vec::new(),
             reply_to: None,
             kind: MessageKind::Text,
+            format: TextFormat::Markdown,
         };
         let item_id = || "i".to_owned();
         vec![

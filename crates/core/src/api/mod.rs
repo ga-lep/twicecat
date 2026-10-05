@@ -14,8 +14,8 @@ pub use types::{
     ItemActions, Member, MentionRef, MentionTarget, MessageDetails, MessageKind, MessagePreview,
     MessageText, OutgoingMessage, PaginationState, Password, PlaceholderKind, ReactionGroup,
     ReplyPreview, ReplyState, RichText, RoomId, RoomListQuery, RoomListTab, RoomSummary,
-    SendFailure, SendStatus, StateChange, SyncState, TextStyle, TimelineItem, TimelineItemKind,
-    TypingUser, UserId,
+    SendFailure, SendStatus, StateChange, SyncState, TextFormat, TextStyle, TimelineItem,
+    TimelineItemKind, TypingUser, UserId,
 };
 
 /// A request from the front end to the engine.
@@ -532,6 +532,7 @@ mod tests {
             }],
             reply_to: Some("item-1".into()),
             kind: MessageKind::Text,
+            format: TextFormat::Markdown,
         }
     }
 

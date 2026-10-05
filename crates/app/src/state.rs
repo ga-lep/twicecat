@@ -12,8 +12,8 @@ use iced::widget::{operation, scrollable};
 use iced::{Element, Subscription, Task, Theme, clipboard, system, window};
 use tessera_core::api::{
     ActionKind, Command, CoreError, CoreEvent, EventId, ListDiff, MessageDetails, MessageText,
-    Password, RoomId, RoomListQuery, RoomListTab, RoomSummary, SyncState, TimelineItem,
-    TimelineItemKind, TypingUser, UserId,
+    OutgoingMessage, Password, RoomId, RoomListQuery, RoomListTab, RoomSummary, SyncState,
+    TimelineItem, TimelineItemKind, TypingUser, UserId,
 };
 use tokio::sync::mpsc;
 
@@ -216,6 +216,10 @@ pub enum Message {
     LinkConfirmed,
     /// The user closed the link bar.
     LinkDismissed,
+    /// "Send as message" on the unknown-command bar.
+    CommandSendAnyway,
+    /// The unknown-command bar was closed; the text stays in the composer.
+    CommandCancelled,
     /// The system handler was started (or failed to start) for a link.
     LinkOpened {
         /// Whether the handler started without error.
@@ -305,6 +309,8 @@ pub struct App {
     pub window_focused: bool,
     /// The bar above the composer about a clicked link.
     pub link_bar: Option<LinkBar>,
+    /// The name of an unknown `/command` waiting for "Send as message".
+    pub command_bar: Option<String>,
     /// Set when the app decided to exit (the task itself is opaque to tests).
     pub exit_requested: bool,
 }
@@ -366,6 +372,7 @@ impl App {
             typing: Vec::new(),
             window_focused: true,
             link_bar: None,
+            command_bar: None,
             exit_requested: false,
         };
         let restore = app.send(Command::RestoreSession);
@@ -465,6 +472,20 @@ impl App {
             },
             Message::LinkDismissed => {
                 self.link_bar = None;
+                Task::none()
+            }
+            Message::CommandSendAnyway => {
+                self.command_bar = None;
+                match self.selected.clone() {
+                    Some(room_id) => match composer::as_text(&self.composer, &room_id) {
+                        Some(message) => self.send_composed(message),
+                        None => Task::none(),
+                    },
+                    None => Task::none(),
+                }
+            }
+            Message::CommandCancelled => {
+                self.command_bar = None;
                 Task::none()
             }
             Message::LinkOpened { ok } => {
@@ -1140,9 +1161,21 @@ impl App {
         let Some(room_id) = self.selected.clone() else {
             return Task::none();
         };
-        let Some(message) = composer::outgoing(&self.composer, &room_id) else {
-            return Task::none();
+        let message = match composer::outgoing(&self.composer, &room_id) {
+            composer::Outgoing::Send(message) => message,
+            composer::Outgoing::UnknownCommand(name) => {
+                self.command_bar = Some(name);
+                return Task::none();
+            }
+            composer::Outgoing::Nothing => return Task::none(),
         };
+        self.send_composed(message)
+    }
+
+    /// Sends `message` as a new message, a reply or an edit, as the composer
+    /// mode says, and resets the composer.
+    fn send_composed(&mut self, message: OutgoingMessage) -> Task<Message> {
+        self.command_bar = None;
         let command = match &self.composer.mode {
             composer::Mode::Edit(item_id) => Command::Edit {
                 item_id: item_id.clone(),
@@ -1196,10 +1229,12 @@ impl App {
         self.reset_link_state();
     }
 
-    /// Forgets revealed spoilers and the link bar of the room left.
+    /// Forgets revealed spoilers, the link bar and the unknown-command bar
+    /// of the room left.
     fn reset_link_state(&mut self) {
         self.revealed.clear();
         self.link_bar = None;
+        self.command_bar = None;
     }
 
     /// A click on a link, pill or spoiler (plan Q19). Nothing here opens
@@ -2875,6 +2910,60 @@ mod tests {
         let _ = app.update(Message::PickerOpened("theirs".into()));
         let _ = app.update(Message::PickerQuery(key("secret-query-x")));
         assert!(!format!("{app:?}").contains("secret-query-x"));
+    }
+
+    // ---- slash commands (as in Element) ----------------------------------
+
+    #[test]
+    fn an_unknown_command_asks_before_sending() {
+        let (mut app, mut rx) = main_app();
+        type_in(&mut app, "/foo bar");
+        let _ = app.update(Message::ComposerKey(ComposerKey::Send));
+        assert!(
+            send_commands(&drain(&mut rx)).is_empty(),
+            "nothing sent yet"
+        );
+        assert_eq!(app.command_bar.as_deref(), Some("foo"));
+        assert_eq!(app.composer.text(), "/foo bar", "the text stays");
+        let _ = app.update(Message::CommandSendAnyway);
+        let commands = drain(&mut rx);
+        match send_commands(&commands).as_slice() {
+            [Command::Send(m)] => {
+                assert_eq!(m.text.expose(), "/foo bar");
+                assert_eq!(m.format, tessera_core::api::TextFormat::Markdown);
+            }
+            other => panic!("expected one send, got {other:?}"),
+        }
+        assert!(app.command_bar.is_none());
+        assert_eq!(app.composer.text(), "");
+    }
+
+    #[test]
+    fn cancelling_an_unknown_command_keeps_the_text() {
+        let (mut app, mut rx) = main_app();
+        type_in(&mut app, "/foo");
+        let _ = app.update(Message::ComposerKey(ComposerKey::Send));
+        let _ = app.update(Message::CommandCancelled);
+        assert!(app.command_bar.is_none());
+        assert!(send_commands(&drain(&mut rx)).is_empty());
+        assert_eq!(app.composer.text(), "/foo");
+    }
+
+    #[test]
+    fn html_is_sent_as_html_and_the_bar_goes_with_the_room() {
+        let (mut app, mut rx) = main_app();
+        type_in(&mut app, "/html <b>hi</b>");
+        let _ = app.update(Message::ComposerKey(ComposerKey::Send));
+        let commands = drain(&mut rx);
+        assert!(matches!(
+            send_commands(&commands).as_slice(),
+            [Command::Send(m)] if m.format == tessera_core::api::TextFormat::Html
+        ));
+        type_in(&mut app, "/foo");
+        let _ = app.update(Message::ComposerKey(ComposerKey::Send));
+        assert!(app.command_bar.is_some());
+        let _ = app.update(Message::SelectRoom(RoomId::from("!b:x")));
+        assert!(app.command_bar.is_none());
     }
 
     // ---- jumping to a reply's original ------------------------------------

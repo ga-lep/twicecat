@@ -11,7 +11,9 @@ use std::time::{Duration, Instant};
 
 use iced::keyboard::{self, key};
 use iced::widget::text_editor::{self, Action, Binding, Cursor, Edit, KeyPress, Position, Status};
-use tessera_core::api::{Member, MentionRef, MessageKind, MessageText, OutgoingMessage, RoomId};
+use tessera_core::api::{
+    Member, MentionRef, MessageKind, MessageText, OutgoingMessage, RoomId, TextFormat,
+};
 
 use crate::emoji;
 use crate::state::Message;
@@ -797,28 +799,108 @@ impl Composer {
     }
 }
 
-/// The message to send, or `None` when there is nothing to send. Pure.
-pub fn outgoing(composer: &Composer, room_id: &RoomId) -> Option<OutgoingMessage> {
-    let text = composer.text();
-    let trimmed = text.trim_end();
-    let (kind, body) = if trimmed == "/me" {
-        return None;
-    } else if let Some(rest) = trimmed.strip_prefix("/me")
-        && rest.starts_with(char::is_whitespace)
-    {
-        (MessageKind::Emote, rest.trim_start())
-    } else {
-        (MessageKind::Text, trimmed)
+/// What Enter does with the composer text.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Outgoing {
+    /// Send this message.
+    Send(OutgoingMessage),
+    /// `/name` is no command Tessera knows: ask before sending the text as
+    /// a message (Element's "Unknown Command" question).
+    UnknownCommand(String),
+    /// Nothing to send.
+    Nothing,
+}
+
+impl Outgoing {
+    /// The message to send, if any.
+    pub fn message(self) -> Option<OutgoingMessage> {
+        match self {
+            Self::Send(message) => Some(message),
+            Self::UnknownCommand(_) | Self::Nothing => None,
+        }
+    }
+}
+
+/// The text split as Element does (element-web v1.12.30
+/// `editor/commands.tsx`, `slash-commands/SlashCommands.tsx`,
+/// `SendMessageComposer.tsx`): a leading `/` (not `//`) starts a command whose
+/// name runs to the first whitespace; `//` and `\/` send one slash as text.
+#[derive(Debug, PartialEq, Eq)]
+enum Parsed<'a> {
+    Markdown(&'a str),
+    Emote(&'a str),
+    Plain(&'a str),
+    Html(&'a str),
+    Unknown(&'a str),
+}
+
+fn parse_command(text: &str) -> Parsed<'_> {
+    if text.starts_with("//") || text.starts_with("\\/") {
+        return Parsed::Markdown(&text[1..]);
+    }
+    let Some(after) = text.strip_prefix('/') else {
+        return Parsed::Markdown(text);
     };
-    if body.is_empty() {
+    let (name, args) = match after.find(char::is_whitespace) {
+        Some(i) => (&after[..i], after[i..].trim_start()),
+        None => (after, ""),
+    };
+    match name {
+        "me" => Parsed::Emote(args),
+        "plain" => Parsed::Plain(args),
+        "html" => Parsed::Html(args),
+        _ => Parsed::Unknown(name),
+    }
+}
+
+/// What to do with the composer text: send it, ask about an unknown command,
+/// or nothing (blank text, or a command without its text). Pure.
+pub fn outgoing(composer: &Composer, room_id: &RoomId) -> Outgoing {
+    let text = composer.text();
+    let (kind, format, body) = match parse_command(text.trim_end()) {
+        Parsed::Markdown(body) => (MessageKind::Text, TextFormat::Markdown, body),
+        Parsed::Emote(body) => (MessageKind::Emote, TextFormat::Markdown, body),
+        Parsed::Plain(body) => (MessageKind::Text, TextFormat::Plain, body),
+        Parsed::Html(body) => (MessageKind::Text, TextFormat::Html, body),
+        Parsed::Unknown(name) => return Outgoing::UnknownCommand(name.to_owned()),
+    };
+    build(composer, room_id, kind, format, body).map_or(Outgoing::Nothing, Outgoing::Send)
+}
+
+/// The whole text as a markdown message, slash included: "Send as message"
+/// after an unknown command. `None` for blank text.
+pub fn as_text(composer: &Composer, room_id: &RoomId) -> Option<OutgoingMessage> {
+    let text = composer.text();
+    build(
+        composer,
+        room_id,
+        MessageKind::Text,
+        TextFormat::Markdown,
+        text.trim_end(),
+    )
+}
+
+fn build(
+    composer: &Composer,
+    room_id: &RoomId,
+    kind: MessageKind,
+    format: TextFormat,
+    body: &str,
+) -> Option<OutgoingMessage> {
+    if body.trim().is_empty() {
         return None;
     }
-    let mentions = composer
-        .mentions
-        .iter()
-        .filter(|m| body.contains(&m.label))
-        .cloned()
-        .collect();
+    // Pills come from markdown links, so only markdown can mention anyone.
+    let mentions = if format == TextFormat::Markdown {
+        composer
+            .mentions
+            .iter()
+            .filter(|m| body.contains(&m.label))
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
     let reply_to = match &composer.mode {
         Mode::Reply(id) => Some(id.clone()),
         Mode::Normal | Mode::Edit(_) => None,
@@ -829,6 +911,7 @@ pub fn outgoing(composer: &Composer, room_id: &RoomId) -> Option<OutgoingMessage
         mentions,
         reply_to,
         kind,
+        format,
     })
 }
 
@@ -1299,25 +1382,115 @@ mod tests {
 
     #[test]
     fn outgoing_trims_trailing_blank_lines_and_refuses_blank_text() {
-        let m = outgoing(&composer_with("**hi**\n\n  \n"), &room()).expect("text");
+        let m = outgoing(&composer_with("**hi**\n\n  \n"), &room())
+            .message()
+            .expect("text");
         assert_eq!(m.text.expose(), "**hi**");
         assert_eq!(m.room_id, room());
         assert_eq!(m.kind, MessageKind::Text);
         assert!(m.reply_to.is_none() && m.mentions.is_empty());
-        assert!(outgoing(&composer_with(""), &room()).is_none());
-        assert!(outgoing(&composer_with(" \n\t\n"), &room()).is_none());
+        assert!(outgoing(&composer_with(""), &room()).message().is_none());
+        assert!(
+            outgoing(&composer_with(" \n\t\n"), &room())
+                .message()
+                .is_none()
+        );
     }
 
     #[test]
     fn me_gives_an_emote() {
-        let m = outgoing(&composer_with("/me waves"), &room()).expect("emote");
+        let m = outgoing(&composer_with("/me waves"), &room())
+            .message()
+            .expect("emote");
         assert_eq!(m.kind, MessageKind::Emote);
         assert_eq!(m.text.expose(), "waves");
-        assert!(outgoing(&composer_with("/me "), &room()).is_none());
-        assert!(outgoing(&composer_with("/me"), &room()).is_none());
-        let plain = outgoing(&composer_with("/mean"), &room()).expect("text");
-        assert_eq!(plain.kind, MessageKind::Text);
-        assert_eq!(plain.text.expose(), "/mean");
+        assert!(
+            outgoing(&composer_with("/me "), &room())
+                .message()
+                .is_none()
+        );
+        assert!(outgoing(&composer_with("/me"), &room()).message().is_none());
+        // As in Element, `/mean` is not `/me` with an argument: it is an
+        // unknown command.
+        assert_eq!(
+            outgoing(&composer_with("/mean"), &room()),
+            Outgoing::UnknownCommand("mean".into())
+        );
+    }
+
+    fn sent(text: &str) -> OutgoingMessage {
+        outgoing(&composer_with(text), &room())
+            .message()
+            .unwrap_or_else(|| panic!("{text:?} sends nothing"))
+    }
+
+    #[test]
+    fn html_and_plain_commands_set_the_format_like_element() {
+        let html = sent(r#"/html <a href="https://matrix.org">click here</a>"#);
+        assert_eq!(html.format, TextFormat::Html);
+        assert_eq!(html.kind, MessageKind::Text);
+        assert_eq!(
+            html.text.expose(),
+            r#"<a href="https://matrix.org">click here</a>"#
+        );
+        let plain = sent("/plain **not bold**");
+        assert_eq!(plain.format, TextFormat::Plain);
+        assert_eq!(plain.text.expose(), "**not bold**");
+        assert_eq!(sent("**bold**").format, TextFormat::Markdown);
+        assert_eq!(sent("/me waves").format, TextFormat::Markdown);
+        assert!(
+            outgoing(&composer_with("/html"), &room())
+                .message()
+                .is_none()
+        );
+        assert!(
+            outgoing(&composer_with("/plain  "), &room())
+                .message()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn unknown_commands_ask_and_slashes_can_be_escaped() {
+        for (text, name) in [
+            ("/shrug", "shrug"),
+            ("/foo bar", "foo"),
+            ("/", ""),
+            ("/ME hi", "ME"),
+        ] {
+            assert_eq!(
+                outgoing(&composer_with(text), &room()),
+                Outgoing::UnknownCommand(name.into()),
+                "{text}"
+            );
+        }
+        // `//` and `\/` send one slash, as text.
+        assert_eq!(sent("//foo bar").text.expose(), "/foo bar");
+        assert_eq!(sent("\\/foo").text.expose(), "/foo");
+        assert_eq!(sent("a /foo").text.expose(), "a /foo");
+    }
+
+    #[test]
+    fn sending_an_unknown_command_anyway_sends_the_whole_text() {
+        let c = composer_with("/foo **bar**");
+        let m = as_text(&c, &room()).expect("text");
+        assert_eq!(m.text.expose(), "/foo **bar**");
+        assert_eq!(
+            (m.kind, m.format),
+            (MessageKind::Text, TextFormat::Markdown)
+        );
+        assert!(as_text(&composer_with("  "), &room()).is_none());
+    }
+
+    #[test]
+    fn commands_send_no_mentions() {
+        let now = Instant::now();
+        let mut c = Composer::new();
+        type_text(&mut c, "/plain @al", now);
+        c.set_members("al", vec![member("@alice:x", Some("Alice"))]);
+        let _ = c.pick(None, now);
+        let m = outgoing(&c, &room()).message().expect("plain");
+        assert!(m.mentions.is_empty());
     }
 
     #[test]
@@ -1330,13 +1503,13 @@ mod tests {
         type_text(&mut c, "and @bo", now);
         c.set_members("bo", vec![member("@bob:x", Some("Bob"))]);
         let _ = c.pick(None, now);
-        let both = outgoing(&c, &room()).expect("text");
+        let both = outgoing(&c, &room()).message().expect("text");
         assert_eq!(both.mentions.len(), 2);
         // Delete "@Bob " (5 characters).
         for _ in 0..5 {
             let _ = c.apply(Action::Edit(Edit::Backspace), now);
         }
-        let one = outgoing(&c, &room()).expect("text");
+        let one = outgoing(&c, &room()).message().expect("text");
         assert_eq!(one.mentions.len(), 1);
         assert_eq!(one.mentions[0].user_id, UserId::from("@alice:x"));
         assert_eq!(c.mentions.len(), 1, "the buffer edit also pruned the list");
@@ -1346,10 +1519,10 @@ mod tests {
     fn reply_mode_fills_reply_to_and_edit_mode_does_not() {
         let mut c = composer_with("hello");
         c.mode = Mode::Reply("item-7".into());
-        let m = outgoing(&c, &room()).expect("text");
+        let m = outgoing(&c, &room()).message().expect("text");
         assert_eq!(m.reply_to.as_deref(), Some("item-7"));
         c.mode = Mode::Edit("item-8".into());
-        let m = outgoing(&c, &room()).expect("text");
+        let m = outgoing(&c, &room()).message().expect("text");
         assert_eq!(m.reply_to, None);
     }
 

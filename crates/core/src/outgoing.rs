@@ -12,7 +12,7 @@ use matrix_sdk::ruma::events::room::message::{
 };
 use matrix_sdk::ruma::html::SanitizerConfig;
 
-use crate::api::{MentionRef, MessageKind, OutgoingMessage};
+use crate::api::{MentionRef, MessageKind, OutgoingMessage, TextFormat};
 
 /// Most start tags (`<` followed by a letter) a formatted body may hold. The
 /// sanitizer here and the receive mapper (`rich_text::from_html`) parse the
@@ -36,6 +36,36 @@ pub(crate) fn outgoing_content(
     message: &OutgoingMessage,
 ) -> RoomMessageEventContentWithoutRelation {
     let text = message.text.expose();
+    match message.format {
+        TextFormat::Markdown => {}
+        // As Element's `/plain` and `/html`: no markdown and no pills, so no
+        // mentions either.
+        TextFormat::Plain => {
+            return match message.kind {
+                MessageKind::Text => RoomMessageEventContentWithoutRelation::text_plain(text),
+                MessageKind::Notice => RoomMessageEventContentWithoutRelation::notice_plain(text),
+                MessageKind::Emote => RoomMessageEventContentWithoutRelation::emote_plain(text),
+            };
+        }
+        TextFormat::Html => {
+            let mut content = match message.kind {
+                MessageKind::Text => RoomMessageEventContentWithoutRelation::text_html(text, text),
+                MessageKind::Notice => {
+                    RoomMessageEventContentWithoutRelation::notice_html(text, text)
+                }
+                MessageKind::Emote => {
+                    RoomMessageEventContentWithoutRelation::emote_html(text, text)
+                }
+            };
+            match &mut content.msgtype {
+                MessageType::Text(t) => sanitize_formatted(&mut t.formatted),
+                MessageType::Notice(n) => sanitize_formatted(&mut n.formatted),
+                MessageType::Emote(e) => sanitize_formatted(&mut e.formatted),
+                _ => {}
+            }
+            return content;
+        }
+    }
     let (source, mentioned) = markdown_with_mentions(text, &message.mentions);
     let mut content = match message.kind {
         MessageKind::Text => RoomMessageEventContentWithoutRelation::text_markdown(source),
@@ -209,7 +239,7 @@ mod tests {
     use matrix_sdk::ruma::events::room::message::MessageType;
 
     use super::*;
-    use crate::api::{MentionRef, MessageKind, MessageText, RoomId, UserId};
+    use crate::api::{MentionRef, MessageKind, MessageText, RoomId, TextFormat, UserId};
 
     fn message(text: &str, mentions: Vec<MentionRef>, kind: MessageKind) -> OutgoingMessage {
         OutgoingMessage {
@@ -218,6 +248,7 @@ mod tests {
             mentions,
             reply_to: None,
             kind,
+            format: TextFormat::Markdown,
         }
     }
 
@@ -226,6 +257,46 @@ mod tests {
             label: label.to_owned(),
             user_id: UserId::from(user.to_owned()),
         }
+    }
+
+    fn formatted_as(text: &str, format: TextFormat) -> (String, Option<String>) {
+        let mut m = message(
+            text,
+            vec![mention("Bob", "@bob:localhost")],
+            MessageKind::Text,
+        );
+        m.format = format;
+        let content = outgoing_content(&m);
+        assert!(content.mentions.is_none(), "commands never ping");
+        text_parts(&content)
+    }
+
+    #[test]
+    fn plain_format_sends_the_text_without_markdown() {
+        let (body, html) = formatted_as("**not bold** Bob", TextFormat::Plain);
+        assert_eq!(body, "**not bold** Bob");
+        assert_eq!(html, None);
+    }
+
+    #[test]
+    fn html_format_sends_the_source_as_body_and_sanitised_html() {
+        let source =
+            r#"<a href="https://matrix.org">click here</a> *stars* <script>alert(1)</script>"#;
+        let (body, html) = formatted_as(source, TextFormat::Html);
+        assert_eq!(body, source, "Element sends the source as the body too");
+        let html = html.expect("an html body");
+        assert!(
+            html.contains(r#"<a href="https://matrix.org">click here</a>"#),
+            "{html}"
+        );
+        assert!(
+            !html.contains("script") && !html.contains("alert"),
+            "{html}"
+        );
+        assert!(
+            html.contains("*stars*") && !html.contains("<em>"),
+            "no markdown: {html}"
+        );
     }
 
     /// Body and formatted body of a text message.

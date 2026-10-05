@@ -73,6 +73,9 @@ fn room_pane(app: &App) -> Element<'_, Message> {
     if let Some(bar) = &app.link_bar {
         body = body.push(link_bar(bar));
     }
+    if let Some(name) = &app.command_bar {
+        body = body.push(command_bar(name));
+    }
     if let Some(error) = &app.send_error {
         body = body.push(text(error.as_str()).style(text::danger));
     }
@@ -264,6 +267,33 @@ pub fn link_bar_text(bar: &LinkBar) -> String {
     }
 }
 
+/// Longest command name shown in the unknown-command bar.
+const MAX_COMMAND_CHARS: usize = 64;
+
+/// What the unknown-command bar says (Element's wording).
+pub fn command_bar_text(name: &str) -> String {
+    format!(
+        "Unrecognised command: /{}. Begin your message with // to start it with a slash.",
+        one_line_capped(name, MAX_COMMAND_CHARS)
+    )
+}
+
+/// The bar above the composer about an unknown `/command`: send the text as a
+/// message, or go back to editing it.
+fn command_bar(name: &str) -> Element<'_, Message> {
+    let bar_row = row![
+        text(command_bar_text(name)),
+        space().width(Fill),
+        button(text("Send as message")).on_press(Message::CommandSendAnyway),
+        button(text("Cancel"))
+            .on_press(Message::CommandCancelled)
+            .style(button::secondary),
+    ]
+    .spacing(8)
+    .align_y(iced::Center);
+    container(bar_row).padding(4).into()
+}
+
 /// The bar above the composer about a clicked link.
 fn link_bar(bar: &LinkBar) -> Element<'_, Message> {
     let mut bar_row = row![text(link_bar_text(bar)), space().width(Fill)]
@@ -330,6 +360,16 @@ mod tests {
         assert_eq!(account_label(Some(&id)), "@a\u{FFFD}b:x");
         let long = UserId::from(format!("@{}:x", "u".repeat(1000)));
         assert_eq!(account_label(Some(&long)).chars().count(), 256);
+    }
+
+    #[test]
+    fn the_command_bar_names_the_command_and_gives_the_hint() {
+        let text = command_bar_text("foo");
+        assert!(text.contains("Unrecognised command: /foo"), "{text}");
+        assert!(text.contains("//"), "{text}");
+        let evil = command_bar_text(&format!("x\u{202E}{}", "y".repeat(200)));
+        assert!(!evil.contains('\u{202E}'));
+        assert!(evil.chars().count() < 160, "{}", evil.chars().count());
     }
 
     #[test]

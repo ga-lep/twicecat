@@ -538,6 +538,20 @@ pub enum MessageKind {
     Emote,
 }
 
+/// How the text of an [`OutgoingMessage`] is turned into an event (the
+/// composer's `/plain` and `/html` commands, as in Element).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TextFormat {
+    /// Markdown, with mention pills.
+    #[default]
+    Markdown,
+    /// The text as is, with no formatted body.
+    Plain,
+    /// The text is HTML: it is sent as the body and, sanitised, as the
+    /// formatted body.
+    Html,
+}
+
 /// Whether the quoted event of a reply could be loaded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReplyState {
@@ -839,6 +853,8 @@ pub struct OutgoingMessage {
     pub reply_to: Option<String>,
     /// Text, notice or emote.
     pub kind: MessageKind,
+    /// How `text` becomes the event's body.
+    pub format: TextFormat,
 }
 
 // Manual impl: the text and labels are user content.
@@ -850,6 +866,7 @@ impl fmt::Debug for OutgoingMessage {
             .field("mentions", &self.mentions.len())
             .field("reply_to", &self.reply_to.is_some())
             .field("kind", &self.kind)
+            .field("format", &self.format)
             .finish()
     }
 }

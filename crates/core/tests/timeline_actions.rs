@@ -15,7 +15,7 @@ use tessera_core::CoreHandle;
 use tessera_core::api::{
     ActionKind, Block, Command, CoreError, CoreEvent, Inline, ListDiff, MentionRef, MentionTarget,
     MessageKind, MessageText, OutgoingMessage, Password, PlaceholderKind, RoomId, RoomSummary,
-    SendStatus, SyncState, TimelineItem, TimelineItemKind, UserId,
+    SendStatus, SyncState, TextFormat, TimelineItem, TimelineItemKind, UserId,
 };
 use tessera_core::secrets::InMemorySecretStore;
 
@@ -115,6 +115,7 @@ fn outgoing(room: &str, text: &str) -> OutgoingMessage {
         mentions: Vec::new(),
         reply_to: None,
         kind: MessageKind::Text,
+        format: TextFormat::Markdown,
     }
 }
 
