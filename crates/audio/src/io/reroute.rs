@@ -1,0 +1,207 @@
+//! When a cpal stream must be reopened, and where (`io::cpal`). WASAPI
+//! never moves a stream itself: when its device goes away, or the default it
+//! should follow changes, the stream fails or stays behind, so the
+//! processing thread reopens it. Signals come from cpal's error callbacks
+//! and, on Windows, the MMDevice API's notifications (`crate::wasapi`); both
+//! run on other threads and only set flags here and wake the processing
+//! thread, which acts between frames.
+
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::thread::Thread;
+
+/// Where a direction's stream is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(super) enum Placement {
+    /// On the device the user chose; it stays there.
+    Chosen = 0,
+    /// On the default device, nothing being chosen; it follows the default.
+    Default = 1,
+    /// On the default device because the chosen one is gone; it goes back
+    /// when that one returns, and follows the default meanwhile.
+    FellBack = 2,
+    /// No stream: no device to open.
+    Missing = 3,
+}
+
+impl Placement {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            0 => Self::Chosen,
+            1 => Self::Default,
+            2 => Self::FellBack,
+            _ => Self::Missing,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Side {
+    placement: AtomicU8,
+    /// Reopen at the next chance.
+    requested: AtomicBool,
+    /// Devices changed: see whether a displaced stream can go back.
+    check: AtomicBool,
+}
+
+impl Side {
+    fn new() -> Self {
+        Self {
+            placement: AtomicU8::new(Placement::Missing as u8),
+            requested: AtomicBool::new(false),
+            check: AtomicBool::new(false),
+        }
+    }
+}
+
+/// Shared between the processing thread and the threads that signal it.
+#[derive(Debug)]
+pub(super) struct Reroute {
+    thread: Thread,
+    /// Playback (0) and capture (1).
+    sides: [Side; 2],
+}
+
+impl Reroute {
+    /// For the processing thread `thread`, which the signals wake.
+    pub(super) fn new(thread: Thread) -> Self {
+        Self {
+            thread,
+            sides: [Side::new(), Side::new()],
+        }
+    }
+
+    fn side(&self, input: bool) -> &Side {
+        &self.sides[usize::from(input)]
+    }
+
+    /// Records where the stream for `input` now is.
+    pub(super) fn placed(&self, input: bool, placement: Placement) {
+        self.side(input)
+            .placement
+            .store(placement as u8, Ordering::Release);
+    }
+
+    pub(super) fn placement(&self, input: bool) -> Placement {
+        Placement::from_u8(self.side(input).placement.load(Ordering::Acquire))
+    }
+
+    fn request(&self, input: bool) {
+        self.side(input).requested.store(true, Ordering::Release);
+        self.thread.unpark();
+    }
+
+    /// The stream's device went away, or the stream became unusable
+    /// (cpal's error callback): reopen it wherever it now belongs.
+    pub(super) fn lost(&self, input: bool) {
+        self.request(input);
+    }
+
+    /// The default device for `input` changed: a stream on the default, or
+    /// none at all, moves to the new one; one on a chosen device stays.
+    /// (Called by the MMDevice API's notifications, on Windows only.)
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub(super) fn default_changed(&self, input: bool) {
+        if self.placement(input) != Placement::Chosen {
+            self.request(input);
+        }
+    }
+
+    /// Devices came or went: a displaced stream may go back (the chosen
+    /// device returned, or a device appeared where there was none). Whether
+    /// it can is checked on the processing thread ([`take_check`]).
+    ///
+    /// [`take_check`]: Self::take_check
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub(super) fn devices_changed(&self) {
+        for input in [false, true] {
+            if matches!(
+                self.placement(input),
+                Placement::FellBack | Placement::Missing
+            ) {
+                self.side(input).check.store(true, Ordering::Release);
+                self.thread.unpark();
+            }
+        }
+    }
+
+    /// Whether to check if the stream for `input` can go back; clears it.
+    pub(super) fn take_check(&self, input: bool) -> bool {
+        self.side(input).check.swap(false, Ordering::AcqRel)
+    }
+
+    /// Asks for a reopen from the processing thread (a check succeeded).
+    pub(super) fn reopen_later(&self, input: bool) {
+        self.side(input).requested.store(true, Ordering::Release);
+    }
+
+    /// Whether a reopen is asked for, without clearing it.
+    pub(super) fn requested(&self, input: bool) -> bool {
+        self.side(input).requested.load(Ordering::Acquire)
+    }
+
+    /// Takes the request for `input`.
+    pub(super) fn take_request(&self, input: bool) -> bool {
+        self.side(input).requested.swap(false, Ordering::AcqRel)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reroute() -> Reroute {
+        Reroute::new(std::thread::current())
+    }
+
+    #[test]
+    fn a_lost_stream_is_reopened_wherever_it_is() {
+        for placement in [
+            Placement::Chosen,
+            Placement::Default,
+            Placement::FellBack,
+            Placement::Missing,
+        ] {
+            let r = reroute();
+            r.placed(true, placement);
+            r.lost(true);
+            assert!(r.take_request(true), "{placement:?}");
+            assert!(!r.take_request(true), "taken once");
+            assert!(!r.requested(false), "the other direction is untouched");
+        }
+    }
+
+    #[test]
+    fn a_new_default_moves_all_but_a_chosen_device() {
+        for (placement, moves) in [
+            (Placement::Chosen, false),
+            (Placement::Default, true),
+            (Placement::FellBack, true),
+            (Placement::Missing, true),
+        ] {
+            let r = reroute();
+            r.placed(false, placement);
+            r.default_changed(false);
+            assert_eq!(r.take_request(false), moves, "{placement:?}");
+        }
+    }
+
+    #[test]
+    fn device_changes_check_only_displaced_streams() {
+        for (placement, checks) in [
+            (Placement::Chosen, false),
+            (Placement::Default, false),
+            (Placement::FellBack, true),
+            (Placement::Missing, true),
+        ] {
+            let r = reroute();
+            r.placed(true, placement);
+            r.placed(false, Placement::Chosen);
+            r.devices_changed();
+            assert_eq!(r.take_check(true), checks, "{placement:?}");
+            assert!(!r.take_check(true), "taken once");
+            assert!(!r.take_check(false));
+            assert!(!r.requested(true), "a check is not a reopen");
+        }
+    }
+}

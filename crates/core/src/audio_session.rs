@@ -432,6 +432,15 @@ async fn report(
                 IoEvent::StreamError { input: false, .. } => {
                     CoreError::Audio("the playback stream failed".into())
                 }
+                // Followed to another device; nothing failed.
+                IoEvent::Switched { input, device } => {
+                    tracing::info!(
+                        "audio {} moved to {}",
+                        if input { "input" } else { "output" },
+                        device.device_name
+                    );
+                    continue;
+                }
                 IoEvent::Stopped(e) => audio_error(e),
             };
             if events.send(CoreEvent::Error(error)).await.is_err() {

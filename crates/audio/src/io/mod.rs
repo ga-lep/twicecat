@@ -14,6 +14,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 mod cpal;
+mod reroute;
 
 use crate::AudioError;
 use crate::frame::{Frame, SAMPLE_RATE, SILENCE};
@@ -102,6 +103,14 @@ pub enum IoEvent {
         input: bool,
         /// The backend's description (device names, no user data).
         message: String,
+    },
+    /// The device in use went away or the default changed, and the stream
+    /// was reopened on this device; the call goes on.
+    Switched {
+        /// Capture (true) or playback.
+        input: bool,
+        /// The device now used.
+        device: StreamInfo,
     },
     /// The processing thread stopped on an internal error.
     Stopped(AudioError),
@@ -341,14 +350,34 @@ pub(super) fn realtime_wanted() -> bool {
 /// Runs the pipeline until `stop`: paced by the capture stream (its
 /// callback wakes this thread when audio comes), or by a 10 ms timer
 /// without one.
+#[cfg(target_os = "linux")]
 fn process<P: FrameProcessor>(
-    mut pipeline: Pipeline<P>,
+    pipeline: Pipeline<P>,
     stop: &AtomicBool,
     events: &mpsc::Sender<IoEvent>,
 ) {
+    process_with(pipeline, stop, events, |_| {});
+}
+
+/// [`process`], calling `maintain` between frames (it may swap the
+/// pipeline's streams: cpal's reopened devices).
+fn process_with<P: FrameProcessor>(
+    mut pipeline: Pipeline<P>,
+    stop: &AtomicBool,
+    events: &mpsc::Sender<IoEvent>,
+    mut maintain: impl FnMut(&mut Pipeline<P>),
+) {
     let tick = Duration::from_millis(10);
     let mut next_tick = Instant::now() + tick;
+    let mut had_capture = pipeline.has_capture();
     while !stop.load(Ordering::Acquire) {
+        maintain(&mut pipeline);
+        // The timer starts from now when the microphone goes, rather than
+        // catching up on every tick missed while it ran.
+        if had_capture && !pipeline.has_capture() {
+            next_tick = Instant::now() + tick;
+        }
+        had_capture = pipeline.has_capture();
         let ran = if pipeline.has_capture() {
             pipeline.pump()
         } else if Instant::now() >= next_tick {

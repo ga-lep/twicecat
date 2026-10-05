@@ -21,6 +21,8 @@ mod pipeline;
 mod pw;
 mod resample;
 mod voice;
+#[cfg(target_os = "windows")]
+mod wasapi;
 
 pub use chain::{
     CaptureChain, CaptureResult, ChainSettings, ChainStats, LEVEL_FLOOR_DB, NoiseMode, NsLevel,

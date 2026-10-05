@@ -3,17 +3,23 @@
 //! platform, so they live and die there. The callbacks only convert samples
 //! and move them through lock-free rings.
 //!
-//! On Windows the echo reference ([`IoConfig::echo_reference`]) is WASAPI's
-//! loopback of the output device: everything it plays, mixed by the system.
+//! A stream whose device goes away, or that follows the default when the
+//! default changes, is reopened there between frames ([`Devices`],
+//! `super::reroute`): WASAPI never moves a stream itself. On Windows the
+//! default devices are the *communications* ones (`crate::wasapi`), and the
+//! echo reference ([`IoConfig::echo_reference`]) is WASAPI's loopback of the
+//! output device: everything it plays, mixed by the system.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig, SupportedStreamConfig};
 
-use super::{IoConfig, IoEvent, IoInfo, StreamInfo, process};
+use super::reroute::{Placement, Reroute};
+use super::{IoConfig, IoEvent, IoInfo, StreamInfo, process_with};
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 use super::{Realtime, realtime_wanted};
 use crate::AudioError;
@@ -24,8 +30,23 @@ use crate::pipeline::{
     playback_ring_len,
 };
 
+/// Calls `$build::<T>(...)` for the sample type of `$format`.
+macro_rules! by_format {
+    ($format:expr, $build:ident($($arg:expr),*)) => {
+        match $format {
+            SampleFormat::F32 => $build::<f32>($($arg),*),
+            SampleFormat::I16 => $build::<i16>($($arg),*),
+            SampleFormat::I32 => $build::<i32>($($arg),*),
+            SampleFormat::U16 => $build::<u16>($($arg),*),
+            SampleFormat::I8 => $build::<i8>($($arg),*),
+            SampleFormat::U8 => $build::<u8>($($arg),*),
+            _ => Err(AudioError::UnsupportedFormat),
+        }
+    };
+}
+
 /// The processing thread's body: opens the streams, reports what opened on
-/// `ready`, then processes until `stop`.
+/// `ready`, then processes until `stop`, reopening streams as needed.
 pub(super) fn run(
     config: IoConfig,
     processor: impl FrameProcessor,
@@ -38,47 +59,39 @@ pub(super) fn run(
     // denormals as zero; see `denormals`.
     crate::denormals::flush_denormals_on_this_thread();
     counters.set_processing_thread();
-    let host = cpal::default_host();
+    let mut devices = Devices::new(config, counters.clone(), events.clone());
     let mut info = IoInfo::default();
-    let mut streams = Vec::new();
-    let mut capture = None;
-    let mut playback = None;
-    #[cfg(target_os = "windows")]
-    let mut reference = None;
     let opened = (|| {
-        if config.capture {
-            let (stream, side, stream_info) =
-                open_input(&host, config.input_device.as_deref(), &counters, &events)?;
-            streams.push(stream);
-            capture = Some(side);
-            info.input = Some(stream_info);
-        }
-        if config.playback {
-            let (device, format, stream_config) =
-                configure(&host, config.output_device.as_deref(), false, &events)?;
-            let (stream, side, stream_info) =
-                open_output(&device, format, stream_config, &counters, &events)?;
-            streams.push(stream);
-            playback = Some(side);
-            info.output = Some(stream_info);
-            // The same device the call plays on.
-            #[cfg(target_os = "windows")]
-            if config.echo_reference {
-                let (stream, side, stream_info) = open_loopback(&device, &events)?;
-                streams.push(stream);
-                reference = Some(side);
-                info.echo_reference = Some(stream_info);
-            }
-        }
-        for stream in &streams {
-            stream.play().map_err(|e| map_error(&e))?;
-        }
-        Ok(())
+        let capture = match devices.config.capture {
+            true => Some(devices.open_capture()?),
+            false => None,
+        };
+        let playback = match devices.config.playback {
+            true => Some(devices.open_playback()?),
+            false => None,
+        };
+        Ok::<_, AudioError>((capture, playback))
     })();
-    if let Err(e) = opened {
-        let _ = ready.send(Err(e));
-        return;
-    }
+    let (capture, playback) = match opened {
+        Ok(opened) => opened,
+        Err(e) => {
+            let _ = ready.send(Err(e));
+            return;
+        }
+    };
+    let capture = capture.map(|(side, stream_info)| {
+        info.input = Some(stream_info);
+        side
+    });
+    let mut reference = None;
+    let playback = playback.map(|(side, stream_info, loopback)| {
+        info.output = Some(stream_info);
+        if let Some((side, stream_info)) = loopback {
+            info.echo_reference = Some(stream_info);
+            reference = Some(side);
+        }
+        side
+    });
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     let raised = if realtime_wanted() {
         let (realtime, handle) = make_current_realtime();
@@ -88,17 +101,271 @@ pub(super) fn run(
         None
     };
     let _ = ready.send(Ok(info));
-    #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
     let mut pipeline = Pipeline::new(capture, playback, processor, counters);
-    #[cfg(target_os = "windows")]
     pipeline.set_echo_reference(reference);
-    process(pipeline, &stop, &events);
+    // Registered on this thread, which owns its COM objects; the callback
+    // only sets flags and wakes the thread.
+    #[cfg(target_os = "windows")]
+    let _watch = {
+        let reroute = devices.reroute.clone();
+        crate::wasapi::EndpointWatch::register(move |event| match event {
+            crate::wasapi::EndpointEvent::Devices => reroute.devices_changed(),
+            crate::wasapi::EndpointEvent::CommunicationsDefault { input } => {
+                reroute.default_changed(input);
+            }
+        })
+    };
+    process_with(pipeline, &stop, &events, |pipeline| {
+        devices.maintain(pipeline);
+    });
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     if let Some(handle) = raised {
         let _ = audio_thread_priority::demote_current_thread_from_real_time(handle);
     }
     // The streams stop when dropped, on the thread that created them.
-    drop(streams);
+    drop(devices);
+}
+
+/// The least time between two reopenings of one direction, so a device
+/// that fails as soon as it opens is not reopened in a loop.
+const REOPEN_INTERVAL: Duration = Duration::from_millis(500);
+
+/// A playback stream as opened: its side, what it is, and the echo
+/// reference on the same device (Windows) if asked for.
+type OpenedPlayback = (PlaybackSide, StreamInfo, Option<(CaptureSide, StreamInfo)>);
+
+/// The open streams and what is needed to reopen them. Lives on the
+/// processing thread.
+struct Devices {
+    host: cpal::Host,
+    config: IoConfig,
+    counters: Arc<IoCounters>,
+    events: mpsc::Sender<IoEvent>,
+    reroute: Arc<Reroute>,
+    capture: Option<cpal::Stream>,
+    playback: Option<cpal::Stream>,
+    /// Windows' loopback of the playback device (the echo reference).
+    loopback: Option<cpal::Stream>,
+    /// When each direction (playback, capture) was last reopened.
+    last_reopen: [Option<Instant>; 2],
+    /// Whether the last reopening of each direction failed (reported once).
+    failed: [bool; 2],
+}
+
+impl Devices {
+    fn new(config: IoConfig, counters: Arc<IoCounters>, events: mpsc::Sender<IoEvent>) -> Self {
+        Self {
+            host: cpal::default_host(),
+            config,
+            counters,
+            events,
+            reroute: Arc::new(Reroute::new(std::thread::current())),
+            capture: None,
+            playback: None,
+            loopback: None,
+            last_reopen: [None, None],
+            failed: [false, false],
+        }
+    }
+
+    /// Opens and starts the capture stream.
+    fn open_capture(&mut self) -> Result<(CaptureSide, StreamInfo), AudioError> {
+        let id = self.config.input_device.clone();
+        let (device, placement) = pick(&self.host, id.as_deref(), true, &self.events)?;
+        let (format, config) = configure(&device, true)?;
+        let (producer, consumer) = rtrb::RingBuffer::new(capture_ring_len(config.sample_rate));
+        let stream = by_format!(
+            format,
+            build_input(
+                &device,
+                config,
+                producer,
+                self.counters.clone(),
+                self.events.clone(),
+                self.reroute.clone()
+            )
+        )?;
+        stream.play().map_err(|e| map_error(&e))?;
+        self.capture = Some(stream);
+        self.reroute.placed(true, placement);
+        let side = CaptureSide::new(consumer, config.sample_rate)?;
+        Ok((side, stream_info(&device, &config)))
+    }
+
+    /// Opens and starts the playback stream, with the echo reference on the
+    /// same device when asked for (Windows).
+    fn open_playback(&mut self) -> Result<OpenedPlayback, AudioError> {
+        let id = self.config.output_device.clone();
+        let (device, placement) = pick(&self.host, id.as_deref(), false, &self.events)?;
+        let (format, config) = configure(&device, false)?;
+        let (producer, consumer) = rtrb::RingBuffer::new(playback_ring_len(config.sample_rate));
+        let stream = by_format!(
+            format,
+            build_output(
+                &device,
+                config,
+                consumer,
+                self.counters.clone(),
+                self.events.clone(),
+                self.reroute.clone()
+            )
+        )?;
+        stream.play().map_err(|e| map_error(&e))?;
+        self.playback = Some(stream);
+        self.reroute.placed(false, placement);
+        let side = PlaybackSide::new(producer, config.sample_rate)?;
+        let info = stream_info(&device, &config);
+        #[cfg(target_os = "windows")]
+        if self.config.echo_reference {
+            let (stream, reference, reference_info) =
+                open_loopback(&device, &self.events, &self.reroute)?;
+            stream.play().map_err(|e| map_error(&e))?;
+            self.loopback = Some(stream);
+            return Ok((side, info, Some((reference, reference_info))));
+        }
+        Ok((side, info, None))
+    }
+
+    /// Between frames: reopens what was asked for (at most every
+    /// [`REOPEN_INTERVAL`] per direction), after checking whether a
+    /// displaced stream can go back.
+    fn maintain<P: FrameProcessor>(&mut self, pipeline: &mut Pipeline<P>) {
+        for input in [false, true] {
+            let wanted = if input {
+                self.config.capture
+            } else {
+                self.config.playback
+            };
+            if !wanted {
+                continue;
+            }
+            if self.reroute.take_check(input) && self.can_go_back(input) {
+                self.reroute.reopen_later(input);
+            }
+            if !self.reroute.requested(input) {
+                continue;
+            }
+            let i = usize::from(input);
+            if self.last_reopen[i].is_some_and(|t| t.elapsed() < REOPEN_INTERVAL) {
+                continue; // still asked for: retried on a later pass
+            }
+            self.reroute.take_request(input);
+            self.last_reopen[i] = Some(Instant::now());
+            if input {
+                self.reopen_capture(pipeline);
+            } else {
+                self.reopen_playback(pipeline);
+            }
+        }
+    }
+
+    /// Whether a displaced stream has somewhere better to be: the chosen
+    /// device is back, or a device exists where there was none.
+    fn can_go_back(&self, input: bool) -> bool {
+        match self.reroute.placement(input) {
+            Placement::FellBack => {
+                let chosen = if input {
+                    &self.config.input_device
+                } else {
+                    &self.config.output_device
+                };
+                chosen
+                    .as_deref()
+                    .is_some_and(|id| find(&self.host, id, input).is_some())
+            }
+            Placement::Missing => default_device(&self.host, input).is_some(),
+            Placement::Chosen | Placement::Default => false,
+        }
+    }
+
+    fn reopen_capture<P: FrameProcessor>(&mut self, pipeline: &mut Pipeline<P>) {
+        // The old stream goes first, releasing its device.
+        pipeline.replace_capture(None);
+        self.capture = None;
+        match self.open_capture() {
+            Ok((side, device)) => {
+                pipeline.replace_capture(Some(side));
+                self.switched(true, device);
+            }
+            Err(_) => {
+                self.capture = None;
+                self.lost_for_good(true);
+            }
+        }
+    }
+
+    fn reopen_playback<P: FrameProcessor>(&mut self, pipeline: &mut Pipeline<P>) {
+        pipeline.replace_playback(None);
+        pipeline.set_echo_reference(None);
+        self.loopback = None;
+        self.playback = None;
+        match self.open_playback() {
+            Ok((side, device, reference)) => {
+                pipeline.replace_playback(Some(side));
+                pipeline.set_echo_reference(reference.map(|(side, _)| side));
+                self.switched(false, device);
+            }
+            Err(_) => {
+                self.loopback = None;
+                self.playback = None;
+                self.lost_for_good(false);
+            }
+        }
+    }
+
+    fn switched(&mut self, input: bool, device: StreamInfo) {
+        self.failed[usize::from(input)] = false;
+        let _ = self.events.send(IoEvent::Switched { input, device });
+    }
+
+    /// No device to reopen on: reported once; a device that comes later
+    /// brings the stream back (`Placement::Missing`).
+    fn lost_for_good(&mut self, input: bool) {
+        self.reroute.placed(input, Placement::Missing);
+        let i = usize::from(input);
+        if !self.failed[i] {
+            self.failed[i] = true;
+            let _ = self.events.send(IoEvent::StreamError {
+                input,
+                message: "the device is gone and no other could be opened".into(),
+            });
+        }
+    }
+}
+
+/// What a stream error means: reopen (the device is gone or the stream is
+/// unusable); count it (an underrun or overrun, a glitch: WASAPI reports
+/// them as errors); nothing (the backend moved the stream itself, or its
+/// own thread got no real-time priority); or report it.
+fn on_stream_error(
+    e: &cpal::Error,
+    input: bool,
+    reroute: &Reroute,
+    counters: Option<&IoCounters>,
+    events: &mpsc::Sender<IoEvent>,
+) {
+    match e.kind() {
+        cpal::ErrorKind::DeviceNotAvailable | cpal::ErrorKind::StreamInvalidated => {
+            reroute.lost(input);
+        }
+        cpal::ErrorKind::Xrun => {
+            if let Some(counters) = counters {
+                let xruns = if input {
+                    &counters.capture_overruns
+                } else {
+                    &counters.playback_underruns
+                };
+                xruns.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        cpal::ErrorKind::DeviceChanged | cpal::ErrorKind::RealtimeDenied => {}
+        _ => {
+            let _ = events.send(IoEvent::StreamError {
+                input,
+                message: e.to_string(),
+            });
+        }
+    }
 }
 
 /// Windows and macOS: raises the calling thread through the system's audio
@@ -131,36 +398,56 @@ fn map_error(e: &cpal::Error) -> AudioError {
     }
 }
 
-/// The configured device, else the default (reporting the fallback).
+/// The device with cpal ID `id`, if present for that direction.
+fn find(host: &cpal::Host, id: &str, input: bool) -> Option<cpal::Device> {
+    id.parse::<cpal::DeviceId>()
+        .ok()
+        .and_then(|id| host.device_by_id(&id))
+        .filter(|d| {
+            if input {
+                d.supports_input()
+            } else {
+                d.supports_output()
+            }
+        })
+}
+
+/// The default device: on Windows the communications one when there is
+/// one, else the host's.
+fn default_device(host: &cpal::Host, input: bool) -> Option<cpal::Device> {
+    #[cfg(target_os = "windows")]
+    if let Some(device) =
+        crate::wasapi::communications_default(input).and_then(|id| find(host, &id, input))
+    {
+        return Some(device);
+    }
+    if input {
+        host.default_input_device()
+    } else {
+        host.default_output_device()
+    }
+}
+
+/// The configured device, else the default (reporting the fallback), and
+/// where that puts the stream.
 fn pick(
     host: &cpal::Host,
     id: Option<&str>,
     input: bool,
     events: &mpsc::Sender<IoEvent>,
-) -> Result<cpal::Device, AudioError> {
-    if let Some(id) = id {
-        let found = id
-            .parse::<cpal::DeviceId>()
-            .ok()
-            .and_then(|id| host.device_by_id(&id))
-            .filter(|d| {
-                if input {
-                    d.supports_input()
-                } else {
-                    d.supports_output()
-                }
-            });
-        if let Some(device) = found {
-            return Ok(device);
-        }
-        let _ = events.send(IoEvent::FellBackToDefault { input });
-    }
-    let default = if input {
-        host.default_input_device()
-    } else {
-        host.default_output_device()
+) -> Result<(cpal::Device, Placement), AudioError> {
+    let placement = match id {
+        Some(id) => match find(host, id, input) {
+            Some(device) => return Ok((device, Placement::Chosen)),
+            None => {
+                let _ = events.send(IoEvent::FellBackToDefault { input });
+                Placement::FellBack
+            }
+        },
+        None => Placement::Default,
     };
-    default.ok_or(AudioError::NoDevice)
+    let device = default_device(host, input).ok_or(AudioError::NoDevice)?;
+    Ok((device, placement))
 }
 
 /// 10 ms device buffers (one frame) when the device reports its range;
@@ -207,17 +494,12 @@ fn stream_info(device: &cpal::Device, config: &StreamConfig) -> StreamInfo {
     }
 }
 
-type Opened<S> = (cpal::Stream, S, StreamInfo);
-
-/// The device for one direction, its format (the default, at 48 kHz when
+/// The format for one direction of `device` (its default, at 48 kHz when
 /// it can) and 10 ms buffers.
 fn configure(
-    host: &cpal::Host,
-    id: Option<&str>,
+    device: &cpal::Device,
     input: bool,
-    events: &mpsc::Sender<IoEvent>,
-) -> Result<(cpal::Device, SampleFormat, StreamConfig), AudioError> {
-    let device = pick(host, id, input, events)?;
+) -> Result<(SampleFormat, StreamConfig), AudioError> {
     let (default, supported) = if input {
         let default = device.default_input_config();
         let supported = device.supported_input_configs().map(Iterator::collect);
@@ -231,54 +513,7 @@ fn configure(
     let chosen = prefer_48k(default.map_err(|e| map_error(&e))?, supported.into_iter());
     let mut config = chosen.config();
     config.buffer_size = ten_ms_buffer(chosen.buffer_size(), config.sample_rate);
-    Ok((device, chosen.sample_format(), config))
-}
-
-/// Calls `$build::<T>(...)` for the sample type of `$format`.
-macro_rules! by_format {
-    ($format:expr, $build:ident($($arg:expr),*)) => {
-        match $format {
-            SampleFormat::F32 => $build::<f32>($($arg),*),
-            SampleFormat::I16 => $build::<i16>($($arg),*),
-            SampleFormat::I32 => $build::<i32>($($arg),*),
-            SampleFormat::U16 => $build::<u16>($($arg),*),
-            SampleFormat::I8 => $build::<i8>($($arg),*),
-            SampleFormat::U8 => $build::<u8>($($arg),*),
-            _ => Err(AudioError::UnsupportedFormat),
-        }
-    };
-}
-
-fn open_input(
-    host: &cpal::Host,
-    id: Option<&str>,
-    counters: &Arc<IoCounters>,
-    events: &mpsc::Sender<IoEvent>,
-) -> Result<Opened<CaptureSide>, AudioError> {
-    let (device, format, config) = configure(host, id, true, events)?;
-    let (producer, consumer) = rtrb::RingBuffer::new(capture_ring_len(config.sample_rate));
-    let stream = by_format!(
-        format,
-        build_input(&device, config, producer, counters.clone(), events.clone())
-    )?;
-    let side = CaptureSide::new(consumer, config.sample_rate)?;
-    Ok((stream, side, stream_info(&device, &config)))
-}
-
-fn open_output(
-    device: &cpal::Device,
-    format: SampleFormat,
-    config: StreamConfig,
-    counters: &Arc<IoCounters>,
-    events: &mpsc::Sender<IoEvent>,
-) -> Result<Opened<PlaybackSide>, AudioError> {
-    let (producer, consumer) = rtrb::RingBuffer::new(playback_ring_len(config.sample_rate));
-    let stream = by_format!(
-        format,
-        build_output(device, config, consumer, counters.clone(), events.clone())
-    )?;
-    let side = PlaybackSide::new(producer, config.sample_rate)?;
-    Ok((stream, side, stream_info(device, &config)))
+    Ok((chosen.sample_format(), config))
 }
 
 /// Windows: WASAPI's loopback of `device` (an input stream on an output
@@ -290,7 +525,8 @@ fn open_output(
 fn open_loopback(
     device: &cpal::Device,
     events: &mpsc::Sender<IoEvent>,
-) -> Result<Opened<CaptureSide>, AudioError> {
+    reroute: &Arc<Reroute>,
+) -> Result<(cpal::Stream, CaptureSide, StreamInfo), AudioError> {
     let mix = device.default_output_config().map_err(|e| map_error(&e))?;
     let format = mix.sample_format();
     let mut config = mix.config();
@@ -298,7 +534,7 @@ fn open_loopback(
     let (producer, consumer) = rtrb::RingBuffer::new(capture_ring_len(config.sample_rate));
     let stream = by_format!(
         format,
-        build_loopback(device, config, producer, events.clone())
+        build_loopback(device, config, producer, events.clone(), reroute.clone())
     )?;
     let side = CaptureSide::new(consumer, config.sample_rate)?;
     Ok((stream, side, stream_info(device, &config)))
@@ -310,6 +546,7 @@ fn build_loopback<T>(
     config: StreamConfig,
     mut ring: rtrb::Producer<f32>,
     events: mpsc::Sender<IoEvent>,
+    reroute: Arc<Reroute>,
 ) -> Result<cpal::Stream, AudioError>
 where
     T: SizedSample,
@@ -326,14 +563,9 @@ where
                     let _ = ring.push(s);
                 });
             },
-            move |e| {
-                // A failing reference costs the cancellation of other
-                // applications' sound, not the call: reported as playback.
-                let _ = events.send(IoEvent::StreamError {
-                    input: false,
-                    message: format!("echo reference: {e}"),
-                });
-            },
+            // It goes with the playback stream: reopened with it. Its
+            // glitches are not the speakers', so not counted.
+            move |e| on_stream_error(&e, false, &reroute, None, &events),
             None,
         )
         .map_err(|e| map_error(&e))
@@ -345,12 +577,14 @@ fn build_input<T>(
     mut ring: rtrb::Producer<f32>,
     counters: Arc<IoCounters>,
     events: mpsc::Sender<IoEvent>,
+    reroute: Arc<Reroute>,
 ) -> Result<cpal::Stream, AudioError>
 where
     T: SizedSample,
     f32: FromSample<T>,
 {
     let channels = usize::from(config.channels);
+    let errors = counters.clone();
     device
         .build_input_stream::<T, _, _>(
             config,
@@ -363,12 +597,7 @@ where
                 });
                 counters.captured(ring.buffer().capacity() - ring.slots());
             },
-            move |e| {
-                let _ = events.send(IoEvent::StreamError {
-                    input: true,
-                    message: e.to_string(),
-                });
-            },
+            move |e| on_stream_error(&e, true, &reroute, Some(&errors), &events),
             None,
         )
         .map_err(|e| map_error(&e))
@@ -380,11 +609,13 @@ fn build_output<T>(
     mut ring: rtrb::Consumer<f32>,
     counters: Arc<IoCounters>,
     events: mpsc::Sender<IoEvent>,
+    reroute: Arc<Reroute>,
 ) -> Result<cpal::Stream, AudioError>
 where
     T: SizedSample + FromSample<f32>,
 {
     let channels = usize::from(config.channels);
+    let errors = counters.clone();
     device
         .build_output_stream::<T, _, _>(
             config,
@@ -397,12 +628,7 @@ where
                     })
                 });
             },
-            move |e| {
-                let _ = events.send(IoEvent::StreamError {
-                    input: false,
-                    message: e.to_string(),
-                });
-            },
+            move |e| on_stream_error(&e, false, &reroute, Some(&errors), &events),
             None,
         )
         .map_err(|e| map_error(&e))
@@ -522,5 +748,53 @@ mod tests {
             (0.0005..0.0055).contains(&a),
             "tone amplitude {a} (played 0.005)"
         );
+    }
+
+    #[test]
+    #[ignore = "needs an audio output device; plays silence"]
+    fn a_lost_playback_stream_is_reopened_between_frames_at_most_twice_a_second() {
+        let (tx, rx) = mpsc::channel();
+        let counters = Arc::new(IoCounters::default());
+        let mut devices = Devices::new(
+            IoConfig {
+                playback: true,
+                echo_reference: cfg!(target_os = "windows"),
+                ..IoConfig::default()
+            },
+            counters.clone(),
+            tx,
+        );
+        let (side, first, reference) = devices.open_playback().expect("default output device");
+        assert_eq!(reference.is_some(), cfg!(target_os = "windows"));
+        let mut pipeline = Pipeline::new(None, Some(side), |_: &_, _: &mut _| {}, counters);
+        pipeline.set_echo_reference(reference.map(|(side, _)| side));
+
+        devices.reroute.lost(false);
+        devices.maintain(&mut pipeline);
+        let device = switched(&rx).expect("reopened");
+        assert_eq!(device.device_id, first.device_id, "the same default device");
+        assert!(devices.playback.is_some());
+        assert_eq!(devices.loopback.is_some(), cfg!(target_os = "windows"));
+        pipeline.tick().expect("frames run on the new stream");
+
+        // Again at once: deferred, not lost.
+        devices.reroute.lost(false);
+        devices.maintain(&mut pipeline);
+        assert!(switched(&rx).is_none(), "within the interval");
+        std::thread::sleep(REOPEN_INTERVAL);
+        devices.maintain(&mut pipeline);
+        assert!(switched(&rx).is_some(), "reopened after the interval");
+    }
+
+    /// The device of a playback switch among the events so far; others
+    /// (the old stream's last errors) are skipped.
+    fn switched(rx: &mpsc::Receiver<IoEvent>) -> Option<StreamInfo> {
+        rx.try_iter().find_map(|e| match e {
+            IoEvent::Switched {
+                input: false,
+                device,
+            } => Some(device),
+            _ => None,
+        })
     }
 }

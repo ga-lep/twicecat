@@ -43,6 +43,13 @@ audio_thread_priority = { version = "=0.35.1", default-features = false }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 cpal = { version = "=0.18.2", features = ["realtime"] }
+# The MMDevice API beside cpal (src/wasapi.rs): the default communications
+# devices and endpoint notifications (hot-plug, default changes), which cpal
+# does not expose. The version cpal 0.18.2 already uses (human-approved
+# 2026-10-05).
+windows = { version = "=0.62.2", features = ["Win32_Foundation", "Win32_Media_Audio", "Win32_System_Com"] }
+# `#[implement]` (the notification callback) expands to windows-core paths.
+windows-core = "=0.62.2"
 
 # Linux: our own PipeWire client (src/pw, plan decision 12): call-role
 # streams in the graph's real-time cycle, devices and changes from the

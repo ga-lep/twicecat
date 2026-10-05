@@ -261,7 +261,6 @@ impl<P: FrameProcessor> Pipeline<P> {
 
     /// Adds the echo reference stream (what the output device plays): our
     /// PipeWire client's sink monitor, or WASAPI's loopback on Windows.
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
     pub(crate) fn set_echo_reference(&mut self, reference: Option<CaptureSide>) {
         if let Some(r) = &reference {
             let need = r.converter.input_frames_max();
@@ -270,6 +269,25 @@ impl<P: FrameProcessor> Pipeline<P> {
             }
         }
         self.reference = reference;
+    }
+
+    /// Swaps the capture side (a stream reopened on another device), or
+    /// removes it (no microphone left: [`tick`](Self::tick) paces then).
+    /// What the old ring still held is dropped.
+    pub(crate) fn replace_capture(&mut self, capture: Option<CaptureSide>) {
+        if let Some(c) = &capture {
+            let need = c.converter.input_frames_max();
+            if need > self.scratch.len() {
+                self.scratch.resize(need, 0.0);
+            }
+        }
+        self.capture = capture;
+    }
+
+    /// Swaps the playback side (a stream reopened on another device), or
+    /// removes it.
+    pub(crate) fn replace_playback(&mut self, playback: Option<PlaybackSide>) {
+        self.playback = playback;
     }
 
     pub(crate) fn has_capture(&self) -> bool {
