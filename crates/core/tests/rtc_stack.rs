@@ -19,7 +19,7 @@ use matrix_sdk::ruma::serde::Raw;
 use serde_json::json;
 
 #[tokio::test]
-#[ignore = "needs local homeserver: docker compose up -d --wait"]
+#[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
 async fn rtc_transports_point_at_the_local_jwt_service() {
     let env = TestEnv::load();
     let alice = raw_login(1).await;
@@ -39,7 +39,7 @@ async fn rtc_transports_point_at_the_local_jwt_service() {
 }
 
 #[tokio::test]
-#[ignore = "needs local homeserver: docker compose up -d --wait"]
+#[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
 async fn openid_token_buys_a_livekit_jwt_that_connects() {
     let env = TestEnv::load();
     let alice = raw_login(1).await;
@@ -109,7 +109,7 @@ async fn openid_token_buys_a_livekit_jwt_that_connects() {
 }
 
 #[tokio::test]
-#[ignore = "needs local homeserver: docker compose up -d --wait"]
+#[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
 async fn delayed_state_event_is_sent_by_the_server() {
     let alice = raw_login(1).await;
     let room_id = create_room(&alice, &unique_room_name(), None).await;

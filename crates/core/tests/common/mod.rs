@@ -5,6 +5,8 @@
 // Each test file uses a different subset of these helpers.
 #![allow(dead_code)]
 
+pub mod stack_env;
+
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -21,22 +23,17 @@ use tessera_core::{Core, CoreConfig, CoreHandle};
 /// Default wait for an expected event.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Values from `.env.test`, overridden by environment variables.
+/// The stack settings and test accounts: `.env.test`, overridden by
+/// `.env.local`, overridden by environment variables ([`stack_env`]).
 pub struct TestEnv {
     values: HashMap<String, String>,
 }
 
 impl TestEnv {
     pub fn load() -> Self {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.env.test");
-        let text = std::fs::read_to_string(&path).expect("read .env.test at the workspace root");
-        let mut values = parse_env(&text);
-        for (key, value) in values.iter_mut() {
-            if let Ok(over) = std::env::var(key) {
-                *value = over;
-            }
-        }
-        let env = Self { values };
+        let env = Self {
+            values: stack_env::load(),
+        };
         assert_local_homeserver(env.get("HOMESERVER_URL"));
         env
     }
@@ -88,16 +85,6 @@ pub fn assert_local_homeserver(url: &str) {
         "HOMESERVER_URL must be http://127.0.0.1:<port>, http://localhost:<port> or http://[::1]:<port>; \
          the test accounts must never be used against another server"
     );
-}
-
-/// Parses `KEY=VALUE` lines; `#` comments and blank lines are skipped.
-pub fn parse_env(text: &str) -> HashMap<String, String> {
-    text.lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .filter_map(|l| l.split_once('='))
-        .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned()))
-        .collect()
 }
 
 /// Starts a core on `dir` against the local homeserver, with `audio` as

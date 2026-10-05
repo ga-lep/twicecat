@@ -110,7 +110,7 @@ jobs:
         run: echo "LK_CUSTOM_WEBRTC=$(scripts/fetch-libwebrtc.sh)" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
       - name: Start local Synapse
-        run: docker compose up -d --wait
+        run: scripts/stack.sh up -d --wait
       - name: Register test users
         run: scripts/create-test-users.sh
       # The real-keychain test needs a desktop session, and hardware_ tests a
@@ -120,4 +120,4 @@ jobs:
       - run: scripts/check-no-webrtc-download.sh
       - name: Stop local Synapse
         if: always()
-        run: docker compose down -v
+        run: scripts/stack.sh down -v

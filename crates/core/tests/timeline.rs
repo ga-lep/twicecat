@@ -1,5 +1,5 @@
 //! Timeline subscription and sending against the local homeserver
-//! (`docker compose up -d --wait && scripts/create-test-users.sh`).
+//! (`scripts/stack.sh up -d --wait && scripts/create-test-users.sh`).
 //!
 //! The receiving side is carol, not bob: `login::restore_without_logging_in_again`
 //! counts bob's devices and needs bob to stay otherwise unused.
@@ -71,7 +71,7 @@ fn unique_marker() -> String {
 }
 
 #[tokio::test]
-#[ignore = "needs local homeserver: docker compose up -d --wait"]
+#[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
 async fn message_travels_from_a_to_b_through_the_timeline() {
     let env = TestEnv::load();
     let alice_raw = raw_login(1).await;
@@ -147,7 +147,7 @@ async fn message_travels_from_a_to_b_through_the_timeline() {
 }
 
 #[tokio::test]
-#[ignore = "needs local homeserver: docker compose up -d --wait"]
+#[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
 async fn send_without_a_selected_room_is_an_error() {
     let env = TestEnv::load();
     let dir = tempfile::tempdir().unwrap();
@@ -168,7 +168,7 @@ async fn send_without_a_selected_room_is_an_error() {
 }
 
 #[tokio::test]
-#[ignore = "needs local homeserver: docker compose up -d --wait"]
+#[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
 async fn selecting_an_unknown_room_is_an_error() {
     let env = TestEnv::load();
     let dir = tempfile::tempdir().unwrap();

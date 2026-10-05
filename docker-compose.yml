@@ -1,3 +1,9 @@
+# Start it with scripts/stack.sh (up -d --wait, down -v, ...), which sets
+# the address and ports below from the environment, .env.local or .env.test;
+# a bare `docker compose` stops at the first one missing.
+x-stack: &stack
+  TESSERA_ADDRESS: ${TESSERA_ADDRESS:?run through scripts/stack.sh}
+
 services:
   synapse:
     image: matrixdotorg/synapse:v1.151.0
@@ -5,19 +11,25 @@ services:
     environment:
       SYNAPSE_SERVER_NAME: localhost
       SYNAPSE_REPORT_STATS: "no"
+      # The call service as clients reach it (MSC4143 transports).
+      TESSERA_LK_JWT_URL: ${LK_JWT_URL:?run through scripts/stack.sh}
     # livekit and lk-jwt share this network namespace, so their ports are
-    # published here, on 127.0.0.1 only.
+    # published here, on TESSERA_ADDRESS only (127.0.0.1 by default).
+    # Synapse and lk-jwt-service listen on fixed ports inside, published on
+    # the configured ones. LiveKit listens on the configured ports inside
+    # too: lk-jwt-service uses the URL it gives clients itself, and ICE
+    # candidates carry the ports.
     ports:
-      - "127.0.0.1:8008:8008" # Synapse client API
-      - "127.0.0.1:8080:8080" # lk-jwt-service
-      - "127.0.0.1:7880:7880" # LiveKit signalling (ws)
-      - "127.0.0.1:7881:7881" # LiveKit ICE over TCP
-      - "127.0.0.1:7882:7882/udp" # LiveKit ICE over UDP (muxed)
+      - "${TESSERA_PUBLISH_ADDRESS:?run through scripts/stack.sh}:${TESSERA_SYNAPSE_PORT:?}:8008" # Synapse client API
+      - "${TESSERA_PUBLISH_ADDRESS}:${TESSERA_LK_JWT_PORT:?}:8080" # lk-jwt-service
+      - "${TESSERA_PUBLISH_ADDRESS}:${TESSERA_LIVEKIT_PORT:?}:${TESSERA_LIVEKIT_PORT}" # LiveKit signalling (ws)
+      - "${TESSERA_PUBLISH_ADDRESS}:${TESSERA_LIVEKIT_TCP_PORT:?}:${TESSERA_LIVEKIT_TCP_PORT}" # LiveKit ICE over TCP
+      - "${TESSERA_PUBLISH_ADDRESS}:${TESSERA_LIVEKIT_UDP_PORT:?}:${TESSERA_LIVEKIT_UDP_PORT}/udp" # LiveKit ICE over UDP (muxed)
       # Second SFU and lk-jwt-service (multi-SFU tests: another "homeserver's" call service).
-      - "127.0.0.1:8081:8081" # lk-jwt-service B
-      - "127.0.0.1:7890:7890" # LiveKit B signalling (ws)
-      - "127.0.0.1:7891:7891" # LiveKit B ICE over TCP
-      - "127.0.0.1:7892:7892/udp" # LiveKit B ICE over UDP (muxed)
+      - "${TESSERA_PUBLISH_ADDRESS}:${TESSERA_LK_JWT_PORT_B:?}:8081" # lk-jwt-service B
+      - "${TESSERA_PUBLISH_ADDRESS}:${TESSERA_LIVEKIT_PORT_B:?}:${TESSERA_LIVEKIT_PORT_B}" # LiveKit B signalling (ws)
+      - "${TESSERA_PUBLISH_ADDRESS}:${TESSERA_LIVEKIT_TCP_PORT_B:?}:${TESSERA_LIVEKIT_TCP_PORT_B}" # LiveKit B ICE over TCP
+      - "${TESSERA_PUBLISH_ADDRESS}:${TESSERA_LIVEKIT_UDP_PORT_B:?}:${TESSERA_LIVEKIT_UDP_PORT_B}/udp" # LiveKit B ICE over UDP (muxed)
     volumes:
       - synapse-data:/data
       - ./dev/synapse/start.sh:/start-dev.sh:ro
@@ -28,8 +40,9 @@ services:
       retries: 30
       start_period: 5s
 
-  # LiveKit SFU. In synapse's network namespace so that 127.0.0.1:7880 is the
-  # same address for the host (published above) and for lk-jwt-service.
+  # LiveKit SFU. In synapse's network namespace so that its address is the
+  # same for the host (published above) and for lk-jwt-service.
+  # dev/livekit/livekit.yaml is a template; the entrypoint fills it in.
   livekit:
     image: livekit/livekit-server:v1.13.7
     network_mode: "service:synapse"
@@ -37,13 +50,23 @@ services:
       synapse:
         condition: service_healthy
     env_file: .env.test
+    environment:
+      <<: *stack
+      TESSERA_LIVEKIT_PORT: ${TESSERA_LIVEKIT_PORT:?}
+      TESSERA_LIVEKIT_TCP_PORT: ${TESSERA_LIVEKIT_TCP_PORT:?}
+      TESSERA_LIVEKIT_UDP_PORT: ${TESSERA_LIVEKIT_UDP_PORT:?}
+      TESSERA_WEBHOOK_PORT: "8080"
     entrypoint: ["/bin/sh", "-c"]
-    command:
-      - 'LIVEKIT_KEYS="$$LIVEKIT_KEY: $$LIVEKIT_SECRET" exec /livekit-server --config /etc/livekit.yaml'
+    command: &livekit-command
+      - >-
+        sed -e "s|@PORT@|$$TESSERA_LIVEKIT_PORT|" -e "s|@TCP_PORT@|$$TESSERA_LIVEKIT_TCP_PORT|"
+        -e "s|@UDP_PORT@|$$TESSERA_LIVEKIT_UDP_PORT|" -e "s|@NODE_IP@|$$TESSERA_ADDRESS|"
+        -e "s|@WEBHOOK_PORT@|$$TESSERA_WEBHOOK_PORT|" /etc/livekit.yaml.in >/tmp/livekit.yaml &&
+        LIVEKIT_KEYS="$$LIVEKIT_KEY: $$LIVEKIT_SECRET" exec /livekit-server --config /tmp/livekit.yaml
     volumes:
-      - ./dev/livekit/livekit.yaml:/etc/livekit.yaml:ro
+      - ./dev/livekit/livekit.yaml:/etc/livekit.yaml.in:ro
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:7880 >/dev/null"]
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:$$TESSERA_LIVEKIT_PORT >/dev/null"]
       interval: 2s
       timeout: 5s
       retries: 30
@@ -62,6 +85,7 @@ services:
     env_file: .env.test
     environment:
       LIVEKIT_JWT_BIND: ":8080"
+      LIVEKIT_URL: ${LIVEKIT_URL:?run through scripts/stack.sh}
       LIVEKIT_FULL_ACCESS_HOMESERVERS: localhost
       # Dev only: Synapse's federation listener uses a self-signed certificate.
       LIVEKIT_INSECURE_SKIP_VERIFY_TLS: YES_I_KNOW_WHAT_I_AM_DOING
@@ -83,13 +107,18 @@ services:
       synapse:
         condition: service_healthy
     env_file: .env.test
+    environment:
+      <<: *stack
+      TESSERA_LIVEKIT_PORT: ${TESSERA_LIVEKIT_PORT_B:?}
+      TESSERA_LIVEKIT_TCP_PORT: ${TESSERA_LIVEKIT_TCP_PORT_B:?}
+      TESSERA_LIVEKIT_UDP_PORT: ${TESSERA_LIVEKIT_UDP_PORT_B:?}
+      TESSERA_WEBHOOK_PORT: "8081"
     entrypoint: ["/bin/sh", "-c"]
-    command:
-      - 'LIVEKIT_KEYS="$$LIVEKIT_KEY: $$LIVEKIT_SECRET" exec /livekit-server --config /etc/livekit.yaml'
+    command: *livekit-command
     volumes:
-      - ./dev/livekit/livekit-b.yaml:/etc/livekit.yaml:ro
+      - ./dev/livekit/livekit.yaml:/etc/livekit.yaml.in:ro
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:7890 >/dev/null"]
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:$$TESSERA_LIVEKIT_PORT >/dev/null"]
       interval: 2s
       timeout: 5s
       retries: 30
@@ -104,7 +133,7 @@ services:
     env_file: .env.test
     environment:
       LIVEKIT_JWT_BIND: ":8081"
-      LIVEKIT_URL: ws://127.0.0.1:7890
+      LIVEKIT_URL: ${LIVEKIT_URL_B:?run through scripts/stack.sh}
       LIVEKIT_FULL_ACCESS_HOMESERVERS: localhost
       # Dev only: Synapse's federation listener uses a self-signed certificate.
       LIVEKIT_INSECURE_SKIP_VERIFY_TLS: YES_I_KNOW_WHAT_I_AM_DOING

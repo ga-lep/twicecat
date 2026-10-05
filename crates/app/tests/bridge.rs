@@ -1,12 +1,12 @@
 //! Drives the real bridge and `App::update` headlessly against the local
-//! homeserver (`docker compose up -d --wait && scripts/create-test-users.sh`).
+//! homeserver (`scripts/stack.sh up -d --wait && scripts/create-test-users.sh`).
 //!
 //! Nothing here prints passwords, tokens, or message bodies.
 
 use std::collections::HashMap;
 use std::io::{Read as _, Write as _};
 use std::net::TcpStream;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,24 +17,17 @@ use tessera_core::CoreConfig;
 use tessera_core::paths::DataPaths;
 use tessera_core::secrets::InMemorySecretStore;
 
+// The same settings as tessera-core's tests: .env.test, .env.local, the
+// environment.
+#[allow(dead_code)]
+#[path = "../../core/tests/common/stack_env.rs"]
+mod stack_env;
+
 struct TestEnv(HashMap<String, String>);
 
 impl TestEnv {
     fn load() -> Self {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.env.test");
-        let text = std::fs::read_to_string(path).expect("read .env.test at the workspace root");
-        let mut values: HashMap<String, String> = text
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty() && !l.starts_with('#'))
-            .filter_map(|l| l.split_once('='))
-            .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned()))
-            .collect();
-        for (key, value) in values.iter_mut() {
-            if let Ok(over) = std::env::var(key) {
-                *value = over;
-            }
-        }
+        let values = stack_env::load();
         assert_local_homeserver(values.get("HOMESERVER_URL").map_or("", String::as_str));
         Self(values)
     }
@@ -151,7 +144,7 @@ fn scratch_dir() -> PathBuf {
 }
 
 #[test]
-#[ignore = "needs local homeserver: docker compose up -d --wait"]
+#[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
 fn login_reaches_main_with_rooms_and_shutdown_closes_the_bridge() {
     let env = TestEnv::load();
     let base = env.get("HOMESERVER_URL").to_owned();

@@ -1,21 +1,24 @@
-# Dev-only LiveKit SFU for the local MatrixRTC stack (docker-compose.yml).
+# Dev-only LiveKit SFU for the local MatrixRTC stack (docker-compose.yml),
+# used by both SFUs. A template: the container's entrypoint replaces the
+# @...@ values from the stack settings (scripts/stack.sh, .env.test).
 # Runs in the synapse container's network namespace; the compose file
-# publishes its ports on 127.0.0.1 only. Keys come from .env.test.
-port: 7880
+# publishes its ports on TESSERA_ADDRESS only. Keys come from .env.test.
+port: @PORT@
 rtc:
-  tcp_port: 7881
+  tcp_port: @TCP_PORT@
   # One UDP port (ICE mux) so docker only has to publish a single port.
-  udp_port: 7882
-  # Clients connect from the host through the published 127.0.0.1 ports.
+  udp_port: @UDP_PORT@
+  # Clients connect from the host through the published ports.
   use_external_ip: false
-  node_ip: 127.0.0.1
+  node_ip: @NODE_IP@
 room:
   # lk-jwt-service decides who may create rooms (its README requires this).
   auto_create: false
 webhook:
   # Lets lk-jwt-service see participants leave (delegated delayed leave).
+  # Its port inside the shared network namespace, not the published one.
   api_key: devkey
   urls:
-    - http://127.0.0.1:8080/sfu_webhook
+    - http://127.0.0.1:@WEBHOOK_PORT@/sfu_webhook
 logging:
   level: info
