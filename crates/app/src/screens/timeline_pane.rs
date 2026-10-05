@@ -18,9 +18,9 @@ use iced::widget::{
 };
 use iced::{Background, Color, Element, Fill, Font, Padding, Shrink, Theme, mouse};
 use tessera_core::api::{
-    MessageDetails, MessageText, PaginationState, PlaceholderKind, ReactionGroup, ReplyPreview,
-    ReplyState, RoomSummary, SendStatus, StateChange, TimelineItem, TimelineItemKind, TypingUser,
-    UserId,
+    Block, Inline, MessageDetails, MessageKind, MessageText, PaginationState, PlaceholderKind,
+    ReactionGroup, ReplyPreview, ReplyState, RichText, RoomSummary, SendStatus, StateChange,
+    TextStyle, TimelineItem, TimelineItemKind, TypingUser, UserId,
 };
 
 use crate::actions::{self, ActionButtons, ActionState};
@@ -194,6 +194,7 @@ fn row_content<'a, Tz: TimeZone>(
                 body,
                 details,
                 echo == Echo::Sending,
+                sender,
                 env,
             ));
             if let Some(label) = edited_text(details) {
@@ -412,17 +413,45 @@ fn with_actions<'a>(
         .into()
 }
 
+/// `content` with Element's emote prefix, "* name ", at the start of its
+/// first paragraph, or on a line of its own before a list, quote or other
+/// block.
+pub fn with_emote_prefix(content: &RichText, name: &str) -> RichText {
+    let prefix = Inline::Text {
+        text: format!("* {name} "),
+        style: TextStyle::default(),
+    };
+    let mut blocks = content.blocks.clone();
+    match blocks.first_mut() {
+        Some(Block::Paragraph(inlines)) => inlines.insert(0, prefix),
+        _ => blocks.insert(0, Block::Paragraph(vec![prefix])),
+    }
+    RichText { blocks }
+}
+
 /// The body of a message: its formatted content, or the plain text when the
-/// core sent none.
+/// core sent none. An emote starts with "* name ", as in Element.
 fn body_widget<'a>(
     id: &str,
     body: &str,
     details: &MessageDetails,
     dim: bool,
+    sender: &UserId,
     env: RichEnv<'_>,
 ) -> Element<'a, Message> {
+    let emote = (details.kind == MessageKind::Emote).then(|| {
+        sender_label(
+            details.sender_name.as_deref(),
+            details.sender_name_ambiguous,
+            sender,
+        )
+    });
     if details.content.blocks.is_empty() {
-        let plain = text(body_text(body)).width(Fill);
+        let shown = match &emote {
+            Some(name) => format!("* {name} {}", body_text(body)),
+            None => body_text(body),
+        };
+        let plain = text(shown).width(Fill);
         return if dim {
             plain.style(muted).into()
         } else {
@@ -435,7 +464,10 @@ fn body_widget<'a>(
         revealed: env.revealed,
         rooms: env.rooms,
     };
-    blocks_view(&details.content, &ctx, env.theme)
+    match &emote {
+        Some(name) => blocks_view(&with_emote_prefix(&details.content, name), &ctx, env.theme),
+        None => blocks_view(&details.content, &ctx, env.theme),
+    }
 }
 
 /// The marker under an edited message.
@@ -1239,6 +1271,27 @@ mod tests {
         let (name, body) = reply_quote_text(&evil);
         assert!(!name.contains('\u{202E}') && !body.contains('\u{202E}'));
         assert!(body.chars().count() <= 201, "{}", body.chars().count());
+    }
+
+    #[test]
+    fn an_emote_starts_with_a_star_and_the_name_like_element() {
+        let text = |t: &str| Inline::Text {
+            text: t.to_owned(),
+            style: TextStyle::default(),
+        };
+        let waves = RichText {
+            blocks: vec![Block::Paragraph(vec![text("waves")])],
+        };
+        assert_eq!(
+            with_emote_prefix(&waves, "carol").blocks,
+            vec![Block::Paragraph(vec![text("* carol "), text("waves")])]
+        );
+        let list = RichText {
+            blocks: vec![Block::Quote(vec![Block::Paragraph(vec![text("q")])])],
+        };
+        let out = with_emote_prefix(&list, "carol").blocks;
+        assert_eq!(out[0], Block::Paragraph(vec![text("* carol ")]));
+        assert_eq!(out[1..], list.blocks[..]);
     }
 
     #[test]
