@@ -834,7 +834,24 @@ enum Parsed<'a> {
     Emote(&'a str),
     Plain(&'a str),
     Html(&'a str),
+    Spoiler(&'a str),
+    /// An emoticon command: the emoticon, then the text if any.
+    Emoticon(&'static str, &'a str),
     Unknown(&'a str),
+}
+
+/// Element's emoticon commands (`slash-commands/emoticon.ts`), copied from
+/// its `SlashCommands.tsx`.
+fn emoticon(name: &str) -> Option<&'static str> {
+    match name {
+        "shrug" => Some("\u{AF}\\_(\u{30C4})_/\u{AF}"),
+        "tableflip" => {
+            Some("(\u{256F}\u{B0}\u{25A1}\u{B0}\u{FF09}\u{256F}\u{FE35} \u{253B}\u{2501}\u{253B}")
+        }
+        "unflip" => Some("\u{252C}\u{2500}\u{2500}\u{252C} \u{30CE}( \u{309C}-\u{309C}\u{30CE})"),
+        "lenny" => Some("( \u{361}\u{B0} \u{35C}\u{296} \u{361}\u{B0})"),
+        _ => None,
+    }
 }
 
 fn parse_command(text: &str) -> Parsed<'_> {
@@ -852,7 +869,11 @@ fn parse_command(text: &str) -> Parsed<'_> {
         "me" => Parsed::Emote(args),
         "plain" => Parsed::Plain(args),
         "html" => Parsed::Html(args),
-        _ => Parsed::Unknown(name),
+        "spoiler" => Parsed::Spoiler(args),
+        _ => match emoticon(name) {
+            Some(prefix) => Parsed::Emoticon(prefix, args),
+            None => Parsed::Unknown(name),
+        },
     }
 }
 
@@ -867,6 +888,22 @@ pub fn outgoing(composer: &Composer, room_id: &RoomId) -> Outgoing {
         Parsed::Emote(body) => (MessageKind::Emote, TextFormat::Markdown, body),
         Parsed::Plain(body) => (MessageKind::Text, TextFormat::Plain, body),
         Parsed::Html(body) => (MessageKind::Text, TextFormat::Html, body),
+        Parsed::Spoiler(body) => (MessageKind::Text, TextFormat::Spoiler, body),
+        Parsed::Emoticon(prefix, args) => {
+            let body = if args.is_empty() {
+                prefix.to_owned()
+            } else {
+                format!("{prefix} {args}")
+            };
+            return build(
+                composer,
+                room_id,
+                MessageKind::Text,
+                TextFormat::Plain,
+                &body,
+            )
+            .map_or(Outgoing::Nothing, Outgoing::Send);
+        }
         Parsed::Unknown(name) => return Outgoing::UnknownCommand(name.to_owned()),
     };
     match build(composer, room_id, kind, format, body) {
@@ -1457,9 +1494,32 @@ mod tests {
     }
 
     #[test]
+    fn spoiler_and_emoticon_commands_like_element() {
+        let spoiler = sent("/spoiler the butler did it");
+        assert_eq!(spoiler.format, TextFormat::Spoiler);
+        assert_eq!(spoiler.text.expose(), "the butler did it");
+        let shrug = sent("/shrug");
+        assert_eq!(shrug.format, TextFormat::Plain);
+        assert_eq!(shrug.text.expose(), "\u{AF}\\_(\u{30C4})_/\u{AF}");
+        assert_eq!(
+            sent("/shrug fine").text.expose(),
+            "\u{AF}\\_(\u{30C4})_/\u{AF} fine"
+        );
+        for command in ["/tableflip", "/unflip", "/lenny"] {
+            let m = sent(command);
+            assert_eq!(m.format, TextFormat::Plain, "{command}");
+            assert!(!m.text.expose().starts_with('/'), "{command}");
+        }
+        assert_eq!(
+            outgoing(&composer_with("/spoiler"), &room()),
+            Outgoing::CommandError
+        );
+    }
+
+    #[test]
     fn unknown_commands_ask_and_slashes_can_be_escaped() {
         for (text, name) in [
-            ("/shrug", "shrug"),
+            ("/rainbow", "rainbow"),
             ("/foo bar", "foo"),
             ("/", ""),
             ("/ME hi", "ME"),

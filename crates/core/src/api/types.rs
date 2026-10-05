@@ -550,6 +550,9 @@ pub enum TextFormat {
     /// The text is HTML: it is sent as the body and, sanitised, as the
     /// formatted body.
     Html,
+    /// The text is hidden behind a spoiler: sent as the body, and inside a
+    /// `data-mx-spoiler` span (sanitised) as the formatted body.
+    Spoiler,
 }
 
 /// Whether the quoted event of a reply could be loaded.

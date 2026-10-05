@@ -196,6 +196,11 @@ Phase 3 agent work is done. The Phase 3 human checkpoint below stays open: nothi
 - App: `RichEnv.rooms` / `Ctx.rooms` (the room list); a room pill whose label is its bare room ID shows the known room's name (through `take_label`, so sanitised and capped); a sender's own label is kept. Clicking already switched rooms (`LinkTarget::Room`).
 - Tests (red first): core +2 (`a_pasted_permalink_in_plain_text_is_a_pill_like_element`, `an_anchor_whose_text_is_its_permalink_gets_the_id_as_label`), app +1 (`a_room_pill_without_its_own_label_shows_the_known_room_name`). Checks on the committed tree alone (the unconfirmed pill-margin and `/spoiler` work set aside): `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` (app lib 416, core lib 226), `check-core-api.sh`, `check-app-deps.sh` pass.
 
+### `/spoiler` and emoticon commands (human-reported at the checkpoint)
+- `/spoiler …` showed the unknown-command bar. Element v1.12.30 `SlashCommands.tsx`: `/spoiler` = `makeHtmlMessage(message, <span data-mx-spoiler>${message}</span>)` (unescaped); `slash-commands/emoticon.ts`: `/shrug`, `/tableflip`, `/unflip`, `/lenny` send the emoticon plus " <text>" as plain text.
+- Core API (additive): `TextFormat::Spoiler`; `outgoing_content` sends the text as the body and the span (through `sanitize_formatted`, which keeps `data-mx-spoiler`) as the formatted body, with the picked mentions. App: `Parsed::{Spoiler, Emoticon}`; the emoticons are copied byte for byte from Element's source (`composer::emoticon`); `/spoiler` alone is a `CommandError`. `/rainbow` is now the unknown-command example in tests (`/shrug` became a command).
+- Tests (red first): core `spoiler_format_wraps_the_text_like_element`; app `spoiler_and_emoticon_commands_like_element`. Checks on the committed tree alone: `cargo fmt --all --check`, clippy `-D warnings`, `cargo test --workspace` (app lib 417, core lib 227), both boundary scripts pass.
+
 ## Phase 3 human checkpoint
 - [ ] CI green on Linux, Windows and macOS with the new dependencies (matrix-sdk `markdown`, emojis, chrono, dev-only iced `advanced`).
 - [ ] Revisit plan decisions Q1-Q25.
@@ -223,6 +228,8 @@ Phase 3 agent work is done. The Phase 3 human checkpoint below stays open: nothi
 - [x] Slash commands (fix): `/html <a href="https://matrix.org">click here</a>` shows only the link, with no "/html" prefix, in Tessera and Element (human-confirmed).
 - [x] Slash commands (fix): `//plain` sends "/plain" as text (human-confirmed).
 - [x] Pasted room links (fix): a room link copied in Element ("Copy room link") and sent shows in Tessera as a pill with the room's name, and clicking it switches to the room (human-confirmed).
+- [x] `/spoiler` (fix): `/spoiler <text>` from Tessera arrives as a hidden spoiler (human-confirmed).
+- [ ] Emoticon commands (fix): `/shrug fine` sends "¯\_(ツ)_/¯ fine"; `/tableflip`, `/unflip`, `/lenny` likewise; `/rainbow` (not supported) shows the "Unrecognised command" bar.
 - [ ] Slash commands (fix): `/plain **x**` shows the asterisks; `/me waves` is still an emote; `/me` alone shows the red "Command error: Unable to handle slash command." line and keeps the text; `/plain hi @bob` (bob picked from the list) notifies bob without a pill; an unknown command (`/shrug`) shows the "Unrecognised command" bar (seen by the human with `/toto`), Cancel keeps the text, "Send as message" sends it as an ordinary message, and switching rooms closes the bar.
 - [ ] Edited marker (fix): a message edited in Element or in Tessera shows a muted "(edited)" line under its text, with no gap or overlap with the next row; unedited messages have none.
 - [ ] Message actions (Task 12): reply, edit, delete and react round-trip with Element on the real account (reply shows the quote there; an edit shows "(edited)"; delete asks first, then the message becomes a placeholder; a reaction appears and a second click removes it); a failed delete or reaction shows the red one-line notice for about 5 seconds.

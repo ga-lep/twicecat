@@ -49,14 +49,21 @@ pub(crate) fn outgoing_content(
             };
             return with_picked_mentions(content, &message.mentions);
         }
-        TextFormat::Html => {
+        TextFormat::Html | TextFormat::Spoiler => {
+            // Element: `/html` sends the source twice, `/spoiler` wraps it
+            // unescaped (`makeHtmlMessage(message, <span data-mx-spoiler>…)`).
+            let html = if message.format == TextFormat::Spoiler {
+                format!("<span data-mx-spoiler>{text}</span>")
+            } else {
+                text.to_owned()
+            };
             let mut content = match message.kind {
-                MessageKind::Text => RoomMessageEventContentWithoutRelation::text_html(text, text),
+                MessageKind::Text => RoomMessageEventContentWithoutRelation::text_html(text, html),
                 MessageKind::Notice => {
-                    RoomMessageEventContentWithoutRelation::notice_html(text, text)
+                    RoomMessageEventContentWithoutRelation::notice_html(text, html)
                 }
                 MessageKind::Emote => {
-                    RoomMessageEventContentWithoutRelation::emote_html(text, text)
+                    RoomMessageEventContentWithoutRelation::emote_html(text, html)
                 }
             };
             match &mut content.msgtype {
@@ -282,6 +289,19 @@ mod tests {
         let mut m = message(text, Vec::new(), MessageKind::Text);
         m.format = format;
         text_parts(&outgoing_content(&m))
+    }
+
+    #[test]
+    fn spoiler_format_wraps_the_text_like_element() {
+        let (body, html) = formatted_as("the butler <script>x</script>did it", TextFormat::Spoiler);
+        assert_eq!(body, "the butler <script>x</script>did it");
+        let html = html.expect("an html body");
+        assert!(html.starts_with("<span data-mx-spoiler"), "{html}");
+        assert!(
+            html.contains("the butler") && html.contains("did it"),
+            "{html}"
+        );
+        assert!(!html.contains("script"), "{html}");
     }
 
     #[test]
