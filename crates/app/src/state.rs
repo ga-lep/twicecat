@@ -5,25 +5,58 @@
 //! type.
 
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use iced::theme;
+use iced::widget::{operation, scrollable};
 use iced::{Element, Subscription, Task, Theme, clipboard, system, window};
 use tessera_core::api::{
-    Command, CoreError, CoreEvent, ListDiff, MessageText, Password, RoomId, RoomListQuery,
-    RoomListTab, RoomSummary, SyncState, TimelineItem, UserId,
+    ActionKind, Command, CoreError, CoreEvent, Draft, EventId, ListDiff, MessageDetails,
+    MessageText, OutgoingMessage, Password, RoomId, RoomListQuery, RoomListTab, RoomSummary,
+    SyncState, TimelineItem, TimelineItemKind, TypingUser, UserId,
 };
 use tokio::sync::mpsc;
 
+use crate::actions::{self, ActionButtons, ActionState, NOTICE_DURATION, Notice, Picker};
 use crate::avatars::Avatars;
 use crate::bridge::{self, Bridge, EventsSlot};
+use crate::composer::{self, Composer, ComposerKey, EditorAction, SearchStep};
+use crate::emoji;
+use crate::links::{self, LinkBar};
+use crate::rich_text::{LinkTarget, MAX_REVEALED, Revealed};
 use crate::room_list;
 use crate::screens::login::{self, BrowserUrl, LoginForm};
 use crate::screens::{self, loading, main_view};
 use crate::text_safety;
+use crate::timeline::{self, Effects, TimelineView};
 
 /// How long to wait for the core to close after `Shutdown` (plan Q18).
 pub const SHUTDOWN_WAIT: Duration = Duration::from_secs(10);
+/// Pause after the last composer change before its draft is stored.
+pub const DRAFT_SAVE_DELAY: Duration = Duration::from_secs(1);
+/// The notice for a command without its text, such as `/me` alone
+/// (Element's wording).
+pub const COMMAND_ERROR_TEXT: &str = "Command error: Unable to handle slash command.";
+/// The notice for command `name` sent without its text, in Element's words:
+/// its usage line, except for `/me`, whose Element error is the generic one.
+pub fn command_error_text(name: &str) -> String {
+    if name == "me" {
+        COMMAND_ERROR_TEXT.to_owned()
+    } else {
+        format!("Command error: Usage: /{name} <message>")
+    }
+}
+
+/// The notice when a reply's original is not found.
+pub const JUMP_FAILED_TEXT: &str =
+    "Could not find the original message (searched about 1,000 earlier messages)";
+
+/// Starts the system handler for a checked link, away from `update`.
+fn open_link_task(url: links::CheckedUrl) -> Task<Message> {
+    Task::perform(async move { links::open_link(&url) }, |ok| {
+        Message::LinkOpened { ok }
+    })
+}
 
 /// Where commands go. The [`Bridge`] in production; a plain channel sender in
 /// tests, so `update` can be tested without a runtime.
@@ -34,6 +67,9 @@ pub trait CommandSink: Send {
 
     /// A task that yields [`Message::ShutdownDeadline`] after `after`.
     fn deadline(&self, after: Duration) -> Task<Message>;
+
+    /// A task that yields `message` after `after`.
+    fn timer(&self, after: Duration, message: Message) -> Task<Message>;
 }
 
 impl CommandSink for Bridge {
@@ -43,6 +79,10 @@ impl CommandSink for Bridge {
 
     fn deadline(&self, after: Duration) -> Task<Message> {
         Bridge::deadline(self, after)
+    }
+
+    fn timer(&self, after: Duration, message: Message) -> Task<Message> {
+        Bridge::timer(self, after, message)
     }
 }
 
@@ -55,6 +95,11 @@ impl CommandSink for mpsc::Sender<Command> {
 
     /// Tests have no runtime to time on: no deadline.
     fn deadline(&self, _after: Duration) -> Task<Message> {
+        Task::none()
+    }
+
+    /// Likewise: tests call the timer's handler themselves.
+    fn timer(&self, _after: Duration, _message: Message) -> Task<Message> {
         Task::none()
     }
 }
@@ -106,10 +151,59 @@ pub enum Message {
     },
     /// The user pressed **Copy link**.
     CopyLink,
-    /// The composer text changed; its `Debug` is redacted.
-    ComposerChanged(MessageText),
-    /// The user pressed Enter in the composer.
-    ComposerSubmitted,
+    /// An action in the composer's text editor; its `Debug` shows only the
+    /// kind of action.
+    Composer(EditorAction),
+    /// A key command in the composer (send, suggestion keys, escape).
+    ComposerKey(ComposerKey),
+    /// The user clicked suggestion `index` under the composer.
+    SuggestionPicked(usize),
+    /// The member search timer fired.
+    MembersDue,
+    /// The pointer entered a message.
+    HoverEnter(String),
+    /// The pointer left a message.
+    HoverExit(String),
+    /// **Reply** on a message.
+    ReplyRequested(String),
+    /// **Edit** on a message.
+    EditRequested(String),
+    /// **Copy** on a message.
+    CopyRequested(String),
+    /// **Delete** on a message (asks for confirmation).
+    DeleteRequested(String),
+    /// The user confirmed the pending delete.
+    DeleteConfirmed,
+    /// The user backed out of the pending delete.
+    DeleteCancelled,
+    /// The user pressed the reply bar's cross (reply or edit mode).
+    ModeCancelled,
+    /// **React** on a message opens the picker.
+    PickerOpened(String),
+    /// The picker's search field changed; the text is not logged.
+    PickerQuery(MessageText),
+    /// The user pressed Enter in the picker's search field.
+    PickerSubmitted,
+    /// The user picked an emoji in the picker; the key is not logged.
+    PickerPicked(MessageText),
+    /// The user closed the picker.
+    PickerClosed,
+    /// The user clicked a reaction chip; the key is not logged.
+    ReactionToggled {
+        /// The message.
+        item: String,
+        /// The reaction.
+        key: MessageText,
+    },
+    /// The failure notice with this sequence number timed out.
+    NoticeExpired(u64),
+    /// A reply's quote was clicked: jump to the quoted message.
+    ReplyQuoteClicked(EventId),
+    /// The highlight of the row jumped to timed out.
+    FlashEnded(String),
+    /// The pause after a composer change ended: store the draft if this is
+    /// still the last change.
+    DraftDue(u64),
     /// The user pressed **Log out**.
     LogoutRequested,
     /// The user picked a room in the list.
@@ -125,6 +219,38 @@ pub enum Message {
         /// Height of the visible part, in pixels.
         viewport_h: f32,
     },
+    /// The pane measured a timeline row.
+    RowMeasured {
+        /// The item's ID.
+        id: String,
+        /// Its height in pixels.
+        height: f32,
+    },
+    /// The timeline scrolled, or its size changed.
+    TimelineScrolled(scrollable::Viewport),
+    /// The user clicked a link, pill or spoiler in a message.
+    LinkClicked(LinkTarget),
+    /// The user confirmed opening the link in the confirmation bar.
+    LinkConfirmed,
+    /// The user closed the link bar.
+    LinkDismissed,
+    /// "Send as message" on the unknown-command bar.
+    CommandSendAnyway,
+    /// The unknown-command bar was closed; the text stays in the composer.
+    CommandCancelled,
+    /// The system handler was started (or failed to start) for a link.
+    LinkOpened {
+        /// Whether the handler started without error.
+        ok: bool,
+    },
+    /// The window gained or lost focus.
+    WindowFocus(bool),
+    /// The timer of a delayed read receipt ended.
+    ReadDue(RoomId),
+    /// **Retry** on a failed local echo.
+    RetryRequested(String),
+    /// **Discard** on a failed local echo.
+    DiscardRequested(String),
     /// The user asked to close the window.
     CloseRequested,
     /// The core did not close in time after `Shutdown`.
@@ -164,7 +290,7 @@ pub struct App {
     /// The room whose timeline is open.
     pub selected: Option<RoomId>,
     /// The selected room's timeline, kept in step with the core's diffs.
-    pub timeline: Vec<TimelineItem>,
+    pub timeline: TimelineView,
     /// The signed-in account.
     pub user_id: Option<UserId>,
     /// The last sync state.
@@ -184,12 +310,30 @@ pub struct App {
     pub browser_link: Option<BrowserUrl>,
     /// `None` while the browser launcher runs, then whether it worked.
     pub browser_opened: Option<bool>,
-    /// The composer text of the selected room.
-    pub composer: MessageText,
+    /// The composer of the selected room.
+    pub composer: Composer,
     /// A non-secret line about the last failed send.
     pub send_error: Option<String>,
+    /// Hover, delete confirmation, reaction picker and failure notice.
+    pub actions: ActionState,
     /// The system theme mode.
     pub theme_mode: theme::Mode,
+    /// Spoilers the user revealed in the open room.
+    pub revealed: Revealed,
+    /// Who is typing in the open room (other users, at most
+    /// [`timeline::MAX_TYPING_KEPT`]).
+    pub typing: Vec<TypingUser>,
+    /// The window has focus (read receipts wait for it).
+    pub window_focused: bool,
+    /// The bar above the composer about a clicked link.
+    pub link_bar: Option<LinkBar>,
+    /// The name of an unknown `/command` waiting for "Send as message".
+    pub command_bar: Option<String>,
+    /// Counts composer changes, so only the last draft timer saves.
+    pub draft_seq: u64,
+    /// The composer changed since the room was opened: only then is its
+    /// draft stored (the room's own draft may still be on its way).
+    draft_dirty: bool,
     /// Set when the app decided to exit (the task itself is opaque to tests).
     pub exit_requested: bool,
 }
@@ -201,11 +345,12 @@ impl std::fmt::Debug for App {
         f.debug_struct("App")
             .field("screen", &self.screen)
             .field("rooms", &self.rooms.len())
-            .field("timeline", &self.timeline.len())
+            .field("timeline", &self.timeline)
             .field("selected", &self.selected)
             .field("login", &self.login)
             .field("login_in_flight", &self.login_in_flight)
             .field("composer", &self.composer)
+            .field("actions", &self.actions)
             .finish_non_exhaustive()
     }
 }
@@ -233,7 +378,7 @@ impl App {
             load_more_at: None,
             avatars: Avatars::default(),
             selected: None,
-            timeline: Vec::new(),
+            timeline: TimelineView::default(),
             user_id: None,
             sync_state: SyncState::Idle,
             login: LoginForm::new(),
@@ -242,9 +387,17 @@ impl App {
             notice: None,
             browser_link: None,
             browser_opened: None,
-            composer: MessageText::from(String::new()),
+            composer: Composer::new(),
             send_error: None,
+            actions: ActionState::default(),
             theme_mode: theme::Mode::None,
+            revealed: Revealed::new(),
+            typing: Vec::new(),
+            window_focused: true,
+            link_bar: None,
+            command_bar: None,
+            draft_seq: 0,
+            draft_dirty: false,
             exit_requested: false,
         };
         let restore = app.send(Command::RestoreSession);
@@ -271,6 +424,29 @@ impl App {
 
     /// Applies a message.
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        let touches_composer = matches!(
+            message,
+            Message::Composer(_)
+                | Message::ComposerKey(_)
+                | Message::SuggestionPicked(_)
+                | Message::ReplyRequested(_)
+                | Message::EditRequested(_)
+                | Message::ModeCancelled
+        );
+        let task = self.update_inner(message);
+        if touches_composer && self.selected.is_some() {
+            self.draft_dirty = true;
+            self.draft_seq = self.draft_seq.wrapping_add(1);
+            let timer = self
+                .sink
+                .timer(DRAFT_SAVE_DELAY, Message::DraftDue(self.draft_seq));
+            Task::batch([task, timer])
+        } else {
+            task
+        }
+    }
+
+    fn update_inner(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Core(event) => self.on_core(*event),
             Message::CoreClosed => {
@@ -316,22 +492,181 @@ impl App {
                 Some(link) => clipboard::write(link.as_str().to_owned()),
                 None => Task::none(),
             },
-            Message::ComposerChanged(text) => {
-                if self.selected.is_some() {
-                    self.composer = text;
+            Message::Composer(EditorAction(action)) => {
+                self.composer_action_at(action, Instant::now())
+            }
+            Message::ComposerKey(key) => self.composer_key_at(key, Instant::now()),
+            Message::SuggestionPicked(index) => {
+                self.pick_suggestion_at(Some(index), Instant::now())
+            }
+            Message::MembersDue => self.members_due_at(Instant::now()),
+            Message::RowMeasured { id, height } => {
+                let effects = self.timeline.row_measured(&id, height);
+                self.timeline_effects(effects)
+            }
+            Message::TimelineScrolled(viewport) => {
+                let bounds = viewport.bounds();
+                // The scrollable is anchored at the bottom, so its stored
+                // offset is the distance from the bottom edge.
+                self.on_timeline_scrolled(viewport.absolute_offset().y, bounds.height, bounds.width)
+            }
+            Message::LinkClicked(target) => self.link_clicked(target),
+            Message::LinkConfirmed => match self.link_bar.take() {
+                Some(LinkBar::Confirm(url)) => open_link_task(url),
+                other => {
+                    self.link_bar = other;
+                    Task::none()
+                }
+            },
+            Message::LinkDismissed => {
+                self.link_bar = None;
+                Task::none()
+            }
+            Message::CommandSendAnyway => {
+                self.command_bar = None;
+                match self.selected.clone() {
+                    Some(room_id) => match composer::as_text(&self.composer, &room_id) {
+                        Some(message) => self.send_composed(message),
+                        None => Task::none(),
+                    },
+                    None => Task::none(),
+                }
+            }
+            Message::CommandCancelled => {
+                self.command_bar = None;
+                Task::none()
+            }
+            Message::LinkOpened { ok } => {
+                if !ok {
+                    self.link_bar = Some(LinkBar::Failed);
                 }
                 Task::none()
             }
-            Message::ComposerSubmitted => self.submit_composer(),
+            Message::HoverEnter(id) => {
+                self.actions.hovered = Some(id);
+                Task::none()
+            }
+            Message::HoverExit(id) => {
+                if self.actions.hovered.as_deref() == Some(id.as_str()) {
+                    self.actions.hovered = None;
+                }
+                Task::none()
+            }
+            Message::WindowFocus(focused) => {
+                self.window_focused = focused;
+                self.read_receipt(Instant::now())
+            }
+            Message::ReadDue(room_id) => {
+                if self.selected.as_ref() != Some(&room_id) {
+                    return Task::none();
+                }
+                self.timeline.read_timer_fired();
+                self.read_receipt(Instant::now())
+            }
+            Message::RetryRequested(id) => self.echo_command(id, false),
+            Message::DiscardRequested(id) => self.echo_command(id, true),
+            Message::ReplyRequested(id) => self.request_reply(id),
+            Message::EditRequested(id) => self.request_edit(id),
+            Message::CopyRequested(id) => match self.copy_source(&id) {
+                Some(body) => clipboard::write(body.to_owned()),
+                None => Task::none(),
+            },
+            Message::DeleteRequested(id) => {
+                if self.buttons_for(&id).is_some_and(|b| b.delete) {
+                    self.actions.confirm_delete = Some(id);
+                }
+                Task::none()
+            }
+            Message::DeleteConfirmed => self.confirm_delete(),
+            Message::DeleteCancelled => {
+                self.actions.confirm_delete = None;
+                Task::none()
+            }
+            Message::ModeCancelled => {
+                let was_edit = matches!(self.composer.mode, composer::Mode::Edit(_));
+                self.composer.cancel_mode();
+                self.after_edit_left(was_edit)
+            }
+            Message::PickerOpened(id) => {
+                if self.buttons_for(&id).is_some_and(|b| b.react) {
+                    self.actions.picker = Some(Picker {
+                        target: id,
+                        query: String::new(),
+                    });
+                    return operation::focus(actions::PICKER_INPUT_ID);
+                }
+                Task::none()
+            }
+            Message::PickerQuery(query) => {
+                if let Some(picker) = &mut self.actions.picker {
+                    query.expose().clone_into(&mut picker.query);
+                }
+                Task::none()
+            }
+            Message::PickerSubmitted => {
+                let first = self
+                    .actions
+                    .picker
+                    .as_ref()
+                    .and_then(|p| emoji::picker_results(&p.query).first().copied());
+                match first {
+                    Some(glyph) => self.pick_reaction(glyph),
+                    None => Task::none(),
+                }
+            }
+            Message::PickerPicked(key) => self.pick_reaction(key.expose()),
+            Message::PickerClosed => {
+                self.actions.picker = None;
+                Task::none()
+            }
+            Message::ReactionToggled { item, key } => self.toggle_reaction(&item, key.expose()),
+            Message::NoticeExpired(seq) => {
+                if self.actions.notice.as_ref().is_some_and(|n| n.seq == seq) {
+                    self.actions.notice = None;
+                }
+                Task::none()
+            }
+            Message::ReplyQuoteClicked(event_id) => {
+                if self.selected.is_none() {
+                    return Task::none();
+                }
+                let effects = self.timeline.jump_to(event_id);
+                self.timeline_effects(effects)
+            }
+            Message::FlashEnded(id) => {
+                self.timeline.flash_ended(&id);
+                Task::none()
+            }
+            Message::DraftDue(seq) => {
+                if seq == self.draft_seq {
+                    self.save_draft()
+                } else {
+                    Task::none()
+                }
+            }
             Message::LogoutRequested => self.send(Command::Logout),
             Message::SelectRoom(id) => {
                 if !room_list::contains(&self.rooms, &id) {
                     return Task::none();
                 }
+                let stop_typing = self.stop_typing();
+                let marker = self.move_read_marker();
+                // Before the core opens the next room (commands run in order).
+                let save = self.save_draft();
+                self.draft_dirty = false;
+                self.draft_seq = self.draft_seq.wrapping_add(1);
                 self.selected = Some(id.clone());
-                self.timeline.clear();
+                self.timeline.reset();
+                self.typing.clear();
+                self.actions.reset();
                 self.clear_draft();
-                self.send(Command::SelectRoom(id))
+                self.reset_link_state();
+                Task::batch([
+                    stop_typing,
+                    marker,
+                    save,
+                    self.send(Command::SelectRoom(id)),
+                ])
             }
             Message::TabSelected(tab) => {
                 let query = RoomListQuery {
@@ -360,8 +695,10 @@ impl App {
                 if self.screen == Screen::ShuttingDown {
                     return Task::none();
                 }
+                let save = self.save_draft();
                 self.screen = Screen::ShuttingDown;
                 Task::batch([
+                    save,
                     self.send(Command::Shutdown),
                     self.sink.deadline(SHUTDOWN_WAIT),
                 ])
@@ -455,7 +792,28 @@ impl App {
                 task = self.check_paging();
             }
             CoreEvent::TimelineDiff { room_id, diffs } => {
-                self.apply_timeline(&room_id, &diffs);
+                task = self.apply_timeline(&room_id, diffs);
+            }
+            CoreEvent::DraftLoaded { room_id, draft } => {
+                if self.selected.as_ref() == Some(&room_id) {
+                    // A reply whose message is not loaded comes back as a
+                    // plain draft; the text is never lost.
+                    let reply = draft.reply_to.as_ref().and_then(|event| {
+                        self.timeline
+                            .items
+                            .iter()
+                            .find(|i| i.event_id.as_ref() == Some(event))
+                            .map(|i| i.id.clone())
+                    });
+                    self.composer
+                        .load_draft(draft.text.expose(), draft.mentions, reply);
+                }
+            }
+            CoreEvent::Pagination { room_id, state } => {
+                if self.selected.as_ref() == Some(&room_id) {
+                    let effects = self.timeline.pagination_changed(state);
+                    task = self.timeline_effects(effects);
+                }
             }
             CoreEvent::SendFailed { room_id, error } => {
                 if self.selected.as_ref() == Some(&room_id) {
@@ -464,6 +822,40 @@ impl App {
             }
             CoreEvent::Error(error) => task = self.on_core_error(&error),
             CoreEvent::Avatar { id, image } => self.avatars.answer(&id, image),
+            CoreEvent::Members {
+                room_id,
+                query,
+                members,
+            } => {
+                if self.selected.as_ref() == Some(&room_id) {
+                    self.composer.set_members(query.expose(), members);
+                }
+            }
+            CoreEvent::ActionFailed {
+                room_id,
+                action: ActionKind::Send | ActionKind::Edit,
+                error,
+            } => {
+                if self.selected.as_ref() == Some(&room_id) {
+                    self.send_error = Some(safe_line(&error.to_string()));
+                }
+            }
+            CoreEvent::ActionFailed {
+                room_id,
+                action: action @ (ActionKind::Redact | ActionKind::React),
+                error,
+            } => {
+                if self.selected.as_ref() == Some(&room_id) {
+                    task = self.show_notice(action, &error);
+                }
+            }
+            CoreEvent::Typing { room_id, mut users } => {
+                if self.selected.as_ref() == Some(&room_id) {
+                    users.truncate(timeline::MAX_TYPING_KEPT);
+                    self.typing = users;
+                }
+            }
+            CoreEvent::ActionFailed { .. } => {}
         }
         task
     }
@@ -630,14 +1022,288 @@ impl App {
         self.send(Command::LoadMoreRooms)
     }
 
-    /// Sends the composer text to the selected room and clears the field.
-    fn submit_composer(&mut self) -> Task<Message> {
-        if self.selected.is_none() || self.composer.expose().trim().is_empty() {
+    /// Applies an editor action to the composer of the open room and sends
+    /// what that asks for: typing notices and member searches.
+    fn composer_action_at(
+        &mut self,
+        action: iced::widget::text_editor::Action,
+        now: Instant,
+    ) -> Task<Message> {
+        if self.selected.is_none() {
             return Task::none();
         }
-        let text = std::mem::replace(&mut self.composer, MessageText::from(String::new()));
+        let effects = self.composer.apply(action, now);
+        self.run_effects(effects.search, effects.typing)
+    }
+
+    /// Sends a `SetTyping` and starts or runs a member search step.
+    fn run_effects(&self, search: SearchStep, typing: Option<bool>) -> Task<Message> {
+        let Some(room_id) = self.selected.clone() else {
+            return Task::none();
+        };
+        let mut tasks = Vec::new();
+        if let Some(typing) = typing {
+            tasks.push(self.send(Command::SetTyping {
+                room_id: room_id.clone(),
+                typing,
+            }));
+        }
+        match search {
+            SearchStep::Idle => {}
+            SearchStep::Send(query) => {
+                tasks.push(self.send(Command::SearchMembers { room_id, query }));
+            }
+            SearchStep::Arm(after) => tasks.push(self.sink.timer(after, Message::MembersDue)),
+        }
+        Task::batch(tasks)
+    }
+
+    fn members_due_at(&mut self, now: Instant) -> Task<Message> {
+        let step = self.composer.search.timer_fired(now);
+        self.run_effects(step, None)
+    }
+
+    fn pick_suggestion_at(&mut self, index: Option<usize>, now: Instant) -> Task<Message> {
+        match self.composer.pick(index, now) {
+            Some(effects) if self.selected.is_some() => {
+                self.run_effects(effects.search, effects.typing)
+            }
+            _ => Task::none(),
+        }
+    }
+
+    fn composer_key_at(&mut self, key: ComposerKey, now: Instant) -> Task<Message> {
+        match key {
+            ComposerKey::Send => self.submit_composer(),
+            ComposerKey::Pick => self.pick_suggestion_at(None, now),
+            ComposerKey::Next => {
+                self.composer.step(1);
+                Task::none()
+            }
+            ComposerKey::Previous => {
+                self.composer.step(-1);
+                Task::none()
+            }
+            ComposerKey::Escape => {
+                let was_edit = matches!(self.composer.mode, composer::Mode::Edit(_));
+                self.composer.escape();
+                self.after_edit_left(was_edit)
+            }
+        }
+    }
+
+    /// The message `id` of the open timeline: its plain body, whether it is
+    /// the user's own, and its details. `None` for other kinds of item.
+    fn find_message(&self, id: &str) -> Option<(&str, bool, &MessageDetails)> {
+        self.timeline
+            .items
+            .iter()
+            .find(|item| item.id == id)
+            .and_then(|item| match &item.kind {
+                TimelineItemKind::Message {
+                    body,
+                    is_own,
+                    details,
+                    ..
+                } => Some((body.as_str(), *is_own, details.as_ref())),
+                _ => None,
+            })
+    }
+
+    /// The buttons message `id` offers right now, or `None` when it is gone.
+    fn buttons_for(&self, id: &str) -> Option<ActionButtons> {
+        self.find_message(id)
+            .map(|(_, is_own, details)| actions::action_buttons(details, is_own))
+    }
+
+    /// The text **Copy** puts on the clipboard: the plain body, when the core
+    /// allows copying.
+    pub fn copy_source(&self, id: &str) -> Option<&str> {
+        let (body, is_own, details) = self.find_message(id)?;
+        actions::action_buttons(details, is_own)
+            .copy
+            .then_some(body)
+    }
+
+    /// After a reply or an edit mode ended: an edit that leaves an empty
+    /// composer ends the typing notice it started.
+    fn after_edit_left(&mut self, was_edit: bool) -> Task<Message> {
+        if was_edit
+            && matches!(self.composer.mode, composer::Mode::Normal)
+            && self.composer.is_empty()
+        {
+            self.stop_typing()
+        } else {
+            Task::none()
+        }
+    }
+
+    /// **Reply**: quote message `id` in the next send.
+    fn request_reply(&mut self, id: String) -> Task<Message> {
+        if self.selected.is_none() || !self.buttons_for(&id).is_some_and(|b| b.reply) {
+            return Task::none();
+        }
+        let was_edit = matches!(self.composer.mode, composer::Mode::Edit(_));
+        if was_edit {
+            self.composer.cancel_mode();
+        }
+        self.composer.mode = composer::Mode::Reply(id);
+        Task::batch([
+            self.after_edit_left(was_edit),
+            operation::focus(composer::COMPOSER_ID),
+        ])
+    }
+
+    /// **Edit**: load the plain body of the user's own message `id`.
+    fn request_edit(&mut self, id: String) -> Task<Message> {
+        if self.selected.is_none() || !self.buttons_for(&id).is_some_and(|b| b.edit) {
+            return Task::none();
+        }
+        let Some(body) = self.find_message(&id).map(|(body, ..)| body.to_owned()) else {
+            return Task::none();
+        };
+        self.composer.begin_edit(id, &body);
+        operation::focus(composer::COMPOSER_ID)
+    }
+
+    /// The user confirmed **Delete**: redact the message, if it is still
+    /// there and the core still allows it.
+    fn confirm_delete(&mut self) -> Task<Message> {
+        let Some(id) = self.actions.confirm_delete.take() else {
+            return Task::none();
+        };
+        let Some(room_id) = self.selected.clone() else {
+            return Task::none();
+        };
+        if !self.buttons_for(&id).is_some_and(|b| b.delete) {
+            return Task::none();
+        }
+        self.send(Command::Redact {
+            room_id,
+            item_id: id,
+            reason: None,
+        })
+    }
+
+    /// Sends `ToggleReaction` for message `id` when the core allows reacting.
+    fn toggle_reaction(&self, id: &str, key: &str) -> Task<Message> {
+        let Some(room_id) = self.selected.clone() else {
+            return Task::none();
+        };
+        if !self.buttons_for(id).is_some_and(|b| b.react) {
+            return Task::none();
+        }
+        self.send(Command::ToggleReaction {
+            room_id,
+            item_id: id.to_owned(),
+            key: key.to_owned(),
+        })
+    }
+
+    /// An emoji was picked: react with it and close the picker.
+    fn pick_reaction(&mut self, key: &str) -> Task<Message> {
+        match self.actions.picker.take() {
+            Some(picker) => self.toggle_reaction(&picker.target, key),
+            None => Task::none(),
+        }
+    }
+
+    /// Stores the open room's draft, or clears it when the composer is empty;
+    /// nothing when the composer was not touched since the room was opened.
+    fn save_draft(&mut self) -> Task<Message> {
+        let Some(room_id) = self.selected.clone() else {
+            return Task::none();
+        };
+        if !self.draft_dirty {
+            return Task::none();
+        }
+        let draft = self.composer.draft_parts().map(|(text, mentions, reply)| {
+            // The reply target is kept by event; an item not sent yet has
+            // none, and the draft then stays a plain message.
+            let reply_to = reply.and_then(|item| {
+                self.timeline
+                    .items
+                    .iter()
+                    .find(|i| i.id == item)
+                    .and_then(|i| i.event_id.clone())
+            });
+            Draft {
+                text: MessageText::from(text),
+                mentions,
+                reply_to,
+            }
+        });
+        self.send(Command::SaveDraft { room_id, draft })
+    }
+
+    /// Shows the failure line of a delete or reaction for 5 seconds.
+    fn show_notice(&mut self, action: ActionKind, error: &CoreError) -> Task<Message> {
+        let Some(text) = actions::notice_text(action, &safe_line(&error.to_string())) else {
+            return Task::none();
+        };
+        self.show_notice_text(text)
+    }
+
+    /// Shows a failure line for 5 seconds.
+    fn show_notice_text(&mut self, text: String) -> Task<Message> {
+        let seq = self.actions.notice_seq.saturating_add(1);
+        self.actions.notice_seq = seq;
+        self.actions.notice = Some(Notice { seq, text });
+        self.sink
+            .timer(NOTICE_DURATION, Message::NoticeExpired(seq))
+    }
+
+    /// `SetTyping(false)` for the open room when a notice is outstanding.
+    fn stop_typing(&mut self) -> Task<Message> {
+        match &self.selected {
+            Some(room_id) if self.composer.typing.stop() => self.send(Command::SetTyping {
+                room_id: room_id.clone(),
+                typing: false,
+            }),
+            _ => Task::none(),
+        }
+    }
+
+    /// Sends the composer text to the selected room (a new message, a reply
+    /// or an edit) and resets the composer. A blank text sends nothing.
+    fn submit_composer(&mut self) -> Task<Message> {
+        let Some(room_id) = self.selected.clone() else {
+            return Task::none();
+        };
+        let message = match composer::outgoing(&self.composer, &room_id) {
+            composer::Outgoing::Send(message) => message,
+            composer::Outgoing::UnknownCommand(name) => {
+                self.command_bar = Some(name);
+                return Task::none();
+            }
+            composer::Outgoing::CommandError(name) => {
+                return self.show_notice_text(command_error_text(&name));
+            }
+            composer::Outgoing::Nothing => return Task::none(),
+        };
+        self.send_composed(message)
+    }
+
+    /// Sends `message` as a new message, a reply or an edit, as the composer
+    /// mode says, and resets the composer.
+    fn send_composed(&mut self, message: OutgoingMessage) -> Task<Message> {
+        self.command_bar = None;
+        let command = match &self.composer.mode {
+            composer::Mode::Edit(item_id) => Command::Edit {
+                item_id: item_id.clone(),
+                message,
+            },
+            composer::Mode::Normal | composer::Mode::Reply(_) => Command::Send(message),
+        };
+        self.composer.finish_send();
         self.send_error = None;
-        self.send(Command::SendMessage { text })
+        let sent = self.send(command);
+        // The stored draft becomes what is left: nothing, or after an edit
+        // the draft it set aside. Marked dirty here because "Send as message"
+        // reaches this without a composer message.
+        self.draft_dirty = true;
+        let save = self.save_draft();
+        Task::batch([sent, save, self.stop_typing()])
     }
 
     /// Forgets everything about a login attempt: the flag, the browser link
@@ -649,8 +1315,11 @@ impl App {
         self.login.password = Password::from(String::new());
     }
 
+    /// Empties the composer without telling the room (the caller does that
+    /// where the room is still open and reachable).
     fn clear_draft(&mut self) {
-        self.composer = MessageText::from(String::new());
+        self.composer.clear();
+        self.composer.typing.reset();
         self.send_error = None;
     }
 
@@ -671,18 +1340,152 @@ impl App {
 
     fn deselect(&mut self) {
         self.selected = None;
-        self.timeline.clear();
+        self.timeline.reset();
+        self.typing.clear();
+        self.actions.reset();
         self.clear_draft();
+        self.reset_link_state();
+    }
+
+    /// Forgets revealed spoilers, the link bar and the unknown-command bar
+    /// of the room left.
+    fn reset_link_state(&mut self) {
+        self.revealed.clear();
+        self.link_bar = None;
+        self.command_bar = None;
+    }
+
+    /// A click on a link, pill or spoiler (plan Q19). Nothing here opens
+    /// anything itself: opening is a `Task`.
+    fn link_clicked(&mut self, target: LinkTarget) -> Task<Message> {
+        match target {
+            // Every link asks first; opening happens on `LinkConfirmed`.
+            LinkTarget::Url(url) => {
+                self.link_bar = Some(match links::check_link_url(&url) {
+                    Ok(checked) => LinkBar::Confirm(checked),
+                    Err(_) => LinkBar::Refused,
+                });
+                Task::none()
+            }
+            LinkTarget::Room(room) => {
+                let id = RoomId::from(room);
+                if room_list::contains(&self.rooms, &id) {
+                    self.update(Message::SelectRoom(id))
+                } else {
+                    Task::none()
+                }
+            }
+            // Profiles are Phase 5.
+            LinkTarget::User(_) => Task::none(),
+            LinkTarget::Spoiler { item, index } => {
+                let key = (item, index);
+                if !self.revealed.remove(&key) && self.revealed.len() < MAX_REVEALED {
+                    self.revealed.insert(key);
+                }
+                Task::none()
+            }
+        }
     }
 
     /// Applies timeline diffs of the selected room; other rooms are ignored.
-    fn apply_timeline(&mut self, room_id: &RoomId, diffs: &[ListDiff<TimelineItem>]) {
+    fn apply_timeline(
+        &mut self,
+        room_id: &RoomId,
+        diffs: Vec<ListDiff<TimelineItem>>,
+    ) -> Task<Message> {
         if self.selected.as_ref() != Some(room_id) {
-            return;
+            return Task::none();
         }
-        for diff in diffs {
-            diff.apply(&mut self.timeline);
+        let effects = self.timeline.apply_diffs(diffs);
+        self.timeline_effects(effects)
+    }
+
+    /// The timeline scrolled to `offset_from_bottom` pixels from the bottom
+    /// in a viewport of `viewport_h` by `width` pixels.
+    pub fn on_timeline_scrolled(
+        &mut self,
+        offset_from_bottom: f32,
+        viewport_h: f32,
+        width: f32,
+    ) -> Task<Message> {
+        let effects = self
+            .timeline
+            .scrolled(offset_from_bottom, viewport_h, width);
+        self.timeline_effects(effects)
+    }
+
+    /// Turns what the timeline model asks for into a scroll task and a
+    /// `PaginateBackwards` command (plan Q14, Q16).
+    fn timeline_effects(&mut self, effects: Effects) -> Task<Message> {
+        let mut tasks = Vec::new();
+        if let Some(y) = effects.scroll_to {
+            tasks.push(operation::scroll_to(
+                timeline::TIMELINE_ID,
+                scrollable::AbsoluteOffset {
+                    x: None,
+                    y: Some(y),
+                },
+            ));
         }
+        if effects.paginate
+            && let Some(room_id) = self.selected.clone()
+        {
+            tasks.push(self.send(Command::PaginateBackwards { room_id }));
+        }
+        if let Some(id) = effects.flash {
+            tasks.push(
+                self.sink
+                    .timer(timeline::FLASH_DURATION, Message::FlashEnded(id)),
+            );
+        }
+        if effects.jump_failed {
+            tasks.push(self.show_notice_text(JUMP_FAILED_TEXT.to_owned()));
+        }
+        tasks.push(self.read_receipt(Instant::now()));
+        Task::batch(tasks)
+    }
+
+    /// Sends the read receipt when one is due, or starts the timer that
+    /// asks again (plan Q12). `now` is a parameter for the tests.
+    fn read_receipt(&mut self, now: Instant) -> Task<Message> {
+        let Some(room_id) = self.selected.clone() else {
+            return Task::none();
+        };
+        match self.timeline.read_step(self.window_focused, now) {
+            timeline::ReadStep::Idle => Task::none(),
+            timeline::ReadStep::Send => self.send(Command::MarkRead {
+                room_id,
+                fully_read: false,
+            }),
+            timeline::ReadStep::Wait(after) => self.sink.timer(after, Message::ReadDue(room_id)),
+        }
+    }
+
+    /// `MoveReadMarker` for the room being left, when its bottom was seen
+    /// with the window focused. Never a public receipt.
+    fn move_read_marker(&mut self) -> Task<Message> {
+        match &self.selected {
+            Some(room_id) if self.timeline.bottom_seen => self.send(Command::MoveReadMarker {
+                room_id: room_id.clone(),
+            }),
+            _ => Task::none(),
+        }
+    }
+
+    /// **Retry** or **Discard** for item `id`, only while it is a failed
+    /// local echo.
+    fn echo_command(&mut self, item_id: String, discard: bool) -> Task<Message> {
+        let failed = self
+            .find_message(&item_id)
+            .is_some_and(|(_, _, details)| details.send_failure.is_some());
+        let Some(room_id) = self.selected.clone().filter(|_| failed) else {
+            return Task::none();
+        };
+        self.send(if discard {
+            Command::DiscardSend { room_id, item_id }
+        } else {
+            Command::RetrySend { room_id, item_id }
+        })
     }
 
     /// The window content.
@@ -703,6 +1506,11 @@ impl App {
         Subscription::batch([
             bridge::events_subscription(self.events.clone()),
             window::close_requests().map(|_| Message::CloseRequested),
+            iced::event::listen_with(|event, _status, _id| match event {
+                iced::Event::Window(window::Event::Focused) => Some(Message::WindowFocus(true)),
+                iced::Event::Window(window::Event::Unfocused) => Some(Message::WindowFocus(false)),
+                _ => None,
+            }),
             system::theme_changes().map(Message::ThemeMode),
         ])
     }
@@ -715,8 +1523,9 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
+    use std::sync::Arc;
 
+    use iced::widget::text_editor::{Action, Edit};
     use tessera_core::api::{DeviceId, ListDiff, RoomId};
 
     use super::*;
@@ -1152,14 +1961,16 @@ mod tests {
         let _ = app.update(message);
         assert!(!format!("{app:?}").contains("hunter2-x"));
 
-        let message = Message::ComposerChanged(MessageText::from("secret-body-x"));
-        assert!(!format!("{message:?}").contains("secret-body-x"));
+        let paste = Message::Composer(EditorAction(Action::Edit(Edit::Paste(Arc::new(
+            "secret-body-x".to_owned(),
+        )))));
+        assert!(!format!("{paste:?}").contains("secret-body-x"));
         let _ = app.update(core(CoreEvent::LoggedOut));
         logged_in(&mut app);
         let _ = app.update(core(room_event(&["a"])));
         let _ = app.update(Message::SelectRoom(RoomId::from("!a:x")));
-        let _ = app.update(message);
-        assert_eq!(app.composer.expose(), "secret-body-x");
+        let _ = app.update(paste);
+        assert_eq!(app.composer.text(), "secret-body-x");
         let dbg = format!("{app:?}");
         assert!(!dbg.contains("secret-body-x"), "{dbg}");
         assert!(dbg.contains("Main"), "the app Debug still says something");
@@ -1175,38 +1986,266 @@ mod tests {
         (app, rx)
     }
 
-    #[test]
-    fn composer_enter_sends_the_message_and_clears_the_field() {
-        let (mut app, mut rx) = main_app();
-        let _ = app.update(Message::ComposerChanged(MessageText::from("hello")));
-        let _ = app.update(Message::ComposerSubmitted);
-        match rx.try_recv() {
-            Ok(Command::SendMessage { text }) => assert_eq!(text.expose(), "hello"),
-            other => panic!("unexpected {other:?}"),
+    /// Types `text` into the composer through `update`, like the editor does.
+    fn type_in(app: &mut App, text: &str) {
+        for c in text.chars() {
+            let edit = if c == '\n' {
+                Edit::Enter
+            } else {
+                Edit::Insert(c)
+            };
+            let _ = app.update(Message::Composer(EditorAction(Action::Edit(edit))));
         }
-        assert_eq!(app.composer.expose(), "");
-        let _ = app.update(Message::ComposerSubmitted);
-        assert!(rx.try_recv().is_err(), "an empty composer sends nothing");
-        let _ = app.update(Message::ComposerChanged(MessageText::from("  \t ")));
-        let _ = app.update(Message::ComposerSubmitted);
-        assert!(rx.try_recv().is_err(), "blank text sends nothing");
+    }
+
+    /// Everything queued so far.
+    fn drain(rx: &mut mpsc::Receiver<Command>) -> Vec<Command> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    fn send_commands(commands: &[Command]) -> Vec<&Command> {
+        commands
+            .iter()
+            .filter(|c| matches!(c, Command::Send(_) | Command::Edit { .. }))
+            .collect()
     }
 
     #[test]
-    fn composer_is_disabled_without_a_selected_room() {
+    fn composer_enter_sends_the_message_and_clears_the_field() {
+        let (mut app, mut rx) = main_app();
+        type_in(&mut app, "hello");
+        let _ = drain(&mut rx);
+        let _ = app.update(Message::ComposerKey(ComposerKey::Send));
+        let commands = drain(&mut rx);
+        match send_commands(&commands).as_slice() {
+            [Command::Send(message)] => {
+                assert_eq!(message.text.expose(), "hello");
+                assert_eq!(message.room_id, RoomId::from("!a:x"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(
+            commands
+                .iter()
+                .any(|c| matches!(c, Command::SetTyping { typing: false, .. })),
+            "sending stops the typing notice"
+        );
+        assert_eq!(app.composer.text(), "");
+        let _ = app.update(Message::ComposerKey(ComposerKey::Send));
+        assert!(drain(&mut rx).is_empty(), "an empty composer sends nothing");
+        type_in(&mut app, "  \t \n");
+        let _ = drain(&mut rx);
+        let _ = app.update(Message::ComposerKey(ComposerKey::Send));
+        assert!(
+            send_commands(&drain(&mut rx)).is_empty(),
+            "blank text sends nothing"
+        );
+    }
+
+    #[test]
+    fn the_composer_is_disabled_without_a_selected_room() {
         let (mut app, mut rx) = login_app();
         logged_in(&mut app);
         let _ = app.update(core(room_event(&["a"])));
-        let _ = app.update(Message::ComposerChanged(MessageText::from("hello")));
-        assert_eq!(app.composer.expose(), "", "input ignored");
-        let _ = app.update(Message::ComposerSubmitted);
+        let _ = drain(&mut rx);
+        type_in(&mut app, "hello");
+        assert_eq!(app.composer.text(), "", "input ignored");
+        let _ = app.update(Message::ComposerKey(ComposerKey::Send));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn edit_mode_sends_an_edit_and_reply_mode_a_reply() {
+        let (mut app, mut rx) = main_app();
+        app.composer.mode = composer::Mode::Reply("item-1".into());
+        type_in(&mut app, "answer");
+        let _ = drain(&mut rx);
+        let _ = app.update(Message::ComposerKey(ComposerKey::Send));
+        match send_commands(&drain(&mut rx)).as_slice() {
+            [Command::Send(m)] => assert_eq!(m.reply_to.as_deref(), Some("item-1")),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(app.composer.mode, composer::Mode::Normal);
+
+        app.composer.mode = composer::Mode::Edit("item-2".into());
+        type_in(&mut app, "fixed");
+        let _ = drain(&mut rx);
+        let _ = app.update(Message::ComposerKey(ComposerKey::Send));
+        match send_commands(&drain(&mut rx)).as_slice() {
+            [Command::Edit { item_id, message }] => {
+                assert_eq!(item_id, "item-2");
+                assert_eq!(message.text.expose(), "fixed");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(app.composer.mode, composer::Mode::Normal);
+    }
+
+    #[test]
+    fn typing_notices_are_throttled_and_stop_on_clear_and_room_switch() {
+        let (mut app, mut rx) = main_app();
+        let t0 = Instant::now();
+        let key = |c| Action::Edit(Edit::Insert(c));
+        let _ = app.composer_action_at(key('a'), t0);
+        let _ = app.composer_action_at(key('b'), t0 + Duration::from_secs(1));
+        let _ = app.composer_action_at(key('c'), t0 + Duration::from_secs(3));
+        let typing: Vec<bool> = drain(&mut rx)
+            .into_iter()
+            .filter_map(|c| match c {
+                Command::SetTyping { typing, room_id } => {
+                    assert_eq!(room_id, RoomId::from("!a:x"));
+                    Some(typing)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(typing, [true, true]);
+
+        // Emptying the buffer stops it.
+        for _ in 0..3 {
+            let _ =
+                app.composer_action_at(Action::Edit(Edit::Backspace), t0 + Duration::from_secs(4));
+        }
+        assert!(matches!(
+            drain(&mut rx).last(),
+            Some(Command::SetTyping { typing: false, .. })
+        ));
+
+        // Switching room stops it in the room left.
+        let _ = app.composer_action_at(key('x'), t0 + Duration::from_secs(5));
+        let _ = drain(&mut rx);
+        let _ = app.update(Message::SelectRoom(RoomId::from("!b:x")));
+        let commands = drain(&mut rx);
+        assert!(
+            matches!(
+                commands.first(),
+                Some(Command::SetTyping { room_id, typing: false }) if *room_id == RoomId::from("!a:x")
+            ),
+            "{commands:?}"
+        );
+        assert!(matches!(commands.last(), Some(Command::SelectRoom(_))));
+        // Nothing outstanding: another switch sends no stop.
+        let _ = app.update(Message::SelectRoom(RoomId::from("!a:x")));
+        assert!(
+            !drain(&mut rx)
+                .iter()
+                .any(|c| matches!(c, Command::SetTyping { .. }))
+        );
+    }
+
+    #[test]
+    fn mention_queries_are_rate_limited_and_the_answer_fills_the_list() {
+        let (mut app, mut rx) = main_app();
+        let t0 = Instant::now();
+        let key = |c| Action::Edit(Edit::Insert(c));
+        let ms = |n| t0 + Duration::from_millis(n);
+        let _ = app.composer_action_at(key('@'), ms(0));
+        let _ = app.composer_action_at(key('a'), ms(0));
+        let _ = app.composer_action_at(key('l'), ms(40));
+        let _ = app.composer_action_at(key('i'), ms(80));
+        let queries = |commands: Vec<Command>| -> Vec<String> {
+            commands
+                .into_iter()
+                .filter_map(|c| match c {
+                    Command::SearchMembers { query, .. } => Some(query),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(
+            queries(drain(&mut rx)),
+            ["a"],
+            "the burst waits for the timer"
+        );
+        let _ = app.members_due_at(ms(150));
+        assert_eq!(queries(drain(&mut rx)), ["ali"]);
+
+        let answer = |query: &str| {
+            core(CoreEvent::Members {
+                room_id: RoomId::from("!a:x"),
+                query: tessera_core::api::MessageText::from(query),
+                members: vec![tessera_core::api::Member {
+                    user_id: UserId::from("@alice:x"),
+                    display_name: Some("Alice".into()),
+                }],
+            })
+        };
+        let _ = app.update(answer("al"));
+        assert!(
+            !app.composer.suggestions.is_open(),
+            "a stale answer is ignored"
+        );
+        let _ = app.update(answer("ali"));
+        assert!(app.composer.suggestions.is_open());
+        let _ = app.update(Message::SuggestionPicked(0));
+        assert_eq!(
+            app.composer.text(),
+            "@Alice: ",
+            "starts the message: Element's colon"
+        );
+        assert_eq!(app.composer.mentions.len(), 1);
+    }
+
+    #[test]
+    fn a_members_answer_for_another_room_is_ignored() {
+        let (mut app, _rx) = main_app();
+        type_in(&mut app, "@a");
+        let _ = app.update(core(CoreEvent::Members {
+            room_id: RoomId::from("!b:x"),
+            query: tessera_core::api::MessageText::from("a"),
+            members: vec![tessera_core::api::Member {
+                user_id: UserId::from("@alice:x"),
+                display_name: None,
+            }],
+        }));
+        assert!(!app.composer.suggestions.is_open());
+    }
+
+    #[test]
+    fn suggestion_keys_pick_move_and_escape() {
+        let (mut app, _rx) = main_app();
+        type_in(&mut app, ":smi");
+        assert!(app.composer.suggestions.is_open());
+        let _ = app.update(Message::ComposerKey(ComposerKey::Next));
+        assert_eq!(app.composer.suggestions.selected(), 1);
+        let _ = app.update(Message::ComposerKey(ComposerKey::Previous));
+        assert_eq!(app.composer.suggestions.selected(), 0);
+        let _ = app.update(Message::ComposerKey(ComposerKey::Escape));
+        assert!(!app.composer.suggestions.is_open());
+        type_in(&mut app, "l");
+        let _ = app.update(Message::ComposerKey(ComposerKey::Pick));
+        assert!(!app.composer.suggestions.is_open());
+        assert!(
+            app.composer
+                .text()
+                .chars()
+                .last()
+                .is_some_and(|c| !c.is_ascii())
+        );
+    }
+
+    #[test]
+    fn a_failed_send_or_edit_shows_a_line_for_the_open_room() {
+        let (mut app, _rx) = main_app();
+        let failed = |room: &str, action| {
+            core(CoreEvent::ActionFailed {
+                room_id: RoomId::from(room),
+                action,
+                error: CoreError::Network("offline".into()),
+            })
+        };
+        let _ = app.update(failed("!b:x", ActionKind::Send));
+        assert!(app.send_error.is_none());
+        let _ = app.update(failed("!a:x", ActionKind::Redact));
+        assert!(app.send_error.is_none());
+        let _ = app.update(failed("!a:x", ActionKind::Edit));
+        assert!(app.send_error.is_some());
     }
 
     #[test]
     fn send_failed_shows_a_non_secret_error_for_the_selected_room() {
         let (mut app, _rx) = main_app();
-        let _ = app.update(Message::ComposerChanged(MessageText::from("secret-body-x")));
+        type_in(&mut app, "secret-body-x");
         let _ = app.update(core(CoreEvent::SendFailed {
             room_id: RoomId::from("!b:x"),
             error: CoreError::Network("offline".into()),
@@ -1228,9 +2267,9 @@ mod tests {
     #[test]
     fn changing_room_keeps_no_stale_composer_text() {
         let (mut app, _rx) = main_app();
-        let _ = app.update(Message::ComposerChanged(MessageText::from("draft")));
+        type_in(&mut app, "draft");
         let _ = app.update(Message::SelectRoom(RoomId::from("!b:x")));
-        assert_eq!(app.composer.expose(), "");
+        assert_eq!(app.composer.text(), "");
     }
 
     #[test]
@@ -1243,9 +2282,9 @@ mod tests {
     #[test]
     fn logged_out_clears_the_composer_and_errors() {
         let (mut app, _rx) = main_app();
-        let _ = app.update(Message::ComposerChanged(MessageText::from("draft")));
+        type_in(&mut app, "draft");
         let _ = app.update(core(CoreEvent::LoggedOut));
-        assert_eq!(app.composer.expose(), "");
+        assert_eq!(app.composer.text(), "");
         assert!(app.send_error.is_none());
     }
 
@@ -1394,35 +2433,35 @@ mod tests {
     #[test]
     fn search_keeps_the_open_room_and_its_draft_when_the_filtered_list_lacks_it() {
         let (mut app, _rx) = main_app();
-        let _ = app.update(Message::ComposerChanged(MessageText::from("unsent")));
+        type_in(&mut app, "unsent");
         let _ = app.update(Message::SearchChanged("zzz".into()));
         let _ = app.update(core(room_event(&["z"])));
         assert_eq!(app.selected, Some(RoomId::from("!a:x")));
-        assert_eq!(app.composer.expose(), "unsent");
+        assert_eq!(app.composer.text(), "unsent");
         // Emptied list, too.
         let _ = app.update(core(CoreEvent::RoomListChanged(vec![ListDiff::Clear])));
         assert_eq!(app.selected, Some(RoomId::from("!a:x")));
-        assert_eq!(app.composer.expose(), "unsent");
+        assert_eq!(app.composer.text(), "unsent");
     }
 
     #[test]
     fn switching_tabs_keeps_the_open_room_and_its_draft() {
         let (mut app, _rx) = main_app();
-        let _ = app.update(Message::ComposerChanged(MessageText::from("unsent")));
+        type_in(&mut app, "unsent");
         let _ = app.update(Message::TabSelected(RoomListTab::People));
         let _ = app.update(core(room_event(&["z"])));
         assert_eq!(app.selected, Some(RoomId::from("!a:x")));
-        assert_eq!(app.composer.expose(), "unsent");
+        assert_eq!(app.composer.text(), "unsent");
     }
 
     #[test]
     fn the_open_room_is_deselected_when_the_default_query_loses_it() {
         let (mut app, _rx) = main_app();
-        let _ = app.update(Message::ComposerChanged(MessageText::from("unsent")));
+        type_in(&mut app, "unsent");
         assert_eq!(app.query, RoomListQuery::default());
         let _ = app.update(core(room_event(&["b"])));
         assert_eq!(app.selected, None);
-        assert_eq!(app.composer.expose(), "");
+        assert_eq!(app.composer.text(), "");
 
         // Also after returning to the default query.
         let (mut app, _rx) = main_app();
@@ -1459,5 +2498,1047 @@ mod tests {
             let _ = app.update(core(event.clone()));
             assert!(!app.pending_cancel, "{event:?}");
         }
+    }
+
+    fn clicked(url: &str) -> Message {
+        Message::LinkClicked(LinkTarget::Url(url.to_owned()))
+    }
+
+    #[test]
+    fn every_url_click_asks_first_and_opens_nothing_until_confirmed() {
+        // Labels do not matter to the app: plain-word, matching,
+        // mismatching, spoiler-wrapped and split-anchor links all reach
+        // `update` as the same click (see the `rich_text` tests).
+        for url in [
+            "https://example.org/a",
+            "http://example.org/",
+            "https://Evil.example:8443/path?token=1",
+            "mailto:alice@example.org",
+        ] {
+            let (mut app, mut rx) = main_app();
+            let task = app.update(clicked(url));
+            assert_eq!(task.units(), 0, "nothing opens before the answer: {url}");
+            let Some(LinkBar::Confirm(checked)) = &app.link_bar else {
+                panic!("expected a confirmation, got {:?}", app.link_bar);
+            };
+            assert!(!checked.host().is_empty());
+            assert!(rx.try_recv().is_err());
+            assert!(app.update(Message::LinkConfirmed).units() > 0, "{url}");
+            assert!(app.link_bar.is_none());
+        }
+    }
+
+    #[test]
+    fn the_confirmation_names_the_host_or_mail_domain() {
+        let (mut app, _rx) = main_app();
+        let _ = app.update(clicked("https://Evil.example:8443/path?token=1"));
+        let Some(LinkBar::Confirm(url)) = &app.link_bar else {
+            panic!("expected a confirmation");
+        };
+        assert_eq!(url.host(), "evil.example");
+        let _ = app.update(clicked("mailto:alice@Mail.example"));
+        let Some(LinkBar::Confirm(url)) = &app.link_bar else {
+            panic!("expected a confirmation");
+        };
+        assert_eq!(url.host(), "mail.example");
+    }
+
+    #[test]
+    fn dismissing_the_bar_opens_nothing() {
+        let (mut app, _rx) = main_app();
+        let _ = app.update(clicked("https://evil.example/"));
+        assert_eq!(app.update(Message::LinkDismissed).units(), 0);
+        assert!(app.link_bar.is_none());
+        // Confirming with no bar does nothing either.
+        assert_eq!(app.update(Message::LinkConfirmed).units(), 0);
+    }
+
+    #[test]
+    fn unsafe_links_are_refused_without_opening() {
+        let (mut app, _rx) = main_app();
+        for url in [
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "data:text/html,x",
+            "https://user@evil.example/",
+            "https://exa mple.org/",
+            "https://exämple.org/",
+        ] {
+            let task = app.update(clicked(url));
+            assert_eq!(task.units(), 0, "{url}");
+            assert_eq!(app.link_bar, Some(LinkBar::Refused), "{url}");
+            assert_eq!(app.update(Message::LinkConfirmed).units(), 0, "{url}");
+            let _ = app.update(Message::LinkDismissed);
+        }
+    }
+
+    #[test]
+    fn a_failed_launch_is_reported() {
+        let (mut app, _rx) = main_app();
+        let _ = app.update(Message::LinkOpened { ok: true });
+        assert!(app.link_bar.is_none());
+        let _ = app.update(Message::LinkOpened { ok: false });
+        assert_eq!(app.link_bar, Some(LinkBar::Failed));
+    }
+
+    #[test]
+    fn a_room_pill_selects_a_listed_room_only() {
+        let (mut app, mut rx) = main_app();
+        let task = app.update(Message::LinkClicked(LinkTarget::Room("!b:x".into())));
+        assert_eq!(task.units(), 0);
+        assert_eq!(app.selected, Some(RoomId::from("!b:x")));
+        assert!(matches!(rx.try_recv(), Ok(Command::SelectRoom(id)) if id == RoomId::from("!b:x")));
+        let _ = app.update(Message::LinkClicked(LinkTarget::Room("!nope:x".into())));
+        let _ = app.update(Message::LinkClicked(LinkTarget::Room("#alias:x".into())));
+        assert_eq!(app.selected, Some(RoomId::from("!b:x")));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_user_pill_does_nothing() {
+        let (mut app, mut rx) = main_app();
+        let task = app.update(Message::LinkClicked(LinkTarget::User(UserId::from("@a:x"))));
+        assert_eq!(task.units(), 0);
+        assert!(rx.try_recv().is_err());
+        assert!(app.link_bar.is_none() && app.revealed.is_empty());
+    }
+
+    #[test]
+    fn a_spoiler_click_toggles_it_per_item_and_index() {
+        let (mut app, _rx) = main_app();
+        let spoiler = |item: &str, index| {
+            Message::LinkClicked(LinkTarget::Spoiler {
+                item: item.to_owned(),
+                index,
+            })
+        };
+        let _ = app.update(spoiler("i1", 0));
+        let _ = app.update(spoiler("i1", 1));
+        let _ = app.update(spoiler("i2", 0));
+        assert_eq!(app.revealed.len(), 3);
+        let _ = app.update(spoiler("i1", 0));
+        assert!(!app.revealed.contains(&("i1".to_owned(), 0)));
+        assert!(app.revealed.contains(&("i1".to_owned(), 1)));
+        assert!(app.revealed.contains(&("i2".to_owned(), 0)));
+    }
+
+    #[test]
+    fn revealed_spoilers_are_capped() {
+        let (mut app, _rx) = main_app();
+        for index in 0..MAX_REVEALED + 50 {
+            let _ = app.update(Message::LinkClicked(LinkTarget::Spoiler {
+                item: "i".into(),
+                index,
+            }));
+        }
+        assert_eq!(app.revealed.len(), MAX_REVEALED);
+    }
+
+    #[test]
+    fn changing_room_resets_spoilers_and_the_link_bar() {
+        let (mut app, _rx) = main_app();
+        let _ = app.update(Message::LinkClicked(LinkTarget::Spoiler {
+            item: "i".into(),
+            index: 0,
+        }));
+        let _ = app.update(clicked("https://evil.example/"));
+        let _ = app.update(Message::SelectRoom(RoomId::from("!b:x")));
+        assert!(app.revealed.is_empty());
+        assert!(app.link_bar.is_none());
+    }
+
+    #[test]
+    fn links_never_reach_debug_output() {
+        let (mut app, _rx) = main_app();
+        let message = clicked("https://sentinel-host.example/sentinel-path");
+        assert!(!format!("{message:?}").contains("sentinel"));
+        let _ = app.update(message);
+        let dbg = format!("{app:?} {:?}", app.link_bar);
+        assert!(!dbg.contains("sentinel"), "{dbg}");
+    }
+
+    #[test]
+    fn update_opens_links_only_through_the_links_module() {
+        let source = include_str!("state.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production code");
+        let code: String = production
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect();
+        assert!(!code.contains("open::"), "no direct launcher call");
+        assert!(code.contains("links::open_link"), "the launcher is reached");
+        assert!(code.contains("Task::perform"), "inside a task");
+    }
+
+    // ---- Task 12: message actions ----
+
+    use crate::actions::NOTICE_DURATION;
+    use tessera_core::api::{
+        ItemActions, MessageDetails, MessageText, ReactionGroup, SendStatus, TimelineItemKind,
+    };
+
+    const ALL_ACTIONS: ItemActions = ItemActions {
+        can_reply: true,
+        can_edit: true,
+        can_redact: true,
+        can_react: true,
+        can_copy: true,
+    };
+
+    fn message_item(id: &str, body: &str, is_own: bool, actions: ItemActions) -> TimelineItem {
+        TimelineItem::new(
+            id.to_owned(),
+            TimelineItemKind::Message {
+                sender: UserId::from(if is_own { "@me:x" } else { "@them:x" }),
+                body: body.to_owned(),
+                is_own,
+                timestamp_ms: 1,
+                sent: SendStatus::Sent,
+                details: Box::new(MessageDetails {
+                    actions,
+                    reactions: vec![ReactionGroup {
+                        key: "\u{1F44D}".into(),
+                        count: 1,
+                        own: false,
+                        senders: Vec::new(),
+                    }],
+                    ..MessageDetails::default()
+                }),
+            },
+        )
+    }
+
+    /// `main_app` with an own message `mine`, someone else's `theirs`, and a
+    /// message `locked` that allows nothing.
+    fn actions_app() -> (App, mpsc::Receiver<Command>) {
+        let (mut app, mut rx) = main_app();
+        let _ = app.update(core(CoreEvent::TimelineDiff {
+            room_id: RoomId::from("!a:x"),
+            diffs: vec![ListDiff::Append {
+                values: vec![
+                    message_item("mine", "my words\nsecond line", true, ALL_ACTIONS),
+                    message_item("theirs", "their words", false, ALL_ACTIONS),
+                    message_item("locked", "locked words", false, ItemActions::default()),
+                ],
+            }],
+        }));
+        while rx.try_recv().is_ok() {}
+        (app, rx)
+    }
+
+    fn key(glyph: &str) -> MessageText {
+        MessageText::from(glyph)
+    }
+
+    #[test]
+    fn hover_tracks_one_message_and_a_stale_exit_changes_nothing() {
+        let (mut app, _rx) = actions_app();
+        let _ = app.update(Message::HoverEnter("mine".into()));
+        assert_eq!(app.actions.hovered.as_deref(), Some("mine"));
+        let _ = app.update(Message::HoverEnter("theirs".into()));
+        let _ = app.update(Message::HoverExit("mine".into()));
+        assert_eq!(app.actions.hovered.as_deref(), Some("theirs"));
+        let _ = app.update(Message::HoverExit("theirs".into()));
+        assert_eq!(app.actions.hovered, None);
+    }
+
+    #[test]
+    fn reply_sets_the_mode_only_where_the_core_allows_it() {
+        let (mut app, mut rx) = actions_app();
+        let _ = app.update(Message::ReplyRequested("locked".into()));
+        assert_eq!(app.composer.mode, composer::Mode::Normal);
+        let _ = app.update(Message::ReplyRequested("gone".into()));
+        assert_eq!(app.composer.mode, composer::Mode::Normal);
+        let _ = app.update(Message::ReplyRequested("theirs".into()));
+        assert_eq!(app.composer.mode, composer::Mode::Reply("theirs".into()));
+        assert!(drain(&mut rx).is_empty(), "nothing is sent yet");
+
+        // The reply bar's cross leaves reply mode and keeps the draft.
+        type_in(&mut app, "draft");
+        let _ = app.update(Message::ModeCancelled);
+        assert_eq!(app.composer.mode, composer::Mode::Normal);
+        assert_eq!(app.composer.text(), "draft");
+
+        // Escape leaves it as well.
+        let _ = app.update(Message::ReplyRequested("theirs".into()));
+        let _ = app.update(Message::ComposerKey(ComposerKey::Escape));
+        assert_eq!(app.composer.mode, composer::Mode::Normal);
+    }
+
+    #[test]
+    fn edit_loads_the_body_of_an_own_message_and_escape_restores_the_draft() {
+        let (mut app, mut rx) = actions_app();
+        let _ = app.update(Message::EditRequested("theirs".into()));
+        assert_eq!(app.composer.mode, composer::Mode::Normal, "not own");
+        let _ = app.update(Message::EditRequested("locked".into()));
+        assert_eq!(app.composer.mode, composer::Mode::Normal);
+
+        type_in(&mut app, "my draft");
+        let _ = drain(&mut rx);
+        let _ = app.update(Message::EditRequested("mine".into()));
+        assert_eq!(app.composer.mode, composer::Mode::Edit("mine".into()));
+        assert_eq!(app.composer.text(), "my words\nsecond line");
+
+        let _ = app.update(Message::ComposerKey(ComposerKey::Escape));
+        assert_eq!(app.composer.mode, composer::Mode::Normal);
+        assert_eq!(app.composer.text(), "my draft");
+    }
+
+    #[test]
+    fn leaving_an_edit_to_an_empty_composer_stops_the_typing_notice() {
+        let (mut app, mut rx) = actions_app();
+        let _ = app.update(Message::EditRequested("mine".into()));
+        type_in(&mut app, "!");
+        assert!(
+            drain(&mut rx)
+                .iter()
+                .any(|c| matches!(c, Command::SetTyping { typing: true, .. }))
+        );
+        let _ = app.update(Message::ComposerKey(ComposerKey::Escape));
+        assert_eq!(app.composer.text(), "");
+        assert!(
+            drain(&mut rx)
+                .iter()
+                .any(|c| matches!(c, Command::SetTyping { typing: false, .. })),
+            "the notice must not linger"
+        );
+
+        let _ = app.update(Message::EditRequested("mine".into()));
+        type_in(&mut app, "!");
+        let _ = drain(&mut rx);
+        let _ = app.update(Message::ModeCancelled);
+        assert!(
+            drain(&mut rx)
+                .iter()
+                .any(|c| matches!(c, Command::SetTyping { typing: false, .. }))
+        );
+    }
+
+    #[test]
+    fn sending_an_edit_gives_command_edit_and_brings_the_draft_back() {
+        let (mut app, mut rx) = actions_app();
+        type_in(&mut app, "draft");
+        let _ = app.update(Message::EditRequested("mine".into()));
+        let _ = drain(&mut rx);
+        let _ = app.update(Message::ComposerKey(ComposerKey::Send));
+        match send_commands(&drain(&mut rx)).as_slice() {
+            [Command::Edit { item_id, message }] => {
+                assert_eq!(item_id, "mine");
+                assert_eq!(message.text.expose(), "my words\nsecond line");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(app.composer.mode, composer::Mode::Normal);
+        assert_eq!(app.composer.text(), "draft");
+    }
+
+    #[test]
+    fn reply_while_editing_leaves_the_edit_first() {
+        let (mut app, _rx) = actions_app();
+        type_in(&mut app, "draft");
+        let _ = app.update(Message::EditRequested("mine".into()));
+        let _ = app.update(Message::ReplyRequested("theirs".into()));
+        assert_eq!(app.composer.mode, composer::Mode::Reply("theirs".into()));
+        assert_eq!(app.composer.text(), "draft");
+    }
+
+    #[test]
+    fn delete_asks_first_and_then_redacts_without_a_reason() {
+        let (mut app, mut rx) = actions_app();
+        let _ = app.update(Message::DeleteRequested("theirs".into()));
+        assert_eq!(app.actions.confirm_delete.as_deref(), Some("theirs"));
+        assert!(drain(&mut rx).is_empty(), "no command before confirming");
+
+        let _ = app.update(Message::DeleteCancelled);
+        assert_eq!(app.actions.confirm_delete, None);
+        let _ = app.update(Message::DeleteConfirmed);
+        assert!(drain(&mut rx).is_empty(), "nothing to confirm");
+
+        let _ = app.update(Message::DeleteRequested("theirs".into()));
+        let _ = app.update(Message::DeleteConfirmed);
+        match drain(&mut rx).as_slice() {
+            [
+                Command::Redact {
+                    room_id,
+                    item_id,
+                    reason: None,
+                },
+            ] => {
+                assert_eq!(*room_id, RoomId::from("!a:x"));
+                assert_eq!(item_id, "theirs");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(app.actions.confirm_delete, None);
+    }
+
+    #[test]
+    fn delete_is_refused_where_the_core_does_not_allow_it() {
+        let (mut app, mut rx) = actions_app();
+        let _ = app.update(Message::DeleteRequested("locked".into()));
+        assert_eq!(app.actions.confirm_delete, None);
+        let _ = app.update(Message::DeleteRequested("gone".into()));
+        assert_eq!(app.actions.confirm_delete, None);
+
+        // The message vanished between the question and the answer.
+        let _ = app.update(Message::DeleteRequested("theirs".into()));
+        let _ = app.update(core(CoreEvent::TimelineDiff {
+            room_id: RoomId::from("!a:x"),
+            diffs: vec![ListDiff::Clear],
+        }));
+        let _ = app.update(Message::DeleteConfirmed);
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn copy_uses_the_plain_body_and_only_where_allowed() {
+        let (mut app, mut rx) = actions_app();
+        assert_eq!(app.copy_source("theirs"), Some("their words"));
+        assert_eq!(app.copy_source("locked"), None);
+        assert_eq!(app.copy_source("gone"), None);
+        let _ = app.update(Message::CopyRequested("theirs".into()));
+        assert!(drain(&mut rx).is_empty(), "copying sends no command");
+    }
+
+    #[test]
+    fn a_pick_in_the_picker_toggles_the_reaction_and_closes_it() {
+        let (mut app, mut rx) = actions_app();
+        let _ = app.update(Message::PickerOpened("locked".into()));
+        assert!(app.actions.picker.is_none(), "react not allowed");
+        let _ = app.update(Message::PickerOpened("theirs".into()));
+        let picker = app.actions.picker.clone().expect("open");
+        assert_eq!(picker.target, "theirs");
+        let _ = app.update(Message::PickerQuery(key("smile")));
+        assert_eq!(
+            app.actions.picker.as_ref().map(|p| p.query.as_str()),
+            Some("smile")
+        );
+
+        let _ = app.update(Message::PickerPicked(key("\u{1F604}")));
+        match drain(&mut rx).as_slice() {
+            [
+                Command::ToggleReaction {
+                    room_id,
+                    item_id,
+                    key,
+                },
+            ] => {
+                assert_eq!(*room_id, RoomId::from("!a:x"));
+                assert_eq!(item_id, "theirs");
+                assert_eq!(key, "\u{1F604}");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(app.actions.picker.is_none());
+    }
+
+    #[test]
+    fn enter_in_the_picker_picks_the_first_result() {
+        let (mut app, mut rx) = actions_app();
+        let _ = app.update(Message::PickerOpened("theirs".into()));
+        let _ = app.update(Message::PickerSubmitted);
+        match drain(&mut rx).as_slice() {
+            [Command::ToggleReaction { key, .. }] => assert_eq!(key, "\u{1F44D}"),
+            other => panic!("unexpected {other:?}"),
+        }
+        let _ = app.update(Message::PickerOpened("theirs".into()));
+        let _ = app.update(Message::PickerQuery(key("zzzzqqqq")));
+        let _ = app.update(Message::PickerSubmitted);
+        assert!(drain(&mut rx).is_empty(), "no result, nothing sent");
+        let _ = app.update(Message::PickerClosed);
+        assert!(app.actions.picker.is_none());
+    }
+
+    #[test]
+    fn a_reaction_chip_toggles_and_a_pick_for_a_vanished_message_sends_nothing() {
+        let (mut app, mut rx) = actions_app();
+        let _ = app.update(Message::ReactionToggled {
+            item: "theirs".into(),
+            key: key("\u{1F44D}"),
+        });
+        assert!(matches!(
+            drain(&mut rx).as_slice(),
+            [Command::ToggleReaction { .. }]
+        ));
+        let _ = app.update(Message::ReactionToggled {
+            item: "locked".into(),
+            key: key("\u{1F44D}"),
+        });
+        assert!(drain(&mut rx).is_empty());
+
+        let _ = app.update(Message::PickerOpened("theirs".into()));
+        let _ = app.update(core(CoreEvent::TimelineDiff {
+            room_id: RoomId::from("!a:x"),
+            diffs: vec![ListDiff::Clear],
+        }));
+        let _ = app.update(Message::PickerPicked(key("\u{1F604}")));
+        assert!(drain(&mut rx).is_empty());
+        assert!(app.actions.picker.is_none());
+    }
+
+    #[test]
+    fn a_failed_delete_or_reaction_shows_a_notice_that_expires() {
+        let (mut app, _rx) = actions_app();
+        let failed = |room: &str, action| {
+            core(CoreEvent::ActionFailed {
+                room_id: RoomId::from(room),
+                action,
+                error: CoreError::Network("offline".into()),
+            })
+        };
+        let _ = app.update(failed("!b:x", ActionKind::Redact));
+        assert!(app.actions.notice.is_none(), "another room");
+        let _ = app.update(failed("!a:x", ActionKind::Typing));
+        assert!(app.actions.notice.is_none(), "not reported");
+        let _ = app.update(failed("!a:x", ActionKind::Redact));
+        let first = app.actions.notice.clone().expect("a notice");
+        assert!(first.text.contains("offline"));
+        assert!(NOTICE_DURATION.as_secs() == 5);
+
+        let _ = app.update(failed("!a:x", ActionKind::React));
+        let second = app.actions.notice.clone().expect("a newer notice");
+        assert_ne!(first.seq, second.seq);
+        let _ = app.update(Message::NoticeExpired(first.seq));
+        assert!(app.actions.notice.is_some(), "an old timer is stale");
+        let _ = app.update(Message::NoticeExpired(second.seq));
+        assert!(app.actions.notice.is_none());
+    }
+
+    #[test]
+    fn changing_room_resets_the_action_state() {
+        let (mut app, _rx) = actions_app();
+        let _ = app.update(Message::HoverEnter("mine".into()));
+        let _ = app.update(Message::DeleteRequested("mine".into()));
+        let _ = app.update(Message::PickerOpened("mine".into()));
+        let _ = app.update(Message::SelectRoom(RoomId::from("!b:x")));
+        assert!(app.actions.hovered.is_none());
+        assert!(app.actions.confirm_delete.is_none());
+        assert!(app.actions.picker.is_none());
+    }
+
+    #[test]
+    fn action_messages_never_print_reactions_or_queries() {
+        let m = Message::ReactionToggled {
+            item: "i".into(),
+            key: key("secret-key-x"),
+        };
+        assert!(!format!("{m:?}").contains("secret-key-x"));
+        let m = Message::PickerQuery(key("secret-query-x"));
+        assert!(!format!("{m:?}").contains("secret-query-x"));
+        let (mut app, _rx) = actions_app();
+        let _ = app.update(Message::PickerOpened("theirs".into()));
+        let _ = app.update(Message::PickerQuery(key("secret-query-x")));
+        assert!(!format!("{app:?}").contains("secret-query-x"));
+    }
+
+    // ---- per-room drafts ----------------------------------------------------
+
+    fn saved_drafts(commands: &[Command]) -> Vec<(String, Option<tessera_core::api::Draft>)> {
+        commands
+            .iter()
+            .filter_map(|c| match c {
+                Command::SaveDraft { room_id, draft } => {
+                    Some((room_id.as_str().to_owned(), draft.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn draft_text(draft: &Option<tessera_core::api::Draft>) -> Option<String> {
+        draft.as_ref().map(|d| d.text.expose().to_owned())
+    }
+
+    #[test]
+    fn leaving_a_room_saves_its_draft_before_opening_the_next() {
+        let (mut app, mut rx) = main_app();
+        type_in(&mut app, "half a thought");
+        let _ = drain(&mut rx);
+        let _ = app.update(Message::SelectRoom(RoomId::from("!b:x")));
+        let commands = drain(&mut rx);
+        let saved = saved_drafts(&commands);
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].0, "!a:x");
+        assert_eq!(draft_text(&saved[0].1).as_deref(), Some("half a thought"));
+        let save_at = commands
+            .iter()
+            .position(|c| matches!(c, Command::SaveDraft { .. }))
+            .unwrap();
+        let select_at = commands
+            .iter()
+            .position(|c| matches!(c, Command::SelectRoom(_)))
+            .unwrap();
+        assert!(
+            save_at < select_at,
+            "saved before the core opens the next room"
+        );
+        assert_eq!(app.composer.text(), "");
+    }
+
+    #[test]
+    fn leaving_a_room_after_emptying_the_composer_clears_its_draft() {
+        let (mut app, mut rx) = main_app();
+        type_in(&mut app, "x");
+        let _ = app.update(Message::Composer(EditorAction(Action::Edit(
+            Edit::Backspace,
+        ))));
+        let _ = drain(&mut rx);
+        let _ = app.update(Message::SelectRoom(RoomId::from("!b:x")));
+        assert_eq!(
+            saved_drafts(&drain(&mut rx)),
+            vec![("!a:x".to_owned(), None)]
+        );
+    }
+
+    #[test]
+    fn an_untouched_composer_leaves_the_stored_draft_alone() {
+        // The room's draft may not have arrived yet: saving the empty
+        // composer would wipe it.
+        let (mut app, mut rx) = main_app();
+        let _ = drain(&mut rx);
+        let _ = app.update(Message::SelectRoom(RoomId::from("!b:x")));
+        let _ = app.update(Message::CloseRequested);
+        assert!(saved_drafts(&drain(&mut rx)).is_empty());
+    }
+
+    #[test]
+    fn a_save_timer_from_the_previous_room_is_ignored() {
+        let (mut app, mut rx) = main_app();
+        type_in(&mut app, "abc");
+        let seq = app.draft_seq;
+        let _ = app.update(Message::SelectRoom(RoomId::from("!b:x")));
+        let _ = drain(&mut rx);
+        let _ = app.update(Message::DraftDue(seq));
+        assert!(saved_drafts(&drain(&mut rx)).is_empty());
+    }
+
+    #[test]
+    fn a_loaded_draft_fills_the_empty_composer_with_its_reply() {
+        let (mut app, _rx) = actions_app();
+        if let Some(item) = app.timeline.items.iter_mut().find(|i| i.id == "theirs") {
+            item.event_id = Some(EventId::from("$theirs"));
+        }
+        let draft = tessera_core::api::Draft {
+            text: MessageText::from("@Bob: back"),
+            mentions: vec![tessera_core::api::MentionRef {
+                label: "@Bob".into(),
+                user_id: UserId::from("@bob:x"),
+            }],
+            reply_to: Some(EventId::from("$theirs")),
+        };
+        let _ = app.update(core(CoreEvent::DraftLoaded {
+            room_id: RoomId::from("!b:x"),
+            draft: draft.clone(),
+        }));
+        assert_eq!(app.composer.text(), "", "another room's draft is ignored");
+        let _ = app.update(core(CoreEvent::DraftLoaded {
+            room_id: RoomId::from("!a:x"),
+            draft,
+        }));
+        assert_eq!(app.composer.text(), "@Bob: back");
+        assert_eq!(app.composer.mentions.len(), 1);
+        assert_eq!(app.composer.mode, composer::Mode::Reply("theirs".into()));
+    }
+
+    #[test]
+    fn a_loaded_draft_never_replaces_typed_text() {
+        let (mut app, _rx) = main_app();
+        type_in(&mut app, "typed already");
+        let _ = app.update(core(CoreEvent::DraftLoaded {
+            room_id: RoomId::from("!a:x"),
+            draft: tessera_core::api::Draft {
+                text: MessageText::from("old draft"),
+                mentions: Vec::new(),
+                reply_to: None,
+            },
+        }));
+        assert_eq!(app.composer.text(), "typed already");
+    }
+
+    #[test]
+    fn sending_clears_the_stored_draft() {
+        let (mut app, mut rx) = main_app();
+        type_in(&mut app, "hello");
+        let _ = drain(&mut rx);
+        let _ = app.update(Message::ComposerKey(ComposerKey::Send));
+        let commands = drain(&mut rx);
+        assert_eq!(send_commands(&commands).len(), 1);
+        assert_eq!(saved_drafts(&commands), vec![("!a:x".to_owned(), None)]);
+    }
+
+    #[test]
+    fn during_an_edit_the_set_aside_draft_is_what_is_kept() {
+        let (mut app, mut rx) = actions_app();
+        type_in(&mut app, "my draft");
+        let _ = app.update(Message::EditRequested("mine".into()));
+        let _ = drain(&mut rx);
+        let _ = app.update(Message::SelectRoom(RoomId::from("!b:x")));
+        let saved = saved_drafts(&drain(&mut rx));
+        assert_eq!(draft_text(&saved[0].1).as_deref(), Some("my draft"));
+    }
+
+    #[test]
+    fn closing_the_window_saves_the_draft_before_shutting_down() {
+        let (mut app, mut rx) = main_app();
+        type_in(&mut app, "unsent");
+        let _ = drain(&mut rx);
+        let _ = app.update(Message::CloseRequested);
+        let commands = drain(&mut rx);
+        assert!(
+            matches!(
+                commands.as_slice(),
+                [
+                    Command::SaveDraft { draft: Some(_), .. },
+                    ..,
+                    Command::Shutdown
+                ]
+            ),
+            "{commands:?}"
+        );
+    }
+
+    #[test]
+    fn typing_saves_the_draft_after_a_pause() {
+        let (mut app, mut rx) = main_app();
+        type_in(&mut app, "abc");
+        let _ = drain(&mut rx);
+        let seq = app.draft_seq;
+        let _ = app.update(Message::DraftDue(seq - 1));
+        assert!(saved_drafts(&drain(&mut rx)).is_empty(), "a stale timer");
+        let _ = app.update(Message::DraftDue(seq));
+        let saved = saved_drafts(&drain(&mut rx));
+        assert_eq!(draft_text(&saved[0].1).as_deref(), Some("abc"));
+    }
+
+    // ---- slash commands (as in Element) ----------------------------------
+
+    #[test]
+    fn an_unknown_command_asks_before_sending() {
+        let (mut app, mut rx) = main_app();
+        type_in(&mut app, "/foo bar");
+        let _ = app.update(Message::ComposerKey(ComposerKey::Send));
+        assert!(
+            send_commands(&drain(&mut rx)).is_empty(),
+            "nothing sent yet"
+        );
+        assert_eq!(app.command_bar.as_deref(), Some("foo"));
+        assert_eq!(app.composer.text(), "/foo bar", "the text stays");
+        let _ = app.update(Message::CommandSendAnyway);
+        let commands = drain(&mut rx);
+        match send_commands(&commands).as_slice() {
+            [Command::Send(m)] => {
+                assert_eq!(m.text.expose(), "/foo bar");
+                assert_eq!(m.format, tessera_core::api::TextFormat::Markdown);
+            }
+            other => panic!("expected one send, got {other:?}"),
+        }
+        assert!(app.command_bar.is_none());
+        assert_eq!(app.composer.text(), "");
+    }
+
+    #[test]
+    fn me_alone_shows_elements_command_error() {
+        let (mut app, mut rx) = main_app();
+        type_in(&mut app, "/me");
+        let _ = app.update(Message::ComposerKey(ComposerKey::Send));
+        assert!(send_commands(&drain(&mut rx)).is_empty());
+        assert_eq!(
+            app.actions.notice.as_ref().map(|n| n.text.as_str()),
+            Some(COMMAND_ERROR_TEXT)
+        );
+        assert_eq!(app.composer.text(), "/me", "the text stays");
+    }
+
+    #[test]
+    fn a_command_missing_its_text_shows_elements_usage_line() {
+        assert_eq!(command_error_text("me"), COMMAND_ERROR_TEXT);
+        assert_eq!(
+            command_error_text("rainbow"),
+            "Command error: Usage: /rainbow <message>"
+        );
+        let (mut app, _rx) = main_app();
+        type_in(&mut app, "/rainbowme ");
+        let _ = app.update(Message::ComposerKey(ComposerKey::Send));
+        assert_eq!(
+            app.actions.notice.as_ref().map(|n| n.text.as_str()),
+            Some("Command error: Usage: /rainbowme <message>")
+        );
+    }
+
+    #[test]
+    fn cancelling_an_unknown_command_keeps_the_text() {
+        let (mut app, mut rx) = main_app();
+        type_in(&mut app, "/foo");
+        let _ = app.update(Message::ComposerKey(ComposerKey::Send));
+        let _ = app.update(Message::CommandCancelled);
+        assert!(app.command_bar.is_none());
+        assert!(send_commands(&drain(&mut rx)).is_empty());
+        assert_eq!(app.composer.text(), "/foo");
+    }
+
+    #[test]
+    fn html_is_sent_as_html_and_the_bar_goes_with_the_room() {
+        let (mut app, mut rx) = main_app();
+        type_in(&mut app, "/html <b>hi</b>");
+        let _ = app.update(Message::ComposerKey(ComposerKey::Send));
+        let commands = drain(&mut rx);
+        assert!(matches!(
+            send_commands(&commands).as_slice(),
+            [Command::Send(m)] if m.format == tessera_core::api::TextFormat::Html
+        ));
+        type_in(&mut app, "/foo");
+        let _ = app.update(Message::ComposerKey(ComposerKey::Send));
+        assert!(app.command_bar.is_some());
+        let _ = app.update(Message::SelectRoom(RoomId::from("!b:x")));
+        assert!(app.command_bar.is_none());
+    }
+
+    // ---- jumping to a reply's original ------------------------------------
+
+    fn with_event(mut item: TimelineItem, event: &str) -> TimelineItem {
+        item.event_id = Some(EventId::from(event));
+        item
+    }
+
+    #[test]
+    fn clicking_a_quote_of_a_loaded_message_flashes_it() {
+        let (mut app, mut rx) = main_app();
+        append(
+            &mut app,
+            vec![
+                with_event(message_item("q", "question", false, ALL_ACTIONS), "$q"),
+                with_event(message_item("r", "answer", false, ALL_ACTIONS), "$r"),
+            ],
+        );
+        let _ = drain(&mut rx);
+        let _ = app.update(Message::ReplyQuoteClicked(EventId::from("$q")));
+        assert_eq!(app.timeline.flash.as_deref(), Some("q"));
+        assert!(app.actions.notice.is_none());
+        let _ = app.update(Message::FlashEnded("q".into()));
+        assert_eq!(app.timeline.flash, None);
+    }
+
+    #[test]
+    fn clicking_a_quote_of_an_unloaded_message_pages_back() {
+        let (mut app, mut rx) = main_app();
+        append(
+            &mut app,
+            vec![message_item("r", "answer", false, ALL_ACTIONS)],
+        );
+        // Let any pagination of the short timeline finish first.
+        let _ = app.update(core(CoreEvent::Pagination {
+            room_id: RoomId::from("!a:x"),
+            state: tessera_core::api::PaginationState::Idle,
+        }));
+        let _ = drain(&mut rx);
+        let _ = app.update(Message::ReplyQuoteClicked(EventId::from("$old")));
+        assert!(
+            drain(&mut rx)
+                .iter()
+                .any(|c| matches!(c, Command::PaginateBackwards { .. }))
+        );
+        assert!(app.timeline.jump.is_some());
+    }
+
+    #[test]
+    fn a_jump_that_reaches_the_start_shows_a_notice() {
+        let (mut app, mut rx) = main_app();
+        append(
+            &mut app,
+            vec![message_item("r", "answer", false, ALL_ACTIONS)],
+        );
+        let _ = drain(&mut rx);
+        let _ = app.update(Message::ReplyQuoteClicked(EventId::from("$gone")));
+        let _ = app.update(core(CoreEvent::Pagination {
+            room_id: RoomId::from("!a:x"),
+            state: tessera_core::api::PaginationState::ReachedStart,
+        }));
+        let _ = app.update(core(CoreEvent::TimelineDiff {
+            room_id: RoomId::from("!a:x"),
+            diffs: vec![ListDiff::PushFront {
+                value: TimelineItem::new("start".into(), TimelineItemKind::TimelineStart),
+            }],
+        }));
+        assert_eq!(
+            app.actions.notice.as_ref().map(|n| n.text.as_str()),
+            Some(JUMP_FAILED_TEXT)
+        );
+        assert!(app.timeline.jump.is_none());
+    }
+
+    // ---- Task 13: receipts, typing and local echoes ----
+
+    fn append(app: &mut App, items: Vec<TimelineItem>) {
+        let _ = app.update(core(CoreEvent::TimelineDiff {
+            room_id: RoomId::from("!a:x"),
+            diffs: vec![ListDiff::Append { values: items }],
+        }));
+    }
+
+    fn marks(commands: &[Command]) -> Vec<bool> {
+        commands
+            .iter()
+            .filter_map(|c| match c {
+                Command::MarkRead { fully_read, .. } => Some(*fully_read),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_receipt_follows_the_bottom_item_and_never_repeats() {
+        let (mut app, mut rx) = main_app();
+        append(&mut app, vec![message_item("a", "hi", false, ALL_ACTIONS)]);
+        assert_eq!(marks(&drain(&mut rx)), [false]);
+        // The same item again (a re-measure, a scroll to the same place).
+        let _ = app.update(Message::RowMeasured {
+            id: "a".into(),
+            height: 40.0,
+        });
+        let _ = app.on_timeline_scrolled(0.0, 600.0, 800.0);
+        assert_eq!(marks(&drain(&mut rx)), Vec::<bool>::new());
+    }
+
+    #[test]
+    fn no_receipt_while_scrolled_up_until_the_bottom_is_reached() {
+        let (mut app, mut rx) = main_app();
+        let _ = app.on_timeline_scrolled(500.0, 600.0, 800.0);
+        append(&mut app, vec![message_item("a", "hi", false, ALL_ACTIONS)]);
+        assert_eq!(marks(&drain(&mut rx)), Vec::<bool>::new());
+        let _ = app.on_timeline_scrolled(0.0, 600.0, 800.0);
+        assert_eq!(marks(&drain(&mut rx)), [false]);
+    }
+
+    #[test]
+    fn no_receipt_without_window_focus_until_it_returns() {
+        let (mut app, mut rx) = main_app();
+        let _ = app.update(Message::WindowFocus(false));
+        append(&mut app, vec![message_item("a", "hi", false, ALL_ACTIONS)]);
+        assert_eq!(marks(&drain(&mut rx)), Vec::<bool>::new());
+        let _ = app.update(Message::WindowFocus(true));
+        assert_eq!(marks(&drain(&mut rx)), [false]);
+    }
+
+    #[test]
+    fn leaving_a_room_whose_bottom_was_seen_moves_the_read_marker() {
+        let (mut app, mut rx) = main_app();
+        append(&mut app, vec![message_item("a", "hi", false, ALL_ACTIONS)]);
+        let _ = drain(&mut rx);
+        let _ = app.update(Message::SelectRoom(RoomId::from("!b:x")));
+        let commands = drain(&mut rx);
+        assert!(commands.iter().any(|c| matches!(
+            c,
+            Command::MoveReadMarker { room_id } if *room_id == RoomId::from("!a:x")
+        )));
+        // Never a public receipt on the way out.
+        assert!(
+            !commands
+                .iter()
+                .any(|c| matches!(c, Command::MarkRead { .. }))
+        );
+        // Leaving again without having seen any bottom sends nothing.
+        let _ = app.update(Message::SelectRoom(RoomId::from("!a:x")));
+        assert_eq!(marks(&drain(&mut rx)), Vec::<bool>::new());
+    }
+
+    #[test]
+    fn leaving_an_unfocused_room_sends_no_marker() {
+        let (mut app, mut rx) = main_app();
+        let _ = app.update(Message::WindowFocus(false));
+        append(&mut app, vec![message_item("a", "hi", false, ALL_ACTIONS)]);
+        let _ = app.update(Message::SelectRoom(RoomId::from("!b:x")));
+        let commands = drain(&mut rx);
+        assert!(
+            !commands
+                .iter()
+                .any(|c| matches!(c, Command::MarkRead { .. } | Command::MoveReadMarker { .. }))
+        );
+    }
+
+    #[test]
+    fn a_stale_read_timer_is_ignored() {
+        let (mut app, mut rx) = main_app();
+        append(&mut app, vec![message_item("a", "hi", false, ALL_ACTIONS)]);
+        let _ = drain(&mut rx);
+        let _ = app.update(Message::SelectRoom(RoomId::from("!b:x")));
+        let _ = drain(&mut rx);
+        app.timeline.receipt_timer_armed = true;
+        let _ = app.update(Message::ReadDue(RoomId::from("!a:x")));
+        assert!(app.timeline.receipt_timer_armed, "another room's timer");
+        let _ = app.update(Message::ReadDue(RoomId::from("!b:x")));
+        assert!(!app.timeline.receipt_timer_armed);
+    }
+
+    #[test]
+    fn leaving_a_room_scrolled_up_never_seen_sends_no_marker() {
+        let (mut app, mut rx) = main_app();
+        let _ = app.on_timeline_scrolled(500.0, 600.0, 800.0);
+        append(&mut app, vec![message_item("a", "hi", false, ALL_ACTIONS)]);
+        let _ = app.update(Message::SelectRoom(RoomId::from("!b:x")));
+        assert_eq!(marks(&drain(&mut rx)), Vec::<bool>::new());
+    }
+
+    fn typist(id: &str, name: Option<&str>) -> tessera_core::api::TypingUser {
+        tessera_core::api::TypingUser {
+            user_id: UserId::from(id),
+            name: name.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn typing_events_apply_to_the_open_room_and_reset_on_switch() {
+        let (mut app, _rx) = main_app();
+        let _ = app.update(core(CoreEvent::Typing {
+            room_id: RoomId::from("!b:x"),
+            users: vec![typist("@x:x", None)],
+        }));
+        assert!(app.typing.is_empty(), "another room");
+        let users: Vec<_> = (0..10).map(|i| typist(&format!("@u{i}:x"), None)).collect();
+        let _ = app.update(core(CoreEvent::Typing {
+            room_id: RoomId::from("!a:x"),
+            users,
+        }));
+        assert_eq!(app.typing.len(), crate::timeline::MAX_TYPING_KEPT);
+        let _ = app.update(Message::SelectRoom(RoomId::from("!b:x")));
+        assert!(app.typing.is_empty());
+    }
+
+    fn failed_item(id: &str, recoverable: bool) -> TimelineItem {
+        let mut item = message_item(id, "x", true, ALL_ACTIONS);
+        if let TimelineItemKind::Message { sent, details, .. } = &mut item.kind {
+            *sent = SendStatus::Failed;
+            details.send_failure = Some(tessera_core::api::SendFailure { recoverable });
+        }
+        item
+    }
+
+    #[test]
+    fn retry_and_discard_send_commands_for_failed_echoes_only() {
+        let (mut app, mut rx) = main_app();
+        append(
+            &mut app,
+            vec![
+                failed_item("bad", true),
+                message_item("ok", "fine", true, ALL_ACTIONS),
+            ],
+        );
+        let _ = drain(&mut rx);
+        let _ = app.update(Message::RetryRequested("bad".into()));
+        let _ = app.update(Message::DiscardRequested("bad".into()));
+        let _ = app.update(Message::RetryRequested("ok".into()));
+        let _ = app.update(Message::DiscardRequested("gone".into()));
+        let commands = drain(&mut rx);
+        assert_eq!(commands.len(), 2, "{commands:?}");
+        assert!(matches!(
+            &commands[0],
+            Command::RetrySend { room_id, item_id } if *room_id == RoomId::from("!a:x") && item_id == "bad"
+        ));
+        assert!(matches!(
+            &commands[1],
+            Command::DiscardSend { room_id, item_id } if *room_id == RoomId::from("!a:x") && item_id == "bad"
+        ));
     }
 }

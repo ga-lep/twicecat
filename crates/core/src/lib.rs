@@ -7,10 +7,13 @@
 pub mod api;
 mod avatars;
 mod client;
+mod drafts;
 mod engine;
 pub mod logging;
 mod oauth;
+mod outgoing;
 pub mod paths;
+mod rich_text;
 mod room_list;
 pub mod secrets;
 mod session;

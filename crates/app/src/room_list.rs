@@ -340,16 +340,17 @@ mod tests {
     }
 
     fn item(id: &str, body: &str) -> TimelineItem {
-        TimelineItem {
-            id: id.to_owned(),
-            kind: TimelineItemKind::Message {
+        TimelineItem::new(
+            id.to_owned(),
+            TimelineItemKind::Message {
                 sender: UserId::from("@a:x"),
                 body: body.to_owned(),
                 is_own: false,
                 timestamp_ms: 1,
                 sent: SendStatus::Sent,
+                details: Box::default(),
             },
-        }
+        )
     }
 
     fn timeline_event(room: &str, diffs: Vec<ListDiff<TimelineItem>>) -> Message {
@@ -360,7 +361,7 @@ mod tests {
     }
 
     fn timeline_ids(app: &App) -> Vec<&str> {
-        app.timeline.iter().map(|i| i.id.as_str()).collect()
+        app.timeline.items.iter().map(|i| i.id.as_str()).collect()
     }
 
     #[test]
@@ -381,7 +382,7 @@ mod tests {
         ));
         let _ = app.update(Message::SelectRoom(rid("b")));
         assert_eq!(app.selected, Some(rid("b")));
-        assert!(app.timeline.is_empty());
+        assert!(app.timeline.items.is_empty());
     }
 
     #[test]
@@ -422,7 +423,7 @@ mod tests {
                 value: item("1", "x"),
             }],
         ));
-        assert!(app.timeline.is_empty());
+        assert!(app.timeline.items.is_empty());
     }
 
     #[test]
@@ -440,7 +441,7 @@ mod tests {
         assert_eq!(timeline_ids(&app), ["1"]);
         let _ = app.update(rooms_event(vec![ListDiff::Remove { index: 0 }]));
         assert_eq!(app.selected, None);
-        assert!(app.timeline.is_empty());
+        assert!(app.timeline.items.is_empty());
     }
 
     #[test]
@@ -476,7 +477,7 @@ mod tests {
         })));
         let _ = app.update(Message::Core(Box::new(CoreEvent::LoggedOut)));
         assert_eq!(app.selected, None);
-        assert!(app.timeline.is_empty() && app.rooms.is_empty());
+        assert!(app.timeline.items.is_empty() && app.rooms.is_empty());
         assert_eq!(app.total_rooms, None);
     }
 

@@ -129,7 +129,7 @@ pub fn check_browser_url(url: &str) -> Result<BrowserUrl, UrlRefused> {
 }
 
 /// The host part of `host[:port]`, checked for shape.
-fn host_of(authority: &str) -> Result<&str, UrlRefused> {
+pub(crate) fn host_of(authority: &str) -> Result<&str, UrlRefused> {
     let (host, port) = if authority.starts_with('[') {
         let end = authority.find(']').ok_or(UrlRefused::Malformed)?;
         let (host, after) = authority.split_at(end + 1);

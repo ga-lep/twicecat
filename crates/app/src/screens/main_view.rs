@@ -1,59 +1,26 @@
-//! The two-pane main layout: the room list pane on the left and a minimal
-//! room view on the right (plan Q15; Phase 3 replaces it).
+//! The two-pane main layout: the room list pane on the left and the room view
+//! (timeline pane and composer) on the right.
 
-use iced::font::Weight;
-use iced::widget::{button, column, container, row, scrollable, space, text, text_input};
-use iced::{Element, Fill, Font};
-use tessera_core::api::{MessageText, TimelineItem, TimelineItemKind, UserId};
+use iced::widget::{
+    Column, Row, button, column, container, opaque, row, space, stack, text, text_editor,
+    text_input,
+};
+use iced::{Element, Fill};
+use tessera_core::api::{MessageText, UserId};
 
+use crate::actions::{self, Picker};
+use crate::composer::{self, EditorAction, Mode, Suggestions};
+use crate::emoji;
+use crate::links::{CheckedUrl, LinkBar, LinkKind};
 use crate::screens::loading::sync_label;
-use crate::screens::room_list_pane;
+use crate::screens::timeline_pane::RichEnv;
+use crate::screens::{room_list_pane, timeline_pane};
 use crate::state::{App, Message};
-use crate::text_safety::{MAX_BODY_CHARS, MAX_NAME_CHARS, name_or_placeholder, one_line_capped};
+use crate::text_safety::{MAX_NAME_CHARS, name_or_placeholder, one_line_capped};
 use crate::theme;
 
 /// Width of the left pane.
 pub const LIST_PANE_WIDTH: f32 = 300.0;
-
-/// How many timeline messages the right pane shows.
-pub const MAX_MESSAGES: usize = 50;
-
-/// The last [`MAX_MESSAGES`] message items, oldest first, as `(sender, body)`.
-/// Other kinds of item are skipped.
-pub fn last_messages(items: &[TimelineItem]) -> Vec<(&UserId, &str)> {
-    let mut messages: Vec<(&UserId, &str)> = items
-        .iter()
-        .rev()
-        .filter_map(|item| match &item.kind {
-            TimelineItemKind::Message { sender, body, .. } => Some((sender, body.as_str())),
-            TimelineItemKind::Other => None,
-        })
-        .take(MAX_MESSAGES)
-        .collect();
-    messages.reverse();
-    messages
-}
-
-/// One message ready to draw: the sender and the body each on one line, to be
-/// shown in separate widgets so a body can never pass for another sender.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DisplayLine {
-    /// The sender, sanitised and capped.
-    pub sender: String,
-    /// The body, sanitised onto one line and capped.
-    pub body: String,
-}
-
-/// [`last_messages`] with every remote string sanitised for display.
-pub fn display_lines(items: &[TimelineItem]) -> Vec<DisplayLine> {
-    last_messages(items)
-        .into_iter()
-        .map(|(sender, body)| DisplayLine {
-            sender: name_or_placeholder(&sender.to_string(), MAX_NAME_CHARS),
-            body: one_line_capped(body, MAX_BODY_CHARS),
-        })
-        .collect()
-}
 
 /// A room name ready to draw: one line, capped, a placeholder when blank.
 pub fn display_name(name: &str) -> String {
@@ -69,7 +36,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
     .into()
 }
 
-/// The selected room: name, last messages, composer.
+/// The selected room: name, timeline, composer.
 fn room_pane(app: &App) -> Element<'_, Message> {
     let selected = app
         .selected
@@ -80,38 +47,308 @@ fn room_pane(app: &App) -> Element<'_, Message> {
         |room| display_name(&room.name),
     );
 
-    // The sender is its own bold widget; the body is sanitised onto one line
-    // and can never pass for another sender's line.
-    let bold = Font {
-        weight: Weight::Bold,
-        ..Font::DEFAULT
+    let theme = theme::theme_for(app.theme_mode);
+    let env = RichEnv {
+        theme: &theme,
+        own_user: app.user_id.as_ref(),
+        revealed: &app.revealed,
+        actions: &app.actions,
+        rooms: &app.rooms,
     };
-    let lines = display_lines(&app.timeline).into_iter().map(|line| {
-        row![text(line.sender).font(bold), text(line.body).width(Fill)]
-            .spacing(8)
+    let timeline = container(timeline_pane::view(&app.timeline, env)).height(Fill);
+    // The picker floats over the timeline's bottom right corner.
+    let picker = app.actions.picker.as_ref().map(|picker| {
+        container(opaque(picker_panel(picker)))
+            .width(Fill)
+            .height(Fill)
+            .align_right(Fill)
+            .align_bottom(Fill)
+            .padding(8)
             .into()
     });
-    let mut body = column![
-        text(title).size(22),
-        scrollable(column(lines).spacing(4))
-            .anchor_bottom()
-            .height(Fill)
-            .width(Fill),
-    ]
-    .spacing(8);
+    let mut bars: Vec<Element<'_, Message>> = Vec::new();
+    if let Some(bar) = &app.link_bar {
+        bars.push(link_bar(bar));
+    }
+    if let Some(name) = &app.command_bar {
+        bars.push(command_bar(name));
+    }
     if let Some(error) = &app.send_error {
-        body = body.push(text(error.as_str()).style(text::danger));
+        bars.push(text(error.as_str()).style(text::danger).into());
+    }
+    if let Some(notice) = &app.actions.notice {
+        bars.push(text(notice.text.as_str()).style(text::danger).into());
     }
     let enabled = selected.is_some();
-    body = body.push(
-        text_input("Message", app.composer.expose())
-            .on_input_maybe(
-                enabled.then_some(|s: String| Message::ComposerChanged(MessageText::from(s))),
-            )
-            .on_submit_maybe(enabled.then_some(Message::ComposerSubmitted))
-            .padding(8),
+    if let Some(line) = timeline_pane::typing_line(&app.typing) {
+        bars.push(
+            text(line)
+                .size(13)
+                .style(|theme: &iced::Theme| text::Style {
+                    color: Some(theme::semantic(theme).muted),
+                })
+                .into(),
+        );
+    }
+    if let Some(list) = suggestion_list(&app.composer.suggestions) {
+        bars.push(list);
+    }
+    if let Some(bar) = mode_bar(app) {
+        bars.push(bar);
+    }
+    let body = room_column(
+        text(title).size(22).into(),
+        timeline_layer(timeline.into(), picker),
+        bars,
+        editor(app, enabled),
     );
     container(body).width(Fill).height(Fill).padding(8).into()
+}
+
+/// The room pane's column, always `[title, timeline, bars, editor]`. iced
+/// keeps a widget's state only while the widget at that place in the tree
+/// keeps its type: with the bars (link and command bars, notices, typing
+/// line, suggestion list, reply bar) as siblings, the editor moved whenever
+/// one came or went and lost its focus. `from_vec` keeps an empty bar column.
+fn room_column<'a>(
+    title: Element<'a, Message>,
+    timeline: Element<'a, Message>,
+    bars: Vec<Element<'a, Message>>,
+    editor: Element<'a, Message>,
+) -> Element<'a, Message> {
+    let bars = Column::from_vec(bars).spacing(8).width(Fill);
+    Column::from_vec(vec![title, timeline, bars.into(), editor])
+        .spacing(8)
+        .width(Fill)
+        .height(Fill)
+        .into()
+}
+
+/// The timeline with the reaction picker as an optional layer: always a
+/// stack with the timeline first, so opening the picker keeps the scroll.
+fn timeline_layer<'a>(
+    timeline: Element<'a, Message>,
+    picker: Option<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    stack([timeline, picker.unwrap_or_else(|| space().into())]).into()
+}
+
+/// Tallest the editor grows before it scrolls, in pixels.
+const EDITOR_MAX_HEIGHT: f32 = 160.0;
+
+/// The composer's text editor. Without a selected room it has no `on_action`,
+/// which disables it.
+fn editor(app: &App, enabled: bool) -> Element<'_, Message> {
+    let open = app.composer.suggestions.is_open();
+    let mut editor = text_editor(app.composer.content())
+        .id(composer::COMPOSER_ID)
+        .placeholder("Message")
+        .padding(8)
+        .max_height(EDITOR_MAX_HEIGHT)
+        .key_binding(move |press| composer::binding(press, open));
+    if enabled {
+        editor = editor.on_action(|action| Message::Composer(EditorAction(action)));
+    }
+    editor.into()
+}
+
+/// The text of the bar above the editor: the quote of the message being
+/// replied to, or a note about the edit. `None` in the normal mode.
+pub fn mode_text(app: &App) -> Option<String> {
+    match &app.composer.mode {
+        Mode::Normal => None,
+        Mode::Reply(id) => Some(format!(
+            "Replying to {}",
+            actions::quote_for(&app.timeline.items, id).unwrap_or_else(|| "a message".to_owned())
+        )),
+        Mode::Edit(_) => Some("Editing a message".to_owned()),
+    }
+}
+
+/// The reply or edit bar above the editor, with a cross that leaves the mode.
+fn mode_bar(app: &App) -> Option<Element<'_, Message>> {
+    let label = mode_text(app)?;
+    Some(
+        container(
+            row![
+                text(label),
+                space().width(Fill),
+                button(text("\u{2715}"))
+                    .on_press(Message::ModeCancelled)
+                    .style(button::secondary),
+            ]
+            .spacing(8)
+            .align_y(iced::Center),
+        )
+        .padding(4)
+        .style(container::bordered_box)
+        .into(),
+    )
+}
+
+/// Width of the reaction picker, in pixels.
+const PICKER_WIDTH: f32 = 360.0;
+
+/// The reaction picker: a search field and the emoji it finds, the quick row
+/// first while the search is empty.
+fn picker_panel(picker: &Picker) -> Element<'_, Message> {
+    let mut grid: Row<'_, Message> = Row::new();
+    for glyph in emoji::picker_results(&picker.query) {
+        grid = grid.push(
+            button(text(glyph).size(22))
+                .padding(4)
+                .style(button::text)
+                .on_press(Message::PickerPicked(MessageText::from(glyph))),
+        );
+    }
+    container(
+        column![
+            row![
+                text_input("Search emoji", &picker.query)
+                    .id(actions::PICKER_INPUT_ID)
+                    .on_input(|query| Message::PickerQuery(MessageText::from(query)))
+                    .on_submit(Message::PickerSubmitted),
+                button(text("\u{2715}"))
+                    .on_press(Message::PickerClosed)
+                    .style(button::secondary),
+            ]
+            .spacing(8),
+            grid.wrap(),
+        ]
+        .spacing(8),
+    )
+    .width(PICKER_WIDTH)
+    .padding(8)
+    .style(container::bordered_box)
+    .into()
+}
+
+/// The autocomplete rows (members or emojis) above the editor, or `None`
+/// while there is nothing to pick.
+fn suggestion_list(suggestions: &Suggestions) -> Option<Element<'_, Message>> {
+    let rows: Vec<(String, bool)> = match suggestions {
+        Suggestions::Closed => return None,
+        Suggestions::Mentions {
+            members, selected, ..
+        } => members
+            .iter()
+            .enumerate()
+            .map(|(i, member)| (member_row_label(member), i == *selected))
+            .collect(),
+        Suggestions::Emoji {
+            items, selected, ..
+        } => items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| {
+                (
+                    format!("{} :{}:", item.glyph, item.shortcode),
+                    i == *selected,
+                )
+            })
+            .collect(),
+    };
+    if rows.is_empty() {
+        return None;
+    }
+    let mut list = column![].spacing(2);
+    for (index, (label, selected)) in rows.into_iter().enumerate() {
+        list = list.push(
+            button(text(label))
+                .on_press(Message::SuggestionPicked(index))
+                .width(Fill)
+                .style(if selected {
+                    button::primary
+                } else {
+                    button::text
+                }),
+        );
+    }
+    Some(container(list).padding(4).into())
+}
+
+/// One member row: the display name and the user ID, sanitised and capped.
+pub fn member_row_label(member: &tessera_core::api::Member) -> String {
+    let id = one_line_capped(member.user_id.as_str(), MAX_NAME_CHARS);
+    match member.display_name.as_deref() {
+        Some(name) if !name.trim().is_empty() => {
+            format!("{} ({id})", one_line_capped(name, MAX_NAME_CHARS))
+        }
+        _ => id,
+    }
+}
+
+/// The confirmation question for a link. It depends on the link kind and
+/// shows only the sanitised host (for `mailto`, the domain), never the URL.
+pub fn confirm_text(url: &CheckedUrl) -> String {
+    let host = one_line_capped(url.host(), MAX_NAME_CHARS);
+    match url.kind() {
+        LinkKind::Https => format!("Open {host}?"),
+        LinkKind::Http => format!("Open {host}? (not encrypted)"),
+        LinkKind::Mailto => format!("Write an email to {host}?"),
+    }
+}
+
+/// What the link bar says. Only the host of a link is ever shown.
+pub fn link_bar_text(bar: &LinkBar) -> String {
+    match bar {
+        LinkBar::Confirm(url) => confirm_text(url),
+        LinkBar::Refused => "This link cannot be opened.".to_owned(),
+        LinkBar::Failed => "The link could not be opened.".to_owned(),
+    }
+}
+
+/// Longest command name shown in the unknown-command bar.
+const MAX_COMMAND_CHARS: usize = 64;
+
+/// What the unknown-command bar says (Element's wording).
+pub fn command_bar_text(name: &str) -> String {
+    format!(
+        "Unrecognised command: /{}. Begin your message with // to start it with a slash.",
+        one_line_capped(name, MAX_COMMAND_CHARS)
+    )
+}
+
+/// The bar above the composer about an unknown `/command`: send the text as a
+/// message, or go back to editing it.
+fn command_bar(name: &str) -> Element<'_, Message> {
+    let bar_row = row![
+        text(command_bar_text(name)),
+        space().width(Fill),
+        button(text("Send as message")).on_press(Message::CommandSendAnyway),
+        button(text("Cancel"))
+            .on_press(Message::CommandCancelled)
+            .style(button::secondary),
+    ]
+    .spacing(8)
+    .align_y(iced::Center);
+    container(bar_row).padding(4).into()
+}
+
+/// The bar above the composer about a clicked link.
+fn link_bar(bar: &LinkBar) -> Element<'_, Message> {
+    let mut bar_row = row![text(link_bar_text(bar)), space().width(Fill)]
+        .spacing(8)
+        .align_y(iced::Center);
+    match bar {
+        LinkBar::Confirm(_) => {
+            bar_row = bar_row
+                .push(button(text("Open")).on_press(Message::LinkConfirmed))
+                .push(
+                    button(text("Cancel"))
+                        .on_press(Message::LinkDismissed)
+                        .style(button::secondary),
+                );
+        }
+        LinkBar::Refused | LinkBar::Failed => {
+            bar_row = bar_row.push(
+                button(text("Dismiss"))
+                    .on_press(Message::LinkDismissed)
+                    .style(button::secondary),
+            );
+        }
+    }
+    container(bar_row).padding(4).into()
 }
 
 /// The signed-in user ID for the status bar: one line, capped. It comes from
@@ -145,99 +382,38 @@ fn status_bar(app: &App) -> Element<'_, Message> {
 
 #[cfg(test)]
 mod tests {
-    use tessera_core::api::SendStatus;
-
     use super::*;
 
-    fn message(n: usize) -> TimelineItem {
-        TimelineItem {
-            id: format!("i{n}"),
-            kind: TimelineItemKind::Message {
-                sender: UserId::from("@a:x"),
-                body: format!("m{n}"),
-                is_own: false,
-                timestamp_ms: n as u64,
-                sent: SendStatus::Sent,
-            },
+    #[test]
+    fn the_editor_and_the_timeline_keep_their_place_when_bars_come_and_go() {
+        use iced::advanced::widget::Tree;
+
+        let content = text_editor::Content::new();
+        let build = |bars: usize, picker: bool| -> Element<'_, Message> {
+            let bars = (0..bars).map(|_| text("bar").into()).collect();
+            let picker = picker.then(|| text("picker").into());
+            room_column(
+                text("title").into(),
+                timeline_layer(space().into(), picker),
+                bars,
+                text_editor(&content).into(),
+            )
+        };
+        let mut tree = Tree::new(build(0, false));
+        let tags = |tree: &Tree| {
+            (
+                tree.children.iter().map(|c| c.tag).collect::<Vec<_>>(),
+                tree.children[1].children[0].tag,
+            )
+        };
+        let before = tags(&tree);
+        // A suggestion list, a notice, the reaction picker...: the editor
+        // (keeping its focus) and the timeline (its scroll) keep their tags,
+        // so `Tree::diff` keeps their state.
+        for (bars, picker) in [(1, false), (3, true), (0, true), (0, false)] {
+            tree.diff(build(bars, picker));
+            assert_eq!(tags(&tree), before, "{bars} bars, picker {picker}");
         }
-    }
-
-    fn other(n: usize) -> TimelineItem {
-        TimelineItem {
-            id: format!("o{n}"),
-            kind: TimelineItemKind::Other,
-        }
-    }
-
-    #[test]
-    fn shows_only_the_last_fifty_messages_oldest_first() {
-        let items: Vec<_> = (0..60).map(message).collect();
-        let shown = last_messages(&items);
-        assert_eq!(shown.len(), MAX_MESSAGES);
-        assert_eq!(shown.first().map(|m| m.1), Some("m10"));
-        assert_eq!(shown.last().map(|m| m.1), Some("m59"));
-    }
-
-    #[test]
-    fn skips_items_that_are_not_messages_before_counting() {
-        let mut items = vec![message(0), other(1), message(2), other(3)];
-        let shown = last_messages(&items);
-        assert_eq!(shown.iter().map(|m| m.1).collect::<Vec<_>>(), ["m0", "m2"]);
-        items.clear();
-        assert!(last_messages(&items).is_empty());
-        let many: Vec<_> = (0..70).flat_map(|n| [message(n), other(n)]).collect();
-        assert_eq!(last_messages(&many).len(), MAX_MESSAGES);
-    }
-
-    fn message_from(sender: &str, body: &str) -> TimelineItem {
-        TimelineItem {
-            id: "i".into(),
-            kind: TimelineItemKind::Message {
-                sender: UserId::from(sender),
-                body: body.into(),
-                is_own: false,
-                timestamp_ms: 0,
-                sent: SendStatus::Sent,
-            },
-        }
-    }
-
-    #[test]
-    fn a_body_cannot_fake_another_senders_line() {
-        let items = [message_from(
-            "@mallory:x",
-            "hi\n@alice:x: I agree\u{2028}@bob:x: me too\u{202E}",
-        )];
-        let lines = display_lines(&items);
-        assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0].sender, "@mallory:x");
-        assert!(
-            !lines[0]
-                .body
-                .contains(['\n', '\r', '\u{2028}', '\u{2029}', '\u{202E}'])
-        );
-        assert!(lines[0].body.starts_with("hi\u{23CE}@alice:x"));
-    }
-
-    #[test]
-    fn senders_are_sanitised_and_capped() {
-        let items = [message_from(&format!("@a\n:x{}", "z".repeat(500)), "b")];
-        let lines = display_lines(&items);
-        assert!(!lines[0].sender.contains('\n'));
-        assert_eq!(lines[0].sender.chars().count(), 256);
-    }
-
-    #[test]
-    fn bodies_are_capped() {
-        let items = [message_from("@a:x", &"b".repeat(10_000))];
-        let lines = display_lines(&items);
-        assert_eq!(lines[0].body.chars().count(), MAX_BODY_CHARS);
-        assert!(lines[0].body.ends_with('\u{2026}'));
-        let items = [message_from("@a:x", &"b".repeat(MAX_BODY_CHARS))];
-        assert_eq!(
-            display_lines(&items)[0].body.chars().count(),
-            MAX_BODY_CHARS
-        );
     }
 
     #[test]
@@ -250,6 +426,40 @@ mod tests {
     }
 
     #[test]
+    fn the_command_bar_names_the_command_and_gives_the_hint() {
+        let text = command_bar_text("foo");
+        assert!(text.contains("Unrecognised command: /foo"), "{text}");
+        assert!(text.contains("//"), "{text}");
+        let evil = command_bar_text(&format!("x\u{202E}{}", "y".repeat(200)));
+        assert!(!evil.contains('\u{202E}'));
+        assert!(evil.chars().count() < 160, "{}", evil.chars().count());
+    }
+
+    #[test]
+    fn the_link_bar_shows_only_the_host() {
+        let url = crate::links::check_link_url("https://Evil.example:8443/secret/path?token=abc")
+            .expect("valid link");
+        let text = link_bar_text(&LinkBar::Confirm(url));
+        assert_eq!(text, "Open evil.example?");
+        assert!(!link_bar_text(&LinkBar::Refused).is_empty());
+        assert!(!link_bar_text(&LinkBar::Failed).is_empty());
+    }
+
+    #[test]
+    fn the_confirm_text_names_the_link_kind() {
+        let text = |u: &str| confirm_text(&crate::links::check_link_url(u).expect("valid link"));
+        assert_eq!(text("https://Evil.example/x?t=1"), "Open evil.example?");
+        assert_eq!(
+            text("http://Evil.example:8080/x?t=1"),
+            "Open evil.example? (not encrypted)"
+        );
+        assert_eq!(
+            text("mailto:Bob@Mail.Example?body=secret"),
+            "Write an email to mail.example?"
+        );
+    }
+
+    #[test]
     fn room_names_are_sanitised_and_capped() {
         assert_eq!(display_name("Lounge"), "Lounge");
         assert_eq!(display_name("a\nb\u{202E}c"), "a\u{23CE}b\u{FFFD}c");
@@ -259,8 +469,36 @@ mod tests {
     }
 
     #[test]
-    fn keeps_the_sender() {
-        let items = vec![message(0)];
-        assert_eq!(last_messages(&items)[0].0, &UserId::from("@a:x"));
+    fn the_mode_bar_quotes_the_replied_message() {
+        use crate::state::Startup;
+        use tessera_core::api::{
+            ListDiff, MessageDetails, SendStatus, TimelineItem, TimelineItemKind,
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let (_etx, erx) = tokio::sync::mpsc::channel(1);
+        let (mut app, _boot) = App::new(Startup {
+            sink: Box::new(tx),
+            events: crate::bridge::EventsSlot::new(erx),
+        });
+        assert_eq!(mode_text(&app), None);
+        app.timeline.apply_diffs(vec![ListDiff::Append {
+            values: vec![TimelineItem::new(
+                "m".to_owned(),
+                TimelineItemKind::Message {
+                    sender: UserId::from("@a:x"),
+                    body: "hello\nthere".into(),
+                    is_own: false,
+                    timestamp_ms: 1,
+                    sent: SendStatus::Sent,
+                    details: Box::new(MessageDetails::default()),
+                },
+            )],
+        }]);
+        app.composer.mode = Mode::Reply("m".into());
+        assert_eq!(mode_text(&app).as_deref(), Some("Replying to @a:x: hello"));
+        app.composer.mode = Mode::Reply("gone".into());
+        assert_eq!(mode_text(&app).as_deref(), Some("Replying to a message"));
+        app.composer.mode = Mode::Edit("m".into());
+        assert_eq!(mode_text(&app).as_deref(), Some("Editing a message"));
     }
 }

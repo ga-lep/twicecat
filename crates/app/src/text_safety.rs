@@ -207,6 +207,67 @@ pub fn one_line_capped(text: &str, max_chars: usize) -> String {
     cut
 }
 
+/// Splits at the first line break (`\n`, `\r\n`, `\r`, NEL, LS or PS): the
+/// line, and the rest after the break when there was one.
+fn split_line(text: &str) -> (&str, Option<&str>) {
+    let Some((at, c)) = text
+        .char_indices()
+        .find(|(_, c)| matches!(c, '\n' | '\r' | '\u{85}' | '\u{2028}' | '\u{2029}'))
+    else {
+        return (text, None);
+    };
+    let rest = &text[at + c.len_utf8()..];
+    let rest = if c == '\r' {
+        rest.strip_prefix('\n').unwrap_or(rest)
+    } else {
+        rest
+    };
+    (&text[..at], Some(rest))
+}
+
+/// [`one_line`] for text that may span lines: every line break variant
+/// becomes `\n` (CRLF counts once), and the result has at most `max_lines`
+/// lines and `max_chars` characters (line breaks count). A cut ends in
+/// [`ELLIPSIS`], and always falls on a character boundary.
+///
+/// ```
+/// use tessera_app::text_safety::multi_line_capped;
+/// assert_eq!(multi_line_capped("a\r\nb\u{2028}c", 100, 2), "a\nb\u{2026}");
+/// ```
+pub fn multi_line_capped(text: &str, max_chars: usize, max_lines: usize) -> String {
+    if max_chars == 0 || max_lines == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut chars = 0;
+    let mut rest = Some(text);
+    let mut lines = 0;
+    let mut cut = false;
+    while let Some(remaining) = rest {
+        if lines == max_lines || chars > max_chars {
+            cut = true;
+            break;
+        }
+        let (line, next) = split_line(remaining);
+        if lines > 0 {
+            out.push('\n');
+            chars += 1;
+        }
+        let clean = one_line(line);
+        chars += clean.chars().count();
+        out.push_str(&clean);
+        lines += 1;
+        rest = next;
+    }
+    if chars > max_chars || (cut && chars == max_chars) {
+        out = out.chars().take(max_chars - 1).collect();
+        out.push(ELLIPSIS);
+    } else if cut {
+        out.push(ELLIPSIS);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -474,5 +535,70 @@ mod tests {
         assert!(one_line(&flag).chars().count() <= 1 + MAX_TAG_CHARS);
         // Hidden characters in between interrupt the sequence.
         assert_eq!(one_line("\u{1F3F4}\u{200B}\u{E0067}"), "\u{1F3F4}");
+    }
+
+    #[test]
+    fn multi_line_keeps_line_breaks_and_normalises_variants() {
+        assert_eq!(multi_line_capped("a\nb", 100, 10), "a\nb");
+        for br in ["\r\n", "\r", "\u{85}", "\u{2028}", "\u{2029}", "\n"] {
+            assert_eq!(
+                multi_line_capped(&format!("a{br}b"), 100, 10),
+                "a\nb",
+                "{br:?}"
+            );
+        }
+        assert_eq!(multi_line_capped("a\n\nb", 100, 10), "a\n\nb");
+        assert_eq!(multi_line_capped("", 100, 10), "");
+    }
+
+    #[test]
+    fn multi_line_replaces_bidi_and_removes_invisible() {
+        assert_eq!(
+            multi_line_capped("a\u{202E}b\u{200B}c\nd\u{2066}e", 100, 10),
+            format!("a{REPLACEMENT}bc\nd{REPLACEMENT}e")
+        );
+        assert_eq!(
+            multi_line_capped("a\tb\0c", 100, 10),
+            format!("a b{REPLACEMENT}c")
+        );
+    }
+
+    #[test]
+    fn multi_line_caps_lines() {
+        assert_eq!(multi_line_capped("1\n2\n3", 100, 3), "1\n2\n3");
+        assert_eq!(multi_line_capped("1\n2\n3\n4", 100, 3), "1\n2\n3\u{2026}");
+        assert_eq!(multi_line_capped("1\n2", 100, 1), "1\u{2026}");
+        assert_eq!(multi_line_capped("1\n2", 100, 0), "");
+        let many = "x\n".repeat(100_000);
+        assert_eq!(multi_line_capped(&many, 10_000, 5).lines().count(), 5);
+    }
+
+    #[test]
+    fn multi_line_caps_chars_including_line_breaks() {
+        assert_eq!(multi_line_capped("abcd", 4, 10), "abcd");
+        assert_eq!(multi_line_capped("abcde", 4, 10), "abc\u{2026}");
+        assert_eq!(multi_line_capped("ab\ncd", 4, 10), "ab\n\u{2026}");
+        assert_eq!(multi_line_capped("abc\nd", 3, 1), "ab\u{2026}");
+        assert_eq!(multi_line_capped("abc", 0, 10), "");
+        assert_eq!(multi_line_capped("abc", 1, 10), "\u{2026}");
+    }
+
+    #[test]
+    fn multi_line_cuts_on_char_boundaries() {
+        let text = "é\u{1F600}\u{4F60}".repeat(10);
+        for max in 0..40 {
+            let out = multi_line_capped(&text, max, 3);
+            assert!(out.chars().count() <= max, "{max}");
+        }
+        assert_eq!(
+            multi_line_capped("\u{1F600}\u{1F600}\u{1F600}", 2, 3),
+            "\u{1F600}\u{2026}"
+        );
+    }
+
+    #[test]
+    fn multi_line_caps_after_sanitising() {
+        let zw = "\u{200B}".repeat(500);
+        assert_eq!(multi_line_capped(&format!("{zw}ab\nc"), 4, 5), "ab\nc");
     }
 }

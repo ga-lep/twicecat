@@ -255,3 +255,36 @@ pub async fn create_space(
         .room_id()
         .to_owned()
 }
+
+/// Sets the global display name of the account `client` is logged in as.
+pub async fn set_display_name(client: &matrix_sdk::Client, name: &str) {
+    client
+        .account()
+        .set_display_name(Some(name))
+        .await
+        .expect("set display name");
+}
+
+/// Sends a plain `m.text` message to `room` as `client` and returns the
+/// event ID. Works on a client that never synced. Prints nothing.
+pub async fn send_text(
+    client: &matrix_sdk::Client,
+    room: &matrix_sdk::ruma::RoomId,
+    body: &str,
+) -> matrix_sdk::ruma::OwnedEventId {
+    use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
+    send_content(client, room, &RoomMessageEventContent::text_plain(body)).await
+}
+
+/// Sends `content` to `room` as `client` and returns the event ID.
+pub async fn send_content(
+    client: &matrix_sdk::Client,
+    room: &matrix_sdk::ruma::RoomId,
+    content: &matrix_sdk::ruma::events::room::message::RoomMessageEventContent,
+) -> matrix_sdk::ruma::OwnedEventId {
+    use matrix_sdk::ruma::TransactionId;
+    use matrix_sdk::ruma::api::client::message::send_message_event::v3::Request;
+    let request = Request::new(room.to_owned(), TransactionId::new(), content)
+        .expect("serialize message content");
+    client.send(request).await.expect("send message").event_id
+}

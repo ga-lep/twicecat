@@ -93,6 +93,58 @@ impl StateSink for WatchSink {
     }
 }
 
+/// Spots the return to `Running` after the connection was lost.
+#[derive(Debug, Default)]
+pub(crate) struct ResumeDetector {
+    /// An `Offline` or `Reconnecting` has been seen since the last `Running`.
+    degraded: std::sync::atomic::AtomicBool,
+}
+
+impl ResumeDetector {
+    /// Records `state`; `true` when it is a `Running` that ends an outage.
+    pub(crate) fn observe(&self, state: &SyncState) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        match state {
+            SyncState::Offline | SyncState::Reconnecting { .. } => {
+                self.degraded.store(true, SeqCst);
+                false
+            }
+            SyncState::Running => self.degraded.swap(false, SeqCst),
+            _ => false,
+        }
+    }
+}
+
+/// A [`StateSink`] that calls `on_resume` (which must not block) whenever the
+/// sync returns to `Running` after an outage, then publishes to `inner`.
+///
+/// It sees every state the supervisor publishes, unlike the latest-value slot
+/// behind `inner`, which may coalesce `Offline` and `Running`.
+pub(crate) struct ResumeSink<K, F> {
+    inner: K,
+    detector: ResumeDetector,
+    on_resume: F,
+}
+
+impl<K, F> ResumeSink<K, F> {
+    pub(crate) fn new(inner: K, on_resume: F) -> Self {
+        Self {
+            inner,
+            detector: ResumeDetector::default(),
+            on_resume,
+        }
+    }
+}
+
+impl<K: StateSink, F: Fn()> StateSink for ResumeSink<K, F> {
+    fn publish(&self, state: SyncState) -> bool {
+        if self.detector.observe(&state) {
+            (self.on_resume)();
+        }
+        self.inner.publish(state)
+    }
+}
+
 /// Delivers the latest published state to `events`, waiting for room there.
 async fn forward_latest(mut slot: watch::Receiver<SyncState>, events: mpsc::Sender<CoreEvent>) {
     while slot.changed().await.is_ok() {
@@ -153,20 +205,24 @@ impl Drop for AbortOnDrop {
 }
 
 /// Runs [`supervise`] with a non-blocking path to `events`: states go through
-/// a latest-value slot drained by a forwarder task.
-pub(crate) async fn run_supervised<C, S>(
+/// a latest-value slot drained by a forwarder task. `on_resume` is called
+/// (without blocking) when `Running` returns after `Offline` or `Reconnecting`.
+pub(crate) async fn run_supervised<C, S, F>(
     control: &C,
     initial: State,
     states: S,
     events: mpsc::Sender<CoreEvent>,
     mut cancel: Cancel,
+    on_resume: F,
 ) where
     C: SyncControl,
     S: Stream<Item = State> + Unpin,
+    F: Fn() + Send + Sync,
 {
     let (slot_tx, slot_rx) = watch::channel(SyncState::Idle);
     let _forwarder = AbortOnDrop(tokio::spawn(forward_latest(slot_rx, events)));
-    supervise(control, initial, states, &WatchSink(slot_tx), &mut cancel).await;
+    let sink = ResumeSink::new(WatchSink(slot_tx), on_resume);
+    supervise(control, initial, states, &sink, &mut cancel).await;
 }
 
 /// Consecutive unstable Offline cycles after which the supervisor throttles.
@@ -785,6 +841,56 @@ mod tests {
         assert_eq!(*fake.stops.lock().unwrap(), 1);
     }
 
+    /// The states that `ResumeDetector` flags as a resume.
+    fn resumes(states: &[SyncState]) -> Vec<usize> {
+        let detector = ResumeDetector::default();
+        states
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| detector.observe(s))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    #[test]
+    fn running_after_offline_or_reconnecting_is_a_resume() {
+        use SyncState::{Idle, Offline, Reconnecting, Running};
+        assert_eq!(resumes(&[Idle, Running]), Vec::<usize>::new());
+        assert_eq!(resumes(&[Running, Running]), Vec::<usize>::new());
+        assert_eq!(resumes(&[Running, Offline, Running]), vec![2]);
+        assert_eq!(
+            resumes(&[Running, Reconnecting { attempt: 1 }, Running]),
+            vec![2]
+        );
+        // One resume per outage, however many failure states preceded it.
+        assert_eq!(
+            resumes(&[
+                Running,
+                Offline,
+                Reconnecting { attempt: 1 },
+                Reconnecting { attempt: 2 },
+                Running,
+                Running,
+            ]),
+            vec![4]
+        );
+        assert_eq!(resumes(&[Offline, Running, Offline, Running]), vec![1, 3]);
+    }
+
+    #[test]
+    fn the_resume_sink_calls_back_and_still_publishes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = AtomicUsize::new(0);
+        let sink = ResumeSink::new(RecSink(Mutex::default()), || {
+            calls.fetch_add(1, Ordering::SeqCst);
+        });
+        for state in [SyncState::Running, SyncState::Offline, SyncState::Running] {
+            assert!(sink.publish(state));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(sink.inner.0.lock().unwrap().len(), 3);
+    }
+
     #[tokio::test]
     async fn a_stalled_consumer_does_not_stop_the_backoff() {
         let fake = Fake::new(quick((0..5).map(|_| failure()).collect()));
@@ -794,7 +900,7 @@ mod tests {
         let (_trigger, cancel) = cancel_pair();
         tokio::time::timeout(
             Duration::from_secs(5),
-            run_supervised(&fake, State::Running, Box::pin(states), tx, cancel),
+            run_supervised(&fake, State::Running, Box::pin(states), tx, cancel, || {}),
         )
         .await
         .expect("the supervisor must not wait for the consumer");

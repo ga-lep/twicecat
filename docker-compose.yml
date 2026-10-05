@@ -17,5 +17,19 @@ services:
       retries: 30
       start_period: 5s
 
+  # Element Web for the human checks, as the other side of a chat. Browsers
+  # block app.element.io from calling http://localhost, so it runs locally.
+  # Not started by default (CI does not need it): `docker compose --profile element up -d`,
+  # then open http://localhost:8080.
+  element:
+    image: vectorim/element-web:v1.12.30
+    profiles: ["element"]
+    ports:
+      - "127.0.0.1:8080:80"
+    volumes:
+      - ./dev/element/config.json:/app/config.json:ro
+    depends_on:
+      - synapse
+
 volumes:
   synapse-data:

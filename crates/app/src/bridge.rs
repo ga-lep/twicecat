@@ -88,7 +88,8 @@ pub fn events_subscription(slot: EventsSlot) -> Subscription<Message> {
 #[derive(Debug)]
 pub struct Pending {
     commands: mpsc::Sender<Command>,
-    command: Command,
+    // Boxed: `Command` is large, and this is the `Err` of `try_send`.
+    command: Box<Command>,
 }
 
 impl Pending {
@@ -96,7 +97,7 @@ impl Pending {
     /// channel send, not network work.
     pub async fn deliver(self) {
         // An error means the core is gone; there is nobody to tell.
-        let _ = self.commands.send(self.command).await;
+        let _ = self.commands.send(*self.command).await;
     }
 
     /// The same, as an Iced task that produces no message.
@@ -112,7 +113,7 @@ pub fn try_send(commands: &mpsc::Sender<Command>, command: Command) -> Result<()
         Ok(()) | Err(TrySendError::Closed(_)) => Ok(()),
         Err(TrySendError::Full(command)) => Err(Pending {
             commands: commands.clone(),
-            command,
+            command: Box::new(command),
         }),
     }
 }
@@ -162,11 +163,17 @@ impl Bridge {
     /// A task that yields [`Message::ShutdownDeadline`] after `after`. The
     /// timer runs on the core's runtime.
     pub fn deadline(&self, after: Duration) -> Task<Message> {
+        self.timer(after, Message::ShutdownDeadline)
+    }
+
+    /// A task that yields `message` after `after`. The timer runs on the
+    /// core's runtime.
+    pub fn timer(&self, after: Duration, message: Message) -> Task<Message> {
         let timer = spawn_timer(&self.handle, after);
         Task::future(async move {
             // The timer ends either way (done, or runtime gone).
             let _ = timer.await;
-            Message::ShutdownDeadline
+            message
         })
     }
 }

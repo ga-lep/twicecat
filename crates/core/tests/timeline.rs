@@ -91,7 +91,7 @@ fn has_message(
             sent,
             ..
         } => body == marker && pred(&sender.as_str().to_owned(), *is_own, *sent),
-        TimelineItemKind::Other => false,
+        _ => false,
     })
 }
 

@@ -2,30 +2,41 @@
 //!
 //! Only plain API types cross the public boundary. SDK types stay in here.
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures_util::{Stream, StreamExt as _, pin_mut};
+use matrix_sdk::event_cache::PaginationStatus;
+use matrix_sdk::room::edit::EditedContent;
+use matrix_sdk::ruma::OwnedUserId;
+use matrix_sdk::ruma::api::client::receipt::create_receipt::v3::ReceiptType;
 use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
-use matrix_sdk::{Client, SessionChange};
+use matrix_sdk::send_queue::SendHandle;
+use matrix_sdk::{Client, RoomMemberships, SessionChange};
 use matrix_sdk_ui::eyeball_im::{Vector, VectorDiff};
 use matrix_sdk_ui::sync_service::SyncService;
-use matrix_sdk_ui::timeline::{RoomExt as _, Timeline, TimelineItem as SdkTimelineItem};
-use tokio::sync::{broadcast, mpsc, oneshot, watch};
-use tokio::task::JoinHandle;
+use matrix_sdk_ui::timeline::{
+    EventSendState, RoomExt as _, Timeline, TimelineItem as SdkTimelineItem,
+};
+use tokio::sync::{Notify, OnceCell, broadcast, mpsc, oneshot, watch};
+use tokio::task::{JoinHandle, JoinSet};
 use tracing::{info, warn};
 use zeroize::Zeroizing;
 
 use crate::api::{
-    Command, CoreError, CoreEvent, DeviceId, ListDiff, MessageText, Password, RoomId,
-    RoomListQuery, UserId,
+    ActionKind, Command, CoreError, CoreEvent, DeviceId, Draft, ListDiff, Member, MessageText,
+    OutgoingMessage, PaginationState, Password, RoomId, RoomListQuery, TypingUser, UserId,
 };
 use crate::avatars::{Avatars, SdkFetcher, answer_unavailable};
 use crate::client::{
     ServerSpec, WRONG_ACCOUNT, account_bound, build_client, discover_homeserver_url,
     ensure_homeserver_after_login, map_login_error, same_origin,
 };
+use crate::drafts;
 use crate::oauth::authorize;
+use crate::outgoing::outgoing_content;
 use crate::paths::DataPaths;
 use crate::room_list::{Registered, build_filter, loaded_event, map_batch, map_diff};
 use crate::secrets::{SecretError, SecretStore};
@@ -33,7 +44,13 @@ use crate::session::{
     RECORD_VERSION, SessionAuth, SessionRecord, generate_session_id, generate_store_passphrase,
 };
 use crate::sync::{CancelTrigger, SyncControl, cancel_pair, run_supervised};
-use crate::timeline::{map_item, parse_room_id};
+use crate::timeline::{map_item, normalize_reaction_key, parse_room_id, rank_members};
+
+/// Events loaded by one back-pagination.
+const PAGINATION_BATCH: u16 = 20;
+
+/// Most typing users reported at once (a hostile room could list thousands).
+const MAX_TYPING_USERS: usize = 16;
 
 /// Default number of rooms the room list loads per page.
 pub const DEFAULT_ROOM_LIST_PAGE_SIZE: usize = 500;
@@ -101,19 +118,57 @@ struct Syncing {
     more_rooms: mpsc::Sender<()>,
 }
 
-/// The room whose timeline is open, and the task forwarding its diffs.
+/// The room whose timeline is open, the task forwarding its diffs and the
+/// tasks of its actions (send, retry, discard: every network call runs
+/// there, so `handle` never waits on the network).
 struct Selected {
     room_id: RoomId,
-    timeline: Timeline,
+    timeline: Arc<Timeline>,
     task: JoinHandle<()>,
+    tasks: JoinSet<()>,
+    /// Set once the full member list has been fetched for this selection.
+    members_synced: Arc<OnceCell<()>>,
+    /// Set while a back-pagination of this room runs.
+    paginating: Arc<AtomicBool>,
 }
 
 impl Selected {
-    /// Ends the forwarder; the timeline is dropped with `self`.
-    async fn stop(self) {
+    /// Ends the forwarder and the action tasks; the timeline is dropped with
+    /// `self`, after the tasks that hold clones of it.
+    async fn stop(mut self) {
         self.task.abort();
         // An aborted task ends with a cancellation error; that is expected.
         let _ = self.task.await;
+        self.tasks.shutdown().await;
+    }
+
+    /// Runs `work` on the timeline in the action tasks. Its error, if any,
+    /// is reported as `ActionFailed`.
+    fn spawn_action<F, Fut>(
+        &mut self,
+        action: ActionKind,
+        events: &mpsc::Sender<CoreEvent>,
+        work: F,
+    ) where
+        F: FnOnce(Arc<Timeline>) -> Fut,
+        Fut: std::future::Future<Output = Result<(), CoreError>> + Send + 'static,
+    {
+        // Forget finished tasks, so the set does not grow with every action.
+        while self.tasks.try_join_next().is_some() {}
+        let fut = work(self.timeline.clone());
+        let events = events.clone();
+        let room_id = self.room_id.clone();
+        self.tasks.spawn(async move {
+            if let Err(error) = fut.await {
+                let _ = events
+                    .send(CoreEvent::ActionFailed {
+                        room_id,
+                        action,
+                        error,
+                    })
+                    .await;
+            }
+        });
     }
 }
 
@@ -179,9 +234,12 @@ impl SyncControl for ServiceControl {
 }
 
 /// Forwards sync state changes as events and restarts the service after a
-/// failure (see [`supervise`]).
+/// failure (see [`supervise`]). When the sync comes back after an outage it
+/// also re-enables the send queue, which the SDK disables after a failed
+/// send, so that recoverable failures are retried.
 async fn forward_sync_state(
     service: Arc<SyncService>,
+    client: Client,
     events: mpsc::Sender<CoreEvent>,
     cancel: crate::sync::Cancel,
 ) {
@@ -190,14 +248,23 @@ async fn forward_sync_state(
     // transition.
     let mut subscriber = service.state();
     let initial = subscriber.next_now();
-    run_supervised(
-        &ServiceControl(service),
-        initial,
-        subscriber,
-        events,
-        cancel,
-    )
-    .await;
+    let resumed = Notify::new();
+    // Runs in this task, so it ends with the supervisor and holds the client
+    // no longer than the supervisor does.
+    let reenable = async {
+        loop {
+            resumed.notified().await;
+            client.send_queue().set_enabled(true).await;
+        }
+    };
+    let control = ServiceControl(service);
+    let supervised = run_supervised(&control, initial, subscriber, events, cancel, || {
+        resumed.notify_one()
+    });
+    tokio::select! {
+        () = supervised => {}
+        () = reenable => {}
+    }
 }
 
 /// Forwards every room list diff batch as one `RoomListChanged` event.
@@ -274,15 +341,19 @@ async fn forward_room_list(
     }
 }
 
-/// Forwards the initial timeline items as one `Reset`, then every diff batch.
+/// Forwards the initial timeline items as one `Reset`, then the room's stored
+/// draft (after the items, so a reply draft can find its message), then every
+/// diff batch.
 async fn forward_timeline(
     room_id: RoomId,
     items: Vector<Arc<SdkTimelineItem>>,
     stream: impl Stream<Item = Vec<VectorDiff<Arc<SdkTimelineItem>>>>,
     events: mpsc::Sender<CoreEvent>,
+    own: Option<OwnedUserId>,
+    draft: Option<Draft>,
 ) {
     let initial = ListDiff::Reset {
-        values: items.iter().map(|i| map_item(i)).collect(),
+        values: items.iter().map(|i| map_item(i, own.as_deref())).collect(),
     };
     let first = CoreEvent::TimelineDiff {
         room_id: room_id.clone(),
@@ -291,11 +362,20 @@ async fn forward_timeline(
     if events.send(first).await.is_err() {
         return;
     }
+    if let Some(draft) = draft {
+        let loaded = CoreEvent::DraftLoaded {
+            room_id: room_id.clone(),
+            draft,
+        };
+        if events.send(loaded).await.is_err() {
+            return;
+        }
+    }
     pin_mut!(stream);
     while let Some(diffs) = stream.next().await {
         let diffs = diffs
             .into_iter()
-            .map(|d| map_diff(d, |item| map_item(&item)))
+            .map(|d| map_diff(d, |item| map_item(&item, own.as_deref())))
             .collect();
         let event = CoreEvent::TimelineDiff {
             room_id: room_id.clone(),
@@ -387,6 +467,324 @@ async fn next_change(active: &mut Option<Active>) -> Change {
     }
 }
 
+/// Finds the timeline item with this `TimelineItem::id`.
+async fn find_item(timeline: &Timeline, item_id: &str) -> Result<Arc<SdkTimelineItem>, CoreError> {
+    timeline
+        .items()
+        .await
+        .iter()
+        .find(|item| item.unique_id().0 == item_id)
+        .cloned()
+        .ok_or(CoreError::ItemNotFound)
+}
+
+/// Queues a message, as a reply when it names the item to reply to.
+async fn send_task(timeline: Arc<Timeline>, message: OutgoingMessage) -> Result<(), CoreError> {
+    // Resolve the reply target first: a refused reply sends nothing.
+    let reply_to = match &message.reply_to {
+        None => None,
+        Some(item_id) => {
+            let item = find_item(&timeline, item_id).await?;
+            let event = item.as_event().ok_or(CoreError::NotAllowed)?;
+            if !event.can_be_replied_to() {
+                return Err(CoreError::NotAllowed);
+            }
+            Some(event.event_id().ok_or(CoreError::NotAllowed)?.to_owned())
+        }
+    };
+    let content = outgoing_content(&message);
+    let queued = match reply_to {
+        Some(event_id) => timeline.send_reply(content, event_id).await,
+        None => {
+            timeline
+                .send(RoomMessageEventContent::from(content).into())
+                .await
+        }
+    };
+    queued
+        .map(drop)
+        .map_err(|_| CoreError::Internal("the message could not be queued".into()))
+}
+
+/// Replaces the content of one of the user's own messages. The new content
+/// goes through the same `outgoing_content` (sanitizer and tag cap) as a send.
+async fn edit_task(
+    timeline: Arc<Timeline>,
+    item_id: String,
+    message: OutgoingMessage,
+) -> Result<(), CoreError> {
+    let item = find_item(&timeline, &item_id).await?;
+    let event = item.as_event().ok_or(CoreError::NotAllowed)?;
+    if !event.is_editable() {
+        return Err(CoreError::NotAllowed);
+    }
+    let content = EditedContent::RoomMessage(outgoing_content(&message));
+    timeline
+        .edit(&event.identifier(), content)
+        .await
+        .map_err(|_| CoreError::Internal("the message could not be edited".into()))
+}
+
+/// Redacts a message. The reason is exposed only at the SDK call.
+async fn redact_task(
+    timeline: Arc<Timeline>,
+    item_id: String,
+    reason: Option<MessageText>,
+) -> Result<(), CoreError> {
+    let item = find_item(&timeline, &item_id).await?;
+    let event = item.as_event().ok_or(CoreError::NotAllowed)?;
+    timeline
+        .redact(
+            &event.identifier(),
+            reason.as_ref().map(MessageText::expose),
+        )
+        .await
+        .map_err(|_| CoreError::Internal("the message could not be redacted".into()))
+}
+
+/// Adds the user's reaction to a message, or removes it when present.
+async fn react_task(
+    timeline: Arc<Timeline>,
+    item_id: String,
+    key: String,
+) -> Result<(), CoreError> {
+    let key = normalize_reaction_key(&key)?;
+    let item = find_item(&timeline, &item_id).await?;
+    let event = item.as_event().ok_or(CoreError::NotAllowed)?;
+    timeline
+        .toggle_reaction(&event.identifier(), &key)
+        .await
+        .map(drop)
+        .map_err(|_| CoreError::Internal("the reaction could not be sent".into()))
+}
+
+/// Answers a member search with the best matches among the joined members.
+/// The member list is fetched once per selection (`synced`); the search
+/// itself reads only the local store.
+async fn members_task(
+    timeline: Arc<Timeline>,
+    synced: Arc<OnceCell<()>>,
+    events: mpsc::Sender<CoreEvent>,
+    query: MessageText,
+) -> Result<(), CoreError> {
+    let room = timeline.room();
+    let fail = |_| CoreError::Internal("the members could not be loaded".into());
+    synced
+        .get_or_try_init(|| async { room.sync_members().await })
+        .await
+        .map_err(fail)?;
+    let joined = room
+        .members_no_sync(RoomMemberships::JOIN)
+        .await
+        .map_err(fail)?;
+    let all = joined
+        .iter()
+        .map(|m| Member {
+            user_id: UserId::from(m.user_id().as_str()),
+            display_name: m.display_name().map(str::to_owned),
+        })
+        .collect();
+    let members = rank_members(query.expose(), all);
+    // A dropped receiver just means nobody listens any more.
+    let _ = events
+        .send(CoreEvent::Members {
+            room_id: RoomId::from(room.room_id().as_str()),
+            query,
+            members,
+        })
+        .await;
+    Ok(())
+}
+
+/// The send handle of the failed local echo `item_id`, and whether the
+/// failure is unrecoverable (the request is parked until unwedged).
+async fn local_echo(timeline: &Timeline, item_id: &str) -> Result<(SendHandle, bool), CoreError> {
+    let item = find_item(timeline, item_id).await?;
+    let event = item.as_event().ok_or(CoreError::NotAllowed)?;
+    let handle = event
+        .local_echo_send_handle()
+        .ok_or(CoreError::NotAllowed)?;
+    let wedged = matches!(
+        event.send_state(),
+        Some(EventSendState::SendingFailed {
+            is_recoverable: false,
+            ..
+        })
+    );
+    Ok((handle, wedged))
+}
+
+/// Sends a failed local echo again: unwedges it when needed, then re-enables
+/// the room's send queue, which a failure disabled.
+async fn retry_task(timeline: Arc<Timeline>, item_id: String) -> Result<(), CoreError> {
+    let (handle, wedged) = local_echo(&timeline, &item_id).await?;
+    if wedged {
+        handle
+            .unwedge()
+            .await
+            .map_err(|_| CoreError::Internal("the message could not be retried".into()))?;
+    }
+    timeline.room().send_queue().set_enabled(true);
+    Ok(())
+}
+
+/// Drops a local echo, then re-enables the room's send queue so that later
+/// messages go out.
+async fn discard_task(timeline: Arc<Timeline>, item_id: String) -> Result<(), CoreError> {
+    let (handle, _) = local_echo(&timeline, &item_id).await?;
+    let result = handle.abort().await;
+    // Enabled even when the abort failed: the queue must not stay stuck.
+    timeline.room().send_queue().set_enabled(true);
+    result
+        .map(drop)
+        .map_err(|_| CoreError::Internal("the message could not be discarded".into()))
+}
+
+/// Marks a back-pagination as running; at most one runs per selection.
+/// Dropping the permit frees the slot.
+struct PaginationPermit(Arc<AtomicBool>);
+
+impl PaginationPermit {
+    /// Takes the slot, or `None` while another pagination holds it.
+    fn try_acquire(flag: &Arc<AtomicBool>) -> Option<Self> {
+        flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self(flag.clone()))
+    }
+}
+
+impl Drop for PaginationPermit {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// Loads 20 older events, unless a pagination of this room is already
+/// running (then the request is dropped: the app asks again when idle).
+async fn paginate_task(timeline: Arc<Timeline>, flag: Arc<AtomicBool>) -> Result<(), CoreError> {
+    let Some(_permit) = PaginationPermit::try_acquire(&flag) else {
+        return Ok(());
+    };
+    timeline
+        .paginate_backwards(PAGINATION_BATCH)
+        .await
+        .map(drop)
+        .map_err(|_| CoreError::Internal("older messages could not be loaded".into()))
+}
+
+/// Sends a read receipt for the newest event, and moves the read marker when
+/// asked.
+async fn mark_read_task(timeline: Arc<Timeline>, fully_read: bool) -> Result<(), CoreError> {
+    let fail = |_| CoreError::Internal("the read receipt could not be sent".into());
+    timeline
+        .mark_as_read(ReceiptType::Read)
+        .await
+        .map_err(fail)?;
+    if fully_read {
+        timeline
+            .mark_as_read(ReceiptType::FullyRead)
+            .await
+            .map_err(fail)?;
+    }
+    Ok(())
+}
+
+/// Moves only the private fully-read marker; no public receipt is sent.
+async fn move_marker_task(timeline: Arc<Timeline>) -> Result<(), CoreError> {
+    timeline
+        .mark_as_read(ReceiptType::FullyRead)
+        .await
+        .map(drop)
+        .map_err(|_| CoreError::Internal("the read marker could not be moved".into()))
+}
+
+/// Tells the room whether the user is typing.
+async fn typing_task(timeline: Arc<Timeline>, typing: bool) -> Result<(), CoreError> {
+    timeline
+        .room()
+        .typing_notice(typing)
+        .await
+        .map_err(|_| CoreError::Internal("the typing notice could not be sent".into()))
+}
+
+/// The API state for an SDK back-pagination status.
+fn pagination_state(status: PaginationStatus) -> PaginationState {
+    match status {
+        PaginationStatus::Idle {
+            hit_timeline_start: true,
+        } => PaginationState::ReachedStart,
+        PaginationStatus::Idle { .. } => PaginationState::Idle,
+        PaginationStatus::Paginating => PaginationState::Loading,
+    }
+}
+
+/// Forwards the back-pagination status of the room as `Pagination` events,
+/// the current value first. Ends with the selection (it is aborted) or when
+/// the receiver is gone.
+async fn forward_pagination(
+    room_id: RoomId,
+    timeline: Arc<Timeline>,
+    events: mpsc::Sender<CoreEvent>,
+) {
+    let Some((current, stream)) = timeline.live_back_pagination_status().await else {
+        return;
+    };
+    pin_mut!(stream);
+    let mut next = Some(current);
+    while let Some(status) = next {
+        let event = CoreEvent::Pagination {
+            room_id: room_id.clone(),
+            state: pagination_state(status),
+        };
+        if events.send(event).await.is_err() {
+            return;
+        }
+        next = stream.next().await;
+    }
+}
+
+/// The typing users with the names the room's members have, if known.
+fn typing_users(ids: Vec<OwnedUserId>, names: &HashMap<OwnedUserId, String>) -> Vec<TypingUser> {
+    ids.into_iter()
+        .take(MAX_TYPING_USERS)
+        .map(|id| TypingUser {
+            name: names.get(&id).cloned(),
+            user_id: UserId::from(id.as_str()),
+        })
+        .collect()
+}
+
+/// Forwards who else is typing in the room as `Typing` events. Ends with the
+/// selection (it is aborted); the SDK event handler goes with the guard.
+async fn forward_typing(room_id: RoomId, timeline: Arc<Timeline>, events: mpsc::Sender<CoreEvent>) {
+    let room = timeline.room();
+    let (_guard, mut receiver) = room.subscribe_to_typing_notifications();
+    loop {
+        let ids = match receiver.recv().await {
+            Ok(ids) => ids,
+            // Only the latest list matters; wait for the next one.
+            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(broadcast::error::RecvError::Closed) => return,
+        };
+        let mut names = HashMap::new();
+        for id in ids.iter().take(MAX_TYPING_USERS) {
+            // A failed lookup just leaves the name out.
+            if let Ok(Some(member)) = room.get_member_no_sync(id).await
+                && let Some(name) = member.display_name()
+            {
+                names.insert(id.clone(), name.to_owned());
+            }
+        }
+        let event = CoreEvent::Typing {
+            room_id: room_id.clone(),
+            users: typing_users(ids, &names),
+        };
+        if events.send(event).await.is_err() {
+            return;
+        }
+    }
+}
+
 impl Engine {
     async fn run(mut self, mut commands: mpsc::Receiver<Command>) {
         let mut watch_changes = true;
@@ -441,6 +839,11 @@ impl Engine {
                 }
             }
             Command::Logout => self.logout().await,
+            // Awaited here, not in the action set: it is a local store write,
+            // and a draft saved just before `Shutdown` must not be cut off.
+            Command::SaveDraft { room_id, draft } => {
+                self.save_draft(&room_id, draft.as_ref()).await
+            }
             Command::LoginOAuth { server } => self.login_oauth(server).await,
             // The task ends with `Cancelled`, which `on_oauth_done` reports.
             Command::CancelOAuth => {
@@ -487,6 +890,98 @@ impl Engine {
                 // No session to fetch with: every ID is unavailable.
                 None => answer_unavailable(ids, &self.events).await,
             },
+            Command::Send(message) => {
+                let room_id = message.room_id.clone();
+                self.run_action(room_id, ActionKind::Send, |timeline| {
+                    send_task(timeline, message)
+                })
+                .await;
+            }
+            Command::RetrySend { room_id, item_id } => {
+                self.run_action(room_id, ActionKind::Retry, |timeline| {
+                    retry_task(timeline, item_id)
+                })
+                .await;
+            }
+            Command::DiscardSend { room_id, item_id } => {
+                self.run_action(room_id, ActionKind::Discard, |timeline| {
+                    discard_task(timeline, item_id)
+                })
+                .await;
+            }
+            Command::Edit { item_id, message } => {
+                let room_id = message.room_id.clone();
+                self.run_action(room_id, ActionKind::Edit, |timeline| {
+                    edit_task(timeline, item_id, message)
+                })
+                .await;
+            }
+            Command::Redact {
+                room_id,
+                item_id,
+                reason,
+            } => {
+                self.run_action(room_id, ActionKind::Redact, |timeline| {
+                    redact_task(timeline, item_id, reason)
+                })
+                .await;
+            }
+            Command::ToggleReaction {
+                room_id,
+                item_id,
+                key,
+            } => {
+                self.run_action(room_id, ActionKind::React, |timeline| {
+                    react_task(timeline, item_id, key)
+                })
+                .await;
+            }
+            Command::SearchMembers { room_id, query } => {
+                let query = MessageText::from(query);
+                let events = self.events.clone();
+                let synced = self
+                    .active
+                    .as_ref()
+                    .and_then(|a| a.selected.as_ref())
+                    .map(|s| s.members_synced.clone());
+                self.run_action(room_id, ActionKind::Members, |timeline| {
+                    // `run_action` only calls this with a selected room, so
+                    // `synced` is present then.
+                    members_task(timeline, synced.unwrap_or_default(), events, query)
+                })
+                .await;
+            }
+            Command::PaginateBackwards { room_id } => {
+                let flag = self
+                    .active
+                    .as_ref()
+                    .and_then(|a| a.selected.as_ref())
+                    .map(|s| s.paginating.clone())
+                    .unwrap_or_default();
+                self.run_action(room_id, ActionKind::Paginate, |timeline| {
+                    paginate_task(timeline, flag)
+                })
+                .await;
+            }
+            Command::MarkRead {
+                room_id,
+                fully_read,
+            } => {
+                self.run_action(room_id, ActionKind::Receipt, |timeline| {
+                    mark_read_task(timeline, fully_read)
+                })
+                .await;
+            }
+            Command::MoveReadMarker { room_id } => {
+                self.run_action(room_id, ActionKind::Receipt, move_marker_task)
+                    .await;
+            }
+            Command::SetTyping { room_id, typing } => {
+                self.run_action(room_id, ActionKind::Typing, |timeline| {
+                    typing_task(timeline, typing)
+                })
+                .await;
+            }
             // Handled in `run`.
             Command::Shutdown => {}
         }
@@ -634,6 +1129,27 @@ impl Engine {
         }
     }
 
+    /// Stores `draft` as the composer draft of `room_id`, or removes it
+    /// (`None` or blank). Without a session or a known room, nothing happens.
+    async fn save_draft(&self, room_id: &RoomId, draft: Option<&Draft>) {
+        let Some(active) = self.active.as_ref() else {
+            return;
+        };
+        let Some(room) = parse_room_id(room_id)
+            .ok()
+            .and_then(|id| active.client.get_room(&id))
+        else {
+            return;
+        };
+        let result = match draft.and_then(drafts::to_sdk) {
+            Some(sdk) => room.save_composer_draft(sdk, None).await,
+            None => room.clear_composer_draft(None).await,
+        };
+        if result.is_err() {
+            warn!("the composer draft could not be stored");
+        }
+    }
+
     /// Opens the timeline of `room_id`, replacing any previous selection.
     async fn select_room(&mut self, room_id: RoomId) -> Result<(), CoreError> {
         let active = self.active.as_mut().ok_or(CoreError::NotLoggedIn)?;
@@ -649,19 +1165,80 @@ impl Engine {
             .timeline()
             .await
             .map_err(|_| CoreError::Internal("could not open the room timeline".into()))?;
+        // Typing and receipts of the open room arrive through sliding sync
+        // only when the room is subscribed.
+        if let Some(sync) = active.sync.as_ref() {
+            sync.service
+                .room_list_service()
+                .set_room_subscriptions(&[&sdk_id])
+                .await;
+        }
+        // A store error loses only the draft, never the room.
+        let draft = room
+            .load_composer_draft(None)
+            .await
+            .ok()
+            .flatten()
+            .and_then(drafts::from_sdk);
         let (items, stream) = timeline.subscribe().await;
         let task = tokio::spawn(forward_timeline(
             room_id.clone(),
             items,
             stream,
             self.events.clone(),
+            active.client.user_id().map(ToOwned::to_owned),
+            draft,
+        ));
+        let timeline = Arc::new(timeline);
+        // Both forwarders live in the action set, so they end with the
+        // selection.
+        let mut tasks = JoinSet::new();
+        tasks.spawn(forward_pagination(
+            room_id.clone(),
+            timeline.clone(),
+            self.events.clone(),
+        ));
+        tasks.spawn(forward_typing(
+            room_id.clone(),
+            timeline.clone(),
+            self.events.clone(),
         ));
         active.selected = Some(Selected {
             room_id,
             timeline,
             task,
+            tasks,
+            members_synced: Arc::new(OnceCell::new()),
+            paginating: Arc::new(AtomicBool::new(false)),
         });
         Ok(())
+    }
+
+    /// Runs an action on the selected room's timeline in the background, or
+    /// reports `ActionFailed` when there is no session or `room_id` is not the
+    /// selected room.
+    async fn run_action<F, Fut>(&mut self, room_id: RoomId, action: ActionKind, work: F)
+    where
+        F: FnOnce(Arc<Timeline>) -> Fut,
+        Fut: std::future::Future<Output = Result<(), CoreError>> + Send + 'static,
+    {
+        let events = self.events.clone();
+        let error = match self.active.as_mut() {
+            None => CoreError::NotLoggedIn,
+            Some(active) => match active.selected.as_mut().filter(|s| s.room_id == room_id) {
+                Some(selected) => {
+                    selected.spawn_action(action, &events, work);
+                    return;
+                }
+                None => CoreError::NoRoomSelected,
+            },
+        };
+        self.emit(CoreEvent::ActionFailed {
+            room_id,
+            action,
+            error,
+        })
+        .await;
     }
 
     /// Sends a text message to the selected room.
@@ -1000,6 +1577,7 @@ impl Engine {
         let (cancel, cancelled) = cancel_pair();
         let supervisor = tokio::spawn(forward_sync_state(
             service.clone(),
+            active.client.clone(),
             self.events.clone(),
             cancelled,
         ));
@@ -1117,8 +1695,15 @@ mod tests {
     }
 
     fn record_bytes(user: &str, homeserver: &str, session_id: &str) -> Vec<u8> {
+        record(user, homeserver, session_id)
+            .to_bytes()
+            .unwrap()
+            .to_vec()
+    }
+
+    fn record(user: &str, homeserver: &str, session_id: &str) -> SessionRecord {
         use matrix_sdk::authentication::matrix::MatrixSession;
-        use matrix_sdk::ruma::{OwnedUserId, owned_device_id};
+        use matrix_sdk::ruma::owned_device_id;
         use matrix_sdk::{SessionMeta, SessionTokens};
         let user_id = OwnedUserId::try_from(user).unwrap();
         SessionRecord {
@@ -1138,9 +1723,6 @@ mod tests {
                 },
             }),
         }
-        .to_bytes()
-        .unwrap()
-        .to_vec()
     }
 
     fn u(s: &str) -> url::Url {
@@ -1308,5 +1890,207 @@ mod tests {
             }
         }
         assert!(rx.try_recv().is_err());
+    }
+
+    use crate::api::{MessageKind, OutgoingMessage, TextFormat};
+
+    fn rid(n: &str) -> RoomId {
+        RoomId::from(format!("!{n}:x"))
+    }
+
+    /// One of every new command, each naming `room`, with its action kind.
+    fn action_commands(room: &RoomId) -> Vec<(Command, ActionKind)> {
+        let message = OutgoingMessage {
+            room_id: room.clone(),
+            text: MessageText::from("hi"),
+            mentions: Vec::new(),
+            reply_to: None,
+            kind: MessageKind::Text,
+            format: TextFormat::Markdown,
+        };
+        let item_id = || "i".to_owned();
+        vec![
+            (Command::Send(message.clone()), ActionKind::Send),
+            (
+                Command::Edit {
+                    item_id: item_id(),
+                    message,
+                },
+                ActionKind::Edit,
+            ),
+            (
+                Command::Redact {
+                    room_id: room.clone(),
+                    item_id: item_id(),
+                    reason: None,
+                },
+                ActionKind::Redact,
+            ),
+            (
+                Command::ToggleReaction {
+                    room_id: room.clone(),
+                    item_id: item_id(),
+                    key: "k".into(),
+                },
+                ActionKind::React,
+            ),
+            (
+                Command::RetrySend {
+                    room_id: room.clone(),
+                    item_id: item_id(),
+                },
+                ActionKind::Retry,
+            ),
+            (
+                Command::DiscardSend {
+                    room_id: room.clone(),
+                    item_id: item_id(),
+                },
+                ActionKind::Discard,
+            ),
+            (
+                Command::PaginateBackwards {
+                    room_id: room.clone(),
+                },
+                ActionKind::Paginate,
+            ),
+            (
+                Command::MarkRead {
+                    room_id: room.clone(),
+                    fully_read: false,
+                },
+                ActionKind::Receipt,
+            ),
+            (
+                Command::MoveReadMarker {
+                    room_id: room.clone(),
+                },
+                ActionKind::Receipt,
+            ),
+            (
+                Command::SetTyping {
+                    room_id: room.clone(),
+                    typing: true,
+                },
+                ActionKind::Typing,
+            ),
+            (
+                Command::SearchMembers {
+                    room_id: room.clone(),
+                    query: "a".into(),
+                },
+                ActionKind::Members,
+            ),
+        ]
+    }
+
+    #[test]
+    fn pagination_runs_at_most_one_at_a_time() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let first = PaginationPermit::try_acquire(&flag).expect("free");
+        assert!(PaginationPermit::try_acquire(&flag).is_none(), "busy");
+        drop(first);
+        let again = PaginationPermit::try_acquire(&flag);
+        assert!(again.is_some(), "released on drop");
+    }
+
+    #[test]
+    fn sdk_pagination_status_maps_to_the_api_state() {
+        use matrix_sdk::event_cache::PaginationStatus as S;
+        assert_eq!(
+            pagination_state(S::Idle {
+                hit_timeline_start: false
+            }),
+            PaginationState::Idle
+        );
+        assert_eq!(
+            pagination_state(S::Idle {
+                hit_timeline_start: true
+            }),
+            PaginationState::ReachedStart
+        );
+        assert_eq!(pagination_state(S::Paginating), PaginationState::Loading);
+    }
+
+    #[test]
+    fn typing_users_take_names_from_members() {
+        let alice: OwnedUserId = "@alice:x".try_into().unwrap();
+        let bob: OwnedUserId = "@bob:x".try_into().unwrap();
+        let names = HashMap::from([(alice.clone(), "Alice".to_owned())]);
+        let users = typing_users(vec![alice, bob], &names);
+        assert_eq!(
+            users,
+            vec![
+                TypingUser {
+                    user_id: UserId::from("@alice:x"),
+                    name: Some("Alice".into())
+                },
+                TypingUser {
+                    user_id: UserId::from("@bob:x"),
+                    name: None
+                },
+            ]
+        );
+        assert!(typing_users(Vec::new(), &names).is_empty());
+    }
+
+    async fn drain(rx: &mut mpsc::Receiver<CoreEvent>) -> Vec<CoreEvent> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn new_commands_without_a_session_fail_with_not_logged_in() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut engine, mut rx) = oauth_engine(tmp.path());
+        let room = rid("a");
+        for (cmd, kind) in action_commands(&room) {
+            engine.handle(cmd).await;
+            let got = drain(&mut rx).await;
+            assert!(
+                matches!(
+                    got.as_slice(),
+                    [CoreEvent::ActionFailed { room_id, action, error: CoreError::NotLoggedIn }]
+                        if *room_id == room && *action == kind
+                ),
+                "{kind:?}: {got:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn new_commands_without_a_selected_room_fail_with_no_room_selected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut engine, mut rx) = oauth_engine(tmp.path());
+        let client = Client::builder()
+            .homeserver_url("http://127.0.0.1:1")
+            .build()
+            .await
+            .unwrap();
+        engine.active = Some(Active {
+            fetcher: Arc::new(SdkFetcher(client.clone())),
+            client,
+            record: record("@alice:x", "http://127.0.0.1:1", "s1"),
+            changes: broadcast::channel(1).1,
+            sync: None,
+            selected: None,
+            avatars: Avatars::new(),
+        });
+        let room = rid("a");
+        for (cmd, kind) in action_commands(&room) {
+            engine.handle(cmd).await;
+            let got = drain(&mut rx).await;
+            assert!(
+                matches!(
+                    got.as_slice(),
+                    [CoreEvent::ActionFailed { room_id, action, error: CoreError::NoRoomSelected }]
+                        if *room_id == room && *action == kind
+                ),
+                "{kind:?}: {got:?}"
+            );
+        }
     }
 }

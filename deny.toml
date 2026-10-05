@@ -3,6 +3,7 @@
 ignore = [
     { id = "RUSTSEC-2024-0436", reason = "paste unmaintained, transitive via iced/wgpu" },
     { id = "RUSTSEC-2026-0192", reason = "ttf-parser unmaintained, transitive via iced text stack" },
+    { id = "RUSTSEC-2026-0319", reason = "anymap2 unmaintained, transitive via matrix-sdk 0.19.1; no fix without changing the pin" },
 ]
 
 [bans]
