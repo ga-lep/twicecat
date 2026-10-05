@@ -283,6 +283,15 @@ fn mention_target(href: &str) -> Option<MentionTarget> {
     }
 }
 
+/// The label of a mention with no text of its own: the user ID, or the room
+/// ID or alias (the app shows a known room's name instead).
+fn id_label(target: &MentionTarget) -> String {
+    match target {
+        MentionTarget::User(user) => user.as_str().to_owned(),
+        MentionTarget::Room(room) => room.clone(),
+    }
+}
+
 // ---- linkify ---------------------------------------------------------------
 
 enum Piece<'a> {
@@ -601,7 +610,15 @@ impl Builder {
         for piece in linkify(s) {
             match piece {
                 Piece::Text(text) => self.plain(text, style),
-                Piece::Url { text, url } => self.link(text, url, style),
+                // A pasted permalink (Element's "Copy room link") is a pill,
+                // as Element shows it, not a web link.
+                Piece::Url { text, url } => match mention_target(text) {
+                    Some(target) => {
+                        let label = id_label(&target);
+                        self.mention(target, &label);
+                    }
+                    None => self.link(text, url, style),
+                },
             }
         }
     }
@@ -831,11 +848,9 @@ impl Builder {
             let label = || collapse_ws(&collect_text(node, false)).trim().to_owned();
             if let Some(target) = mention_target(&href) {
                 let mut label = label();
-                if label.is_empty() {
-                    label = match &target {
-                        MentionTarget::User(user) => user.as_str().to_owned(),
-                        MentionTarget::Room(room) => room.clone(),
-                    };
+                // No text, or the bare permalink: show the ID instead.
+                if label.is_empty() || label == href {
+                    label = id_label(&target);
                 }
                 self.mention(target, &label);
                 return;
@@ -1605,6 +1620,68 @@ mod tests {
         assert_rt(
             &from_plain("mail a@example.org"),
             &[p(vec![t("mail a@example.org")])],
+        );
+    }
+
+    #[test]
+    fn a_pasted_permalink_in_plain_text_is_a_pill_like_element() {
+        // Element's "Copy room link", pasted and sent as plain text.
+        let room = from_plain("see https://matrix.to/#/!LuZr:localhost?via=localhost now");
+        assert_eq!(
+            first_inlines(&room),
+            [
+                t("see "),
+                mention(
+                    MentionTarget::Room("!LuZr:localhost".into()),
+                    "!LuZr:localhost"
+                ),
+                t(" now"),
+            ]
+            .as_slice()
+        );
+        let alias = from_plain("https://matrix.to/#/%23lobby:localhost");
+        assert_eq!(
+            first_inlines(&alias),
+            [mention(
+                MentionTarget::Room("#lobby:localhost".into()),
+                "#lobby:localhost"
+            )]
+            .as_slice()
+        );
+        let user = from_plain("ping https://matrix.to/#/@bob:localhost");
+        assert_eq!(
+            first_inlines(&user)[1],
+            mention(
+                MentionTarget::User(UserId::from("@bob:localhost")),
+                "@bob:localhost"
+            )
+        );
+        // Other URLs stay links.
+        assert!(matches!(
+            first_inlines(&from_plain("https://matrix.org/")),
+            [Inline::Link { .. }]
+        ));
+    }
+
+    #[test]
+    fn an_anchor_whose_text_is_its_permalink_gets_the_id_as_label() {
+        let href = "https://matrix.to/#/!LuZr:localhost?via=localhost";
+        assert_eq!(
+            first_inlines(&anchor(href, href)),
+            [mention(
+                MentionTarget::Room("!LuZr:localhost".into()),
+                "!LuZr:localhost"
+            )]
+            .as_slice()
+        );
+        // A real label is kept.
+        assert_eq!(
+            first_inlines(&anchor(href, "Lobby")),
+            [mention(
+                MentionTarget::Room("!LuZr:localhost".into()),
+                "Lobby"
+            )]
+            .as_slice()
         );
     }
 

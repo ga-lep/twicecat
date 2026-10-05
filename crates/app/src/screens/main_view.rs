@@ -52,6 +52,7 @@ fn room_pane(app: &App) -> Element<'_, Message> {
         own_user: app.user_id.as_ref(),
         revealed: &app.revealed,
         actions: &app.actions,
+        rooms: &app.rooms,
     };
     let timeline = container(timeline_pane::view(&app.timeline, env)).height(Fill);
     // The picker floats over the timeline's bottom right corner.

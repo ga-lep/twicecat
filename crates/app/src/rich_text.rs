@@ -17,7 +17,7 @@ use iced::font::{Style as FontStyle, Weight};
 use iced::widget::text::{Span, Wrapping};
 use iced::widget::{Column, container, rich_text, row, rule, text};
 use iced::{Background, Border, Color, Element, Fill, Font, Length, Pixels, Shrink, Theme};
-use tessera_core::api::{Block, Inline, MentionTarget, RichText, TextStyle, UserId};
+use tessera_core::api::{Block, Inline, MentionTarget, RichText, RoomSummary, TextStyle, UserId};
 
 use crate::state::Message;
 use crate::text_safety::{
@@ -113,6 +113,8 @@ pub struct Ctx<'a> {
     pub item: &'a str,
     /// Spoilers already revealed.
     pub revealed: &'a Revealed,
+    /// Known rooms, so a room pill can show the room's name.
+    pub rooms: &'a [RoomSummary],
 }
 
 /// Running state of one message: what is left of its budget, and how many
@@ -222,7 +224,19 @@ fn push_spans(inlines: &[Inline], ctx: &Ctx<'_>, walk: &mut Walk, out: &mut Vec<
                 }
             }
             Inline::Mention { target, label } => {
-                let label = walk.take_label(label);
+                // A pill labelled with the bare room ID (a pasted permalink)
+                // shows the room's name when the room is known, as Element.
+                let shown = match target {
+                    MentionTarget::Room(room) if label == room => ctx
+                        .rooms
+                        .iter()
+                        .find(|r| r.id.as_str() == room)
+                        .map(|r| r.name.as_str())
+                        .filter(|name| !name.trim().is_empty())
+                        .unwrap_or(label),
+                    _ => label,
+                };
+                let label = walk.take_label(shown);
                 if label.is_empty() {
                     continue;
                 }
@@ -534,7 +548,42 @@ mod tests {
             own_user: own,
             item: "item1",
             revealed,
+            rooms: &[],
         }
+    }
+
+    #[test]
+    fn a_room_pill_without_its_own_label_shows_the_known_room_name() {
+        use tessera_core::api::RoomId;
+        let rooms = [RoomSummary::new(
+            RoomId::from("!r:x"),
+            "Lobby\u{202E}".into(),
+        )];
+        let revealed = Revealed::new();
+        let ctx = Ctx {
+            rooms: &rooms,
+            ..ctx(&revealed, None)
+        };
+        let pill = |room: &str, label: &str| {
+            let inline = Inline::Mention {
+                target: MentionTarget::Room(room.into()),
+                label: label.into(),
+            };
+            spans_for(&[inline], &ctx, &mut Walk::default())[0]
+                .text
+                .clone()
+        };
+        assert_eq!(pill("!r:x", "!r:x"), "Lobby\u{FFFD}", "named, sanitised");
+        assert_eq!(
+            pill("!r:x", "our room"),
+            "our room",
+            "the sender's label stays"
+        );
+        assert_eq!(
+            pill("!other:x", "!other:x"),
+            "!other:x",
+            "unknown room: the ID"
+        );
     }
 
     fn spans(inlines: &[Inline]) -> Vec<SpanModel> {

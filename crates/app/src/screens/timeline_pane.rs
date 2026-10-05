@@ -19,7 +19,8 @@ use iced::widget::{
 use iced::{Background, Color, Element, Fill, Font, Padding, Shrink, Theme, mouse};
 use tessera_core::api::{
     MessageDetails, MessageText, PaginationState, PlaceholderKind, ReactionGroup, ReplyPreview,
-    ReplyState, SendStatus, StateChange, TimelineItem, TimelineItemKind, TypingUser, UserId,
+    ReplyState, RoomSummary, SendStatus, StateChange, TimelineItem, TimelineItemKind, TypingUser,
+    UserId,
 };
 
 use crate::actions::{self, ActionButtons, ActionState};
@@ -54,6 +55,8 @@ pub struct RichEnv<'a> {
     pub revealed: &'a Revealed,
     /// Hover and delete confirmation, for the action bar of a message.
     pub actions: &'a ActionState,
+    /// Known rooms, for the names on room pills.
+    pub rooms: &'a [RoomSummary],
 }
 
 /// The pane for the selected room's timeline, in the local time zone.
@@ -430,6 +433,7 @@ fn body_widget<'a>(
         own_user: env.own_user,
         item: id,
         revealed: env.revealed,
+        rooms: env.rooms,
     };
     blocks_view(&details.content, &ctx, env.theme)
 }
@@ -1297,6 +1301,7 @@ mod tests {
             own_user: None,
             revealed: &revealed,
             actions: &actions,
+            rooms: &[],
         };
         BUILT_ROWS.with(|built| built.set(0));
         let _ = view_in(&view, 0, &chrono::Utc, env);
@@ -1315,6 +1320,7 @@ mod tests {
             own_user: None,
             revealed: &revealed,
             actions: &actions,
+            rooms: &[],
         };
         let mut view = TimelineView::default();
         let mut tree = Tree::new(view_in(&view, 0, &chrono::Utc, env));
@@ -1380,6 +1386,7 @@ mod tests {
             own_user: None,
             revealed,
             actions: &NO_ACTIONS,
+            rooms: &[],
         }
     }
 

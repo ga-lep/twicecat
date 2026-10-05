@@ -75,6 +75,7 @@ fn content_node(view: &TimelineView, renderer: &Renderer) -> Node {
         own_user: None,
         revealed: &revealed,
         actions: &actions,
+        rooms: &[],
     };
     let mut element = view_in(view, NOW, &Utc, env);
     let mut tree = Tree::new(element.as_widget());
