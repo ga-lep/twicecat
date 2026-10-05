@@ -2308,7 +2308,9 @@ impl Engine {
                 self.start_sync().await;
             }
             Err(e) => {
-                // The client is already dropped, so the store is released.
+                // The client is already dropped; its stores close shortly
+                // after, which the removal waits for (Windows cannot delete
+                // an open file).
                 let paths = self.config.data.clone();
                 let sid = pending.session_id;
                 let _ = blocking(move || paths.remove_session_store_dir(&sid)).await;
