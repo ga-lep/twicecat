@@ -43,11 +43,11 @@ audio_thread_priority = { version = "=0.35.1", default-features = false }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 cpal = { version = "=0.18.2", features = ["realtime"] }
-# The MMDevice API beside cpal (src/wasapi.rs): the default communications
-# devices and endpoint notifications (hot-plug, default changes), which cpal
-# does not expose. The version cpal 0.18.2 already uses (human-approved
-# 2026-10-05).
-windows = { version = "=0.62.2", features = ["Win32_Foundation", "Win32_Media_Audio", "Win32_System_Com"] }
+# The MMDevice API and our own WASAPI streams (src/wasapi): the default
+# communications devices, endpoint notifications (hot-plug, default
+# changes), and streams marked as calls, which cpal does not offer. The
+# version cpal 0.18.2 already uses (human-approved 2026-10-05).
+windows = { version = "=0.62.2", features = ["Win32_Foundation", "Win32_Media_Audio", "Win32_Security", "Win32_System_Com", "Win32_System_Threading"] }
 # `#[implement]` (the notification callback) expands to windows-core paths.
 windows-core = "=0.62.2"
 

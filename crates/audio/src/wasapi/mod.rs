@@ -21,8 +21,12 @@ use windows::Win32::System::Com::{
 use windows::core::{HRESULT, PCWSTR};
 use windows_core::implement;
 
+mod stream;
+
+pub(crate) use stream::{Side, Stream, open as open_stream};
+
 /// cpal's prefix for WASAPI device IDs (`"wasapi:<endpoint ID>"`).
-const CPAL_PREFIX: &str = "wasapi:";
+pub(crate) const CPAL_PREFIX: &str = "wasapi:";
 
 /// COM for the current thread, released when the thread ends. Single-
 /// threaded apartment, as cpal asks for on the same threads; a thread whose
@@ -46,7 +50,7 @@ thread_local! {
 }
 
 /// The endpoint enumerator, with COM set up on this thread.
-fn enumerator() -> Option<IMMDeviceEnumerator> {
+pub(super) fn enumerator() -> Option<IMMDeviceEnumerator> {
     let usable = COM.with(|com| com.0.is_ok() || com.0 == RPC_E_CHANGED_MODE);
     if !usable {
         return None;
@@ -118,8 +122,10 @@ impl EndpointWatch {
 
 impl Drop for EndpointWatch {
     fn drop(&mut self) {
-        // SAFETY: same thread and objects as the registration. The call
-        // waits for a callback in progress, which never blocks (above).
+        // SAFETY: same thread and objects as the registration. A callback
+        // still running on the MMDevice API's thread holds its own COM
+        // reference to `client`, and the closure owns everything it uses
+        // (`'static`), so nothing it touches is freed under it.
         let _ = unsafe {
             self.enumerator
                 .UnregisterEndpointNotificationCallback(&self.client)

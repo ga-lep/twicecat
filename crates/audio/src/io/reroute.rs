@@ -1,10 +1,13 @@
-//! When a cpal stream must be reopened, and where (`io::cpal`). WASAPI
-//! never moves a stream itself: when its device goes away, or the default it
-//! should follow changes, the stream fails or stays behind, so the
-//! processing thread reopens it. Signals come from cpal's error callbacks
-//! and, on Windows, the MMDevice API's notifications (`crate::wasapi`); both
-//! run on other threads and only set flags here and wake the processing
-//! thread, which acts between frames.
+//! When a stream opened by `io::cpal` (cpal's, or on Windows our own
+//! WASAPI client's) must be reopened, and where. WASAPI never moves a
+//! stream itself: when its device goes away, or the default it should
+//! follow changes, the stream fails or stays behind, so the processing
+//! thread reopens it. Signals come from cpal's error callbacks, our WASAPI
+//! streams' threads and, on Windows, the MMDevice API's notifications
+//! (`crate::wasapi`); all run on other threads and only set flags here and
+//! wake the processing thread, which acts between frames. A displaced
+//! stream is also checked on a slow timer there, for platforms without
+//! device notifications and for failures no notification follows.
 
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::thread::Thread;
@@ -40,6 +43,8 @@ struct Side {
     placement: AtomicU8,
     /// Reopen at the next chance.
     requested: AtomicBool,
+    /// The default device changed: reopen unless the stream is on it.
+    default_moved: AtomicBool,
     /// Devices changed: see whether a displaced stream can go back.
     check: AtomicBool,
 }
@@ -49,6 +54,7 @@ impl Side {
         Self {
             placement: AtomicU8::new(Placement::Missing as u8),
             requested: AtomicBool::new(false),
+            default_moved: AtomicBool::new(false),
             check: AtomicBool::new(false),
         }
     }
@@ -92,19 +98,34 @@ impl Reroute {
     }
 
     /// The stream's device went away, or the stream became unusable
-    /// (cpal's error callback): reopen it wherever it now belongs.
+    /// (cpal's error callback, our WASAPI stream's thread): reopen it
+    /// wherever it now belongs.
     pub(super) fn lost(&self, input: bool) {
         self.request(input);
     }
 
     /// The default device for `input` changed: a stream on the default, or
-    /// none at all, moves to the new one; one on a chosen device stays.
+    /// none at all, moves to the new one; one on a chosen device stays. The
+    /// processing thread first checks whether the stream is already there
+    /// ([`take_default_moved`]): a stream reopened because its device went
+    /// away is often on the new default before this arrives.
     /// (Called by the MMDevice API's notifications, on Windows only.)
+    ///
+    /// [`take_default_moved`]: Self::take_default_moved
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub(super) fn default_changed(&self, input: bool) {
         if self.placement(input) != Placement::Chosen {
-            self.request(input);
+            self.side(input)
+                .default_moved
+                .store(true, Ordering::Release);
+            self.thread.unpark();
         }
+    }
+
+    /// Whether the default for `input` changed since the last call; clears
+    /// it.
+    pub(super) fn take_default_moved(&self, input: bool) -> bool {
+        self.side(input).default_moved.swap(false, Ordering::AcqRel)
     }
 
     /// Devices came or went: a displaced stream may go back (the chosen
@@ -182,7 +203,9 @@ mod tests {
             let r = reroute();
             r.placed(false, placement);
             r.default_changed(false);
-            assert_eq!(r.take_request(false), moves, "{placement:?}");
+            assert_eq!(r.take_default_moved(false), moves, "{placement:?}");
+            assert!(!r.take_default_moved(false), "taken once");
+            assert!(!r.requested(false), "the processing thread decides");
         }
     }
 

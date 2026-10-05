@@ -3,9 +3,11 @@
 //! [`AudioIo::start`] opens the capture and playback streams, then runs the
 //! [`Pipeline`] on a dedicated thread. On Linux with a PipeWire daemon the
 //! streams are our own PipeWire client's (`crate::pw`), on their own thread;
-//! elsewhere they are cpal's, opened on the processing thread (cpal streams
-//! are not `Send` on every platform, so they live and die there). The device
-//! callbacks only convert samples and move them through lock-free rings.
+//! on Windows our own WASAPI client's (`crate::wasapi`), each on its own
+//! thread, with cpal's as the fallback; elsewhere cpal's. Both kinds are
+//! opened on the processing thread (cpal streams are not `Send` on every
+//! platform, so they live and die there). The device callbacks only convert
+//! samples and move them through lock-free rings.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -47,9 +49,12 @@ pub struct StreamInfo {
     pub device_id: String,
     /// Device name.
     pub device_name: String,
-    /// The device's rate (the pipeline resamples to 48 kHz when it differs).
+    /// The stream's rate: the device's (the pipeline resamples to 48 kHz
+    /// when it differs), or 48 kHz where the system converts (our WASAPI
+    /// and PipeWire streams).
     pub sample_rate: u32,
-    /// The device's channel count (mixed down or copied to mono).
+    /// The stream's channel count (mixed down or copied to mono): the
+    /// device's, or 1 where the system converts.
     pub channels: u16,
 }
 
