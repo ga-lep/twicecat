@@ -38,14 +38,16 @@ pub(crate) fn outgoing_content(
     let text = message.text.expose();
     match message.format {
         TextFormat::Markdown => {}
-        // As Element's `/plain` and `/html`: no markdown and no pills, so no
-        // mentions either.
+        // As Element's `/plain` and `/html`: no markdown and no pills, but the
+        // picked mentions still go to `m.mentions` (element-web
+        // `utils/messages.ts` `attachMentions`).
         TextFormat::Plain => {
-            return match message.kind {
+            let content = match message.kind {
                 MessageKind::Text => RoomMessageEventContentWithoutRelation::text_plain(text),
                 MessageKind::Notice => RoomMessageEventContentWithoutRelation::notice_plain(text),
                 MessageKind::Emote => RoomMessageEventContentWithoutRelation::emote_plain(text),
             };
+            return with_picked_mentions(content, &message.mentions);
         }
         TextFormat::Html => {
             let mut content = match message.kind {
@@ -63,7 +65,7 @@ pub(crate) fn outgoing_content(
                 MessageType::Emote(e) => sanitize_formatted(&mut e.formatted),
                 _ => {}
             }
-            return content;
+            return with_picked_mentions(content, &message.mentions);
         }
     }
     let (source, mentioned) = markdown_with_mentions(text, &message.mentions);
@@ -134,6 +136,23 @@ fn too_many_tags(html: &str) -> bool {
         .filter(|w| w[0] == b'<' && w[1].is_ascii_alphabetic())
         .nth(MAX_TAGS)
         .is_some()
+}
+
+/// Adds `m.mentions` for every picked mention with a valid user ID (none:
+/// the content unchanged).
+fn with_picked_mentions(
+    content: RoomMessageEventContentWithoutRelation,
+    mentions: &[MentionRef],
+) -> RoomMessageEventContentWithoutRelation {
+    let users: Vec<OwnedUserId> = mentions
+        .iter()
+        .filter_map(|m| OwnedUserId::try_from(m.user_id.as_str()).ok())
+        .collect();
+    if users.is_empty() {
+        content
+    } else {
+        content.add_mentions(Mentions::with_user_ids(users))
+    }
 }
 
 /// The `href` attribute (as serialized) of a mention link.
@@ -260,15 +279,29 @@ mod tests {
     }
 
     fn formatted_as(text: &str, format: TextFormat) -> (String, Option<String>) {
-        let mut m = message(
-            text,
-            vec![mention("Bob", "@bob:localhost")],
-            MessageKind::Text,
-        );
+        let mut m = message(text, Vec::new(), MessageKind::Text);
         m.format = format;
-        let content = outgoing_content(&m);
-        assert!(content.mentions.is_none(), "commands never ping");
-        text_parts(&content)
+        text_parts(&outgoing_content(&m))
+    }
+
+    #[test]
+    fn plain_and_html_keep_the_mentions_like_element() {
+        for format in [TextFormat::Plain, TextFormat::Html] {
+            let mut m = message(
+                "hi Bob",
+                vec![mention("Bob", "@bob:localhost")],
+                MessageKind::Text,
+            );
+            m.format = format;
+            let mentions = outgoing_content(&m).mentions.expect("m.mentions");
+            assert_eq!(mentions.user_ids.len(), 1, "{format:?}");
+            assert!(
+                mentions
+                    .user_ids
+                    .iter()
+                    .any(|u| u.as_str() == "@bob:localhost")
+            );
+        }
     }
 
     #[test]

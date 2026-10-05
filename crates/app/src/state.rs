@@ -32,6 +32,9 @@ use crate::timeline::{self, Effects, TimelineView};
 
 /// How long to wait for the core to close after `Shutdown` (plan Q18).
 pub const SHUTDOWN_WAIT: Duration = Duration::from_secs(10);
+/// The notice for a command without its text, such as `/me` alone
+/// (Element's wording).
+pub const COMMAND_ERROR_TEXT: &str = "Command error: Unable to handle slash command.";
 /// The notice when a reply's original is not found.
 pub const JUMP_FAILED_TEXT: &str =
     "Could not find the original message (searched about 1,000 earlier messages)";
@@ -1166,6 +1169,9 @@ impl App {
             composer::Outgoing::UnknownCommand(name) => {
                 self.command_bar = Some(name);
                 return Task::none();
+            }
+            composer::Outgoing::CommandError => {
+                return self.show_notice_text(COMMAND_ERROR_TEXT.to_owned());
             }
             composer::Outgoing::Nothing => return Task::none(),
         };
@@ -2936,6 +2942,19 @@ mod tests {
         }
         assert!(app.command_bar.is_none());
         assert_eq!(app.composer.text(), "");
+    }
+
+    #[test]
+    fn me_alone_shows_elements_command_error() {
+        let (mut app, mut rx) = main_app();
+        type_in(&mut app, "/me");
+        let _ = app.update(Message::ComposerKey(ComposerKey::Send));
+        assert!(send_commands(&drain(&mut rx)).is_empty());
+        assert_eq!(
+            app.actions.notice.as_ref().map(|n| n.text.as_str()),
+            Some(COMMAND_ERROR_TEXT)
+        );
+        assert_eq!(app.composer.text(), "/me", "the text stays");
     }
 
     #[test]

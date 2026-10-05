@@ -807,6 +807,9 @@ pub enum Outgoing {
     /// `/name` is no command Tessera knows: ask before sending the text as
     /// a message (Element's "Unknown Command" question).
     UnknownCommand(String),
+    /// A known command without its text, such as `/me` alone (Element shows
+    /// a command error).
+    CommandError,
     /// Nothing to send.
     Nothing,
 }
@@ -816,7 +819,7 @@ impl Outgoing {
     pub fn message(self) -> Option<OutgoingMessage> {
         match self {
             Self::Send(message) => Some(message),
-            Self::UnknownCommand(_) | Self::Nothing => None,
+            Self::UnknownCommand(_) | Self::CommandError | Self::Nothing => None,
         }
     }
 }
@@ -854,17 +857,23 @@ fn parse_command(text: &str) -> Parsed<'_> {
 }
 
 /// What to do with the composer text: send it, ask about an unknown command,
-/// or nothing (blank text, or a command without its text). Pure.
+/// report a command without its text, or nothing (blank text). Pure.
 pub fn outgoing(composer: &Composer, room_id: &RoomId) -> Outgoing {
     let text = composer.text();
-    let (kind, format, body) = match parse_command(text.trim_end()) {
+    let parsed = parse_command(text.trim_end());
+    let command = !matches!(parsed, Parsed::Markdown(_));
+    let (kind, format, body) = match parsed {
         Parsed::Markdown(body) => (MessageKind::Text, TextFormat::Markdown, body),
         Parsed::Emote(body) => (MessageKind::Emote, TextFormat::Markdown, body),
         Parsed::Plain(body) => (MessageKind::Text, TextFormat::Plain, body),
         Parsed::Html(body) => (MessageKind::Text, TextFormat::Html, body),
         Parsed::Unknown(name) => return Outgoing::UnknownCommand(name.to_owned()),
     };
-    build(composer, room_id, kind, format, body).map_or(Outgoing::Nothing, Outgoing::Send)
+    match build(composer, room_id, kind, format, body) {
+        Some(message) => Outgoing::Send(message),
+        None if command => Outgoing::CommandError,
+        None => Outgoing::Nothing,
+    }
 }
 
 /// The whole text as a markdown message, slash included: "Send as message"
@@ -890,17 +899,14 @@ fn build(
     if body.trim().is_empty() {
         return None;
     }
-    // Pills come from markdown links, so only markdown can mention anyone.
-    let mentions = if format == TextFormat::Markdown {
-        composer
-            .mentions
-            .iter()
-            .filter(|m| body.contains(&m.label))
-            .cloned()
-            .collect()
-    } else {
-        Vec::new()
-    };
+    // Picked mentions still in the text; the core links them in markdown and
+    // lists them in `m.mentions` for every format, as Element does.
+    let mentions = composer
+        .mentions
+        .iter()
+        .filter(|m| body.contains(&m.label))
+        .cloned()
+        .collect();
     let reply_to = match &composer.mode {
         Mode::Reply(id) => Some(id.clone()),
         Mode::Normal | Mode::Edit(_) => None,
@@ -1483,14 +1489,26 @@ mod tests {
     }
 
     #[test]
-    fn commands_send_no_mentions() {
+    fn commands_keep_their_mentions_like_element() {
         let now = Instant::now();
         let mut c = Composer::new();
         type_text(&mut c, "/plain @al", now);
         c.set_members("al", vec![member("@alice:x", Some("Alice"))]);
         let _ = c.pick(None, now);
         let m = outgoing(&c, &room()).message().expect("plain");
-        assert!(m.mentions.is_empty());
+        assert_eq!(m.mentions.len(), 1);
+    }
+
+    #[test]
+    fn a_command_without_its_text_is_an_error_like_element() {
+        for text in ["/me", "/me   ", "/html", "/plain \n "] {
+            assert_eq!(
+                outgoing(&composer_with(text), &room()),
+                Outgoing::CommandError,
+                "{text:?}"
+            );
+        }
+        assert_eq!(outgoing(&composer_with("  \n"), &room()), Outgoing::Nothing);
     }
 
     #[test]
