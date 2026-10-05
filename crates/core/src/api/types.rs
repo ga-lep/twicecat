@@ -576,6 +576,9 @@ pub enum TextFormat {
     /// The text is hidden behind a spoiler: sent as the body, and inside a
     /// `data-mx-spoiler` span (sanitised) as the formatted body.
     Spoiler,
+    /// Element's `/rainbow`: sent as the body, and with each character in a
+    /// `data-mx-color` span of a colour sweep as the formatted body.
+    Rainbow,
 }
 
 /// Whether the quoted event of a reply could be loaded.

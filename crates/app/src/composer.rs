@@ -850,9 +850,9 @@ pub enum Outgoing {
     /// `/name` is no command Tessera knows: ask before sending the text as
     /// a message (Element's "Unknown Command" question).
     UnknownCommand(String),
-    /// A known command without its text, such as `/me` alone (Element shows
-    /// a command error).
-    CommandError,
+    /// A known command, named here, without its text, such as `/me` alone
+    /// (Element shows a command error).
+    CommandError(String),
     /// Nothing to send.
     Nothing,
 }
@@ -862,7 +862,7 @@ impl Outgoing {
     pub fn message(self) -> Option<OutgoingMessage> {
         match self {
             Self::Send(message) => Some(message),
-            Self::UnknownCommand(_) | Self::CommandError | Self::Nothing => None,
+            Self::UnknownCommand(_) | Self::CommandError(_) | Self::Nothing => None,
         }
     }
 }
@@ -878,6 +878,8 @@ enum Parsed<'a> {
     Plain(&'a str),
     Html(&'a str),
     Spoiler(&'a str),
+    Rainbow(&'a str),
+    RainbowEmote(&'a str),
     /// An emoticon command: the emoticon, then the text if any.
     Emoticon(&'static str, &'a str),
     Unknown(&'a str),
@@ -913,6 +915,8 @@ fn parse_command(text: &str) -> Parsed<'_> {
         "plain" => Parsed::Plain(args),
         "html" => Parsed::Html(args),
         "spoiler" => Parsed::Spoiler(args),
+        "rainbow" => Parsed::Rainbow(args),
+        "rainbowme" => Parsed::RainbowEmote(args),
         _ => match emoticon(name) {
             Some(prefix) => Parsed::Emoticon(prefix, args),
             None => Parsed::Unknown(name),
@@ -932,6 +936,8 @@ pub fn outgoing(composer: &Composer, room_id: &RoomId) -> Outgoing {
         Parsed::Plain(body) => (MessageKind::Text, TextFormat::Plain, body),
         Parsed::Html(body) => (MessageKind::Text, TextFormat::Html, body),
         Parsed::Spoiler(body) => (MessageKind::Text, TextFormat::Spoiler, body),
+        Parsed::Rainbow(body) => (MessageKind::Text, TextFormat::Rainbow, body),
+        Parsed::RainbowEmote(body) => (MessageKind::Emote, TextFormat::Rainbow, body),
         Parsed::Emoticon(prefix, args) => {
             let body = if args.is_empty() {
                 prefix.to_owned()
@@ -951,7 +957,16 @@ pub fn outgoing(composer: &Composer, room_id: &RoomId) -> Outgoing {
     };
     match build(composer, room_id, kind, format, body) {
         Some(message) => Outgoing::Send(message),
-        None if command => Outgoing::CommandError,
+        None if command => {
+            // The name runs from the slash to the first whitespace.
+            let name = text
+                .trim_end()
+                .trim_start_matches('/')
+                .split(char::is_whitespace)
+                .next()
+                .unwrap_or_default();
+            Outgoing::CommandError(name.to_owned())
+        }
         None => Outgoing::Nothing,
     }
 }
@@ -1578,14 +1593,29 @@ mod tests {
         }
         assert_eq!(
             outgoing(&composer_with("/spoiler"), &room()),
-            Outgoing::CommandError
+            Outgoing::CommandError("spoiler".into())
+        );
+        let rainbow = sent("/rainbow hello");
+        assert_eq!(
+            (rainbow.kind, rainbow.format),
+            (MessageKind::Text, TextFormat::Rainbow)
+        );
+        assert_eq!(rainbow.text.expose(), "hello");
+        let rainbow_me = sent("/rainbowme waves");
+        assert_eq!(
+            (rainbow_me.kind, rainbow_me.format),
+            (MessageKind::Emote, TextFormat::Rainbow)
+        );
+        assert_eq!(
+            outgoing(&composer_with("/rainbow"), &room()),
+            Outgoing::CommandError("rainbow".into())
         );
     }
 
     #[test]
     fn unknown_commands_ask_and_slashes_can_be_escaped() {
         for (text, name) in [
-            ("/rainbow", "rainbow"),
+            ("/topic", "topic"),
             ("/foo bar", "foo"),
             ("/", ""),
             ("/ME hi", "ME"),
@@ -1627,10 +1657,16 @@ mod tests {
 
     #[test]
     fn a_command_without_its_text_is_an_error_like_element() {
-        for text in ["/me", "/me   ", "/html", "/plain \n "] {
+        for (text, name) in [
+            ("/me", "me"),
+            ("/me   ", "me"),
+            ("/html", "html"),
+            ("/plain \n ", "plain"),
+            ("/rainbowme", "rainbowme"),
+        ] {
             assert_eq!(
                 outgoing(&composer_with(text), &room()),
-                Outgoing::CommandError,
+                Outgoing::CommandError(name.into()),
                 "{text:?}"
             );
         }

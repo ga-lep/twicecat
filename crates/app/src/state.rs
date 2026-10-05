@@ -37,6 +37,16 @@ pub const DRAFT_SAVE_DELAY: Duration = Duration::from_secs(1);
 /// The notice for a command without its text, such as `/me` alone
 /// (Element's wording).
 pub const COMMAND_ERROR_TEXT: &str = "Command error: Unable to handle slash command.";
+/// The notice for command `name` sent without its text, in Element's words:
+/// its usage line, except for `/me`, whose Element error is the generic one.
+pub fn command_error_text(name: &str) -> String {
+    if name == "me" {
+        COMMAND_ERROR_TEXT.to_owned()
+    } else {
+        format!("Command error: Usage: /{name} <message>")
+    }
+}
+
 /// The notice when a reply's original is not found.
 pub const JUMP_FAILED_TEXT: &str =
     "Could not find the original message (searched about 1,000 earlier messages)";
@@ -1266,8 +1276,8 @@ impl App {
                 self.command_bar = Some(name);
                 return Task::none();
             }
-            composer::Outgoing::CommandError => {
-                return self.show_notice_text(COMMAND_ERROR_TEXT.to_owned());
+            composer::Outgoing::CommandError(name) => {
+                return self.show_notice_text(command_error_text(&name));
             }
             composer::Outgoing::Nothing => return Task::none(),
         };
@@ -3240,6 +3250,22 @@ mod tests {
             Some(COMMAND_ERROR_TEXT)
         );
         assert_eq!(app.composer.text(), "/me", "the text stays");
+    }
+
+    #[test]
+    fn a_command_missing_its_text_shows_elements_usage_line() {
+        assert_eq!(command_error_text("me"), COMMAND_ERROR_TEXT);
+        assert_eq!(
+            command_error_text("rainbow"),
+            "Command error: Usage: /rainbow <message>"
+        );
+        let (mut app, _rx) = main_app();
+        type_in(&mut app, "/rainbowme ");
+        let _ = app.update(Message::ComposerKey(ComposerKey::Send));
+        assert_eq!(
+            app.actions.notice.as_ref().map(|n| n.text.as_str()),
+            Some("Command error: Usage: /rainbowme <message>")
+        );
     }
 
     #[test]

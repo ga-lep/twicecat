@@ -49,13 +49,14 @@ pub(crate) fn outgoing_content(
             };
             return with_picked_mentions(content, &message.mentions);
         }
-        TextFormat::Html | TextFormat::Spoiler => {
+        TextFormat::Html | TextFormat::Spoiler | TextFormat::Rainbow => {
             // Element: `/html` sends the source twice, `/spoiler` wraps it
-            // unescaped (`makeHtmlMessage(message, <span data-mx-spoiler>…)`).
-            let html = if message.format == TextFormat::Spoiler {
-                format!("<span data-mx-spoiler>{text}</span>")
-            } else {
-                text.to_owned()
+            // unescaped (`makeHtmlMessage(message, <span data-mx-spoiler>…)`),
+            // `/rainbow` colours each character (`textToHtmlRainbow`).
+            let html = match message.format {
+                TextFormat::Spoiler => format!("<span data-mx-spoiler>{text}</span>"),
+                TextFormat::Rainbow => rainbow_html(text),
+                _ => text.to_owned(),
             };
             let mut content = match message.kind {
                 MessageKind::Text => RoomMessageEventContentWithoutRelation::text_html(text, html),
@@ -143,6 +144,108 @@ fn too_many_tags(html: &str) -> bool {
         .filter(|w| w[0] == b'<' && w[1].is_ascii_alphabetic())
         .nth(MAX_TAGS)
         .is_some()
+}
+
+/// Element's `textToHtmlRainbow` (element-web v1.12.30 `utils/colour.ts`):
+/// each character in a `data-mx-color` span, the hue turning once over the
+/// text at CIELAB lightness 75; spaces stay bare. Unlike Element, characters
+/// are HTML-escaped. The step uses the UTF-16 length, as JavaScript's
+/// `str.length` does.
+pub(crate) fn rainbow_html(text: &str) -> String {
+    let units = text.encode_utf16().count();
+    if units == 0 {
+        return String::new();
+    }
+    #[allow(clippy::cast_precision_loss)] // a message is far below 2^52 units
+    let frequency = 2.0 * std::f64::consts::PI / units as f64;
+    let mut html = String::with_capacity(text.len() * 40);
+    for (i, chunk) in rainbow_chunks(text).into_iter().enumerate() {
+        if chunk == " " {
+            html.push(' ');
+            continue;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let hue = i as f64 * frequency;
+        let (red, green, blue) = lab_to_rgb(75.0, 127.0 * hue.cos(), 127.0 * hue.sin());
+        html.push_str(&format!(
+            r##"<span data-mx-color="#{red:02x}{green:02x}{blue:02x}">"##
+        ));
+        for c in chunk.chars() {
+            match c {
+                '&' => html.push_str("&amp;"),
+                '<' => html.push_str("&lt;"),
+                '>' => html.push_str("&gt;"),
+                '"' => html.push_str("&quot;"),
+                _ => html.push(c),
+            }
+        }
+        html.push_str("</span>");
+    }
+    html
+}
+
+/// The text cut into what Element's lodash `split(str, "")` keeps whole, as
+/// near as possible without a grapheme table: combining marks, variation
+/// selectors, emoji modifiers and tags stay with the character before them,
+/// and a zero-width joiner glues the next character on.
+fn rainbow_chunks(text: &str) -> Vec<&str> {
+    let joins_previous = |c: char| {
+        matches!(c,
+            '\u{0300}'..='\u{036F}'
+            | '\u{1AB0}'..='\u{1AFF}'
+            | '\u{1DC0}'..='\u{1DFF}'
+            | '\u{20D0}'..='\u{20FF}'
+            | '\u{FE00}'..='\u{FE0F}'
+            | '\u{FE20}'..='\u{FE2F}'
+            | '\u{200D}'
+            | '\u{1F3FB}'..='\u{1F3FF}'
+            | '\u{E0020}'..='\u{E007F}'
+            | '\u{E0100}'..='\u{E01EF}')
+    };
+    let mut chunks: Vec<&str> = Vec::new();
+    let mut start = 0;
+    let mut glue_next = false;
+    for (at, c) in text.char_indices() {
+        if at > 0 && !joins_previous(c) && !glue_next {
+            chunks.push(&text[start..at]);
+            start = at;
+        }
+        glue_next = c == '\u{200D}';
+    }
+    if start < text.len() {
+        chunks.push(&text[start..]);
+    }
+    chunks
+}
+
+/// CIELAB (D65) to sRGB bytes, as Element's `labToRGB`.
+fn lab_to_rgb(l: f64, a: f64, b: f64) -> (u8, u8, u8) {
+    fn adjust_xyz(v: f64) -> f64 {
+        if v > 0.2069 {
+            v.powi(3)
+        } else {
+            0.1284 * v - 0.01771
+        }
+    }
+    fn adjust_rgb(v: f64) -> u8 {
+        let corrected = if v <= 0.003_130_8 {
+            12.92 * v
+        } else {
+            1.055 * v.powf(1.0 / 2.4) - 0.055
+        };
+        // Clamped to 0..=1 first, so the cast cannot truncate.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let byte = (corrected.clamp(0.0, 1.0) * 255.0).round() as u8;
+        byte
+    }
+    let y = (l + 16.0) / 116.0;
+    let x = adjust_xyz(y + a / 500.0) * 0.9505;
+    let z = adjust_xyz(y - b / 200.0) * 1.089;
+    let y = adjust_xyz(y);
+    let red = 3.240_969_94 * x - 1.537_383_18 * y - 0.498_610_76 * z;
+    let green = -0.969_243_64 * x + 1.875_967_5 * y + 0.041_555_06 * z;
+    let blue = 0.055_630_08 * x - 0.203_976_96 * y + 1.056_971_51 * z;
+    (adjust_rgb(red), adjust_rgb(green), adjust_rgb(blue))
 }
 
 /// Adds `m.mentions` for every picked mention with a valid user ID (none:
@@ -289,6 +392,38 @@ mod tests {
         let mut m = message(text, Vec::new(), MessageKind::Text);
         m.format = format;
         text_parts(&outgoing_content(&m))
+    }
+
+    /// element-web v1.12.30 `slash-commands/__snapshots__/rainbow.test.ts.snap`.
+    const ELEMENT_RAINBOW: &str = r##"<span data-mx-color="#ff00be">t</span><span data-mx-color="#ff0080">h</span><span data-mx-color="#ff0041">i</span><span data-mx-color="#ff5f00">s</span> <span data-mx-color="#faa900">i</span><span data-mx-color="#c3bf00">s</span> <span data-mx-color="#00d800">a</span> <span data-mx-color="#00e371">t</span><span data-mx-color="#00e6b6">e</span><span data-mx-color="#00e7f8">s</span><span data-mx-color="#00e7ff">t</span> <span data-mx-color="#00deff">m</span><span data-mx-color="#00d2ff">e</span><span data-mx-color="#00c0ff">s</span><span data-mx-color="#44a4ff">s</span><span data-mx-color="#e87dff">a</span><span data-mx-color="#ff42ff">g</span><span data-mx-color="#ff00fe">e</span>"##;
+
+    #[test]
+    fn rainbow_html_matches_elements_snapshot() {
+        assert_eq!(rainbow_html("this is a test message"), ELEMENT_RAINBOW);
+    }
+
+    #[test]
+    fn rainbow_format_sends_the_text_and_coloured_html() {
+        let (body, html) = formatted_as("this is a test message", TextFormat::Rainbow);
+        assert_eq!(body, "this is a test message");
+        assert_eq!(
+            html.as_deref(),
+            Some(ELEMENT_RAINBOW),
+            "survives sanitising"
+        );
+        let (_, escaped) = formatted_as("a<b", TextFormat::Rainbow);
+        let escaped = escaped.expect("html");
+        assert!(
+            escaped.contains("&lt;") && !escaped.contains("<b"),
+            "{escaped}"
+        );
+    }
+
+    #[test]
+    fn rainbow_keeps_combined_characters_together() {
+        // An accent, a variation selector and a ZWJ sequence stay in one span.
+        let html = rainbow_html("e\u{301}\u{2764}\u{FE0F}\u{1F469}\u{200D}\u{1F4BB}");
+        assert_eq!(html.matches("<span").count(), 3, "{html}");
     }
 
     #[test]
