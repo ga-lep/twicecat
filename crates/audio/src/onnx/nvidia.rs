@@ -1,8 +1,8 @@
-//! NVIDIA's libraries for the CUDA and TensorRT providers on Linux: from the
-//! system, or from `scripts/fetch-cuda-runtime.sh` and
+//! NVIDIA's libraries for the CUDA and TensorRT providers on Linux and
+//! Windows: from the system, or from `scripts/fetch-cuda-runtime.sh` and
 //! `scripts/fetch-tensorrt.sh` (or `TESSERA_CUDA_DIR`,
 //! `TESSERA_TENSORRT_DIR`), preloaded before the runtime starts so its
-//! providers find them without `LD_LIBRARY_PATH`. Also where TensorRT keeps
+//! providers find them without `LD_LIBRARY_PATH` or `PATH`. Also where TensorRT keeps
 //! the engines it builds for this machine.
 
 use std::path::{Path, PathBuf};
@@ -70,9 +70,78 @@ pub(super) fn preload(runtime_dir: &Path) {
     }
 }
 
+/// Windows: preloads every DLL of the fetched CUDA runtime, then of
+/// TensorRT, when the runtime in `runtime_dir` has those providers. Windows
+/// finds a library by name among the ones already loaded, so the providers'
+/// imports and cuDNN's and TensorRT's own loads by name (sub-libraries,
+/// builder resources) find them without `PATH`. Each is loaded with
+/// `LOAD_WITH_ALTERED_SEARCH_PATH`, which resolves its own imports from its
+/// directory first, so the order does not matter.
+#[cfg(target_os = "windows")]
+pub(super) fn preload(runtime_dir: &Path) {
+    if runtime_dir.join("onnxruntime_providers_cuda.dll").exists()
+        && let Some(cuda) = default_cuda_dir()
+    {
+        preload_dir(&cuda);
+    }
+    if runtime_dir
+        .join("onnxruntime_providers_tensorrt.dll")
+        .exists()
+        && let Some(tensorrt) = default_tensorrt_dir()
+    {
+        preload_dir(&tensorrt);
+    }
+}
+
 /// Nothing to preload elsewhere: the libraries are found by the system.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub(super) fn preload(_runtime_dir: &Path) {}
+
+/// The DLLs in `dir`, sorted (a stable order for the log).
+#[cfg(target_os = "windows")]
+fn dlls_in(dir: &Path) -> Vec<PathBuf> {
+    let mut dlls: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(|e| Some(e.ok()?.path()))
+                .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("dll")))
+                .collect()
+        })
+        .unwrap_or_default();
+    dlls.sort();
+    dlls
+}
+
+/// Loads every DLL in `dir` and keeps it loaded. One that fails is logged
+/// and skipped: the provider that needs it then fails to start and the next
+/// one, or the CPU, runs.
+#[cfg(target_os = "windows")]
+fn preload_dir(dir: &Path) {
+    use libloading::os::windows::{LOAD_WITH_ALTERED_SEARCH_PATH, Library};
+    // `LOAD_WITH_ALTERED_SEARCH_PATH` is only defined for an absolute path;
+    // the directory can come from a variable as given.
+    let Ok(dir) = std::path::absolute(dir) else {
+        tracing::warn!("could not resolve {}", dir.display());
+        return;
+    };
+    for path in dlls_in(&dir) {
+        // SAFETY: loading runs the library's initialisation; these are
+        // NVIDIA's runtime libraries from the pinned, checked download (or
+        // the directory the user named), the same ones the providers load.
+        // The path is absolute (above), as `LOAD_WITH_ALTERED_SEARCH_PATH`
+        // needs. The handle is never freed, so the library stays among the
+        // loaded modules (as `ort::util::preload_dylib` does).
+        match unsafe { Library::load_with_flags(&path, LOAD_WITH_ALTERED_SEARCH_PATH) } {
+            Ok(library) => {
+                let _ = library.into_raw();
+            }
+            Err(e) => {
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                tracing::warn!("could not preload {name}: {e}");
+            }
+        }
+    }
+}
 
 /// TensorRT's libraries, dependencies first; the engine builder's resources
 /// (one per GPU architecture, found by name) go between the runtime and its
@@ -140,6 +209,35 @@ mod tests {
                 "libnvinfer_plugin.so.10",
                 "libnvonnxparser.so.10",
             ]
+        );
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn every_dll_in_the_directory_is_preloaded_in_a_stable_order() {
+        let dir = std::env::temp_dir().join(format!("tessera-cuda-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        for name in [
+            "cudnn64_9.dll",
+            "cudart64_13.DLL",
+            "License.txt",
+            "cublas64_13.dll",
+        ] {
+            std::fs::write(dir.join(name), b"").unwrap();
+        }
+        std::fs::write(dir.join("sub").join("hidden.dll"), b"").unwrap();
+        let names: Vec<String> = dlls_in(&dir)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(
+            names,
+            ["cublas64_13.dll", "cudart64_13.DLL", "cudnn64_9.dll"]
         );
     }
 }

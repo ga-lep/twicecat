@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Downloads NVIDIA's CUDA 13 and cuDNN 9 runtime libraries for the opt-in
-# GPU speech enhancement (plan Task 13b) on Linux x86_64, without a system
-# CUDA install or root: NVIDIA's own PyPI wheels at pinned versions, checked
-# against the SHA-256 in scripts/checksums/cuda-runtime.sha256, their shared libraries
+# GPU speech enhancement (plan Task 13b) on Linux x86_64 and Windows x64,
+# without a system CUDA install or root: NVIDIA's own PyPI wheels at pinned versions, checked
+# against the SHA-256 in scripts/cuda-runtime.sha256, their shared libraries
 # unpacked into one cache dir, whose path is printed. Tessera preloads the
 # libraries from there before ONNX Runtime's CUDA provider starts (or from
 # TESSERA_CUDA_DIR). With CUDA 13 and cuDNN 9 installed system-wide this is
@@ -32,9 +32,19 @@ sha256_of() {
     fi
 }
 
-[ "$(uname -s)" = Linux ] || die "Linux only (on Windows, install CUDA and cuDNN from NVIDIA)"
-arch=$(uname -m)
-[ "$arch" = x86_64 ] || die "no ONNX Runtime GPU build for $arch"
+case "$(uname -s)" in
+    Linux)
+        arch=$(uname -m)
+        [ "$arch" = x86_64 ] || die "no ONNX Runtime GPU build for $arch"
+        libs=so
+        ;;
+    MINGW* | MSYS* | CYGWIN*)
+        [ "$(uname -m)" = x86_64 ] || die "no ONNX Runtime GPU build for $(uname -m)"
+        arch=win_amd64
+        libs=dll
+        ;;
+    *) die "no ONNX Runtime GPU build for $(uname -s)" ;;
+esac
 
 mapfile -t wheels < <(awk -v a="$arch" '!/^#/ && $2 == a {print $1 " " $3}' "$sums")
 [ "${#wheels[@]}" -gt 0 ] || die "no pinned wheels for $arch in $sums"
@@ -67,12 +77,19 @@ if [ ! -f "$marker" ] || [ "$(cat "$marker")" != "$pinned" ]; then
         fi
         rm "$work/$wheel"
         found=0
-        for lib in "$work"/x/nvidia/*/lib/*.so*; do
+        # Linux: nvidia/*/lib/*.so*; Windows: DLLs under nvidia/*/bin
+        # (nvidia/cu13/bin/x86_64/ for the CUDA 13 wheels).
+        if [ "$libs" = so ]; then
+            candidates=("$work"/x/nvidia/*/lib/*.so*)
+        else
+            mapfile -t candidates < <(find "$work"/x/nvidia -path '*/bin/*' -name '*.dll')
+        fi
+        for lib in "${candidates[@]}"; do
             [ -f "$lib" ] || continue
             mv "$lib" "$work/out/lib/"
             found=1
         done
-        [ "$found" = 1 ] || die "unexpected wheel layout (no nvidia/*/lib) in $wheel"
+        [ "$found" = 1 ] || die "unexpected wheel layout (no libraries under nvidia/) in $wheel"
         for licence in "$work"/x/*.dist-info/licenses/* "$work"/x/*.dist-info/License.txt; do
             [ -f "$licence" ] && cp "$licence" "$work/out/licenses/${wheel%%-*}-$(basename "$licence")"
         done
