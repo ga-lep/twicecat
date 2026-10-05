@@ -337,7 +337,16 @@ fn pill(background: Color, radius: f32) -> (Background, Border) {
 pub fn to_span(model: &SpanModel, theme: &Theme) -> Span<'static, LinkTarget> {
     let semantic = theme::semantic(theme);
     let weak = theme.extended_palette().background.weak.color;
-    let mut span: Span<'static, LinkTarget> = Span::new(model.text.clone())
+    // A pill's side margins are narrow no-break spaces inside the span: iced
+    // span padding only grows the background, not the layout, so it painted
+    // over the neighbouring characters (the ":" Element puts after a mention).
+    let text = match model.look {
+        Look::Mention { .. } | Look::SpoilerPill => {
+            format!("{PILL_MARGIN}{}{PILL_MARGIN}", model.text)
+        }
+        Look::Plain | Look::Link | Look::SpoilerOpen => model.text.clone(),
+    };
+    let mut span: Span<'static, LinkTarget> = Span::new(text)
         .font_maybe(font_for(model.style))
         .strikethrough(model.style.strike)
         .underline(model.style.underline)
@@ -358,19 +367,14 @@ pub fn to_span(model: &SpanModel, theme: &Theme) -> Span<'static, LinkTarget> {
                 (semantic.selection, theme.palette().primary)
             };
             let (background, border) = pill(fill, 8.0);
-            span = span
-                .color(color)
-                .background(background)
-                .border(border)
-                .padding([0.0, 4.0]);
+            span = span.color(color).background(background).border(border);
         }
         Look::SpoilerPill => {
             let (background, border) = pill(semantic.badge, 8.0);
             span = span
                 .color(semantic.badge_text)
                 .background(background)
-                .border(border)
-                .padding([0.0, 4.0]);
+                .border(border);
         }
         Look::SpoilerOpen => {
             let (background, border) = pill(weak, 3.0);
@@ -379,6 +383,9 @@ pub fn to_span(model: &SpanModel, theme: &Theme) -> Span<'static, LinkTarget> {
     }
     span
 }
+
+/// The side margin of a pill, inside its span (U+202F NARROW NO-BREAK SPACE).
+const PILL_MARGIN: char = '\u{202F}';
 
 /// The marker of list item `index`: a bullet, or the number counted from
 /// `start` (default 1).
@@ -817,6 +824,35 @@ mod tests {
         };
         assert_ne!(own.highlight, to_span(&other, &theme).highlight);
         assert!(to_span(by(Look::SpoilerPill), &theme).highlight.is_some());
+    }
+
+    #[test]
+    fn pills_take_their_margins_in_the_text_so_neighbours_are_not_covered() {
+        // iced span padding only grows the background, not the layout, so a
+        // padded pill painted over the ":" Element puts after a mention.
+        let theme = theme::theme_for(iced::theme::Mode::Light);
+        for look in [
+            Look::Mention { own: false },
+            Look::Mention { own: true },
+            Look::SpoilerPill,
+        ] {
+            let model = SpanModel {
+                text: "bob".into(),
+                style: TextStyle::default(),
+                look,
+                link: None,
+            };
+            let span = to_span(&model, &theme);
+            assert_eq!(span.padding, iced::Padding::ZERO, "{look:?}");
+            assert_eq!(span.text, "\u{202F}bob\u{202F}", "{look:?}");
+        }
+        let plain = SpanModel {
+            text: "bob".into(),
+            style: TextStyle::default(),
+            look: Look::Plain,
+            link: None,
+        };
+        assert_eq!(to_span(&plain, &theme).text, "bob");
     }
 
     #[test]

@@ -201,6 +201,11 @@ Phase 3 agent work is done. The Phase 3 human checkpoint below stays open: nothi
 - Core API (additive): `TextFormat::Spoiler`; `outgoing_content` sends the text as the body and the span (through `sanitize_formatted`, which keeps `data-mx-spoiler`) as the formatted body, with the picked mentions. App: `Parsed::{Spoiler, Emoticon}`; the emoticons are copied byte for byte from Element's source (`composer::emoticon`); `/spoiler` alone is a `CommandError`. `/rainbow` is now the unknown-command example in tests (`/shrug` became a command).
 - Tests (red first): core `spoiler_format_wraps_the_text_like_element`; app `spoiler_and_emoticon_commands_like_element`. Checks on the committed tree alone: `cargo fmt --all --check`, clippy `-D warnings`, `cargo test --workspace` (app lib 417, core lib 227), both boundary scripts pass.
 
+### Pill margins and the leading mention colon (human-reported at the checkpoint)
+- In Tessera the ":" after an Element mention ("alice: hi") was drawn in the pill colour. The core maps it right (`Mention` then `Text(": hi")`); the pill's `.padding([0.0, 4.0])` was the cause: iced_core 0.14.0 `text.rs:525-528`, span padding "only affects the background and border", so the background covered 4 px of each neighbour. `rich_text::to_span` now puts a U+202F NARROW NO-BREAK SPACE (`PILL_MARGIN`) inside mention and spoiler pills and drops the padding.
+- Composer: as Element (`parts.ts` `createMentionParts`, setting `MessageComposerInput.insertTrailingColon` default true in `Settings.tsx:704`), a member picked at the very start of the message is followed by ": ", elsewhere by " ". Tessera keeps "@" in the label (labels are found by text when sending; without "@" an earlier plain name could be linked).
+- Tests (red first): `pills_take_their_margins_in_the_text_so_neighbours_are_not_covered` (`rich_text.rs`), `only_a_mention_starting_the_message_gets_a_colon_like_element` (`composer.rs`); two existing tests now expect "@Name: " at the start. Checks: `cargo fmt --all --check`, clippy `-D warnings`, `cargo test --workspace` (app lib 419, core lib 227) pass.
+
 ## Phase 3 human checkpoint
 - [ ] CI green on Linux, Windows and macOS with the new dependencies (matrix-sdk `markdown`, emojis, chrono, dev-only iced `advanced`).
 - [ ] Revisit plan decisions Q1-Q25.
@@ -230,6 +235,8 @@ Phase 3 agent work is done. The Phase 3 human checkpoint below stays open: nothi
 - [x] Pasted room links (fix): a room link copied in Element ("Copy room link") and sent shows in Tessera as a pill with the room's name, and clicking it switches to the room (human-confirmed).
 - [x] `/spoiler` (fix): `/spoiler <text>` from Tessera arrives as a hidden spoiler (human-confirmed).
 - [ ] Emoticon commands (fix): `/shrug fine` sends "¯\_(ツ)_/¯ fine"; `/tableflip`, `/unflip`, `/lenny` likewise; `/rainbow` (not supported) shows the "Unrecognised command" bar.
+- [x] Pill margins (fix): the pill background no longer covers the character after it (the ":" in Element's "alice: hi") (human-confirmed).
+- [ ] Leading mention colon (fix): picking a member at the very start of a message inserts "@Name: ", elsewhere "@Name ".
 - [ ] Slash commands (fix): `/plain **x**` shows the asterisks; `/me waves` is still an emote; `/me` alone shows the red "Command error: Unable to handle slash command." line and keeps the text; `/plain hi @bob` (bob picked from the list) notifies bob without a pill; an unknown command (`/shrug`) shows the "Unrecognised command" bar (seen by the human with `/toto`), Cancel keeps the text, "Send as message" sends it as an ordinary message, and switching rooms closes the bar.
 - [ ] Edited marker (fix): a message edited in Element or in Tessera shows a muted "(edited)" line under its text, with no gap or overlap with the next row; unedited messages have none.
 - [ ] Message actions (Task 12): reply, edit, delete and react round-trip with Element on the real account (reply shows the quote there; an edit shows "(edited)"; delete asks first, then the message becomes a placeholder; a reaction appears and a second click removes it); a failed delete or reaction shows the red one-line notice for about 5 seconds.

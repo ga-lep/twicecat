@@ -2066,7 +2066,11 @@ mod tests {
         let _ = app.update(answer("ali"));
         assert!(app.composer.suggestions.is_open());
         let _ = app.update(Message::SuggestionPicked(0));
-        assert_eq!(app.composer.text(), "@Alice ");
+        assert_eq!(
+            app.composer.text(),
+            "@Alice: ",
+            "starts the message: Element's colon"
+        );
         assert_eq!(app.composer.mentions.len(), 1);
     }
 

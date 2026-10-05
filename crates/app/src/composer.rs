@@ -642,7 +642,11 @@ impl Composer {
                     label: label.clone(),
                     user_id: member.user_id.clone(),
                 };
-                (typed, format!("{label} "), Some(mention))
+                // As Element (`createMentionParts`, trailing colon on by
+                // default): ": " after a mention that starts the message.
+                let starts_message = line == 0 && end == typed.len() + 1;
+                let suffix = if starts_message { ": " } else { " " };
+                (typed, format!("{label}{suffix}"), Some(mention))
             }
             (Suggestions::Emoji { query, items, .. }, Some(Token::Emoji(typed)))
                 if *query == typed =>
@@ -1328,13 +1332,36 @@ mod tests {
     }
 
     #[test]
+    fn only_a_mention_starting_the_message_gets_a_colon_like_element() {
+        let now = Instant::now();
+        let pick = |typed: &str, query: &str| {
+            let mut c = Composer::new();
+            type_text(&mut c, typed, now);
+            c.set_members(query, vec![member("@alice:x", Some("Alice"))]);
+            let _ = c.pick(None, now).expect("a suggestion");
+            c.text()
+        };
+        assert_eq!(pick("@al", "al"), "@Alice: ");
+        assert_eq!(pick("hi @al", "al"), "hi @Alice ");
+        assert_eq!(
+            pick("hi\n@al", "al"),
+            "hi\n@Alice ",
+            "start of a later line"
+        );
+    }
+
+    #[test]
     fn a_member_without_a_name_is_inserted_by_localpart() {
         let now = Instant::now();
         let mut c = Composer::new();
         type_text(&mut c, "@bo", now);
         c.set_members("bo", vec![member("@bob:example.org", None)]);
         let _ = c.pick(Some(0), now);
-        assert_eq!(c.text(), "@bob ");
+        assert_eq!(
+            c.text(),
+            "@bob: ",
+            "a mention starting the message gets Element's colon"
+        );
     }
 
     #[test]
