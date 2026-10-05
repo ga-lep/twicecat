@@ -361,8 +361,32 @@ async fn a_draft_is_kept_per_room_and_cleared_on_request() {
     let dir = tempfile::tempdir().unwrap();
     let mut alice = start_core(dir.path(), Arc::new(InMemorySecretStore::new()));
     login_and_run(&mut alice, &env, 1).await;
-    wait_for_room(&mut alice, &second).await;
-    open_room(&mut alice, &first).await;
+    // Both rooms, in one pass: they may arrive in the same list update.
+    let mut rooms: Vec<RoomSummary> = Vec::new();
+    let both = async {
+        while ![&first, &second]
+            .iter()
+            .all(|id| rooms.iter().any(|r| r.id.as_str() == id.as_str()))
+        {
+            match alice.events.recv().await {
+                Some(CoreEvent::RoomListChanged(diffs)) => {
+                    for diff in diffs {
+                        ListDiff::apply(&diff, &mut rooms);
+                    }
+                }
+                Some(_) => {}
+                None => panic!("event channel closed"),
+            }
+        }
+    };
+    tokio::time::timeout(common::DEFAULT_TIMEOUT, both)
+        .await
+        .expect("timed out waiting for both rooms to sync");
+    alice
+        .commands
+        .send(Command::SelectRoom(RoomId::from(first.as_str())))
+        .await
+        .unwrap();
 
     let draft = Draft {
         text: tessera_core::api::MessageText::from("half a thought for @Carol"),
