@@ -206,6 +206,11 @@ Phase 3 agent work is done. The Phase 3 human checkpoint below stays open: nothi
 - Composer: as Element (`parts.ts` `createMentionParts`, setting `MessageComposerInput.insertTrailingColon` default true in `Settings.tsx:704`), a member picked at the very start of the message is followed by ": ", elsewhere by " ". Tessera keeps "@" in the label (labels are found by text when sending; without "@" an earlier plain name could be linked).
 - Tests (red first): `pills_take_their_margins_in_the_text_so_neighbours_are_not_covered` (`rich_text.rs`), `only_a_mention_starting_the_message_gets_a_colon_like_element` (`composer.rs`); two existing tests now expect "@Name: " at the start. Checks: `cargo fmt --all --check`, clippy `-D warnings`, `cargo test --workspace` (app lib 419, core lib 227) pass.
 
+### Composer focus with bars above it (human-reported at the checkpoint)
+- Typing `@a` opened the suggestion list and the editor lost its focus. Same cause as the scroll reset: `main_view::room_pane` pushed the bars (link and command bars, send error, notice, typing line, suggestion list, reply/edit bar) into the same column as the editor, so the editor's index changed whenever one came or went and `Tree::diff` (iced_core 0.14.0 `widget/tree.rs:63-67`) made it a new, unfocused state. Likewise the timeline became a `stack` only while the reaction picker was open, which reset its scroll.
+- Fix: `room_column` is always `[title, timeline, bars column, editor]` (`Column::from_vec`, which keeps an empty bars column; `push` would drop a void child, iced_widget 0.14.2 `column.rs:140-154`), and `timeline_layer` is always `stack([timeline, picker or space()])`.
+- Test: `the_editor_and_the_timeline_keep_their_place_when_bars_come_and_go` (`main_view.rs`): the tags of the column's children and of the timeline layer stay the same as bars and the picker come and go; seen failing with the helpers written the old way. Checks: `cargo fmt --all --check`, clippy `-D warnings`, `cargo test --workspace` (app lib 420, core lib 227) pass.
+
 ## Phase 3 human checkpoint
 - [ ] CI green on Linux, Windows and macOS with the new dependencies (matrix-sdk `markdown`, emojis, chrono, dev-only iced `advanced`).
 - [ ] Revisit plan decisions Q1-Q25.
@@ -234,9 +239,12 @@ Phase 3 agent work is done. The Phase 3 human checkpoint below stays open: nothi
 - [x] Slash commands (fix): `//plain` sends "/plain" as text (human-confirmed).
 - [x] Pasted room links (fix): a room link copied in Element ("Copy room link") and sent shows in Tessera as a pill with the room's name, and clicking it switches to the room (human-confirmed).
 - [x] `/spoiler` (fix): `/spoiler <text>` from Tessera arrives as a hidden spoiler (human-confirmed).
-- [ ] Emoticon commands (fix): `/shrug fine` sends "¯\_(ツ)_/¯ fine"; `/tableflip`, `/unflip`, `/lenny` likewise; `/rainbow` (not supported) shows the "Unrecognised command" bar.
+- [x] Emoticon commands (fix): `/shrug` works (human-confirmed).
+- [ ] Emoticon commands (fix): `/tableflip`, `/unflip`, `/lenny` like `/shrug`; `/rainbow` (not supported) shows the "Unrecognised command" bar.
 - [x] Pill margins (fix): the pill background no longer covers the character after it (the ":" in Element's "alice: hi") (human-confirmed).
-- [ ] Leading mention colon (fix): picking a member at the very start of a message inserts "@Name: ", elsewhere "@Name ".
+- [x] Leading mention colon (fix): picking a member at the very start of a message inserts "@Name: ", elsewhere "@Name " (human-confirmed).
+- [x] Composer focus (fix): typing `@a` opens the suggestion list and the next letters still go into the editor (human-confirmed).
+- [ ] Picker and scroll (fix): opening and closing the reaction picker while scrolled up leaves the timeline where it was.
 - [ ] Slash commands (fix): `/plain **x**` shows the asterisks; `/me waves` is still an emote; `/me` alone shows the red "Command error: Unable to handle slash command." line and keeps the text; `/plain hi @bob` (bob picked from the list) notifies bob without a pill; an unknown command (`/shrug`) shows the "Unrecognised command" bar (seen by the human with `/toto`), Cancel keeps the text, "Send as message" sends it as an ordinary message, and switching rooms closes the bar.
 - [ ] Edited marker (fix): a message edited in Element or in Tessera shows a muted "(edited)" line under its text, with no gap or overlap with the next row; unedited messages have none.
 - [ ] Message actions (Task 12): reply, edit, delete and react round-trip with Element on the real account (reply shows the quote there; an edit shows "(edited)"; delete asks first, then the message becomes a placeholder; a reaction appears and a second click removes it); a failed delete or reaction shows the red one-line notice for about 5 seconds.

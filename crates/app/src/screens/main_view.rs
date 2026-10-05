@@ -2,7 +2,8 @@
 //! (timeline pane and composer) on the right.
 
 use iced::widget::{
-    Row, button, column, container, opaque, row, space, stack, text, text_editor, text_input,
+    Column, Row, button, column, container, opaque, row, space, stack, text, text_editor,
+    text_input,
 };
 use iced::{Element, Fill};
 use tessera_core::api::{MessageText, UserId};
@@ -56,51 +57,80 @@ fn room_pane(app: &App) -> Element<'_, Message> {
     };
     let timeline = container(timeline_pane::view(&app.timeline, env)).height(Fill);
     // The picker floats over the timeline's bottom right corner.
-    let timeline: Element<'_, Message> = match &app.actions.picker {
-        Some(picker) => stack([
-            timeline.into(),
-            container(opaque(picker_panel(picker)))
-                .width(Fill)
-                .height(Fill)
-                .align_right(Fill)
-                .align_bottom(Fill)
-                .padding(8)
-                .into(),
-        ])
-        .into(),
-        None => timeline.into(),
-    };
-    let mut body = column![text(title).size(22), timeline].spacing(8);
+    let picker = app.actions.picker.as_ref().map(|picker| {
+        container(opaque(picker_panel(picker)))
+            .width(Fill)
+            .height(Fill)
+            .align_right(Fill)
+            .align_bottom(Fill)
+            .padding(8)
+            .into()
+    });
+    let mut bars: Vec<Element<'_, Message>> = Vec::new();
     if let Some(bar) = &app.link_bar {
-        body = body.push(link_bar(bar));
+        bars.push(link_bar(bar));
     }
     if let Some(name) = &app.command_bar {
-        body = body.push(command_bar(name));
+        bars.push(command_bar(name));
     }
     if let Some(error) = &app.send_error {
-        body = body.push(text(error.as_str()).style(text::danger));
+        bars.push(text(error.as_str()).style(text::danger).into());
     }
     if let Some(notice) = &app.actions.notice {
-        body = body.push(text(notice.text.as_str()).style(text::danger));
+        bars.push(text(notice.text.as_str()).style(text::danger).into());
     }
     let enabled = selected.is_some();
     if let Some(line) = timeline_pane::typing_line(&app.typing) {
-        body = body.push(
+        bars.push(
             text(line)
                 .size(13)
                 .style(|theme: &iced::Theme| text::Style {
                     color: Some(theme::semantic(theme).muted),
-                }),
+                })
+                .into(),
         );
     }
     if let Some(list) = suggestion_list(&app.composer.suggestions) {
-        body = body.push(list);
+        bars.push(list);
     }
     if let Some(bar) = mode_bar(app) {
-        body = body.push(bar);
+        bars.push(bar);
     }
-    body = body.push(editor(app, enabled));
+    let body = room_column(
+        text(title).size(22).into(),
+        timeline_layer(timeline.into(), picker),
+        bars,
+        editor(app, enabled),
+    );
     container(body).width(Fill).height(Fill).padding(8).into()
+}
+
+/// The room pane's column, always `[title, timeline, bars, editor]`. iced
+/// keeps a widget's state only while the widget at that place in the tree
+/// keeps its type: with the bars (link and command bars, notices, typing
+/// line, suggestion list, reply bar) as siblings, the editor moved whenever
+/// one came or went and lost its focus. `from_vec` keeps an empty bar column.
+fn room_column<'a>(
+    title: Element<'a, Message>,
+    timeline: Element<'a, Message>,
+    bars: Vec<Element<'a, Message>>,
+    editor: Element<'a, Message>,
+) -> Element<'a, Message> {
+    let bars = Column::from_vec(bars).spacing(8).width(Fill);
+    Column::from_vec(vec![title, timeline, bars.into(), editor])
+        .spacing(8)
+        .width(Fill)
+        .height(Fill)
+        .into()
+}
+
+/// The timeline with the reaction picker as an optional layer: always a
+/// stack with the timeline first, so opening the picker keeps the scroll.
+fn timeline_layer<'a>(
+    timeline: Element<'a, Message>,
+    picker: Option<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    stack([timeline, picker.unwrap_or_else(|| space().into())]).into()
 }
 
 /// Tallest the editor grows before it scrolls, in pixels.
@@ -353,6 +383,38 @@ fn status_bar(app: &App) -> Element<'_, Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_editor_and_the_timeline_keep_their_place_when_bars_come_and_go() {
+        use iced::advanced::widget::Tree;
+
+        let content = text_editor::Content::new();
+        let build = |bars: usize, picker: bool| -> Element<'_, Message> {
+            let bars = (0..bars).map(|_| text("bar").into()).collect();
+            let picker = picker.then(|| text("picker").into());
+            room_column(
+                text("title").into(),
+                timeline_layer(space().into(), picker),
+                bars,
+                text_editor(&content).into(),
+            )
+        };
+        let mut tree = Tree::new(build(0, false));
+        let tags = |tree: &Tree| {
+            (
+                tree.children.iter().map(|c| c.tag).collect::<Vec<_>>(),
+                tree.children[1].children[0].tag,
+            )
+        };
+        let before = tags(&tree);
+        // A suggestion list, a notice, the reaction picker...: the editor
+        // (keeping its focus) and the timeline (its scroll) keep their tags,
+        // so `Tree::diff` keeps their state.
+        for (bars, picker) in [(1, false), (3, true), (0, true), (0, false)] {
+            tree.diff(build(bars, picker));
+            assert_eq!(tags(&tree), before, "{bars} bars, picker {picker}");
+        }
+    }
 
     #[test]
     fn the_account_label_is_sanitised_and_capped() {
