@@ -284,7 +284,7 @@ pub struct AudioProcessing {
     /// Also cancel other applications' sound (a game, a video) picked up by
     /// the microphone: echo cancellation then uses everything the output
     /// device plays as its reference, not only the call. Linux with
-    /// PipeWire; needs `echo_cancellation`.
+    /// PipeWire, and Windows; needs `echo_cancellation`.
     pub cancel_system_audio: bool,
 }
 

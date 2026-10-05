@@ -33,8 +33,9 @@ pub struct IoConfig {
     pub output_device: Option<String>,
     /// Also capture what the output device plays (every application's
     /// sound, a game's included) and hand it to the processor as the echo
-    /// reference ([`FrameProcessor::echo_reference`]). PipeWire only;
-    /// ignored elsewhere.
+    /// reference ([`FrameProcessor::echo_reference`]). Our PipeWire client
+    /// (the sink's monitor) and Windows (WASAPI loopback); ignored
+    /// elsewhere. Needs `playback`: it is the playback device's sound.
     pub echo_reference: bool,
 }
 

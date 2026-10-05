@@ -2,6 +2,9 @@
 //! opened on the processing thread: cpal streams are not `Send` on every
 //! platform, so they live and die there. The callbacks only convert samples
 //! and move them through lock-free rings.
+//!
+//! On Windows the echo reference ([`IoConfig::echo_reference`]) is WASAPI's
+//! loopback of the output device: everything it plays, mixed by the system.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,6 +43,8 @@ pub(super) fn run(
     let mut streams = Vec::new();
     let mut capture = None;
     let mut playback = None;
+    #[cfg(target_os = "windows")]
+    let mut reference = None;
     let opened = (|| {
         if config.capture {
             let (stream, side, stream_info) =
@@ -49,11 +54,21 @@ pub(super) fn run(
             info.input = Some(stream_info);
         }
         if config.playback {
+            let (device, format, stream_config) =
+                configure(&host, config.output_device.as_deref(), false, &events)?;
             let (stream, side, stream_info) =
-                open_output(&host, config.output_device.as_deref(), &counters, &events)?;
+                open_output(&device, format, stream_config, &counters, &events)?;
             streams.push(stream);
             playback = Some(side);
             info.output = Some(stream_info);
+            // The same device the call plays on.
+            #[cfg(target_os = "windows")]
+            if config.echo_reference {
+                let (stream, side, stream_info) = open_loopback(&device, &events)?;
+                streams.push(stream);
+                reference = Some(side);
+                info.echo_reference = Some(stream_info);
+            }
         }
         for stream in &streams {
             stream.play().map_err(|e| map_error(&e))?;
@@ -73,7 +88,10 @@ pub(super) fn run(
         None
     };
     let _ = ready.send(Ok(info));
-    let pipeline = Pipeline::new(capture, playback, processor, counters);
+    #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
+    let mut pipeline = Pipeline::new(capture, playback, processor, counters);
+    #[cfg(target_os = "windows")]
+    pipeline.set_echo_reference(reference);
     process(pipeline, &stop, &events);
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     if let Some(handle) = raised {
@@ -248,19 +266,77 @@ fn open_input(
 }
 
 fn open_output(
-    host: &cpal::Host,
-    id: Option<&str>,
+    device: &cpal::Device,
+    format: SampleFormat,
+    config: StreamConfig,
     counters: &Arc<IoCounters>,
     events: &mpsc::Sender<IoEvent>,
 ) -> Result<Opened<PlaybackSide>, AudioError> {
-    let (device, format, config) = configure(host, id, false, events)?;
     let (producer, consumer) = rtrb::RingBuffer::new(playback_ring_len(config.sample_rate));
     let stream = by_format!(
         format,
-        build_output(&device, config, consumer, counters.clone(), events.clone())
+        build_output(device, config, consumer, counters.clone(), events.clone())
     )?;
     let side = PlaybackSide::new(producer, config.sample_rate)?;
-    Ok((stream, side, stream_info(&device, &config)))
+    Ok((stream, side, stream_info(device, &config)))
+}
+
+/// Windows: WASAPI's loopback of `device` (an input stream on an output
+/// device is one), in the device's mix format, which shared-mode loopback
+/// requires. Nothing arrives while the device plays nothing; the pipeline
+/// then hands the processor silence. Its overruns are not counted: the
+/// counters describe the microphone and the speakers.
+#[cfg(target_os = "windows")]
+fn open_loopback(
+    device: &cpal::Device,
+    events: &mpsc::Sender<IoEvent>,
+) -> Result<Opened<CaptureSide>, AudioError> {
+    let mix = device.default_output_config().map_err(|e| map_error(&e))?;
+    let format = mix.sample_format();
+    let mut config = mix.config();
+    config.buffer_size = ten_ms_buffer(mix.buffer_size(), config.sample_rate);
+    let (producer, consumer) = rtrb::RingBuffer::new(capture_ring_len(config.sample_rate));
+    let stream = by_format!(
+        format,
+        build_loopback(device, config, producer, events.clone())
+    )?;
+    let side = CaptureSide::new(consumer, config.sample_rate)?;
+    Ok((stream, side, stream_info(device, &config)))
+}
+
+#[cfg(target_os = "windows")]
+fn build_loopback<T>(
+    device: &cpal::Device,
+    config: StreamConfig,
+    mut ring: rtrb::Producer<f32>,
+    events: mpsc::Sender<IoEvent>,
+) -> Result<cpal::Stream, AudioError>
+where
+    T: SizedSample,
+    f32: FromSample<T>,
+{
+    let channels = usize::from(config.channels);
+    device
+        .build_input_stream::<T, _, _>(
+            config,
+            // Real-time: no allocation, no locks. A full ring drops the
+            // newest samples; the pipeline trims a backlog on its side.
+            move |data: &[T], _| {
+                downmix(data, channels, |s| {
+                    let _ = ring.push(s);
+                });
+            },
+            move |e| {
+                // A failing reference costs the cancellation of other
+                // applications' sound, not the call: reported as playback.
+                let _ = events.send(IoEvent::StreamError {
+                    input: false,
+                    message: format!("echo reference: {e}"),
+                });
+            },
+            None,
+        )
+        .map_err(|e| map_error(&e))
 }
 
 fn build_input<T>(
@@ -379,5 +455,72 @@ mod tests {
         assert!(stats.frames >= 20, "{stats:?}");
         assert!(io.info().output.is_some());
         assert!(io.info().input.is_none());
+    }
+
+    /// Plays a quiet tone and keeps the echo reference it is handed.
+    #[cfg(target_os = "windows")]
+    struct ToneAndReference {
+        tone: Vec<f32>,
+        at: usize,
+        heard: Arc<std::sync::Mutex<Vec<f32>>>,
+    }
+
+    #[cfg(target_os = "windows")]
+    impl crate::FrameProcessor for ToneAndReference {
+        fn process(&mut self, _: &crate::Frame, playback: &mut crate::Frame) {
+            for s in playback.iter_mut() {
+                *s = self.tone[self.at % self.tone.len()];
+                self.at += 1;
+            }
+        }
+        fn echo_reference(&mut self, played: &crate::Frame) {
+            self.heard.lock().unwrap().extend_from_slice(played);
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "needs an audio output device; plays a faint 1 kHz tone (-46 dBFS) for 1.5 s"]
+    fn wasapi_loopback_hands_the_processor_what_the_device_plays() {
+        use crate::resample::tests::{sine, tone_amplitude};
+        let heard = Arc::new(std::sync::Mutex::new(Vec::new()));
+        // 1 kHz repeats every 48 samples: a whole number of periods loops.
+        let io = AudioIo::start(
+            IoConfig {
+                playback: true,
+                echo_reference: true,
+                ..IoConfig::default()
+            },
+            ToneAndReference {
+                tone: sine(SAMPLE_RATE, 1000.0, 0.005, 4800),
+                at: 0,
+                heard: heard.clone(),
+            },
+        )
+        .expect("default output device");
+        let reference = io.info().echo_reference.clone().expect("loopback opened");
+        assert_eq!(
+            reference.device_id,
+            io.info().output.as_ref().unwrap().device_id
+        );
+        std::thread::sleep(Duration::from_millis(1500));
+        drop(io);
+        let heard = heard.lock().unwrap();
+        assert!(
+            heard.len() >= SAMPLE_RATE as usize,
+            "{} samples",
+            heard.len()
+        );
+        // The last second: the stream has settled. Other applications may
+        // play too, so only the tone's own frequency is measured. What the
+        // device does to the mix before loopback (a virtual device's fader:
+        // Elgato Wave Link's is -6 dB here) scales it, which echo
+        // cancellation adapts to; the tone must be there, not louder.
+        let last = &heard[heard.len() - SAMPLE_RATE as usize..];
+        let a = tone_amplitude(last, SAMPLE_RATE, 1000.0);
+        assert!(
+            (0.0005..0.0055).contains(&a),
+            "tone amplitude {a} (played 0.005)"
+        );
     }
 }

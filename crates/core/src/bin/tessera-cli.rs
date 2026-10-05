@@ -104,7 +104,7 @@ AUDIO SETTINGS (saved; take effect at the next call or mic test):
                           and where DeepFilterNet runs
     /aec [on|off]         Echo cancellation
     /aec system [on|off]  Also cancel other apps' sound (a game) picked up by
-                          the microphone (Linux with PipeWire)
+                          the microphone (Linux with PipeWire, Windows)
     /agc [on|off]         Automatic gain
     /gate auto|<dB>|ptt [ms]
                           Voice activity (automatic or above a level in dBFS),
