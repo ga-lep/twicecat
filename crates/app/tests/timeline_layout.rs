@@ -64,7 +64,8 @@ fn timeline(n: usize) -> TimelineView {
     view
 }
 
-/// The layout of the pane: the content column inside the scrollable.
+/// The layout of the pane: the content column inside the scrollable, which
+/// is the first layer of the pane's stack.
 fn content_node(view: &TimelineView, renderer: &Renderer) -> Node {
     let theme = tessera_app::theme::theme_for(iced::theme::Mode::Light);
     let revealed = Revealed::new();
@@ -82,8 +83,9 @@ fn content_node(view: &TimelineView, renderer: &Renderer) -> Node {
         renderer,
         &Limits::new(Size::ZERO, Size::new(WIDTH, HEIGHT)),
     );
-    assert_eq!(root.children().len(), 1, "the scrollable has one child");
-    root.children()[0].clone()
+    let list = &root.children()[0];
+    assert_eq!(list.children().len(), 1, "the scrollable has one child");
+    list.children()[0].clone()
 }
 
 /// Reports the laid-out height of every built row, as the sensors would,

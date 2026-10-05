@@ -85,14 +85,19 @@ pub fn view_in<'a, Tz: TimeZone>(
         .on_scroll(Message::TimelineScrolled)
         .width(Fill)
         .height(Fill);
-    if timeline.pagination == PaginationState::Loading {
-        let badge = container(text("Loading\u{2026}").size(13).style(muted))
+    // Always a stack with the list first: iced keeps a widget's state only
+    // while the widget at that place in the tree keeps its type, so returning
+    // the bare list when idle would reset the scroll offset to the bottom on
+    // every pagination.
+    let badge: Element<'a, Message> = if timeline.pagination == PaginationState::Loading {
+        container(text("Loading\u{2026}").size(13).style(muted))
             .center_x(Fill)
-            .padding(4);
-        stack([list.into(), badge.into()]).into()
+            .padding(4)
+            .into()
     } else {
-        list.into()
-    }
+        space().into()
+    };
+    stack([list.into(), badge]).into()
 }
 
 const BOLD: Font = Font {
@@ -1117,6 +1122,32 @@ mod tests {
         BUILT_ROWS.with(|built| built.set(0));
         let _ = view_in(&view, 0, &chrono::Utc, env);
         assert_eq!(BUILT_ROWS.with(Cell::get), 3);
+    }
+
+    #[test]
+    fn the_scroll_state_survives_a_pagination() {
+        use iced::advanced::widget::Tree;
+
+        let theme = Theme::Light;
+        let revealed = Revealed::new();
+        let actions = ActionState::default();
+        let env = RichEnv {
+            theme: &theme,
+            own_user: None,
+            revealed: &revealed,
+            actions: &actions,
+        };
+        let mut view = TimelineView::default();
+        let mut tree = Tree::new(view_in(&view, 0, &chrono::Utc, env));
+        let (root, list) = (tree.tag, tree.children[0].tag);
+        for state in [PaginationState::Loading, PaginationState::Idle] {
+            view.pagination = state;
+            tree.diff(view_in(&view, 0, &chrono::Utc, env));
+            // Same tags: `Tree::diff` keeps the scrollable's state (its
+            // offset) instead of making a new one.
+            assert_eq!(tree.tag, root, "{state:?}");
+            assert_eq!(tree.children[0].tag, list, "{state:?}");
+        }
     }
 
     use std::time::{Duration, Instant};

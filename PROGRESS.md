@@ -162,12 +162,20 @@ Phase 3 agent work is done. The Phase 3 human checkpoint below stays open: nothi
 - Checks: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`, `cargo test --workspace --locked` (app lib 384 passed), `scripts/check-app-deps.sh`, `scripts/check-core-api.sh`, `cargo deny check` all pass. Ignored run (`create-test-users.sh`, then `cargo test -p tessera-core -p tessera-app --locked -- --ignored --skip keyring`): the first run failed once in `timeline_live.rs` (`typing_notices_reach_the_other_user`, panic at line 332; the Task 7 note already records one earlier timeout in this test; no core or bridge code changed here), and the whole run passed after `create-test-users.sh` again with `--no-fail-fast` (2 min 18 s with build); `docker compose stop` afterwards. Watch this test: one more failure in a row would be the rule 8 "flaky twice" stop.
 - Open issues: see "Phase 3 open issues (summary)". Human items: the new lines in the Phase 3 human checkpoint.
 
+### Scroll reset on back-pagination (human-reported at the checkpoint)
+- Symptom: scrolling up the seeded room jumped back to the newest message after each loaded page, so history seemed to stop a few hundred messages up (9500, then 6700).
+- Cause: `timeline_pane::view_in` returned `stack([list, badge])` while `Loading` and the bare scrollable otherwise. iced replaces a widget's state when the widget type at that place in the tree changes (iced_core 0.14.0 `widget/tree.rs:63-67`, `Tree::diff`), so the scrollable's offset reset to 0 (the bottom, as it is anchored there) at every `Loading` and `Idle`. Found with a temporary numbers-only trace in the app; the core was ruled out first (80 back-paginations through the seeded room, no `Clear` or `Reset`).
+- Fix: the pane is always a stack with the scrollable as the first layer; the second layer is the badge or an empty `space()`. iced_widget 0.14.2 `stack.rs:153` diffs children by position, so the scrollable keeps its state.
+- Tests: `the_scroll_state_survives_a_pagination` (`timeline_pane.rs`: the root and first-layer tags stay the same across `Loading` and `Idle`; seen failing on the old code). `tests/timeline_layout.rs` now goes stack, scrollable, content.
+- Checks: `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` pass. The human confirmed the fix in the real app.
+
 ## Phase 3 human checkpoint
 - [ ] CI green on Linux, Windows and macOS with the new dependencies (matrix-sdk `markdown`, emojis, chrono, dev-only iced `advanced`).
 - [ ] Revisit plan decisions Q1-Q25.
 - [ ] Seed the 10,000-message room (`cargo run -p tessera-core --example seed_big_room -- 10000`, local homeserver only) and scroll it (Tasks 9 and 13).
 - [ ] Timeline pane (Task 9): scrolling the seeded 10,000-event room stays smooth, with no blank gaps when dragging the scrollbar fast.
-- [ ] Timeline pane (Task 9): the scroll position holds while older messages load at the top (and the "Loading" badge shows over the top edge while they do).
+- [x] Timeline pane (Task 9): the scroll position holds while older messages load at the top (human-confirmed after the scroll-reset fix below, wheel and scrollbar).
+- [ ] Timeline pane (Task 9): the "Loading" badge shows over the top edge while older messages load.
 - [ ] Timeline pane (Task 9): reading history while new messages arrive does not jump; a bottom-anchored view follows new messages.
 - [ ] Timeline pane (Task 9): rows look right in both themes (header and continuation spacing, day dividers, "New messages" in the accent colour, muted state and placeholder rows, highlighted message background, start of room).
 - [ ] Timeline pane (Task 9): a row that is replaced in place (for example a message edited or a local echo that is sent) ends up the right height, with no gap or overlap (sensor `on_resize`); the estimate constants in `timeline.rs` are tuned by eye so the scrollbar does not jump as rows are measured.
