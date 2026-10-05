@@ -298,6 +298,12 @@ async fn reply_round_trip() {
         })
     })
     .await;
+    // The quote names the original's event (event IDs are the same for
+    // everyone; alice's copy of carol's message carries it).
+    let (quoted, _) = received(&p.alice_items, &original).expect("alice has it");
+    let (_, reply) = received(&p.carol_items, "the answer").expect("carol has the reply");
+    let target = &reply.reply_to.as_ref().expect("a reply").event_id;
+    assert_eq!(quoted.event_id.as_ref(), Some(target));
     p.finish().await;
 }
 

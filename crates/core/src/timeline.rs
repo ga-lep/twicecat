@@ -12,9 +12,9 @@ use matrix_sdk_ui::timeline::{
 };
 
 use crate::api::{
-    CoreError, ItemActions, Member, MessageDetails, MessageKind, PlaceholderKind, ReactionGroup,
-    ReplyPreview, ReplyState, RoomId, SendFailure, SendStatus, StateChange, TimelineItem,
-    TimelineItemKind, UserId,
+    CoreError, EventId, ItemActions, Member, MessageDetails, MessageKind, PlaceholderKind,
+    ReactionGroup, ReplyPreview, ReplyState, RoomId, SendFailure, SendStatus, StateChange,
+    TimelineItem, TimelineItemKind, UserId,
 };
 use crate::rich_text;
 
@@ -65,6 +65,7 @@ pub(crate) fn map_item(item: &SdkItem, own: Option<&SdkUserId>) -> TimelineItem 
         return TimelineItem::new(id, TimelineItemKind::Other);
     };
     let mut mapped = TimelineItem::new(id, map_event(event, own));
+    mapped.event_id = event.event_id().map(|e| EventId::from(e.to_string()));
     mapped.read_by = receipts_without_own(event.read_receipts().keys().map(|u| &**u), own);
     mapped
 }
@@ -266,6 +267,7 @@ pub(crate) fn map_membership(
 /// Maps the reply details of a message. When the quoted event is not loaded
 /// its sender is unknown and left empty.
 fn map_reply(reply: &InReplyToDetails) -> ReplyPreview {
+    let event_id = EventId::from(reply.event_id.to_string());
     match &reply.event {
         TimelineDetails::Ready(embedded) => {
             let EmbeddedEvent {
@@ -275,6 +277,7 @@ fn map_reply(reply: &InReplyToDetails) -> ReplyPreview {
                 ..
             } = &**embedded;
             ReplyPreview {
+                event_id,
                 sender: user(sender),
                 sender_name: profile_name(sender_profile),
                 body: content
@@ -284,6 +287,7 @@ fn map_reply(reply: &InReplyToDetails) -> ReplyPreview {
             }
         }
         other => ReplyPreview {
+            event_id,
             sender: UserId::from(String::new()),
             sender_name: None,
             body: String::new(),

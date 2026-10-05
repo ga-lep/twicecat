@@ -11,9 +11,9 @@ use iced::theme;
 use iced::widget::{operation, scrollable};
 use iced::{Element, Subscription, Task, Theme, clipboard, system, window};
 use tessera_core::api::{
-    ActionKind, Command, CoreError, CoreEvent, ListDiff, MessageDetails, MessageText, Password,
-    RoomId, RoomListQuery, RoomListTab, RoomSummary, SyncState, TimelineItem, TimelineItemKind,
-    TypingUser, UserId,
+    ActionKind, Command, CoreError, CoreEvent, EventId, ListDiff, MessageDetails, MessageText,
+    Password, RoomId, RoomListQuery, RoomListTab, RoomSummary, SyncState, TimelineItem,
+    TimelineItemKind, TypingUser, UserId,
 };
 use tokio::sync::mpsc;
 
@@ -32,6 +32,9 @@ use crate::timeline::{self, Effects, TimelineView};
 
 /// How long to wait for the core to close after `Shutdown` (plan Q18).
 pub const SHUTDOWN_WAIT: Duration = Duration::from_secs(10);
+/// The notice when a reply's original is not found.
+pub const JUMP_FAILED_TEXT: &str =
+    "Could not find the original message (searched about 1,000 earlier messages)";
 
 /// Starts the system handler for a checked link, away from `update`.
 fn open_link_task(url: links::CheckedUrl) -> Task<Message> {
@@ -179,6 +182,10 @@ pub enum Message {
     },
     /// The failure notice with this sequence number timed out.
     NoticeExpired(u64),
+    /// A reply's quote was clicked: jump to the quoted message.
+    ReplyQuoteClicked(EventId),
+    /// The highlight of the row jumped to timed out.
+    FlashEnded(String),
     /// The user pressed **Log out**.
     LogoutRequested,
     /// The user picked a room in the list.
@@ -548,6 +555,17 @@ impl App {
                 if self.actions.notice.as_ref().is_some_and(|n| n.seq == seq) {
                     self.actions.notice = None;
                 }
+                Task::none()
+            }
+            Message::ReplyQuoteClicked(event_id) => {
+                if self.selected.is_none() {
+                    return Task::none();
+                }
+                let effects = self.timeline.jump_to(event_id);
+                self.timeline_effects(effects)
+            }
+            Message::FlashEnded(id) => {
+                self.timeline.flash_ended(&id);
                 Task::none()
             }
             Message::LogoutRequested => self.send(Command::Logout),
@@ -1093,6 +1111,11 @@ impl App {
         let Some(text) = actions::notice_text(action, &safe_line(&error.to_string())) else {
             return Task::none();
         };
+        self.show_notice_text(text)
+    }
+
+    /// Shows a failure line for 5 seconds.
+    fn show_notice_text(&mut self, text: String) -> Task<Message> {
         let seq = self.actions.notice_seq.saturating_add(1);
         self.actions.notice_seq = seq;
         self.actions.notice = Some(Notice { seq, text });
@@ -1255,6 +1278,15 @@ impl App {
             && let Some(room_id) = self.selected.clone()
         {
             tasks.push(self.send(Command::PaginateBackwards { room_id }));
+        }
+        if let Some(id) = effects.flash {
+            tasks.push(
+                self.sink
+                    .timer(timeline::FLASH_DURATION, Message::FlashEnded(id)),
+            );
+        }
+        if effects.jump_failed {
+            tasks.push(self.show_notice_text(JUMP_FAILED_TEXT.to_owned()));
         }
         tasks.push(self.read_receipt(Instant::now()));
         Task::batch(tasks)
@@ -2843,6 +2875,79 @@ mod tests {
         let _ = app.update(Message::PickerOpened("theirs".into()));
         let _ = app.update(Message::PickerQuery(key("secret-query-x")));
         assert!(!format!("{app:?}").contains("secret-query-x"));
+    }
+
+    // ---- jumping to a reply's original ------------------------------------
+
+    fn with_event(mut item: TimelineItem, event: &str) -> TimelineItem {
+        item.event_id = Some(EventId::from(event));
+        item
+    }
+
+    #[test]
+    fn clicking_a_quote_of_a_loaded_message_flashes_it() {
+        let (mut app, mut rx) = main_app();
+        append(
+            &mut app,
+            vec![
+                with_event(message_item("q", "question", false, ALL_ACTIONS), "$q"),
+                with_event(message_item("r", "answer", false, ALL_ACTIONS), "$r"),
+            ],
+        );
+        let _ = drain(&mut rx);
+        let _ = app.update(Message::ReplyQuoteClicked(EventId::from("$q")));
+        assert_eq!(app.timeline.flash.as_deref(), Some("q"));
+        assert!(app.actions.notice.is_none());
+        let _ = app.update(Message::FlashEnded("q".into()));
+        assert_eq!(app.timeline.flash, None);
+    }
+
+    #[test]
+    fn clicking_a_quote_of_an_unloaded_message_pages_back() {
+        let (mut app, mut rx) = main_app();
+        append(
+            &mut app,
+            vec![message_item("r", "answer", false, ALL_ACTIONS)],
+        );
+        // Let any pagination of the short timeline finish first.
+        let _ = app.update(core(CoreEvent::Pagination {
+            room_id: RoomId::from("!a:x"),
+            state: tessera_core::api::PaginationState::Idle,
+        }));
+        let _ = drain(&mut rx);
+        let _ = app.update(Message::ReplyQuoteClicked(EventId::from("$old")));
+        assert!(
+            drain(&mut rx)
+                .iter()
+                .any(|c| matches!(c, Command::PaginateBackwards { .. }))
+        );
+        assert!(app.timeline.jump.is_some());
+    }
+
+    #[test]
+    fn a_jump_that_reaches_the_start_shows_a_notice() {
+        let (mut app, mut rx) = main_app();
+        append(
+            &mut app,
+            vec![message_item("r", "answer", false, ALL_ACTIONS)],
+        );
+        let _ = drain(&mut rx);
+        let _ = app.update(Message::ReplyQuoteClicked(EventId::from("$gone")));
+        let _ = app.update(core(CoreEvent::Pagination {
+            room_id: RoomId::from("!a:x"),
+            state: tessera_core::api::PaginationState::ReachedStart,
+        }));
+        let _ = app.update(core(CoreEvent::TimelineDiff {
+            room_id: RoomId::from("!a:x"),
+            diffs: vec![ListDiff::PushFront {
+                value: TimelineItem::new("start".into(), TimelineItemKind::TimelineStart),
+            }],
+        }));
+        assert_eq!(
+            app.actions.notice.as_ref().map(|n| n.text.as_str()),
+            Some(JUMP_FAILED_TEXT)
+        );
+        assert!(app.timeline.jump.is_none());
     }
 
     // ---- Task 13: receipts, typing and local echoes ----

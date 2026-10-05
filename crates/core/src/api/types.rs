@@ -51,6 +51,10 @@ string_newtype!(
     DeviceId
 );
 string_newtype!(
+    /// A Matrix event ID such as `$abc`.
+    EventId
+);
+string_newtype!(
     /// Identifies an avatar image; holds its `mxc://` URI. The core checks the
     /// URI when the avatar is fetched, not when the ID is built.
     AvatarId
@@ -548,6 +552,8 @@ pub enum ReplyState {
 /// The message a reply answers. `Debug` hides the body.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ReplyPreview {
+    /// The quoted message's event.
+    pub event_id: EventId,
     /// Sender of the quoted message.
     pub sender: UserId,
     /// Their display name, when known.
@@ -562,6 +568,7 @@ pub struct ReplyPreview {
 impl fmt::Debug for ReplyPreview {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ReplyPreview")
+            .field("event_id", &self.event_id)
             .field("sender", &self.sender)
             .field("sender_name", &self.sender_name)
             .field(
@@ -992,6 +999,9 @@ impl fmt::Debug for TimelineItemKind {
 pub struct TimelineItem {
     /// Stable identifier of the item within its timeline.
     pub id: String,
+    /// The Matrix event, once the server has one (not for dividers, markers
+    /// or local echoes not sent yet).
+    pub event_id: Option<EventId>,
     /// Content.
     pub kind: TimelineItemKind,
     /// Other users whose read receipt points at this item (at most 20).
@@ -1009,6 +1019,7 @@ impl TimelineItem {
     pub fn new(id: String, kind: TimelineItemKind) -> Self {
         Self {
             id,
+            event_id: None,
             kind,
             read_by: Vec::new(),
         }

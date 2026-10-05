@@ -15,7 +15,8 @@ use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use tessera_core::api::{
-    Block, Inline, ListDiff, PaginationState, RichText, SendStatus, TimelineItem, TimelineItemKind,
+    Block, EventId, Inline, ListDiff, PaginationState, RichText, SendStatus, TimelineItem,
+    TimelineItemKind,
 };
 
 /// How far outside the viewport rows are built, in pixels.
@@ -44,6 +45,13 @@ pub const RECEIPT_MIN_INTERVAL: Duration = Duration::from_secs(1);
 pub const MAX_TYPING_KEPT: usize = 3;
 /// The id of the timeline's scrollable.
 pub const TIMELINE_ID: &str = "timeline";
+/// Pages (of the core's 20 events) searched for a reply's original before
+/// giving up: about 1,000 messages.
+pub const JUMP_MAX_PAGES: u32 = 50;
+/// How long the row jumped to stays highlighted.
+pub const FLASH_DURATION: Duration = Duration::from_secs(2);
+/// Where the row jumped to lands: this fraction of the viewport below its top.
+const JUMP_TOP_FRACTION: f32 = 0.3;
 
 /// Anchor candidates kept on each side of the anchor item.
 const CANDIDATE_REACH: usize = 8;
@@ -459,12 +467,27 @@ pub enum ReadStep {
 }
 
 /// What the app has to do after a change of the view.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Effects {
     /// Scroll the timeline to this offset from the bottom.
     pub scroll_to: Option<f32>,
     /// Send `PaginateBackwards`.
     pub paginate: bool,
+    /// A jump reached this item: end its highlight after [`FLASH_DURATION`].
+    pub flash: Option<String>,
+    /// A jump gave up: the original is not in the room's loadable history.
+    pub jump_failed: bool,
+}
+
+/// A search for a reply's original (see [`TimelineView::jump_to`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Jump {
+    /// The event looked for.
+    pub event_id: EventId,
+    /// Pages that may still be asked for.
+    pub pages_left: u32,
+    /// A page was asked for in this `Idle` period.
+    asked: bool,
 }
 
 /// Applies a diff, taking ownership so that a `Reset` moves the new list in
@@ -538,6 +561,10 @@ pub struct TimelineView {
     /// The offset from the bottom at which `PaginateBackwards` was sent in
     /// this `Idle` period.
     requested_at: Option<f32>,
+    /// A running search for a reply's original.
+    pub jump: Option<Jump>,
+    /// The row highlighted after a jump.
+    pub flash: Option<String>,
 }
 
 impl Default for TimelineView {
@@ -557,6 +584,8 @@ impl Default for TimelineView {
             receipt_timer_armed: false,
             last_scroll_request: None,
             requested_at: None,
+            jump: None,
+            flash: None,
         }
     }
 }
@@ -705,6 +734,80 @@ impl TimelineView {
         effects
     }
 
+    /// Scrolls to the message of `event_id` and highlights it, or searches
+    /// older history for it, a page at a time (at most [`JUMP_MAX_PAGES`]).
+    pub fn jump_to(&mut self, event_id: EventId) -> Effects {
+        self.jump = Some(Jump {
+            event_id,
+            pages_left: JUMP_MAX_PAGES,
+            asked: false,
+        });
+        let mut effects = Effects::default();
+        self.drive_jump(&mut effects, true);
+        effects
+    }
+
+    /// The highlight timer of `id` ended.
+    pub fn flash_ended(&mut self, id: &str) {
+        if self.flash.as_deref() == Some(id) {
+            self.flash = None;
+        }
+    }
+
+    /// Advances a running jump. `items_changed` is true only for new items
+    /// (or the jump's start): the core reports `Idle` before a page's items
+    /// arrive, so the jump may give up only once they are in.
+    fn drive_jump(&mut self, effects: &mut Effects, items_changed: bool) {
+        let Some(jump) = &self.jump else {
+            return;
+        };
+        let found = self
+            .items
+            .iter()
+            .position(|item| item.event_id.as_ref() == Some(&jump.event_id));
+        if let Some(i) = found {
+            self.jump = None;
+            effects.scroll_to = Some(self.scroll_to_item(i));
+            let id = self.items[i].id.clone();
+            self.flash = Some(id.clone());
+            effects.flash = Some(id);
+            return;
+        }
+        let at_start = self.has_start_item() || self.pagination == PaginationState::ReachedStart;
+        let Some(jump) = &mut self.jump else {
+            return;
+        };
+        if jump.asked {
+            return;
+        }
+        if jump.pages_left == 0 || at_start {
+            if items_changed {
+                self.jump = None;
+                effects.jump_failed = true;
+            }
+            return;
+        }
+        if self.pagination == PaginationState::Idle {
+            jump.asked = true;
+            jump.pages_left -= 1;
+            effects.paginate = true;
+        }
+    }
+
+    /// Puts item `i` [`JUMP_TOP_FRACTION`] of the viewport below its top (as
+    /// near as the content allows) and returns the new offset.
+    fn scroll_to_item(&mut self, i: usize) -> f32 {
+        let total = self.total();
+        let vh = self.viewport_h;
+        let top = (self.prefix[i] - vh * JUMP_TOP_FRACTION).max(0.0);
+        let max_offset = (total - vh).max(0.0);
+        let offset = (total - vh - top).clamp(0.0, max_offset);
+        self.offset_from_bottom = offset;
+        self.last_scroll_request = Some(offset);
+        self.anchor = record_anchor(&self.items, &self.prefix, offset, vh);
+        offset
+    }
+
     /// Q16, once per `Idle` period (see [`RETRY_SCROLL_PX`]).
     fn check_pagination(&mut self) -> bool {
         if self.has_start_item() {
@@ -732,7 +835,9 @@ impl TimelineView {
             self.measured.retain(|id, _| live.contains(id.as_str()));
         }
         self.prefix = rebuild_prefix(&self.items, &self.measured, self.width);
-        self.settle(&candidates)
+        let mut effects = self.settle(&candidates);
+        self.drive_jump(&mut effects, true);
+        effects
     }
 
     /// Records the measured height of a row. Unknown items and heights that
@@ -778,8 +883,8 @@ impl TimelineView {
             self.viewport_h,
         );
         Effects {
-            scroll_to: None,
             paginate: self.check_pagination(),
+            ..Effects::default()
         }
     }
 
@@ -789,11 +894,16 @@ impl TimelineView {
         if state != PaginationState::Loading {
             // A new period: a request may be sent again.
             self.requested_at = None;
+            if let Some(jump) = &mut self.jump {
+                jump.asked = false;
+            }
         }
-        Effects {
-            scroll_to: None,
+        let mut effects = Effects {
             paginate: self.check_pagination(),
-        }
+            ..Effects::default()
+        };
+        self.drive_jump(&mut effects, false);
+        effects
     }
 }
 
@@ -803,7 +913,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use tessera_core::api::{
-        Block, Command, CoreEvent, Inline, ListDiff, MessageDetails, PaginationState,
+        Block, Command, CoreEvent, EventId, Inline, ListDiff, MessageDetails, PaginationState,
         PlaceholderKind, ReactionGroup, RichText, RoomId, RoomSummary, SendStatus, StateChange,
         TextStyle, TimelineItem, TimelineItemKind, UserId,
     };
@@ -1879,6 +1989,139 @@ mod tests {
         view.reset();
         assert!(!view.bottom_seen);
         assert_eq!(view.last_marked, None);
+    }
+
+    // ---- jumping to a reply's original ------------------------------------
+
+    fn with_event(mut item: TimelineItem, event: &str) -> TimelineItem {
+        item.event_id = Some(EventId::from(event));
+        item
+    }
+
+    /// 40 messages `m0`..`m39` with events `$0`..`$39`, scrolled to the bottom.
+    fn loaded(n: usize) -> TimelineView {
+        let items = (0..n)
+            .map(|i| with_event(msg(&format!("m{i}"), "@a:x", i as u64), &format!("${i}")))
+            .collect();
+        let mut view = view_with(items);
+        let _ = view.scrolled(0.0, 300.0, 800.0);
+        view
+    }
+
+    fn page(view: &mut TimelineView, from: usize, to: usize) -> Effects {
+        let diffs = (from..to)
+            .map(|i| ListDiff::Insert {
+                index: i - from,
+                value: with_event(msg(&format!("old{i}"), "@a:x", 0), &format!("$old{i}")),
+            })
+            .collect();
+        view.apply_diffs(diffs)
+    }
+
+    #[test]
+    fn jumping_to_a_loaded_message_scrolls_to_it_and_flashes_it() {
+        let mut view = loaded(40);
+        let effects = view.jump_to(EventId::from("$5"));
+        let wanted = effects.scroll_to.expect("a scroll");
+        assert!(!effects.paginate && !effects.jump_failed);
+        assert_eq!(effects.flash.as_deref(), Some("m5"));
+        assert_eq!(view.flash.as_deref(), Some("m5"));
+        // m5 is in the viewport, in its upper part.
+        let total = view.total();
+        let top = total - wanted - view.viewport_h;
+        assert!(view.prefix[5] >= top && view.prefix[6] <= top + view.viewport_h);
+        assert!(view.prefix[5] - top < view.viewport_h / 2.0);
+    }
+
+    #[test]
+    fn jumping_to_an_unloaded_message_pages_back_until_it_arrives() {
+        let mut view = loaded(40);
+        let first = view.jump_to(EventId::from("$old3"));
+        assert!(first.paginate && first.scroll_to.is_none() && !first.jump_failed);
+        // The core reports Loading, then Idle before the page's items.
+        let loading = view.pagination_changed(PaginationState::Loading);
+        assert!(!loading.paginate);
+        let idle = view.pagination_changed(PaginationState::Idle);
+        assert!(idle.paginate, "the next page is asked at once");
+        let _ = view.pagination_changed(PaginationState::Loading);
+        // A page without the target: still searching.
+        let miss = page(&mut view, 20, 40);
+        assert!(miss.flash.is_none() && !miss.jump_failed);
+        let _ = view.pagination_changed(PaginationState::Idle);
+        let _ = view.pagination_changed(PaginationState::Loading);
+        let hit = page(&mut view, 0, 20);
+        assert_eq!(hit.flash.as_deref(), Some("old3"));
+        assert!(hit.scroll_to.is_some());
+        assert!(view.jump.is_none());
+    }
+
+    #[test]
+    fn a_jump_gives_up_at_the_start_of_the_room() {
+        let mut view = loaded(40);
+        let _ = view.jump_to(EventId::from("$nowhere"));
+        let _ = view.pagination_changed(PaginationState::Loading);
+        let _ = view.pagination_changed(PaginationState::ReachedStart);
+        let start = TimelineItem::new("start".into(), TimelineItemKind::TimelineStart);
+        let effects = view.apply_diffs(vec![ListDiff::PushFront { value: start }]);
+        assert!(effects.jump_failed);
+        assert!(view.jump.is_none());
+    }
+
+    #[test]
+    fn a_jump_gives_up_after_its_page_budget() {
+        let mut view = loaded(40);
+        let mut effects = view.jump_to(EventId::from("$nowhere"));
+        let mut pages = 0;
+        let mut next = 1000;
+        while !effects.jump_failed {
+            assert!(pages <= JUMP_MAX_PAGES, "never gave up");
+            if effects.paginate {
+                pages += 1;
+            }
+            let _ = view.pagination_changed(PaginationState::Loading);
+            let idle = view.pagination_changed(PaginationState::Idle);
+            pages += u32::from(idle.paginate);
+            effects = page(&mut view, next, next + 20);
+            next += 20;
+        }
+        assert_eq!(pages, JUMP_MAX_PAGES);
+    }
+
+    #[test]
+    fn a_row_measured_before_the_last_page_arrives_does_not_end_the_jump() {
+        let mut view = loaded(40);
+        let mut effects = view.jump_to(EventId::from("$nowhere"));
+        // Spend the budget, then reach the Idle that precedes the last page.
+        while view.jump.as_ref().is_some_and(|j| j.pages_left > 0) {
+            let _ = view.pagination_changed(PaginationState::Loading);
+            effects = view.pagination_changed(PaginationState::Idle);
+        }
+        assert!(!effects.jump_failed);
+        // The last page is in flight; its Idle comes before its items.
+        let _ = view.pagination_changed(PaginationState::Loading);
+        let _ = view.pagination_changed(PaginationState::Idle);
+        let measured = view.row_measured("m39", 123.0);
+        assert!(!measured.jump_failed && view.jump.is_some());
+        assert!(page(&mut view, 900, 920).jump_failed);
+    }
+
+    #[test]
+    fn a_flash_ends_only_for_its_own_row() {
+        let mut view = loaded(10);
+        let _ = view.jump_to(EventId::from("$2"));
+        view.flash_ended("m3");
+        assert_eq!(view.flash.as_deref(), Some("m2"));
+        view.flash_ended("m2");
+        assert_eq!(view.flash, None);
+    }
+
+    #[test]
+    fn selecting_another_room_drops_the_jump_and_the_flash() {
+        let mut view = loaded(10);
+        let _ = view.jump_to(EventId::from("$2"));
+        let _ = view.jump_to(EventId::from("$elsewhere"));
+        view.reset();
+        assert!(view.jump.is_none() && view.flash.is_none());
     }
 
     #[test]

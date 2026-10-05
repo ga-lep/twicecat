@@ -10,11 +10,12 @@ mod types;
 
 pub use diff::ListDiff;
 pub use types::{
-    ActionKind, AuthUrl, AvatarId, AvatarImage, Block, CoreError, DeviceId, Inline, ItemActions,
-    Member, MentionRef, MentionTarget, MessageDetails, MessageKind, MessagePreview, MessageText,
-    OutgoingMessage, PaginationState, Password, PlaceholderKind, ReactionGroup, ReplyPreview,
-    ReplyState, RichText, RoomId, RoomListQuery, RoomListTab, RoomSummary, SendFailure, SendStatus,
-    StateChange, SyncState, TextStyle, TimelineItem, TimelineItemKind, TypingUser, UserId,
+    ActionKind, AuthUrl, AvatarId, AvatarImage, Block, CoreError, DeviceId, EventId, Inline,
+    ItemActions, Member, MentionRef, MentionTarget, MessageDetails, MessageKind, MessagePreview,
+    MessageText, OutgoingMessage, PaginationState, Password, PlaceholderKind, ReactionGroup,
+    ReplyPreview, ReplyState, RichText, RoomId, RoomListQuery, RoomListTab, RoomSummary,
+    SendFailure, SendStatus, StateChange, SyncState, TextStyle, TimelineItem, TimelineItemKind,
+    TypingUser, UserId,
 };
 
 /// A request from the front end to the engine.
@@ -504,6 +505,7 @@ mod tests {
 
     fn preview_reply() -> ReplyPreview {
         ReplyPreview {
+            event_id: EventId::from("$e"),
             sender: UserId::from("@a:x"),
             sender_name: Some("Ann".into()),
             body: "secret-body-x".into(),

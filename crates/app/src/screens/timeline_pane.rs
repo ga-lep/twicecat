@@ -13,12 +13,13 @@ use std::cell::Cell;
 use chrono::{Local, TimeZone};
 use iced::font::{Style as FontStyle, Weight};
 use iced::widget::{
-    Column, Row, button, container, mouse_area, row, scrollable, sensor, space, stack, text,
+    Column, Row, button, column, container, mouse_area, row, rule, scrollable, sensor, space,
+    stack, text,
 };
-use iced::{Background, Color, Element, Fill, Font, Padding, Theme};
+use iced::{Background, Color, Element, Fill, Font, Padding, Shrink, Theme, mouse};
 use tessera_core::api::{
-    MessageDetails, MessageText, PaginationState, PlaceholderKind, ReactionGroup, SendStatus,
-    StateChange, TimelineItem, TimelineItemKind, TypingUser, UserId,
+    MessageDetails, MessageText, PaginationState, PlaceholderKind, ReactionGroup, ReplyPreview,
+    ReplyState, SendStatus, StateChange, TimelineItem, TimelineItemKind, TypingUser, UserId,
 };
 
 use crate::actions::{self, ActionButtons, ActionState};
@@ -39,6 +40,8 @@ pub const MAX_BODY_LINES: usize = 200;
 
 /// How many characters of an event type are shown.
 const MAX_EVENT_TYPE_CHARS: usize = 64;
+/// Longest reply quote line, in characters (the core already cuts at 200).
+const MAX_QUOTE_CHARS: usize = 200;
 
 /// What the pane needs besides the timeline to draw formatted text.
 #[derive(Clone, Copy)]
@@ -177,6 +180,9 @@ fn row_content<'a, Tz: TimeZone>(
                 );
                 content = content.push(header(name, time_label(*timestamp_ms, tz)));
             }
+            if let Some(reply) = &details.reply_to {
+                content = content.push(reply_quote(reply));
+            }
             // The body sits below the header in its own widget, so it cannot
             // pass for a sender line. Rich text has no muted colour and no
             // small size, so it cannot copy the time next to a name either.
@@ -200,8 +206,12 @@ fn row_content<'a, Tz: TimeZone>(
             if let Some(line) = receipts_row(items, i) {
                 content = content.push(line);
             }
-            let hovered = bar_visible(env.actions, &items[i].id);
-            let framed = framed(content.into(), continuation, details.highlighted, hovered);
+            let look = RowLook {
+                highlighted: details.highlighted,
+                hovered: bar_visible(env.actions, &items[i].id),
+                flashed: timeline.flash.as_deref() == Some(items[i].id.as_str()),
+            };
+            let framed = framed(content.into(), continuation, look);
             with_actions(&items[i].id, framed, buttons, env.actions)
         }
         TimelineItemKind::Placeholder {
@@ -226,7 +236,7 @@ fn row_content<'a, Tz: TimeZone>(
             if let Some(line) = receipts_row(items, i) {
                 content = content.push(line);
             }
-            framed(content.into(), continuation, false, false)
+            framed(content.into(), continuation, RowLook::default())
         }
         TimelineItemKind::State {
             sender,
@@ -472,17 +482,77 @@ fn header<'a>(name: String, time: String) -> Element<'a, Message> {
         .into()
 }
 
-/// The background of a message row: the mention highlight, else the hover
-/// background under the pointer (so each message of a run from one sender
-/// shows where it starts and ends), else none.
-pub fn row_background(sem: &theme::Semantic, highlighted: bool, hovered: bool) -> Option<Color> {
-    if highlighted {
+/// What decides the background of a message row.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RowLook {
+    /// The message mentions the user.
+    pub highlighted: bool,
+    /// The pointer is over the row.
+    pub hovered: bool,
+    /// A reply quote jumped to this row a moment ago.
+    pub flashed: bool,
+}
+
+/// The background of a message row: the jump flash, else the mention
+/// highlight, else the hover background under the pointer (so each message
+/// of a run from one sender shows where it starts and ends), else none.
+pub fn row_background(sem: &theme::Semantic, look: RowLook) -> Option<Color> {
+    if look.flashed {
+        Some(sem.selection)
+    } else if look.highlighted {
         Some(sem.message_highlight)
-    } else if hovered {
+    } else if look.hovered {
         Some(sem.message_hover)
     } else {
         None
     }
+}
+
+/// The sender and the line of a reply quote, sanitised and capped.
+pub fn reply_quote_text(reply: &ReplyPreview) -> (String, String) {
+    match reply.state {
+        ReplyState::Ready => {
+            let name = sender_label(reply.sender_name.as_deref(), false, &reply.sender);
+            let line = one_line_capped(&reply.body, MAX_QUOTE_CHARS);
+            let line = if line.trim().is_empty() {
+                "(no text)".to_owned()
+            } else {
+                line
+            };
+            (name, line)
+        }
+        ReplyState::Loading => (
+            "Reply".to_owned(),
+            "Loading the original message\u{2026}".to_owned(),
+        ),
+        ReplyState::Unavailable => (
+            "Reply".to_owned(),
+            "Original message unavailable".to_owned(),
+        ),
+    }
+}
+
+/// The quote above a reply. Clicking it jumps to the original.
+fn reply_quote<'a>(reply: &ReplyPreview) -> Element<'a, Message> {
+    let (name, line) = reply_quote_text(reply);
+    let quote = row![
+        rule::vertical(3),
+        column![
+            text(name).size(12).font(BOLD),
+            text(line).size(13).style(muted),
+        ]
+        .width(Fill),
+    ]
+    .spacing(8)
+    .height(Shrink);
+    let padded = container(quote).padding(Padding {
+        bottom: 4.0,
+        ..Padding::ZERO
+    });
+    mouse_area(padded)
+        .on_press(Message::ReplyQuoteClicked(reply.event_id.clone()))
+        .interaction(mouse::Interaction::Pointer)
+        .into()
 }
 
 /// Pads a message row: indented, with less space above a continuation, on
@@ -490,8 +560,7 @@ pub fn row_background(sem: &theme::Semantic, highlighted: bool, hovered: bool) -
 fn framed(
     content: Element<'_, Message>,
     continuation: bool,
-    highlighted: bool,
-    hovered: bool,
+    look: RowLook,
 ) -> Element<'_, Message> {
     let padded = container(content).width(Fill).padding(Padding {
         top: if continuation {
@@ -503,13 +572,12 @@ fn framed(
         bottom: 0.0,
         left: INDENT_PX,
     });
-    if !highlighted && !hovered {
+    if look == RowLook::default() {
         return padded.into();
     }
     padded
         .style(move |theme: &Theme| container::Style {
-            background: row_background(&theme::semantic(theme), highlighted, hovered)
-                .map(Background::Color),
+            background: row_background(&theme::semantic(theme), look).map(Background::Color),
             ..container::Style::default()
         })
         .into()
@@ -798,6 +866,8 @@ thread_local! {
 
 #[cfg(test)]
 mod tests {
+    use tessera_core::api::EventId;
+
     use super::*;
 
     #[test]
@@ -1094,16 +1164,77 @@ mod tests {
     #[test]
     fn a_hovered_row_gets_the_hover_background_and_a_mention_keeps_its_own() {
         let sem = theme::LIGHT_SEMANTIC;
-        assert_eq!(row_background(&sem, false, false), None);
-        assert_eq!(row_background(&sem, false, true), Some(sem.message_hover));
+        let bg = |highlighted, hovered| {
+            row_background(
+                &sem,
+                RowLook {
+                    highlighted,
+                    hovered,
+                    flashed: false,
+                },
+            )
+        };
+        assert_eq!(bg(false, false), None);
+        assert_eq!(bg(false, true), Some(sem.message_hover));
+        assert_eq!(bg(true, false), Some(sem.message_highlight));
+        assert_eq!(bg(true, true), Some(sem.message_highlight));
+    }
+
+    #[test]
+    fn a_flashed_row_wins_over_the_mention_and_the_hover() {
+        let sem = theme::LIGHT_SEMANTIC;
+        let look = RowLook {
+            highlighted: true,
+            hovered: true,
+            flashed: true,
+        };
+        assert_eq!(row_background(&sem, look), Some(sem.selection));
+    }
+
+    fn preview(state: ReplyState, name: Option<&str>, body: &str) -> ReplyPreview {
+        ReplyPreview {
+            event_id: EventId::from("$e"),
+            sender: UserId::from(if state == ReplyState::Ready {
+                "@bob:x"
+            } else {
+                ""
+            }),
+            sender_name: name.map(str::to_owned),
+            body: body.to_owned(),
+            state,
+        }
+    }
+
+    #[test]
+    fn the_reply_quote_names_the_sender_and_shows_one_line() {
+        let ready = preview(ReplyState::Ready, Some("Bob"), "the question");
         assert_eq!(
-            row_background(&sem, true, false),
-            Some(sem.message_highlight)
+            reply_quote_text(&ready),
+            ("Bob".to_owned(), "the question".to_owned())
         );
+        let no_name = preview(ReplyState::Ready, None, "hi");
+        assert_eq!(reply_quote_text(&no_name).0, "@bob:x");
+        let empty = preview(ReplyState::Ready, Some("Bob"), "");
+        assert_eq!(reply_quote_text(&empty).1, "(no text)");
+        let loading = preview(ReplyState::Loading, None, "");
         assert_eq!(
-            row_background(&sem, true, true),
-            Some(sem.message_highlight)
+            reply_quote_text(&loading).1,
+            "Loading the original message\u{2026}"
         );
+        let gone = preview(ReplyState::Unavailable, None, "");
+        assert_eq!(reply_quote_text(&gone).1, "Original message unavailable");
+    }
+
+    #[test]
+    fn the_reply_quote_is_sanitised_and_capped() {
+        let evil = preview(
+            ReplyState::Ready,
+            Some("Mallory\u{202E}evil"),
+            &format!("line\u{202E}one{}", "x".repeat(500)),
+        );
+        let (name, body) = reply_quote_text(&evil);
+        assert!(!name.contains('\u{202E}') && !body.contains('\u{202E}'));
+        assert!(body.chars().count() <= 201, "{}", body.chars().count());
     }
 
     #[test]
