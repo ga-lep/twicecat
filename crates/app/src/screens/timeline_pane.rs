@@ -187,6 +187,9 @@ fn row_content<'a, Tz: TimeZone>(
                 echo == Echo::Sending,
                 env,
             ));
+            if let Some(label) = edited_text(details) {
+                content = content.push(text(label).size(12).style(muted));
+            }
             let buttons = actions::action_buttons(details, *is_own);
             if !details.reactions.is_empty() {
                 content = content.push(reactions_row(&items[i].id, &details.reactions, buttons));
@@ -418,6 +421,11 @@ fn body_widget<'a>(
         revealed: env.revealed,
     };
     blocks_view(&details.content, &ctx, env.theme)
+}
+
+/// The marker under an edited message.
+pub fn edited_text(details: &MessageDetails) -> Option<&'static str> {
+    details.edited.then_some("(edited)")
 }
 
 /// The status line of a local echo: muted while sending, in the danger
@@ -1066,6 +1074,16 @@ mod tests {
             echo_of(SendStatus::Failed, &recoverable),
             Echo::Failed { recoverable: true }
         );
+    }
+
+    #[test]
+    fn only_edited_messages_get_the_marker() {
+        let edited = MessageDetails {
+            edited: true,
+            ..MessageDetails::default()
+        };
+        assert_eq!(edited_text(&edited), Some("(edited)"));
+        assert_eq!(edited_text(&MessageDetails::default()), None);
     }
 
     #[test]

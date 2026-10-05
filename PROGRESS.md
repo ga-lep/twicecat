@@ -169,6 +169,10 @@ Phase 3 agent work is done. The Phase 3 human checkpoint below stays open: nothi
 - Tests: `the_scroll_state_survives_a_pagination` (`timeline_pane.rs`: the root and first-layer tags stay the same across `Loading` and `Idle`; seen failing on the old code). `tests/timeline_layout.rs` now goes stack, scrollable, content.
 - Checks: `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` pass. The human confirmed the fix in the real app.
 
+### Edited marker (human-reported at the checkpoint)
+- The core already set `MessageDetails::edited` (`timeline.rs:126`, from `Message::is_edited`), but the pane never drew it. Now `timeline_pane::edited_text` gives "(edited)" for edited messages, shown as a muted 12 px line under the body; the estimate adds `EDITED_H` (18 px). Under the body rather than inline after the last word, because rich text has no muted inline style.
+- Tests (red first): `only_edited_messages_get_the_marker` (`timeline_pane.rs`), `an_edited_message_estimate_has_room_for_its_marker` (`timeline.rs`). Checks: `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` pass. Rendering is on the human checkpoint.
+
 ## Phase 3 human checkpoint
 - [ ] CI green on Linux, Windows and macOS with the new dependencies (matrix-sdk `markdown`, emojis, chrono, dev-only iced `advanced`).
 - [ ] Revisit plan decisions Q1-Q25.
@@ -191,6 +195,7 @@ Phase 3 agent work is done. The Phase 3 human checkpoint below stays open: nothi
 - [ ] Composer (Task 11): typing in the composer shows "typing" on another client (Element) within a few seconds, and stops after you clear the text, send, or switch room; the Escape key unfocus/close behaviour feels right (Escape no longer unfocuses the editor).
 - [ ] Composer (Task 11): the focus stays in the editor after sending and after picking a suggestion with the mouse; the suggestion list and the Reply/Edit bar look right in both themes.
 - [ ] Message actions (Task 12): hovering a message shows the action bar (Reply, Edit on own messages, React, Copy, Delete as the room's power levels allow) and it disappears cleanly when the pointer leaves, with no flicker when moving between rows or onto the bar; the bar does not hide the message text badly on one-line messages.
+- [ ] Edited marker (fix): a message edited in Element or in Tessera shows a muted "(edited)" line under its text, with no gap or overlap with the next row; unedited messages have none.
 - [ ] Message actions (Task 12): reply, edit, delete and react round-trip with Element on the real account (reply shows the quote there; an edit shows "(edited)"; delete asks first, then the message becomes a placeholder; a reaction appears and a second click removes it); a failed delete or reaction shows the red one-line notice for about 5 seconds.
 - [ ] Message actions (Task 12): Copy puts the plain message text on the clipboard (Linux Wayland and X11, Windows, macOS); the reply bar shows the sender and the first line, and the cross and Escape leave the mode; Escape in an edit brings the previous draft back; "typing" on another client stops after leaving an edit.
 - [ ] Message actions (Task 12): the reaction picker opens over the timeline's bottom right corner, takes focus in its search field, Enter picks the first result, clicking an emoji reacts and closes it, the cross closes it; emoji (including ❤️ with its variation selector) draw in the chips and the grid; reaction chips highlight your own reactions and wrap on narrow windows.

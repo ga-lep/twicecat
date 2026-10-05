@@ -70,6 +70,7 @@ const REPLY_H: f32 = 44.0;
 const REACTIONS_H: f32 = 30.0;
 const RECEIPTS_H: f32 = 18.0;
 const FAILURE_H: f32 = 22.0;
+const EDITED_H: f32 = 18.0;
 /// Height of a day divider row.
 pub const DIVIDER_H: f32 = 36.0;
 /// Estimated height of a state event row.
@@ -199,6 +200,9 @@ fn estimate_unclamped(item: &TimelineItem, continuation: bool, width: f32) -> f3
             let mut h = lead + rich_height(&details.content, body, cpl);
             if details.reply_to.is_some() {
                 h += REPLY_H;
+            }
+            if details.edited {
+                h += EDITED_H;
             }
             if !details.reactions.is_empty() {
                 h += REACTIONS_H;
@@ -1882,5 +1886,20 @@ mod tests {
         let sent = estimate_height(&msg("a", "@a:x", 0), false, 800.0);
         let sending = estimate_height(&sending_msg("a"), false, 800.0);
         assert!(sending > sent);
+    }
+
+    #[test]
+    fn an_edited_message_estimate_has_room_for_its_marker() {
+        let plain = estimate_height(&msg("a", "@a:x", 0), false, 800.0);
+        let edited = msg_with(
+            "a",
+            "@a:x",
+            0,
+            MessageDetails {
+                edited: true,
+                ..MessageDetails::default()
+            },
+        );
+        assert!(estimate_height(&edited, false, 800.0) > plain);
     }
 }
