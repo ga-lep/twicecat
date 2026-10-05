@@ -538,6 +538,29 @@ pub enum MessageKind {
     Emote,
 }
 
+/// The unsent text of a room's composer, kept in the session store between
+/// visits and restarts. `Debug` shows sizes only.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Draft {
+    /// The text as typed (markdown source).
+    pub text: MessageText,
+    /// Mentions picked from the suggestions whose labels are in `text`.
+    pub mentions: Vec<MentionRef>,
+    /// The message being replied to.
+    pub reply_to: Option<EventId>,
+}
+
+// Manual impl: the text and labels are user content.
+impl fmt::Debug for Draft {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Draft")
+            .field("text", &self.text)
+            .field("mentions", &self.mentions.len())
+            .field("reply_to", &self.reply_to.is_some())
+            .finish()
+    }
+}
+
 /// How the text of an [`OutgoingMessage`] is turned into an event (the
 /// composer's `/plain` and `/html` commands, as in Element).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

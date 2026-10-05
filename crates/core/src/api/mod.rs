@@ -10,7 +10,7 @@ mod types;
 
 pub use diff::ListDiff;
 pub use types::{
-    ActionKind, AuthUrl, AvatarId, AvatarImage, Block, CoreError, DeviceId, EventId, Inline,
+    ActionKind, AuthUrl, AvatarId, AvatarImage, Block, CoreError, DeviceId, Draft, EventId, Inline,
     ItemActions, Member, MentionRef, MentionTarget, MessageDetails, MessageKind, MessagePreview,
     MessageText, OutgoingMessage, PaginationState, Password, PlaceholderKind, ReactionGroup,
     ReplyPreview, ReplyState, RichText, RoomId, RoomListQuery, RoomListTab, RoomSummary,
@@ -129,6 +129,14 @@ pub enum Command {
         /// Text to match.
         query: String,
     },
+    /// Keep `draft` as the room's composer draft in the session store, or
+    /// remove it (`None`).
+    SaveDraft {
+        /// Room.
+        room_id: RoomId,
+        /// The draft; `None` clears it.
+        draft: Option<Draft>,
+    },
     /// Log out and delete the local session.
     Logout,
     /// Stop the engine.
@@ -227,6 +235,11 @@ impl fmt::Debug for Command {
                 .field("room_id", room_id)
                 .field("query", &format_args!("<redacted, {} bytes>", query.len()))
                 .finish(),
+            Self::SaveDraft { room_id, draft } => f
+                .debug_struct("SaveDraft")
+                .field("room_id", room_id)
+                .field("draft", draft)
+                .finish(),
             Self::Logout => f.write_str("Logout"),
             Self::Shutdown => f.write_str("Shutdown"),
         }
@@ -308,6 +321,14 @@ pub enum CoreEvent {
         query: MessageText,
         /// Matching members.
         members: Vec<Member>,
+    },
+    /// The stored composer draft of a room just opened; sent after the
+    /// room's first timeline items, only when there is one.
+    DraftLoaded {
+        /// Room.
+        room_id: RoomId,
+        /// The draft.
+        draft: Draft,
     },
     /// An action on a room or item failed.
     ActionFailed {

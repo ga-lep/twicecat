@@ -775,6 +775,45 @@ impl Composer {
             .perform(Action::Move(text_editor::Motion::DocumentEnd));
     }
 
+    /// What to keep as the room's draft: the text and the picked mentions
+    /// still in it, with the item being replied to. During an edit, the
+    /// draft the edit set aside (the edit itself is never kept, so it cannot
+    /// come back as a new message). `None` for blank text.
+    pub fn draft_parts(&self) -> Option<(String, Vec<MentionRef>, Option<&str>)> {
+        let (text, mentions, reply) = match &self.mode {
+            Mode::Edit(_) => (self.saved_draft.clone()?, Vec::new(), None),
+            Mode::Reply(id) => (self.text(), self.mentions.clone(), Some(id.as_str())),
+            Mode::Normal => (self.text(), self.mentions.clone(), None),
+        };
+        if text.trim().is_empty() {
+            return None;
+        }
+        let mentions = mentions
+            .into_iter()
+            .filter(|m| text.contains(&m.label))
+            .collect();
+        Some((text, mentions, reply))
+    }
+
+    /// Puts a stored draft into an untouched composer (empty, no reply or
+    /// edit). Returns `false`, changing nothing, otherwise.
+    pub fn load_draft(
+        &mut self,
+        text: &str,
+        mentions: Vec<MentionRef>,
+        reply_to: Option<String>,
+    ) -> bool {
+        if !self.text().is_empty() || self.mode != Mode::Normal {
+            return false;
+        }
+        self.set_text(text);
+        self.mentions = mentions;
+        if let Some(item) = reply_to {
+            self.mode = Mode::Reply(item);
+        }
+        true
+    }
+
     /// The core's answer to a member search.
     pub fn set_members(&mut self, query: &str, members: Vec<Member>) {
         if let Suggestions::Mentions {

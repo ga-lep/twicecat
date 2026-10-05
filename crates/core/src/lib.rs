@@ -7,6 +7,7 @@
 pub mod api;
 mod avatars;
 mod client;
+mod drafts;
 mod engine;
 pub mod logging;
 mod oauth;

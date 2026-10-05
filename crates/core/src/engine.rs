@@ -26,7 +26,7 @@ use tracing::{info, warn};
 use zeroize::Zeroizing;
 
 use crate::api::{
-    ActionKind, Command, CoreError, CoreEvent, DeviceId, ListDiff, Member, MessageText,
+    ActionKind, Command, CoreError, CoreEvent, DeviceId, Draft, ListDiff, Member, MessageText,
     OutgoingMessage, PaginationState, Password, RoomId, RoomListQuery, TypingUser, UserId,
 };
 use crate::avatars::{Avatars, SdkFetcher, answer_unavailable};
@@ -34,6 +34,7 @@ use crate::client::{
     ServerSpec, WRONG_ACCOUNT, account_bound, build_client, discover_homeserver_url,
     ensure_homeserver_after_login, map_login_error, same_origin,
 };
+use crate::drafts;
 use crate::oauth::authorize;
 use crate::outgoing::outgoing_content;
 use crate::paths::DataPaths;
@@ -340,13 +341,16 @@ async fn forward_room_list(
     }
 }
 
-/// Forwards the initial timeline items as one `Reset`, then every diff batch.
+/// Forwards the initial timeline items as one `Reset`, then the room's stored
+/// draft (after the items, so a reply draft can find its message), then every
+/// diff batch.
 async fn forward_timeline(
     room_id: RoomId,
     items: Vector<Arc<SdkTimelineItem>>,
     stream: impl Stream<Item = Vec<VectorDiff<Arc<SdkTimelineItem>>>>,
     events: mpsc::Sender<CoreEvent>,
     own: Option<OwnedUserId>,
+    draft: Option<Draft>,
 ) {
     let initial = ListDiff::Reset {
         values: items.iter().map(|i| map_item(i, own.as_deref())).collect(),
@@ -357,6 +361,15 @@ async fn forward_timeline(
     };
     if events.send(first).await.is_err() {
         return;
+    }
+    if let Some(draft) = draft {
+        let loaded = CoreEvent::DraftLoaded {
+            room_id: room_id.clone(),
+            draft,
+        };
+        if events.send(loaded).await.is_err() {
+            return;
+        }
     }
     pin_mut!(stream);
     while let Some(diffs) = stream.next().await {
@@ -826,6 +839,11 @@ impl Engine {
                 }
             }
             Command::Logout => self.logout().await,
+            // Awaited here, not in the action set: it is a local store write,
+            // and a draft saved just before `Shutdown` must not be cut off.
+            Command::SaveDraft { room_id, draft } => {
+                self.save_draft(&room_id, draft.as_ref()).await
+            }
             Command::LoginOAuth { server } => self.login_oauth(server).await,
             // The task ends with `Cancelled`, which `on_oauth_done` reports.
             Command::CancelOAuth => {
@@ -1111,6 +1129,27 @@ impl Engine {
         }
     }
 
+    /// Stores `draft` as the composer draft of `room_id`, or removes it
+    /// (`None` or blank). Without a session or a known room, nothing happens.
+    async fn save_draft(&self, room_id: &RoomId, draft: Option<&Draft>) {
+        let Some(active) = self.active.as_ref() else {
+            return;
+        };
+        let Some(room) = parse_room_id(room_id)
+            .ok()
+            .and_then(|id| active.client.get_room(&id))
+        else {
+            return;
+        };
+        let result = match draft.and_then(drafts::to_sdk) {
+            Some(sdk) => room.save_composer_draft(sdk, None).await,
+            None => room.clear_composer_draft(None).await,
+        };
+        if result.is_err() {
+            warn!("the composer draft could not be stored");
+        }
+    }
+
     /// Opens the timeline of `room_id`, replacing any previous selection.
     async fn select_room(&mut self, room_id: RoomId) -> Result<(), CoreError> {
         let active = self.active.as_mut().ok_or(CoreError::NotLoggedIn)?;
@@ -1134,6 +1173,13 @@ impl Engine {
                 .set_room_subscriptions(&[&sdk_id])
                 .await;
         }
+        // A store error loses only the draft, never the room.
+        let draft = room
+            .load_composer_draft(None)
+            .await
+            .ok()
+            .flatten()
+            .and_then(drafts::from_sdk);
         let (items, stream) = timeline.subscribe().await;
         let task = tokio::spawn(forward_timeline(
             room_id.clone(),
@@ -1141,6 +1187,7 @@ impl Engine {
             stream,
             self.events.clone(),
             active.client.user_id().map(ToOwned::to_owned),
+            draft,
         ));
         let timeline = Arc::new(timeline);
         // Both forwarders live in the action set, so they end with the

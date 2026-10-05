@@ -11,9 +11,9 @@ use iced::theme;
 use iced::widget::{operation, scrollable};
 use iced::{Element, Subscription, Task, Theme, clipboard, system, window};
 use tessera_core::api::{
-    ActionKind, Command, CoreError, CoreEvent, EventId, ListDiff, MessageDetails, MessageText,
-    OutgoingMessage, Password, RoomId, RoomListQuery, RoomListTab, RoomSummary, SyncState,
-    TimelineItem, TimelineItemKind, TypingUser, UserId,
+    ActionKind, Command, CoreError, CoreEvent, Draft, EventId, ListDiff, MessageDetails,
+    MessageText, OutgoingMessage, Password, RoomId, RoomListQuery, RoomListTab, RoomSummary,
+    SyncState, TimelineItem, TimelineItemKind, TypingUser, UserId,
 };
 use tokio::sync::mpsc;
 
@@ -32,6 +32,8 @@ use crate::timeline::{self, Effects, TimelineView};
 
 /// How long to wait for the core to close after `Shutdown` (plan Q18).
 pub const SHUTDOWN_WAIT: Duration = Duration::from_secs(10);
+/// Pause after the last composer change before its draft is stored.
+pub const DRAFT_SAVE_DELAY: Duration = Duration::from_secs(1);
 /// The notice for a command without its text, such as `/me` alone
 /// (Element's wording).
 pub const COMMAND_ERROR_TEXT: &str = "Command error: Unable to handle slash command.";
@@ -189,6 +191,9 @@ pub enum Message {
     ReplyQuoteClicked(EventId),
     /// The highlight of the row jumped to timed out.
     FlashEnded(String),
+    /// The pause after a composer change ended: store the draft if this is
+    /// still the last change.
+    DraftDue(u64),
     /// The user pressed **Log out**.
     LogoutRequested,
     /// The user picked a room in the list.
@@ -314,6 +319,11 @@ pub struct App {
     pub link_bar: Option<LinkBar>,
     /// The name of an unknown `/command` waiting for "Send as message".
     pub command_bar: Option<String>,
+    /// Counts composer changes, so only the last draft timer saves.
+    pub draft_seq: u64,
+    /// The composer changed since the room was opened: only then is its
+    /// draft stored (the room's own draft may still be on its way).
+    draft_dirty: bool,
     /// Set when the app decided to exit (the task itself is opaque to tests).
     pub exit_requested: bool,
 }
@@ -376,6 +386,8 @@ impl App {
             window_focused: true,
             link_bar: None,
             command_bar: None,
+            draft_seq: 0,
+            draft_dirty: false,
             exit_requested: false,
         };
         let restore = app.send(Command::RestoreSession);
@@ -402,6 +414,29 @@ impl App {
 
     /// Applies a message.
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        let touches_composer = matches!(
+            message,
+            Message::Composer(_)
+                | Message::ComposerKey(_)
+                | Message::SuggestionPicked(_)
+                | Message::ReplyRequested(_)
+                | Message::EditRequested(_)
+                | Message::ModeCancelled
+        );
+        let task = self.update_inner(message);
+        if touches_composer && self.selected.is_some() {
+            self.draft_dirty = true;
+            self.draft_seq = self.draft_seq.wrapping_add(1);
+            let timer = self
+                .sink
+                .timer(DRAFT_SAVE_DELAY, Message::DraftDue(self.draft_seq));
+            Task::batch([task, timer])
+        } else {
+            task
+        }
+    }
+
+    fn update_inner(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Core(event) => self.on_core(*event),
             Message::CoreClosed => {
@@ -592,6 +627,13 @@ impl App {
                 self.timeline.flash_ended(&id);
                 Task::none()
             }
+            Message::DraftDue(seq) => {
+                if seq == self.draft_seq {
+                    self.save_draft()
+                } else {
+                    Task::none()
+                }
+            }
             Message::LogoutRequested => self.send(Command::Logout),
             Message::SelectRoom(id) => {
                 if !room_list::contains(&self.rooms, &id) {
@@ -599,13 +641,22 @@ impl App {
                 }
                 let stop_typing = self.stop_typing();
                 let marker = self.move_read_marker();
+                // Before the core opens the next room (commands run in order).
+                let save = self.save_draft();
+                self.draft_dirty = false;
+                self.draft_seq = self.draft_seq.wrapping_add(1);
                 self.selected = Some(id.clone());
                 self.timeline.reset();
                 self.typing.clear();
                 self.actions.reset();
                 self.clear_draft();
                 self.reset_link_state();
-                Task::batch([stop_typing, marker, self.send(Command::SelectRoom(id))])
+                Task::batch([
+                    stop_typing,
+                    marker,
+                    save,
+                    self.send(Command::SelectRoom(id)),
+                ])
             }
             Message::TabSelected(tab) => {
                 let query = RoomListQuery {
@@ -634,8 +685,10 @@ impl App {
                 if self.screen == Screen::ShuttingDown {
                     return Task::none();
                 }
+                let save = self.save_draft();
                 self.screen = Screen::ShuttingDown;
                 Task::batch([
+                    save,
                     self.send(Command::Shutdown),
                     self.sink.deadline(SHUTDOWN_WAIT),
                 ])
@@ -730,6 +783,21 @@ impl App {
             }
             CoreEvent::TimelineDiff { room_id, diffs } => {
                 task = self.apply_timeline(&room_id, diffs);
+            }
+            CoreEvent::DraftLoaded { room_id, draft } => {
+                if self.selected.as_ref() == Some(&room_id) {
+                    // A reply whose message is not loaded comes back as a
+                    // plain draft; the text is never lost.
+                    let reply = draft.reply_to.as_ref().and_then(|event| {
+                        self.timeline
+                            .items
+                            .iter()
+                            .find(|i| i.event_id.as_ref() == Some(event))
+                            .map(|i| i.id.clone())
+                    });
+                    self.composer
+                        .load_draft(draft.text.expose(), draft.mentions, reply);
+                }
             }
             CoreEvent::Pagination { room_id, state } => {
                 if self.selected.as_ref() == Some(&room_id) {
@@ -1130,6 +1198,34 @@ impl App {
         }
     }
 
+    /// Stores the open room's draft, or clears it when the composer is empty;
+    /// nothing when the composer was not touched since the room was opened.
+    fn save_draft(&mut self) -> Task<Message> {
+        let Some(room_id) = self.selected.clone() else {
+            return Task::none();
+        };
+        if !self.draft_dirty {
+            return Task::none();
+        }
+        let draft = self.composer.draft_parts().map(|(text, mentions, reply)| {
+            // The reply target is kept by event; an item not sent yet has
+            // none, and the draft then stays a plain message.
+            let reply_to = reply.and_then(|item| {
+                self.timeline
+                    .items
+                    .iter()
+                    .find(|i| i.id == item)
+                    .and_then(|i| i.event_id.clone())
+            });
+            Draft {
+                text: MessageText::from(text),
+                mentions,
+                reply_to,
+            }
+        });
+        self.send(Command::SaveDraft { room_id, draft })
+    }
+
     /// Shows the failure line of a delete or reaction for 5 seconds.
     fn show_notice(&mut self, action: ActionKind, error: &CoreError) -> Task<Message> {
         let Some(text) = actions::notice_text(action, &safe_line(&error.to_string())) else {
@@ -1191,7 +1287,13 @@ impl App {
         };
         self.composer.finish_send();
         self.send_error = None;
-        Task::batch([self.send(command), self.stop_typing()])
+        let sent = self.send(command);
+        // The stored draft becomes what is left: nothing, or after an edit
+        // the draft it set aside. Marked dirty here because "Send as message"
+        // reaches this without a composer message.
+        self.draft_dirty = true;
+        let save = self.save_draft();
+        Task::batch([sent, save, self.stop_typing()])
     }
 
     /// Forgets everything about a login attempt: the flag, the browser link
@@ -2920,6 +3022,185 @@ mod tests {
         let _ = app.update(Message::PickerOpened("theirs".into()));
         let _ = app.update(Message::PickerQuery(key("secret-query-x")));
         assert!(!format!("{app:?}").contains("secret-query-x"));
+    }
+
+    // ---- per-room drafts ----------------------------------------------------
+
+    fn saved_drafts(commands: &[Command]) -> Vec<(String, Option<tessera_core::api::Draft>)> {
+        commands
+            .iter()
+            .filter_map(|c| match c {
+                Command::SaveDraft { room_id, draft } => {
+                    Some((room_id.as_str().to_owned(), draft.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn draft_text(draft: &Option<tessera_core::api::Draft>) -> Option<String> {
+        draft.as_ref().map(|d| d.text.expose().to_owned())
+    }
+
+    #[test]
+    fn leaving_a_room_saves_its_draft_before_opening_the_next() {
+        let (mut app, mut rx) = main_app();
+        type_in(&mut app, "half a thought");
+        let _ = drain(&mut rx);
+        let _ = app.update(Message::SelectRoom(RoomId::from("!b:x")));
+        let commands = drain(&mut rx);
+        let saved = saved_drafts(&commands);
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].0, "!a:x");
+        assert_eq!(draft_text(&saved[0].1).as_deref(), Some("half a thought"));
+        let save_at = commands
+            .iter()
+            .position(|c| matches!(c, Command::SaveDraft { .. }))
+            .unwrap();
+        let select_at = commands
+            .iter()
+            .position(|c| matches!(c, Command::SelectRoom(_)))
+            .unwrap();
+        assert!(
+            save_at < select_at,
+            "saved before the core opens the next room"
+        );
+        assert_eq!(app.composer.text(), "");
+    }
+
+    #[test]
+    fn leaving_a_room_after_emptying_the_composer_clears_its_draft() {
+        let (mut app, mut rx) = main_app();
+        type_in(&mut app, "x");
+        let _ = app.update(Message::Composer(EditorAction(Action::Edit(
+            Edit::Backspace,
+        ))));
+        let _ = drain(&mut rx);
+        let _ = app.update(Message::SelectRoom(RoomId::from("!b:x")));
+        assert_eq!(
+            saved_drafts(&drain(&mut rx)),
+            vec![("!a:x".to_owned(), None)]
+        );
+    }
+
+    #[test]
+    fn an_untouched_composer_leaves_the_stored_draft_alone() {
+        // The room's draft may not have arrived yet: saving the empty
+        // composer would wipe it.
+        let (mut app, mut rx) = main_app();
+        let _ = drain(&mut rx);
+        let _ = app.update(Message::SelectRoom(RoomId::from("!b:x")));
+        let _ = app.update(Message::CloseRequested);
+        assert!(saved_drafts(&drain(&mut rx)).is_empty());
+    }
+
+    #[test]
+    fn a_save_timer_from_the_previous_room_is_ignored() {
+        let (mut app, mut rx) = main_app();
+        type_in(&mut app, "abc");
+        let seq = app.draft_seq;
+        let _ = app.update(Message::SelectRoom(RoomId::from("!b:x")));
+        let _ = drain(&mut rx);
+        let _ = app.update(Message::DraftDue(seq));
+        assert!(saved_drafts(&drain(&mut rx)).is_empty());
+    }
+
+    #[test]
+    fn a_loaded_draft_fills_the_empty_composer_with_its_reply() {
+        let (mut app, _rx) = actions_app();
+        if let Some(item) = app.timeline.items.iter_mut().find(|i| i.id == "theirs") {
+            item.event_id = Some(EventId::from("$theirs"));
+        }
+        let draft = tessera_core::api::Draft {
+            text: MessageText::from("@Bob: back"),
+            mentions: vec![tessera_core::api::MentionRef {
+                label: "@Bob".into(),
+                user_id: UserId::from("@bob:x"),
+            }],
+            reply_to: Some(EventId::from("$theirs")),
+        };
+        let _ = app.update(core(CoreEvent::DraftLoaded {
+            room_id: RoomId::from("!b:x"),
+            draft: draft.clone(),
+        }));
+        assert_eq!(app.composer.text(), "", "another room's draft is ignored");
+        let _ = app.update(core(CoreEvent::DraftLoaded {
+            room_id: RoomId::from("!a:x"),
+            draft,
+        }));
+        assert_eq!(app.composer.text(), "@Bob: back");
+        assert_eq!(app.composer.mentions.len(), 1);
+        assert_eq!(app.composer.mode, composer::Mode::Reply("theirs".into()));
+    }
+
+    #[test]
+    fn a_loaded_draft_never_replaces_typed_text() {
+        let (mut app, _rx) = main_app();
+        type_in(&mut app, "typed already");
+        let _ = app.update(core(CoreEvent::DraftLoaded {
+            room_id: RoomId::from("!a:x"),
+            draft: tessera_core::api::Draft {
+                text: MessageText::from("old draft"),
+                mentions: Vec::new(),
+                reply_to: None,
+            },
+        }));
+        assert_eq!(app.composer.text(), "typed already");
+    }
+
+    #[test]
+    fn sending_clears_the_stored_draft() {
+        let (mut app, mut rx) = main_app();
+        type_in(&mut app, "hello");
+        let _ = drain(&mut rx);
+        let _ = app.update(Message::ComposerKey(ComposerKey::Send));
+        let commands = drain(&mut rx);
+        assert_eq!(send_commands(&commands).len(), 1);
+        assert_eq!(saved_drafts(&commands), vec![("!a:x".to_owned(), None)]);
+    }
+
+    #[test]
+    fn during_an_edit_the_set_aside_draft_is_what_is_kept() {
+        let (mut app, mut rx) = actions_app();
+        type_in(&mut app, "my draft");
+        let _ = app.update(Message::EditRequested("mine".into()));
+        let _ = drain(&mut rx);
+        let _ = app.update(Message::SelectRoom(RoomId::from("!b:x")));
+        let saved = saved_drafts(&drain(&mut rx));
+        assert_eq!(draft_text(&saved[0].1).as_deref(), Some("my draft"));
+    }
+
+    #[test]
+    fn closing_the_window_saves_the_draft_before_shutting_down() {
+        let (mut app, mut rx) = main_app();
+        type_in(&mut app, "unsent");
+        let _ = drain(&mut rx);
+        let _ = app.update(Message::CloseRequested);
+        let commands = drain(&mut rx);
+        assert!(
+            matches!(
+                commands.as_slice(),
+                [
+                    Command::SaveDraft { draft: Some(_), .. },
+                    ..,
+                    Command::Shutdown
+                ]
+            ),
+            "{commands:?}"
+        );
+    }
+
+    #[test]
+    fn typing_saves_the_draft_after_a_pause() {
+        let (mut app, mut rx) = main_app();
+        type_in(&mut app, "abc");
+        let _ = drain(&mut rx);
+        let seq = app.draft_seq;
+        let _ = app.update(Message::DraftDue(seq - 1));
+        assert!(saved_drafts(&drain(&mut rx)).is_empty(), "a stale timer");
+        let _ = app.update(Message::DraftDue(seq));
+        let saved = saved_drafts(&drain(&mut rx));
+        assert_eq!(draft_text(&saved[0].1).as_deref(), Some("abc"));
     }
 
     // ---- slash commands (as in Element) ----------------------------------

@@ -343,3 +343,87 @@ async fn typing_notices_reach_the_other_user() {
     let _ = (&p.carol_items, &p.alice_items);
     p.finish().await;
 }
+
+#[tokio::test]
+#[ignore = "needs local homeserver: docker compose up -d --wait"]
+async fn a_draft_is_kept_per_room_and_cleared_on_request() {
+    use tessera_core::api::{Draft, MentionRef, UserId};
+
+    let env = TestEnv::load();
+    let alice_raw = raw_login(1).await;
+    let first = create_room(&alice_raw, &unique_room_name(), None)
+        .await
+        .to_string();
+    let second = create_room(&alice_raw, &unique_room_name(), None)
+        .await
+        .to_string();
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut alice = start_core(dir.path(), Arc::new(InMemorySecretStore::new()));
+    login_and_run(&mut alice, &env, 1).await;
+    wait_for_room(&mut alice, &second).await;
+    open_room(&mut alice, &first).await;
+
+    let draft = Draft {
+        text: tessera_core::api::MessageText::from("half a thought for @Carol"),
+        mentions: vec![MentionRef {
+            label: "@Carol".into(),
+            user_id: UserId::from(env.user_id(3)),
+        }],
+        reply_to: None,
+    };
+    let save = |draft: Option<Draft>| Command::SaveDraft {
+        room_id: RoomId::from(first.as_str()),
+        draft,
+    };
+    alice
+        .commands
+        .send(save(Some(draft.clone())))
+        .await
+        .unwrap();
+    alice
+        .commands
+        .send(Command::SelectRoom(RoomId::from(second.as_str())))
+        .await
+        .unwrap();
+    alice
+        .commands
+        .send(Command::SelectRoom(RoomId::from(first.as_str())))
+        .await
+        .unwrap();
+    let loaded = expect_event(
+        &mut alice,
+        |e| matches!(e, CoreEvent::DraftLoaded { room_id, .. } if room_id.as_str() == first),
+    )
+    .await;
+    let CoreEvent::DraftLoaded { draft: back, .. } = loaded else {
+        unreachable!()
+    };
+    assert_eq!(back, draft);
+
+    // Cleared: reopening the room gives its timeline and no draft.
+    alice.commands.send(save(None)).await.unwrap();
+    alice
+        .commands
+        .send(Command::SelectRoom(RoomId::from(first.as_str())))
+        .await
+        .unwrap();
+    let mut saw_reset = false;
+    let wait = async {
+        loop {
+            match alice.events.recv().await {
+                Some(CoreEvent::TimelineDiff { room_id, diffs }) if room_id.as_str() == first => {
+                    if diffs.iter().any(|d| matches!(d, ListDiff::Reset { .. })) {
+                        saw_reset = true;
+                    }
+                }
+                Some(CoreEvent::DraftLoaded { .. }) => panic!("a cleared draft came back"),
+                Some(_) => {}
+                None => break,
+            }
+        }
+    };
+    let _ = tokio::time::timeout(Duration::from_secs(3), wait).await;
+    assert!(saw_reset, "the room reopened");
+    logout(&mut alice).await;
+}

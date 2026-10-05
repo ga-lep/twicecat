@@ -643,6 +643,7 @@ impl Cli {
             | CoreEvent::Pagination { .. }
             | CoreEvent::Typing { .. }
             | CoreEvent::Members { .. }
+            | CoreEvent::DraftLoaded { .. }
             | CoreEvent::ActionFailed { .. } => {}
             CoreEvent::TimelineDiff { room_id, diffs } => self.on_timeline(&room_id, &diffs),
             CoreEvent::SendFailed { room_id, error } => {
