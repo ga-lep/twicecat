@@ -5,6 +5,8 @@ use std::fmt;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
+use super::{Shield, UtdReason};
+
 macro_rules! string_newtype {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
@@ -314,6 +316,8 @@ pub struct RoomSummary {
     pub marked_unread: bool,
     /// The latest message, if any.
     pub last_message: Option<MessagePreview>,
+    /// The room is end-to-end encrypted.
+    pub is_encrypted: bool,
 }
 
 impl RoomSummary {
@@ -339,6 +343,7 @@ impl RoomSummary {
             highlights: 0,
             marked_unread: false,
             last_message: None,
+            is_encrypted: false,
         }
     }
 }
@@ -698,6 +703,9 @@ pub struct MessageDetails {
     pub actions: ItemActions,
     /// Set when sending failed.
     pub send_failure: Option<SendFailure>,
+    /// The authenticity shield, for encrypted messages the SDK vouches for
+    /// (or warns about); `None` when there is nothing to show.
+    pub shield: Option<Shield>,
 }
 
 /// A state change shown as a muted line. Targets carry an optional display
@@ -926,6 +934,14 @@ pub enum ActionKind {
     Typing,
     /// Look up room members.
     Members,
+    /// Set up, change or use recovery.
+    Recovery,
+    /// Create or reset the cross-signing identity.
+    CrossSigning,
+    /// Request or answer a verification.
+    Verification,
+    /// List, rename or sign out devices, or watch a user's trust.
+    Devices,
 }
 
 /// What a timeline item is.
@@ -981,6 +997,8 @@ pub enum TimelineItemKind {
         timestamp_ms: u64,
         /// Why there is no content.
         what: PlaceholderKind,
+        /// Why decryption failed, for [`PlaceholderKind::UnableToDecrypt`].
+        utd: Option<UtdReason>,
     },
     /// Anything not covered by the other variants.
     Other,
@@ -1030,6 +1048,7 @@ impl fmt::Debug for TimelineItemKind {
                 is_own,
                 timestamp_ms,
                 what,
+                utd,
             } => f
                 .debug_struct("Placeholder")
                 .field("sender", sender)
@@ -1037,6 +1056,7 @@ impl fmt::Debug for TimelineItemKind {
                 .field("is_own", is_own)
                 .field("timestamp_ms", timestamp_ms)
                 .field("what", what)
+                .field("utd", utd)
                 .finish(),
             Self::Other => f.write_str("Other"),
         }
@@ -1111,4 +1131,10 @@ pub enum CoreError {
     /// Unexpected internal failure.
     #[error("internal error: {0}")]
     Internal(String),
+    /// The password for a re-authenticated action was rejected.
+    #[error("re-authentication failed")]
+    ReauthFailed,
+    /// Another operation of the same kind is already running.
+    #[error("busy")]
+    Busy,
 }

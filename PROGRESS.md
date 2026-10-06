@@ -308,7 +308,7 @@ Fixes the human may want before or after the checkpoint, from the task notes and
 
 ## Phase 4 steps
 - [x] 1. Phase 4 ledger, sign-off record and fixed-account E2EE test helpers (phase4.1)
-- [ ] 2. Additive core API for Phase 4 (phase4.2)
+- [x] 2. Additive core API for Phase 4 (phase4.2)
 - [ ] 3. Encryption settings, encrypted rooms, shields and UTD reasons in the core (roadmap steps 1, 5, core side)
 - [ ] 4. Security status, cross-signing bootstrap, identity reset and re-authentication in the core (roadmap step 4, core side)
 - [ ] 5. Recovery in the core (roadmap steps 2, 5, core side)
@@ -339,6 +339,15 @@ Fixes the human may want before or after the checkpoint, from the task notes and
 - Environment note: a stale `tessera-core`/`tessera-app` test artifact built from a removed scratch worktree (compiled-in `CARGO_MANIFEST_DIR` pointed at it) made `cargo test --workspace` fail with "read .env.test ... NotFound" in `avatars`/`bridge`; `cargo clean -p tessera-core -p tessera-app` fixed it. Not a repo problem.
 - Runs after the fix: `timeline_items` alone 4 of 4 passed; full ignored run `scripts/create-test-users.sh && cargo test --workspace -- --ignored --skip keyring` passed twice in a row (about 150 s and 102 s); gate (fmt --check, clippy `--all-features -D warnings`, `cargo test --workspace`) passed.
 - Open issues: none from the `timeline_items` flake (fixed above). No new human items beyond the Phase 4 human checkpoint below.
+
+## Phase 4 / Task 2 notes
+- TDD: the redaction, `QrImage`, default and `RecoveryKey` tests in `crates/core/src/api/security.rs` were written first and failed to compile (types missing); the engine tests (every new command: `NotLoggedIn` without a session, `Internal("not implemented yet")` with one) and the CLI tests followed the same way.
+- Added `crates/core/src/api/security.rs` (all Q7 types, SDK-free, documented, `Clone + Debug + PartialEq`) and re-exported it from `api/mod.rs`. Additive changes: `RoomSummary.is_encrypted` (false), `MessageDetails.shield` (None; the core mapping sets it in Task 3), `Placeholder.utd` (None at the one core and one app literal), `CoreError::{ReauthFailed, Busy}`, `ActionKind::{Recovery, CrossSigning, Verification, Devices}`, 19 commands, 10 events. `RecoveryKey`, `Password` and `QrImage` never reach `Debug` (sentinel-tested; the QR test uses a 45 x 45 grid).
+- Decisions to review: (1) `VerificationPhase::Emojis` holds `Box<[SasEmoji; 7]>`, not the plan's bare array: clippy `large_enum_variant` (-D warnings) fires on `VerificationPhase` and `CoreEvent` otherwise. (2) `ActionFailed` still has a `room_id`; the new actions belong to no room, so they carry an empty `RoomId` (documented on the event). Task 3+ and the app should key on `action`, not `room_id`, for them. (3) `WatchUserTrust` reports under `ActionKind::Devices`.
+- Engine: `security_action(&Command)` maps each new command to its `ActionKind`; `Engine::security_stub` answers them until the real handlers land. CLI: `Security` prints `[security] recovery/device/cross-signing` states, `RecoveryKeyReady` prints "recovery key received, not shown", the other new events are ignored (Q19). App: `state.rs` ignores the new events until Tasks 10-13.
+- Checks: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo test --workspace`, `scripts/check-core-api.sh`, `scripts/check-app-deps.sh` and `cargo deny check` pass. Ignored run (`--ignored --skip keyring`) passes in about 1m46 including build; `e2ee_rooms` repeat run passes (about 5 s); `docker compose stop` done.
+- APIs used: none from matrix-sdk, ruma or iced (plain Rust types and engine glue only). `zeroize::Zeroizing` as in `Password`.
+- Open issues: none. No new human items.
 
 ## Phase 4 human checkpoint
 - [ ] Phase 3 sign-off recorded (Q1, 2026-10-06). Confirm Q3 as planned: matrix-sdk `qrcode` enabled, iced `qr_code` **not** enabled (the QR code is drawn with the existing `image` widget from the SDK's own grid); and revisit any of Q1-Q19.

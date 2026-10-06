@@ -785,6 +785,32 @@ async fn forward_typing(room_id: RoomId, timeline: Arc<Timeline>, events: mpsc::
     }
 }
 
+/// The action kind of a Phase 4 (encryption) command, `None` for any other.
+fn security_action(cmd: &Command) -> Option<ActionKind> {
+    match cmd {
+        Command::EnableRecovery | Command::Recover { .. } | Command::ChangeRecoveryKey => {
+            Some(ActionKind::Recovery)
+        }
+        Command::BootstrapCrossSigning { .. }
+        | Command::ResetIdentity { .. }
+        | Command::CancelIdentityReset => Some(ActionKind::CrossSigning),
+        Command::RequestSelfVerification
+        | Command::RequestDeviceVerification { .. }
+        | Command::RequestUserVerification { .. }
+        | Command::AcceptVerification { .. }
+        | Command::StartSas { .. }
+        | Command::ConfirmQrScanned { .. }
+        | Command::ConfirmSas { .. }
+        | Command::SasMismatch { .. }
+        | Command::CancelVerification { .. } => Some(ActionKind::Verification),
+        Command::ListDevices
+        | Command::RenameDevice { .. }
+        | Command::SignOutDevices { .. }
+        | Command::WatchUserTrust { .. } => Some(ActionKind::Devices),
+        _ => None,
+    }
+}
+
 impl Engine {
     async fn run(mut self, mut commands: mpsc::Receiver<Command>) {
         let mut watch_changes = true;
@@ -982,9 +1008,49 @@ impl Engine {
                 })
                 .await;
             }
+            // The real handlers land in later Phase 4 tasks.
+            cmd @ (Command::EnableRecovery
+            | Command::Recover { .. }
+            | Command::ChangeRecoveryKey
+            | Command::BootstrapCrossSigning { .. }
+            | Command::ResetIdentity { .. }
+            | Command::CancelIdentityReset
+            | Command::RequestSelfVerification
+            | Command::RequestDeviceVerification { .. }
+            | Command::RequestUserVerification { .. }
+            | Command::AcceptVerification { .. }
+            | Command::StartSas { .. }
+            | Command::ConfirmQrScanned { .. }
+            | Command::ConfirmSas { .. }
+            | Command::SasMismatch { .. }
+            | Command::CancelVerification { .. }
+            | Command::ListDevices
+            | Command::RenameDevice { .. }
+            | Command::SignOutDevices { .. }
+            | Command::WatchUserTrust { .. }) => self.security_stub(&cmd).await,
             // Handled in `run`.
             Command::Shutdown => {}
         }
+    }
+
+    /// Answers a Phase 4 command until its handler exists: `NotLoggedIn`
+    /// without a session, else "not implemented yet". These actions belong to
+    /// no room, so `room_id` is empty.
+    async fn security_stub(&self, cmd: &Command) {
+        let Some(action) = security_action(cmd) else {
+            return;
+        };
+        let error = if self.active.is_some() {
+            CoreError::Internal("not implemented yet".into())
+        } else {
+            CoreError::NotLoggedIn
+        };
+        self.emit(CoreEvent::ActionFailed {
+            room_id: RoomId::from(""),
+            action,
+            error,
+        })
+        .await;
     }
 
     /// Why a new login cannot start now, if so.
@@ -2040,6 +2106,137 @@ mod tests {
             out.push(ev);
         }
         out
+    }
+
+    /// One of every Phase 4 command, with its action kind.
+    fn security_commands() -> Vec<(Command, ActionKind)> {
+        use crate::api::{RecoveryKey, VerificationId};
+        let id = || VerificationId::from("flow");
+        let dev = || DeviceId::from("DEV");
+        let pw = || Some(Password::from("pw"));
+        vec![
+            (Command::EnableRecovery, ActionKind::Recovery),
+            (
+                Command::Recover {
+                    key: RecoveryKey::from("k"),
+                },
+                ActionKind::Recovery,
+            ),
+            (Command::ChangeRecoveryKey, ActionKind::Recovery),
+            (
+                Command::BootstrapCrossSigning { password: pw() },
+                ActionKind::CrossSigning,
+            ),
+            (
+                Command::ResetIdentity { password: None },
+                ActionKind::CrossSigning,
+            ),
+            (Command::CancelIdentityReset, ActionKind::CrossSigning),
+            (Command::RequestSelfVerification, ActionKind::Verification),
+            (
+                Command::RequestDeviceVerification { device_id: dev() },
+                ActionKind::Verification,
+            ),
+            (
+                Command::RequestUserVerification {
+                    user_id: UserId::from("@b:x"),
+                },
+                ActionKind::Verification,
+            ),
+            (
+                Command::AcceptVerification { id: id() },
+                ActionKind::Verification,
+            ),
+            (Command::StartSas { id: id() }, ActionKind::Verification),
+            (
+                Command::ConfirmQrScanned { id: id() },
+                ActionKind::Verification,
+            ),
+            (Command::ConfirmSas { id: id() }, ActionKind::Verification),
+            (Command::SasMismatch { id: id() }, ActionKind::Verification),
+            (
+                Command::CancelVerification { id: id() },
+                ActionKind::Verification,
+            ),
+            (Command::ListDevices, ActionKind::Devices),
+            (
+                Command::RenameDevice {
+                    device_id: dev(),
+                    name: "n".into(),
+                },
+                ActionKind::Devices,
+            ),
+            (
+                Command::SignOutDevices {
+                    device_ids: vec![dev()],
+                    password: pw(),
+                },
+                ActionKind::Devices,
+            ),
+            (
+                Command::WatchUserTrust {
+                    user_id: UserId::from("@b:x"),
+                },
+                ActionKind::Devices,
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn security_commands_without_a_session_fail_with_not_logged_in() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut engine, mut rx) = oauth_engine(tmp.path());
+        for (cmd, kind) in security_commands() {
+            assert_eq!(security_action(&cmd), Some(kind));
+            engine.handle(cmd).await;
+            let got = drain(&mut rx).await;
+            assert!(
+                matches!(
+                    got.as_slice(),
+                    [CoreEvent::ActionFailed { action, error: CoreError::NotLoggedIn, .. }]
+                        if *action == kind
+                ),
+                "{kind:?}: {got:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn security_commands_with_a_session_are_not_implemented_yet() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut engine, mut rx) = oauth_engine(tmp.path());
+        let client = Client::builder()
+            .homeserver_url("http://127.0.0.1:1")
+            .build()
+            .await
+            .unwrap();
+        engine.active = Some(Active {
+            fetcher: Arc::new(SdkFetcher(client.clone())),
+            client,
+            record: record("@alice:x", "http://127.0.0.1:1", "s1"),
+            changes: broadcast::channel(1).1,
+            sync: None,
+            selected: None,
+            avatars: Avatars::new(),
+        });
+        for (cmd, kind) in security_commands() {
+            engine.handle(cmd).await;
+            let got = drain(&mut rx).await;
+            assert!(
+                matches!(
+                    got.as_slice(),
+                    [CoreEvent::ActionFailed { action, error: CoreError::Internal(m), .. }]
+                        if *action == kind && m == "not implemented yet"
+                ),
+                "{kind:?}: {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn room_commands_are_not_security_actions() {
+        assert_eq!(security_action(&Command::Logout), None);
+        assert_eq!(security_action(&Command::LoadMoreRooms), None);
     }
 
     #[tokio::test]

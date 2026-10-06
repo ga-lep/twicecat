@@ -12,8 +12,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tessera_core::api::{
-    Command, CoreEvent, ListDiff, MessageText, Password, RoomId, RoomSummary, SyncState,
-    TimelineItem, TimelineItemKind,
+    Command, CoreEvent, ListDiff, MessageText, Password, RoomId, RoomSummary, SecurityStatus,
+    SyncState, TimelineItem, TimelineItemKind,
 };
 use tessera_core::logging;
 use tessera_core::paths::DataPaths;
@@ -162,6 +162,17 @@ fn resolve_room(rooms: &[RoomSummary], arg: &str) -> Option<RoomId> {
         .iter()
         .find(|room| room.id.as_str() == arg)
         .map(|room| room.id.clone())
+}
+
+/// Message printed instead of a new recovery key.
+const RECOVERY_KEY_LINE: &str = "recovery key received, not shown";
+
+/// One line for a security status: states only, nothing secret.
+fn security_line(status: &SecurityStatus) -> String {
+    format!(
+        "[security] recovery: {:?}, device: {:?}, cross-signing: {:?}",
+        status.recovery, status.device, status.cross_signing
+    )
 }
 
 fn status_line(state: &SyncState) -> String {
@@ -645,6 +656,19 @@ impl Cli {
             | CoreEvent::Members { .. }
             | CoreEvent::DraftLoaded { .. }
             | CoreEvent::ActionFailed { .. } => {}
+            CoreEvent::Security(status) => println!("{}", security_line(&status)),
+            // The key is never printed.
+            CoreEvent::RecoveryKeyReady(_) => println!("{RECOVERY_KEY_LINE}"),
+            // Recovery progress, re-authentication, verification (including
+            // QR codes), devices and trust are for the graphical app.
+            CoreEvent::RecoveryProgress(_)
+            | CoreEvent::Recovered
+            | CoreEvent::ReauthRequired { .. }
+            | CoreEvent::OpenAccountManagement(_)
+            | CoreEvent::VerificationRequested { .. }
+            | CoreEvent::Verification { .. }
+            | CoreEvent::Devices(_)
+            | CoreEvent::UserTrust { .. } => {}
             CoreEvent::TimelineDiff { room_id, diffs } => self.on_timeline(&room_id, &diffs),
             CoreEvent::SendFailed { room_id, error } => {
                 println!("Send failed in {}: {error}", sanitize(room_id.as_str()));
@@ -1042,6 +1066,33 @@ mod tests {
             printed: HashSet::new(),
         };
         (cli, interrupt_tx)
+    }
+
+    #[test]
+    fn security_line_prints_states_only() {
+        use tessera_core::api::{CrossSigning, DeviceVerification, RecoveryStatus, SecurityStatus};
+        let status = SecurityStatus {
+            recovery: RecoveryStatus::Incomplete,
+            device: DeviceVerification::Unverified,
+            cross_signing: CrossSigning::MissingKeys,
+            has_devices_to_verify_against: true,
+            identity_exists: true,
+        };
+        assert_eq!(
+            security_line(&status),
+            "[security] recovery: Incomplete, device: Unverified, cross-signing: MissingKeys"
+        );
+    }
+
+    #[test]
+    fn recovery_key_event_prints_no_key() {
+        use tessera_core::api::RecoveryKey;
+        let (mut cli, _keep) = test_cli(Mode::Idle, true);
+        // `on_event` must accept it; the line it prints names no key.
+        cli.on_event(CoreEvent::RecoveryKeyReady(RecoveryKey::from(
+            "secret-key-x",
+        )));
+        assert_eq!(RECOVERY_KEY_LINE, "recovery key received, not shown");
     }
 
     #[test]

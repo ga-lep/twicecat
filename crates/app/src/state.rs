@@ -856,6 +856,17 @@ impl App {
                 }
             }
             CoreEvent::ActionFailed { .. } => {}
+            // Phase 4 events: the app screens for them land in Tasks 10-13.
+            CoreEvent::Security(_)
+            | CoreEvent::RecoveryProgress(_)
+            | CoreEvent::RecoveryKeyReady(_)
+            | CoreEvent::Recovered
+            | CoreEvent::ReauthRequired { .. }
+            | CoreEvent::OpenAccountManagement(_)
+            | CoreEvent::VerificationRequested { .. }
+            | CoreEvent::Verification { .. }
+            | CoreEvent::Devices(_)
+            | CoreEvent::UserTrust { .. } => {}
         }
         task
     }

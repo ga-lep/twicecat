@@ -91,6 +91,7 @@ fn map_event(event: &EventTimelineItem, own: Option<&SdkUserId>) -> TimelineItem
         is_own: event.is_own(),
         timestamp_ms,
         what,
+        utd: None,
     };
     let state = |change| TimelineItemKind::State {
         sender: sender.clone(),
@@ -149,6 +150,8 @@ fn map_event(event: &EventTimelineItem, own: Option<&SdkUserId>) -> TimelineItem
                         }
                         _ => None,
                     },
+                    // Task 3 fills the shield from `get_shield(false)`.
+                    shield: None,
                 };
                 // A remote event has no send state: the server accepted it.
                 let sent = event.send_state().map_or(SendStatus::Sent, map_send_state);

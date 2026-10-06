@@ -985,6 +985,7 @@ mod tests {
                 is_own: false,
                 timestamp_ms: ts,
                 what: PlaceholderKind::Redacted,
+                utd: None,
             },
         )
     }
