@@ -958,3 +958,11 @@ Phase 2 signed off by the human on 2026-10-02 (merge of PR #3). Every other unti
 - Gate: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo test --workspace` all pass.
 - Residual (for the Task 14 review): SDK `debug`/`trace` are not asserted; table layout and sizes of the SQLite store stay visible; the scan covers values the test knows, not derived forms (base64, URL-encoded).
 - Nothing new for the human checkpoint.
+
+### Phase 4 / Task 9 follow-up: send promptly after an identity reset
+- Symptom: a message sent right after the reset's `Security` event stayed unsent for 5 to 60 s (seen in `log_hygiene.rs` before 443f88d).
+- Cause (core): the status forwarder sent `Security` while the identity task still held the `SyncPause` (the status turns complete before the task ends). A send then ran with the sync stopped; the SDK waits up to 5 s for a pending own-user `/keys/query` (`matrix-sdk-crypto-0.19.1` `store/mod.rs:201-250`) that only the sync sends. The send queue was NOT the cause (it was already on).
+- Fix: `IdentityOp::paused` (held by `bootstrap`/`reset` for the whole pause) is waited for by `forward_status` before it reads and sends a status; `IdentityOp::announce` makes the status after such an operation go out even when equal to the last one (a second reset in a row ends in the same status; `a_reset_right_after_login_keeps_the_new_private_keys` caught this). `PauseTarget::settled` makes the restore wait (10 s cap) until the room list is `Running` again. Task 4/5 race protection unchanged (stop before the keys exist, restart after).
+- Test: `a_message_sent_right_after_a_reset_is_sent_promptly` in `e2ee_identity.rs` (ignored, `e2ee_serial`): the own "Sent" item is in the list within 10 s of the Security event. Before the fix it stalled 5 s or timed out.
+- Ignored runs right after `scripts/create-test-users.sh`, first and repeat: `log_hygiene`, `e2ee_identity` (7), `e2ee_recovery` (7) all green. `log_hygiene.rs` order unchanged.
+- Open: an SDK timeline race can leave a stale local echo "Sending" next to its "Sent" item (`matrix-sdk-ui-0.19.1` `timeline/controller/state_transaction.rs:944-978`); handled in the next commit.

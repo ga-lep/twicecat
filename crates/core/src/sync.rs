@@ -107,6 +107,8 @@ pub(crate) trait PauseTarget: Send + Sync + 'static {
     fn queue_enabled(&self) -> bool;
     /// Enables or disables the send queue.
     fn set_queue_enabled(&self, enabled: bool) -> impl Future<Output = ()> + Send;
+    /// Returns once the started service has made its catch-up requests.
+    fn settled(&self) -> impl Future<Output = ()> + Send;
 }
 
 /// The real sync service and the client's send queue.
@@ -141,6 +143,22 @@ impl PauseTarget for SdkTarget {
 
     async fn set_queue_enabled(&self, enabled: bool) {
         self.client.send_queue().set_enabled(enabled).await;
+    }
+
+    async fn settled(&self) {
+        use matrix_sdk_ui::room_list_service::State as ListState;
+        let mut state = self.service.room_list_service().state();
+        let running = async {
+            if matches!(state.get(), ListState::Running) {
+                return;
+            }
+            while let Some(s) = state.next().await {
+                if matches!(s, ListState::Running) {
+                    return;
+                }
+            }
+        };
+        let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
     }
 }
 
@@ -217,6 +235,9 @@ impl<P: PauseTarget> Held<P> {
             }
             if self.queue_was_enabled {
                 self.target.set_queue_enabled(true).await;
+            }
+            if self.was_running {
+                self.target.settled().await;
             }
         }
         drop(self.guard);
@@ -1239,6 +1260,8 @@ mod tests {
             self.0.queue.store(enabled, Ordering::SeqCst);
             self.note(if enabled { "queue on" } else { "queue off" });
         }
+
+        async fn settled(&self) {}
     }
 
     /// Waits (bounded) until `cond` holds.

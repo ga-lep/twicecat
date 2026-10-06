@@ -312,3 +312,39 @@ async fn messages_after_a_reset_carry_no_shield() {
     assert_eq!(shield, None, "the shield never went away");
     p.finish().await;
 }
+
+/// A message sent right after the reset's `Security` event goes out promptly
+/// (regression, Task 9): the "Sent" item for it is in the list within 10 s.
+/// A stale local echo next to it is a separate check (Task 9, step B).
+#[tokio::test]
+#[ignore = "needs local homeserver: docker compose up -d --wait"]
+async fn a_message_sent_right_after_a_reset_is_sent_promptly() {
+    let _serial = e2ee_serial().await;
+    let mut p = EncryptedPair::new().await;
+    let room = p.room();
+    reset_identity_on(&mut p.alice, 1).await;
+    let body = format!("after-reset-{}", hex());
+    p.alice
+        .commands
+        .send(Command::Send(outgoing(&room, &body)))
+        .await
+        .unwrap();
+    let sent = |items: &[tessera_core::api::TimelineItem]| {
+        items.iter().any(|i| {
+            matches!(&i.kind, TimelineItemKind::Message { body: b, is_own: true,
+                sent: tessera_core::api::SendStatus::Sent, .. } if *b == body)
+        })
+    };
+    let reached = common::try_pump_with(
+        &mut p.alice,
+        &room,
+        Duration::from_secs(10),
+        &mut p.alice_rooms,
+        &mut p.alice_items,
+        |_| {},
+        |_, items| sent(items),
+    )
+    .await;
+    assert!(reached, "the message was not sent within 10 s of the reset");
+    p.finish().await;
+}

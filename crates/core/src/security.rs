@@ -370,10 +370,23 @@ async fn forward_status(
     let mut changes_open = true;
     let mut last: Option<SecurityStatus> = None;
     loop {
+        // While an identity operation has the sync paused, no status goes
+        // out: a front end that reacts to it (a message sent right after the
+        // reset's status) would run against a stopped sync and send queue.
+        // The lock is only waited for, never held, and never nested with
+        // `keys_gate` here.
+        drop(op.paused.lock().await);
         let status = {
             let _gate = op.keys_gate.lock().await;
             read_status(&client, &op).await
         };
+        // After an operation that paused the sync the status goes out even
+        // when it equals the last one sent: the paused changes were held
+        // back, and the front end waits for the result (a second reset in a
+        // row ends in the same status as the first).
+        if op.announce.swap(false, Ordering::AcqRel) {
+            last = None;
+        }
         if last != Some(status) {
             last = Some(status);
             if events.send(CoreEvent::Security(status)).await.is_err() {
@@ -431,6 +444,15 @@ struct IdentityOp {
     /// query answered with the old identity in that time makes the SDK drop
     /// the new private keys for good, so no query of ours may run then.
     keys_gate: Mutex<()>,
+    /// Held by `bootstrap` and `reset` for as long as they keep the sync
+    /// paused, until the sync and the send queue are back. The status
+    /// forwarder waits for it before it reads and sends a status, so that the
+    /// `Security` event that ends such an operation is sent with the sync
+    /// running and the send queue on. Taken before `keys_gate`.
+    paused: Mutex<()>,
+    /// Set when `bootstrap` or `reset` ends: the next status is sent even if
+    /// it equals the last one.
+    announce: AtomicBool,
     /// The server was seen to hold an identity for the account (it stays).
     server_identity_seen: AtomicBool,
 }
@@ -564,6 +586,7 @@ impl SecurityTasks {
         let refresh = self.refresh.clone();
         let op = self.identity.clone();
         self.spawn_identity(events, ActionKind::CrossSigning, move || async move {
+            let _paused = op.paused.lock().await;
             let result = with_sync_paused(&client, pause.as_ref(), async {
                 let result = {
                     let _gate = op.keys_gate.lock().await;
@@ -576,6 +599,7 @@ impl SecurityTasks {
                 result
             })
             .await;
+            op.announce.store(true, Ordering::Release);
             refresh.notify_one();
             result.map(|()| None)
         });
@@ -594,6 +618,7 @@ impl SecurityTasks {
         let op = self.identity.clone();
         let events_for_task = events.clone();
         self.spawn_identity(events, ActionKind::CrossSigning, move || async move {
+            let _paused = op.paused.lock().await;
             let result = with_sync_paused(&client, pause.as_ref(), async {
                 let result = {
                     let _gate = op.keys_gate.lock().await;
@@ -609,6 +634,7 @@ impl SecurityTasks {
                 }
             })
             .await;
+            op.announce.store(true, Ordering::Release);
             refresh.notify_one();
             result.map(|()| None)
         });
