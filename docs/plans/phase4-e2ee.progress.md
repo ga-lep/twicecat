@@ -4,3 +4,4 @@ Task 1: complete (b141792..b973feb, gate ok, security PASS, review PASS)
 Task 2: started
 Task 2: complete (5d1b6f3..28611e5, gate ok, security PASS, review PASS)
   notes: deviations accepted by review: VerificationPhase::Emojis is Box<[SasEmoji; 7]> (clippy large_enum_variant); non-room actions send ActionFailed with an empty RoomId (app must route by action); WatchUserTrust failures use ActionKind::Devices. Low: RecoveryKey derived PartialEq is not constant-time (drop it or use subtle if keys are ever compared outside tests); QrImage grid (flow secret) not zeroized. Watch in later tasks: open OpenAccountManagement URLs only if https from the discovered endpoint; sanitize device names, peer names and SAS text in CLI/UI. Suggestions: CLI recovery_key_event_prints_no_key test is weak (does not capture output); add a QrImage constructor / size check in Task 7.
+Task 3: started
