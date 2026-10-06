@@ -7,3 +7,4 @@ Task 2: complete (5d1b6f3..28611e5, gate ok, security PASS, review PASS)
 Task 3: started
 Task 3: complete (cc2110f..9e796bb, gate ok, security PASS, review PASS)
   notes: human approved matrix-sdk-crypto = "=0.19.1" as a direct crates/core dependency (UtdCause not re-exported). Integration tests passed on first run (not seen red first). Warning/Low: RoomSummary.is_encrypted is false while the SDK encryption state is Unknown; must be handled before the app shows an encrypted/unencrypted mark (Task 12: treat as "known encrypted" only or go tri-state; check summarize re-runs on state change). Info: lax shields (get_shield(false)) as in Element X. Suggestions: client.rs test placed above `use super::*`; EncryptedPair setup could move to common.
+Task 4: started
