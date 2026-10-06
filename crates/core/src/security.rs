@@ -313,20 +313,27 @@ impl SecurityTasks {
     }
 
     /// Runs one identity operation in the background. Without a permit the
-    /// answer is `Busy`.
+    /// answer is `Busy`. The permit lives in the spawned task until the work
+    /// ends, so the work cannot drop it early by not mentioning it.
     fn spawn_identity<F, Fut>(&mut self, events: &mpsc::Sender<CoreEvent>, work: F)
     where
-        F: FnOnce(IdentityPermit) -> Fut,
+        F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<(), Stop>> + Send + 'static,
     {
         // Forget finished tasks, so the set does not grow with every action.
         while self.tasks.try_join_next().is_some() {}
         let events = events.clone();
         let permit = self.identity.try_start();
-        let fut = permit.map(work);
+        let fut = permit.map(|permit| (permit, work()));
         self.tasks.spawn(async move {
             let result = match fut {
-                Some(fut) => fut.await,
+                Some((permit, fut)) => {
+                    let result = fut.await;
+                    // Free the slot before the answer, so a front end that
+                    // reacts to it can start the next operation.
+                    drop(permit);
+                    result
+                }
                 None => Err(Stop::Failed(CoreError::Busy)),
             };
             if let Err(stop) = result {
@@ -344,7 +351,7 @@ impl SecurityTasks {
     ) {
         let client = client.clone();
         let refresh = self.refresh.clone();
-        self.spawn_identity(events, move |_permit| async move {
+        self.spawn_identity(events, move || async move {
             bootstrap_task(&client, password.as_ref()).await?;
             finish(&client, &refresh).await;
             Ok(())
@@ -362,7 +369,7 @@ impl SecurityTasks {
         let refresh = self.refresh.clone();
         let op = self.identity.clone();
         let events_for_task = events.clone();
-        self.spawn_identity(events, move |_permit| async move {
+        self.spawn_identity(events, move || async move {
             let result = reset_task(&client, &op, password.as_ref(), &events_for_task).await;
             // Also after a failure: the attempt made new private keys that
             // the server never accepted, and the query drops them again.
@@ -427,6 +434,15 @@ async fn bootstrap_task(client: &Client, password: Option<&Password>) -> Result<
     match uia_step(info, me, password) {
         ResetStep::NeedPassword => Err(Stop::Reauth(ReauthAction::BootstrapCrossSigning)),
         ResetStep::Retry(auth) => {
+            // UIA on a first upload means the server already has an identity
+            // this client had not seen. Only a confirmed "none" goes on, or
+            // the retry would replace it without the reset's intent.
+            let known = encryption
+                .request_user_identity(me)
+                .await
+                .ok()
+                .map(|identity| identity.is_some());
+            bootstrap_retry_allowed(known)?;
             // The failed first attempt already made the keys; the upload
             // goes on directly with the authentication data.
             encryption
@@ -437,6 +453,25 @@ async fn bootstrap_task(client: &Client, password: Option<&Password>) -> Result<
         ResetStep::Done | ResetStep::Approve(_) | ResetStep::Unsupported => {
             Err(CoreError::Internal(FAILED.into()).into())
         }
+    }
+}
+
+/// The approval URL the server gave, when it is safe to hand to the front end.
+fn approval_url(url: &url::Url) -> Result<crate::api::AuthUrl, CoreError> {
+    // Not `Login`: this is no login, and the check's own message says so.
+    check_auth_url(url.as_str())
+        .map_err(|_| CoreError::Internal("the identity reset gave an unsafe approval URL".into()))
+}
+
+/// Whether a password retry of the first upload may go on, given whether the
+/// account has an identity now (`None`: could not be determined). Anything but
+/// a confirmed "none" stops, so a retry cannot replace an identity.
+fn bootstrap_retry_allowed(identity_exists: Option<bool>) -> Result<(), CoreError> {
+    match identity_exists {
+        Some(false) => Ok(()),
+        Some(true) | None => Err(CoreError::Internal(
+            "an identity exists on the server; confirm it or reset it instead".into(),
+        )),
     }
 }
 
@@ -473,7 +508,7 @@ async fn reset_task(
             .map_err(|e| Stop::Failed(map_recovery_error(&e, FAILED))),
         (ResetStep::Approve(url), Some(handle)) => {
             // The URL comes from the server and the front end opens it.
-            let url = check_auth_url(url.as_str())?;
+            let url = approval_url(&url)?;
             let handle = Arc::new(handle);
             *op.waiting.lock().await = Some(handle.clone());
             // A cancel that arrived before the handle was stored.
@@ -765,5 +800,132 @@ mod tests {
             "Invalid password".into(),
         )));
         assert!(auth_rejected(Some(&info)));
+    }
+
+    fn unlimited_events() -> (mpsc::Sender<CoreEvent>, mpsc::Receiver<CoreEvent>) {
+        mpsc::channel(16)
+    }
+
+    async fn next_event(rx: &mut mpsc::Receiver<CoreEvent>) -> CoreEvent {
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("an event within 5 s")
+            .expect("the channel is open")
+    }
+
+    type BoxedWork = std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Stop>> + Send>>;
+
+    /// A fake identity operation that runs until `release` is notified and
+    /// then ends like `reset_task` does: `Cancelled` when a cancel came.
+    fn blocking_work(
+        op: Arc<IdentityOp>,
+        started: &Arc<Notify>,
+        release: &Arc<Notify>,
+    ) -> impl FnOnce() -> BoxedWork + use<> {
+        let (started, release) = (started.clone(), release.clone());
+        move || {
+            Box::pin(async move {
+                started.notify_one();
+                release.notified().await;
+                if op.cancelled.load(Ordering::Acquire) {
+                    return Err(CoreError::Cancelled.into());
+                }
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_second_identity_operation_in_flight_gets_busy() {
+        let (tx, mut rx) = unlimited_events();
+        let mut tasks = SecurityTasks::new();
+        let (started, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        tasks.spawn_identity(
+            &tx,
+            blocking_work(tasks.identity.clone(), &started, &release),
+        );
+        started.notified().await;
+
+        tasks.spawn_identity(
+            &tx,
+            blocking_work(tasks.identity.clone(), &started, &release),
+        );
+        match next_event(&mut rx).await {
+            CoreEvent::ActionFailed { action, error, .. } => {
+                assert_eq!(action, ActionKind::CrossSigning);
+                assert_eq!(error, CoreError::Busy);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // The first one finishes without any event, and frees the slot.
+        release.notify_one();
+        tasks.tasks.join_next().await;
+        tasks.tasks.join_next().await;
+        assert!(rx.try_recv().is_err());
+        assert!(tasks.identity.try_start().is_some(), "the slot is free");
+    }
+
+    #[tokio::test]
+    async fn cancel_during_an_identity_operation_ends_it_with_cancelled() {
+        let (tx, mut rx) = unlimited_events();
+        let mut tasks = SecurityTasks::new();
+        let (started, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        tasks.spawn_identity(
+            &tx,
+            blocking_work(tasks.identity.clone(), &started, &release),
+        );
+        started.notified().await;
+
+        tasks.cancel_reset();
+        assert!(
+            tasks.identity.cancelled.load(Ordering::Acquire),
+            "the running operation must see the cancel"
+        );
+        release.notify_one();
+        match next_event(&mut rx).await {
+            CoreEvent::ActionFailed { action, error, .. } => {
+                assert_eq!(action, ActionKind::CrossSigning);
+                assert_eq!(error, CoreError::Cancelled);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cancel_without_an_operation_does_not_hit_the_next_one() {
+        let (tx, mut rx) = unlimited_events();
+        let mut tasks = SecurityTasks::new();
+        tasks.cancel_reset();
+        let (started, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        tasks.spawn_identity(
+            &tx,
+            blocking_work(tasks.identity.clone(), &started, &release),
+        );
+        started.notified().await;
+        release.notify_one();
+        tasks.tasks.join_next().await;
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_rejected_approval_url_is_an_internal_error_with_a_fixed_message() {
+        let bad = url::Url::parse("http://evil.example.org/approve?s=1").unwrap();
+        let error = approval_url(&bad).expect_err("plain http to a remote host");
+        assert!(
+            matches!(&error, CoreError::Internal(m) if !m.contains("evil")),
+            "{error:?}"
+        );
+        let ok = url::Url::parse("https://account.example.org/reset?s=1").unwrap();
+        assert!(approval_url(&ok).is_ok());
+    }
+
+    #[test]
+    fn a_bootstrap_retry_needs_a_confirmed_absence_of_an_identity() {
+        assert!(bootstrap_retry_allowed(Some(false)).is_ok());
+        for known in [Some(true), None] {
+            let error = bootstrap_retry_allowed(known).expect_err("must not upload");
+            assert!(matches!(error, CoreError::Internal(_)), "{error:?}");
+        }
     }
 }
