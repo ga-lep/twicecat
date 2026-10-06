@@ -9,13 +9,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures_util::StreamExt as _;
 use futures_util::stream::{BoxStream, select_all};
-use matrix_sdk::Client;
 use matrix_sdk::encryption::recovery::{IdentityResetHandle, RecoveryError, RecoveryState};
 use matrix_sdk::encryption::{CrossSigningResetAuthType, CrossSigningStatus, VerificationState};
 use matrix_sdk::ruma::UserId;
+use matrix_sdk::ruma::api::client::keys::get_keys;
 use matrix_sdk::ruma::api::client::uiaa::{
     AuthData, AuthType, MatrixUserIdentifier, Password as UiaaPassword, UiaaInfo, UserIdentifier,
 };
+use matrix_sdk::{AuthApi, Client};
 use tokio::sync::{Mutex, Notify, mpsc};
 use tokio::task::{JoinHandle, JoinSet};
 
@@ -153,24 +154,118 @@ fn map_recovery_error(error: &RecoveryError, what: &'static str) -> CoreError {
     }
 }
 
+/// What the status says about the own identity. A local identity does not
+/// prove that the server has one (a bootstrap saves it locally before the
+/// upload, and a keys query that finds no identity keeps it), so with a local
+/// identity only the server's answer counts. Without one, "none" counts only
+/// after the server was asked (`queried`).
+fn identity_known(local: Option<bool>, queried: bool, server: Option<bool>) -> Option<bool> {
+    match local {
+        Some(true) => server,
+        Some(false) => queried.then_some(false),
+        None => None,
+    }
+}
+
+/// A password session must give the password before a reset starts: the SDK
+/// deletes the key backup and turns secret storage off before it asks for
+/// authentication (matrix-sdk-0.19.1 `recovery/mod.rs:438-443`). OAuth
+/// approves in the browser and takes no password.
+fn reset_needs_password_first(oauth: bool, password: Option<&Password>) -> bool {
+    !oauth && password.is_none()
+}
+
+/// How an OAuth-approval reset ended.
+#[derive(Debug, PartialEq)]
+enum ResetEnd {
+    Success,
+    Cancelled,
+    Failed,
+}
+
+/// Classifies the end of `handle.reset(None)`: `ok` is its result,
+/// `cancelled` whether a cancel came, `uploaded` whether the server now holds
+/// the new master key (`None`: could not be checked). After a cancel the SDK's
+/// `auth` also returns `Ok` (matrix-sdk-0.19.1 `encryption/mod.rs:386-389`),
+/// so only the server tells an approval that raced the cancel from a cancel.
+fn reset_end(ok: bool, cancelled: bool, uploaded: Option<bool>) -> ResetEnd {
+    match (ok, cancelled) {
+        (true, false) => ResetEnd::Success,
+        (false, false) => ResetEnd::Failed,
+        (true, true) if uploaded == Some(true) => ResetEnd::Success,
+        (_, true) => ResetEnd::Cancelled,
+    }
+}
+
+/// The master key (base64) the homeserver holds for `me`: `None` when the
+/// request failed, `Some(None)` when the account has no identity there. Asks
+/// the server directly, without feeding the answer to the Olm machine, so it
+/// cannot change the local store (`get_keys` `master_keys`, ruma-client-api
+/// 0.25.0 `keys/get_keys.rs:67`).
+async fn server_master_key(client: &Client, me: &UserId) -> Option<Option<String>> {
+    let mut request = get_keys::v3::Request::new();
+    request.device_keys.insert(me.to_owned(), Vec::new());
+    let response = client.send(request).await.ok()?;
+    let Some(raw) = response.master_keys.get(me) else {
+        return Some(None);
+    };
+    // Present but unreadable still counts as present; it matches no local key.
+    Some(Some(
+        raw.deserialize()
+            .ok()
+            .and_then(|key| key.keys.values().next().cloned())
+            .unwrap_or_default(),
+    ))
+}
+
+/// Whether the homeserver holds a cross-signing identity for `me`.
+async fn server_has_identity(client: &Client, me: &UserId) -> Option<bool> {
+    server_master_key(client, me).await.map(|key| key.is_some())
+}
+
+/// The master key (base64) of the identity in the local store.
+async fn local_master_key(client: &Client, me: &UserId) -> Option<String> {
+    let identity = client
+        .encryption()
+        .get_user_identity(me)
+        .await
+        .ok()
+        .flatten()?;
+    identity
+        .master_key()
+        .get_first_key()
+        .map(|key| key.to_base64())
+}
+
 /// Reads the current status from the client.
-async fn read_status(client: &Client) -> SecurityStatus {
+async fn read_status(client: &Client, op: &IdentityOp) -> SecurityStatus {
     let encryption = client.encryption();
     let Some(me) = client.user_id() else {
         return SecurityStatus::default();
     };
     // Also asks the server for the own identity when it is not known yet.
     let devices = encryption.has_devices_to_verify_against().await;
-    let identity = encryption
+    let local = encryption
         .get_user_identity(me)
         .await
         .ok()
         .map(|identity| identity.is_some());
-    // "No identity" means something only when the server was asked.
-    let identity_exists = match (identity, &devices) {
-        (Some(false), Err(_)) => None,
-        (known, _) => known,
+    // An identity the server has stays there, so that answer is kept and the
+    // request is made only until it is confirmed.
+    let server = if local == Some(true) {
+        if op.server_identity_seen.load(Ordering::Acquire) {
+            Some(true)
+        } else {
+            let server = server_has_identity(client, me).await;
+            if server == Some(true) {
+                op.server_identity_seen.store(true, Ordering::Release);
+            }
+            server
+        }
+    } else {
+        None
     };
+    let identity_exists = identity_known(local, devices.is_ok(), server);
     compute_status(&StatusInputs {
         recovery: encryption.recovery().state(),
         verification: encryption.verification_state().get(),
@@ -210,7 +305,7 @@ async fn forward_status(
     loop {
         let status = {
             let _gate = op.keys_gate.lock().await;
-            read_status(&client).await
+            read_status(&client, &op).await
         };
         if last != Some(status) {
             last = Some(status);
@@ -269,6 +364,8 @@ struct IdentityOp {
     /// query answered with the old identity in that time makes the SDK drop
     /// the new private keys for good, so no query of ours may run then.
     keys_gate: Mutex<()>,
+    /// The server was seen to hold an identity for the account (it stays).
+    server_identity_seen: AtomicBool,
 }
 
 impl IdentityOp {
@@ -368,12 +465,15 @@ impl SecurityTasks {
         let refresh = self.refresh.clone();
         let op = self.identity.clone();
         self.spawn_identity(events, move || async move {
-            {
+            let result = {
                 let _gate = op.keys_gate.lock().await;
-                bootstrap_task(&client, password.as_ref()).await?;
-            }
+                bootstrap_task(&client, password.as_ref()).await
+            };
+            // Also after a failure: the status is read again, and a keys
+            // query drops local keys when the server turned out to have an
+            // identity.
             finish(&client, &refresh).await;
-            Ok(())
+            result
         });
     }
 
@@ -393,8 +493,8 @@ impl SecurityTasks {
                 let _gate = op.keys_gate.lock().await;
                 reset_task(&client, &op, password.as_ref(), &events_for_task).await
             };
-            // Also after a failure: the attempt made new private keys that
-            // the server never accepted, and the query drops them again.
+            // Also after a failure: after a reset that made new private keys
+            // the server never accepted, the query drops them again.
             finish(&client, &refresh).await;
             result
         });
@@ -441,39 +541,165 @@ async fn finish(client: &Client, refresh: &Notify) {
     refresh.notify_one();
 }
 
-/// Creates the cross-signing identity when there is none (Q13).
+/// Why one bootstrap call failed.
+#[derive(Debug)]
+enum AttemptError {
+    /// The homeserver wants user-interactive authentication.
+    Uia(Box<UiaaInfo>),
+    /// Anything else.
+    Failed(CoreError),
+}
+
+/// The calls a bootstrap makes, so that the sequence can be tested.
+trait BootstrapApi {
+    /// Whether the server holds an identity (`None`: could not be checked).
+    async fn server_has_identity(&self) -> Option<bool>;
+    /// Whether the local store holds an identity.
+    async fn local_identity(&self) -> bool;
+    /// Fetches the own identity into the local store (best effort).
+    async fn sync_identity(&self);
+    /// Creates the identity unless the store has one, and uploads it.
+    async fn first_attempt(&self) -> Result<(), AttemptError>;
+    /// Uploads the identity of the store (it keeps the keys the failed first
+    /// attempt made), with `auth` when given.
+    async fn upload(&self, auth: Option<AuthData>) -> Result<(), AttemptError>;
+}
+
+/// The real calls.
+struct ClientBootstrap<'a> {
+    client: &'a Client,
+    me: &'a UserId,
+}
+
+fn attempt_error(error: &matrix_sdk::Error) -> AttemptError {
+    match error.as_uiaa_response() {
+        Some(info) => AttemptError::Uia(Box::new(info.clone())),
+        None => AttemptError::Failed(CoreError::Internal(BOOTSTRAP_FAILED.into())),
+    }
+}
+
+impl BootstrapApi for ClientBootstrap<'_> {
+    async fn server_has_identity(&self) -> Option<bool> {
+        server_has_identity(self.client, self.me).await
+    }
+
+    async fn local_identity(&self) -> bool {
+        self.client
+            .encryption()
+            .get_user_identity(self.me)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
+    async fn sync_identity(&self) {
+        let _ = self
+            .client
+            .encryption()
+            .request_user_identity(self.me)
+            .await;
+    }
+
+    async fn first_attempt(&self) -> Result<(), AttemptError> {
+        self.client
+            .encryption()
+            .bootstrap_cross_signing_if_needed(None)
+            .await
+            .map_err(|e| attempt_error(&e))
+    }
+
+    async fn upload(&self, auth: Option<AuthData>) -> Result<(), AttemptError> {
+        self.client
+            .encryption()
+            .bootstrap_cross_signing(auth)
+            .await
+            .map_err(|e| attempt_error(&e))
+    }
+}
+
+const BOOTSTRAP_FAILED: &str = "cross-signing could not be set up";
+
+/// What a bootstrap request does. `server`: whether the homeserver holds an
+/// identity; `local`: whether the local store does. The SDK saves a new
+/// identity locally before it uploads it, and a keys query that finds none on
+/// the server leaves it there (matrix-sdk-crypto-0.19.1 `machine/mod.rs:808-835`,
+/// `identities/manager.rs:464`, `olm/signing/mod.rs:351`), so a failed first
+/// upload leaves "server none, local some", and `bootstrap_cross_signing_if_needed`
+/// (matrix-sdk-0.19.1 `encryption/mod.rs:1696-1708`) would then do nothing.
+fn bootstrap_plan(server: Option<bool>, local: bool) -> BootstrapPlan {
+    match (server, local) {
+        (Some(true), _) => BootstrapPlan::AlreadySetUp,
+        (Some(false), false) => BootstrapPlan::FirstAttempt,
+        (Some(false), true) => BootstrapPlan::UploadLocal,
+        (None, _) => BootstrapPlan::Unverifiable,
+    }
+}
+
+/// The step a bootstrap request starts with.
+#[derive(Debug, PartialEq)]
+enum BootstrapPlan {
+    /// The server has an identity; nothing to upload.
+    AlreadySetUp,
+    /// Neither side has one: create and upload.
+    FirstAttempt,
+    /// An earlier attempt made the keys but the server never got them.
+    UploadLocal,
+    /// The server could not be asked.
+    Unverifiable,
+}
+
+/// Creates the cross-signing identity when the server has none (Q13).
 async fn bootstrap_task(client: &Client, password: Option<&Password>) -> Result<(), Stop> {
-    const FAILED: &str = "cross-signing could not be set up";
-    let encryption = client.encryption();
-    let error = match encryption.bootstrap_cross_signing_if_needed(None).await {
-        Ok(()) => return Ok(()),
-        Err(error) => error,
-    };
-    let Some(info) = error.as_uiaa_response() else {
-        return Err(CoreError::Internal(FAILED.into()).into());
-    };
     let me = client.user_id().ok_or(CoreError::NotLoggedIn)?;
-    match uia_step(info, me, password) {
+    bootstrap_flow(&ClientBootstrap { client, me }, me, password).await
+}
+
+/// The bootstrap sequence over `api`.
+async fn bootstrap_flow<A: BootstrapApi>(
+    api: &A,
+    me: &UserId,
+    password: Option<&Password>,
+) -> Result<(), Stop> {
+    let first = match bootstrap_plan(api.server_has_identity().await, api.local_identity().await) {
+        BootstrapPlan::AlreadySetUp => {
+            // Bring a server-side identity this client had not seen into the
+            // store; never replace it.
+            api.sync_identity().await;
+            return Ok(());
+        }
+        BootstrapPlan::Unverifiable => {
+            return Err(CoreError::Internal(
+                "the server could not be asked about the identity".into(),
+            )
+            .into());
+        }
+        BootstrapPlan::FirstAttempt => api.first_attempt().await,
+        BootstrapPlan::UploadLocal => api.upload(None).await,
+    };
+    let info = match first {
+        Ok(()) => return Ok(()),
+        Err(AttemptError::Failed(error)) => return Err(error.into()),
+        Err(AttemptError::Uia(info)) => info,
+    };
+    match uia_step(&info, me, password) {
         ResetStep::NeedPassword => Err(Stop::Reauth(ReauthAction::BootstrapCrossSigning)),
         ResetStep::Retry(auth) => {
-            // UIA on a first upload means the server already has an identity
-            // this client had not seen. Only a confirmed "none" goes on, or
-            // the retry would replace it without the reset's intent.
-            let known = encryption
-                .request_user_identity(me)
-                .await
-                .ok()
-                .map(|identity| identity.is_some());
-            bootstrap_retry_allowed(known)?;
-            // The failed first attempt already made the keys; the upload
+            // Only a confirmed "none" on the server goes on, or the retry
+            // would replace an identity without the reset's intent.
+            bootstrap_retry_allowed(api.server_has_identity().await)?;
+            // The keys exist locally already (reset is false), so the upload
             // goes on directly with the authentication data.
-            encryption
-                .bootstrap_cross_signing(Some(auth))
-                .await
-                .map_err(|e| Stop::Failed(map_sdk_error(&e, FAILED)))
+            api.upload(Some(auth)).await.map_err(|error| match error {
+                AttemptError::Uia(info) if auth_rejected(Some(&info)) => {
+                    Stop::Failed(CoreError::ReauthFailed)
+                }
+                AttemptError::Uia(_) => Stop::Failed(CoreError::Internal(BOOTSTRAP_FAILED.into())),
+                AttemptError::Failed(error) => Stop::Failed(error),
+            })
         }
         ResetStep::Done | ResetStep::Approve(_) | ResetStep::Unsupported => {
-            Err(CoreError::Internal(FAILED.into()).into())
+            Err(CoreError::Internal(BOOTSTRAP_FAILED.into()).into())
         }
     }
 }
@@ -506,6 +732,12 @@ async fn reset_task(
 ) -> Result<(), Stop> {
     const FAILED: &str = "the identity could not be reset";
     let me = client.user_id().ok_or(CoreError::NotLoggedIn)?;
+    // Before anything is touched: `reset_identity` deletes the key backup and
+    // turns secret storage off first, then asks for authentication.
+    let oauth = matches!(client.auth_api(), Some(AuthApi::OAuth(_)));
+    if reset_needs_password_first(oauth, password) {
+        return Err(Stop::Reauth(ReauthAction::ResetIdentity));
+    }
     // A keys query that answers with the old identity after the new keys were
     // made (and before they are uploaded) makes the SDK drop the new private
     // keys. Asking first leaves nothing pending, so the window is one upload.
@@ -533,19 +765,37 @@ async fn reset_task(
             let url = approval_url(&url)?;
             let handle = Arc::new(handle);
             *op.waiting.lock().await = Some(handle.clone());
-            // A cancel that arrived before the handle was stored.
+            // A cancel that arrived before the handle was stored: the front
+            // end never gets the approval URL.
             if op.cancelled.load(Ordering::Acquire) {
                 handle.cancel().await;
+                *op.waiting.lock().await = None;
+                return Err(CoreError::Cancelled.into());
             }
             let _ = events.send(CoreEvent::OpenAccountManagement(url)).await;
             // Polls until the approval arrives, the 2 minutes are up, or the
             // reset is cancelled.
             let result = handle.reset(None).await;
             *op.waiting.lock().await = None;
-            if op.cancelled.load(Ordering::Acquire) {
-                return Err(CoreError::Cancelled.into());
+            let cancelled = op.cancelled.load(Ordering::Acquire);
+            let uploaded = if result.is_ok() && cancelled {
+                match (
+                    server_master_key(client, me).await,
+                    local_master_key(client, me).await,
+                ) {
+                    (Some(Some(server)), Some(local)) => Some(server == local),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            match reset_end(result.is_ok(), cancelled, uploaded) {
+                ResetEnd::Success => Ok(()),
+                ResetEnd::Cancelled => Err(CoreError::Cancelled.into()),
+                ResetEnd::Failed => {
+                    result.map_err(|e| Stop::Failed(map_recovery_error(&e, FAILED)))
+                }
             }
-            result.map_err(|e| Stop::Failed(map_recovery_error(&e, FAILED)))
         }
         (ResetStep::Unsupported, _) => Err(CoreError::Internal(FAILED.into()).into()),
     }
@@ -949,5 +1199,249 @@ mod tests {
             let error = bootstrap_retry_allowed(known).expect_err("must not upload");
             assert!(matches!(error, CoreError::Internal(_)), "{error:?}");
         }
+    }
+
+    #[test]
+    fn bootstrap_plan_table() {
+        use BootstrapPlan::*;
+        let cases = [
+            // The server has one: never upload, whatever the local store says.
+            (Some(true), false, AlreadySetUp),
+            (Some(true), true, AlreadySetUp),
+            // Nothing anywhere: the first attempt.
+            (Some(false), false, FirstAttempt),
+            // A failed first attempt left a local identity the server lacks.
+            (Some(false), true, UploadLocal),
+            // Cannot tell: do nothing.
+            (None, false, Unverifiable),
+            (None, true, Unverifiable),
+        ];
+        for (server, local, want) in cases {
+            assert_eq!(bootstrap_plan(server, local), want, "{server:?} {local}");
+        }
+    }
+
+    #[test]
+    fn a_local_identity_never_proves_the_server_has_one() {
+        // A pending upload: the store has the identity, the server does not.
+        assert_eq!(identity_known(Some(true), true, Some(false)), Some(false));
+        let status = compute_status(&StatusInputs {
+            identity_exists: identity_known(Some(true), true, Some(false)),
+            private_keys: keys(true, true, true),
+            ..inputs()
+        });
+        assert_eq!(status.cross_signing, CrossSigning::NotSetUp);
+        assert!(!status.identity_exists);
+        // Server unreachable: unknown, not complete.
+        assert_eq!(identity_known(Some(true), true, None), None);
+        assert_eq!(identity_known(Some(true), false, Some(true)), Some(true));
+        // No local identity: "none" only after the server was asked.
+        assert_eq!(identity_known(Some(false), true, None), Some(false));
+        assert_eq!(identity_known(Some(false), false, None), None);
+        assert_eq!(identity_known(None, true, Some(true)), None);
+    }
+
+    #[test]
+    fn a_password_session_needs_the_password_before_the_reset_starts() {
+        let pw = Password::from("secret-pw-x");
+        assert!(reset_needs_password_first(false, None));
+        assert!(!reset_needs_password_first(false, Some(&pw)));
+        // OAuth never takes a password.
+        assert!(!reset_needs_password_first(true, None));
+        assert!(!reset_needs_password_first(true, Some(&pw)));
+    }
+
+    #[test]
+    fn reset_end_table() {
+        use ResetEnd::*;
+        let cases = [
+            (true, false, None, Success),
+            (false, false, None, Failed),
+            // A cancel that raced an approval that did upload.
+            (true, true, Some(true), Success),
+            // After a cancel the SDK answers Ok without having uploaded.
+            (true, true, Some(false), Cancelled),
+            (true, true, None, Cancelled),
+            (false, true, None, Cancelled),
+            (false, true, Some(false), Cancelled),
+        ];
+        for (ok, cancelled, uploaded, want) in cases {
+            assert_eq!(
+                reset_end(ok, cancelled, uploaded),
+                want,
+                "{ok} {cancelled} {uploaded:?}"
+            );
+        }
+    }
+
+    /// A scripted server and store for the bootstrap sequence.
+    struct Fake {
+        /// The server holds an identity.
+        server: std::sync::Mutex<Option<bool>>,
+        /// The local store holds an identity.
+        local: AtomicBool,
+        /// The server demands UIA for an upload without auth.
+        demands_uia: bool,
+        /// Calls, in order.
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Fake {
+        fn new(server: Option<bool>, local: bool, demands_uia: bool) -> Self {
+            Self {
+                server: std::sync::Mutex::new(server),
+                local: AtomicBool::new(local),
+                demands_uia,
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        fn log(&self, call: &str) {
+            self.calls.lock().unwrap().push(call.to_owned());
+        }
+
+        fn uia() -> AttemptError {
+            AttemptError::Uia(Box::new(UiaaInfo::new(vec![AuthFlow::new(vec![
+                AuthType::Password,
+            ])])))
+        }
+    }
+
+    impl BootstrapApi for Fake {
+        async fn server_has_identity(&self) -> Option<bool> {
+            self.log("server");
+            *self.server.lock().unwrap()
+        }
+
+        async fn local_identity(&self) -> bool {
+            self.local.load(Ordering::Acquire)
+        }
+
+        async fn sync_identity(&self) {
+            self.log("sync");
+        }
+
+        async fn first_attempt(&self) -> Result<(), AttemptError> {
+            self.log("first");
+            // Like the SDK: the identity is saved locally before the upload.
+            let had = self.local.swap(true, Ordering::AcqRel);
+            if had {
+                return Ok(());
+            }
+            if self.demands_uia {
+                return Err(Self::uia());
+            }
+            *self.server.lock().unwrap() = Some(true);
+            Ok(())
+        }
+
+        async fn upload(&self, auth: Option<AuthData>) -> Result<(), AttemptError> {
+            self.log(if auth.is_some() {
+                "upload+auth"
+            } else {
+                "upload"
+            });
+            if auth.is_none() && self.demands_uia {
+                return Err(Self::uia());
+            }
+            *self.server.lock().unwrap() = Some(true);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_first_bootstrap_is_retried_with_the_password() {
+        let me = owned_user_id!("@alice:example.org");
+        let pw = Password::from("secret-pw-x");
+        let fake = Fake::new(Some(false), false, true);
+
+        // Without a password: asked for it, the local identity is left.
+        let result = bootstrap_flow(&fake, &me, None).await;
+        assert!(
+            matches!(
+                result,
+                Err(Stop::Reauth(ReauthAction::BootstrapCrossSigning))
+            ),
+            "{result:?}"
+        );
+        assert!(fake.local.load(Ordering::Acquire));
+        assert_eq!(fake.calls(), ["server", "first"]);
+
+        // The next request with the password goes straight to the upload.
+        let result = bootstrap_flow(&fake, &me, Some(&pw)).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            fake.calls(),
+            [
+                "server",
+                "first",
+                "server",
+                "upload",
+                "server",
+                "upload+auth"
+            ]
+        );
+        assert_eq!(*fake.server.lock().unwrap(), Some(true));
+
+        // And now the server has it: nothing more is uploaded.
+        let result = bootstrap_flow(&fake, &me, Some(&pw)).await;
+        assert!(result.is_ok());
+        assert_eq!(fake.calls().last().map(String::as_str), Some("sync"));
+        assert!(!fake.calls()[6..].iter().any(|c| c.starts_with("upload")));
+    }
+
+    #[tokio::test]
+    async fn a_password_on_the_first_request_retries_once_with_the_session() {
+        let me = owned_user_id!("@alice:example.org");
+        let pw = Password::from("secret-pw-x");
+        let fake = Fake::new(Some(false), false, true);
+        let result = bootstrap_flow(&fake, &me, Some(&pw)).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(fake.calls(), ["server", "first", "server", "upload+auth"]);
+    }
+
+    #[tokio::test]
+    async fn a_server_identity_seen_late_is_never_replaced() {
+        let me = owned_user_id!("@alice:example.org");
+        let pw = Password::from("secret-pw-x");
+        // The first attempt wants UIA, and by the retry the server has one.
+        struct Late(Fake);
+        impl BootstrapApi for Late {
+            async fn server_has_identity(&self) -> Option<bool> {
+                let seen = self.0.server_has_identity().await;
+                // The first question says "none", later ones "exists".
+                *self.0.server.lock().unwrap() = Some(true);
+                seen
+            }
+            async fn local_identity(&self) -> bool {
+                self.0.local_identity().await
+            }
+            async fn sync_identity(&self) {
+                self.0.sync_identity().await;
+            }
+            async fn first_attempt(&self) -> Result<(), AttemptError> {
+                self.0.first_attempt().await
+            }
+            async fn upload(&self, auth: Option<AuthData>) -> Result<(), AttemptError> {
+                self.0.upload(auth).await
+            }
+        }
+        let late = Late(Fake::new(Some(false), false, true));
+        let result = bootstrap_flow(&late, &me, Some(&pw)).await;
+        assert!(matches!(result, Err(Stop::Failed(CoreError::Internal(_)))));
+        assert!(!late.0.calls().iter().any(|c| c.starts_with("upload")));
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_server_uploads_nothing() {
+        let me = owned_user_id!("@alice:example.org");
+        let fake = Fake::new(None, true, false);
+        let result = bootstrap_flow(&fake, &me, None).await;
+        assert!(matches!(result, Err(Stop::Failed(CoreError::Internal(_)))));
+        assert_eq!(fake.calls(), ["server"]);
     }
 }

@@ -13,7 +13,7 @@ use std::time::Duration;
 use common::{
     EncryptedPair, TestEnv, e2ee_serial, expect_event, expect_security, first_device, hex,
     message_with, outgoing, pump, raw_login_named, reset_e2ee_account, reset_identity_on,
-    start_core,
+    seed_recovery, start_core,
 };
 use tessera_core::CoreHandle;
 use tessera_core::api::{
@@ -98,13 +98,16 @@ async fn status_on_a_fresh_baseline_account() {
 #[ignore = "needs local homeserver: docker compose up -d --wait"]
 async fn reset_needs_the_password_and_replaces_the_identity() {
     let _serial = e2ee_serial().await;
-    reset_e2ee_account(1).await;
+    // B1: a backup exists, which a reset deletes before it asks for the
+    // password (the core must not start one without it).
+    let _recovery_key = seed_recovery(1, None).await;
     let (mut core, _dir, _secrets) = login(1).await;
     expect_security(&mut core, |s| {
         s.cross_signing == CrossSigning::MissingKeys && s.identity_exists
     })
     .await;
-    let (master_before, _) = server_view(1).await;
+    let (master_before, backup_before) = server_view(1).await;
+    assert!(backup_before, "the baseline has a backup");
 
     // No password: the core asks for one.
     core.commands
@@ -127,6 +130,10 @@ async fn reset_needs_the_password_and_replaces_the_identity() {
         ),
         "{event:?}"
     );
+    // The refusal came before anything was touched: the backup is still there.
+    let (master_now, backup_now) = server_view(1).await;
+    assert!(backup_now, "a password-less reset deleted the backup");
+    assert_eq!(master_before, master_now);
 
     // A wrong password is refused.
     core.commands

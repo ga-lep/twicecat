@@ -2290,8 +2290,8 @@ mod tests {
     async fn identity_commands_with_a_session_run_in_the_background() {
         let tmp = tempfile::tempdir().unwrap();
         let (mut engine, mut rx) = oauth_engine(tmp.path());
-        // No encryption was set up on this client, so there is no Olm
-        // machine and no network is needed to fail.
+        // This client never logged in, so the task fails at once with no
+        // network (bootstrap needs the user ID first).
         let client = Client::builder()
             .homeserver_url("http://127.0.0.1:1")
             .build()
@@ -2320,7 +2320,7 @@ mod tests {
                 &event,
                 CoreEvent::ActionFailed {
                     action: ActionKind::CrossSigning,
-                    error: CoreError::Internal(_),
+                    error: CoreError::NotLoggedIn,
                     ..
                 }
             ),
