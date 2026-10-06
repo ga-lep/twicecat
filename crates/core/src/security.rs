@@ -28,6 +28,7 @@ use crate::api::{
     RecoveryKey, RecoveryProgress, RecoveryStatus, RoomId, SecurityStatus,
 };
 use crate::oauth::check_auth_url;
+use crate::sync::SyncPause;
 
 /// What the status is computed from.
 #[derive(Clone, Debug)]
@@ -245,7 +246,7 @@ enum ResetEnd {
 
 /// Classifies the end of `handle.reset(None)`: `ok` is its result,
 /// `cancelled` whether a cancel came, `uploaded` whether the server now holds
-/// the new master key (`None`: could not be checked). After a cancel the SDK's
+/// the master key of the local private identity (`None`: could not be checked). After a cancel the SDK's
 /// `auth` also returns `Ok` (matrix-sdk-0.19.1 `encryption/mod.rs:386-389`),
 /// so only the server tells an approval that raced the cancel from a cancel.
 fn reset_end(ok: bool, cancelled: bool, uploaded: Option<bool>) -> ResetEnd {
@@ -527,6 +528,7 @@ impl SecurityTasks {
     pub(crate) fn bootstrap(
         &mut self,
         client: &Client,
+        pause: Option<SyncPause>,
         password: Option<Password>,
         events: &mpsc::Sender<CoreEvent>,
     ) {
@@ -534,14 +536,19 @@ impl SecurityTasks {
         let refresh = self.refresh.clone();
         let op = self.identity.clone();
         self.spawn_identity(events, ActionKind::CrossSigning, move || async move {
-            let result = {
-                let _gate = op.keys_gate.lock().await;
-                bootstrap_task(&client, password.as_ref()).await
-            };
-            // Also after a failure: the status is read again, and a keys
-            // query drops local keys when the server turned out to have an
-            // identity.
-            finish(&client, &refresh).await;
+            let result = with_sync_paused(&client, pause.as_ref(), async {
+                let result = {
+                    let _gate = op.keys_gate.lock().await;
+                    bootstrap_task(&client, password.as_ref()).await
+                };
+                // Also after a failure: a keys query drops local keys when
+                // the server turned out to have an identity. It runs while the
+                // sync is still paused.
+                query_own_identity(&client).await;
+                result
+            })
+            .await;
+            refresh.notify_one();
             result.map(|()| None)
         });
     }
@@ -550,6 +557,7 @@ impl SecurityTasks {
     pub(crate) fn reset(
         &mut self,
         client: &Client,
+        pause: Option<SyncPause>,
         password: Option<Password>,
         events: &mpsc::Sender<CoreEvent>,
     ) {
@@ -558,13 +566,22 @@ impl SecurityTasks {
         let op = self.identity.clone();
         let events_for_task = events.clone();
         self.spawn_identity(events, ActionKind::CrossSigning, move || async move {
-            let result = {
-                let _gate = op.keys_gate.lock().await;
-                reset_task(&client, &op, password.as_ref(), &events_for_task).await
-            };
-            // Also after a failure: after a reset that made new private keys
-            // the server never accepted, the query drops them again.
-            finish(&client, &refresh).await;
+            let result = with_sync_paused(&client, pause.as_ref(), async {
+                let result = {
+                    let _gate = op.keys_gate.lock().await;
+                    reset_task(&client, &op, password.as_ref(), &events_for_task).await
+                };
+                // Also after a failure: after a reset that made new private
+                // keys the server never accepted, the query drops them again.
+                // It runs while the sync is still paused.
+                query_own_identity(&client).await;
+                match result {
+                    Ok(()) => reset_complete(client.encryption().cross_signing_status().await),
+                    Err(stop) => Err(stop),
+                }
+            })
+            .await;
+            refresh.notify_one();
             result.map(|()| None)
         });
     }
@@ -650,14 +667,55 @@ async fn report(events: &mpsc::Sender<CoreEvent>, action: ActionKind, stop: Stop
     let _ = events.send(event).await;
 }
 
+/// Runs `work` with the sync stopped (when there is a sync service): the
+/// operations that create new private cross-signing keys must not have a sync
+/// `/keys/query` answered with the old identity processed in between, see
+/// [`SyncPause`]. The SDK's one-shot setup after the login (it can query keys
+/// and bootstrap too) is awaited first.
+async fn with_sync_paused<T>(
+    client: &Client,
+    pause: Option<&SyncPause>,
+    work: impl std::future::Future<Output = T>,
+) -> T {
+    client
+        .encryption()
+        .wait_for_e2ee_initialization_tasks()
+        .await;
+    let paused = match pause {
+        Some(pause) => Some(pause.pause().await),
+        None => None,
+    };
+    let result = work.await;
+    if let Some(paused) = paused {
+        paused.resume().await;
+    }
+    result
+}
+
+/// A reset that reported success must leave all three private keys here: a
+/// query answered by another device's newer identity (or any lost race) drops
+/// them, and the account would be verified on the server only.
+fn reset_complete(status: Option<CrossSigningStatus>) -> Result<(), Stop> {
+    if status.is_some_and(|status| status.is_complete()) {
+        Ok(())
+    } else {
+        Err(CoreError::Internal("the identity reset did not complete on this device".into()).into())
+    }
+}
+
 /// After a change of identity: asks the server for the own keys (so that the
 /// device's new signature is seen) and has the status recomputed.
 async fn finish(client: &Client, refresh: &Notify) {
+    query_own_identity(client).await;
+    refresh.notify_one();
+}
+
+/// Asks the server for the own keys (best effort: the sync brings the same
+/// information a moment later).
+async fn query_own_identity(client: &Client) {
     if let Some(me) = client.user_id() {
-        // Best effort: the sync brings the same information a moment later.
         let _ = client.encryption().request_user_identity(me).await;
     }
-    refresh.notify_one();
 }
 
 /// Why one bootstrap call failed.
@@ -953,11 +1011,19 @@ async fn reset_task(
             *op.waiting.lock().await = None;
             let cancelled = op.cancelled.load(Ordering::Acquire);
             let uploaded = if result.is_ok() && cancelled {
+                // The private keys must be there too: a public identity alone
+                // can be the old one put back by a sync-driven query, which
+                // would make a cancelled reset look like a success.
+                let complete = client
+                    .encryption()
+                    .cross_signing_status()
+                    .await
+                    .is_some_and(|status| status.is_complete());
                 match (
                     server_master_key(client, me).await,
                     local_master_key(client, me).await,
                 ) {
-                    (Some(Some(server)), Some(local)) => Some(server == local),
+                    (Some(Some(server)), Some(local)) => Some(complete && server == local),
                     _ => None,
                 }
             } else {
@@ -1570,6 +1636,19 @@ mod tests {
         // OAuth never takes a password.
         assert!(!reset_needs_password_first(true, None));
         assert!(!reset_needs_password_first(true, Some(&pw)));
+    }
+
+    #[test]
+    fn a_reset_is_complete_only_with_all_three_private_keys() {
+        assert!(reset_complete(keys(true, true, true)).is_ok());
+        for status in [
+            keys(true, true, false),
+            keys(false, true, true),
+            keys(false, false, false),
+            None,
+        ] {
+            assert!(reset_complete(status).is_err());
+        }
     }
 
     #[test]

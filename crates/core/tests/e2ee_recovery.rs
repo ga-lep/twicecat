@@ -532,10 +532,14 @@ async fn resetting_the_identity_clears_recovery_and_makes_a_new_backup() {
         })
         .await
         .unwrap();
-    // Recovery is off from the moment secret storage is turned off. The
-    // cross-signing state is not asserted here: a sync-driven keys query can
-    // drop the new private keys during a reset (see the Task 5 notes).
-    expect_security(&mut core, |s| s.recovery == RecoveryStatus::Disabled).await;
+    // Recovery is off from the moment secret storage is turned off, and the
+    // reset, started right after enabling recovery, keeps its new private keys
+    // (the reset stops the sync meanwhile, see `SyncPause`).
+    expect_security(&mut core, |s| {
+        s.recovery == RecoveryStatus::Disabled && s.cross_signing == CrossSigning::Complete
+    })
+    .await;
+    common::assert_identity_stays_complete(&mut core, Duration::from_secs(5)).await;
     // The new backup is made at the end of the reset; poll for it.
     let wait = async {
         loop {

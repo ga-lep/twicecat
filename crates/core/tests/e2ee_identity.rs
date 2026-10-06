@@ -212,6 +212,27 @@ async fn bootstrap_is_a_no_op_when_an_identity_exists() {
     logout(core).await;
 }
 
+/// Resets the identity and expects the whole identity here, and no loss of the
+/// private keys once the sync is back (a sync-driven keys query answered with
+/// the old identity drops them; the reset stops the sync to prevent it).
+async fn reset_and_expect_complete(core: &mut CoreHandle, n: u8) {
+    reset_identity_on(core, n).await;
+    common::assert_identity_stays_complete(core, Duration::from_secs(5)).await;
+}
+
+#[tokio::test]
+#[ignore = "needs local homeserver: docker compose up -d --wait"]
+async fn a_reset_right_after_login_keeps_the_new_private_keys() {
+    let _serial = e2ee_serial().await;
+    reset_e2ee_account(1).await;
+    // No settle time: the reset starts while the first syncs query the keys.
+    let (mut core, _dir, _secrets) = login(1).await;
+    reset_and_expect_complete(&mut core, 1).await;
+    // A second reset in a row, also right away.
+    reset_and_expect_complete(&mut core, 1).await;
+    logout(core).await;
+}
+
 #[tokio::test]
 #[ignore = "needs local homeserver: docker compose up -d --wait"]
 async fn a_restored_session_keeps_the_complete_identity() {

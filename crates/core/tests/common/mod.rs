@@ -742,6 +742,27 @@ pub async fn reset_identity_on(core: &mut CoreHandle, n: u8) {
     .await;
 }
 
+/// Watches `core` for `window` and fails if the status shows an incomplete
+/// cross-signing identity (a sync-driven keys query dropped the private keys).
+pub async fn assert_identity_stays_complete(core: &mut CoreHandle, window: Duration) {
+    use tessera_core::api::CrossSigning;
+    let watch = async {
+        loop {
+            match core.events.recv().await {
+                Some(CoreEvent::Security(s)) => assert_eq!(
+                    s.cross_signing,
+                    CrossSigning::Complete,
+                    "the private keys were dropped: {s:?}"
+                ),
+                Some(_) => {}
+                None => panic!("event channel closed"),
+            }
+        }
+    };
+    // Running out of time is the expected end.
+    let _ = tokio::time::timeout(window, watch).await;
+}
+
 /// Logs `core` in as test user `n` on baseline B0 and makes it the account's
 /// first device (Q2): see [`reset_identity_on`]. Nothing is synced yet.
 pub async fn first_device(core: &mut CoreHandle, n: u8) {
@@ -755,16 +776,8 @@ pub async fn first_device(core: &mut CoreHandle, n: u8) {
         .await
         .unwrap();
     expect_event(core, |e| matches!(e, CoreEvent::LoggedIn { .. })).await;
-    // The first syncs after a login query the own keys. A reset that starts
-    // in that burst can have its new private keys dropped by a sync-driven
-    // query that the server answers with the old identity before the upload
-    // lands (the SDK race of the Task 4 notes; the keys gate cannot cover the
-    // SDK's own sync requests). Without this settle time `first_device` ended
-    // in `MissingKeys` in about half the runs (Task 5 notes).
-    expect_event(core, |e| {
-        matches!(e, CoreEvent::SyncState(SyncState::Running))
-    })
-    .await;
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // No wait for the sync: the reset stops the sync service itself while it
+    // makes the new keys (Task 4/5 notes, `SyncPause`), so a reset right after
+    // the login is safe.
     reset_identity_on(core, n).await;
 }

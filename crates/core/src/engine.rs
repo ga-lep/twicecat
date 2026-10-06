@@ -44,7 +44,7 @@ use crate::security::SecurityTasks;
 use crate::session::{
     RECORD_VERSION, SessionAuth, SessionRecord, generate_session_id, generate_store_passphrase,
 };
-use crate::sync::{CancelTrigger, SyncControl, cancel_pair, run_supervised};
+use crate::sync::{CancelTrigger, SyncControl, SyncPause, cancel_pair, run_supervised};
 use crate::timeline::{map_item, normalize_reaction_key, parse_room_id, rank_members};
 
 /// Events loaded by one back-pagination.
@@ -110,6 +110,8 @@ impl Core {
 /// A running sync service and the tasks that forward its output as events.
 struct Syncing {
     service: Arc<SyncService>,
+    /// Stops the service while an identity operation makes new keys.
+    pause: SyncPause,
     /// Asks the supervisor to end between steps (it is never aborted: an
     /// aborted `SyncService::stop` could leave SDK tasks running).
     cancel: CancelTrigger,
@@ -214,15 +216,20 @@ impl Active {
 }
 
 /// Production [`SyncControl`]: restarts the real service.
-struct ServiceControl(Arc<SyncService>);
+struct ServiceControl {
+    service: Arc<SyncService>,
+    /// Closed while an identity operation has the sync paused (`SyncPause`).
+    gate: Arc<tokio::sync::Mutex<()>>,
+}
 
 impl SyncControl for ServiceControl {
     async fn restart(&self) {
-        self.0.start().await;
+        let _open = self.gate.lock().await;
+        self.service.start().await;
     }
 
     async fn stop(&self) {
-        self.0.stop().await;
+        self.service.stop().await;
     }
 
     fn now(&self) -> std::time::Instant {
@@ -247,6 +254,7 @@ async fn forward_sync_state(
     client: Client,
     events: mpsc::Sender<CoreEvent>,
     cancel: crate::sync::Cancel,
+    gate: Arc<tokio::sync::Mutex<()>>,
 ) {
     // Subscribe, then mark the current value as seen: the subscriber would
     // otherwise yield it again, which the supervisor reads as a missed
@@ -262,7 +270,7 @@ async fn forward_sync_state(
             client.send_queue().set_enabled(true).await;
         }
     };
-    let control = ServiceControl(service);
+    let control = ServiceControl { service, gate };
     let supervised = run_supervised(&control, initial, subscriber, events, cancel, || {
         resumed.notify_one()
     });
@@ -1017,15 +1025,21 @@ impl Engine {
             // Network work runs in the security tasks, so `handle` never
             // waits for it.
             Command::BootstrapCrossSigning { password } => match self.active.as_mut() {
-                Some(active) => active
-                    .security
-                    .bootstrap(&active.client, password, &self.events),
+                Some(active) => {
+                    let pause = active.sync.as_ref().map(|s| s.pause.clone());
+                    active
+                        .security
+                        .bootstrap(&active.client, pause, password, &self.events);
+                }
                 None => self.not_logged_in(ActionKind::CrossSigning).await,
             },
             Command::ResetIdentity { password } => match self.active.as_mut() {
-                Some(active) => active
-                    .security
-                    .reset(&active.client, password, &self.events),
+                Some(active) => {
+                    let pause = active.sync.as_ref().map(|s| s.pause.clone());
+                    active
+                        .security
+                        .reset(&active.client, pause, password, &self.events);
+                }
                 None => self.not_logged_in(ActionKind::CrossSigning).await,
             },
             Command::CancelIdentityReset => match self.active.as_mut() {
@@ -1697,11 +1711,13 @@ impl Engine {
             }
         };
         let (cancel, cancelled) = cancel_pair();
+        let pause = SyncPause::new(service.clone());
         let supervisor = tokio::spawn(forward_sync_state(
             service.clone(),
             active.client.clone(),
             self.events.clone(),
             cancelled,
+            pause.gate(),
         ));
         let (more_rooms, more_rx) = mpsc::channel(8);
         let room_list = tokio::spawn(forward_room_list(
@@ -1715,6 +1731,7 @@ impl Engine {
         if let Some(active) = self.active.as_mut() {
             active.sync = Some(Syncing {
                 service,
+                pause,
                 cancel,
                 supervisor,
                 room_list,

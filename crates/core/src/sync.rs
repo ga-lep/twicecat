@@ -2,9 +2,11 @@
 
 use std::time::{Duration, Instant};
 
+use std::sync::Arc;
+
 use futures_util::{Stream, StreamExt as _};
-use matrix_sdk_ui::sync_service::State;
-use tokio::sync::{mpsc, watch};
+use matrix_sdk_ui::sync_service::{State, SyncService};
+use tokio::sync::{Mutex, OwnedMutexGuard, mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
@@ -58,6 +60,61 @@ pub(crate) fn backoff_delay(attempt: u32, jitter_unit: f64) -> Duration {
         jitter_unit.clamp(0.0, 1.0)
     };
     base.mul_f64(1.0 - JITTER + 2.0 * JITTER * unit)
+}
+
+/// Stops the sync service for the time an identity operation creates new
+/// private cross-signing keys. The sync service sends the SDK's `/keys/query`
+/// requests (matrix-sdk-0.19.1 `sliding_sync/mod.rs:633`, `send_outgoing_requests`
+/// next to every sync request), and a response with the old identity that is
+/// processed after the new private keys exist makes the SDK drop them for good
+/// (matrix-sdk-crypto-0.19.1 `identities/manager.rs:462-470`,
+/// `olm/signing/mod.rs:351`). `SyncService::stop` returns only when both sync
+/// tasks have ended (matrix-sdk-ui-0.19.1 `sync_service.rs:657-668`,
+/// `SyncTaskSupervisor::shutdown`), so no query is in flight afterwards.
+#[derive(Clone)]
+pub(crate) struct SyncPause {
+    service: Arc<SyncService>,
+    /// Held while paused; the supervisor's `restart` waits for it, so a
+    /// failure that happens meanwhile cannot bring the sync back early.
+    gate: Arc<Mutex<()>>,
+}
+
+impl SyncPause {
+    pub(crate) fn new(service: Arc<SyncService>) -> Self {
+        Self {
+            service,
+            gate: Arc::new(Mutex::new(())),
+        }
+    }
+
+    /// The gate the supervisor's restarts take.
+    pub(crate) fn gate(&self) -> Arc<Mutex<()>> {
+        self.gate.clone()
+    }
+
+    /// Stops the service and keeps it stopped until [`Paused::resume`]. If the
+    /// `Paused` is dropped instead (the session ends), nothing restarts it.
+    pub(crate) async fn pause(&self) -> Paused {
+        let guard = self.gate.clone().lock_owned().await;
+        self.service.stop().await;
+        Paused {
+            service: self.service.clone(),
+            _guard: guard,
+        }
+    }
+}
+
+/// A stopped sync service, see [`SyncPause`].
+pub(crate) struct Paused {
+    service: Arc<SyncService>,
+    _guard: OwnedMutexGuard<()>,
+}
+
+impl Paused {
+    /// Starts the service again (the gate opens when this returns).
+    pub(crate) async fn resume(self) {
+        self.service.start().await;
+    }
 }
 
 /// What the supervisor needs from the sync service. A trait so that the loop
