@@ -198,12 +198,20 @@ async fn change_stream(client: &Client) -> BoxStream<'static, ()> {
 
 /// Sends `Security` once at the start, then only when the status changed.
 /// `refresh` asks for a recomputation (after an action).
-async fn forward_status(client: Client, events: mpsc::Sender<CoreEvent>, refresh: Arc<Notify>) {
+async fn forward_status(
+    client: Client,
+    events: mpsc::Sender<CoreEvent>,
+    refresh: Arc<Notify>,
+    op: Arc<IdentityOp>,
+) {
     let mut changes = change_stream(&client).await;
     let mut changes_open = true;
     let mut last: Option<SecurityStatus> = None;
     loop {
-        let status = read_status(&client).await;
+        let status = {
+            let _gate = op.keys_gate.lock().await;
+            read_status(&client).await
+        };
         if last != Some(status) {
             last = Some(status);
             if events.send(CoreEvent::Security(status)).await.is_err() {
@@ -255,6 +263,12 @@ struct IdentityOp {
     cancelled: AtomicBool,
     /// The reset waiting for an OAuth approval, so that it can be cancelled.
     waiting: Mutex<Option<Arc<IdentityResetHandle>>>,
+    /// Held by the status forwarder while it reads (reading may query the
+    /// server for the own keys) and by an identity operation from the moment
+    /// it makes new private keys until the server has the public ones. A
+    /// query answered with the old identity in that time makes the SDK drop
+    /// the new private keys for good, so no query of ours may run then.
+    keys_gate: Mutex<()>,
 }
 
 impl IdentityOp {
@@ -298,6 +312,7 @@ impl SecurityTasks {
             client.clone(),
             events.clone(),
             self.refresh.clone(),
+            self.identity.clone(),
         )));
     }
 
@@ -351,8 +366,12 @@ impl SecurityTasks {
     ) {
         let client = client.clone();
         let refresh = self.refresh.clone();
+        let op = self.identity.clone();
         self.spawn_identity(events, move || async move {
-            bootstrap_task(&client, password.as_ref()).await?;
+            {
+                let _gate = op.keys_gate.lock().await;
+                bootstrap_task(&client, password.as_ref()).await?;
+            }
             finish(&client, &refresh).await;
             Ok(())
         });
@@ -370,7 +389,10 @@ impl SecurityTasks {
         let op = self.identity.clone();
         let events_for_task = events.clone();
         self.spawn_identity(events, move || async move {
-            let result = reset_task(&client, &op, password.as_ref(), &events_for_task).await;
+            let result = {
+                let _gate = op.keys_gate.lock().await;
+                reset_task(&client, &op, password.as_ref(), &events_for_task).await
+            };
             // Also after a failure: the attempt made new private keys that
             // the server never accepted, and the query drops them again.
             finish(&client, &refresh).await;
