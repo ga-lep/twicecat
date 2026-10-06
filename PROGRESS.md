@@ -309,7 +309,7 @@ Fixes the human may want before or after the checkpoint, from the task notes and
 ## Phase 4 steps
 - [x] 1. Phase 4 ledger, sign-off record and fixed-account E2EE test helpers (phase4.1)
 - [x] 2. Additive core API for Phase 4 (phase4.2)
-- [ ] 3. Encryption settings, encrypted rooms, shields and UTD reasons in the core (roadmap steps 1, 5, core side)
+- [x] 3. Encryption settings, encrypted rooms, shields and UTD reasons in the core (roadmap steps 1, 5, core side)
 - [ ] 4. Security status, cross-signing bootstrap, identity reset and re-authentication in the core (roadmap step 4, core side)
 - [ ] 5. Recovery in the core (roadmap steps 2, 5, core side)
 - [ ] 6. Interactive SAS verification in the core (roadmap steps 3, 4, core side)
@@ -348,6 +348,15 @@ Fixes the human may want before or after the checkpoint, from the task notes and
 - Checks: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo test --workspace`, `scripts/check-core-api.sh`, `scripts/check-app-deps.sh` and `cargo deny check` pass. Ignored run (`--ignored --skip keyring`) passes in about 1m46 including build; `e2ee_rooms` repeat run passes (about 5 s); `docker compose stop` done.
 - APIs used: none from matrix-sdk, ruma or iced (plain Rust types and engine glue only). `zeroize::Zeroizing` as in `Password`.
 - Open issues: none. No new human items.
+
+## Phase 4 / Task 3 notes
+- Dependency (human approval, 2026-10-06): added `matrix-sdk-crypto = "=0.19.1"` to `crates/core/Cargo.toml` only (default features, same pin as matrix-sdk). Reason: `UtdCause` is defined in matrix-sdk-crypto-0.19.1 `src/types/events/utd_cause.rs:24` (exported `types/events/mod.rs:37`) and is re-exported by neither matrix-sdk (`src/lib.rs:24-33`, `encryption/mod.rs:124-134`) nor matrix-sdk-ui (`src/lib.rs:19,32`; `timeline/mod.rs:93-105` exports only `EncryptedMessage`), so the table-tested `map_utd_cause` could not name it. `Cargo.lock` gains exactly one line (the dependency edge in `tessera-core`); no package or version changes; `cargo deny check` passes; `crates/app` untouched.
+- TDD: unit tests (`encryption_settings_are_the_element_x_set`, `shield_mapping_table`, `utd_cause_mapping_table`) were written first and failed to compile (functions missing), then the code. The integration tests were written together with the code and passed on the first run.
+- Code: `client::encryption_settings()` (used by `build_client` through `with_encryption_settings`); `room_list::summarize` sets `is_encrypted`; `timeline::{map_shield, map_utd_cause, map_utd}` (Megolm uses the cause, Olm and unknown algorithm give `Unknown`); `map_event` fills `shield` from `get_shield(false)` and `utd` for `UnableToDecrypt`. `markdown_round_trip` now also asserts `shield == None` in a plain room.
+- Integration tests (`crates/core/tests/e2ee_rooms.rs`): `encrypted_dm_works_both_ways` (bodies `secret-body-<hex>`, both events `m.room.encrypted` on the server, both cores `is_encrypted`), `formatted_body_survives_encryption` (bold inline), `messages_from_an_unsigned_device_get_a_red_shield` (`Red(UnsignedDevice)`). Each takes `e2ee_serial`, resets alice and carol, and no body is printed.
+- Checks: fmt, clippy (`--all-features --locked -D warnings`), `cargo test --workspace --locked`, `check-app-deps.sh`, `check-core-api.sh`, `cargo deny check` all pass. Ignored run (`--ignored --skip keyring`) all ok in 3m26 including build (no flaky test); `e2ee_rooms` ignored run 33 s, repeat run right after 34 s, both 6 passed. `docker compose stop` done.
+- APIs confirmed (registry `matrix-sdk-0.19.1` unless noted): `ClientBuilder::with_encryption_settings` `src/client/builder/mod.rs:549`; `EncryptionSettings` `src/encryption/mod.rs:265` (no `PartialEq`, tests compare fields); `BackupDownloadStrategy::AfterDecryptionFailure` `:300`; `Room::encryption_state` `src/room/mod.rs:1115`; `EncryptionState::is_encrypted` matrix-sdk-base-0.19.1 `src/room/encryption.rs:55`; `RoomListItem: Deref<Target=Room>` matrix-sdk-ui-0.19.1 `src/room_list_service/room_list.rs:458`; `EventTimelineItem::get_shield` matrix-sdk-ui `src/timeline/event_item/mod.rs:408`; `TimelineEventShieldState` `:884` and `TimelineEventShieldStateCode` `:918` (exported `timeline/mod.rs:93-105`); `EncryptedMessage::MegolmV1AesSha2 { cause, .. }` `event_item/content/mod.rs:548-573`; `UtdCause` 9 variants `utd_cause.rs:37-97`.
+- Open issues: `is_encrypted` is false while the SDK's encryption state is `Unknown` (not yet synced); not seen in tests. No new human items.
 
 ## Phase 4 human checkpoint
 - [ ] Phase 3 sign-off recorded (Q1, 2026-10-06). Confirm Q3 as planned: matrix-sdk `qrcode` enabled, iced `qr_code` **not** enabled (the QR code is drawn with the existing `image` widget from the SDK's own grid); and revisit any of Q1-Q19.

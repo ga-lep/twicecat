@@ -13,6 +13,8 @@ path = "src/bin/tessera-cli.rs"
 [dependencies]
 matrix-sdk = { version = "=0.19.1", features = ["bundled-sqlite", "local-server", "markdown"] }
 matrix-sdk-ui = "=0.19.1"
+# Only to name `UtdCause` (not re-exported by matrix-sdk or matrix-sdk-ui); same pin as matrix-sdk.
+matrix-sdk-crypto = "=0.19.1"
 keyring = "=4.2.0"
 directories = "=6.0.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "io-util", "io-std", "signal"] }

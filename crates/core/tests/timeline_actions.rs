@@ -217,6 +217,7 @@ async fn markdown_round_trip() {
     })
     .await;
     let (_, details) = received(&p.carol_items, source).expect("arrived");
+    assert_eq!(details.shield, None, "a plain room has no shield");
     let inlines = paragraph_inlines(&details.content.blocks);
     assert!(inlines.iter().any(|i| matches!(
         i,
