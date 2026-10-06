@@ -288,3 +288,229 @@ pub async fn send_content(
         .expect("serialize message content");
     client.send(request).await.expect("send message").event_id
 }
+
+/// Serializes the E2EE tests of one test binary (Phase 4 Q2).
+static E2EE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Takes the per-binary E2EE lock; hold the guard for the whole test.
+///
+/// E2EE tests reset the crypto state of the fixed accounts, so two of them must
+/// never overlap. Cargo runs test binaries one at a time, so one lock per
+/// binary is enough. A test that panics while holding the guard does not block
+/// the next one (tokio's mutex does not poison).
+pub async fn e2ee_serial() -> tokio::sync::MutexGuard<'static, ()> {
+    E2EE_LOCK.lock().await
+}
+
+/// Like [`raw_login`] with a chosen device display name. The caller logs the
+/// client out, so no device is left behind.
+pub async fn raw_login_named(n: u8, device_name: &str) -> matrix_sdk::Client {
+    let env = TestEnv::load();
+    assert_local_homeserver(env.homeserver_url());
+    let client = matrix_sdk::Client::builder()
+        .homeserver_url(env.homeserver_url())
+        .build()
+        .await
+        .expect("build raw client");
+    client
+        .matrix_auth()
+        .login_username(env.user(n), env.password(n))
+        .initial_device_display_name(device_name)
+        .await
+        .expect("raw login");
+    client
+}
+
+/// Password UIA data for test user `n`, for the session in `info`.
+fn password_auth(
+    env: &TestEnv,
+    n: u8,
+    session: Option<String>,
+) -> matrix_sdk::ruma::api::client::uiaa::AuthData {
+    use matrix_sdk::ruma::api::client::uiaa::{AuthData, MatrixUserIdentifier, Password};
+    let mut password = Password::new(
+        MatrixUserIdentifier::new(env.user(n).to_owned()).into(),
+        env.password(n).to_owned(),
+    );
+    password.session = session;
+    AuthData::Password(password)
+}
+
+/// Resets test user `n` to the Q2 baseline B0 and returns the client used, still
+/// logged in (the caller must log it out), with the number of other devices
+/// removed.
+///
+/// B0: a fresh cross-signing identity whose private keys nobody else holds, no
+/// backup on the server, secret storage (4S) off, and no device but the
+/// returned client's. The client is built without encryption settings, so
+/// nothing runs automatically.
+async fn reset_to_b0(n: u8) -> (matrix_sdk::Client, usize) {
+    use matrix_sdk::encryption::CrossSigningResetAuthType;
+    let env = TestEnv::load();
+    assert_local_homeserver(env.homeserver_url());
+    let client = raw_login_named(n, "tessera-e2ee-reset").await;
+    client
+        .encryption()
+        .wait_for_e2ee_initialization_tasks()
+        .await;
+
+    // 1. Sign out every other device.
+    let own = client.device_id().expect("logged in").to_owned();
+    let others: Vec<_> = client
+        .devices()
+        .await
+        .expect("list devices")
+        .devices
+        .into_iter()
+        .map(|d| d.device_id)
+        .filter(|id| *id != own)
+        .collect();
+    let removed = others.len();
+    if !others.is_empty()
+        && let Err(error) = client.delete_devices(&others, None).await
+    {
+        let session = error
+            .as_uiaa_response()
+            .expect("device deletion fails only for user-interactive auth")
+            .session
+            .clone();
+        client
+            .delete_devices(&others, Some(password_auth(&env, n, session)))
+            .await
+            .expect("delete other devices with the password");
+    }
+
+    // 2. Delete every backup, turn 4S off, replace the identity.
+    if let Some(handle) = client
+        .encryption()
+        .recovery()
+        .reset_identity()
+        .await
+        .expect("reset identity")
+    {
+        match handle.auth_type() {
+            CrossSigningResetAuthType::Uiaa(info) => handle
+                .reset(Some(password_auth(&env, n, info.session.clone())))
+                .await
+                .expect("reset identity with the password"),
+            _ => panic!("the local homeserver asked for a non-password reset"),
+        }
+    }
+
+    // 3. Postconditions, on the same client.
+    let me = client.user_id().expect("logged in").to_owned();
+    assert!(
+        !client
+            .encryption()
+            .backups()
+            .fetch_exists_on_server()
+            .await
+            .expect("fetch backup state"),
+        "a backup survived the reset"
+    );
+    assert!(
+        !client
+            .encryption()
+            .secret_storage()
+            .is_enabled()
+            .await
+            .expect("fetch 4S state"),
+        "4S is still on after the reset"
+    );
+    assert!(
+        client
+            .encryption()
+            .request_user_identity(&me)
+            .await
+            .expect("query own identity")
+            .is_some(),
+        "no own identity after the reset"
+    );
+    assert_eq!(
+        client.devices().await.expect("list devices").devices.len(),
+        1,
+        "other devices survived the reset"
+    );
+    (client, removed)
+}
+
+/// Resets test user `n` to baseline B0 (see [`reset_to_b0`]) and logs the
+/// resetting device out. Prints the account name and the number of devices
+/// removed.
+pub async fn reset_e2ee_account(n: u8) {
+    let env = TestEnv::load();
+    assert_local_homeserver(env.homeserver_url());
+    let (client, removed) = reset_to_b0(n).await;
+    client.logout().await.expect("log the reset device out");
+    println!("e2ee reset {}: {removed} devices removed", env.user(n));
+}
+
+/// Resets test user `n` to baseline B1: like B0, then recovery is enabled
+/// (4S on, a matching backup), `passphrase` protecting the key when given. No
+/// device is left. Returns the recovery key; prints the account name and the
+/// number of devices removed.
+pub async fn seed_recovery(n: u8, passphrase: Option<&str>) -> zeroize::Zeroizing<String> {
+    let env = TestEnv::load();
+    assert_local_homeserver(env.homeserver_url());
+    let (client, removed) = reset_to_b0(n).await;
+    let recovery = client.encryption().recovery();
+    let enable = recovery.enable();
+    let key = match passphrase {
+        Some(passphrase) => enable.with_passphrase(passphrase).await,
+        None => enable.await,
+    }
+    .expect("enable recovery");
+    client.logout().await.expect("log the reset device out");
+    println!("e2ee seed {}: {removed} devices removed", env.user(n));
+    zeroize::Zeroizing::new(key)
+}
+
+/// Creates an encrypted room (initial `m.room.encryption` state,
+/// `m.megolm.v1.aes-sha2`) as `creator` and invites `invitee` when given.
+pub async fn create_encrypted_room(
+    creator: &matrix_sdk::Client,
+    name: &str,
+    invitee: Option<&str>,
+) -> matrix_sdk::ruma::OwnedRoomId {
+    use matrix_sdk::ruma::api::client::room::create_room::v3::Request;
+    use matrix_sdk::ruma::events::InitialStateEvent;
+    use matrix_sdk::ruma::events::room::encryption::RoomEncryptionEventContent;
+    let mut request = Request::new();
+    request.name = Some(name.to_owned());
+    request.initial_state = vec![
+        InitialStateEvent::with_empty_state_key(
+            RoomEncryptionEventContent::with_recommended_defaults(),
+        )
+        .to_raw_any(),
+    ];
+    if let Some(user) = invitee {
+        request
+            .invite
+            .push(user.try_into().expect("valid invitee user id"));
+    }
+    creator
+        .create_room(request)
+        .await
+        .expect("create encrypted room")
+        .room_id()
+        .to_owned()
+}
+
+/// The `type` of the event `event_id` in `room`, read raw from the server
+/// (works on a client that never synced).
+pub async fn fetch_raw_event_type(
+    client: &matrix_sdk::Client,
+    room: &matrix_sdk::ruma::RoomId,
+    event_id: &matrix_sdk::ruma::EventId,
+) -> String {
+    use matrix_sdk::ruma::api::client::room::get_room_event::v3::Request;
+    let event = client
+        .send(Request::new(room.to_owned(), event_id.to_owned()))
+        .await
+        .expect("fetch raw event")
+        .event;
+    event
+        .get_field::<String>("type")
+        .expect("event type parses")
+        .expect("event has a type")
+}
