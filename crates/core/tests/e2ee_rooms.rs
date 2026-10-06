@@ -5,23 +5,16 @@
 
 mod common;
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use common::{
-    TestEnv, create_encrypted_room, e2ee_serial, expect_event, fetch_raw_event_type,
-    raw_login_named, reset_e2ee_account, seed_recovery, start_core,
+    EncryptedPair, TestEnv, create_encrypted_room, e2ee_serial, fetch_raw_event_type, hex,
+    message_with, outgoing, pump, raw_login_named, reset_e2ee_account, seed_recovery,
 };
 use matrix_sdk::Client;
 use matrix_sdk::ruma::api::client::state::get_state_events;
 use matrix_sdk::ruma::serde::Raw;
-use tessera_core::CoreHandle;
-use tessera_core::api::{
-    Block, Command, CoreEvent, Inline, ListDiff, MessageKind, MessageText, OutgoingMessage,
-    Password, RoomId, RoomSummary, Shield, ShieldCode, SyncState, TextFormat, TimelineItem,
-    TimelineItemKind,
-};
-use tessera_core::secrets::InMemorySecretStore;
+use tessera_core::api::{Block, Command, Inline, Shield, ShieldCode, TimelineItemKind};
 
 /// What a fresh raw client (no encryption settings) sees for an account.
 struct View {
@@ -186,163 +179,6 @@ async fn encrypted_room_state_is_readable_by_the_invitee() {
 
     alice.logout().await.expect("alice logs out");
     carol.logout().await.expect("carol logs out");
-}
-
-/// Alice and carol (both reset to B0) in a fresh encrypted room, each with a
-/// running core that has the room open.
-struct EncryptedPair {
-    room_id: matrix_sdk::ruma::OwnedRoomId,
-    alice: CoreHandle,
-    carol: CoreHandle,
-    alice_rooms: Vec<RoomSummary>,
-    carol_rooms: Vec<RoomSummary>,
-    alice_items: Vec<TimelineItem>,
-    carol_items: Vec<TimelineItem>,
-    _dirs: [tempfile::TempDir; 2],
-}
-
-fn hex() -> String {
-    let mut bytes = [0u8; 8];
-    rand::fill(&mut bytes);
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-fn outgoing(room: &str, text: &str) -> OutgoingMessage {
-    OutgoingMessage {
-        room_id: RoomId::from(room),
-        text: MessageText::from(text),
-        mentions: Vec::new(),
-        reply_to: None,
-        kind: MessageKind::Text,
-        format: TextFormat::Markdown,
-    }
-}
-
-async fn login_and_run(core: &mut CoreHandle, env: &TestEnv, n: u8) {
-    core.commands
-        .send(Command::LoginPassword {
-            username: env.user(n).to_owned(),
-            password: Password::from(env.password(n)),
-            server: None,
-        })
-        .await
-        .unwrap();
-    expect_event(core, |e| matches!(e, CoreEvent::LoggedIn { .. })).await;
-    expect_event(core, |e| {
-        matches!(e, CoreEvent::SyncState(SyncState::Running))
-    })
-    .await;
-}
-
-/// Applies room list and timeline events until `done` holds.
-async fn pump(
-    core: &mut CoreHandle,
-    room: &str,
-    rooms: &mut Vec<RoomSummary>,
-    items: &mut Vec<TimelineItem>,
-    done: impl Fn(&[RoomSummary], &[TimelineItem]) -> bool,
-) {
-    let wait = async {
-        while !done(rooms, items) {
-            match core.events.recv().await {
-                Some(CoreEvent::RoomListChanged(diffs)) => {
-                    for diff in diffs {
-                        ListDiff::apply(&diff, rooms);
-                    }
-                }
-                Some(CoreEvent::TimelineDiff { room_id, diffs }) if room_id.as_str() == room => {
-                    for diff in diffs {
-                        ListDiff::apply(&diff, items);
-                    }
-                }
-                Some(_) => {}
-                None => panic!("event channel closed"),
-            }
-        }
-    };
-    tokio::time::timeout(common::DEFAULT_TIMEOUT, wait)
-        .await
-        .expect("timed out waiting for the core");
-}
-
-impl EncryptedPair {
-    async fn new() -> Self {
-        reset_e2ee_account(1).await;
-        reset_e2ee_account(3).await;
-        let env = TestEnv::load();
-        let alice_raw = raw_login_named(1, "tessera-e2ee-setup").await;
-        let carol_raw = raw_login_named(3, "tessera-e2ee-setup").await;
-        let room_id = create_encrypted_room(
-            &alice_raw,
-            &common::unique_room_name(),
-            Some(&env.user_id(3)),
-        )
-        .await;
-        carol_raw
-            .join_room_by_id(&room_id)
-            .await
-            .expect("carol joins the room");
-        alice_raw.logout().await.expect("alice setup logout");
-        carol_raw.logout().await.expect("carol setup logout");
-
-        let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
-        let mut alice = start_core(dirs[0].path(), Arc::new(InMemorySecretStore::new()));
-        let mut carol = start_core(dirs[1].path(), Arc::new(InMemorySecretStore::new()));
-        login_and_run(&mut alice, &env, 1).await;
-        login_and_run(&mut carol, &env, 3).await;
-        let room = room_id.to_string();
-        let mut pair = Self {
-            room_id,
-            alice,
-            carol,
-            alice_rooms: Vec::new(),
-            carol_rooms: Vec::new(),
-            alice_items: Vec::new(),
-            carol_items: Vec::new(),
-            _dirs: dirs,
-        };
-        pump(
-            &mut pair.alice,
-            &room,
-            &mut pair.alice_rooms,
-            &mut pair.alice_items,
-            |r, _| r.iter().any(|x| x.id.as_str() == room),
-        )
-        .await;
-        pump(
-            &mut pair.carol,
-            &room,
-            &mut pair.carol_rooms,
-            &mut pair.carol_items,
-            |r, _| r.iter().any(|x| x.id.as_str() == room),
-        )
-        .await;
-        for core in [&mut pair.alice, &mut pair.carol] {
-            core.commands
-                .send(Command::SelectRoom(RoomId::from(room.as_str())))
-                .await
-                .unwrap();
-        }
-        pair
-    }
-
-    fn room(&self) -> String {
-        self.room_id.to_string()
-    }
-
-    async fn finish(mut self) {
-        for core in [&mut self.alice, &mut self.carol] {
-            core.commands.send(Command::Logout).await.unwrap();
-            expect_event(core, |e| matches!(e, CoreEvent::LoggedOut)).await;
-        }
-    }
-}
-
-fn message_with<'a>(items: &'a [TimelineItem], text: &str, own: bool) -> Option<&'a TimelineItem> {
-    items.iter().find(|i| {
-        matches!(&i.kind, TimelineItemKind::Message { body, is_own, .. }
-            if body == text && *is_own == own)
-    })
 }
 
 #[tokio::test]

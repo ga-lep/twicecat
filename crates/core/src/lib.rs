@@ -16,6 +16,7 @@ pub mod paths;
 mod rich_text;
 mod room_list;
 pub mod secrets;
+mod security;
 mod session;
 mod sync;
 mod timeline;

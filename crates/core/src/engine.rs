@@ -40,6 +40,7 @@ use crate::outgoing::outgoing_content;
 use crate::paths::DataPaths;
 use crate::room_list::{Registered, build_filter, loaded_event, map_batch, map_diff};
 use crate::secrets::{SecretError, SecretStore};
+use crate::security::SecurityTasks;
 use crate::session::{
     RECORD_VERSION, SessionAuth, SessionRecord, generate_session_id, generate_store_passphrase,
 };
@@ -181,6 +182,8 @@ struct Active {
     /// Avatar fetches of this session (in flight and answered).
     avatars: Avatars,
     fetcher: Arc<SdkFetcher>,
+    /// The status forwarder and the network actions of the encryption API.
+    security: SecurityTasks,
 }
 
 impl Active {
@@ -188,7 +191,9 @@ impl Active {
     /// service, so that nothing holds the client or its store afterwards (the
     /// tasks own clones of it).
     async fn stop_tasks(&mut self) {
-        // Fetch tasks hold clones of the client, so they go first.
+        // The security tasks hold clones of the client too, and go first.
+        self.security.stop().await;
+        // Fetch tasks hold clones of the client, so they go next.
         self.avatars.stop().await;
         if let Some(selected) = self.selected.take() {
             selected.stop().await;
@@ -859,6 +864,7 @@ impl Engine {
                 match self.login_password(&username, &password, server).await {
                     Ok(event) => {
                         self.emit(event).await;
+                        self.start_security();
                         self.start_sync().await;
                     }
                     Err(e) => self.emit(CoreEvent::LoginFailed(e)).await,
@@ -1008,13 +1014,28 @@ impl Engine {
                 })
                 .await;
             }
+            // Network work runs in the security tasks, so `handle` never
+            // waits for it.
+            Command::BootstrapCrossSigning { password } => match self.active.as_mut() {
+                Some(active) => active
+                    .security
+                    .bootstrap(&active.client, password, &self.events),
+                None => self.not_logged_in(ActionKind::CrossSigning).await,
+            },
+            Command::ResetIdentity { password } => match self.active.as_mut() {
+                Some(active) => active
+                    .security
+                    .reset(&active.client, password, &self.events),
+                None => self.not_logged_in(ActionKind::CrossSigning).await,
+            },
+            Command::CancelIdentityReset => match self.active.as_mut() {
+                Some(active) => active.security.cancel_reset(),
+                None => self.not_logged_in(ActionKind::CrossSigning).await,
+            },
             // The real handlers land in later Phase 4 tasks.
             cmd @ (Command::EnableRecovery
             | Command::Recover { .. }
             | Command::ChangeRecoveryKey
-            | Command::BootstrapCrossSigning { .. }
-            | Command::ResetIdentity { .. }
-            | Command::CancelIdentityReset
             | Command::RequestSelfVerification
             | Command::RequestDeviceVerification { .. }
             | Command::RequestUserVerification { .. }
@@ -1051,6 +1072,24 @@ impl Engine {
             error,
         })
         .await;
+    }
+
+    /// Answers a Phase 4 action sent without a session. These actions belong
+    /// to no room, so `room_id` is empty.
+    async fn not_logged_in(&self, action: ActionKind) {
+        self.emit(CoreEvent::ActionFailed {
+            room_id: RoomId::from(""),
+            action,
+            error: CoreError::NotLoggedIn,
+        })
+        .await;
+    }
+
+    /// Starts the security status forwarder of the new session.
+    fn start_security(&mut self) {
+        if let Some(active) = self.active.as_mut() {
+            active.security.start(&active.client, &self.events);
+        }
     }
 
     /// Why a new login cannot start now, if so.
@@ -1143,6 +1182,7 @@ impl Engine {
             Ok((active, event)) => {
                 self.active = Some(active);
                 self.emit(event).await;
+                self.start_security();
                 self.start_sync().await;
             }
             Err(e) => {
@@ -1442,6 +1482,7 @@ impl Engine {
                         sync: None,
                         selected: None,
                         avatars: Avatars::new(),
+                        security: SecurityTasks::new(),
                     },
                     event,
                 ))
@@ -1552,6 +1593,7 @@ impl Engine {
             Ok(Some((active, event))) => {
                 self.active = Some(active);
                 self.emit(event).await;
+                self.start_security();
                 self.start_sync().await;
             }
             Ok(None) => self.emit(CoreEvent::NoSession).await,
@@ -1618,6 +1660,7 @@ impl Engine {
                 sync: None,
                 selected: None,
                 avatars: Avatars::new(),
+                security: SecurityTasks::new(),
             },
             event,
         )))
@@ -2218,8 +2261,18 @@ mod tests {
             sync: None,
             selected: None,
             avatars: Avatars::new(),
+            security: SecurityTasks::new(),
         });
-        for (cmd, kind) in security_commands() {
+        // The identity commands have real handlers; see the next test.
+        let stubbed = security_commands().into_iter().filter(|(cmd, _)| {
+            !matches!(
+                cmd,
+                Command::BootstrapCrossSigning { .. }
+                    | Command::ResetIdentity { .. }
+                    | Command::CancelIdentityReset
+            )
+        });
+        for (cmd, kind) in stubbed {
             engine.handle(cmd).await;
             let got = drain(&mut rx).await;
             assert!(
@@ -2230,6 +2283,54 @@ mod tests {
                 ),
                 "{kind:?}: {got:?}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn identity_commands_with_a_session_run_in_the_background() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut engine, mut rx) = oauth_engine(tmp.path());
+        // No encryption was set up on this client, so there is no Olm
+        // machine and no network is needed to fail.
+        let client = Client::builder()
+            .homeserver_url("http://127.0.0.1:1")
+            .build()
+            .await
+            .unwrap();
+        engine.active = Some(Active {
+            fetcher: Arc::new(SdkFetcher(client.clone())),
+            client,
+            record: record("@alice:x", "http://127.0.0.1:1", "s1"),
+            changes: broadcast::channel(1).1,
+            sync: None,
+            selected: None,
+            avatars: Avatars::new(),
+            security: SecurityTasks::new(),
+        });
+        engine
+            .handle(Command::BootstrapCrossSigning { password: None })
+            .await;
+        // `handle` returned before the task ended; its answer arrives.
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("an answer within 5 s")
+            .expect("channel open");
+        assert!(
+            matches!(
+                &event,
+                CoreEvent::ActionFailed {
+                    action: ActionKind::CrossSigning,
+                    error: CoreError::Internal(_),
+                    ..
+                }
+            ),
+            "{event:?}"
+        );
+        // Cancelling with nothing running is a no-op.
+        engine.handle(Command::CancelIdentityReset).await;
+        assert!(drain(&mut rx).await.is_empty());
+        if let Some(mut active) = engine.active.take() {
+            active.stop_tasks().await;
         }
     }
 
@@ -2275,6 +2376,7 @@ mod tests {
             sync: None,
             selected: None,
             avatars: Avatars::new(),
+            security: SecurityTasks::new(),
         });
         let room = rid("a");
         for (cmd, kind) in action_commands(&room) {
