@@ -529,6 +529,9 @@ pub struct EncryptedPair {
     pub alice_items: Vec<TimelineItem>,
     pub carol_items: Vec<TimelineItem>,
     pub _dirs: [tempfile::TempDir; 2],
+    /// The secret stores of the two cores (alice, carol), for tests that read
+    /// the stored session record.
+    pub secrets: [Arc<InMemorySecretStore>; 2],
 }
 
 pub fn hex() -> String {
@@ -689,8 +692,12 @@ impl EncryptedPair {
         carol_raw.logout().await.expect("carol setup logout");
 
         let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
-        let mut alice = start_core(dirs[0].path(), Arc::new(InMemorySecretStore::new()));
-        let mut carol = start_core(dirs[1].path(), Arc::new(InMemorySecretStore::new()));
+        let secrets = [
+            Arc::new(InMemorySecretStore::new()),
+            Arc::new(InMemorySecretStore::new()),
+        ];
+        let mut alice = start_core(dirs[0].path(), secrets[0].clone());
+        let mut carol = start_core(dirs[1].path(), secrets[1].clone());
         login_and_run(&mut alice, &env, 1).await;
         login_and_run(&mut carol, &env, 3).await;
         let room = room_id.to_string();
@@ -703,6 +710,7 @@ impl EncryptedPair {
             alice_items: Vec::new(),
             carol_items: Vec::new(),
             _dirs: dirs,
+            secrets,
         };
         pump(
             &mut pair.alice,
