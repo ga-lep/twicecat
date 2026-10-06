@@ -13,6 +13,7 @@ pub mod links;
 pub mod rich_text;
 pub mod room_list;
 pub mod screens;
+pub mod security;
 pub mod state;
 pub mod text_safety;
 pub mod theme;

@@ -360,6 +360,130 @@ fn typing_markdown_and_pressing_enter_shows_a_bold_message_in_the_timeline() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Carol (not alice): confirm-identity, reset with the password, set up
+/// recovery, log out, all through `update` only. Nothing is printed.
+#[test]
+#[ignore = "needs local homeserver: docker compose up -d --wait"]
+fn carol_resets_her_identity_sets_up_recovery_and_logs_out() {
+    use tessera_app::security::{Overlay, SecurityMessage, Visible};
+    use tessera_core::api::{DeviceVerification, Password, RecoveryStatus};
+    let env = TestEnv::load();
+    let base = env.get("HOMESERVER_URL").to_owned();
+    let user = env.get("TEST_USER_3").to_owned();
+    let password = env.get("TEST_PASSWORD_3").to_owned();
+
+    let dir = scratch_dir();
+    let (bridge, slot) = Bridge::start(
+        CoreConfig {
+            data: DataPaths::at(&dir),
+            homeserver_override: Some(base),
+            room_list_page_size: tessera_core::DEFAULT_ROOM_LIST_PAGE_SIZE,
+        },
+        Arc::new(InMemorySecretStore::new()),
+    )
+    .expect("start the bridge");
+    let (mut app, _boot) = App::new(Startup {
+        sink: Box::new(bridge),
+        events: slot.clone(),
+    });
+    let pump = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("pump runtime");
+    let mut events = events_stream(&slot).boxed();
+    let mut next = |app: &mut App, wait: Duration| {
+        pump.block_on(async {
+            match tokio::time::timeout(wait, events.next()).await {
+                Ok(Some(BridgeEvent::Core(event))) => {
+                    let _ = app.update(Message::Core(Box::new(event)));
+                }
+                Ok(Some(BridgeEvent::Closed)) => {
+                    let _ = app.update(Message::CoreClosed);
+                }
+                Ok(None) | Err(_) => {}
+            }
+        })
+    };
+    // Pumps events until the condition holds; panics after `secs`.
+    macro_rules! until {
+        ($secs:expr, $what:expr, $cond:expr) => {{
+            let limit = std::time::Instant::now() + Duration::from_secs($secs);
+            while !($cond) {
+                assert!(std::time::Instant::now() < limit, "{}", $what);
+                next(&mut app, Duration::from_secs(2));
+            }
+        }};
+    }
+
+    until!(60, "no login screen in 60 s", app.screen == Screen::Login);
+    let _ = app.update(Message::UsernameChanged(user));
+    let _ = app.update(Message::PasswordChanged(Password::from(password.clone())));
+    let _ = app.update(Message::LoginSubmitted);
+    until!(
+        90,
+        "no security status in 90 s",
+        app.security.status.device != DeviceVerification::Unknown
+    );
+
+    // A new device of an account with an identity sees the screen and the
+    // banner. Whatever earlier runs left, the reset below works.
+    if app.security.status.device == DeviceVerification::Unverified
+        && app.security.status.identity_exists
+    {
+        assert_eq!(
+            app.security.visible(),
+            Visible::Overlay(Overlay::ConfirmIdentity)
+        );
+        assert!(app.security.banner().is_some());
+    }
+
+    // Reset: the warning first, then the password when the core asks.
+    let _ = app.update(Message::Security(SecurityMessage::ResetRequested));
+    let _ = app.update(Message::Security(SecurityMessage::ResetConfirmed));
+    let mut answered = false;
+    let limit = std::time::Instant::now() + Duration::from_secs(240);
+    while app.security.busy.is_some() || app.security.reauth.is_some() {
+        assert!(
+            std::time::Instant::now() < limit,
+            "the reset did not end in 240 s"
+        );
+        if app.security.visible() == Visible::Reauth && !answered {
+            answered = true;
+            let _ = app.update(Message::Security(SecurityMessage::ReauthInput(
+                Password::from(password.clone()),
+            )));
+            let _ = app.update(Message::Security(SecurityMessage::ReauthSubmitted));
+        }
+        next(&mut app, Duration::from_secs(2));
+    }
+    assert_eq!(app.security.notice, None, "the reset failed");
+    assert_eq!(app.security.status.device, DeviceVerification::Verified);
+
+    // Set up recovery: the key arrives on the show-once screen.
+    let _ = app.update(Message::Security(SecurityMessage::SetupRecovery));
+    until!(
+        180,
+        "no recovery key in 180 s",
+        app.security.visible() == Visible::Key
+    );
+    let _ = app.update(Message::Security(SecurityMessage::Done));
+    assert_eq!(app.security.visible(), Visible::Key, "refused until ticked");
+    let _ = app.update(Message::Security(SecurityMessage::SavedToggled(true)));
+    let _ = app.update(Message::Security(SecurityMessage::Done));
+    assert!(app.security.setup.is_none());
+    until!(
+        60,
+        "recovery not enabled in 60 s",
+        app.security.status.recovery == RecoveryStatus::Enabled
+    );
+    assert!(app.security.setup.is_none());
+
+    let _ = app.update(Message::LogoutRequested);
+    until!(60, "no logout in 60 s", app.screen == Screen::Login);
+    drop(app);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn only_loopback_http_urls_count_as_local() {
     for ok in [

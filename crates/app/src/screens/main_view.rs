@@ -14,7 +14,7 @@ use crate::emoji;
 use crate::links::{CheckedUrl, LinkBar, LinkKind};
 use crate::screens::loading::sync_label;
 use crate::screens::timeline_pane::RichEnv;
-use crate::screens::{room_list_pane, timeline_pane};
+use crate::screens::{room_list_pane, security, timeline_pane};
 use crate::state::{App, Message};
 use crate::text_safety::{MAX_NAME_CHARS, name_or_placeholder, one_line_capped};
 use crate::theme;
@@ -29,11 +29,26 @@ pub fn display_name(name: &str) -> String {
 
 /// The main screen: panes above a status bar.
 pub fn view(app: &App) -> Element<'_, Message> {
-    column![
-        row![room_list_pane::view(app), room_pane(app)].height(Fill),
-        status_bar(app)
-    ]
-    .into()
+    let content = main_column(
+        security::banner_slot(&app.security),
+        row![room_list_pane::view(app), room_pane(app)]
+            .height(Fill)
+            .into(),
+        status_bar(app),
+    );
+    security::layer(content, security::top_layer(app))
+}
+
+/// The main column, always `[banner slot, panes, status bar]`: the slot is
+/// an empty column when there is no banner, so the panes (timeline scroll,
+/// editor focus) keep their place in the widget tree when a banner comes
+/// or goes.
+fn main_column<'a>(
+    banner: Element<'a, Message>,
+    panes: Element<'a, Message>,
+    status: Element<'a, Message>,
+) -> Element<'a, Message> {
+    Column::from_vec(vec![banner, panes, status]).into()
 }
 
 /// The selected room: name, timeline, composer.
@@ -414,6 +429,64 @@ mod tests {
             tree.diff(build(bars, picker));
             assert_eq!(tags(&tree), before, "{bars} bars, picker {picker}");
         }
+    }
+
+    #[test]
+    fn the_panes_keep_their_place_when_the_banner_and_security_screens_come_and_go() {
+        use crate::security::{Banner, Overlay, RecoverySetup, SecurityModel};
+        use iced::advanced::widget::Tree;
+        use tessera_core::api::{DeviceVerification, RecoveryKey, RecoveryStatus};
+
+        let content = text_editor::Content::new();
+        fn build<'a>(
+            model: &'a SecurityModel,
+            content: &'a text_editor::Content,
+        ) -> Element<'a, Message> {
+            let panes = row![timeline_layer(space().into(), None), text_editor(content)].into();
+            let base = main_column(security::banner_slot(model), panes, text("status").into());
+            security::layer(base, security::screen(model))
+        }
+        let tags = |tree: &Tree| {
+            (
+                tree.children[0].tag,
+                tree.children[0]
+                    .children
+                    .iter()
+                    .map(|c| c.tag)
+                    .collect::<Vec<_>>(),
+                tree.children[0].children[1]
+                    .children
+                    .iter()
+                    .map(|c| c.tag)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let mut model = SecurityModel::default();
+        let mut tree = Tree::new(build(&model, &content));
+        let before = tags(&tree);
+        type Step = Box<dyn Fn(&mut SecurityModel)>;
+        let states: Vec<Step> = vec![
+            Box::new(|m| m.status.device = DeviceVerification::Unverified),
+            Box::new(|m| m.overlay = Some(Overlay::ConfirmIdentity)),
+            Box::new(|m| m.overlay = Some(Overlay::Restore)),
+            Box::new(|m| m.overlay = Some(Overlay::ResetConfirm)),
+            Box::new(|m| {
+                m.setup = Some(RecoverySetup::new(RecoveryKey::from("secret-key-x")));
+            }),
+            Box::new(|m| {
+                m.setup = None;
+                m.overlay = None;
+                m.status.device = DeviceVerification::Verified;
+                m.status.recovery = RecoveryStatus::Disabled;
+            }),
+            Box::new(|m| m.status.recovery = RecoveryStatus::Enabled),
+        ];
+        for apply in &states {
+            apply(&mut model);
+            tree.diff(build(&model, &content));
+            assert_eq!(tags(&tree), before, "{model:?}");
+        }
+        assert!(!Banner::DeviceUnverified.dismissible());
     }
 
     #[test]

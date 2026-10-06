@@ -27,6 +27,7 @@ use crate::rich_text::{LinkTarget, MAX_REVEALED, Revealed};
 use crate::room_list;
 use crate::screens::login::{self, BrowserUrl, LoginForm};
 use crate::screens::{self, loading, main_view};
+use crate::security::{SecurityMessage, SecurityModel};
 use crate::text_safety;
 use crate::timeline::{self, Effects, TimelineView};
 
@@ -255,6 +256,8 @@ pub enum Message {
     CloseRequested,
     /// The core did not close in time after `Shutdown`.
     ShutdownDeadline,
+    /// A message of the security banner and screens.
+    Security(SecurityMessage),
 }
 
 /// What `main` hands to Iced's boot function.
@@ -334,6 +337,8 @@ pub struct App {
     /// The composer changed since the room was opened: only then is its
     /// draft stored (the room's own draft may still be on its way).
     draft_dirty: bool,
+    /// The security banner and screens.
+    pub security: SecurityModel,
     /// Set when the app decided to exit (the task itself is opaque to tests).
     pub exit_requested: bool,
 }
@@ -351,6 +356,7 @@ impl std::fmt::Debug for App {
             .field("login_in_flight", &self.login_in_flight)
             .field("composer", &self.composer)
             .field("actions", &self.actions)
+            .field("security", &self.security)
             .finish_non_exhaustive()
     }
 }
@@ -398,6 +404,7 @@ impl App {
             command_bar: None,
             draft_seq: 0,
             draft_dirty: false,
+            security: SecurityModel::default(),
             exit_requested: false,
         };
         let restore = app.send(Command::RestoreSession);
@@ -418,8 +425,13 @@ impl App {
         }
     }
 
-    fn send(&self, command: Command) -> Task<Message> {
+    pub(crate) fn send(&self, command: Command) -> Task<Message> {
         self.sink.send(command).unwrap_or_else(Task::none)
+    }
+
+    /// A task that delivers `message` after `after`.
+    pub(crate) fn timer(&self, after: Duration, message: Message) -> Task<Message> {
+        self.sink.timer(after, message)
     }
 
     /// Applies a message.
@@ -644,7 +656,11 @@ impl App {
                     Task::none()
                 }
             }
-            Message::LogoutRequested => self.send(Command::Logout),
+            Message::LogoutRequested => {
+                self.security.clear_secrets();
+                self.send(Command::Logout)
+            }
+            Message::Security(message) => self.on_security(message),
             Message::SelectRoom(id) => {
                 if !room_list::contains(&self.rooms, &id) {
                     return Task::none();
@@ -696,6 +712,7 @@ impl App {
                     return Task::none();
                 }
                 let save = self.save_draft();
+                self.security.clear_secrets();
                 self.screen = Screen::ShuttingDown;
                 Task::batch([
                     save,
@@ -729,9 +746,13 @@ impl App {
                 self.end_login_attempt();
                 self.screen = Screen::Login;
             }
-            CoreEvent::LoggedIn { user_id, .. } => {
+            CoreEvent::LoggedIn {
+                user_id, restored, ..
+            } => {
                 // Any cancel reply would have come before this login.
                 self.pending_cancel = false;
+                self.security = SecurityModel::default();
+                self.security.fresh_login = !restored;
                 self.user_id = Some(user_id);
                 self.notice = None;
                 self.end_login_attempt();
@@ -855,15 +876,18 @@ impl App {
                     self.typing = users;
                 }
             }
-            CoreEvent::ActionFailed { .. } => {}
-            // Phase 4 events: the app screens for them land in Tasks 10-13.
-            CoreEvent::Security(_)
+            // Recovery and cross-signing failures belong to the security
+            // screens; other actions have no screen yet.
+            event @ (CoreEvent::ActionFailed { .. }
+            | CoreEvent::Security(_)
             | CoreEvent::RecoveryProgress(_)
             | CoreEvent::RecoveryKeyReady(_)
             | CoreEvent::Recovered
             | CoreEvent::ReauthRequired { .. }
-            | CoreEvent::OpenAccountManagement(_)
-            | CoreEvent::VerificationRequested { .. }
+            | CoreEvent::OpenAccountManagement(_)) => {
+                task = self.on_security_event(event);
+            }
+            CoreEvent::VerificationRequested { .. }
             | CoreEvent::Verification { .. }
             | CoreEvent::Devices(_)
             | CoreEvent::UserTrust { .. } => {}
@@ -1344,6 +1368,8 @@ impl App {
         self.list_offset_y = 0.0;
         self.deselect();
         self.sync_state = SyncState::Idle;
+        self.security.clear_secrets();
+        self.security = SecurityModel::default();
         self.notice = Some(notice.to_owned());
         self.end_login_attempt();
         self.screen = Screen::Login;
@@ -1505,7 +1531,9 @@ impl App {
             Screen::Starting => screens::centered_text("Starting\u{2026}"),
             Screen::Login => login::view(self),
             Screen::WaitingForBrowser => login::waiting_view(self),
-            Screen::Loading => loading::view(self),
+            Screen::Loading => {
+                screens::security::layer(loading::view(self), screens::security::top_layer(self))
+            }
             Screen::Main => main_view::view(self),
             Screen::ShuttingDown => screens::centered_text("Closing\u{2026}"),
             Screen::Disconnected => screens::centered_text("The core stopped"),
@@ -3551,5 +3579,483 @@ mod tests {
             &commands[1],
             Command::DiscardSend { room_id, item_id } if *room_id == RoomId::from("!a:x") && item_id == "bad"
         ));
+    }
+
+    // ---- Task 10: security banner and screens ----
+
+    use crate::security::{Banner, Busy, Overlay, SecurityMessage, Visible};
+    use tessera_core::api::{
+        ActionKind as Kind, CrossSigning, DeviceVerification, ReauthAction, RecoveryKey,
+        RecoveryStatus, SecurityStatus,
+    };
+
+    fn sec(app: &mut App, message: SecurityMessage) -> Task<Message> {
+        app.update(Message::Security(message))
+    }
+
+    fn status(device: DeviceVerification, recovery: RecoveryStatus) -> SecurityStatus {
+        SecurityStatus {
+            recovery,
+            device,
+            cross_signing: CrossSigning::Complete,
+            has_devices_to_verify_against: true,
+            identity_exists: true,
+        }
+    }
+
+    fn set_status(app: &mut App, device: DeviceVerification, recovery: RecoveryStatus) {
+        let _ = app.update(core(CoreEvent::Security(status(device, recovery))));
+    }
+
+    /// A freshly logged-in app whose device is unverified, on the identity
+    /// screen, with the commands drained.
+    fn identity_app() -> (App, mpsc::Receiver<Command>) {
+        let (mut app, mut rx) = main_app();
+        set_status(
+            &mut app,
+            DeviceVerification::Unverified,
+            RecoveryStatus::Enabled,
+        );
+        while rx.try_recv().is_ok() {}
+        (app, rx)
+    }
+
+    /// A verified app with recovery off, so the key can be set up.
+    fn recovery_app() -> (App, mpsc::Receiver<Command>) {
+        let (mut app, mut rx) = main_app();
+        set_status(
+            &mut app,
+            DeviceVerification::Verified,
+            RecoveryStatus::Disabled,
+        );
+        while rx.try_recv().is_ok() {}
+        (app, rx)
+    }
+
+    fn key_ready(app: &mut App, key: &str) {
+        let _ = app.update(core(CoreEvent::RecoveryKeyReady(RecoveryKey::from(key))));
+    }
+
+    fn recovery_failed(error: CoreError) -> Message {
+        core(CoreEvent::ActionFailed {
+            room_id: RoomId::from(""),
+            action: Kind::Recovery,
+            error,
+        })
+    }
+
+    #[test]
+    fn a_fresh_login_with_an_unverified_device_opens_the_identity_screen() {
+        let (app, _rx) = identity_app();
+        assert_eq!(
+            app.security.visible(),
+            Visible::Overlay(Overlay::ConfirmIdentity)
+        );
+        assert_eq!(app.security.banner(), Some(Banner::DeviceUnverified));
+    }
+
+    #[test]
+    fn a_restored_session_shows_the_banner_but_not_the_screen() {
+        let (mut app, _rx) = app_with(16);
+        let _ = app.update(core(CoreEvent::LoggedIn {
+            user_id: UserId::from("@a:x"),
+            device_id: DeviceId::from("D"),
+            restored: true,
+        }));
+        set_status(
+            &mut app,
+            DeviceVerification::Unverified,
+            RecoveryStatus::Enabled,
+        );
+        assert_eq!(app.security.visible(), Visible::Nothing);
+        assert_eq!(app.security.banner(), Some(Banner::DeviceUnverified));
+    }
+
+    #[test]
+    fn skip_leaves_the_unverified_banner_and_verify_reopens_the_screen() {
+        let (mut app, mut rx) = identity_app();
+        let _ = sec(&mut app, SecurityMessage::SkipIdentity);
+        assert!(app.security.identity_screen_skipped);
+        assert_eq!(app.security.visible(), Visible::Nothing);
+        assert_eq!(app.security.banner(), Some(Banner::DeviceUnverified));
+        // A dismiss message does not remove the persistent banner.
+        let _ = sec(&mut app, SecurityMessage::DismissRecoveryBanner);
+        assert_eq!(app.security.banner(), Some(Banner::DeviceUnverified));
+        // Later status updates do not reopen the screen by themselves.
+        set_status(
+            &mut app,
+            DeviceVerification::Unverified,
+            RecoveryStatus::Enabled,
+        );
+        assert_eq!(app.security.visible(), Visible::Nothing);
+        let _ = sec(&mut app, SecurityMessage::OpenConfirmIdentity);
+        assert_eq!(
+            app.security.visible(),
+            Visible::Overlay(Overlay::ConfirmIdentity)
+        );
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn the_unverified_banner_goes_when_the_device_is_verified() {
+        let (mut app, _rx) = identity_app();
+        set_status(
+            &mut app,
+            DeviceVerification::Verified,
+            RecoveryStatus::Enabled,
+        );
+        assert_eq!(app.security.banner(), None);
+        assert_eq!(app.security.visible(), Visible::Nothing);
+    }
+
+    #[test]
+    fn use_another_device_sends_one_self_verification_request() {
+        let (mut app, mut rx) = identity_app();
+        let _ = sec(&mut app, SecurityMessage::UseOtherDevice);
+        let _ = sec(&mut app, SecurityMessage::UseOtherDevice);
+        let commands = drain(&mut rx);
+        assert_eq!(commands.len(), 1, "{commands:?}");
+        assert!(matches!(commands[0], Command::RequestSelfVerification));
+    }
+
+    #[test]
+    fn set_up_recovery_sends_enable_once_and_the_key_opens_the_show_once_screen() {
+        let (mut app, mut rx) = recovery_app();
+        let _ = sec(&mut app, SecurityMessage::SetupRecovery);
+        let _ = sec(&mut app, SecurityMessage::SetupRecovery);
+        let commands = drain(&mut rx);
+        assert_eq!(commands.len(), 1, "{commands:?}");
+        assert!(matches!(commands[0], Command::EnableRecovery));
+        assert_eq!(app.security.busy, Some(Busy::SettingUp));
+        key_ready(&mut app, "secret-key-x");
+        assert_eq!(app.security.visible(), Visible::Key);
+        assert_eq!(app.security.busy, None);
+    }
+
+    #[test]
+    fn done_is_refused_until_the_box_is_ticked_and_then_drops_the_key() {
+        let (mut app, _rx) = recovery_app();
+        key_ready(&mut app, "secret-key-x");
+        let _ = sec(&mut app, SecurityMessage::Done);
+        assert_eq!(app.security.visible(), Visible::Key, "refused");
+        let _ = sec(&mut app, SecurityMessage::SavedToggled(true));
+        let _ = sec(&mut app, SecurityMessage::Done);
+        assert!(app.security.setup.is_none());
+        // Toggling with no key screen does nothing.
+        let _ = sec(&mut app, SecurityMessage::SavedToggled(true));
+        assert!(app.security.setup.is_none());
+    }
+
+    #[test]
+    fn copy_arms_one_timer_and_the_clipboard_is_cleared_only_if_it_still_holds_the_key() {
+        let (mut app, _rx) = recovery_app();
+        key_ready(&mut app, "secret-key-x");
+        assert!(sec(&mut app, SecurityMessage::CopyKey).units() > 0);
+        assert_eq!(app.security.copy_seq, 1);
+        // A timer of an older copy does nothing.
+        assert_eq!(sec(&mut app, SecurityMessage::ClipboardDue(0)).units(), 0);
+        // Done does not forget the copy: it is still checked.
+        let _ = sec(&mut app, SecurityMessage::SavedToggled(true));
+        let _ = sec(&mut app, SecurityMessage::Done);
+        assert!(app.security.setup.is_none());
+        assert!(sec(&mut app, SecurityMessage::ClipboardDue(1)).units() > 0);
+        let other = Some(RecoveryKey::from("something else"));
+        assert_eq!(
+            sec(&mut app, SecurityMessage::ClipboardRead(other)).units(),
+            0
+        );
+        assert!(app.security.copied.is_none());
+
+        // The clipboard still holds the key: cleared.
+        let (mut app, _rx) = recovery_app();
+        key_ready(&mut app, "secret-key-x");
+        let _ = sec(&mut app, SecurityMessage::CopyKey);
+        let _ = sec(&mut app, SecurityMessage::ClipboardDue(1));
+        let held = Some(RecoveryKey::from("secret-key-x"));
+        assert!(sec(&mut app, SecurityMessage::ClipboardRead(held)).units() > 0);
+        assert!(app.security.copied.is_none());
+    }
+
+    #[test]
+    fn restore_sends_the_trimmed_input_once_and_a_failure_keeps_it() {
+        let (mut app, mut rx) = identity_app();
+        let _ = sec(&mut app, SecurityMessage::OpenRestore);
+        assert_eq!(app.security.visible(), Visible::Overlay(Overlay::Restore));
+        // Nothing to send while the field is empty.
+        let _ = sec(&mut app, SecurityMessage::RestoreSubmitted);
+        assert!(drain(&mut rx).is_empty());
+        let typed = RecoveryKey::from("  EsTc aaaa  \n");
+        let _ = sec(&mut app, SecurityMessage::RestoreInput(typed));
+        let _ = sec(&mut app, SecurityMessage::RestoreSubmitted);
+        let _ = sec(&mut app, SecurityMessage::RestoreSubmitted);
+        let commands = drain(&mut rx);
+        assert_eq!(commands.len(), 1, "{commands:?}");
+        match &commands[0] {
+            Command::Recover { key } => assert_eq!(key.expose(), "EsTc aaaa"),
+            other => panic!("{other:?}"),
+        }
+        let _ = app.update(recovery_failed(CoreError::Internal(
+            "that recovery key or passphrase is not correct".into(),
+        )));
+        assert_eq!(app.security.busy, None);
+        let notice = app.security.notice.clone().expect("a notice");
+        assert!(notice.contains("not correct"), "{notice}");
+        assert_eq!(app.security.restore_input.expose(), "  EsTc aaaa  \n");
+        assert_eq!(app.security.visible(), Visible::Overlay(Overlay::Restore));
+        // A success empties the field and closes the screen.
+        let _ = app.update(core(CoreEvent::Recovered));
+        assert_eq!(app.security.restore_input.expose(), "");
+        assert_eq!(app.security.visible(), Visible::Nothing);
+        assert_eq!(app.security.notice, None);
+    }
+
+    #[test]
+    fn a_backup_that_already_exists_opens_the_restore_field() {
+        let (mut app, mut rx) = recovery_app();
+        let _ = sec(&mut app, SecurityMessage::SetupRecovery);
+        let _ = drain(&mut rx);
+        let _ = app.update(recovery_failed(CoreError::Internal(
+            "a key backup already exists; enter your recovery key".into(),
+        )));
+        assert_eq!(app.security.visible(), Visible::Overlay(Overlay::Restore));
+        let notice = app.security.notice.clone().expect("a notice");
+        assert!(notice.contains("backup already exists"), "{notice}");
+        assert_eq!(app.security.busy, None);
+    }
+
+    #[test]
+    fn a_recovery_failure_shows_one_capped_line() {
+        let (mut app, _rx) = recovery_app();
+        let _ = app.update(recovery_failed(CoreError::Internal(format!(
+            "bad\n{}",
+            "x".repeat(2000)
+        ))));
+        let notice = app.security.notice.clone().expect("a notice");
+        assert!(!notice.contains('\n') && notice.chars().count() <= 512);
+    }
+
+    #[test]
+    fn the_reset_warns_first_then_asks_for_the_password_and_resends_with_it() {
+        let (mut app, mut rx) = identity_app();
+        let _ = sec(&mut app, SecurityMessage::ResetRequested);
+        assert_eq!(
+            app.security.visible(),
+            Visible::Overlay(Overlay::ResetConfirm)
+        );
+        assert!(drain(&mut rx).is_empty(), "the warning sends nothing");
+        let _ = sec(&mut app, SecurityMessage::ResetConfirmed);
+        let _ = sec(&mut app, SecurityMessage::ResetConfirmed);
+        let commands = drain(&mut rx);
+        assert_eq!(commands.len(), 1, "{commands:?}");
+        assert!(matches!(
+            commands[0],
+            Command::ResetIdentity { password: None }
+        ));
+        assert_eq!(app.security.busy, Some(Busy::Resetting));
+
+        let _ = app.update(core(CoreEvent::ReauthRequired {
+            action: ReauthAction::ResetIdentity,
+        }));
+        assert_eq!(app.security.visible(), Visible::Reauth);
+        assert_eq!(app.security.busy, None);
+        // An empty password sends nothing.
+        let _ = sec(&mut app, SecurityMessage::ReauthSubmitted);
+        assert!(drain(&mut rx).is_empty());
+        let _ = sec(
+            &mut app,
+            SecurityMessage::ReauthInput(Password::from("secret-pw-x")),
+        );
+        let _ = sec(&mut app, SecurityMessage::ReauthSubmitted);
+        let _ = sec(&mut app, SecurityMessage::ReauthSubmitted);
+        let commands = drain(&mut rx);
+        assert_eq!(commands.len(), 1, "{commands:?}");
+        match &commands[0] {
+            Command::ResetIdentity {
+                password: Some(password),
+            } => assert_eq!(password.expose(), "secret-pw-x"),
+            other => panic!("{other:?}"),
+        }
+        let prompt = app.security.reauth.as_ref().expect("prompt kept");
+        assert_eq!(prompt.password.expose(), "", "the password is gone");
+        assert!(prompt.waiting);
+        assert_eq!(app.security.busy, Some(Busy::Resetting));
+
+        // The server refused it: the prompt returns with the backup warning.
+        let _ = app.update(core(CoreEvent::ActionFailed {
+            room_id: RoomId::from(""),
+            action: Kind::CrossSigning,
+            error: CoreError::ReauthFailed,
+        }));
+        let prompt = app.security.reauth.as_ref().expect("prompt kept");
+        assert!(prompt.failed && !prompt.waiting);
+        assert_eq!(app.security.busy, None);
+        let notice = app.security.notice.clone().expect("a notice");
+        assert!(notice.contains("backup"), "{notice}");
+
+        // A successful reset ends everything.
+        let _ = sec(
+            &mut app,
+            SecurityMessage::ReauthInput(Password::from("secret-pw-x")),
+        );
+        let _ = sec(&mut app, SecurityMessage::ReauthSubmitted);
+        set_status(
+            &mut app,
+            DeviceVerification::Verified,
+            RecoveryStatus::Disabled,
+        );
+        assert_eq!(app.security.visible(), Visible::Nothing);
+        assert_eq!(app.security.busy, None);
+        assert_eq!(app.security.notice, None);
+        assert_eq!(app.security.banner(), Some(Banner::RecoveryDisabled));
+    }
+
+    #[test]
+    fn a_status_from_before_the_reset_does_not_end_it() {
+        let (mut app, mut rx) = identity_app();
+        let _ = sec(&mut app, SecurityMessage::ResetRequested);
+        let _ = sec(&mut app, SecurityMessage::ResetConfirmed);
+        let _ = drain(&mut rx);
+        // A status already on its way when the reset began: still unverified.
+        set_status(
+            &mut app,
+            DeviceVerification::Unverified,
+            RecoveryStatus::Enabled,
+        );
+        assert_eq!(app.security.busy, Some(Busy::Resetting));
+        // Verified, but the backup still there: not the reset's result yet.
+        set_status(
+            &mut app,
+            DeviceVerification::Verified,
+            RecoveryStatus::Enabled,
+        );
+        assert_eq!(app.security.busy, Some(Busy::Resetting));
+        set_status(
+            &mut app,
+            DeviceVerification::Verified,
+            RecoveryStatus::Disabled,
+        );
+        assert_eq!(app.security.busy, None);
+    }
+
+    #[test]
+    fn a_failed_or_cancelled_reset_says_the_backup_is_gone() {
+        let (mut app, mut rx) = identity_app();
+        let _ = sec(&mut app, SecurityMessage::ResetRequested);
+        let _ = sec(&mut app, SecurityMessage::ResetConfirmed);
+        let _ = drain(&mut rx);
+        let _ = app.update(core(CoreEvent::ActionFailed {
+            room_id: RoomId::from(""),
+            action: Kind::CrossSigning,
+            error: CoreError::Internal("identity reset could not be completed".into()),
+        }));
+        let notice = app.security.notice.clone().expect("a notice");
+        assert!(notice.contains("backup"), "{notice}");
+        assert_eq!(app.security.busy, None);
+        assert!(app.security.reauth.is_none());
+    }
+
+    #[test]
+    fn an_account_management_url_opens_only_when_it_is_https() {
+        let (mut app, mut rx) = identity_app();
+        let _ = sec(&mut app, SecurityMessage::ResetRequested);
+        let _ = sec(&mut app, SecurityMessage::ResetConfirmed);
+        let _ = drain(&mut rx);
+        let task = app.update(core(CoreEvent::OpenAccountManagement(AuthUrl::from(
+            "https://account.example.org/reset?x=1",
+        ))));
+        assert!(task.units() > 0);
+        assert!(app.security.waiting_approval);
+        assert_eq!(app.security.busy, Some(Busy::Resetting));
+
+        let (mut app, mut rx) = identity_app();
+        let _ = sec(&mut app, SecurityMessage::ResetRequested);
+        let _ = sec(&mut app, SecurityMessage::ResetConfirmed);
+        let _ = drain(&mut rx);
+        let task = app.update(core(CoreEvent::OpenAccountManagement(AuthUrl::from(
+            "http://evil.example.org/reset",
+        ))));
+        assert_eq!(task.units(), 0);
+        assert!(!app.security.waiting_approval);
+        let commands = drain(&mut rx);
+        assert!(matches!(commands[..], [Command::CancelIdentityReset]));
+    }
+
+    #[test]
+    fn cancelling_the_approval_sends_one_cancel_and_says_the_backup_is_gone() {
+        let (mut app, mut rx) = identity_app();
+        let _ = sec(&mut app, SecurityMessage::ResetRequested);
+        let _ = sec(&mut app, SecurityMessage::ResetConfirmed);
+        let _ = app.update(core(CoreEvent::OpenAccountManagement(AuthUrl::from(
+            "https://account.example.org/reset",
+        ))));
+        let _ = drain(&mut rx);
+        let _ = sec(&mut app, SecurityMessage::CancelApproval);
+        let _ = sec(&mut app, SecurityMessage::CancelApproval);
+        let commands = drain(&mut rx);
+        assert_eq!(commands.len(), 1, "{commands:?}");
+        assert!(matches!(commands[0], Command::CancelIdentityReset));
+        assert!(!app.security.waiting_approval);
+        let notice = app.security.notice.clone().expect("a notice");
+        assert!(notice.contains("backup"), "{notice}");
+    }
+
+    #[test]
+    fn logout_and_window_close_drop_the_key_and_the_inputs() {
+        for message in [Message::LogoutRequested, Message::CloseRequested] {
+            let (mut app, _rx) = recovery_app();
+            key_ready(&mut app, "secret-key-x");
+            let _ = sec(&mut app, SecurityMessage::CopyKey);
+            let _ = sec(
+                &mut app,
+                SecurityMessage::RestoreInput(RecoveryKey::from("secret-input-x")),
+            );
+            let _ = app.update(message);
+            assert!(app.security.setup.is_none());
+            assert!(app.security.copied.is_none());
+            assert_eq!(app.security.restore_input.expose(), "");
+        }
+    }
+
+    #[test]
+    fn logged_out_resets_the_security_state() {
+        let (mut app, _rx) = identity_app();
+        let _ = sec(&mut app, SecurityMessage::SkipIdentity);
+        let _ = app.update(core(CoreEvent::LoggedOut));
+        assert_eq!(app.security.banner(), None);
+        assert!(!app.security.identity_screen_skipped);
+        assert!(!app.security.fresh_login);
+    }
+
+    #[test]
+    fn a_sentinel_key_never_appears_in_the_app_debug_output() {
+        let (mut app, _rx) = recovery_app();
+        key_ready(&mut app, "secret-key-x");
+        let _ = sec(&mut app, SecurityMessage::CopyKey);
+        let _ = sec(
+            &mut app,
+            SecurityMessage::RestoreInput(RecoveryKey::from("secret-input-x")),
+        );
+        let _ = sec(
+            &mut app,
+            SecurityMessage::ReauthInput(Password::from("secret-pw-x")),
+        );
+        let dbg = format!("{app:?}");
+        assert!(dbg.contains("security"), "{dbg}");
+        for secret in ["secret-key-x", "secret-input-x", "secret-pw-x"] {
+            assert!(!dbg.contains(secret), "{dbg}");
+        }
+        let messages = format!(
+            "{:?} {:?} {:?}",
+            Message::Core(Box::new(CoreEvent::RecoveryKeyReady(RecoveryKey::from(
+                "secret-key-x"
+            )))),
+            Message::Security(SecurityMessage::RestoreInput(RecoveryKey::from(
+                "secret-input-x"
+            ))),
+            Message::Security(SecurityMessage::ClipboardRead(Some(RecoveryKey::from(
+                "secret-key-x"
+            )))),
+        );
+        assert!(!messages.contains("secret-"), "{messages}");
     }
 }
