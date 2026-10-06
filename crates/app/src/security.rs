@@ -327,6 +327,9 @@ pub enum SecurityMessage {
     ClipboardDue(u64),
     /// The clipboard's contents, read for the check.
     ClipboardRead(Option<RecoveryKey>),
+    /// The clipboard's contents (first) read at once because the key (second)
+    /// is being dropped; cleared if it still holds that key.
+    ClipboardFlushed(Option<RecoveryKey>, RecoveryKey),
     /// "I've saved my recovery key" was toggled.
     SavedToggled(bool),
     /// **Done** on the key screen.
@@ -419,6 +422,13 @@ impl App {
                 let Some(key) = self.security.copied.take() else {
                     return Task::none();
                 };
+                if should_clear_clipboard(held.as_ref().map(RecoveryKey::expose), &key) {
+                    clipboard::write(String::new())
+                } else {
+                    Task::none()
+                }
+            }
+            M::ClipboardFlushed(held, key) => {
                 if should_clear_clipboard(held.as_ref().map(RecoveryKey::expose), &key) {
                     clipboard::write(String::new())
                 } else {
@@ -541,6 +551,23 @@ impl App {
                 self.security.notice = None;
                 Task::none()
             }
+        }
+    }
+
+    /// Drops the key, the inputs and the copy, and checks the clipboard at
+    /// once: a copied key still on it is cleared now, not after 60 s (the
+    /// timer would find nothing to compare with). Returns that task.
+    pub(crate) fn drop_secrets(&mut self) -> Task<Message> {
+        let copied = self.security.copied.take();
+        self.security.clear_secrets();
+        match copied {
+            Some(key) => clipboard::read().map(move |held| {
+                Message::Security(SecurityMessage::ClipboardFlushed(
+                    held.map(RecoveryKey::from),
+                    key.clone(),
+                ))
+            }),
+            None => Task::none(),
         }
     }
 

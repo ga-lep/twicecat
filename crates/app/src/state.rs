@@ -466,7 +466,7 @@ impl App {
                     self.exit()
                 } else {
                     self.screen = Screen::Disconnected;
-                    Task::none()
+                    self.drop_secrets()
                 }
             }
             Message::ThemeMode(mode) => {
@@ -657,8 +657,8 @@ impl App {
                 }
             }
             Message::LogoutRequested => {
-                self.security.clear_secrets();
-                self.send(Command::Logout)
+                let flush = self.drop_secrets();
+                Task::batch([flush, self.send(Command::Logout)])
             }
             Message::Security(message) => self.on_security(message),
             Message::SelectRoom(id) => {
@@ -712,9 +712,12 @@ impl App {
                     return Task::none();
                 }
                 let save = self.save_draft();
-                self.security.clear_secrets();
+                // The app stays alive until the core closes, so the read can
+                // still be answered.
+                let flush = self.drop_secrets();
                 self.screen = Screen::ShuttingDown;
                 Task::batch([
+                    flush,
                     save,
                     self.send(Command::Shutdown),
                     self.sink.deadline(SHUTDOWN_WAIT),
@@ -751,6 +754,8 @@ impl App {
             } => {
                 // Any cancel reply would have come before this login.
                 self.pending_cancel = false;
+                // A copy still on the clipboard is checked, not forgotten.
+                task = self.drop_secrets();
                 self.security = SecurityModel::default();
                 self.security.fresh_login = !restored;
                 self.user_id = Some(user_id);
@@ -776,9 +781,9 @@ impl App {
                 self.end_login_attempt();
                 self.screen = Screen::Login;
             }
-            CoreEvent::LoggedOut => self.back_to_login("You were logged out."),
+            CoreEvent::LoggedOut => task = self.back_to_login("You were logged out."),
             CoreEvent::SessionExpired => {
-                self.back_to_login("Your session expired. Please log in again.");
+                task = self.back_to_login("Your session expired. Please log in again.");
             }
             CoreEvent::OAuthUrl(url) => task = self.on_oauth_url(url.expose()),
             CoreEvent::SyncState(state) => self.sync_state = state,
@@ -1358,7 +1363,7 @@ impl App {
         self.send_error = None;
     }
 
-    fn back_to_login(&mut self, notice: &str) {
+    fn back_to_login(&mut self, notice: &str) -> Task<Message> {
         self.pending_cancel = false;
         self.user_id = None;
         self.rooms.clear();
@@ -1368,11 +1373,12 @@ impl App {
         self.list_offset_y = 0.0;
         self.deselect();
         self.sync_state = SyncState::Idle;
-        self.security.clear_secrets();
+        let flush = self.drop_secrets();
         self.security = SecurityModel::default();
         self.notice = Some(notice.to_owned());
         self.end_login_attempt();
         self.screen = Screen::Login;
+        flush
     }
 
     fn deselect(&mut self) {
@@ -4057,5 +4063,65 @@ mod tests {
             )))),
         );
         assert!(!messages.contains("secret-"), "{messages}");
+    }
+
+    /// An app that has copied its recovery key just now.
+    fn copied_app() -> App {
+        let (mut app, _rx) = recovery_app();
+        key_ready(&mut app, "secret-key-x");
+        assert!(sec(&mut app, SecurityMessage::CopyKey).units() > 0);
+        app
+    }
+
+    #[test]
+    fn logout_close_and_disconnect_check_and_clear_the_clipboard_at_once() {
+        let mut app = copied_app();
+        assert!(app.update(Message::LogoutRequested).units() > 0);
+        assert!(app.security.copied.is_none());
+        let mut app = copied_app();
+        assert!(app.update(Message::CloseRequested).units() > 0);
+        assert!(app.security.copied.is_none());
+        let mut app = copied_app();
+        assert!(app.update(Message::CoreClosed).units() > 0);
+        assert_eq!(app.screen, Screen::Disconnected);
+        assert!(app.security.setup.is_none() && app.security.copied.is_none());
+        let mut app = copied_app();
+        assert!(app.update(core(CoreEvent::LoggedOut)).units() > 0);
+        let mut app = copied_app();
+        let task = app.update(core(CoreEvent::LoggedIn {
+            user_id: UserId::from("@a:x"),
+            device_id: DeviceId::from("D"),
+            restored: false,
+        }));
+        assert!(task.units() > 0, "a pending copy is flushed, not lost");
+        // Nothing copied: nothing to check.
+        let (mut app, _rx) = recovery_app();
+        assert_eq!(app.update(Message::LogoutRequested).units(), 0);
+    }
+
+    #[test]
+    fn the_flush_clears_only_a_clipboard_that_still_holds_the_key() {
+        let key = RecoveryKey::from("secret-key-x");
+        let (mut app, _rx) = recovery_app();
+        let same = SecurityMessage::ClipboardFlushed(Some(key.clone()), key.clone());
+        assert!(sec(&mut app, same).units() > 0);
+        let other = SecurityMessage::ClipboardFlushed(Some(RecoveryKey::from("x")), key.clone());
+        assert_eq!(sec(&mut app, other).units(), 0);
+        let none = SecurityMessage::ClipboardFlushed(None, key);
+        assert_eq!(sec(&mut app, none).units(), 0);
+    }
+
+    #[test]
+    fn security_messages_never_print_their_secrets() {
+        let dbg = format!(
+            "{:?} {:?} {:?}",
+            SecurityMessage::RestoreInput(RecoveryKey::from("secret-input-x")),
+            SecurityMessage::ReauthInput(Password::from("secret-pw-x")),
+            SecurityMessage::ClipboardFlushed(
+                Some(RecoveryKey::from("secret-key-x")),
+                RecoveryKey::from("secret-key-y")
+            ),
+        );
+        assert!(!dbg.contains("secret-"), "{dbg}");
     }
 }

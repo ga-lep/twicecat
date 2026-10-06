@@ -425,8 +425,11 @@ fn carol_resets_her_identity_sets_up_recovery_and_logs_out() {
         app.security.status.device != DeviceVerification::Unknown
     );
 
-    // A new device of an account with an identity sees the screen and the
-    // banner. Whatever earlier runs left, the reset below works.
+    // The check is conditional on purpose: login bootstraps cross-signing
+    // when the account has no identity yet (Q4), and that device is already
+    // verified, so neither the screen nor the banner shows. The reset path
+    // below must work in both cases.
+    // A new device of an account with an identity sees the screen and banner.
     if app.security.status.device == DeviceVerification::Unverified
         && app.security.status.identity_exists
     {
