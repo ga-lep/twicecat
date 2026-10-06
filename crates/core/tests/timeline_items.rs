@@ -20,6 +20,13 @@ use tessera_core::api::{
 };
 use tessera_core::secrets::InMemorySecretStore;
 
+/// Carol's display name is account-wide: Synapse copies a change into the
+/// member event of every room she is in, asynchronously and with the latest
+/// name at that moment. Two tests changing it at the same time can overwrite
+/// each other's change before it reaches the other's room, so the tests that
+/// change it take this lock (tests of one binary run in parallel).
+static CAROL_PROFILE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 async fn login_and_run(core: &mut CoreHandle, env: &TestEnv, n: u8) {
     core.commands
         .send(Command::LoginPassword {
@@ -120,6 +127,7 @@ type UserIdStr = String;
 #[tokio::test]
 #[ignore = "needs local homeserver: docker compose up -d --wait"]
 async fn membership_and_profile_changes_become_state_items() {
+    let _profile = CAROL_PROFILE.lock().await;
     let env = TestEnv::load();
     let alice_raw = raw_login(1).await;
     let carol_raw = raw_login(3).await;
@@ -132,15 +140,31 @@ async fn membership_and_profile_changes_become_state_items() {
     login_and_run(&mut alice, &env, 1).await;
     open_room(&mut alice, &room).await;
 
+    // One change at a time, each seen before the next is made. Until the
+    // room subscription made by `SelectRoom` takes effect, a sync response
+    // may carry only the latest events of the room and be marked limited; the
+    // SDK then clears the timeline and the earlier invite and join are gone
+    // (seen in the full ignored run: only a later name change was left).
+    // Waiting after each step keeps every response to one new event.
+    let carol_id = env.user_id(3);
+    let mut items = Vec::new();
+    apply_until(&mut alice, &room, &mut items, |items| {
+        state_position(items, 0, |_, c| matches!(c, StateChange::Invited { .. })).is_some()
+    })
+    .await;
     carol_raw
         .join_room_by_id(&room_id)
         .await
         .expect("carol joins");
+    apply_until(&mut alice, &room, &mut items, |items| {
+        state_position(items, 0, |s, c| {
+            s == &carol_id && matches!(c, StateChange::Joined | StateChange::InviteAccepted)
+        })
+        .is_some()
+    })
+    .await;
     let new_name = format!("carol-{}", &name[name.len() - 8..]);
     set_display_name(&carol_raw, &new_name).await;
-
-    let carol_id = env.user_id(3);
-    let mut items = Vec::new();
     apply_until(&mut alice, &room, &mut items, |items| {
         let found = |from, pred: &dyn Fn(&UserIdStr, &StateChange) -> bool| {
             state_position(items, from, pred)
@@ -173,6 +197,7 @@ async fn membership_and_profile_changes_become_state_items() {
 #[tokio::test]
 #[ignore = "needs local homeserver: docker compose up -d --wait"]
 async fn notices_and_emotes_become_messages_with_details() {
+    let _profile = CAROL_PROFILE.lock().await;
     let env = TestEnv::load();
     let alice_raw = raw_login(1).await;
     let carol_raw = raw_login(3).await;
