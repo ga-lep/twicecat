@@ -315,25 +315,65 @@ async fn messages_after_a_reset_carry_no_shield() {
 
 /// A message sent right after the reset's `Security` event goes out promptly
 /// (regression, Task 9): the "Sent" item for it is in the list within 10 s.
-/// A stale local echo next to it is a separate check (Task 9, step B).
+/// Exactly one item for it, none left at "Sending".
 #[tokio::test]
 #[ignore = "needs local homeserver: docker compose up -d --wait"]
 async fn a_message_sent_right_after_a_reset_is_sent_promptly() {
     let _serial = e2ee_serial().await;
     let mut p = EncryptedPair::new().await;
     let room = p.room();
-    reset_identity_on(&mut p.alice, 1).await;
+    // The reset runs through a pump: the open room's diffs must not be lost,
+    // or the test's item list drifts from the core's.
+    let env = TestEnv::load();
+    p.alice
+        .commands
+        .send(Command::ResetIdentity {
+            password: Some(Password::from(env.password(1))),
+        })
+        .await
+        .unwrap();
+    let reset_done = std::cell::Cell::new(false);
+    common::pump_with(
+        &mut p.alice,
+        &room,
+        common::DEFAULT_TIMEOUT,
+        &mut p.alice_rooms,
+        &mut p.alice_items,
+        |e| {
+            if let CoreEvent::Security(s) = e
+                && s.cross_signing == CrossSigning::Complete
+                && s.device == DeviceVerification::Verified
+                && s.recovery == RecoveryStatus::Disabled
+            {
+                reset_done.set(true);
+            }
+        },
+        |_, _| reset_done.get(),
+    )
+    .await;
     let body = format!("after-reset-{}", hex());
     p.alice
         .commands
         .send(Command::Send(outgoing(&room, &body)))
         .await
         .unwrap();
+    // Exactly one item for the message, and it is "Sent": a duplicate or a
+    // local echo left at "Sending" fails the test.
     let sent = |items: &[tessera_core::api::TimelineItem]| {
-        items.iter().any(|i| {
-            matches!(&i.kind, TimelineItemKind::Message { body: b, is_own: true,
-                sent: tessera_core::api::SendStatus::Sent, .. } if *b == body)
-        })
+        let mine: Vec<_> = items
+            .iter()
+            .filter(|i| {
+                matches!(&i.kind, TimelineItemKind::Message { body: b, is_own: true, .. } if *b == body)
+            })
+            .collect();
+        mine.len() == 1
+            && matches!(
+                &mine[0].kind,
+                TimelineItemKind::Message {
+                    sent: tessera_core::api::SendStatus::Sent,
+                    ..
+                }
+            )
     };
     let reached = common::try_pump_with(
         &mut p.alice,
