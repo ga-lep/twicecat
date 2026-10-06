@@ -9,7 +9,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures_util::StreamExt as _;
 use futures_util::stream::{BoxStream, select_all};
-use matrix_sdk::encryption::recovery::{IdentityResetHandle, RecoveryError, RecoveryState};
+use matrix_sdk::encryption::recovery::{
+    EnableProgress, IdentityResetHandle, RecoveryError, RecoveryState,
+};
+use matrix_sdk::encryption::secret_storage::SecretStorageError;
 use matrix_sdk::encryption::{CrossSigningResetAuthType, CrossSigningStatus, VerificationState};
 use matrix_sdk::ruma::UserId;
 use matrix_sdk::ruma::api::client::keys::get_keys;
@@ -22,7 +25,7 @@ use tokio::task::{JoinHandle, JoinSet};
 
 use crate::api::{
     ActionKind, CoreError, CoreEvent, CrossSigning, DeviceVerification, Password, ReauthAction,
-    RecoveryStatus, RoomId, SecurityStatus,
+    RecoveryKey, RecoveryProgress, RecoveryStatus, RoomId, SecurityStatus,
 };
 use crate::oauth::check_auth_url;
 
@@ -146,11 +149,68 @@ fn map_sdk_error(error: &matrix_sdk::Error, what: &'static str) -> CoreError {
     }
 }
 
-/// Like [`map_sdk_error`] for the recovery subsystem's error type.
+const BACKUP_EXISTS: &str = "a key backup already exists; enter your recovery key";
+const WRONG_KEY: &str = "that recovery key or passphrase is not correct";
+const NOT_SET_UP: &str = "recovery is not set up on this account";
+const ALREADY_ON: &str = "recovery is already set up; change the key instead";
+const NEEDS_KEY_FIRST: &str = "enter your recovery key before changing it";
+const STATE_UNKNOWN: &str = "the recovery state is not known yet; try again in a moment";
+const RECOVERY_FAILED: &str = "recovery could not be completed";
+
+/// Like [`map_sdk_error`] for the recovery subsystem's error type. The SDK's
+/// own texts can quote parts of the input, so none is forwarded.
 fn map_recovery_error(error: &RecoveryError, what: &'static str) -> CoreError {
     match error {
+        RecoveryError::BackupExistsOnServer => CoreError::Internal(BACKUP_EXISTS.into()),
         RecoveryError::Sdk(e) => map_sdk_error(e, what),
-        _ => CoreError::Internal(what.into()),
+        // The key does not decode, or fails the secret store's MAC check.
+        RecoveryError::SecretStorage(SecretStorageError::SecretStorageKey(_)) => {
+            CoreError::Internal(WRONG_KEY.into())
+        }
+        RecoveryError::SecretStorage(SecretStorageError::MissingKeyInfo { .. }) => {
+            CoreError::Internal(NOT_SET_UP.into())
+        }
+        RecoveryError::SecretStorage(_) => CoreError::Internal(what.into()),
+    }
+}
+
+/// Progress of `Recovery::enable` as the API reports it. `None` for the final
+/// `Done`, whose payload is the new recovery key and must never be forwarded.
+fn map_progress(progress: &EnableProgress) -> Option<RecoveryProgress> {
+    match progress {
+        EnableProgress::Starting => Some(RecoveryProgress::Starting),
+        EnableProgress::CreatingBackup => Some(RecoveryProgress::CreatingBackup),
+        EnableProgress::CreatingRecoveryKey => Some(RecoveryProgress::CreatingKey),
+        EnableProgress::BackingUp(counts) => Some(RecoveryProgress::BackingUp {
+            done: counts.backed_up as u64,
+            total: counts.total as u64,
+        }),
+        EnableProgress::RoomKeyUploadError => Some(RecoveryProgress::UploadFailed),
+        EnableProgress::Done { .. } => None,
+    }
+}
+
+/// Whether `EnableRecovery` may start in recovery state `state`. Over an
+/// existing secret store `enable` would replace its key with one that lacks
+/// the secrets this device is missing, so only "nothing set up" goes on (the
+/// SDK still checks the server for a backup this device is not connected to).
+fn enable_precheck(state: RecoveryState) -> Result<(), CoreError> {
+    match state {
+        RecoveryState::Disabled => Ok(()),
+        RecoveryState::Incomplete => Err(CoreError::Internal(BACKUP_EXISTS.into())),
+        RecoveryState::Enabled => Err(CoreError::Internal(ALREADY_ON.into())),
+        RecoveryState::Unknown => Err(CoreError::Internal(STATE_UNKNOWN.into())),
+    }
+}
+
+/// Whether `ChangeRecoveryKey` may start in recovery state `state`: it
+/// re-uploads the secrets this device holds, so it needs all of them.
+fn change_key_precheck(state: RecoveryState) -> Result<(), CoreError> {
+    match state {
+        RecoveryState::Enabled => Ok(()),
+        RecoveryState::Disabled => Err(CoreError::Internal(NOT_SET_UP.into())),
+        RecoveryState::Incomplete => Err(CoreError::Internal(NEEDS_KEY_FIRST.into())),
+        RecoveryState::Unknown => Err(CoreError::Internal(STATE_UNKNOWN.into())),
     }
 }
 
@@ -427,10 +487,14 @@ impl SecurityTasks {
     /// Runs one identity operation in the background. Without a permit the
     /// answer is `Busy`. The permit lives in the spawned task until the work
     /// ends, so the work cannot drop it early by not mentioning it.
-    fn spawn_identity<F, Fut>(&mut self, events: &mpsc::Sender<CoreEvent>, work: F)
-    where
+    fn spawn_identity<F, Fut>(
+        &mut self,
+        events: &mpsc::Sender<CoreEvent>,
+        action: ActionKind,
+        work: F,
+    ) where
         F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = Result<(), Stop>> + Send + 'static,
+        Fut: std::future::Future<Output = Result<Option<CoreEvent>, Stop>> + Send + 'static,
     {
         // Forget finished tasks, so the set does not grow with every action.
         while self.tasks.try_join_next().is_some() {}
@@ -448,8 +512,13 @@ impl SecurityTasks {
                 }
                 None => Err(Stop::Failed(CoreError::Busy)),
             };
-            if let Err(stop) = result {
-                report(&events, stop).await;
+            match result {
+                // The success answer, if any, goes after the slot is free.
+                Ok(Some(event)) => {
+                    let _ = events.send(event).await;
+                }
+                Ok(None) => {}
+                Err(stop) => report(&events, action, stop).await,
             }
         });
     }
@@ -464,7 +533,7 @@ impl SecurityTasks {
         let client = client.clone();
         let refresh = self.refresh.clone();
         let op = self.identity.clone();
-        self.spawn_identity(events, move || async move {
+        self.spawn_identity(events, ActionKind::CrossSigning, move || async move {
             let result = {
                 let _gate = op.keys_gate.lock().await;
                 bootstrap_task(&client, password.as_ref()).await
@@ -473,7 +542,7 @@ impl SecurityTasks {
             // query drops local keys when the server turned out to have an
             // identity.
             finish(&client, &refresh).await;
-            result
+            result.map(|()| None)
         });
     }
 
@@ -488,13 +557,63 @@ impl SecurityTasks {
         let refresh = self.refresh.clone();
         let op = self.identity.clone();
         let events_for_task = events.clone();
-        self.spawn_identity(events, move || async move {
+        self.spawn_identity(events, ActionKind::CrossSigning, move || async move {
             let result = {
                 let _gate = op.keys_gate.lock().await;
                 reset_task(&client, &op, password.as_ref(), &events_for_task).await
             };
             // Also after a failure: after a reset that made new private keys
             // the server never accepted, the query drops them again.
+            finish(&client, &refresh).await;
+            result.map(|()| None)
+        });
+    }
+
+    /// `EnableRecovery`: sets recovery up and sends the new key once.
+    pub(crate) fn enable_recovery(&mut self, client: &Client, events: &mpsc::Sender<CoreEvent>) {
+        let client = client.clone();
+        let refresh = self.refresh.clone();
+        let events_for_task = events.clone();
+        self.spawn_identity(events, ActionKind::Recovery, move || async move {
+            let result = enable_task(&client, &events_for_task).await;
+            finish(&client, &refresh).await;
+            result
+        });
+    }
+
+    /// `Recover`: restores the secrets with a recovery key or passphrase.
+    pub(crate) fn recover(
+        &mut self,
+        client: &Client,
+        key: RecoveryKey,
+        events: &mpsc::Sender<CoreEvent>,
+    ) {
+        let client = client.clone();
+        let refresh = self.refresh.clone();
+        let op = self.identity.clone();
+        self.spawn_identity(events, ActionKind::Recovery, move || async move {
+            let result = {
+                // Importing the private keys signs this device; a keys query
+                // must not run in between.
+                let _gate = op.keys_gate.lock().await;
+                recover_task(&client, &key).await
+            };
+            // Also after a failure: the status is read again.
+            finish(&client, &refresh).await;
+            result
+        });
+    }
+
+    /// `ChangeRecoveryKey`: replaces the recovery key and sends the new one.
+    pub(crate) fn change_recovery_key(
+        &mut self,
+        client: &Client,
+        events: &mpsc::Sender<CoreEvent>,
+    ) {
+        let client = client.clone();
+        let refresh = self.refresh.clone();
+        self.spawn_identity(events, ActionKind::Recovery, move || async move {
+            let result = change_key_task(&client).await;
             finish(&client, &refresh).await;
             result
         });
@@ -517,13 +636,13 @@ impl SecurityTasks {
 }
 
 /// Sends the event that tells the user why `stop` ended an action.
-async fn report(events: &mpsc::Sender<CoreEvent>, stop: Stop) {
+async fn report(events: &mpsc::Sender<CoreEvent>, action: ActionKind, stop: Stop) {
     let event = match stop {
         Stop::Reauth(action) => CoreEvent::ReauthRequired { action },
         Stop::Failed(error) => CoreEvent::ActionFailed {
             // These actions belong to no room.
             room_id: RoomId::from(""),
-            action: ActionKind::CrossSigning,
+            action,
             error,
         },
     };
@@ -702,6 +821,61 @@ async fn bootstrap_flow<A: BootstrapApi>(
             Err(CoreError::Internal(BOOTSTRAP_FAILED.into()).into())
         }
     }
+}
+
+/// The success answer of an action that hands out a new recovery key.
+fn key_ready(key: String) -> Option<CoreEvent> {
+    Some(CoreEvent::RecoveryKeyReady(RecoveryKey::from(key)))
+}
+
+/// Sets recovery up (Q5), forwarding progress (never the key it carries).
+async fn enable_task(
+    client: &Client,
+    events: &mpsc::Sender<CoreEvent>,
+) -> Result<Option<CoreEvent>, Stop> {
+    let recovery = client.encryption().recovery();
+    enable_precheck(recovery.state())?;
+    let enable = recovery.enable().wait_for_backups_to_upload();
+    let progress = enable.subscribe_to_progress();
+    let mut progress = std::pin::pin!(progress);
+    let mut enable = std::pin::pin!(enable.into_future());
+    let result = loop {
+        tokio::select! {
+            result = &mut enable => break result,
+            Some(item) = progress.next() => {
+                if let Ok(item) = &item
+                    && let Some(progress) = map_progress(item)
+                {
+                    // A dropped receiver just means nobody listens any more.
+                    let _ = events.send(CoreEvent::RecoveryProgress(progress)).await;
+                }
+            }
+        }
+    };
+    let key = result.map_err(|e| Stop::Failed(map_recovery_error(&e, RECOVERY_FAILED)))?;
+    Ok(key_ready(key))
+}
+
+/// Restores the secrets from secret storage with `key`.
+async fn recover_task(client: &Client, key: &RecoveryKey) -> Result<Option<CoreEvent>, Stop> {
+    client
+        .encryption()
+        .recovery()
+        .recover(key.expose())
+        .await
+        .map_err(|e| Stop::Failed(map_recovery_error(&e, RECOVERY_FAILED)))?;
+    Ok(Some(CoreEvent::Recovered))
+}
+
+/// Replaces the recovery key.
+async fn change_key_task(client: &Client) -> Result<Option<CoreEvent>, Stop> {
+    let recovery = client.encryption().recovery();
+    change_key_precheck(recovery.state())?;
+    let key = recovery
+        .reset_key()
+        .await
+        .map_err(|e| Stop::Failed(map_recovery_error(&e, RECOVERY_FAILED)))?;
+    Ok(key_ready(key))
 }
 
 /// The approval URL the server gave, when it is safe to hand to the front end.
@@ -955,6 +1129,111 @@ mod tests {
     }
 
     #[test]
+    fn recovery_errors_map_to_fixed_messages() {
+        use matrix_sdk::encryption::secret_storage::SecretStorageError;
+        use matrix_sdk_crypto::secret_storage::{DecodeError, MacError};
+        const WHAT: &str = "fallback";
+        let internal = |m: &str| CoreError::Internal(m.into());
+        assert_eq!(
+            map_recovery_error(&RecoveryError::BackupExistsOnServer, WHAT),
+            internal(BACKUP_EXISTS)
+        );
+        assert_eq!(
+            BACKUP_EXISTS,
+            "a key backup already exists; enter your recovery key"
+        );
+        // A wrong key or passphrase: the key does not decode or fails its MAC
+        // check. The SDK's text can quote parts of the input, so it is dropped.
+        for decode in [
+            DecodeError::Parity(1, 2),
+            DecodeError::Prefix([0, 1], [2, 3]),
+            DecodeError::KeyLength(32, 3),
+            DecodeError::Mac(MacError),
+        ] {
+            let error = RecoveryError::SecretStorage(SecretStorageError::SecretStorageKey(decode));
+            assert_eq!(map_recovery_error(&error, WHAT), internal(WRONG_KEY));
+        }
+        assert_eq!(WRONG_KEY, "that recovery key or passphrase is not correct");
+        // Recovery was never set up on the server.
+        let missing =
+            RecoveryError::SecretStorage(SecretStorageError::MissingKeyInfo { key_id: None });
+        assert_eq!(map_recovery_error(&missing, WHAT), internal(NOT_SET_UP));
+        // Anything else keeps the caller's fixed message.
+        let other =
+            RecoveryError::SecretStorage(SecretStorageError::MissingOrInvalidBackupDecryptionKey);
+        assert_eq!(map_recovery_error(&other, WHAT), internal(WHAT));
+    }
+
+    #[test]
+    fn enable_progress_never_forwards_the_key() {
+        use matrix_sdk_crypto::store::types::RoomKeyCounts;
+        let counts = RoomKeyCounts {
+            total: 7,
+            backed_up: 3,
+        };
+        assert_eq!(
+            map_progress(&EnableProgress::Starting),
+            Some(RecoveryProgress::Starting)
+        );
+        assert_eq!(
+            map_progress(&EnableProgress::CreatingBackup),
+            Some(RecoveryProgress::CreatingBackup)
+        );
+        assert_eq!(
+            map_progress(&EnableProgress::CreatingRecoveryKey),
+            Some(RecoveryProgress::CreatingKey)
+        );
+        assert_eq!(
+            map_progress(&EnableProgress::BackingUp(counts)),
+            Some(RecoveryProgress::BackingUp { done: 3, total: 7 })
+        );
+        assert_eq!(
+            map_progress(&EnableProgress::RoomKeyUploadError),
+            Some(RecoveryProgress::UploadFailed)
+        );
+        let done = EnableProgress::Done {
+            recovery_key: "secret-key-x".into(),
+        };
+        assert_eq!(map_progress(&done), None);
+    }
+
+    #[test]
+    fn enabling_and_changing_the_key_are_guarded_by_the_recovery_state() {
+        let internal = |m: &str| Err(CoreError::Internal(m.into()));
+        // Enable only where nothing is set up: over an existing secret store
+        // it would replace the key with one that lacks the secrets this
+        // device is missing.
+        assert_eq!(enable_precheck(RecoveryState::Disabled), Ok(()));
+        assert_eq!(
+            enable_precheck(RecoveryState::Incomplete),
+            internal(BACKUP_EXISTS)
+        );
+        assert_eq!(
+            enable_precheck(RecoveryState::Enabled),
+            internal(ALREADY_ON)
+        );
+        assert_eq!(
+            enable_precheck(RecoveryState::Unknown),
+            internal(STATE_UNKNOWN)
+        );
+        // Changing the key re-uploads the secrets this device holds, so it
+        // needs all of them.
+        assert_eq!(change_key_precheck(RecoveryState::Enabled), Ok(()));
+        assert_eq!(
+            change_key_precheck(RecoveryState::Disabled),
+            internal(NOT_SET_UP)
+        );
+        assert_eq!(
+            change_key_precheck(RecoveryState::Incomplete),
+            internal(NEEDS_KEY_FIRST)
+        );
+        assert_eq!(
+            change_key_precheck(RecoveryState::Unknown),
+            internal(STATE_UNKNOWN)
+        );
+    }
+
+    #[test]
     fn uia_password_carries_user_password_and_session() {
         let user = owned_user_id!("@alice:example.org");
         let auth = uia_password(&user, &Password::from("secret-pw-x"), Some("sess-1"));
@@ -1085,7 +1364,9 @@ mod tests {
             .expect("the channel is open")
     }
 
-    type BoxedWork = std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Stop>> + Send>>;
+    type BoxedWork = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Option<CoreEvent>, Stop>> + Send>,
+    >;
 
     /// A fake identity operation that runs until `release` is notified and
     /// then ends like `reset_task` does: `Cancelled` when a cancel came.
@@ -1102,7 +1383,7 @@ mod tests {
                 if op.cancelled.load(Ordering::Acquire) {
                     return Err(CoreError::Cancelled.into());
                 }
-                Ok(())
+                Ok(None)
             })
         }
     }
@@ -1114,12 +1395,14 @@ mod tests {
         let (started, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
         tasks.spawn_identity(
             &tx,
+            ActionKind::CrossSigning,
             blocking_work(tasks.identity.clone(), &started, &release),
         );
         started.notified().await;
 
         tasks.spawn_identity(
             &tx,
+            ActionKind::CrossSigning,
             blocking_work(tasks.identity.clone(), &started, &release),
         );
         match next_event(&mut rx).await {
@@ -1145,6 +1428,7 @@ mod tests {
         let (started, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
         tasks.spawn_identity(
             &tx,
+            ActionKind::CrossSigning,
             blocking_work(tasks.identity.clone(), &started, &release),
         );
         started.notified().await;
@@ -1172,12 +1456,49 @@ mod tests {
         let (started, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
         tasks.spawn_identity(
             &tx,
+            ActionKind::CrossSigning,
             blocking_work(tasks.identity.clone(), &started, &release),
         );
         started.notified().await;
         release.notify_one();
         tasks.tasks.join_next().await;
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_success_answer_comes_after_the_slot_is_free() {
+        let (tx, mut rx) = unlimited_events();
+        let mut tasks = SecurityTasks::new();
+        tasks.spawn_identity(&tx, ActionKind::Recovery, || async {
+            Ok(Some(CoreEvent::Recovered))
+        });
+        assert!(matches!(next_event(&mut rx).await, CoreEvent::Recovered));
+        // A front end that reacts to the answer can start the next operation.
+        assert!(
+            tasks.identity.try_start().is_some(),
+            "the slot is still held"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_recovery_action_is_reported_as_recovery() {
+        let (tx, mut rx) = unlimited_events();
+        let mut tasks = SecurityTasks::new();
+        tasks.spawn_identity(&tx, ActionKind::Recovery, || async {
+            Err(Stop::Failed(CoreError::Internal(WRONG_KEY.into())))
+        });
+        match next_event(&mut rx).await {
+            CoreEvent::ActionFailed {
+                room_id,
+                action,
+                error,
+            } => {
+                assert!(room_id.as_str().is_empty());
+                assert_eq!(action, ActionKind::Recovery);
+                assert_eq!(error, CoreError::Internal(WRONG_KEY.into()));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[test]

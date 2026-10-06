@@ -572,6 +572,37 @@ pub async fn pump(
     items: &mut Vec<TimelineItem>,
     done: impl Fn(&[RoomSummary], &[TimelineItem]) -> bool,
 ) {
+    pump_with(core, room, DEFAULT_TIMEOUT, rooms, items, |_| {}, done).await;
+}
+
+/// Like [`pump`] with an explicit timeout, and `other` called with every event
+/// that is neither a room list nor a timeline change of `room` (so a test can
+/// follow `Security` or `Recovered` while it keeps the timeline up to date).
+pub async fn pump_with(
+    core: &mut CoreHandle,
+    room: &str,
+    timeout: Duration,
+    rooms: &mut Vec<RoomSummary>,
+    items: &mut Vec<TimelineItem>,
+    other: impl FnMut(&CoreEvent),
+    done: impl Fn(&[RoomSummary], &[TimelineItem]) -> bool,
+) {
+    assert!(
+        try_pump_with(core, room, timeout, rooms, items, other, done).await,
+        "timed out waiting for the core"
+    );
+}
+
+/// Like [`pump_with`], but returns `false` on a timeout instead of panicking.
+pub async fn try_pump_with(
+    core: &mut CoreHandle,
+    room: &str,
+    timeout: Duration,
+    rooms: &mut Vec<RoomSummary>,
+    items: &mut Vec<TimelineItem>,
+    mut other: impl FnMut(&CoreEvent),
+    done: impl Fn(&[RoomSummary], &[TimelineItem]) -> bool,
+) -> bool {
     let wait = async {
         while !done(rooms, items) {
             match core.events.recv().await {
@@ -585,14 +616,12 @@ pub async fn pump(
                         ListDiff::apply(&diff, items);
                     }
                 }
-                Some(_) => {}
+                Some(event) => other(&event),
                 None => panic!("event channel closed"),
             }
         }
     };
-    tokio::time::timeout(DEFAULT_TIMEOUT, wait)
-        .await
-        .expect("timed out waiting for the core");
+    tokio::time::timeout(timeout, wait).await.is_ok()
 }
 
 impl EncryptedPair {
@@ -726,5 +755,16 @@ pub async fn first_device(core: &mut CoreHandle, n: u8) {
         .await
         .unwrap();
     expect_event(core, |e| matches!(e, CoreEvent::LoggedIn { .. })).await;
+    // The first syncs after a login query the own keys. A reset that starts
+    // in that burst can have its new private keys dropped by a sync-driven
+    // query that the server answers with the old identity before the upload
+    // lands (the SDK race of the Task 4 notes; the keys gate cannot cover the
+    // SDK's own sync requests). Without this settle time `first_device` ended
+    // in `MissingKeys` in about half the runs (Task 5 notes).
+    expect_event(core, |e| {
+        matches!(e, CoreEvent::SyncState(SyncState::Running))
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
     reset_identity_on(core, n).await;
 }

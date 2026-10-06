@@ -1032,11 +1032,24 @@ impl Engine {
                 Some(active) => active.security.cancel_reset(),
                 None => self.not_logged_in(ActionKind::CrossSigning).await,
             },
+            Command::EnableRecovery => match self.active.as_mut() {
+                Some(active) => active
+                    .security
+                    .enable_recovery(&active.client, &self.events),
+                None => self.not_logged_in(ActionKind::Recovery).await,
+            },
+            Command::Recover { key } => match self.active.as_mut() {
+                Some(active) => active.security.recover(&active.client, key, &self.events),
+                None => self.not_logged_in(ActionKind::Recovery).await,
+            },
+            Command::ChangeRecoveryKey => match self.active.as_mut() {
+                Some(active) => active
+                    .security
+                    .change_recovery_key(&active.client, &self.events),
+                None => self.not_logged_in(ActionKind::Recovery).await,
+            },
             // The real handlers land in later Phase 4 tasks.
-            cmd @ (Command::EnableRecovery
-            | Command::Recover { .. }
-            | Command::ChangeRecoveryKey
-            | Command::RequestSelfVerification
+            cmd @ (Command::RequestSelfVerification
             | Command::RequestDeviceVerification { .. }
             | Command::RequestUserVerification { .. }
             | Command::AcceptVerification { .. }
@@ -2263,11 +2276,15 @@ mod tests {
             avatars: Avatars::new(),
             security: SecurityTasks::new(),
         });
-        // The identity commands have real handlers; see the next test.
+        // The identity and recovery commands have real handlers; see the
+        // next tests.
         let stubbed = security_commands().into_iter().filter(|(cmd, _)| {
             !matches!(
                 cmd,
-                Command::BootstrapCrossSigning { .. }
+                Command::EnableRecovery
+                    | Command::Recover { .. }
+                    | Command::ChangeRecoveryKey
+                    | Command::BootstrapCrossSigning { .. }
                     | Command::ResetIdentity { .. }
                     | Command::CancelIdentityReset
             )
@@ -2329,6 +2346,56 @@ mod tests {
         // Cancelling with nothing running is a no-op.
         engine.handle(Command::CancelIdentityReset).await;
         assert!(drain(&mut rx).await.is_empty());
+        if let Some(mut active) = engine.active.take() {
+            active.stop_tasks().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_commands_with_a_session_run_in_the_background() {
+        use crate::api::RecoveryKey;
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut engine, mut rx) = oauth_engine(tmp.path());
+        // No server and no logged-in user: each task fails on its own, and
+        // the answer names the recovery action and carries no secret.
+        let client = Client::builder()
+            .homeserver_url("http://127.0.0.1:1")
+            .build()
+            .await
+            .unwrap();
+        engine.active = Some(Active {
+            fetcher: Arc::new(SdkFetcher(client.clone())),
+            client,
+            record: record("@alice:x", "http://127.0.0.1:1", "s1"),
+            changes: broadcast::channel(1).1,
+            sync: None,
+            selected: None,
+            avatars: Avatars::new(),
+            security: SecurityTasks::new(),
+        });
+        for cmd in [
+            Command::EnableRecovery,
+            Command::Recover {
+                key: RecoveryKey::from("secret-key-x"),
+            },
+            Command::ChangeRecoveryKey,
+        ] {
+            engine.handle(cmd).await;
+            let event = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                .await
+                .expect("an answer within 10 s")
+                .expect("channel open");
+            match &event {
+                CoreEvent::ActionFailed {
+                    room_id,
+                    action: ActionKind::Recovery,
+                    error: CoreError::Internal(_),
+                } => assert!(room_id.as_str().is_empty()),
+                other => panic!("unexpected {other:?}"),
+            }
+            assert!(!format!("{event:?}").contains("secret-key-x"));
+            assert!(drain(&mut rx).await.is_empty());
+        }
         if let Some(mut active) = engine.active.take() {
             active.stop_tasks().await;
         }
