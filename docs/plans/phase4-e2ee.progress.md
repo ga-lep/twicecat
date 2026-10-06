@@ -1,3 +1,4 @@
 Task 1: started
 Task 1: complete (b141792..b973feb, gate ok, security PASS, review PASS)
   notes: review round 1 FAILED (96944b0 truncated PROGRESS.md 797→109 lines, Task 1 ledger content missing) → fixed in fd81188 (restored, +49/-0). Human-requested fix of pre-existing Phase 3 flake timeline_items::membership_and_profile_changes_become_state_items (limited-sync race + concurrent carol renames) in b973feb. Low: seed_recovery passphrase/key not zeroized end to end (test-only); e2ee_serial is per-binary only (parallel runners like nextest could overlap resets); a panicking test leaves its device until the next reset. Suggestion: fetch_raw_event_type check in the room smoke test is weak. Plan Task 1 text "iced qr_code per the validated plan" is superseded by the human's Q3 answer (matrix-sdk qrcode only).
+Task 2: started
