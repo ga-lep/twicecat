@@ -28,7 +28,7 @@ use crate::api::{
     RecoveryKey, RecoveryProgress, RecoveryStatus, RoomId, SecurityStatus,
 };
 use crate::oauth::check_auth_url;
-use crate::sync::SyncPause;
+use crate::sync::{PauseTarget, SyncPause, run_paused};
 
 /// What the status is computed from.
 #[derive(Clone, Debug)]
@@ -672,24 +672,16 @@ async fn report(events: &mpsc::Sender<CoreEvent>, action: ActionKind, stop: Stop
 /// `/keys/query` answered with the old identity processed in between, see
 /// [`SyncPause`]. The SDK's one-shot setup after the login (it can query keys
 /// and bootstrap too) is awaited first.
-async fn with_sync_paused<T>(
+async fn with_sync_paused<P: PauseTarget, T>(
     client: &Client,
-    pause: Option<&SyncPause>,
+    pause: Option<&SyncPause<P>>,
     work: impl std::future::Future<Output = T>,
 ) -> T {
     client
         .encryption()
         .wait_for_e2ee_initialization_tasks()
         .await;
-    let paused = match pause {
-        Some(pause) => Some(pause.pause().await),
-        None => None,
-    };
-    let result = work.await;
-    if let Some(paused) = paused {
-        paused.resume().await;
-    }
-    result
+    run_paused(pause, work).await
 }
 
 /// A reset that reported success must leave all three private keys here: a

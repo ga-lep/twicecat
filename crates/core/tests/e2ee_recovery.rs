@@ -13,15 +13,15 @@ use std::time::Duration;
 
 use common::{
     DEFAULT_TIMEOUT, EncryptedPair, TestEnv, e2ee_serial, expect_event, expect_security,
-    first_device, hex, login_and_run, message_with, outgoing, pump, pump_with, raw_login_named,
-    reset_e2ee_account, seed_recovery, start_core, try_pump_with,
+    first_device, hex, login_and_run, message_with, outgoing, pump, pump_recording, pump_with,
+    raw_login_named, reset_e2ee_account, seed_recovery, start_core, try_pump_with,
 };
 use matrix_sdk::ruma::api::client::backup::get_latest_backup_info;
 use tessera_core::CoreHandle;
 use tessera_core::api::{
-    ActionKind, Command, CoreError, CoreEvent, CrossSigning, DeviceVerification, Password,
-    PlaceholderKind, RecoveryKey, RecoveryStatus, RoomId, SecurityStatus, Shield, ShieldCode,
-    TimelineItem, TimelineItemKind, UtdReason,
+    ActionKind, Command, CoreError, CoreEvent, CrossSigning, DeviceVerification, ListDiff,
+    Password, PlaceholderKind, RecoveryKey, RecoveryStatus, RoomId, SecurityStatus, Shield,
+    ShieldCode, TimelineItem, TimelineItemKind, UtdReason,
 };
 use tessera_core::secrets::InMemorySecretStore;
 
@@ -176,6 +176,27 @@ fn mistyped(key: &str) -> String {
     chars.into_iter().collect()
 }
 
+/// The kinds of diff, in order (no bodies or keys).
+fn describe(diffs: &[ListDiff<TimelineItem>]) -> String {
+    diffs
+        .iter()
+        .map(|d| match d {
+            ListDiff::Append { .. } => "Append",
+            ListDiff::Clear => "Clear",
+            ListDiff::PushFront { .. } => "PushFront",
+            ListDiff::PushBack { .. } => "PushBack",
+            ListDiff::PopFront => "PopFront",
+            ListDiff::PopBack => "PopBack",
+            ListDiff::Insert { .. } => "Insert",
+            ListDiff::Set { .. } => "Set",
+            ListDiff::Remove { .. } => "Remove",
+            ListDiff::Truncate { .. } => "Truncate",
+            ListDiff::Reset { .. } => "Reset",
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 #[tokio::test]
 #[ignore = "needs local homeserver: docker compose up -d --wait"]
 async fn set_up_then_restore_on_a_fresh_store_reads_earlier_history() {
@@ -308,12 +329,13 @@ async fn set_up_then_restore_on_a_fresh_store_reads_earlier_history() {
         .unwrap();
     let mut recovered = false;
     let mut restored_status = false;
-    pump_with(
+    let mut diffs = Vec::new();
+    pump_recording(
         &mut second,
         &room,
         Duration::from_secs(60),
-        &mut rooms,
         &mut items,
+        &mut diffs,
         |e| match e {
             CoreEvent::Recovered => recovered = true,
             CoreEvent::Security(s) if restored(s) => restored_status = true,
@@ -322,7 +344,7 @@ async fn set_up_then_restore_on_a_fresh_store_reads_earlier_history() {
             }
             _ => {}
         },
-        |_, i| {
+        |i| {
             ids.iter().all(|id| {
                 i.iter()
                     .any(|x| &x.id == id && matches!(&x.kind, TimelineItemKind::Message { .. }))
@@ -330,6 +352,40 @@ async fn set_up_then_restore_on_a_fresh_store_reads_earlier_history() {
         },
     )
     .await;
+    // The update arrives as `Set` diffs (roadmap step 5): for each of the
+    // three items at least one `Set` whose new value is the decrypted message,
+    // and nothing removes or re-inserts them.
+    for id in &ids {
+        assert!(
+            diffs.iter().any(|d| matches!(d,
+                ListDiff::Set { value, .. }
+                    if &value.id == id && matches!(value.kind, TimelineItemKind::Message { .. }))),
+            "no Set diff made item {id} a message; diffs: {}",
+            describe(&diffs)
+        );
+    }
+    for d in &diffs {
+        let touches = |id: &String| match d {
+            ListDiff::Insert { value, .. }
+            | ListDiff::PushBack { value }
+            | ListDiff::PushFront { value } => &value.id == id,
+            ListDiff::Append { values } | ListDiff::Reset { values } => {
+                values.iter().any(|v| &v.id == id)
+            }
+            ListDiff::Remove { .. }
+            | ListDiff::PopFront
+            | ListDiff::PopBack
+            | ListDiff::Truncate { .. }
+            | ListDiff::Clear => true,
+            ListDiff::Set { .. } => false,
+        };
+        // Removals carry no ID, so any removal in the window counts.
+        assert!(
+            !ids.iter().any(touches),
+            "an item was removed or re-inserted instead of updated; diffs: {}",
+            describe(&diffs)
+        );
+    }
     // Same item IDs, now messages with the original bodies.
     let mut by_id: HashMap<&str, &TimelineItem> = HashMap::new();
     for item in &items {

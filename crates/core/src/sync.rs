@@ -2,9 +2,12 @@
 
 use std::time::{Duration, Instant};
 
+use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures_util::{Stream, StreamExt as _};
+use matrix_sdk::Client;
 use matrix_sdk_ui::sync_service::{State, SyncService};
 use tokio::sync::{Mutex, OwnedMutexGuard, mpsc, watch};
 use tokio::task::JoinHandle;
@@ -71,19 +74,82 @@ pub(crate) fn backoff_delay(attempt: u32, jitter_unit: f64) -> Duration {
 /// `olm/signing/mod.rs:351`). `SyncService::stop` returns only when both sync
 /// tasks have ended (matrix-sdk-ui-0.19.1 `sync_service.rs:657-668`,
 /// `SyncTaskSupervisor::shutdown`), so no query is in flight afterwards.
-#[derive(Clone)]
-pub(crate) struct SyncPause {
-    service: Arc<SyncService>,
+pub(crate) struct SyncPause<P = SdkTarget> {
+    target: Arc<P>,
     /// Held while paused; the supervisor's `restart` waits for it, so a
     /// failure that happens meanwhile cannot bring the sync back early.
     gate: Arc<Mutex<()>>,
+    /// Set when the session ends: a pause that is dropped then must not start
+    /// the sync again.
+    ending: Arc<AtomicBool>,
 }
 
-impl SyncPause {
-    pub(crate) fn new(service: Arc<SyncService>) -> Self {
+impl<P> Clone for SyncPause<P> {
+    fn clone(&self) -> Self {
         Self {
-            service,
+            target: self.target.clone(),
+            gate: self.gate.clone(),
+            ending: self.ending.clone(),
+        }
+    }
+}
+
+/// What a pause acts on: the sync service and the send queue. A trait so that
+/// the pause can be tested without a network.
+pub(crate) trait PauseTarget: Send + Sync + 'static {
+    /// Whether `stop` would stop something (the service runs or is offline).
+    fn is_running(&self) -> bool;
+    /// Stops the service; returns when its tasks have ended.
+    fn stop(&self) -> impl Future<Output = ()> + Send;
+    /// Starts the service.
+    fn start(&self) -> impl Future<Output = ()> + Send;
+    /// Whether the send queue is enabled.
+    fn queue_enabled(&self) -> bool;
+    /// Enables or disables the send queue.
+    fn set_queue_enabled(&self, enabled: bool) -> impl Future<Output = ()> + Send;
+}
+
+/// The real sync service and the client's send queue.
+pub(crate) struct SdkTarget {
+    service: Arc<SyncService>,
+    client: Client,
+}
+
+impl SdkTarget {
+    pub(crate) fn new(service: Arc<SyncService>, client: Client) -> Self {
+        Self { service, client }
+    }
+}
+
+impl PauseTarget for SdkTarget {
+    fn is_running(&self) -> bool {
+        // The states `SyncService::stop` acts on (sync_service.rs:657-668).
+        matches!(self.service.state().get(), State::Running | State::Offline)
+    }
+
+    async fn stop(&self) {
+        self.service.stop().await;
+    }
+
+    async fn start(&self) {
+        self.service.start().await;
+    }
+
+    fn queue_enabled(&self) -> bool {
+        self.client.send_queue().is_enabled()
+    }
+
+    async fn set_queue_enabled(&self, enabled: bool) {
+        self.client.send_queue().set_enabled(enabled).await;
+    }
+}
+
+impl<P: PauseTarget> SyncPause<P> {
+    pub(crate) fn new(target: P) -> Self {
+        Self {
+            target: Arc::new(target),
             gate: Arc::new(Mutex::new(())),
+            ending: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -92,29 +158,117 @@ impl SyncPause {
         self.gate.clone()
     }
 
-    /// Stops the service and keeps it stopped until [`Paused::resume`]. If the
-    /// `Paused` is dropped instead (the session ends), nothing restarts it.
-    pub(crate) async fn pause(&self) -> Paused {
+    /// Marks the session as ending: from now on no pause starts the sync again.
+    pub(crate) fn begin_ending(&self) {
+        self.ending.store(true, Ordering::SeqCst);
+    }
+
+    /// Stops the service and the send queue (a message sent meanwhile would
+    /// make the SDK query keys outside the sync service, room/mod.rs:2557-2581)
+    /// and keeps them stopped until [`Paused::resume`] (or the drop of the
+    /// returned value, unless the session is ending).
+    ///
+    /// The stop runs in its own task: an abort of the caller (the identity
+    /// task) must not interrupt `SyncService::stop`, which can leave SDK tasks
+    /// running (see `Syncing::cancel`).
+    pub(crate) async fn pause(&self) -> Paused<P> {
         let guard = self.gate.clone().lock_owned().await;
-        self.service.stop().await;
+        let target = self.target.clone();
+        let stopped = tokio::spawn(async move {
+            let was_running = target.is_running();
+            let queue_was_enabled = target.queue_enabled();
+            target.set_queue_enabled(false).await;
+            target.stop().await;
+            (was_running, queue_was_enabled)
+        });
+        // A failed task (a panic in the target) leaves the state unknown:
+        // assume both were on, so that they are switched on again.
+        let (was_running, queue_was_enabled) = stopped.await.unwrap_or((true, true));
         Paused {
-            service: self.service.clone(),
-            _guard: guard,
+            held: Some(Held {
+                target: self.target.clone(),
+                guard,
+                was_running,
+                queue_was_enabled,
+                ending: self.ending.clone(),
+            }),
         }
     }
 }
 
-/// A stopped sync service, see [`SyncPause`].
-pub(crate) struct Paused {
-    service: Arc<SyncService>,
-    _guard: OwnedMutexGuard<()>,
+/// What a pause took and has to give back.
+struct Held<P> {
+    target: Arc<P>,
+    /// Keeps the gate closed until the service is back.
+    guard: OwnedMutexGuard<()>,
+    was_running: bool,
+    queue_was_enabled: bool,
+    ending: Arc<AtomicBool>,
 }
 
-impl Paused {
-    /// Starts the service again (the gate opens when this returns).
-    pub(crate) async fn resume(self) {
-        self.service.start().await;
+impl<P: PauseTarget> Held<P> {
+    /// Gives back what the pause took: starts the service only when it ran,
+    /// switches the queue on only when it was on, and opens the gate last.
+    /// Does nothing when the session is ending.
+    async fn restore(self) {
+        if !self.ending.load(Ordering::SeqCst) {
+            if self.was_running {
+                self.target.start().await;
+            }
+            if self.queue_was_enabled {
+                self.target.set_queue_enabled(true).await;
+            }
+        }
+        drop(self.guard);
     }
+}
+
+/// A stopped sync service, see [`SyncPause`]. Dropping it without `resume`
+/// (the work panicked or was cancelled) restarts the sync in a spawned task,
+/// unless the session is ending.
+pub(crate) struct Paused<P: PauseTarget = SdkTarget> {
+    held: Option<Held<P>>,
+}
+
+impl<P: PauseTarget> Paused<P> {
+    /// Starts the service again (the gate opens when this returns).
+    pub(crate) async fn resume(mut self) {
+        if let Some(held) = self.held.take() {
+            held.restore().await;
+        }
+    }
+}
+
+impl<P: PauseTarget> Drop for Paused<P> {
+    fn drop(&mut self) {
+        let Some(held) = self.held.take() else {
+            return;
+        };
+        if held.ending.load(Ordering::SeqCst) {
+            return;
+        }
+        // Dropping needs a runtime for the restart; without one (the runtime
+        // is shutting down) there is nothing left to keep alive.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(held.restore());
+        }
+    }
+}
+
+/// Runs `work` while `pause` (when there is one) holds the sync stopped.
+pub(crate) async fn run_paused<P: PauseTarget, T>(
+    pause: Option<&SyncPause<P>>,
+    work: impl Future<Output = T>,
+) -> T {
+    let paused = match pause {
+        Some(pause) => Some(pause.pause().await),
+        None => None,
+    };
+    let result = work.await;
+    if let Some(paused) = paused {
+        paused.resume().await;
+    }
+    result
 }
 
 /// What the supervisor needs from the sync service. A trait so that the loop
@@ -488,6 +642,7 @@ fn take_stable(running_since: &mut Option<Instant>, now: Instant) -> Option<bool
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
 
     use matrix_sdk_ui::sync_service::Error;
@@ -1011,5 +1166,183 @@ mod tests {
         assert_eq!(*fake.stops.lock().unwrap(), 1);
         // Cancelled: no restart after the stop.
         assert_eq!(*fake.restarts.lock().unwrap(), 0);
+    }
+
+    /// A sync service and send queue that only record what is done to them.
+    #[derive(Clone, Default)]
+    struct FakePause(Arc<FakePauseState>);
+
+    #[derive(Default)]
+    struct FakePauseState {
+        running: AtomicBool,
+        queue: AtomicBool,
+        stop_delay: Duration,
+        log: Mutex<Vec<&'static str>>,
+    }
+
+    impl FakePause {
+        fn new(running: bool, queue: bool) -> Self {
+            Self(Arc::new(FakePauseState {
+                running: AtomicBool::new(running),
+                queue: AtomicBool::new(queue),
+                ..FakePauseState::default()
+            }))
+        }
+
+        fn slow_stop(running: bool, delay: Duration) -> Self {
+            Self(Arc::new(FakePauseState {
+                running: AtomicBool::new(running),
+                queue: AtomicBool::new(true),
+                stop_delay: delay,
+                ..FakePauseState::default()
+            }))
+        }
+
+        fn note(&self, what: &'static str) {
+            self.0.log.lock().unwrap().push(what);
+        }
+
+        fn log(&self) -> Vec<&'static str> {
+            self.0.log.lock().unwrap().clone()
+        }
+
+        fn running(&self) -> bool {
+            self.0.running.load(Ordering::SeqCst)
+        }
+
+        fn queue(&self) -> bool {
+            self.0.queue.load(Ordering::SeqCst)
+        }
+    }
+
+    impl PauseTarget for FakePause {
+        fn is_running(&self) -> bool {
+            self.running()
+        }
+
+        async fn stop(&self) {
+            tokio::time::sleep(self.0.stop_delay).await;
+            self.0.running.store(false, Ordering::SeqCst);
+            self.note("stop");
+        }
+
+        async fn start(&self) {
+            self.0.running.store(true, Ordering::SeqCst);
+            self.note("start");
+        }
+
+        fn queue_enabled(&self) -> bool {
+            self.queue()
+        }
+
+        async fn set_queue_enabled(&self, enabled: bool) {
+            self.0.queue.store(enabled, Ordering::SeqCst);
+            self.note(if enabled { "queue on" } else { "queue off" });
+        }
+    }
+
+    /// Waits (bounded) until `cond` holds.
+    async fn eventually(cond: impl Fn() -> bool) -> bool {
+        for _ in 0..200 {
+            if cond() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        cond()
+    }
+
+    #[tokio::test]
+    async fn a_pause_stops_the_sync_and_the_queue_and_gives_both_back() {
+        let fake = FakePause::new(true, true);
+        let pause = SyncPause::new(fake.clone());
+        let seen = run_paused(Some(&pause), async { (fake.running(), fake.queue()) }).await;
+        assert_eq!(seen, (false, false));
+        assert!(fake.running() && fake.queue());
+    }
+
+    #[tokio::test]
+    async fn a_pause_does_not_start_a_service_that_was_not_running() {
+        let fake = FakePause::new(false, true);
+        let pause = SyncPause::new(fake.clone());
+        run_paused(Some(&pause), async {}).await;
+        assert!(!fake.running());
+        assert!(!fake.log().contains(&"start"));
+    }
+
+    #[tokio::test]
+    async fn a_pause_leaves_a_disabled_queue_disabled() {
+        let fake = FakePause::new(true, false);
+        let pause = SyncPause::new(fake.clone());
+        run_paused(Some(&pause), async {}).await;
+        assert!(fake.running());
+        assert!(!fake.queue());
+        assert!(!fake.log().contains(&"queue on"));
+    }
+
+    #[tokio::test]
+    async fn the_sync_restarts_when_the_work_panics() {
+        let fake = FakePause::new(true, true);
+        let pause = SyncPause::new(fake.clone());
+        let task = {
+            let pause = pause.clone();
+            tokio::spawn(async move {
+                run_paused(Some(&pause), async { panic!("work failed") }).await;
+            })
+        };
+        assert!(task.await.expect_err("the work panicked").is_panic());
+        assert!(eventually(|| fake.running() && fake.queue()).await);
+        // The gate is open again.
+        let gate = pause.gate();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), gate.lock())
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_sync_stays_stopped_when_the_session_is_ending() {
+        let fake = FakePause::new(true, true);
+        let pause = SyncPause::new(fake.clone());
+        let (inside_tx, inside_rx) = tokio::sync::oneshot::channel();
+        let task = {
+            let pause = pause.clone();
+            tokio::spawn(async move {
+                run_paused(Some(&pause), async {
+                    let _ = inside_tx.send(());
+                    std::future::pending::<()>().await;
+                })
+                .await;
+            })
+        };
+        inside_rx.await.expect("the work started");
+        // What `stop_tasks` does: flag first, then abort the identity task.
+        pause.begin_ending();
+        task.abort();
+        let _ = task.await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!fake.running());
+        assert!(!fake.log().contains(&"start"));
+        // The gate opened with the drop, so nothing waits on it.
+        assert!(pause.gate().try_lock_owned().is_ok());
+    }
+
+    #[tokio::test]
+    async fn aborting_the_caller_does_not_cut_the_stop_short() {
+        let fake = FakePause::slow_stop(true, Duration::from_millis(150));
+        let pause = SyncPause::new(fake.clone());
+        let task = {
+            let pause = pause.clone();
+            tokio::spawn(async move {
+                run_paused(Some(&pause), async {}).await;
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        task.abort();
+        let _ = task.await;
+        // The stop was in progress; it still ran to its end.
+        assert!(eventually(|| !fake.running()).await);
+        assert!(fake.log().contains(&"stop"));
     }
 }

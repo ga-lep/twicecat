@@ -44,7 +44,7 @@ use crate::security::SecurityTasks;
 use crate::session::{
     RECORD_VERSION, SessionAuth, SessionRecord, generate_session_id, generate_store_passphrase,
 };
-use crate::sync::{CancelTrigger, SyncControl, SyncPause, cancel_pair, run_supervised};
+use crate::sync::{CancelTrigger, SdkTarget, SyncControl, SyncPause, cancel_pair, run_supervised};
 use crate::timeline::{map_item, normalize_reaction_key, parse_room_id, rank_members};
 
 /// Events loaded by one back-pagination.
@@ -193,6 +193,10 @@ impl Active {
     /// service, so that nothing holds the client or its store afterwards (the
     /// tasks own clones of it).
     async fn stop_tasks(&mut self) {
+        // From here a dropped identity task must not start the sync again.
+        if let Some(sync) = &self.sync {
+            sync.pause.begin_ending();
+        }
         // The security tasks hold clones of the client too, and go first.
         self.security.stop().await;
         // Fetch tasks hold clones of the client, so they go next.
@@ -1711,7 +1715,7 @@ impl Engine {
             }
         };
         let (cancel, cancelled) = cancel_pair();
-        let pause = SyncPause::new(service.clone());
+        let pause = SyncPause::new(SdkTarget::new(service.clone(), active.client.clone()));
         let supervisor = tokio::spawn(forward_sync_state(
             service.clone(),
             active.client.clone(),

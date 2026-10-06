@@ -600,6 +600,53 @@ pub async fn try_pump_with(
     timeout: Duration,
     rooms: &mut Vec<RoomSummary>,
     items: &mut Vec<TimelineItem>,
+    other: impl FnMut(&CoreEvent),
+    done: impl Fn(&[RoomSummary], &[TimelineItem]) -> bool,
+) -> bool {
+    let mut unused = Vec::new();
+    try_pump_recording(core, room, timeout, rooms, items, &mut unused, other, done).await
+}
+
+/// Like [`pump_with`], and appends every timeline diff of `room` to `recorded`
+/// in arrival order, so a test can check which kinds of diff produced the end
+/// state (a `Set` is an in-place update, a `Remove` plus `Insert` is not).
+pub async fn pump_recording(
+    core: &mut CoreHandle,
+    room: &str,
+    timeout: Duration,
+    items: &mut Vec<TimelineItem>,
+    recorded: &mut Vec<ListDiff<TimelineItem>>,
+    other: impl FnMut(&CoreEvent),
+    done: impl Fn(&[TimelineItem]) -> bool,
+) {
+    // The room list is followed in a scratch list; `done` only sees the items.
+    let mut rooms = Vec::new();
+    assert!(
+        try_pump_recording(
+            core,
+            room,
+            timeout,
+            &mut rooms,
+            items,
+            recorded,
+            other,
+            |_, items| done(items)
+        )
+        .await,
+        "timed out waiting for the core"
+    );
+}
+
+// Eight parameters: the shared worker of the public pump helpers, each of
+// which fixes some of them; a parameter struct would only add noise.
+#[allow(clippy::too_many_arguments)]
+async fn try_pump_recording(
+    core: &mut CoreHandle,
+    room: &str,
+    timeout: Duration,
+    rooms: &mut Vec<RoomSummary>,
+    items: &mut Vec<TimelineItem>,
+    recorded: &mut Vec<ListDiff<TimelineItem>>,
     mut other: impl FnMut(&CoreEvent),
     done: impl Fn(&[RoomSummary], &[TimelineItem]) -> bool,
 ) -> bool {
@@ -614,6 +661,7 @@ pub async fn try_pump_with(
                 Some(CoreEvent::TimelineDiff { room_id, diffs }) if room_id.as_str() == room => {
                     for diff in diffs {
                         ListDiff::apply(&diff, items);
+                        recorded.push(diff);
                     }
                 }
                 Some(event) => other(&event),
