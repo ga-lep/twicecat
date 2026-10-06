@@ -46,6 +46,7 @@ use crate::session::{
 };
 use crate::sync::{CancelTrigger, SdkTarget, SyncControl, SyncPause, cancel_pair, run_supervised};
 use crate::timeline::{map_item, normalize_reaction_key, parse_room_id, rank_members};
+use crate::verification::Target;
 
 /// Events loaded by one back-pagination.
 const PAGINATION_BATCH: u16 = 20;
@@ -1066,20 +1067,61 @@ impl Engine {
                     .change_recovery_key(&active.client, &self.events),
                 None => self.not_logged_in(ActionKind::Recovery).await,
             },
+            Command::RequestSelfVerification => match self.active.as_mut() {
+                Some(active) => {
+                    active
+                        .security
+                        .verification
+                        .request(&active.client, &self.events, Target::Own)
+                }
+                None => self.not_logged_in(ActionKind::Verification).await,
+            },
+            Command::RequestDeviceVerification { device_id } => match self.active.as_mut() {
+                Some(active) => active.security.verification.request(
+                    &active.client,
+                    &self.events,
+                    Target::Device(device_id),
+                ),
+                None => self.not_logged_in(ActionKind::Verification).await,
+            },
+            Command::RequestUserVerification { user_id } => match self.active.as_mut() {
+                Some(active) => active.security.verification.request(
+                    &active.client,
+                    &self.events,
+                    Target::User(user_id),
+                ),
+                None => self.not_logged_in(ActionKind::Verification).await,
+            },
+            Command::AcceptVerification { id } => match self.active.as_mut() {
+                Some(active) => active.security.verification.accept(&self.events, &id),
+                None => self.not_logged_in(ActionKind::Verification).await,
+            },
+            Command::ConfirmSas { id } => match self.active.as_mut() {
+                Some(active) => active.security.verification.confirm_sas(&self.events, &id),
+                None => self.not_logged_in(ActionKind::Verification).await,
+            },
+            Command::SasMismatch { id } => match self.active.as_mut() {
+                Some(active) => active.security.verification.mismatch(&self.events, &id),
+                None => self.not_logged_in(ActionKind::Verification).await,
+            },
+            Command::CancelVerification { id } => match self.active.as_mut() {
+                Some(active) => active.security.verification.cancel(&self.events, &id),
+                None => self.not_logged_in(ActionKind::Verification).await,
+            },
+            Command::WatchUserTrust { user_id } => match self.active.as_mut() {
+                Some(active) => {
+                    active
+                        .security
+                        .watch_user_trust(&active.client, &user_id, &self.events);
+                }
+                None => self.not_logged_in(ActionKind::Devices).await,
+            },
             // The real handlers land in later Phase 4 tasks.
-            cmd @ (Command::RequestSelfVerification
-            | Command::RequestDeviceVerification { .. }
-            | Command::RequestUserVerification { .. }
-            | Command::AcceptVerification { .. }
-            | Command::StartSas { .. }
+            cmd @ (Command::StartSas { .. }
             | Command::ConfirmQrScanned { .. }
-            | Command::ConfirmSas { .. }
-            | Command::SasMismatch { .. }
-            | Command::CancelVerification { .. }
             | Command::ListDevices
             | Command::RenameDevice { .. }
-            | Command::SignOutDevices { .. }
-            | Command::WatchUserTrust { .. }) => self.security_stub(&cmd).await,
+            | Command::SignOutDevices { .. }) => self.security_stub(&cmd).await,
             // Handled in `run`.
             Command::Shutdown => {}
         }
@@ -2297,8 +2339,9 @@ mod tests {
             avatars: Avatars::new(),
             security: SecurityTasks::new(),
         });
-        // The identity and recovery commands have real handlers; see the
-        // next tests.
+        // The identity, recovery and verification commands have real
+        // handlers; see the next tests. QR confirmation, `StartSas` and the
+        // device commands are still stubs.
         let stubbed = security_commands().into_iter().filter(|(cmd, _)| {
             !matches!(
                 cmd,
@@ -2308,6 +2351,14 @@ mod tests {
                     | Command::BootstrapCrossSigning { .. }
                     | Command::ResetIdentity { .. }
                     | Command::CancelIdentityReset
+                    | Command::RequestSelfVerification
+                    | Command::RequestDeviceVerification { .. }
+                    | Command::RequestUserVerification { .. }
+                    | Command::AcceptVerification { .. }
+                    | Command::ConfirmSas { .. }
+                    | Command::SasMismatch { .. }
+                    | Command::CancelVerification { .. }
+                    | Command::WatchUserTrust { .. }
             )
         });
         for (cmd, kind) in stubbed {
@@ -2419,6 +2470,99 @@ mod tests {
         }
         if let Some(mut active) = engine.active.take() {
             active.stop_tasks().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn verification_commands_with_a_session_run_in_the_background() {
+        use crate::api::VerificationId;
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut engine, mut rx) = oauth_engine(tmp.path());
+        // No server and no logged-in user: a request fails on its own and
+        // frees the slot, and an unknown flow is named as such.
+        let client = Client::builder()
+            .homeserver_url("http://127.0.0.1:1")
+            .build()
+            .await
+            .unwrap();
+        let events = engine.events.clone();
+        let mut security = SecurityTasks::new();
+        security.start(&client, &events);
+        engine.active = Some(Active {
+            fetcher: Arc::new(SdkFetcher(client.clone())),
+            client,
+            record: record("@alice:x", "http://127.0.0.1:1", "s1"),
+            changes: broadcast::channel(1).1,
+            sync: None,
+            selected: None,
+            avatars: Avatars::new(),
+            security,
+        });
+        // Twice: the failed first request must not leave a reservation behind
+        // (that would answer `Busy`).
+        for _ in 0..2 {
+            engine.handle(Command::RequestSelfVerification).await;
+            let event = next_event(&mut rx).await;
+            assert!(
+                matches!(
+                    &event,
+                    CoreEvent::ActionFailed {
+                        action: ActionKind::Verification,
+                        error: CoreError::NotLoggedIn,
+                        ..
+                    }
+                ),
+                "{event:?}"
+            );
+        }
+        for cmd in [
+            Command::AcceptVerification {
+                id: VerificationId::from("none"),
+            },
+            Command::ConfirmSas {
+                id: VerificationId::from("none"),
+            },
+            Command::SasMismatch {
+                id: VerificationId::from("none"),
+            },
+            Command::CancelVerification {
+                id: VerificationId::from("none"),
+            },
+        ] {
+            engine.handle(cmd).await;
+            let event = next_event(&mut rx).await;
+            assert!(
+                matches!(
+                    &event,
+                    CoreEvent::ActionFailed {
+                        action: ActionKind::Verification,
+                        error: CoreError::Internal(m),
+                        ..
+                    } if m == "there is no such verification"
+                ),
+                "{event:?}"
+            );
+        }
+        let rest = drain(&mut rx).await;
+        assert!(
+            rest.iter().all(|e| matches!(e, CoreEvent::Security(_))),
+            "{rest:?}"
+        );
+        if let Some(mut active) = engine.active.take() {
+            active.stop_tasks().await;
+        }
+    }
+
+    /// The next event that is not the status forwarder's.
+    async fn next_event(rx: &mut mpsc::Receiver<CoreEvent>) -> CoreEvent {
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                .await
+                .expect("an answer within 10 s")
+                .expect("channel open");
+            if !matches!(event, CoreEvent::Security(_)) {
+                return event;
+            }
         }
     }
 

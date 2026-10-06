@@ -14,21 +14,22 @@ use matrix_sdk::encryption::recovery::{
 };
 use matrix_sdk::encryption::secret_storage::SecretStorageError;
 use matrix_sdk::encryption::{CrossSigningResetAuthType, CrossSigningStatus, VerificationState};
-use matrix_sdk::ruma::UserId;
 use matrix_sdk::ruma::api::client::keys::get_keys;
 use matrix_sdk::ruma::api::client::uiaa::{
     AuthData, AuthType, MatrixUserIdentifier, Password as UiaaPassword, UiaaInfo, UserIdentifier,
 };
+use matrix_sdk::ruma::{OwnedUserId, UserId};
 use matrix_sdk::{AuthApi, Client};
 use tokio::sync::{Mutex, Notify, mpsc};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::api::{
     ActionKind, CoreError, CoreEvent, CrossSigning, DeviceVerification, Password, ReauthAction,
-    RecoveryKey, RecoveryProgress, RecoveryStatus, RoomId, SecurityStatus,
+    RecoveryKey, RecoveryProgress, RecoveryStatus, RoomId, SecurityStatus, UserTrust,
 };
 use crate::oauth::check_auth_url;
 use crate::sync::{PauseTarget, SyncPause, run_paused};
+use crate::verification::VerificationTasks;
 
 /// What the status is computed from.
 #[derive(Clone, Debug)]
@@ -446,6 +447,10 @@ impl IdentityOp {
 /// actions (each runs in `tasks`, so `handle` never waits on the network).
 pub(crate) struct SecurityTasks {
     forwarder: Option<JoinHandle<()>>,
+    /// The watcher of `WatchUserTrust` (one user at a time).
+    trust_watch: Option<JoinHandle<()>>,
+    /// Verification requests and flows (see `verification.rs`).
+    pub(crate) verification: VerificationTasks,
     tasks: JoinSet<()>,
     refresh: Arc<Notify>,
     identity: Arc<IdentityOp>,
@@ -455,6 +460,8 @@ impl SecurityTasks {
     pub(crate) fn new() -> Self {
         Self {
             forwarder: None,
+            trust_watch: None,
+            verification: VerificationTasks::new(),
             tasks: JoinSet::new(),
             refresh: Arc::new(Notify::new()),
             identity: Arc::new(IdentityOp::default()),
@@ -472,6 +479,7 @@ impl SecurityTasks {
             self.refresh.clone(),
             self.identity.clone(),
         )));
+        self.verification.start(client, events);
     }
 
     /// Ends the forwarder and every action, so that nothing holds the client
@@ -482,6 +490,12 @@ impl SecurityTasks {
             // An aborted task ends with a cancellation error; that is expected.
             let _ = forwarder.await;
         }
+        if let Some(watch) = self.trust_watch.take() {
+            watch.abort();
+            // An aborted task ends with a cancellation error; that is expected.
+            let _ = watch.await;
+        }
+        self.verification.stop().await;
         self.tasks.shutdown().await;
     }
 
@@ -634,6 +648,36 @@ impl SecurityTasks {
             finish(&client, &refresh).await;
             result
         });
+    }
+
+    /// `WatchUserTrust`: reports the trust in `user` now and on every change;
+    /// replaces the user watched before.
+    pub(crate) fn watch_user_trust(
+        &mut self,
+        client: &Client,
+        user: &crate::api::UserId,
+        events: &mpsc::Sender<CoreEvent>,
+    ) {
+        if let Some(old) = self.trust_watch.take() {
+            old.abort();
+        }
+        let Ok(user) = OwnedUserId::try_from(user.as_str()) else {
+            let events = events.clone();
+            self.tasks.spawn(async move {
+                let failed = CoreEvent::ActionFailed {
+                    room_id: RoomId::from(""),
+                    action: ActionKind::Devices,
+                    error: CoreError::Internal("that is not a valid user ID".into()),
+                };
+                let _ = events.send(failed).await;
+            });
+            return;
+        };
+        self.trust_watch = Some(tokio::spawn(watch_user_trust(
+            client.clone(),
+            user,
+            events.clone(),
+        )));
     }
 
     /// `CancelIdentityReset`: stops a reset that waits for an approval.
@@ -1033,6 +1077,77 @@ async fn reset_task(
     }
 }
 
+/// What the crypto store knows about another user's identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct IdentityFacts {
+    /// Verified by the logged-in user.
+    pub verified: bool,
+    /// The identity changed since it was verified.
+    pub violation: bool,
+}
+
+/// The API trust for `identity` (`None`: the user has no identity).
+pub(crate) fn map_user_trust(identity: Option<IdentityFacts>) -> UserTrust {
+    match identity {
+        None => UserTrust::NoIdentity,
+        Some(facts) if facts.violation => UserTrust::IdentityChanged,
+        Some(facts) if facts.verified => UserTrust::Verified,
+        Some(_) => UserTrust::Unverified,
+    }
+}
+
+/// The trust in `user` as the local store has it; `None` when the store
+/// cannot be read.
+async fn read_user_trust(client: &Client, user: &UserId) -> Option<UserTrust> {
+    let identity = client
+        .encryption()
+        .get_user_identity(user)
+        .await
+        .ok()?
+        .map(|identity| IdentityFacts {
+            verified: identity.is_verified(),
+            violation: identity.has_verification_violation(),
+        });
+    Some(map_user_trust(identity))
+}
+
+/// Sends `UserTrust` for `user` now and whenever it changes.
+async fn watch_user_trust(client: Client, user: OwnedUserId, events: mpsc::Sender<CoreEvent>) {
+    let mut updates = match client.encryption().user_identities_stream().await {
+        Ok(stream) => stream.boxed(),
+        Err(_) => {
+            let failed = CoreEvent::ActionFailed {
+                // These actions belong to no room.
+                room_id: RoomId::from(""),
+                action: ActionKind::Devices,
+                error: CoreError::Internal("the user's trust could not be watched".into()),
+            };
+            let _ = events.send(failed).await;
+            return;
+        }
+    };
+    // Ask the server once: the stored identity can predate a reset.
+    let _ = client.encryption().request_user_identity(&user).await;
+    let mut last: Option<UserTrust> = None;
+    loop {
+        if let Some(trust) = read_user_trust(&client, &user).await
+            && last != Some(trust)
+        {
+            last = Some(trust);
+            let event = CoreEvent::UserTrust {
+                user_id: crate::api::UserId::from(user.as_str()),
+                trust,
+            };
+            if events.send(event).await.is_err() {
+                return;
+            }
+        }
+        if updates.next().await.is_none() {
+            return;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use matrix_sdk::encryption::OAuthCrossSigningResetInfo;
@@ -1041,6 +1156,27 @@ mod tests {
 
     use super::*;
     use crate::api::{CrossSigning, DeviceVerification, RecoveryStatus};
+
+    #[test]
+    fn user_trust_follows_the_identity_facts() {
+        let facts = |verified, violation| {
+            Some(IdentityFacts {
+                verified,
+                violation,
+            })
+        };
+        let cases = [
+            (None, UserTrust::NoIdentity),
+            (facts(true, false), UserTrust::Verified),
+            (facts(false, false), UserTrust::Unverified),
+            (facts(false, true), UserTrust::IdentityChanged),
+            // A violation wins over a stale verified flag.
+            (facts(true, true), UserTrust::IdentityChanged),
+        ];
+        for (identity, want) in cases {
+            assert_eq!(map_user_trust(identity), want, "{identity:?}");
+        }
+    }
 
     fn keys(master: bool, self_signing: bool, user_signing: bool) -> Option<CrossSigningStatus> {
         Some(CrossSigningStatus {

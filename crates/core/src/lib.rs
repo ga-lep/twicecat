@@ -20,5 +20,6 @@ mod security;
 mod session;
 mod sync;
 mod timeline;
+mod verification;
 
 pub use engine::{Core, CoreConfig, CoreHandle, DEFAULT_ROOM_LIST_PAGE_SIZE};
