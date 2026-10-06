@@ -2,9 +2,11 @@
 //! Systems) and prints the frame times.
 //!
 //! `cargo run --release -p tessera-audio --features onnxruntime --example
-//! dfn_profile -- <cpu|gpu|trt|webgpu> [frames]`; the models from
-//! `scripts/fetch-models.sh` and, for `gpu`, `scripts/export-deepfilternet.sh`,
-//! `scripts/fetch-onnxruntime.sh cuda13` (and NVIDIA's libraries).
+//! dfn_profile -- <cpu|gpu|trt|webgpu|directml> [frames]`; the models from
+//! `scripts/fetch-models.sh` and, for the GPU modes, `scripts/export-deepfilternet.sh`,
+//! `scripts/fetch-onnxruntime.sh cuda13` (and NVIDIA's libraries), or for
+//! `directml` `scripts/build-onnxruntime-directml.sh` (Windows; with
+//! `TESSERA_ONNXRUNTIME_DIR` when a CUDA build is also fetched).
 
 use std::time::{Duration, Instant};
 
@@ -36,7 +38,7 @@ fn load(mode: &str) -> DeepFilter {
     match mode {
         "cpu" => DeepFilter::load(&dir, 100.0).expect("run scripts/fetch-models.sh"),
         #[cfg(feature = "onnxruntime")]
-        "gpu" | "trt" | "webgpu" => {
+        "gpu" | "trt" | "webgpu" | "directml" => {
             use tessera_audio::onnx::{Accelerator, OnnxRuntime, default_runtime_dir};
             let runtime = OnnxRuntime::load(&default_runtime_dir().expect("ONNX Runtime"))
                 .expect("load ONNX Runtime");
@@ -44,6 +46,7 @@ fn load(mode: &str) -> DeepFilter {
             let prefer = match mode {
                 "trt" => Accelerator::TensorRt,
                 "webgpu" => Accelerator::WebGpu,
+                "directml" => Accelerator::DirectMl,
                 _ => Accelerator::Cuda,
             };
             let (filter, accelerator) =
@@ -51,12 +54,16 @@ fn load(mode: &str) -> DeepFilter {
             eprintln!("running on {accelerator:?}");
             filter
         }
-        other => panic!("unknown mode {other} (cpu; gpu, trt, webgpu with --features onnxruntime)"),
+        other => panic!(
+            "unknown mode {other} (cpu; gpu, trt, webgpu, directml with --features onnxruntime)"
+        ),
     }
 }
 
 /// CPU time of every thread of this process so far (Linux: the kernel's
-/// per-thread run time, nanoseconds), `None` elsewhere.
+/// per-thread run time; Windows: the process's kernel and user time;
+/// nanoseconds), `None` elsewhere.
+#[cfg(not(windows))]
 fn process_cpu_ns() -> Option<u64> {
     let tasks = std::fs::read_dir("/proc/self/task").ok()?;
     let mut total = 0;
@@ -65,6 +72,28 @@ fn process_cpu_ns() -> Option<u64> {
         total += stat.split_whitespace().next()?.parse::<u64>().ok()?;
     }
     Some(total)
+}
+
+#[cfg(windows)]
+fn process_cpu_ns() -> Option<u64> {
+    use windows::Win32::Foundation::FILETIME;
+    use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+    let (mut created, mut exited, mut kernel, mut user) = Default::default();
+    // SAFETY: the pseudo handle of the current process needs no closing;
+    // the four pointers are to locals that outlive the call.
+    unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &mut created,
+            &mut exited,
+            &mut kernel,
+            &mut user,
+        )
+    }
+    .ok()?;
+    let ticks = |t: FILETIME| (u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime);
+    // In 100 ns ticks.
+    Some((ticks(kernel) + ticks(user)) * 100)
 }
 
 fn main() {

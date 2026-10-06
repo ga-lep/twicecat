@@ -7,3 +7,4 @@ c436bd9f47dbce6f6311ccc21de97f829b3c862c09d24aa321958cb72f0a1d32  onnxruntime-os
 a7216e498c14fb4783a42667ffddcf1590ae262429307ed0dc5889d9c365584e  onnxruntime-win-x64-gpu_cuda13-1.28.3.zip
 65d7f956649df80a8ccdcafa7843e4b02f38bfc9e6de28711ed8384508040330  onnxruntime-win-x64-gpu_cuda12-1.28.3.zip
 76d5e5a23fb7fdbc2ca0c3214bad1b58b2a41016c7052e74e60ed8004bea71b1  onnxruntime-win-arm64-1.28.3.zip
+4e7cb7ddce8cf837a7a75dc029209b520ca0101470fcdf275c1f49736a3615b9  microsoft.ai.directml.1.15.4.nupkg
