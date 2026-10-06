@@ -19,7 +19,8 @@ use futures_util::StreamExt as _;
 use futures_util::stream::BoxStream;
 use matrix_sdk::Client;
 use matrix_sdk::encryption::verification::{
-    CancelInfo, SasState, SasVerification, VerificationRequest, VerificationRequestState,
+    CancelInfo, QrVerification, QrVerificationState, SasState, SasVerification,
+    VerificationRequest, VerificationRequestState,
 };
 use matrix_sdk::event_handler::EventHandlerDropGuard;
 use matrix_sdk::ruma::events::ToDeviceEvent;
@@ -31,7 +32,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
 use crate::api::{
-    ActionKind, CancelReason, CoreError, CoreEvent, DeviceId, RoomId, SasEmoji, UserId,
+    ActionKind, CancelReason, CoreError, CoreEvent, DeviceId, QrImage, RoomId, SasEmoji, UserId,
     VerificationId, VerificationPeer, VerificationPhase,
 };
 
@@ -45,6 +46,7 @@ const CONFIRM_FAILED: &str = "the verification could not be confirmed";
 const NOT_COMPARING: &str = "there is nothing to compare yet";
 const MISMATCH_FAILED: &str = "the mismatch could not be reported";
 const CANCEL_FAILED: &str = "the verification could not be cancelled";
+const QR_FAILED: &str = "the QR code could not be shown";
 
 /// The reason a flow ended, from the cancel code and who cancelled.
 pub(crate) fn map_cancel_code(code: &CancelCode, by_us: bool) -> CancelReason {
@@ -104,6 +106,43 @@ pub(crate) fn map_sas_state(state: &SasState) -> Option<VerificationPhase> {
         SasState::Done { .. } => Some(VerificationPhase::Done),
         SasState::Cancelled(info) => Some(cancelled_phase(info)),
     }
+}
+
+/// The phase a QR state stands for; `None` for `Started`, which `ShowQr`
+/// stands for already.
+pub(crate) fn map_qr_state(state: &QrVerificationState) -> Option<VerificationPhase> {
+    match state {
+        QrVerificationState::Started => None,
+        QrVerificationState::Scanned => Some(VerificationPhase::QrScanned),
+        QrVerificationState::Confirmed => Some(VerificationPhase::Confirmed),
+        QrVerificationState::Reciprocated => Some(VerificationPhase::Waiting),
+        QrVerificationState::Done { .. } => Some(VerificationPhase::Done),
+        QrVerificationState::Cancelled(info) => Some(cancelled_phase(info)),
+    }
+}
+
+/// The module grid of a QR code: `size` modules per side, row by row, `true`
+/// for dark. `None` when `modules` is not `size * size` long, or `size` does
+/// not fit the API type.
+pub(crate) fn qr_image(size: usize, modules: &[bool]) -> Option<QrImage> {
+    if size == 0 || size.checked_mul(size)? != modules.len() {
+        return None;
+    }
+    Some(QrImage {
+        size: u16::try_from(size).ok()?,
+        dark: modules.to_vec(),
+    })
+}
+
+/// The image of the code `qr` shows.
+fn qr_image_of(qr: &QrVerification) -> Option<QrImage> {
+    let code = qr.to_qr_code().ok()?;
+    let modules: Vec<bool> = code
+        .to_colors()
+        .into_iter()
+        .map(|c| c.select(true, false))
+        .collect();
+    qr_image(code.width(), &modules)
 }
 
 /// Which flow the core has open (at most one).
@@ -191,6 +230,10 @@ struct Shared {
     tasks: Mutex<Option<JoinSet<()>>>,
 }
 
+fn internal(text: &str) -> CoreError {
+    CoreError::Internal(text.to_owned())
+}
+
 fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     // The guarded data stays consistent when a holder panics.
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -251,15 +294,26 @@ fn sas_of(request: &VerificationRequest) -> Option<SasVerification> {
     }
 }
 
-/// One flow's driver: follows the request, then the SAS flow.
+/// The QR flow a request has moved into.
+fn qr_of(request: &VerificationRequest) -> Option<QrVerification> {
+    match request.state() {
+        VerificationRequestState::Transitioned { verification } => verification.qr(),
+        _ => None,
+    }
+}
+
+/// One flow's driver: follows the request, then the QR or SAS flow.
 struct Flow {
     shared: Arc<Shared>,
     request: VerificationRequest,
     id: VerificationId,
     last: Option<VerificationPhase>,
     sas: Option<SasVerification>,
+    qr: Option<QrVerification>,
     sas_changes: Option<BoxStream<'static, SasState>>,
     sas_started: bool,
+    qr_tried: bool,
+    qr_changes: Option<BoxStream<'static, QrVerificationState>>,
 }
 
 impl Flow {
@@ -299,30 +353,85 @@ impl Flow {
             return true;
         }
         match state {
-            // Tessera starts the SAS flow of a request it made.
-            VerificationRequestState::Ready { .. }
-                if self.request.we_started() && !self.sas_started =>
-            {
-                self.sas_started = true;
-                if self.request.start_sas().await.is_err() {
-                    self.shared
-                        .fail(CoreError::Internal(START_FAILED.into()))
-                        .await;
+            // The request is ready: show a QR code when the other side can
+            // scan one, else Tessera starts SAS for a request it made.
+            VerificationRequestState::Ready { .. } if !self.qr_tried => {
+                self.qr_tried = true;
+                match self.request.generate_qr_code().await {
+                    Ok(Some(qr)) => self.follow_qr(qr).await,
+                    Ok(None) => {
+                        self.start_own_sas().await;
+                        false
+                    }
+                    Err(_) => {
+                        self.shared
+                            .fail(CoreError::Internal(QR_FAILED.into()))
+                            .await;
+                        self.start_own_sas().await;
+                        false
+                    }
+                }
+            }
+            VerificationRequestState::Transitioned { verification } => {
+                if self.sas.is_none()
+                    && let Some(sas) = verification.clone().sas()
+                {
+                    // SAS took over (we or the peer started it): the QR
+                    // flow ends with it.
+                    self.qr = None;
+                    self.qr_changes = None;
+                    // Subscribe before reading, so no change is missed.
+                    self.sas_changes = Some(sas.changes().boxed());
+                    let current = sas.state();
+                    self.sas = Some(sas);
+                    return self.on_sas(current).await;
+                }
+                if self.qr.is_none()
+                    && self.sas.is_none()
+                    && let Some(qr) = verification.qr()
+                {
+                    return self.follow_qr(qr).await;
                 }
                 false
             }
-            VerificationRequestState::Transitioned { verification } if self.sas.is_none() => {
-                let Some(sas) = verification.sas() else {
-                    return false;
-                };
-                // Subscribe before reading, so no change is missed.
-                self.sas_changes = Some(sas.changes().boxed());
-                let current = sas.state();
-                self.sas = Some(sas);
-                self.on_sas(current).await
-            }
             _ => false,
         }
+    }
+
+    /// Tessera starts the SAS flow of a request it made.
+    async fn start_own_sas(&mut self) {
+        if self.request.we_started() && !self.sas_started {
+            self.sas_started = true;
+            if self.request.start_sas().await.is_err() {
+                self.shared
+                    .fail(CoreError::Internal(START_FAILED.into()))
+                    .await;
+            }
+        }
+    }
+
+    /// Shows the code of `qr` and follows it. A code that cannot be drawn
+    /// falls back to SAS.
+    async fn follow_qr(&mut self, qr: QrVerification) -> bool {
+        let Some(image) = qr_image_of(&qr) else {
+            self.shared
+                .fail(CoreError::Internal(QR_FAILED.into()))
+                .await;
+            self.start_own_sas().await;
+            return false;
+        };
+        // Subscribe before reading, so no change is missed.
+        self.qr_changes = Some(qr.changes().boxed());
+        let current = qr.state();
+        self.qr = Some(qr);
+        if self.emit(Some(VerificationPhase::ShowQr(image))).await {
+            return true;
+        }
+        self.on_qr(current).await
+    }
+
+    async fn on_qr(&mut self, state: QrVerificationState) -> bool {
+        self.emit(map_qr_state(&state)).await
     }
 
     async fn on_sas(&mut self, state: SasState) -> bool {
@@ -354,6 +463,7 @@ impl Flow {
             over = tokio::select! {
                 Some(state) = changes.next() => self.on_request(state).await,
                 Some(state) = next_sas(&mut self.sas_changes) => self.on_sas(state).await,
+                Some(state) = next_qr(&mut self.qr_changes) => self.on_qr(state).await,
                 else => true,
             };
         }
@@ -364,6 +474,15 @@ impl Flow {
 }
 
 async fn next_sas(changes: &mut Option<BoxStream<'static, SasState>>) -> Option<SasState> {
+    match changes {
+        Some(changes) => changes.next().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn next_qr(
+    changes: &mut Option<BoxStream<'static, QrVerificationState>>,
+) -> Option<QrVerificationState> {
     match changes {
         Some(changes) => changes.next().await,
         None => std::future::pending().await,
@@ -443,8 +562,11 @@ fn new_flow(shared: Arc<Shared>, request: VerificationRequest, id: VerificationI
         id,
         last: None,
         sas: None,
+        qr: None,
         sas_changes: None,
         sas_started: false,
+        qr_tried: false,
+        qr_changes: None,
     }
 }
 
@@ -632,7 +754,7 @@ impl VerificationTasks {
     fn act<F, Fut>(&mut self, events: &mpsc::Sender<CoreEvent>, id: &VerificationId, work: F)
     where
         F: FnOnce(VerificationRequest) -> Fut,
-        Fut: Future<Output = Result<(), &'static str>> + Send + 'static,
+        Fut: Future<Output = Result<(), CoreError>> + Send + 'static,
     {
         let Some(shared) = self.shared_or_fail(events) else {
             return;
@@ -643,10 +765,10 @@ impl VerificationTasks {
         shared.spawn(async move {
             let error = match work {
                 Some(work) => work.await.err(),
-                None => Some(NO_FLOW),
+                None => Some(internal(NO_FLOW)),
             };
-            if let Some(text) = error {
-                task_shared.fail(CoreError::Internal(text.into())).await;
+            if let Some(error) = error {
+                task_shared.fail(error).await;
             }
         });
     }
@@ -654,33 +776,64 @@ impl VerificationTasks {
     /// `AcceptVerification`: accepts an incoming request.
     pub(crate) fn accept(&mut self, events: &mpsc::Sender<CoreEvent>, id: &VerificationId) {
         self.act(events, id, |request| async move {
-            request.accept().await.map_err(|_| ACCEPT_FAILED)
+            request.accept().await.map_err(|_| internal(ACCEPT_FAILED))
+        });
+    }
+
+    /// `StartSas`: "compare emoji instead" while a QR code shows.
+    pub(crate) fn start_sas(&mut self, events: &mpsc::Sender<CoreEvent>, id: &VerificationId) {
+        self.act(events, id, |request| async move {
+            if qr_of(&request).is_none() {
+                return Err(CoreError::NotAllowed);
+            }
+            match request.start_sas().await {
+                Ok(Some(_)) => Ok(()),
+                Ok(None) | Err(_) => Err(internal(START_FAILED)),
+            }
+        });
+    }
+
+    /// `ConfirmQrScanned`: the other device shows success after scanning.
+    pub(crate) fn confirm_qr_scanned(
+        &mut self,
+        events: &mpsc::Sender<CoreEvent>,
+        id: &VerificationId,
+    ) {
+        self.act(events, id, |request| async move {
+            let qr = qr_of(&request).ok_or(CoreError::NotAllowed)?;
+            if !matches!(qr.state(), QrVerificationState::Scanned) {
+                return Err(CoreError::NotAllowed);
+            }
+            qr.confirm().await.map_err(|_| internal(CONFIRM_FAILED))
         });
     }
 
     /// `ConfirmSas`: the emoji or numbers match.
     pub(crate) fn confirm_sas(&mut self, events: &mpsc::Sender<CoreEvent>, id: &VerificationId) {
         self.act(events, id, |request| async move {
-            let sas = sas_of(&request).ok_or(NOT_COMPARING)?;
-            sas.confirm().await.map_err(|_| CONFIRM_FAILED)
+            let sas = sas_of(&request).ok_or_else(|| internal(NOT_COMPARING))?;
+            sas.confirm().await.map_err(|_| internal(CONFIRM_FAILED))
         });
     }
 
     /// `SasMismatch`: the emoji or numbers differ.
     pub(crate) fn mismatch(&mut self, events: &mpsc::Sender<CoreEvent>, id: &VerificationId) {
         self.act(events, id, |request| async move {
-            let sas = sas_of(&request).ok_or(NOT_COMPARING)?;
-            sas.mismatch().await.map_err(|_| MISMATCH_FAILED)
+            let sas = sas_of(&request).ok_or_else(|| internal(NOT_COMPARING))?;
+            sas.mismatch().await.map_err(|_| internal(MISMATCH_FAILED))
         });
     }
 
     /// `CancelVerification`: cancels the flow, or declines the request.
     pub(crate) fn cancel(&mut self, events: &mpsc::Sender<CoreEvent>, id: &VerificationId) {
         self.act(events, id, |request| async move {
-            match sas_of(&request) {
-                Some(sas) => sas.cancel().await.map_err(|_| CANCEL_FAILED),
-                None => request.cancel().await.map_err(|_| CANCEL_FAILED),
+            if let Some(sas) = sas_of(&request) {
+                return sas.cancel().await.map_err(|_| internal(CANCEL_FAILED));
             }
+            if let Some(qr) = qr_of(&request) {
+                return qr.cancel().await.map_err(|_| internal(CANCEL_FAILED));
+            }
+            request.cancel().await.map_err(|_| internal(CANCEL_FAILED))
         });
     }
 }
@@ -794,6 +947,87 @@ mod tests {
             }),
             Some(VerificationPhase::Done)
         );
+    }
+
+    #[test]
+    fn qr_states_map_to_phases() {
+        assert_eq!(map_qr_state(&QrVerificationState::Started), None);
+        assert_eq!(
+            map_qr_state(&QrVerificationState::Scanned),
+            Some(VerificationPhase::QrScanned)
+        );
+        assert_eq!(
+            map_qr_state(&QrVerificationState::Confirmed),
+            Some(VerificationPhase::Confirmed)
+        );
+        assert_eq!(
+            map_qr_state(&QrVerificationState::Reciprocated),
+            Some(VerificationPhase::Waiting)
+        );
+        assert_eq!(
+            map_qr_state(&QrVerificationState::Done {
+                verified_devices: Vec::new(),
+                verified_identities: Vec::new(),
+            }),
+            Some(VerificationPhase::Done)
+        );
+    }
+
+    #[test]
+    fn a_qr_image_needs_a_square_of_modules() {
+        let ok = qr_image(2, &[true, false, false, true]).expect("2 x 2");
+        assert_eq!(ok.size, 2);
+        assert_eq!(ok.dark, vec![true, false, false, true]);
+        assert_eq!(qr_image(2, &[true; 3]), None);
+        assert_eq!(qr_image(2, &[true; 5]), None);
+        assert_eq!(qr_image(0, &[]), None);
+        assert_eq!(qr_image(70_000, &[]), None);
+    }
+
+    /// Spec-conformant bytes of a self-verification code (mode 2, no master
+    /// key): the header, version, mode, flow ID, two keys and a secret.
+    fn spec_qr_bytes() -> Vec<u8> {
+        let flow_id = b"FLOW_ID";
+        let mut bytes = b"MATRIX".to_vec();
+        bytes.extend([0x02, 0x02]);
+        bytes.extend(u16::try_from(flow_id.len()).unwrap().to_be_bytes());
+        bytes.extend(flow_id);
+        bytes.extend([0x11; 32]);
+        bytes.extend([0x22; 32]);
+        bytes.extend(b"SHARED_SECRET");
+        bytes
+    }
+
+    #[test]
+    fn spec_bytes_make_a_45_module_image_with_three_finder_patterns() {
+        use matrix_sdk::encryption::verification::QrVerificationData;
+        let data = QrVerificationData::from_bytes(spec_qr_bytes()).expect("spec bytes parse");
+        let code = data.to_qr_code().expect("the data fits a QR code");
+        let modules: Vec<bool> = code
+            .to_colors()
+            .into_iter()
+            .map(|c| c.select(true, false))
+            .collect();
+        let image = qr_image(code.width(), &modules).expect("a square grid");
+        assert_eq!(image.size, 45);
+        let at = |row: usize, col: usize| image.dark[row * 45 + col];
+        // A finder pattern: dark 7 x 7 border, light ring, dark 3 x 3 core.
+        let finder = |top: usize, left: usize| {
+            for r in 0..7 {
+                for c in 0..7 {
+                    let edge = r == 0 || r == 6 || c == 0 || c == 6;
+                    let core = (2..=4).contains(&r) && (2..=4).contains(&c);
+                    assert_eq!(
+                        at(top + r, left + c),
+                        edge || core,
+                        "({top},{left}) {r},{c}"
+                    );
+                }
+            }
+        };
+        finder(0, 0);
+        finder(0, 38);
+        finder(38, 0);
     }
 
     #[test]

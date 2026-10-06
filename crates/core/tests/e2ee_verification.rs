@@ -25,6 +25,10 @@ use tessera_core::api::{
 };
 use tessera_core::secrets::InMemorySecretStore;
 
+/// Set by the tests that talk to a peer that can scan, so `phase` lets
+/// `ShowQr` through. Tests run one at a time under `e2ee_serial`.
+static QR_EXPECTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Waits for the first `Verification` event of flow `id` whose phase `want`
 /// accepts, ignoring everything else, and returns that phase.
 async fn phase(
@@ -32,10 +36,19 @@ async fn phase(
     id: &VerificationId,
     want: impl Fn(&VerificationPhase) -> bool,
 ) -> VerificationPhase {
-    let event = expect_event(
-        core,
-        |e| matches!(e, CoreEvent::Verification { id: i, phase } if i == id && want(phase)),
-    )
+    let event = expect_event(core, |e| {
+        // Two Tessera cores never offer a QR code to each other (neither
+        // advertises scanning); tests that expect one use `qr_phase`.
+        if let CoreEvent::Verification {
+            phase: VerificationPhase::ShowQr(_),
+            ..
+        } = e
+            && !QR_EXPECTED.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            panic!("a QR code was shown between two Tessera cores");
+        }
+        matches!(e, CoreEvent::Verification { id: i, phase } if i == id && want(phase))
+    })
     .await;
     match event {
         CoreEvent::Verification { phase, .. } => phase,
@@ -294,6 +307,16 @@ async fn self_verification_verifies_the_device_and_decrypts_history() {
             &mut rooms,
             &mut items,
             |e| {
+                assert!(
+                    !matches!(
+                        e,
+                        CoreEvent::Verification {
+                            phase: VerificationPhase::ShowQr(_),
+                            ..
+                        }
+                    ),
+                    "a QR code was shown between two Tessera cores"
+                );
                 if let CoreEvent::Verification {
                     id: i,
                     phase: VerificationPhase::Emojis(x),
@@ -642,4 +665,265 @@ async fn phase_cancelled(core: &mut CoreHandle, id: &VerificationId) {
         matches!(p, VerificationPhase::Cancelled { .. })
     })
     .await;
+}
+
+// ---- QR code display (plan Q3) ----
+
+/// A second login of alice that can scan QR codes, syncing in the background.
+struct ScanningPeer {
+    client: matrix_sdk::Client,
+    sync: tokio::task::JoinHandle<()>,
+}
+
+impl ScanningPeer {
+    async fn login() -> Self {
+        let client = raw_login_named(1, "tessera-test-qr").await;
+        // The first sync uploads the device keys.
+        client
+            .sync_once(matrix_sdk::config::SyncSettings::default())
+            .await
+            .expect("first sync of the scanning peer");
+        let background = client.clone();
+        let sync = tokio::spawn(async move {
+            // `Client::sync` does not pass the compiler's `Send` check here
+            // (E0275), so the loop is written out.
+            let settings =
+                matrix_sdk::config::SyncSettings::default().timeout(Duration::from_secs(5));
+            loop {
+                let _ = background.sync_once(settings.clone()).await;
+            }
+        });
+        Self { client, sync }
+    }
+
+    /// Asks the core's device for verification, advertising that it can scan.
+    async fn request_verification(
+        &self,
+    ) -> matrix_sdk::encryption::verification::VerificationRequest {
+        use matrix_sdk::ruma::events::key::verification::VerificationMethod;
+        let me = self.client.user_id().expect("logged in").to_owned();
+        let own = self.client.device_id().expect("logged in").to_owned();
+        let found = async {
+            loop {
+                // Ask the server, so the core's device is known.
+                let _ = self.client.encryption().request_user_identity(&me).await;
+                if let Ok(devices) = self.client.encryption().get_user_devices(&me).await
+                    && let Some(device) = devices.devices().find(|d| d.device_id() != own)
+                {
+                    return device;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        };
+        let device = tokio::time::timeout(DEFAULT_TIMEOUT, found)
+            .await
+            .expect("the core's device never showed up");
+        device
+            .request_verification_with_methods(vec![
+                VerificationMethod::SasV1,
+                VerificationMethod::QrCodeScanV1,
+                VerificationMethod::ReciprocateV1,
+            ])
+            .await
+            .expect("request verification")
+    }
+
+    async fn logout(self) {
+        self.sync.abort();
+        let _ = self.sync.await;
+        self.client.logout().await.expect("log the peer out");
+    }
+}
+
+/// Waits for the first state of `request` that `want` accepts.
+async fn raw_state(
+    request: &matrix_sdk::encryption::verification::VerificationRequest,
+    want: impl Fn(&matrix_sdk::encryption::verification::VerificationRequestState) -> bool,
+) -> matrix_sdk::encryption::verification::VerificationRequestState {
+    use futures_util::StreamExt as _;
+    // Subscribe before reading, so no change is missed.
+    let mut changes = request.changes().boxed();
+    let current = request.state();
+    if want(&current) {
+        return current;
+    }
+    tokio::time::timeout(DEFAULT_TIMEOUT, async {
+        while let Some(state) = changes.next().await {
+            if want(&state) {
+                return state;
+            }
+        }
+        panic!("the request's changes ended");
+    })
+    .await
+    .expect("the request never reached the expected state")
+}
+
+/// Alice's only device (a core, an identity, a verified device) and a peer
+/// that can scan, which has asked the core to verify. The core has accepted
+/// and shows a QR code.
+async fn core_showing_qr() -> (
+    CoreHandle,
+    tempfile::TempDir,
+    ScanningPeer,
+    matrix_sdk::encryption::verification::VerificationRequest,
+    VerificationId,
+    tessera_core::api::QrImage,
+) {
+    reset_e2ee_account(1).await;
+    let env = TestEnv::load();
+    let dir = tempfile::tempdir().unwrap();
+    let mut core = start_core(dir.path(), Arc::new(InMemorySecretStore::new()));
+    login_and_run(&mut core, &env, 1).await;
+    reset_identity_on(&mut core, 1).await;
+    let peer = ScanningPeer::login().await;
+    know_user(&mut core, &UserId::from(env.user_id(1).as_str())).await;
+    let request = peer.request_verification().await;
+    let (id, who) = requested(&mut core).await;
+    assert!(who.own_account, "{who:?}");
+    send(&mut core, Command::AcceptVerification { id: id.clone() }).await;
+    QR_EXPECTED.store(true, std::sync::atomic::Ordering::SeqCst);
+    let shown = phase(&mut core, &id, |p| {
+        matches!(p, VerificationPhase::ShowQr(_))
+    })
+    .await;
+    let VerificationPhase::ShowQr(image) = shown else {
+        unreachable!("the predicate only accepts ShowQr");
+    };
+    (core, dir, peer, request, id, image)
+}
+
+#[tokio::test]
+#[ignore = "needs local homeserver: docker compose up -d --wait"]
+async fn a_qr_code_is_shown_to_a_peer_that_can_scan() {
+    use matrix_sdk::encryption::verification::VerificationRequestState as Raw;
+    use matrix_sdk::ruma::events::key::verification::VerificationMethod;
+    let _serial = e2ee_serial().await;
+    let (core, _dir, peer, request, _id, image) = core_showing_qr().await;
+    QR_EXPECTED.store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(image.size, 45);
+    assert_eq!(image.dark.len(), 45 * 45);
+    assert!(image.dark.iter().any(|d| *d) && image.dark.iter().any(|d| !*d));
+    match raw_state(&request, |s| matches!(s, Raw::Ready { .. })).await {
+        Raw::Ready { their_methods, .. } => {
+            assert!(their_methods.contains(&VerificationMethod::QrCodeShowV1));
+            assert!(!their_methods.contains(&VerificationMethod::QrCodeScanV1));
+        }
+        _ => unreachable!("the predicate only accepts Ready"),
+    }
+    peer.logout().await;
+    logout(core).await;
+}
+
+#[tokio::test]
+#[ignore = "needs local homeserver: docker compose up -d --wait"]
+async fn compare_emoji_instead_of_the_qr_code_verifies_the_peer() {
+    use futures_util::StreamExt as _;
+    use matrix_sdk::encryption::verification::VerificationRequestState as Raw;
+    let _serial = e2ee_serial().await;
+    let (mut core, _dir, peer, request, id, _image) = core_showing_qr().await;
+    send(&mut core, Command::StartSas { id: id.clone() }).await;
+    QR_EXPECTED.store(false, std::sync::atomic::Ordering::SeqCst);
+
+    // The peer gets the SAS flow and accepts it.
+    let state = raw_state(
+        &request,
+        |s| matches!(s, Raw::Transitioned { verification } if verification.clone().sas().is_some()),
+    )
+    .await;
+    let Raw::Transitioned { verification } = state else {
+        unreachable!("the predicate only accepts Transitioned");
+    };
+    let sas = verification.sas().expect("a SAS flow");
+    let mut changes = sas.changes().boxed();
+    sas.accept().await.expect("the peer accepts the SAS flow");
+    let peer_emoji = tokio::time::timeout(DEFAULT_TIMEOUT, async {
+        loop {
+            if let Some(emoji) = sas.emoji() {
+                return emoji.map(|e| e.symbol);
+            }
+            assert!(changes.next().await.is_some(), "the SAS changes ended");
+        }
+    })
+    .await
+    .expect("the peer never got the emoji");
+    let core_emoji = emojis(&mut core, &id).await;
+    assert_eq!(core_emoji.len(), 7);
+    assert!(
+        core_emoji
+            .iter()
+            .map(|e| e.symbol.as_str())
+            .eq(peer_emoji.iter().copied()),
+        "the two sides show different emoji"
+    );
+
+    sas.confirm().await.expect("the peer confirms");
+    send(&mut core, Command::ConfirmSas { id: id.clone() }).await;
+    phase(&mut core, &id, |p| matches!(p, VerificationPhase::Done)).await;
+
+    // The core signed the peer's device (the peer sees it after its next
+    // keys query).
+    let me = peer.client.user_id().expect("logged in").to_owned();
+    let verified = async {
+        loop {
+            let _ = peer.client.encryption().request_user_identity(&me).await;
+            if let Ok(Some(device)) = peer.client.encryption().get_own_device().await
+                && device.is_verified()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(60), verified)
+        .await
+        .expect("the peer's device never became verified");
+    peer.logout().await;
+    logout(core).await;
+}
+
+#[tokio::test]
+#[ignore = "needs local homeserver: docker compose up -d --wait"]
+async fn cancelling_while_the_qr_code_shows_cancels_the_peer_request() {
+    use matrix_sdk::encryption::verification::VerificationRequestState as Raw;
+    use matrix_sdk::ruma::events::key::verification::cancel::CancelCode;
+    let _serial = e2ee_serial().await;
+    let (mut core, _dir, peer, request, id, _image) = core_showing_qr().await;
+    QR_EXPECTED.store(false, std::sync::atomic::Ordering::SeqCst);
+    send(&mut core, Command::CancelVerification { id: id.clone() }).await;
+    let ended = phase(&mut core, &id, |p| {
+        matches!(p, VerificationPhase::Cancelled { .. })
+    })
+    .await;
+    assert_eq!(
+        ended,
+        VerificationPhase::Cancelled {
+            reason: CancelReason::ByUs
+        }
+    );
+    match raw_state(&request, |s| matches!(s, Raw::Cancelled(_))).await {
+        Raw::Cancelled(info) => assert_eq!(*info.cancel_code(), CancelCode::User),
+        _ => unreachable!("the predicate only accepts Cancelled"),
+    }
+    peer.logout().await;
+    logout(core).await;
+}
+
+#[tokio::test]
+#[ignore = "needs local homeserver: docker compose up -d --wait"]
+async fn qr_confirmation_and_sas_need_the_right_phase() {
+    let _serial = e2ee_serial().await;
+    let (mut core, _dir, peer, _request, id, _image) = core_showing_qr().await;
+    QR_EXPECTED.store(false, std::sync::atomic::Ordering::SeqCst);
+    // Nobody scanned the code, so there is nothing to confirm.
+    send(&mut core, Command::ConfirmQrScanned { id: id.clone() }).await;
+    match expect_event(&mut core, |e| matches!(e, CoreEvent::ActionFailed { .. })).await {
+        CoreEvent::ActionFailed { action, error, .. } => {
+            assert_eq!(action, ActionKind::Verification);
+            assert_eq!(error, CoreError::NotAllowed);
+        }
+        _ => unreachable!(),
+    }
+    peer.logout().await;
+    logout(core).await;
 }

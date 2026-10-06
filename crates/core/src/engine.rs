@@ -1096,6 +1096,17 @@ impl Engine {
                 Some(active) => active.security.verification.accept(&self.events, &id),
                 None => self.not_logged_in(ActionKind::Verification).await,
             },
+            Command::StartSas { id } => match self.active.as_mut() {
+                Some(active) => active.security.verification.start_sas(&self.events, &id),
+                None => self.not_logged_in(ActionKind::Verification).await,
+            },
+            Command::ConfirmQrScanned { id } => match self.active.as_mut() {
+                Some(active) => active
+                    .security
+                    .verification
+                    .confirm_qr_scanned(&self.events, &id),
+                None => self.not_logged_in(ActionKind::Verification).await,
+            },
             Command::ConfirmSas { id } => match self.active.as_mut() {
                 Some(active) => active.security.verification.confirm_sas(&self.events, &id),
                 None => self.not_logged_in(ActionKind::Verification).await,
@@ -1117,9 +1128,7 @@ impl Engine {
                 None => self.not_logged_in(ActionKind::Devices).await,
             },
             // The real handlers land in later Phase 4 tasks.
-            cmd @ (Command::StartSas { .. }
-            | Command::ConfirmQrScanned { .. }
-            | Command::ListDevices
+            cmd @ (Command::ListDevices
             | Command::RenameDevice { .. }
             | Command::SignOutDevices { .. }) => self.security_stub(&cmd).await,
             // Handled in `run`.
@@ -2340,7 +2349,7 @@ mod tests {
             security: SecurityTasks::new(),
         });
         // The identity, recovery and verification commands have real
-        // handlers; see the next tests. QR confirmation, `StartSas` and the
+        // handlers; see the next tests. Only the
         // device commands are still stubs.
         let stubbed = security_commands().into_iter().filter(|(cmd, _)| {
             !matches!(
@@ -2355,6 +2364,8 @@ mod tests {
                     | Command::RequestDeviceVerification { .. }
                     | Command::RequestUserVerification { .. }
                     | Command::AcceptVerification { .. }
+                    | Command::StartSas { .. }
+                    | Command::ConfirmQrScanned { .. }
                     | Command::ConfirmSas { .. }
                     | Command::SasMismatch { .. }
                     | Command::CancelVerification { .. }
