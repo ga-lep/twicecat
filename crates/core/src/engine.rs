@@ -40,7 +40,7 @@ use crate::outgoing::outgoing_content;
 use crate::paths::DataPaths;
 use crate::room_list::{Registered, build_filter, loaded_event, map_batch, map_diff};
 use crate::secrets::{SecretError, SecretStore};
-use crate::security::SecurityTasks;
+use crate::security::{self, SecurityTasks};
 use crate::session::{
     RECORD_VERSION, SessionAuth, SessionRecord, generate_session_id, generate_store_passphrase,
 };
@@ -803,32 +803,6 @@ async fn forward_typing(room_id: RoomId, timeline: Arc<Timeline>, events: mpsc::
     }
 }
 
-/// The action kind of a Phase 4 (encryption) command, `None` for any other.
-fn security_action(cmd: &Command) -> Option<ActionKind> {
-    match cmd {
-        Command::EnableRecovery | Command::Recover { .. } | Command::ChangeRecoveryKey => {
-            Some(ActionKind::Recovery)
-        }
-        Command::BootstrapCrossSigning { .. }
-        | Command::ResetIdentity { .. }
-        | Command::CancelIdentityReset => Some(ActionKind::CrossSigning),
-        Command::RequestSelfVerification
-        | Command::RequestDeviceVerification { .. }
-        | Command::RequestUserVerification { .. }
-        | Command::AcceptVerification { .. }
-        | Command::StartSas { .. }
-        | Command::ConfirmQrScanned { .. }
-        | Command::ConfirmSas { .. }
-        | Command::SasMismatch { .. }
-        | Command::CancelVerification { .. } => Some(ActionKind::Verification),
-        Command::ListDevices
-        | Command::RenameDevice { .. }
-        | Command::SignOutDevices { .. }
-        | Command::WatchUserTrust { .. } => Some(ActionKind::Devices),
-        _ => None,
-    }
-}
-
 impl Engine {
     async fn run(mut self, mut commands: mpsc::Receiver<Command>) {
         let mut watch_changes = true;
@@ -1127,33 +1101,33 @@ impl Engine {
                 }
                 None => self.not_logged_in(ActionKind::Devices).await,
             },
-            // The real handlers land in later Phase 4 tasks.
-            cmd @ (Command::ListDevices
-            | Command::RenameDevice { .. }
-            | Command::SignOutDevices { .. }) => self.security_stub(&cmd).await,
+            Command::ListDevices => match self.active.as_mut() {
+                Some(active) => active.security.list_devices(&active.client, &self.events),
+                None => self.not_logged_in(ActionKind::Devices).await,
+            },
+            Command::RenameDevice { device_id, name } => match self.active.as_mut() {
+                Some(active) => {
+                    active
+                        .security
+                        .rename_device(&active.client, &device_id, &name, &self.events);
+                }
+                None => self.not_logged_in(ActionKind::Devices).await,
+            },
+            Command::SignOutDevices {
+                device_ids,
+                password,
+            } => match self.active.as_mut() {
+                Some(active) => active.security.sign_out_devices(
+                    &active.client,
+                    &device_ids,
+                    password,
+                    &self.events,
+                ),
+                None => self.not_logged_in(ActionKind::Devices).await,
+            },
             // Handled in `run`.
             Command::Shutdown => {}
         }
-    }
-
-    /// Answers a Phase 4 command until its handler exists: `NotLoggedIn`
-    /// without a session, else "not implemented yet". These actions belong to
-    /// no room, so `room_id` is empty.
-    async fn security_stub(&self, cmd: &Command) {
-        let Some(action) = security_action(cmd) else {
-            return;
-        };
-        let error = if self.active.is_some() {
-            CoreError::Internal("not implemented yet".into())
-        } else {
-            CoreError::NotLoggedIn
-        };
-        self.emit(CoreEvent::ActionFailed {
-            room_id: RoomId::from(""),
-            action,
-            error,
-        })
-        .await;
     }
 
     /// Answers a Phase 4 action sent without a session. These actions belong
@@ -1399,6 +1373,14 @@ impl Engine {
             members_synced: Arc::new(OnceCell::new()),
             paginating: Arc::new(AtomicBool::new(false)),
         });
+        // A DM with exactly one other user shows that user's trust (Q10).
+        if let Some(peer) = security::dm_peer_of(&room, active.client.user_id()) {
+            active.security.watch_user_trust(
+                &active.client,
+                &crate::api::UserId::from(peer.as_str()),
+                &self.events,
+            );
+        }
         Ok(())
     }
 
@@ -2315,7 +2297,6 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (mut engine, mut rx) = oauth_engine(tmp.path());
         for (cmd, kind) in security_commands() {
-            assert_eq!(security_action(&cmd), Some(kind));
             engine.handle(cmd).await;
             let got = drain(&mut rx).await;
             assert!(
@@ -2330,7 +2311,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn security_commands_with_a_session_are_not_implemented_yet() {
+    async fn renaming_a_device_to_nothing_is_refused_before_any_request() {
         let tmp = tempfile::tempdir().unwrap();
         let (mut engine, mut rx) = oauth_engine(tmp.path());
         let client = Client::builder()
@@ -2348,41 +2329,26 @@ mod tests {
             avatars: Avatars::new(),
             security: SecurityTasks::new(),
         });
-        // The identity, recovery and verification commands have real
-        // handlers; see the next tests. Only the
-        // device commands are still stubs.
-        let stubbed = security_commands().into_iter().filter(|(cmd, _)| {
-            !matches!(
-                cmd,
-                Command::EnableRecovery
-                    | Command::Recover { .. }
-                    | Command::ChangeRecoveryKey
-                    | Command::BootstrapCrossSigning { .. }
-                    | Command::ResetIdentity { .. }
-                    | Command::CancelIdentityReset
-                    | Command::RequestSelfVerification
-                    | Command::RequestDeviceVerification { .. }
-                    | Command::RequestUserVerification { .. }
-                    | Command::AcceptVerification { .. }
-                    | Command::StartSas { .. }
-                    | Command::ConfirmQrScanned { .. }
-                    | Command::ConfirmSas { .. }
-                    | Command::SasMismatch { .. }
-                    | Command::CancelVerification { .. }
-                    | Command::WatchUserTrust { .. }
-            )
-        });
-        for (cmd, kind) in stubbed {
-            engine.handle(cmd).await;
-            let got = drain(&mut rx).await;
-            assert!(
-                matches!(
-                    got.as_slice(),
-                    [CoreEvent::ActionFailed { action, error: CoreError::Internal(m), .. }]
-                        if *action == kind && m == "not implemented yet"
-                ),
-                "{kind:?}: {got:?}"
-            );
+        engine
+            .handle(Command::RenameDevice {
+                device_id: DeviceId::from("DEV"),
+                name: "   ".into(),
+            })
+            .await;
+        let got = next_event(&mut rx).await;
+        assert!(
+            matches!(
+                &got,
+                CoreEvent::ActionFailed {
+                    action: ActionKind::Devices,
+                    error: CoreError::NotAllowed,
+                    ..
+                }
+            ),
+            "{got:?}"
+        );
+        if let Some(mut active) = engine.active.take() {
+            active.stop_tasks().await;
         }
     }
 
@@ -2575,12 +2541,6 @@ mod tests {
                 return event;
             }
         }
-    }
-
-    #[test]
-    fn room_commands_are_not_security_actions() {
-        assert_eq!(security_action(&Command::Logout), None);
-        assert_eq!(security_action(&Command::LoadMoreRooms), None);
     }
 
     #[tokio::test]

@@ -4,6 +4,7 @@
 //!
 //! Nothing here logs or prints a password, a UIA session or an approval URL.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -14,18 +15,22 @@ use matrix_sdk::encryption::recovery::{
 };
 use matrix_sdk::encryption::secret_storage::SecretStorageError;
 use matrix_sdk::encryption::{CrossSigningResetAuthType, CrossSigningStatus, VerificationState};
+use matrix_sdk::ruma::api::client::discovery::get_authorization_server_metadata::v1::{
+    AccountManagementActionData, AuthorizationServerMetadata, DeviceDeleteData,
+};
 use matrix_sdk::ruma::api::client::keys::get_keys;
 use matrix_sdk::ruma::api::client::uiaa::{
     AuthData, AuthType, MatrixUserIdentifier, Password as UiaaPassword, UiaaInfo, UserIdentifier,
 };
-use matrix_sdk::ruma::{OwnedUserId, UserId};
+use matrix_sdk::ruma::{DeviceId as SdkDeviceId, OwnedDeviceId, OwnedUserId, UserId};
 use matrix_sdk::{AuthApi, Client};
 use tokio::sync::{Mutex, Notify, mpsc};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::api::{
-    ActionKind, CoreError, CoreEvent, CrossSigning, DeviceVerification, Password, ReauthAction,
-    RecoveryKey, RecoveryProgress, RecoveryStatus, RoomId, SecurityStatus, UserTrust,
+    ActionKind, CoreError, CoreEvent, CrossSigning, DeviceId, DeviceSummary, DeviceTrust,
+    DeviceVerification, Password, ReauthAction, RecoveryKey, RecoveryProgress, RecoveryStatus,
+    RoomId, SecurityStatus, UserTrust,
 };
 use crate::oauth::check_auth_url;
 use crate::sync::{PauseTarget, SyncPause, run_paused};
@@ -449,6 +454,9 @@ pub(crate) struct SecurityTasks {
     forwarder: Option<JoinHandle<()>>,
     /// The watcher of `WatchUserTrust` (one user at a time).
     trust_watch: Option<JoinHandle<()>>,
+    /// Re-sends the device list on crypto-store device updates; started by the
+    /// first `ListDevices` of the session.
+    devices_watch: Option<JoinHandle<()>>,
     /// Verification requests and flows (see `verification.rs`).
     pub(crate) verification: VerificationTasks,
     tasks: JoinSet<()>,
@@ -461,6 +469,7 @@ impl SecurityTasks {
         Self {
             forwarder: None,
             trust_watch: None,
+            devices_watch: None,
             verification: VerificationTasks::new(),
             tasks: JoinSet::new(),
             refresh: Arc::new(Notify::new()),
@@ -491,6 +500,11 @@ impl SecurityTasks {
             let _ = forwarder.await;
         }
         if let Some(watch) = self.trust_watch.take() {
+            watch.abort();
+            // An aborted task ends with a cancellation error; that is expected.
+            let _ = watch.await;
+        }
+        if let Some(watch) = self.devices_watch.take() {
             watch.abort();
             // An aborted task ends with a cancellation error; that is expected.
             let _ = watch.await;
@@ -652,6 +666,13 @@ impl SecurityTasks {
 
     /// `WatchUserTrust`: reports the trust in `user` now and on every change;
     /// replaces the user watched before.
+    ///
+    /// The old watcher is aborted, not awaited, so one `UserTrust` it had
+    /// already queued can still arrive after the new watcher's first one. That
+    /// is harmless: every `UserTrust` names its user, and a consumer matches
+    /// on `user_id` (the app ignores the trust of a user it does not show).
+    /// An aborted watcher sends nothing after its next await point, so no
+    /// stale value for the old user is produced later than that.
     pub(crate) fn watch_user_trust(
         &mut self,
         client: &Client,
@@ -662,15 +683,10 @@ impl SecurityTasks {
             old.abort();
         }
         let Ok(user) = OwnedUserId::try_from(user.as_str()) else {
-            let events = events.clone();
-            self.tasks.spawn(async move {
-                let failed = CoreEvent::ActionFailed {
-                    room_id: RoomId::from(""),
-                    action: ActionKind::Devices,
-                    error: CoreError::Internal("that is not a valid user ID".into()),
-                };
-                let _ = events.send(failed).await;
-            });
+            self.spawn_failed(
+                events,
+                CoreError::Internal("that is not a valid user ID".into()),
+            );
             return;
         };
         self.trust_watch = Some(tokio::spawn(watch_user_trust(
@@ -678,6 +694,95 @@ impl SecurityTasks {
             user,
             events.clone(),
         )));
+    }
+
+    /// Sends `ActionFailed` for a devices action from a task (the handlers do
+    /// not wait on the channel).
+    fn spawn_failed(&mut self, events: &mpsc::Sender<CoreEvent>, error: CoreError) {
+        let events = events.clone();
+        self.tasks.spawn(async move {
+            report(&events, ActionKind::Devices, Stop::Failed(error)).await;
+        });
+    }
+
+    /// `ListDevices`: answers with `Devices`, and from the first call on
+    /// re-sends the list whenever the crypto store's devices change.
+    pub(crate) fn list_devices(&mut self, client: &Client, events: &mpsc::Sender<CoreEvent>) {
+        while self.tasks.try_join_next().is_some() {}
+        if self
+            .devices_watch
+            .as_ref()
+            .is_some_and(|w| !w.is_finished())
+        {
+            // Already watching: answer this request on its own.
+            let (client, events) = (client.clone(), events.clone());
+            self.tasks
+                .spawn(async move { send_devices(&client, &events).await });
+        } else {
+            self.devices_watch = Some(tokio::spawn(watch_devices(client.clone(), events.clone())));
+        }
+    }
+
+    /// `RenameDevice`.
+    pub(crate) fn rename_device(
+        &mut self,
+        client: &Client,
+        device_id: &DeviceId,
+        name: &str,
+        events: &mpsc::Sender<CoreEvent>,
+    ) {
+        let name = match clean_device_name(name) {
+            Ok(name) => name,
+            Err(error) => return self.spawn_failed(events, error),
+        };
+        let device = OwnedDeviceId::from(device_id.as_str());
+        let (client, events) = (client.clone(), events.clone());
+        self.tasks.spawn(async move {
+            match client.rename_device(&device, &name).await {
+                Ok(_) => send_devices(&client, &events).await,
+                Err(_) => {
+                    let error = CoreError::Internal("the device could not be renamed".into());
+                    report(&events, ActionKind::Devices, Stop::Failed(error)).await;
+                }
+            }
+        });
+    }
+
+    /// `SignOutDevices`: Q12 and Q13. The password is used for the one retry
+    /// and dropped (zeroized) with the task.
+    pub(crate) fn sign_out_devices(
+        &mut self,
+        client: &Client,
+        device_ids: &[DeviceId],
+        password: Option<Password>,
+        events: &mpsc::Sender<CoreEvent>,
+    ) {
+        let (Some(me), Some(current)) = (client.user_id(), client.device_id()) else {
+            return self.spawn_failed(events, CoreError::NotLoggedIn);
+        };
+        if let Err(error) = sign_out_precheck(device_ids, current.as_str()) {
+            return self.spawn_failed(events, error);
+        }
+        let devices: Vec<OwnedDeviceId> = device_ids
+            .iter()
+            .map(|id| OwnedDeviceId::from(id.as_str()))
+            .collect();
+        let (client, events, me) = (client.clone(), events.clone(), me.to_owned());
+        let oauth = matches!(client.auth_api(), Some(AuthApi::OAuth(_)));
+        self.tasks.spawn(async move {
+            if oauth {
+                open_account_page(&client, &devices, &events).await;
+                return;
+            }
+            let api = ClientDelete {
+                client: &client,
+                devices: &devices,
+            };
+            match delete_flow(&api, &me, password.as_ref()).await {
+                Ok(()) => send_devices(&client, &events).await,
+                Err(stop) => report(&events, ActionKind::Devices, stop).await,
+            }
+        });
     }
 
     /// `CancelIdentityReset`: stops a reset that waits for an approval.
@@ -1143,6 +1248,290 @@ async fn watch_user_trust(client: Client, user: OwnedUserId, events: mpsc::Sende
             }
         }
         if updates.next().await.is_none() {
+            return;
+        }
+    }
+}
+
+/// What the server lists about one device.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ServerDevice {
+    pub device_id: String,
+    pub display_name: Option<String>,
+    pub last_seen_ms: Option<u64>,
+}
+
+/// Joins the server's device list with the crypto store's trust (Q12): the
+/// current device first, then the rest by last activity, newest first (never
+/// seen last, equal times by device ID). A device the store has no keys for is
+/// `NoKeys`; an empty name is no name. The last-seen IP is not read at all.
+pub(crate) fn merge_devices(
+    server: Vec<ServerDevice>,
+    crypto_trust: &HashMap<String, DeviceTrust>,
+    current: &str,
+) -> Vec<DeviceSummary> {
+    let mut devices: Vec<DeviceSummary> = server
+        .into_iter()
+        .map(|device| DeviceSummary {
+            trust: crypto_trust
+                .get(&device.device_id)
+                .copied()
+                .unwrap_or(DeviceTrust::NoKeys),
+            current: device.device_id == current,
+            display_name: device.display_name.filter(|name| !name.trim().is_empty()),
+            last_seen_ms: device.last_seen_ms,
+            device_id: DeviceId::from(device.device_id),
+        })
+        .collect();
+    devices.sort_by(|a, b| {
+        (!a.current, std::cmp::Reverse(a.last_seen_ms), &a.device_id).cmp(&(
+            !b.current,
+            std::cmp::Reverse(b.last_seen_ms),
+            &b.device_id,
+        ))
+    });
+    devices
+}
+
+/// The longest device name `RenameDevice` sends, in characters.
+const MAX_DEVICE_NAME_CHARS: usize = 64;
+
+/// The name to send for `RenameDevice`: trimmed and capped; an empty one is
+/// refused.
+pub(crate) fn clean_device_name(name: &str) -> Result<String, CoreError> {
+    let capped: String = name.trim().chars().take(MAX_DEVICE_NAME_CHARS).collect();
+    let capped = capped.trim_end();
+    if capped.is_empty() {
+        return Err(CoreError::NotAllowed);
+    }
+    Ok(capped.to_owned())
+}
+
+/// `SignOutDevices` never signs out the device the core runs on (that is
+/// Logout), and needs at least one device.
+pub(crate) fn sign_out_precheck(device_ids: &[DeviceId], current: &str) -> Result<(), CoreError> {
+    if device_ids.is_empty() || device_ids.iter().any(|id| id.as_str() == current) {
+        return Err(CoreError::NotAllowed);
+    }
+    Ok(())
+}
+
+/// The account-management page for signing out `device` (OAuth sessions);
+/// with no device (several selected) the page that lists the devices. `None`
+/// when the server advertises no account page.
+pub(crate) fn account_management_target(
+    metadata: &AuthorizationServerMetadata,
+    device: Option<&SdkDeviceId>,
+) -> Option<url::Url> {
+    let action = match device {
+        Some(device) => AccountManagementActionData::DeviceDelete(DeviceDeleteData::new(device)),
+        None => AccountManagementActionData::DevicesList,
+    };
+    metadata.account_management_url_with_action(action)
+}
+
+/// The other user of a DM: the one target that is not `own`. A DM with no or
+/// several other users has none (Q10: no badge).
+pub(crate) fn dm_peer<'a>(targets: &[&'a UserId], own: Option<&UserId>) -> Option<&'a UserId> {
+    let mut others = targets.iter().copied().filter(|user| Some(*user) != own);
+    let peer = others.next()?;
+    others.next().is_none().then_some(peer)
+}
+
+/// The peer of `room` when it is a DM with exactly one other user.
+pub(crate) fn dm_peer_of(room: &matrix_sdk::Room, own: Option<&UserId>) -> Option<OwnedUserId> {
+    // A target that is not a user ID (a third-party invite) means no badge.
+    let targets: Vec<OwnedUserId> = room
+        .direct_targets()
+        .iter()
+        .map(|target| target.as_user_id().map(ToOwned::to_owned))
+        .collect::<Option<_>>()?;
+    let refs: Vec<&UserId> = targets.iter().map(|user| &**user).collect();
+    dm_peer(&refs, own).map(ToOwned::to_owned)
+}
+
+const SIGN_OUT_FAILED: &str = "the devices could not be signed out";
+const MANAGE_ON_ACCOUNT_PAGE: &str = "manage your devices on your account page";
+
+/// Why one `delete_devices` call failed.
+#[derive(Debug)]
+enum DeleteError {
+    /// The homeserver wants user-interactive authentication.
+    Uia(Box<UiaaInfo>),
+    /// Anything else.
+    Failed(CoreError),
+}
+
+/// The call a sign-out makes, so that the sequence can be tested.
+trait DeleteApi {
+    /// Deletes the devices, with `auth` when given.
+    async fn delete(&self, auth: Option<AuthData>) -> Result<(), DeleteError>;
+}
+
+struct ClientDelete<'a> {
+    client: &'a Client,
+    devices: &'a [OwnedDeviceId],
+}
+
+impl DeleteApi for ClientDelete<'_> {
+    async fn delete(&self, auth: Option<AuthData>) -> Result<(), DeleteError> {
+        match self.client.delete_devices(self.devices, auth).await {
+            Ok(_) => Ok(()),
+            Err(error) => Err(match error.as_uiaa_response() {
+                Some(info) => DeleteError::Uia(Box::new(info.clone())),
+                // The SDK's text is not forwarded: it can quote the request.
+                None => DeleteError::Failed(CoreError::Internal(SIGN_OUT_FAILED.into())),
+            }),
+        }
+    }
+}
+
+/// Q13: the first call has no auth; a UIA answer asks for the password, or
+/// with one retries once with the answer's session. A refused password is
+/// `ReauthFailed`.
+async fn delete_flow<A: DeleteApi>(
+    api: &A,
+    me: &UserId,
+    password: Option<&Password>,
+) -> Result<(), Stop> {
+    let info = match api.delete(None).await {
+        Ok(()) => return Ok(()),
+        Err(DeleteError::Failed(error)) => return Err(error.into()),
+        Err(DeleteError::Uia(info)) => info,
+    };
+    match uia_step(&info, me, password) {
+        ResetStep::NeedPassword => Err(Stop::Reauth(ReauthAction::DeleteDevices)),
+        ResetStep::Retry(auth) => api.delete(Some(auth)).await.map_err(|error| match error {
+            DeleteError::Uia(info) if auth_rejected(Some(&info)) => {
+                Stop::Failed(CoreError::ReauthFailed)
+            }
+            DeleteError::Uia(_) => Stop::Failed(CoreError::Internal(SIGN_OUT_FAILED.into())),
+            DeleteError::Failed(error) => Stop::Failed(error),
+        }),
+        ResetStep::Done | ResetStep::Approve(_) | ResetStep::Unsupported => {
+            Err(CoreError::Internal(SIGN_OUT_FAILED.into()).into())
+        }
+    }
+}
+
+/// OAuth sessions sign devices out on the account page: emits its URL, or
+/// tells the user to go there themselves.
+async fn open_account_page(
+    client: &Client,
+    devices: &[OwnedDeviceId],
+    events: &mpsc::Sender<CoreEvent>,
+) {
+    let target = match client.oauth().server_metadata().await {
+        Ok(metadata) => {
+            let device = match devices {
+                [one] => Some(&**one),
+                _ => None,
+            };
+            account_management_target(&metadata, device)
+        }
+        Err(_) => None,
+    };
+    let url = target.and_then(|url| check_auth_url(url.as_str()).ok());
+    let event = match url {
+        Some(url) => CoreEvent::OpenAccountManagement(url),
+        None => CoreEvent::ActionFailed {
+            room_id: RoomId::from(""),
+            action: ActionKind::Devices,
+            error: CoreError::Internal(MANAGE_ON_ACCOUNT_PAGE.into()),
+        },
+    };
+    let _ = events.send(event).await;
+}
+
+/// The account's devices as the user sees them.
+async fn read_devices(client: &Client) -> Result<Vec<DeviceSummary>, CoreError> {
+    let (Some(me), Some(current)) = (client.user_id(), client.device_id()) else {
+        return Err(CoreError::NotLoggedIn);
+    };
+    let response = client
+        .devices()
+        .await
+        .map_err(|_| CoreError::Network("the devices could not be loaded".into()))?;
+    let server = response
+        .devices
+        .into_iter()
+        .map(|device| ServerDevice {
+            device_id: device.device_id.to_string(),
+            display_name: device.display_name,
+            last_seen_ms: device.last_seen_ts.map(|ts| u64::from(ts.0)),
+        })
+        .collect();
+    // No keys query here: a device the store does not know yet is `NoKeys`
+    // until the sync's own query brings it (the stream below re-sends then).
+    let trust = match client.encryption().get_user_devices(me).await {
+        Ok(devices) => devices
+            .devices()
+            .map(|device| {
+                let trust = if device.is_verified() {
+                    DeviceTrust::Verified
+                } else {
+                    DeviceTrust::Unverified
+                };
+                (device.device_id().to_string(), trust)
+            })
+            .collect(),
+        Err(_) => HashMap::new(),
+    };
+    Ok(merge_devices(server, &trust, current.as_str()))
+}
+
+/// Sends `Devices`, or the reason it could not be read.
+async fn send_devices(client: &Client, events: &mpsc::Sender<CoreEvent>) {
+    let event = match read_devices(client).await {
+        Ok(devices) => CoreEvent::Devices(devices),
+        Err(error) => CoreEvent::ActionFailed {
+            room_id: RoomId::from(""),
+            action: ActionKind::Devices,
+            error,
+        },
+    };
+    let _ = events.send(event).await;
+}
+
+/// Sends `Devices` now, and again whenever the crypto store's devices change
+/// (a new device, a changed trust) and the list differs from the last one.
+async fn watch_devices(client: Client, events: mpsc::Sender<CoreEvent>) {
+    // Subscribe first, so no change between the stream and the read is lost.
+    let mut updates = client
+        .encryption()
+        .devices_stream()
+        .await
+        .ok()
+        .map(|stream| stream.boxed());
+    let mut last: Option<Vec<DeviceSummary>> = None;
+    loop {
+        match read_devices(&client).await {
+            Ok(devices) => {
+                if last.as_ref() != Some(&devices) {
+                    last = Some(devices.clone());
+                    if events.send(CoreEvent::Devices(devices)).await.is_err() {
+                        return;
+                    }
+                }
+            }
+            // The first read reports its failure; later ones keep the list.
+            Err(error) if last.is_none() => {
+                let failed = CoreEvent::ActionFailed {
+                    room_id: RoomId::from(""),
+                    action: ActionKind::Devices,
+                    error,
+                };
+                if events.send(failed).await.is_err() {
+                    return;
+                }
+                last = Some(Vec::new());
+            }
+            Err(_) => {}
+        }
+        let Some(stream) = updates.as_mut() else {
+            return;
+        };
+        if stream.next().await.is_none() {
             return;
         }
     }
@@ -1971,5 +2360,262 @@ mod tests {
         let result = bootstrap_flow(&fake, &me, None).await;
         assert!(matches!(result, Err(Stop::Failed(CoreError::Internal(_)))));
         assert_eq!(fake.calls(), ["server"]);
+    }
+}
+
+#[cfg(test)]
+mod device_tests {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use matrix_sdk::ruma::api::client::uiaa::{AuthFlow, AuthType, UiaaInfo};
+    use matrix_sdk::ruma::api::error::{ErrorKind, StandardErrorBody};
+    use matrix_sdk::ruma::{device_id, owned_user_id, user_id};
+
+    use super::*;
+    use crate::api::{DeviceId, DeviceSummary, DeviceTrust};
+
+    fn server(id: &str, name: Option<&str>, seen: Option<u64>) -> ServerDevice {
+        ServerDevice {
+            device_id: id.to_owned(),
+            display_name: name.map(str::to_owned),
+            last_seen_ms: seen,
+        }
+    }
+
+    #[test]
+    fn devices_list_the_current_one_first_then_the_latest_seen() {
+        let list = vec![
+            server("OLD", Some("Old"), Some(10)),
+            server("ME", Some("Mine"), Some(5)),
+            server("NEW", Some("New"), Some(99)),
+            server("NEVER", None, None),
+            server("AAA", None, Some(10)),
+        ];
+        let trust = HashMap::from([
+            ("ME".to_owned(), DeviceTrust::Verified),
+            ("OLD".to_owned(), DeviceTrust::Unverified),
+            ("NEW".to_owned(), DeviceTrust::Verified),
+            ("NEVER".to_owned(), DeviceTrust::Unverified),
+            ("AAA".to_owned(), DeviceTrust::Unverified),
+        ]);
+        let merged = merge_devices(list, &trust, "ME");
+        let ids: Vec<&str> = merged.iter().map(|d| d.device_id.as_str()).collect();
+        // Never-seen devices go last; equal times order by device ID.
+        assert_eq!(ids, ["ME", "NEW", "AAA", "OLD", "NEVER"]);
+        assert!(merged[0].current);
+        assert!(merged[1..].iter().all(|d| !d.current));
+    }
+
+    #[test]
+    fn a_device_without_crypto_keys_is_no_keys_and_names_may_be_missing() {
+        let list = vec![
+            server("ME", Some("Mine"), Some(1)),
+            server("BARE", None, Some(2)),
+            server("BLANK", Some("  "), Some(3)),
+        ];
+        let trust = HashMap::from([("ME".to_owned(), DeviceTrust::Verified)]);
+        let merged = merge_devices(list, &trust, "ME");
+        let by_id = |id: &str| -> &DeviceSummary {
+            merged.iter().find(|d| d.device_id.as_str() == id).unwrap()
+        };
+        assert_eq!(by_id("BARE").trust, DeviceTrust::NoKeys);
+        assert_eq!(by_id("BARE").display_name, None);
+        assert_eq!(by_id("BLANK").display_name, None);
+        assert_eq!(by_id("ME").display_name.as_deref(), Some("Mine"));
+        assert_eq!(by_id("ME").trust, DeviceTrust::Verified);
+        assert_eq!(by_id("BARE").last_seen_ms, Some(2));
+    }
+
+    #[test]
+    fn an_empty_server_list_gives_an_empty_device_list() {
+        let merged = merge_devices(vec![], &HashMap::new(), "ME");
+        assert!(merged.is_empty());
+    }
+
+    #[test]
+    fn device_names_are_trimmed_capped_and_never_empty() {
+        assert_eq!(clean_device_name("  Laptop  "), Ok("Laptop".to_owned()));
+        assert_eq!(clean_device_name(""), Err(CoreError::NotAllowed));
+        assert_eq!(clean_device_name(" \t\n "), Err(CoreError::NotAllowed));
+        let long = "é".repeat(100);
+        let cleaned = clean_device_name(&long).unwrap();
+        assert_eq!(cleaned.chars().count(), 64);
+        assert!(long.starts_with(&cleaned));
+        let exact = "x".repeat(64);
+        assert_eq!(clean_device_name(&exact), Ok(exact.clone()));
+    }
+
+    #[test]
+    fn signing_out_the_current_device_or_nothing_is_refused() {
+        let ids = |v: &[&str]| v.iter().map(|s| DeviceId::from(*s)).collect::<Vec<_>>();
+        assert_eq!(sign_out_precheck(&ids(&["A", "B"]), "ME"), Ok(()));
+        assert_eq!(
+            sign_out_precheck(&ids(&["A", "ME"]), "ME"),
+            Err(CoreError::NotAllowed)
+        );
+        assert_eq!(sign_out_precheck(&[], "ME"), Err(CoreError::NotAllowed));
+    }
+
+    fn metadata(extra: serde_json::Value) -> AuthorizationServerMetadata {
+        let mut json = serde_json::json!({
+            "issuer": "https://server.local/",
+            "authorization_endpoint": "https://server.local/authorize",
+            "token_endpoint": "https://server.local/token",
+            "response_types_supported": ["code"],
+            "response_modes_supported": ["query", "fragment"],
+            "grant_types_supported": ["authorization_code", "refresh_token"],
+            "revocation_endpoint": "https://server.local/revoke",
+            "code_challenge_methods_supported": ["S256"],
+        });
+        json.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn the_account_page_url_names_the_action_and_the_device() {
+        let m = metadata(serde_json::json!({
+            "account_management_uri": "https://server.local/account",
+            "account_management_actions_supported": ["org.matrix.device_delete"],
+        }));
+        let url = account_management_target(&m, Some(device_id!("DEV1"))).unwrap();
+        assert_eq!(url.scheme(), "https");
+        assert_eq!(url.host_str(), Some("server.local"));
+        let pairs: HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(pairs["action"], "org.matrix.device_delete");
+        assert_eq!(pairs["device_id"], "DEV1");
+
+        // Without a device (several selected): the devices list.
+        let url = account_management_target(&m, None).unwrap();
+        let pairs: HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(pairs["action"], "org.matrix.devices_list");
+        assert!(!pairs.contains_key("device_id"));
+    }
+
+    #[test]
+    fn no_account_page_means_no_url() {
+        let m = metadata(serde_json::json!({}));
+        assert!(account_management_target(&m, Some(device_id!("DEV1"))).is_none());
+        assert!(account_management_target(&m, None).is_none());
+    }
+
+    #[test]
+    fn the_dm_peer_is_the_one_other_user() {
+        let me = user_id!("@me:example.org");
+        let bob = user_id!("@bob:example.org");
+        let carol = user_id!("@carol:example.org");
+        assert_eq!(dm_peer(&[bob], Some(me)), Some(bob));
+        // Own ID in the targets does not count.
+        assert_eq!(dm_peer(&[me, bob], Some(me)), Some(bob));
+        assert_eq!(dm_peer(&[bob], None), Some(bob));
+        assert_eq!(dm_peer(&[bob, carol], Some(me)), None);
+        assert_eq!(dm_peer(&[], Some(me)), None);
+        assert_eq!(dm_peer(&[me], Some(me)), None);
+    }
+
+    /// A fake `delete_devices`.
+    struct FakeDelete {
+        /// The server asks for UIA when no auth comes.
+        demands_uia: bool,
+        /// The server refuses the password it gets.
+        refuses: bool,
+        flows: Vec<Vec<AuthType>>,
+        seen: Mutex<Vec<Option<AuthData>>>,
+    }
+
+    impl FakeDelete {
+        fn new(demands_uia: bool, refuses: bool) -> Self {
+            Self {
+                demands_uia,
+                refuses,
+                flows: vec![vec![AuthType::Password]],
+                seen: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn info(&self, rejected: bool) -> Box<UiaaInfo> {
+            let flows = self.flows.iter().cloned().map(AuthFlow::new).collect();
+            let mut info = UiaaInfo::new(flows);
+            info.session = Some("uia-session-1".into());
+            if rejected {
+                info.auth_error = Some(Box::new(StandardErrorBody::new(
+                    ErrorKind::Forbidden,
+                    "refused".into(),
+                )));
+            }
+            Box::new(info)
+        }
+    }
+
+    impl DeleteApi for FakeDelete {
+        async fn delete(&self, auth: Option<AuthData>) -> Result<(), DeleteError> {
+            self.seen.lock().unwrap().push(auth.clone());
+            match auth {
+                None if self.demands_uia => Err(DeleteError::Uia(self.info(false))),
+                None => Ok(()),
+                Some(_) if self.refuses => Err(DeleteError::Uia(self.info(true))),
+                Some(_) => Ok(()),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sign_out_without_uia_succeeds_at_once() {
+        let me = owned_user_id!("@alice:example.org");
+        let fake = FakeDelete::new(false, false);
+        assert_eq!(delete_flow(&fake, &me, None).await, Ok(()));
+        assert_eq!(fake.seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sign_out_asks_for_the_password_when_the_server_does() {
+        let me = owned_user_id!("@alice:example.org");
+        let fake = FakeDelete::new(true, false);
+        assert_eq!(
+            delete_flow(&fake, &me, None).await,
+            Err(Stop::Reauth(ReauthAction::DeleteDevices))
+        );
+        assert_eq!(fake.seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sign_out_retries_once_with_the_password_and_the_session() {
+        let me = owned_user_id!("@alice:example.org");
+        let pw = Password::from("secret-pw-x");
+        let fake = FakeDelete::new(true, false);
+        assert_eq!(delete_flow(&fake, &me, Some(&pw)).await, Ok(()));
+        let seen = fake.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert!(seen[0].is_none());
+        let Some(AuthData::Password(auth)) = &seen[1] else {
+            panic!("the retry carries password auth");
+        };
+        assert_eq!(auth.session.as_deref(), Some("uia-session-1"));
+        assert_eq!(auth.password, "secret-pw-x");
+    }
+
+    #[tokio::test]
+    async fn a_refused_password_is_reauth_failed_without_the_password_in_the_error() {
+        let me = owned_user_id!("@alice:example.org");
+        let pw = Password::from("secret-pw-x");
+        let fake = FakeDelete::new(true, true);
+        let result = delete_flow(&fake, &me, Some(&pw)).await;
+        assert_eq!(result, Err(Stop::Failed(CoreError::ReauthFailed)));
+        assert!(!format!("{result:?}").contains("secret-pw-x"));
+        // One retry only.
+        assert_eq!(fake.seen.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_server_that_takes_no_password_cannot_sign_devices_out() {
+        let me = owned_user_id!("@alice:example.org");
+        let pw = Password::from("secret-pw-x");
+        let mut fake = FakeDelete::new(true, false);
+        fake.flows = vec![vec![AuthType::Sso]];
+        let result = delete_flow(&fake, &me, Some(&pw)).await;
+        assert!(matches!(result, Err(Stop::Failed(CoreError::Internal(_)))));
+        assert!(!format!("{result:?}").contains("secret-pw-x"));
     }
 }
