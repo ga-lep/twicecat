@@ -37,5 +37,11 @@ allow = [
 allow = ["CDLA-Permissive-2.0"]
 crate = "webpki-root-certs"
 
+# ksni (tray-icon's Linux KSNI backend) is Unlicense, a public-domain dedication compatible with
+# GPL-3.0-or-later; scoped to that crate. Approved Phase 5 Q3.
+[[licenses.exceptions]]
+allow = ["Unlicense"]
+crate = "ksni"
+
 [licenses.private]
 ignore = true
