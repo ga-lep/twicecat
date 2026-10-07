@@ -872,6 +872,46 @@ async fn forward_typing(room_id: RoomId, timeline: Arc<Timeline>, events: mpsc::
     }
 }
 
+/// The room (empty for commands that name none) and action kind a Phase 5
+/// command fails under while the core has no handler for it; `None` for every
+/// other command.
+fn unimplemented_target(cmd: &Command) -> Option<(RoomId, ActionKind)> {
+    let none = || RoomId::from("");
+    Some(match cmd {
+        Command::FetchMedia { room_id, .. } | Command::SaveMedia { room_id, .. } => {
+            (room_id.clone(), ActionKind::Media)
+        }
+        Command::SendAttachment(a) => (a.room_id.clone(), ActionKind::Upload),
+        Command::SetRoomNotificationMode { room_id, .. } => {
+            (room_id.clone(), ActionKind::Notifications)
+        }
+        Command::SetDefaultNotificationMode { .. }
+        | Command::AddKeyword { .. }
+        | Command::RemoveKeyword { .. } => (none(), ActionKind::Notifications),
+        Command::CreateRoom(_) | Command::CreateDm { .. } | Command::JoinRoom { .. } => {
+            (none(), ActionKind::Rooms)
+        }
+        Command::AcceptInvite { room_id }
+        | Command::DeclineInvite { room_id }
+        | Command::InviteUser { room_id, .. }
+        | Command::LeaveRoom { room_id }
+        | Command::OpenRoomDetails { room_id }
+        | Command::SetRoomName { room_id, .. }
+        | Command::SetRoomTopic { room_id, .. }
+        | Command::SetRoomAvatar { room_id, .. }
+        | Command::EnableRoomEncryption { room_id }
+        | Command::ListRoomMembers { room_id } => (room_id.clone(), ActionKind::Rooms),
+        Command::SetDisplayName { .. } | Command::SetAvatar { .. } | Command::RemoveAvatar => {
+            (none(), ActionKind::Profile)
+        }
+        Command::OpenThread { room_id, .. } | Command::PaginateThread { room_id, .. } => {
+            (room_id.clone(), ActionKind::Thread)
+        }
+        Command::CloseThread => (none(), ActionKind::Thread),
+        _ => return None,
+    })
+}
+
 impl Engine {
     async fn run(mut self, mut commands: mpsc::Receiver<Command>) {
         let mut watch_changes = true;
@@ -911,6 +951,10 @@ impl Engine {
     }
 
     async fn handle(&mut self, cmd: Command) {
+        if let Some((room_id, action)) = unimplemented_target(&cmd) {
+            self.answer_unimplemented(room_id, action).await;
+            return;
+        }
         match cmd {
             Command::RestoreSession => self.restore().await,
             Command::LoginPassword {
@@ -1280,6 +1324,34 @@ impl Engine {
             }
             // Handled in `run`.
             Command::Shutdown => {}
+            // Answered by `unimplemented_target` at the top, until the tasks
+            // that implement them land.
+            Command::FetchMedia { .. }
+            | Command::SaveMedia { .. }
+            | Command::SendAttachment(_)
+            | Command::SetRoomNotificationMode { .. }
+            | Command::SetDefaultNotificationMode { .. }
+            | Command::AddKeyword { .. }
+            | Command::RemoveKeyword { .. }
+            | Command::CreateRoom(_)
+            | Command::CreateDm { .. }
+            | Command::JoinRoom { .. }
+            | Command::AcceptInvite { .. }
+            | Command::DeclineInvite { .. }
+            | Command::InviteUser { .. }
+            | Command::LeaveRoom { .. }
+            | Command::OpenRoomDetails { .. }
+            | Command::SetRoomName { .. }
+            | Command::SetRoomTopic { .. }
+            | Command::SetRoomAvatar { .. }
+            | Command::EnableRoomEncryption { .. }
+            | Command::ListRoomMembers { .. }
+            | Command::SetDisplayName { .. }
+            | Command::SetAvatar { .. }
+            | Command::RemoveAvatar
+            | Command::OpenThread { .. }
+            | Command::CloseThread
+            | Command::PaginateThread { .. } => {}
         }
     }
 
@@ -1631,6 +1703,22 @@ impl Engine {
             Ok((session, _)) => self.audio_session = Some(session),
             Err(e) => self.emit(CoreEvent::Error(e)).await,
         }
+    }
+
+    /// Fails a command that has no handler yet: `NotLoggedIn` without a
+    /// session, an internal "not implemented yet" with one.
+    async fn answer_unimplemented(&self, room_id: RoomId, action: ActionKind) {
+        let error = if self.active.is_some() {
+            CoreError::Internal("not implemented yet".to_owned())
+        } else {
+            CoreError::NotLoggedIn
+        };
+        self.emit(CoreEvent::ActionFailed {
+            room_id,
+            action,
+            error,
+        })
+        .await;
     }
 
     /// Answers a Phase 4 action sent without a session. These actions belong
@@ -2558,6 +2646,7 @@ mod tests {
         let mut watcher = engine.room_list_query.subscribe();
         assert_eq!(*watcher.borrow_and_update(), RoomListQuery::default());
         let query = RoomListQuery {
+            space: None,
             tab: RoomListTab::Spaces,
             search: "x".into(),
         };
@@ -2610,6 +2699,7 @@ mod tests {
             reply_to: None,
             kind: MessageKind::Text,
             format: TextFormat::Markdown,
+            thread_root: None,
         };
         let item_id = || "i".to_owned();
         vec![
@@ -3096,6 +3186,257 @@ mod tests {
             rest.iter().all(|e| matches!(e, CoreEvent::Security(_))),
             "{rest:?}"
         );
+        if let Some(mut active) = engine.active.take() {
+            active.stop_tasks().await;
+        }
+    }
+
+    /// One of every Phase 5 command, with the action kind and room it fails
+    /// under while the core has no handler for it.
+    fn phase5_commands() -> Vec<(Command, ActionKind, RoomId)> {
+        use crate::api::{
+            AttachmentData, CreateRoomRequest, EventId, MediaBytes, MediaKind, MediaSize,
+            OutgoingAttachment, RoomNotificationModeView, RoomVisibility,
+        };
+        let room = || rid("p5");
+        let none = || RoomId::from("");
+        let user = || crate::api::UserId::from("@bob:x");
+        let event = || EventId::from("$root");
+        vec![
+            (
+                Command::FetchMedia {
+                    room_id: room(),
+                    item_id: "i".into(),
+                    size: MediaSize::Thumbnail,
+                },
+                ActionKind::Media,
+                room(),
+            ),
+            (
+                Command::SaveMedia {
+                    room_id: room(),
+                    item_id: "i".into(),
+                    path: "/tmp/x".into(),
+                },
+                ActionKind::Media,
+                room(),
+            ),
+            (
+                Command::SendAttachment(OutgoingAttachment {
+                    room_id: room(),
+                    filename: "a.png".into(),
+                    mimetype: "image/png".into(),
+                    data: AttachmentData::Bytes(MediaBytes::from(vec![1])),
+                    kind: MediaKind::Image,
+                    width: None,
+                    height: None,
+                    thumbnail: None,
+                    reply_to: None,
+                    thread_root: None,
+                }),
+                ActionKind::Upload,
+                room(),
+            ),
+            (
+                Command::SetRoomNotificationMode {
+                    room_id: room(),
+                    mode: Some(RoomNotificationModeView::Mute),
+                },
+                ActionKind::Notifications,
+                room(),
+            ),
+            (
+                Command::SetDefaultNotificationMode {
+                    one_to_one: true,
+                    mode: RoomNotificationModeView::AllMessages,
+                },
+                ActionKind::Notifications,
+                none(),
+            ),
+            (
+                Command::AddKeyword {
+                    keyword: "k".into(),
+                },
+                ActionKind::Notifications,
+                none(),
+            ),
+            (
+                Command::RemoveKeyword {
+                    keyword: "k".into(),
+                },
+                ActionKind::Notifications,
+                none(),
+            ),
+            (
+                Command::CreateRoom(CreateRoomRequest {
+                    name: "n".into(),
+                    topic: None,
+                    encrypted: true,
+                    visibility: RoomVisibility::Private,
+                    invitees: Vec::new(),
+                }),
+                ActionKind::Rooms,
+                none(),
+            ),
+            (
+                Command::CreateDm { user_id: user() },
+                ActionKind::Rooms,
+                none(),
+            ),
+            (
+                Command::JoinRoom {
+                    target: "#a:x".into(),
+                    via: Vec::new(),
+                },
+                ActionKind::Rooms,
+                none(),
+            ),
+            (
+                Command::AcceptInvite { room_id: room() },
+                ActionKind::Rooms,
+                room(),
+            ),
+            (
+                Command::DeclineInvite { room_id: room() },
+                ActionKind::Rooms,
+                room(),
+            ),
+            (
+                Command::InviteUser {
+                    room_id: room(),
+                    user_id: user(),
+                },
+                ActionKind::Rooms,
+                room(),
+            ),
+            (
+                Command::LeaveRoom { room_id: room() },
+                ActionKind::Rooms,
+                room(),
+            ),
+            (
+                Command::OpenRoomDetails { room_id: room() },
+                ActionKind::Rooms,
+                room(),
+            ),
+            (
+                Command::SetRoomName {
+                    room_id: room(),
+                    name: "n".into(),
+                },
+                ActionKind::Rooms,
+                room(),
+            ),
+            (
+                Command::SetRoomTopic {
+                    room_id: room(),
+                    topic: None,
+                },
+                ActionKind::Rooms,
+                room(),
+            ),
+            (
+                Command::SetRoomAvatar {
+                    room_id: room(),
+                    data: MediaBytes::from(vec![1]),
+                    mimetype: "image/png".into(),
+                },
+                ActionKind::Rooms,
+                room(),
+            ),
+            (
+                Command::EnableRoomEncryption { room_id: room() },
+                ActionKind::Rooms,
+                room(),
+            ),
+            (
+                Command::ListRoomMembers { room_id: room() },
+                ActionKind::Rooms,
+                room(),
+            ),
+            (
+                Command::SetDisplayName { name: "n".into() },
+                ActionKind::Profile,
+                none(),
+            ),
+            (
+                Command::SetAvatar {
+                    data: MediaBytes::from(vec![1]),
+                    mimetype: "image/png".into(),
+                },
+                ActionKind::Profile,
+                none(),
+            ),
+            (Command::RemoveAvatar, ActionKind::Profile, none()),
+            (
+                Command::OpenThread {
+                    room_id: room(),
+                    root: event(),
+                },
+                ActionKind::Thread,
+                room(),
+            ),
+            (Command::CloseThread, ActionKind::Thread, none()),
+            (
+                Command::PaginateThread {
+                    room_id: room(),
+                    root: event(),
+                },
+                ActionKind::Thread,
+                room(),
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn phase5_commands_without_a_session_fail_with_not_logged_in() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut engine, mut rx) = oauth_engine(tmp.path());
+        for (cmd, kind, room) in phase5_commands() {
+            engine.handle(cmd).await;
+            let got = drain(&mut rx).await;
+            assert!(
+                matches!(
+                    got.as_slice(),
+                    [CoreEvent::ActionFailed { room_id, action, error: CoreError::NotLoggedIn }]
+                        if *room_id == room && *action == kind
+                ),
+                "{kind:?}: {got:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn phase5_commands_with_a_session_are_not_implemented_yet() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut engine, mut rx) = oauth_engine(tmp.path());
+        let client = Client::builder()
+            .homeserver_url("http://127.0.0.1:1")
+            .build()
+            .await
+            .unwrap();
+        engine.active = Some(Active {
+            fetcher: Arc::new(SdkFetcher(client.clone())),
+            client,
+            record: record("@alice:x", "http://127.0.0.1:1", "s1"),
+            changes: broadcast::channel(1).1,
+            sync: None,
+            selected: None,
+            avatars: Avatars::new(),
+            security: SecurityTasks::new(),
+        });
+        for (cmd, kind, room) in phase5_commands() {
+            engine.handle(cmd).await;
+            let got = drain(&mut rx).await;
+            assert!(
+                matches!(
+                    got.as_slice(),
+                    [CoreEvent::ActionFailed { room_id, action, error: CoreError::Internal(why) }]
+                        if *room_id == room && *action == kind && why == "not implemented yet"
+                ),
+                "{kind:?}: {got:?}"
+            );
+        }
         if let Some(mut active) = engine.active.take() {
             active.stop_tasks().await;
         }

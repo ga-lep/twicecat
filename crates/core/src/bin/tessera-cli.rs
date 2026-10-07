@@ -243,6 +243,54 @@ fn security_line(status: &SecurityStatus) -> String {
     )
 }
 
+/// One non-secret line for a Phase 5 event, or `None` for any other event.
+/// Previews, names, file names, keywords and bytes are never printed.
+fn phase5_line(event: &CoreEvent) -> Option<String> {
+    Some(match event {
+        CoreEvent::Media {
+            size,
+            result: Ok(bytes),
+            ..
+        } => format!("[media] {size:?} received ({} bytes)", bytes.len()),
+        CoreEvent::Media {
+            size,
+            result: Err(error),
+            ..
+        } => format!("[media] {size:?} failed: {error}"),
+        CoreEvent::MediaSaved { .. } => "[media] saved".to_owned(),
+        CoreEvent::MediaLimits { max_upload_bytes } => match max_upload_bytes {
+            Some(max) => format!("[media] upload limit {max} bytes"),
+            None => "[media] upload limit unknown".to_owned(),
+        },
+        CoreEvent::Notification(view) => format!("[notification] {:?}", view.kind),
+        CoreEvent::NotificationSettings(settings) => format!(
+            "[notifications] groups: {:?}, direct messages: {:?}, {} keywords",
+            settings.group_default,
+            settings.dm_default,
+            settings.keywords.len()
+        ),
+        CoreEvent::UnreadTotals {
+            notifications,
+            highlights,
+        } => format!("[unread] {notifications} notifications, {highlights} highlights"),
+        CoreEvent::RoomCreated { .. } => "[rooms] created".to_owned(),
+        CoreEvent::RoomJoined { .. } => "[rooms] joined".to_owned(),
+        CoreEvent::RoomDetails(details) => {
+            format!("[rooms] details (encrypted: {})", details.is_encrypted)
+        }
+        CoreEvent::RoomMembers {
+            members, truncated, ..
+        } => format!("[rooms] {} members (truncated: {truncated})", members.len()),
+        CoreEvent::OwnProfile(profile) => {
+            format!("[profile] avatar: {}", profile.avatar.is_some())
+        }
+        CoreEvent::Spaces(spaces) => format!("[spaces] {} spaces", spaces.len()),
+        CoreEvent::ThreadDiff { diffs, .. } => format!("[thread] {} changes", diffs.len()),
+        CoreEvent::ThreadPagination { state, .. } => format!("[thread] pagination {state:?}"),
+        _ => return None,
+    })
+}
+
 fn status_line(state: &SyncState) -> String {
     match state {
         SyncState::Idle => "[sync] idle".to_owned(),
@@ -757,6 +805,25 @@ impl Cli {
             | CoreEvent::Verification { .. }
             | CoreEvent::Devices(_)
             | CoreEvent::UserTrust { .. } => {}
+            // One short line each; see `phase5_line`.
+            event @ (CoreEvent::Media { .. }
+            | CoreEvent::MediaSaved { .. }
+            | CoreEvent::MediaLimits { .. }
+            | CoreEvent::Notification(_)
+            | CoreEvent::NotificationSettings(_)
+            | CoreEvent::UnreadTotals { .. }
+            | CoreEvent::RoomCreated { .. }
+            | CoreEvent::RoomJoined { .. }
+            | CoreEvent::RoomDetails(_)
+            | CoreEvent::RoomMembers { .. }
+            | CoreEvent::OwnProfile(_)
+            | CoreEvent::Spaces(_)
+            | CoreEvent::ThreadDiff { .. }
+            | CoreEvent::ThreadPagination { .. }) => {
+                if let Some(line) = phase5_line(&event) {
+                    println!("{line}");
+                }
+            }
             CoreEvent::TimelineDiff { room_id, diffs } => self.on_timeline(&room_id, &diffs),
             CoreEvent::SendFailed { room_id, error } => {
                 println!("Send failed in {}: {error}", sanitize(room_id.as_str()));
@@ -1209,6 +1276,103 @@ mod tests {
             security_line(&status),
             "[security] recovery: Incomplete, device: Unverified, cross-signing: MissingKeys"
         );
+    }
+
+    #[test]
+    fn phase5_events_print_one_line_without_content() {
+        use tessera_core::api::{
+            EventId, MediaBytes, MediaSize, NotificationKind, NotificationView, OwnProfileView,
+            PaginationState, RoomNotificationModeView, SpaceView,
+        };
+        let room = || RoomId::from("!r:x");
+        let events = vec![
+            CoreEvent::Media {
+                room_id: room(),
+                item_id: "secret-name-x.png".into(),
+                size: MediaSize::Full,
+                result: Ok(MediaBytes::from(b"secret-body-x".to_vec())),
+            },
+            CoreEvent::MediaSaved {
+                room_id: room(),
+                item_id: "secret-name-x.png".into(),
+            },
+            CoreEvent::MediaLimits {
+                max_upload_bytes: Some(1024),
+            },
+            CoreEvent::Notification(NotificationView {
+                room_id: room(),
+                event_id: EventId::from("$e"),
+                room_name: "secret-name-x".into(),
+                sender: tessera_core::api::UserId::from("@a:x"),
+                sender_name: Some("secret-name-x".into()),
+                is_dm: false,
+                kind: NotificationKind::Message,
+                preview: Some(MessageText::from("secret-body-x")),
+            }),
+            CoreEvent::NotificationSettings(tessera_core::api::NotificationSettingsView {
+                group_default: RoomNotificationModeView::AllMessages,
+                dm_default: RoomNotificationModeView::Mute,
+                keywords: vec!["secret-name-x".into()],
+            }),
+            CoreEvent::UnreadTotals {
+                notifications: 3,
+                highlights: 1,
+            },
+            CoreEvent::RoomCreated { room_id: room() },
+            CoreEvent::RoomJoined { room_id: room() },
+            CoreEvent::RoomDetails(tessera_core::api::RoomDetailsView {
+                room_id: room(),
+                name: "secret-name-x".into(),
+                topic: None,
+                avatar: None,
+                is_encrypted: true,
+                alias: None,
+                permissions: Default::default(),
+            }),
+            CoreEvent::RoomMembers {
+                room_id: room(),
+                members: Vec::new(),
+                truncated: false,
+            },
+            CoreEvent::OwnProfile(OwnProfileView {
+                display_name: Some("secret-name-x".into()),
+                avatar: None,
+            }),
+            CoreEvent::Spaces(vec![SpaceView {
+                id: room(),
+                name: "secret-name-x".into(),
+                avatar: None,
+                level: 0,
+                children: 1,
+            }]),
+            CoreEvent::ThreadDiff {
+                room_id: room(),
+                root: EventId::from("$r"),
+                diffs: Vec::new(),
+            },
+            CoreEvent::ThreadPagination {
+                room_id: room(),
+                root: EventId::from("$r"),
+                state: PaginationState::Idle,
+            },
+        ];
+        for event in events {
+            let line = phase5_line(&event).expect("a line for every Phase 5 event");
+            assert!(!line.contains('\n') && !line.is_empty(), "{line}");
+            assert!(
+                !line.contains("secret-name-x") && !line.contains("secret-body-x"),
+                "{line}"
+            );
+        }
+        assert_eq!(
+            phase5_line(&CoreEvent::UnreadTotals {
+                notifications: 3,
+                highlights: 1
+            })
+            .as_deref(),
+            Some("[unread] 3 notifications, 1 highlights")
+        );
+        assert!(phase5_line(&CoreEvent::LoggedOut).is_none());
     }
 
     #[test]

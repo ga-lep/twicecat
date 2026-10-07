@@ -153,6 +153,8 @@ fn map_event(event: &EventTimelineItem, own: Option<&SdkUserId>) -> TimelineItem
                         _ => None,
                     },
                     shield: map_shield(event.get_shield(false)),
+                    media: None,
+                    thread: None,
                 };
                 // A remote event has no send state: the server accepted it.
                 let sent = event.send_state().map_or(SendStatus::Sent, map_send_state);

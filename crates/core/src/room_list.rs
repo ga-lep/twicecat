@@ -347,6 +347,7 @@ mod tests {
         RoomListQuery {
             tab,
             search: search.to_owned(),
+            space: None,
         }
     }
 

@@ -4,10 +4,13 @@
 //! appears in it (enforced by `scripts/check-core-api.sh`).
 
 use std::fmt;
+use std::path::PathBuf;
 
 mod audio;
 mod call;
 mod diff;
+mod media;
+mod rooms;
 mod security;
 mod types;
 
@@ -21,6 +24,16 @@ pub use call::{
     CallEndReason, CallIntent, CallState, CleaningStatus, Participant, ParticipantId, SkipReason,
 };
 pub use diff::ListDiff;
+pub use media::{
+    AttachmentData, MediaBytes, MediaContent, MediaKind, MediaSize, OutgoingAttachment,
+    UploadProgress, UploadThumbnail,
+};
+pub use rooms::{
+    CreateRoomRequest, MembershipView, NotificationKind, NotificationSettingsView,
+    NotificationView, OwnProfileView, PowerLevelView, Role, RoomDetailsView, RoomMemberView,
+    RoomNotificationModeView, RoomPermissions, RoomVisibility, SpaceView, ThemeChoice,
+    ThreadSummaryView, UiSettings,
+};
 pub use security::{
     CancelReason, CrossSigning, DeviceSummary, DeviceTrust, DeviceVerification, QrImage,
     ReauthAction, RecoveryKey, RecoveryProgress, RecoveryStatus, SasEmoji, SecurityStatus, Shield,
@@ -240,6 +253,159 @@ pub enum Command {
         /// The user.
         user_id: UserId,
     },
+    /// Fetch a media message's thumbnail or file; answered by
+    /// [`CoreEvent::Media`].
+    FetchMedia {
+        /// Room.
+        room_id: RoomId,
+        /// `TimelineItem::id` of the media message.
+        item_id: String,
+        /// Which rendition.
+        size: MediaSize,
+    },
+    /// Save a media message's file to `path`; answered by
+    /// [`CoreEvent::MediaSaved`] or an [`ActionKind::Media`] failure.
+    SaveMedia {
+        /// Room.
+        room_id: RoomId,
+        /// `TimelineItem::id` of the media message.
+        item_id: String,
+        /// Where to write the file.
+        path: PathBuf,
+    },
+    /// Send a file as a media message.
+    SendAttachment(OutgoingAttachment),
+    /// Set a room's own notification mode; `None` goes back to the account
+    /// default.
+    SetRoomNotificationMode {
+        /// Room.
+        room_id: RoomId,
+        /// The mode, or `None` for the default.
+        mode: Option<RoomNotificationModeView>,
+    },
+    /// Set the account default for group rooms or direct messages.
+    SetDefaultNotificationMode {
+        /// Direct messages (true) or group rooms (false).
+        one_to_one: bool,
+        /// The mode.
+        mode: RoomNotificationModeView,
+    },
+    /// Add a notification keyword.
+    AddKeyword {
+        /// The keyword, 1-64 characters.
+        keyword: String,
+    },
+    /// Remove a notification keyword.
+    RemoveKeyword {
+        /// The keyword.
+        keyword: String,
+    },
+    /// Create a room; answered by [`CoreEvent::RoomCreated`].
+    CreateRoom(CreateRoomRequest),
+    /// Open a direct message with a user, reusing an existing one; answered
+    /// by [`CoreEvent::RoomCreated`].
+    CreateDm {
+        /// The other user.
+        user_id: UserId,
+    },
+    /// Join a room by alias, ID or `matrix.to` link; answered by
+    /// [`CoreEvent::RoomJoined`].
+    JoinRoom {
+        /// `#alias:server`, `!id:server` or a `matrix.to` link.
+        target: String,
+        /// Servers to try when joining by ID.
+        via: Vec<String>,
+    },
+    /// Accept an invitation.
+    AcceptInvite {
+        /// Room.
+        room_id: RoomId,
+    },
+    /// Decline an invitation.
+    DeclineInvite {
+        /// Room.
+        room_id: RoomId,
+    },
+    /// Invite a user to a room.
+    InviteUser {
+        /// Room.
+        room_id: RoomId,
+        /// The user.
+        user_id: UserId,
+    },
+    /// Leave a room.
+    LeaveRoom {
+        /// Room.
+        room_id: RoomId,
+    },
+    /// Report [`CoreEvent::RoomDetails`] for a room now and on every change.
+    OpenRoomDetails {
+        /// Room.
+        room_id: RoomId,
+    },
+    /// Change a room's name.
+    SetRoomName {
+        /// Room.
+        room_id: RoomId,
+        /// The new name.
+        name: String,
+    },
+    /// Change a room's topic; `None` clears it.
+    SetRoomTopic {
+        /// Room.
+        room_id: RoomId,
+        /// The new topic.
+        topic: Option<String>,
+    },
+    /// Change a room's avatar.
+    SetRoomAvatar {
+        /// Room.
+        room_id: RoomId,
+        /// The encoded image.
+        data: MediaBytes,
+        /// Its MIME type.
+        mimetype: String,
+    },
+    /// Turn on encryption in a room. This cannot be undone.
+    EnableRoomEncryption {
+        /// Room.
+        room_id: RoomId,
+    },
+    /// List a room's members; answered by [`CoreEvent::RoomMembers`].
+    ListRoomMembers {
+        /// Room.
+        room_id: RoomId,
+    },
+    /// Change the user's display name.
+    SetDisplayName {
+        /// The new name.
+        name: String,
+    },
+    /// Change the user's avatar.
+    SetAvatar {
+        /// The encoded image.
+        data: MediaBytes,
+        /// Its MIME type.
+        mimetype: String,
+    },
+    /// Remove the user's avatar.
+    RemoveAvatar,
+    /// Open a thread in a second timeline, closing any other one.
+    OpenThread {
+        /// Room.
+        room_id: RoomId,
+        /// The thread's root event.
+        root: EventId,
+    },
+    /// Close the open thread.
+    CloseThread,
+    /// Load older events of the open thread.
+    PaginateThread {
+        /// Room.
+        room_id: RoomId,
+        /// The thread's root event.
+        root: EventId,
+    },
     /// Log out and delete the local session.
     Logout,
     /// Stop the engine.
@@ -455,6 +621,131 @@ impl fmt::Debug for Command {
                 .debug_struct("WatchUserTrust")
                 .field("user_id", user_id)
                 .finish(),
+            Self::FetchMedia {
+                room_id,
+                item_id,
+                size,
+            } => f
+                .debug_struct("FetchMedia")
+                .field("room_id", room_id)
+                .field("item_id", item_id)
+                .field("size", size)
+                .finish(),
+            Self::SaveMedia {
+                room_id, item_id, ..
+            } => f
+                .debug_struct("SaveMedia")
+                .field("room_id", room_id)
+                .field("item_id", item_id)
+                .field("path", &format_args!("<redacted>"))
+                .finish(),
+            Self::SendAttachment(attachment) => {
+                f.debug_tuple("SendAttachment").field(attachment).finish()
+            }
+            Self::SetRoomNotificationMode { room_id, mode } => f
+                .debug_struct("SetRoomNotificationMode")
+                .field("room_id", room_id)
+                .field("mode", mode)
+                .finish(),
+            Self::SetDefaultNotificationMode { one_to_one, mode } => f
+                .debug_struct("SetDefaultNotificationMode")
+                .field("one_to_one", one_to_one)
+                .field("mode", mode)
+                .finish(),
+            Self::AddKeyword { keyword } => f
+                .debug_struct("AddKeyword")
+                .field(
+                    "keyword",
+                    &format_args!("<redacted, {} bytes>", keyword.len()),
+                )
+                .finish(),
+            Self::RemoveKeyword { keyword } => f
+                .debug_struct("RemoveKeyword")
+                .field(
+                    "keyword",
+                    &format_args!("<redacted, {} bytes>", keyword.len()),
+                )
+                .finish(),
+            Self::CreateRoom(request) => f.debug_tuple("CreateRoom").field(request).finish(),
+            Self::CreateDm { user_id } => f
+                .debug_struct("CreateDm")
+                .field("user_id", user_id)
+                .finish(),
+            Self::JoinRoom { target, via } => f
+                .debug_struct("JoinRoom")
+                .field("target", target)
+                .field("via", via)
+                .finish(),
+            Self::AcceptInvite { room_id } => f
+                .debug_struct("AcceptInvite")
+                .field("room_id", room_id)
+                .finish(),
+            Self::DeclineInvite { room_id } => f
+                .debug_struct("DeclineInvite")
+                .field("room_id", room_id)
+                .finish(),
+            Self::InviteUser { room_id, user_id } => f
+                .debug_struct("InviteUser")
+                .field("room_id", room_id)
+                .field("user_id", user_id)
+                .finish(),
+            Self::LeaveRoom { room_id } => f
+                .debug_struct("LeaveRoom")
+                .field("room_id", room_id)
+                .finish(),
+            Self::OpenRoomDetails { room_id } => f
+                .debug_struct("OpenRoomDetails")
+                .field("room_id", room_id)
+                .finish(),
+            Self::SetRoomName { room_id, name } => f
+                .debug_struct("SetRoomName")
+                .field("room_id", room_id)
+                .field("name", &format_args!("<redacted, {} bytes>", name.len()))
+                .finish(),
+            Self::SetRoomTopic { room_id, topic } => f
+                .debug_struct("SetRoomTopic")
+                .field("room_id", room_id)
+                .field("topic_bytes", &topic.as_ref().map(String::len))
+                .finish(),
+            Self::SetRoomAvatar {
+                room_id,
+                data,
+                mimetype,
+            } => f
+                .debug_struct("SetRoomAvatar")
+                .field("room_id", room_id)
+                .field("data", data)
+                .field("mimetype", mimetype)
+                .finish(),
+            Self::EnableRoomEncryption { room_id } => f
+                .debug_struct("EnableRoomEncryption")
+                .field("room_id", room_id)
+                .finish(),
+            Self::ListRoomMembers { room_id } => f
+                .debug_struct("ListRoomMembers")
+                .field("room_id", room_id)
+                .finish(),
+            Self::SetDisplayName { name } => f
+                .debug_struct("SetDisplayName")
+                .field("name", &format_args!("<redacted, {} bytes>", name.len()))
+                .finish(),
+            Self::SetAvatar { data, mimetype } => f
+                .debug_struct("SetAvatar")
+                .field("data", data)
+                .field("mimetype", mimetype)
+                .finish(),
+            Self::RemoveAvatar => f.write_str("RemoveAvatar"),
+            Self::OpenThread { room_id, root } => f
+                .debug_struct("OpenThread")
+                .field("room_id", room_id)
+                .field("root", root)
+                .finish(),
+            Self::CloseThread => f.write_str("CloseThread"),
+            Self::PaginateThread { room_id, root } => f
+                .debug_struct("PaginateThread")
+                .field("room_id", room_id)
+                .field("root", root)
+                .finish(),
             Self::Logout => f.write_str("Logout"),
             Self::Shutdown => f.write_str("Shutdown"),
             Self::JoinCall { room_id, intent } => f
@@ -633,6 +924,85 @@ pub enum CoreEvent {
         user_id: UserId,
         /// Their trust.
         trust: UserTrust,
+    },
+    /// Answer to [`Command::FetchMedia`].
+    Media {
+        /// Room.
+        room_id: RoomId,
+        /// `TimelineItem::id` of the media message.
+        item_id: String,
+        /// Which rendition was asked for.
+        size: MediaSize,
+        /// The bytes, or why there are none.
+        result: Result<MediaBytes, CoreError>,
+    },
+    /// [`Command::SaveMedia`] wrote the file.
+    MediaSaved {
+        /// Room.
+        room_id: RoomId,
+        /// `TimelineItem::id` of the media message.
+        item_id: String,
+    },
+    /// The server's upload limit, sent after login or restore.
+    MediaLimits {
+        /// Largest upload in bytes, when the server says.
+        max_upload_bytes: Option<u64>,
+    },
+    /// A notification to show; the front end decides whether to.
+    Notification(NotificationView),
+    /// The account's notification defaults and keywords, sent after login or
+    /// restore and on every change.
+    NotificationSettings(NotificationSettingsView),
+    /// Unread totals over all joined, non-muted rooms, for the tray badge.
+    UnreadTotals {
+        /// Unread notifications.
+        notifications: u64,
+        /// Unread highlights.
+        highlights: u64,
+    },
+    /// A room was created.
+    RoomCreated {
+        /// The new room.
+        room_id: RoomId,
+    },
+    /// A room was joined.
+    RoomJoined {
+        /// The room.
+        room_id: RoomId,
+    },
+    /// A room's settings, after [`Command::OpenRoomDetails`] and on every
+    /// change.
+    RoomDetails(RoomDetailsView),
+    /// Answer to [`Command::ListRoomMembers`].
+    RoomMembers {
+        /// Room.
+        room_id: RoomId,
+        /// Members, sorted by role then name; at most 5,000.
+        members: Vec<RoomMemberView>,
+        /// There were more members than the list holds.
+        truncated: bool,
+    },
+    /// The user's own profile, sent after login or restore and on change.
+    OwnProfile(OwnProfileView),
+    /// The spaces the user has joined.
+    Spaces(Vec<SpaceView>),
+    /// The open thread's timeline changed.
+    ThreadDiff {
+        /// Room.
+        room_id: RoomId,
+        /// The thread's root event.
+        root: EventId,
+        /// Changes, in order.
+        diffs: Vec<ListDiff<TimelineItem>>,
+    },
+    /// Back-pagination of the open thread changed state.
+    ThreadPagination {
+        /// Room.
+        room_id: RoomId,
+        /// The thread's root event.
+        root: EventId,
+        /// The new state.
+        state: PaginationState,
     },
     /// Any other error.
     Error(CoreError),
@@ -904,6 +1274,7 @@ mod tests {
             reply_to: Some("item-1".into()),
             kind: MessageKind::Text,
             format: TextFormat::Markdown,
+            thread_root: None,
         }
     }
 
@@ -1081,6 +1452,217 @@ mod tests {
         assert_eq!(
             TimelineItemKind::DateDivider { timestamp_ms: 1 },
             TimelineItemKind::DateDivider { timestamp_ms: 1 }
+        );
+    }
+
+    const FILE_SENTINEL: &str = "secret-name-x.png";
+
+    fn assert_no_phase5_secret(dbg: &str) {
+        for s in [
+            FILE_SENTINEL,
+            "secret-body-x",
+            "secret-name-x",
+            "secret-key-x",
+        ] {
+            assert!(!dbg.contains(s), "{s} leaked in {dbg}");
+        }
+    }
+
+    fn media_content() -> MediaContent {
+        MediaContent::new(MediaKind::Image, FILE_SENTINEL.into())
+    }
+
+    fn attachment() -> OutgoingAttachment {
+        OutgoingAttachment {
+            room_id: RoomId::from("!r:x"),
+            filename: FILE_SENTINEL.into(),
+            mimetype: "image/png".into(),
+            data: AttachmentData::Path(PathBuf::from("/home/secret-name-x/pic.png")),
+            kind: MediaKind::Image,
+            width: Some(2),
+            height: Some(3),
+            thumbnail: Some(UploadThumbnail {
+                data: MediaBytes::from(b"secret-body-x".to_vec()),
+                mimetype: "image/jpeg".into(),
+                width: 1,
+                height: 1,
+            }),
+            reply_to: None,
+            thread_root: None,
+        }
+    }
+
+    #[test]
+    fn media_bytes_compare_by_content_and_debug_shows_the_length() {
+        let a = MediaBytes::from(b"secret-body-x".to_vec());
+        assert_eq!(a, MediaBytes::from(b"secret-body-x".to_vec()));
+        assert_ne!(a, MediaBytes::from(vec![1]));
+        assert_eq!(a.clone().as_bytes(), a.as_bytes());
+        let dbg = format!("{a:?}");
+        assert_eq!(dbg, "MediaBytes(<13 bytes>)");
+        let ev = CoreEvent::Media {
+            room_id: RoomId::from("!r:x"),
+            item_id: "i".into(),
+            size: MediaSize::Full,
+            result: Ok(a),
+        };
+        assert_no_phase5_secret(&format!("{ev:?}"));
+    }
+
+    #[test]
+    fn media_attachment_and_command_debug_hide_names_paths_and_bytes() {
+        let dbg = format!("{:?}", media_content());
+        assert_no_phase5_secret(&dbg);
+        assert!(dbg.contains("Image"), "{dbg}");
+        let details = MessageDetails {
+            media: Some(Box::new(media_content())),
+            ..MessageDetails::default()
+        };
+        let item = TimelineItem::new(
+            "i".into(),
+            TimelineItemKind::Message {
+                sender: UserId::from("@a:x"),
+                body: FILE_SENTINEL.into(),
+                is_own: false,
+                timestamp_ms: 1,
+                sent: SendStatus::Sent,
+                details: Box::new(details),
+            },
+        );
+        assert_no_phase5_secret(&format!("{item:?}"));
+        assert_no_phase5_secret(&format!("{:?}", attachment()));
+        assert_no_phase5_secret(&format!("{:?}", Command::SendAttachment(attachment())));
+        let save = Command::SaveMedia {
+            room_id: RoomId::from("!r:x"),
+            item_id: "i".into(),
+            path: PathBuf::from("/home/secret-name-x/secret-name-x.png"),
+        };
+        let dbg = format!("{save:?}");
+        assert_no_phase5_secret(&dbg);
+        assert!(dbg.contains("!r:x"), "{dbg}");
+    }
+
+    #[test]
+    fn notification_keyword_and_profile_debug_are_clean() {
+        let view = NotificationView {
+            room_id: RoomId::from("!r:x"),
+            event_id: EventId::from("$e"),
+            room_name: "secret-name-x".into(),
+            sender: UserId::from("@a:x"),
+            sender_name: Some("secret-name-x".into()),
+            is_dm: false,
+            kind: NotificationKind::Mention,
+            preview: Some(MessageText::from("secret-body-x")),
+        };
+        let dbg = format!("{view:?}");
+        assert_no_phase5_secret(&dbg);
+        assert!(dbg.contains("@a:x") && dbg.contains("Mention"), "{dbg}");
+        assert_no_phase5_secret(&format!("{:?}", CoreEvent::Notification(view)));
+        let settings = NotificationSettingsView {
+            group_default: RoomNotificationModeView::AllMessages,
+            dm_default: RoomNotificationModeView::Mute,
+            keywords: vec!["secret-name-x".into()],
+        };
+        assert_no_phase5_secret(&format!("{:?}", CoreEvent::NotificationSettings(settings)));
+        for cmd in [
+            Command::AddKeyword {
+                keyword: "secret-name-x".into(),
+            },
+            Command::RemoveKeyword {
+                keyword: "secret-name-x".into(),
+            },
+            Command::SetDisplayName {
+                name: "secret-name-x".into(),
+            },
+            Command::SetAvatar {
+                data: MediaBytes::from(b"secret-body-x".to_vec()),
+                mimetype: "image/png".into(),
+            },
+            Command::SetRoomName {
+                room_id: RoomId::from("!r:x"),
+                name: "secret-name-x".into(),
+            },
+            Command::SetRoomTopic {
+                room_id: RoomId::from("!r:x"),
+                topic: Some("secret-name-x".into()),
+            },
+            Command::CreateRoom(CreateRoomRequest {
+                name: "secret-name-x".into(),
+                topic: Some("secret-name-x".into()),
+                encrypted: true,
+                visibility: RoomVisibility::Public {
+                    alias: "secret-name-x".into(),
+                },
+                invitees: Vec::new(),
+            }),
+        ] {
+            assert_no_phase5_secret(&format!("{cmd:?}"));
+        }
+        let events = [
+            CoreEvent::OwnProfile(OwnProfileView {
+                display_name: Some("secret-name-x".into()),
+                avatar: None,
+            }),
+            CoreEvent::RoomDetails(RoomDetailsView {
+                room_id: RoomId::from("!r:x"),
+                name: "secret-name-x".into(),
+                topic: Some("secret-name-x".into()),
+                avatar: None,
+                is_encrypted: true,
+                alias: Some("secret-name-x".into()),
+                permissions: RoomPermissions::default(),
+            }),
+            CoreEvent::RoomMembers {
+                room_id: RoomId::from("!r:x"),
+                members: vec![RoomMemberView {
+                    user_id: UserId::from("@a:x"),
+                    display_name: Some("secret-name-x".into()),
+                    avatar: None,
+                    power: PowerLevelView::Level(50),
+                    role: Role::Moderator,
+                    membership: MembershipView::Joined,
+                }],
+                truncated: false,
+            },
+            CoreEvent::Spaces(vec![SpaceView {
+                id: RoomId::from("!s:x"),
+                name: "secret-name-x".into(),
+                avatar: None,
+                level: 0,
+                children: 3,
+            }]),
+        ];
+        for ev in events {
+            assert_no_phase5_secret(&format!("{ev:?}"));
+        }
+        let thread = ThreadSummaryView {
+            replies: 2,
+            latest_sender: Some(UserId::from("@a:x")),
+            latest_sender_name: Some("secret-name-x".into()),
+            latest_preview: Some("secret-body-x".into()),
+        };
+        let details = MessageDetails {
+            thread: Some(thread),
+            ..MessageDetails::default()
+        };
+        assert_no_phase5_secret(&format!("{details:?}"));
+        assert_no_phase5_secret(&format!("{:?}", UiSettings::default()));
+    }
+
+    #[test]
+    fn existing_constructors_give_phase5_fields_their_defaults() {
+        let r = RoomSummary::new(RoomId::from("!r:x"), "Lounge".into());
+        assert!(r.notification_mode.is_none());
+        assert!(RoomListQuery::default().space.is_none());
+        let d = MessageDetails::default();
+        assert!(d.media.is_none() && d.thread.is_none());
+        assert!(outgoing().thread_root.is_none());
+        let s = UiSettings::default();
+        assert_eq!(s.theme, ThemeChoice::System);
+        assert!(s.desktop_notifications && s.show_message_content && s.tray_badge);
+        assert_eq!(
+            MediaContent::new(MediaKind::File, "f".into()),
+            MediaContent::new(MediaKind::File, "f".into())
         );
     }
 

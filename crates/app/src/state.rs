@@ -768,6 +768,7 @@ impl App {
                 let query = RoomListQuery {
                     tab,
                     search: self.query.search.clone(),
+                    space: self.query.space.clone(),
                 };
                 self.set_query(query)
             }
@@ -775,6 +776,7 @@ impl App {
                 let query = RoomListQuery {
                     tab: self.query.tab,
                     search: search.trim().to_owned(),
+                    space: self.query.space.clone(),
                 };
                 self.search_input = search;
                 self.set_query(query)
@@ -1018,6 +1020,22 @@ impl App {
             }
             CoreEvent::UserTrust { user_id, trust } => self.remember_trust(user_id, trust),
             CoreEvent::Devices(list) => self.on_devices_event(list),
+            // Phase 5 events: the app screens that show them arrive with the
+            // UI tasks of the Phase 5 plan; until then they are ignored.
+            CoreEvent::Media { .. }
+            | CoreEvent::MediaSaved { .. }
+            | CoreEvent::MediaLimits { .. }
+            | CoreEvent::Notification(_)
+            | CoreEvent::NotificationSettings(_)
+            | CoreEvent::UnreadTotals { .. }
+            | CoreEvent::RoomCreated { .. }
+            | CoreEvent::RoomJoined { .. }
+            | CoreEvent::RoomDetails(_)
+            | CoreEvent::RoomMembers { .. }
+            | CoreEvent::OwnProfile(_)
+            | CoreEvent::Spaces(_)
+            | CoreEvent::ThreadDiff { .. }
+            | CoreEvent::ThreadPagination { .. } => {}
             // Calls and audio have no UI yet (Phase 6 UI tasks).
             CoreEvent::CallState(_)
             | CoreEvent::CallParticipants { .. }

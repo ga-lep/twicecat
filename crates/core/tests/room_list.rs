@@ -237,6 +237,7 @@ async fn search_query_filters_the_list() {
         .send(Command::SetRoomListQuery(RoomListQuery {
             tab: RoomListTab::All,
             search: name_a.clone(),
+            space: None,
         }))
         .await
         .unwrap();
@@ -276,6 +277,7 @@ async fn tab_queries_split_dms_rooms_and_spaces() {
         Command::SetRoomListQuery(RoomListQuery {
             tab,
             search: String::new(),
+            space: None,
         })
     };
     core.commands

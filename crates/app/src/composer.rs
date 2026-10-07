@@ -1013,6 +1013,7 @@ fn build(
         reply_to,
         kind,
         format,
+        thread_root: None,
     })
 }
 

@@ -378,6 +378,7 @@ mod tests {
             reply_to: None,
             kind,
             format: TextFormat::Markdown,
+            thread_root: None,
         }
     }
 

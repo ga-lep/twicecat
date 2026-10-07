@@ -654,7 +654,7 @@ App:
 ## Phase 5 steps
 - [x] 1. Phase 5 ledger, sign-off record and test helpers (phase5.1)
 - [x] 2. Phase 5 dependencies and licence triage (phase5.2)
-- [ ] 3. Additive core API for Phase 5
+- [x] 3. Additive core API for Phase 5 (phase5.3)
 - [ ] 4. Media in the timeline: mapping, fetch and save in the core (roadmap steps 1 and 2, core side)
 - [ ] 5. Uploads with local echo and progress in the core (roadmap step 3, core side)
 - [ ] 6. Notifications, notification settings and unread totals in the core (roadmap step 4, core side)
@@ -697,6 +697,17 @@ Phase 4 signed off by the human on 2026-10-07 and merged (PR #7, 5d2f4fb); QR sc
 - `cargo tree -p tessera-app -e normal --depth 1` lists arboard, notify-rust, rfd and tray-icon. `cargo tree -p tessera-app -i gtk-sys --target all` finds no such package (no GTK in the lock).
 - `mime` moved from `[dev-dependencies]` to `[dependencies]` in `crates/core` (not declared twice).
 - No APIs used yet; they are confirmed in the tasks that call them.
+- Open issues: none. New human items: none.
+
+## Phase 5 / Task 3 notes
+- Checks run (all pass): `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`, `cargo test --workspace --locked`, `scripts/check-app-deps.sh`, `scripts/check-core-api.sh`, `cargo deny check`. Ignored run (`docker compose up -d --wait && scripts/prune-test-rooms.sh && cargo test -p tessera-core -p tessera-app --locked -- --ignored --skip keyring`, then `docker compose stop`): all pass, **445 s**. No encrypted-media test was added, so no repeat run.
+- Test-first: the engine tests (`phase5_commands_without_a_session_fail_with_not_logged_in`, `phase5_commands_with_a_session_are_not_implemented_yet`) were written before the stub and the workspace failed to compile (non-exhaustive `Command` match); the redaction, default and CLI-line tests were added with the types (they passed at once, the types being redacted by construction).
+- New API (all `Clone + Debug + PartialEq`, SDK-free; `api/media.rs`, `api/rooms.rs`, `api/types.rs`, `api/mod.rs`): `MediaBytes` (`Arc<[u8]>`, equal by content), `MediaKind`, `MediaSize`, `UploadProgress`, `MediaContent`, `AttachmentData`, `UploadThumbnail`, `OutgoingAttachment`, `NotificationKind`, `NotificationView`, `RoomNotificationModeView`, `NotificationSettingsView`, `RoomVisibility`, `CreateRoomRequest`, `RoomPermissions`, `RoomDetailsView`, `PowerLevelView`, `Role`, `MembershipView`, `RoomMemberView`, `OwnProfileView`, `SpaceView`, `ThreadSummaryView`, `ThemeChoice`, `UiSettings`. Fields added: `MessageDetails.media`/`.thread`, `RoomSummary.notification_mode`, `RoomListQuery.space`, `OutgoingMessage.thread_root`. `ActionKind` gains `Media`, `Upload`, `Notifications`, `Rooms`, `Profile`, `Thread`. Constructors (`RoomSummary::new`, `Default`s, the composer and tests) give `None`/defaults; the app keeps the query's `space` when the tab or search changes.
+- New commands: `FetchMedia`, `SaveMedia`, `SendAttachment`, `SetRoomNotificationMode`, `SetDefaultNotificationMode`, `AddKeyword`, `RemoveKeyword`, `CreateRoom`, `CreateDm`, `JoinRoom`, `AcceptInvite`, `DeclineInvite`, `InviteUser`, `LeaveRoom`, `OpenRoomDetails`, `SetRoomName`, `SetRoomTopic`, `SetRoomAvatar`, `EnableRoomEncryption`, `ListRoomMembers`, `SetDisplayName`, `SetAvatar`, `RemoveAvatar`, `OpenThread`, `CloseThread`, `PaginateThread`. New events: `Media`, `MediaSaved`, `MediaLimits`, `Notification`, `NotificationSettings`, `UnreadTotals`, `RoomCreated`, `RoomJoined`, `RoomDetails`, `RoomMembers`, `OwnProfile`, `Spaces`, `ThreadDiff`, `ThreadPagination`.
+- Shape choices the plan left open (recommendation applied, none needs the human to stop): (1) the plan's `RoomDetails { .. }` and `OwnProfile { .. }` events carry a view struct (`RoomDetailsView`, `OwnProfileView`) so that their `Debug` can hide names and topics; (2) `SetRoomNotificationMode.mode` is `Option<..>` (`None` is "Use default", which deletes the user-defined rule); (3) the room-settings panel needs commands the plan's list did not name, added as `SetRoomName`, `SetRoomTopic`, `SetRoomAvatar`, `EnableRoomEncryption`, and the open thread needs `PaginateThread` (its pagination event was named, its trigger was not); (4) `CreateRoom` takes a `CreateRoomRequest`; (5) the `Debug` of display names, room and space names, topics, aliases, keywords and file names prints lengths only.
+- Engine: `unimplemented_target(&Command)` maps each new command to its room (empty when it names none) and `ActionKind`; `handle` answers `NotLoggedIn` without a session and `ActionFailed { Internal("not implemented yet") }` with one. Tasks 4-8 replace these arms.
+- CLI: `phase5_line` prints one line per new event (kind and counts only, never previews, names, file names, keywords or bytes); tested with sentinels. The app ignores the new events until its UI tasks.
+- No matrix-sdk(-ui/-base), ruma, iced, winit, rfd, arboard, notify-rust or tray-icon API was used in this task.
 - Open issues: none. New human items: none.
 
 ## Phase 5 human checkpoint
