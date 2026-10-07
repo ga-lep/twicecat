@@ -5667,10 +5667,20 @@ mod tests {
     const PW_S: &str = "secret-pw-sweep";
     const EMOJI_S: &str = "secret-emoji-sweep";
     const NAME_S: &str = "secret-name-sweep";
-    const ALL_S: [&str; 6] = [KEY_S, INPUT_S, COPIED_S, PW_S, EMOJI_S, NAME_S];
+    const LOGIN_PW_S: &str = "secret-login-pw-sweep";
+    const URL_S: &str = "secret-url-state-sweep";
+    const TEXT_S: &str = "secret-text-sweep";
+    const PASTE_S: &str = "secret-paste-sweep";
+    const ALL_S: [&str; 10] = [
+        KEY_S, INPUT_S, COPIED_S, PW_S, EMOJI_S, NAME_S, LOGIN_PW_S, URL_S, TEXT_S, PASTE_S,
+    ];
 
-    /// Every message that can carry a secret, built the way the app and the
-    /// core build them.
+    /// The messages that carry a secret or typed text, built the way the app
+    /// and the core build them: the recovery key and its inputs, the
+    /// re-authentication passwords, the login password, the two OAuth URLs
+    /// (their `state` is a secret), the QR code, and the text typed or pasted
+    /// into the composer, the picker search and a reaction key. Not covered:
+    /// messages that carry only IDs, flags or an index.
     fn secret_messages() -> Vec<Message> {
         vec![
             core(CoreEvent::RecoveryKeyReady(RecoveryKey::from(KEY_S))),
@@ -5688,6 +5698,23 @@ mod tests {
                 id: vid(),
                 phase: tessera_core::api::VerificationPhase::ShowQr(vqr()),
             }),
+            Message::PasswordChanged(Password::from(LOGIN_PW_S)),
+            core(CoreEvent::OAuthUrl(AuthUrl::from(format!(
+                "https://auth.example.org/a?state={URL_S}"
+            )))),
+            core(CoreEvent::OpenAccountManagement(AuthUrl::from(format!(
+                "https://auth.example.org/account?state={URL_S}"
+            )))),
+            Message::Composer(EditorAction(Action::Edit(Edit::Paste(Arc::new(
+                PASTE_S.to_owned(),
+            ))))),
+            Message::Composer(EditorAction(Action::Edit(Edit::Insert('x')))),
+            Message::PickerQuery(MessageText::from(TEXT_S)),
+            Message::PickerPicked(MessageText::from(TEXT_S)),
+            Message::ReactionToggled {
+                item: "item-1".to_owned(),
+                key: MessageText::from(TEXT_S),
+            },
         ]
     }
 
@@ -5773,6 +5800,23 @@ mod tests {
         let _ = ses(&mut app, SessionsMessage::RenameInput(NAME_S.to_owned()));
         assert!(app.sessions.open && app.sessions.rename.is_some());
         assert_no_sentinel("sessions", &format!("{app:?}"), &ALL_S);
+
+        // The login form with a typed password, then waiting for the browser
+        // with the OAuth URL (and its `state`) held for **Copy link**.
+        let (mut app, _rx) = login_app();
+        let _ = app.update(Message::PasswordChanged(Password::from(LOGIN_PW_S)));
+        assert_no_sentinel("login form", &format!("{app:?}"), &ALL_S);
+        let (app, _rx, _task) = waiting_app(&format!("https://auth.example.org/a?state={URL_S}"));
+        assert!(app.browser_link.is_some(), "the link is held");
+        assert_no_sentinel("waiting for the browser", &format!("{app:?}"), &ALL_S);
+
+        // The composer with pasted text, and the picker with a search typed.
+        let (mut app, _rx) = main_app();
+        let _ = app.update(Message::Composer(EditorAction(Action::Edit(Edit::Paste(
+            Arc::new(PASTE_S.to_owned()),
+        )))));
+        let _ = app.update(Message::PickerQuery(MessageText::from(TEXT_S)));
+        assert_no_sentinel("composer and picker", &format!("{app:?}"), &ALL_S);
 
         // The messages that carry secrets.
         for message in secret_messages() {
