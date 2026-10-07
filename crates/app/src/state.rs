@@ -13,7 +13,7 @@ use iced::{Element, Subscription, Task, Theme, clipboard, system, window};
 use tessera_core::api::{
     ActionKind, Command, CoreError, CoreEvent, Draft, EventId, ListDiff, MessageDetails,
     MessageText, OutgoingMessage, Password, RoomId, RoomListQuery, RoomListTab, RoomSummary,
-    SyncState, TimelineItem, TimelineItemKind, TypingUser, UserId,
+    SyncState, TimelineItem, TimelineItemKind, TypingUser, UserId, UserTrust,
 };
 use tokio::sync::mpsc;
 
@@ -31,6 +31,10 @@ use crate::security::{SecurityMessage, SecurityModel};
 use crate::text_safety;
 use crate::timeline::{self, Effects, TimelineView};
 use crate::verification::{VerificationMessage, VerificationModel};
+
+/// How many users' trust the app keeps: the selected peer, and a stale one or
+/// two from watchers the core replaced.
+pub const MAX_TRUST_KEPT: usize = 8;
 
 /// How long to wait for the core to close after `Shutdown` (plan Q18).
 pub const SHUTDOWN_WAIT: Duration = Duration::from_secs(10);
@@ -257,6 +261,8 @@ pub enum Message {
     CloseRequested,
     /// The core did not close in time after `Shutdown`.
     ShutdownDeadline,
+    /// **Verify** in the header of a direct message.
+    VerifyPeerRequested,
     /// A message of the security banner and screens.
     Security(SecurityMessage),
     /// A button of the verification dialog.
@@ -297,6 +303,12 @@ pub struct App {
     pub selected: Option<RoomId>,
     /// The selected room's timeline, kept in step with the core's diffs.
     pub timeline: TimelineView,
+    /// The latest trust the core reported per user, for the DM header. The
+    /// core says nothing about which room a `UserTrust` belongs to, and an
+    /// aborted watcher can still deliver one for the previous peer after the
+    /// new one, so the header looks up the selected peer by ID
+    /// ([`App::dm_peer_trust`]). Capped at [`MAX_TRUST_KEPT`].
+    pub user_trust: Vec<(UserId, UserTrust)>,
     /// The signed-in account.
     pub user_id: Option<UserId>,
     /// The last sync state.
@@ -396,6 +408,7 @@ impl App {
             avatars: Avatars::default(),
             selected: None,
             timeline: TimelineView::default(),
+            user_trust: Vec::new(),
             user_id: None,
             sync_state: SyncState::Idle,
             login: LoginForm::new(),
@@ -437,6 +450,39 @@ impl App {
                 .expect("iced boots the application exactly once");
             App::new(startup)
         }
+    }
+
+    /// The selected room's other person and the core's latest word on their
+    /// trust: `None` unless the room is a direct message with exactly one
+    /// other sender and the core reported that user. A report for anyone else
+    /// is ignored.
+    pub fn dm_peer_trust(&self) -> Option<(&UserId, UserTrust)> {
+        let (peer, _) = self.dm_peer()?;
+        self.user_trust
+            .iter()
+            .find(|(user, _)| user == peer)
+            .map(|(user, trust)| (user, *trust))
+    }
+
+    /// The selected direct message's other person (see
+    /// [`timeline::dm_peer`]).
+    pub fn dm_peer(&self) -> Option<(&UserId, &RoomSummary)> {
+        let room = self
+            .selected
+            .as_ref()
+            .and_then(|id| self.rooms.iter().find(|room| room.id == *id))
+            .filter(|room| room.is_dm)?;
+        let peer = timeline::dm_peer(&self.timeline.items, self.user_id.as_ref())?;
+        Some((peer, room))
+    }
+
+    /// Keeps the core's word on `user`'s trust, newest last.
+    fn remember_trust(&mut self, user: UserId, trust: UserTrust) {
+        self.user_trust.retain(|(known, _)| *known != user);
+        if self.user_trust.len() >= MAX_TRUST_KEPT {
+            self.user_trust.remove(0);
+        }
+        self.user_trust.push((user, trust));
     }
 
     pub(crate) fn send(&self, command: Command) -> Task<Message> {
@@ -675,6 +721,13 @@ impl App {
                 let flush = self.drop_secrets();
                 Task::batch([flush, self.send(Command::Logout)])
             }
+            Message::VerifyPeerRequested => match self.dm_peer() {
+                Some((peer, _)) => {
+                    let user_id = peer.clone();
+                    self.send(Command::RequestUserVerification { user_id })
+                }
+                None => Task::none(),
+            },
             Message::Security(message) => self.on_security(message),
             Message::Verification(message) => self.on_verification(message),
             Message::SelectRoom(id) => {
@@ -689,6 +742,7 @@ impl App {
                 self.draft_seq = self.draft_seq.wrapping_add(1);
                 self.selected = Some(id.clone());
                 self.timeline.reset();
+                self.user_trust.clear();
                 self.typing.clear();
                 self.actions.reset();
                 self.clear_draft();
@@ -931,7 +985,8 @@ impl App {
             CoreEvent::Verification { id, phase } => {
                 task = self.on_verification_phase(&id, phase);
             }
-            CoreEvent::Devices(_) | CoreEvent::UserTrust { .. } => {}
+            CoreEvent::UserTrust { user_id, trust } => self.remember_trust(user_id, trust),
+            CoreEvent::Devices(_) => {}
         }
         task
     }
@@ -1421,6 +1476,7 @@ impl App {
     fn deselect(&mut self) {
         self.selected = None;
         self.timeline.reset();
+        self.user_trust.clear();
         self.typing.clear();
         self.actions.reset();
         self.clear_draft();
@@ -4502,5 +4558,146 @@ mod tests {
         vphase(&mut app, VP::ShowQr(vqr()));
         let _ = app.back_to_login("signed out");
         assert!(app.verification.is_none());
+    }
+
+    // ---- Task 12: the trust of a DM peer in the header --------------------
+
+    fn dm_app() -> (App, mpsc::Receiver<Command>) {
+        let (mut app, mut rx) = app_with(32);
+        logged_in(&mut app);
+        let mut dm = RoomSummary::new(RoomId::from("!dm:x"), "Bob".to_owned());
+        dm.is_dm = true;
+        let room = RoomSummary::new(RoomId::from("!room:x"), "Lounge".to_owned());
+        let _ = app.update(core(CoreEvent::RoomListChanged(vec![ListDiff::Reset {
+            values: vec![dm, room],
+        }])));
+        let _ = app.update(Message::SelectRoom(RoomId::from("!dm:x")));
+        let _ = app.update(core(CoreEvent::TimelineDiff {
+            room_id: RoomId::from("!dm:x"),
+            diffs: vec![ListDiff::Reset {
+                values: vec![from_bob()],
+            }],
+        }));
+        while rx.try_recv().is_ok() {}
+        (app, rx)
+    }
+
+    fn from_bob() -> TimelineItem {
+        TimelineItem::new(
+            "m".to_owned(),
+            TimelineItemKind::Message {
+                sender: UserId::from("@bob:x"),
+                body: String::new(),
+                is_own: false,
+                timestamp_ms: 0,
+                sent: tessera_core::api::SendStatus::Sent,
+                details: Box::default(),
+            },
+        )
+    }
+
+    fn trust(app: &mut App, user: &str, trust: UserTrust) {
+        let _ = app.update(core(CoreEvent::UserTrust {
+            user_id: UserId::from(user),
+            trust,
+        }));
+    }
+
+    #[test]
+    fn the_header_shows_the_trust_of_the_selected_dm_peer() {
+        let (mut app, _rx) = dm_app();
+        assert_eq!(app.dm_peer_trust(), None, "nothing reported yet");
+        trust(&mut app, "@bob:x", UserTrust::Unverified);
+        assert_eq!(
+            app.dm_peer_trust(),
+            Some((&UserId::from("@bob:x"), UserTrust::Unverified))
+        );
+        trust(&mut app, "@bob:x", UserTrust::Verified);
+        assert_eq!(
+            app.dm_peer_trust(),
+            Some((&UserId::from("@bob:x"), UserTrust::Verified))
+        );
+    }
+
+    #[test]
+    fn a_trust_for_another_user_is_ignored_by_the_header() {
+        let (mut app, _rx) = dm_app();
+        trust(&mut app, "@bob:x", UserTrust::Unverified);
+        // A late report of an aborted watcher for the previous room's peer.
+        trust(&mut app, "@carol:x", UserTrust::Verified);
+        assert_eq!(
+            app.dm_peer_trust(),
+            Some((&UserId::from("@bob:x"), UserTrust::Unverified))
+        );
+        let (mut app, _rx) = dm_app();
+        trust(&mut app, "@carol:x", UserTrust::Verified);
+        assert_eq!(app.dm_peer_trust(), None);
+    }
+
+    #[test]
+    fn a_trust_report_that_arrives_before_the_timeline_still_counts() {
+        let (mut app, _rx) = dm_app();
+        let _ = app.update(Message::SelectRoom(RoomId::from("!room:x")));
+        let _ = app.update(Message::SelectRoom(RoomId::from("!dm:x")));
+        trust(&mut app, "@bob:x", UserTrust::Verified);
+        assert_eq!(app.dm_peer_trust(), None, "no peer known yet");
+        let _ = app.update(core(CoreEvent::TimelineDiff {
+            room_id: RoomId::from("!dm:x"),
+            diffs: vec![ListDiff::Reset {
+                values: vec![from_bob()],
+            }],
+        }));
+        assert_eq!(
+            app.dm_peer_trust(),
+            Some((&UserId::from("@bob:x"), UserTrust::Verified))
+        );
+    }
+
+    #[test]
+    fn a_room_that_is_not_a_dm_has_no_peer_trust() {
+        let (mut app, _rx) = dm_app();
+        trust(&mut app, "@bob:x", UserTrust::Unverified);
+        let _ = app.update(Message::SelectRoom(RoomId::from("!room:x")));
+        let _ = app.update(core(CoreEvent::TimelineDiff {
+            room_id: RoomId::from("!room:x"),
+            diffs: vec![ListDiff::Reset {
+                values: vec![from_bob()],
+            }],
+        }));
+        trust(&mut app, "@bob:x", UserTrust::Unverified);
+        assert_eq!(app.dm_peer_trust(), None);
+    }
+
+    #[test]
+    fn the_kept_trusts_are_capped_and_cleared_on_selecting_a_room() {
+        let (mut app, _rx) = dm_app();
+        for n in 0..(MAX_TRUST_KEPT * 3) {
+            trust(&mut app, &format!("@u{n}:x"), UserTrust::Verified);
+        }
+        assert_eq!(app.user_trust.len(), MAX_TRUST_KEPT);
+        let _ = app.update(Message::SelectRoom(RoomId::from("!room:x")));
+        assert!(app.user_trust.is_empty());
+    }
+
+    #[test]
+    fn verify_sends_a_request_for_the_peer() {
+        let (mut app, mut rx) = dm_app();
+        trust(&mut app, "@bob:x", UserTrust::Unverified);
+        let _ = app.update(Message::VerifyPeerRequested);
+        let commands = drain(&mut rx);
+        assert_eq!(commands.len(), 1, "{commands:?}");
+        assert!(
+            matches!(&commands[0], Command::RequestUserVerification { user_id } if user_id.as_str() == "@bob:x"),
+            "{commands:?}"
+        );
+    }
+
+    #[test]
+    fn verify_without_a_peer_sends_nothing() {
+        let (mut app, mut rx) = dm_app();
+        let _ = app.update(Message::SelectRoom(RoomId::from("!room:x")));
+        let _ = drain(&mut rx);
+        let _ = app.update(Message::VerifyPeerRequested);
+        assert!(drain(&mut rx).is_empty());
     }
 }

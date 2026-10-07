@@ -55,6 +55,17 @@ pub fn count_label(count: u64) -> String {
     }
 }
 
+/// The mark of an encrypted room, in the list row and the room header.
+pub const LOCK_MARK: &str = "\u{1F512}";
+
+/// The lock of `room`, when it is known to be encrypted. The core reports
+/// `is_encrypted` as false while the SDK does not know the room's encryption
+/// yet, so a missing lock does not say "not encrypted": only the lock is
+/// ever drawn, never a mark for the opposite.
+pub fn encrypted_mark(room: &RoomSummary) -> Option<&'static str> {
+    room.is_encrypted.then_some(LOCK_MARK)
+}
+
 /// The pane: tabs, search, then the list or an empty-state line.
 pub fn view(app: &App) -> Element<'_, Message> {
     let tabs = row(TABS.into_iter().map(|tab| {
@@ -121,6 +132,9 @@ fn room_row<'a>(room: &'a RoomSummary, avatars: &Avatars, selected: bool) -> Ele
     let mut name_line = row![text(name).wrapping(Wrapping::None).width(Fill)]
         .spacing(6)
         .align_y(iced::Center);
+    if let Some(lock) = encrypted_mark(room) {
+        name_line = name_line.push(text(lock).size(12));
+    }
     if room.is_invite {
         name_line = name_line.push(tag("Invite"));
     }
@@ -247,6 +261,14 @@ fn pill<'a>(label: String, highlight: bool) -> Element<'a, Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_room_known_to_be_encrypted_has_a_lock() {
+        let mut room = RoomSummary::new(tessera_core::api::RoomId::from("!r:x"), "r".to_owned());
+        assert_eq!(encrypted_mark(&room), None);
+        room.is_encrypted = true;
+        assert_eq!(encrypted_mark(&room), Some(LOCK_MARK));
+    }
 
     #[test]
     fn tab_labels() {

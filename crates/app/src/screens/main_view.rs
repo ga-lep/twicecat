@@ -6,7 +6,7 @@ use iced::widget::{
     text_input,
 };
 use iced::{Element, Fill};
-use tessera_core::api::{MessageText, UserId};
+use tessera_core::api::{MessageText, UserId, UserTrust};
 
 use crate::actions::{self, Picker};
 use crate::composer::{self, EditorAction, Mode, Suggestions};
@@ -25,6 +25,84 @@ pub const LIST_PANE_WIDTH: f32 = 300.0;
 /// A room name ready to draw: one line, capped, a placeholder when blank.
 pub fn display_name(name: &str) -> String {
     name_or_placeholder(name, MAX_NAME_CHARS)
+}
+
+/// What the header of a direct message says about the other person.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Badge {
+    /// Verified by the user.
+    Verified,
+    /// Not verified.
+    NotVerified,
+    /// A verified person's identity changed.
+    IdentityChanged,
+}
+
+impl Badge {
+    /// The badge's words.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Verified => "Verified",
+            Self::NotVerified => "Not verified",
+            Self::IdentityChanged => "Identity changed",
+        }
+    }
+
+    /// Whether the header offers **Verify** next to it.
+    pub fn can_verify(self) -> bool {
+        !matches!(self, Self::Verified)
+    }
+}
+
+/// The badge for a person's trust (plan Q10); nothing for a person without a
+/// cross-signing identity.
+pub fn trust_badge(trust: UserTrust) -> Option<Badge> {
+    match trust {
+        UserTrust::Verified => Some(Badge::Verified),
+        UserTrust::Unverified => Some(Badge::NotVerified),
+        UserTrust::IdentityChanged => Some(Badge::IdentityChanged),
+        UserTrust::NoIdentity => None,
+    }
+}
+
+/// The room header: the name, a lock for an encrypted room, and for a direct
+/// message the trust of the other person with **Verify** where it helps. Always
+/// one row, so the column around it keeps its widget types.
+fn header<'a>(app: &'a App, title: String) -> Element<'a, Message> {
+    let mut line = Row::new().spacing(8).align_y(iced::Center);
+    line = line.push(text(title).size(22));
+    let selected = app
+        .selected
+        .as_ref()
+        .and_then(|id| app.rooms.iter().find(|room| room.id == *id));
+    if let Some(lock) = selected.and_then(room_list_pane::encrypted_mark) {
+        line = line.push(text(lock).size(16));
+    }
+    if let Some(badge) = app
+        .dm_peer_trust()
+        .and_then(|(_, trust)| trust_badge(trust))
+    {
+        line = line.push(
+            text(badge.label())
+                .size(13)
+                .style(move |theme: &iced::Theme| text::Style {
+                    color: Some(match badge {
+                        Badge::Verified => theme.palette().success,
+                        Badge::NotVerified => theme::semantic(theme).muted,
+                        Badge::IdentityChanged => theme.palette().danger,
+                    }),
+                }),
+        );
+        if badge.can_verify() {
+            line = line.push(
+                button(text("Verify").size(13))
+                    .padding([2, 8])
+                    .style(button::secondary)
+                    .on_press(Message::VerifyPeerRequested),
+            );
+        }
+    }
+    line.into()
 }
 
 /// The main screen: panes above a status bar.
@@ -112,7 +190,7 @@ fn room_pane(app: &App) -> Element<'_, Message> {
         bars.push(bar);
     }
     let body = room_column(
-        text(title).size(22).into(),
+        header(app, title),
         timeline_layer(timeline.into(), picker),
         bars,
         editor(app, enabled),
@@ -398,6 +476,31 @@ fn status_bar(app: &App) -> Element<'_, Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trust_maps_to_a_badge() {
+        assert_eq!(trust_badge(UserTrust::Verified), Some(Badge::Verified));
+        assert_eq!(trust_badge(UserTrust::Unverified), Some(Badge::NotVerified));
+        assert_eq!(
+            trust_badge(UserTrust::IdentityChanged),
+            Some(Badge::IdentityChanged)
+        );
+        assert_eq!(trust_badge(UserTrust::NoIdentity), None);
+    }
+
+    #[test]
+    fn verify_is_offered_unless_already_verified() {
+        assert!(!Badge::Verified.can_verify());
+        assert!(Badge::NotVerified.can_verify());
+        assert!(Badge::IdentityChanged.can_verify());
+    }
+
+    #[test]
+    fn badges_have_distinct_words() {
+        assert_eq!(Badge::Verified.label(), "Verified");
+        assert_eq!(Badge::NotVerified.label(), "Not verified");
+        assert_eq!(Badge::IdentityChanged.label(), "Identity changed");
+    }
 
     #[test]
     fn the_editor_and_the_timeline_keep_their_place_when_bars_come_and_go() {

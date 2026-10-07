@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use tessera_core::api::{
     Block, EventId, Inline, ListDiff, PaginationState, RichText, SendStatus, TimelineItem,
-    TimelineItemKind,
+    TimelineItemKind, UserId,
 };
 
 /// How far outside the viewport rows are built, in pixels.
@@ -227,6 +227,31 @@ fn estimate_unclamped(item: &TimelineItem, continuation: bool, width: f32) -> f3
         TimelineItemKind::State { .. } => STATE_H + receipts,
         TimelineItemKind::Other => 0.0,
     }
+}
+
+/// The one other person in a direct message, read from who wrote in it:
+/// the sender of the messages, placeholders and state events that are not
+/// the logged-in user's. `None` when nobody else spoke yet, or when two
+/// others did (the core shows no trust for those either).
+pub fn dm_peer<'a>(items: &'a [TimelineItem], own: Option<&UserId>) -> Option<&'a UserId> {
+    let own = own?;
+    let mut peer: Option<&UserId> = None;
+    for item in items {
+        let sender = match &item.kind {
+            TimelineItemKind::Message { sender, .. }
+            | TimelineItemKind::Placeholder { sender, .. }
+            | TimelineItemKind::State { sender, .. } => sender,
+            _ => continue,
+        };
+        if sender == own {
+            continue;
+        }
+        match peer {
+            Some(known) if known != sender => return None,
+            _ => peer = Some(sender),
+        }
+    }
+    peer
 }
 
 /// The sender and time of a message or placeholder.
@@ -914,8 +939,8 @@ mod tests {
 
     use tessera_core::api::{
         Block, Command, CoreEvent, EventId, Inline, ListDiff, MessageDetails, PaginationState,
-        PlaceholderKind, ReactionGroup, RichText, RoomId, RoomSummary, SendStatus, StateChange,
-        TextStyle, TimelineItem, TimelineItemKind, UserId,
+        PlaceholderKind, ReactionGroup, RichText, RoomId, RoomSummary, SendStatus, Shield,
+        ShieldCode, StateChange, TextStyle, TimelineItem, TimelineItemKind, UserId, UtdReason,
     };
     use tokio::sync::mpsc;
 
@@ -992,6 +1017,136 @@ mod tests {
 
     fn plain(kind: TimelineItemKind) -> TimelineItem {
         TimelineItem::new("p".to_owned(), kind)
+    }
+
+    // ---- Task 12: shields, UTD placeholders, DM peer ----------------------
+
+    fn utd_placeholder(id: &str, utd: Option<UtdReason>) -> TimelineItem {
+        TimelineItem::new(
+            id.to_owned(),
+            TimelineItemKind::Placeholder {
+                sender: UserId::from("@bob:x"),
+                sender_name: None,
+                is_own: false,
+                timestamp_ms: 0,
+                what: PlaceholderKind::UnableToDecrypt,
+                utd,
+            },
+        )
+    }
+
+    #[test]
+    fn a_shield_and_a_utd_reason_do_not_change_the_estimate() {
+        let plain = msg("a", "@a:x", 0);
+        let shielded = msg_with(
+            "a",
+            "@a:x",
+            0,
+            MessageDetails {
+                shield: Some(Shield::Red(ShieldCode::UnsignedDevice)),
+                ..MessageDetails::default()
+            },
+        );
+        for continuation in [false, true] {
+            assert_eq!(
+                estimate_height(&plain, continuation, 800.0),
+                estimate_height(&shielded, continuation, 800.0)
+            );
+        }
+        let waiting = utd_placeholder("u", None);
+        let reasoned = utd_placeholder("u", Some(UtdReason::SentBeforeWeJoined));
+        assert_eq!(
+            estimate_height(&waiting, false, 800.0),
+            estimate_height(&reasoned, false, 800.0)
+        );
+    }
+
+    #[test]
+    fn a_set_turns_a_utd_placeholder_into_a_message_in_place() {
+        let (mut app, _rx) = app();
+        let _ = app.update(reset(vec![
+            msg("m0", "@u:x", 0),
+            utd_placeholder("utd", Some(UtdReason::WithheldBySender)),
+            msg("m2", "@u:x", 0),
+        ]));
+        let _ = app.update(Message::RowMeasured {
+            id: "utd".into(),
+            height: 30.0,
+        });
+        let _ = app.update(diff(
+            "a",
+            vec![ListDiff::Set {
+                index: 1,
+                value: msg_with(
+                    "utd",
+                    "@bob:x",
+                    0,
+                    rich(vec![text_block(20), text_block(20)]),
+                ),
+            }],
+        ));
+        assert_eq!(app.timeline.items.len(), 3);
+        assert_eq!(app.timeline.items[1].id, "utd");
+        assert!(matches!(
+            app.timeline.items[1].kind,
+            TimelineItemKind::Message { .. }
+        ));
+        // The measurement stays until the sensor reports the new height (a
+        // row rebuilt at another size fires `on_resize`; invalidating here
+        // would leave the estimate when the size did not change).
+        assert_eq!(app.timeline.measured["utd"], 30.0);
+        assert_eq!(app.timeline.prefix[2] - app.timeline.prefix[1], 30.0);
+        let _ = app.update(Message::RowMeasured {
+            id: "utd".into(),
+            height: 64.0,
+        });
+        assert_eq!(app.timeline.prefix[2] - app.timeline.prefix[1], 64.0);
+        let total = app.timeline.prefix[3];
+        assert_eq!(
+            total,
+            app.timeline.prefix[1] + 64.0 + (total - app.timeline.prefix[2])
+        );
+    }
+
+    #[test]
+    fn the_dm_peer_is_the_one_other_sender() {
+        let me = UserId::from("@me:x");
+        let own = TimelineItem::new(
+            "own".to_owned(),
+            TimelineItemKind::Message {
+                sender: me.clone(),
+                body: String::new(),
+                is_own: true,
+                timestamp_ms: 0,
+                sent: SendStatus::Sent,
+                details: Box::default(),
+            },
+        );
+        let bob = msg("b", "@bob:x", 0);
+        let bob_utd = utd_placeholder("u", None);
+        assert_eq!(dm_peer(&[], Some(&me)), None);
+        assert_eq!(dm_peer(std::slice::from_ref(&own), Some(&me)), None);
+        let items = [own.clone(), bob.clone(), bob_utd.clone(), divider("d")];
+        assert_eq!(dm_peer(&items, Some(&me)), Some(&UserId::from("@bob:x")));
+        // Two others: no peer.
+        let items = [bob.clone(), msg("c", "@carol:x", 0)];
+        assert_eq!(dm_peer(&items, Some(&me)), None);
+        // A state event of the peer counts, one of mine does not.
+        let mut joined = state_item("s");
+        if let TimelineItemKind::State { sender, .. } = &mut joined.kind {
+            *sender = UserId::from("@bob:x");
+        }
+        let mut mine = state_item("t");
+        if let TimelineItemKind::State { sender, .. } = &mut mine.kind {
+            *sender = me.clone();
+        }
+        assert_eq!(
+            dm_peer(&[mine.clone(), joined], Some(&me)),
+            Some(&UserId::from("@bob:x"))
+        );
+        assert_eq!(dm_peer(&[mine], Some(&me)), None);
+        // Without the own ID nothing can be told apart.
+        assert_eq!(dm_peer(&[bob], None), None);
     }
 
     // ---- estimate_height --------------------------------------------------
