@@ -598,7 +598,7 @@ App:
 - Checks for the commit: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo test --workspace`, `scripts/check-app-deps.sh`, `scripts/check-core-api.sh`.
 
 ## Phase 4 human checkpoint
-- [ ] Phase 3 sign-off recorded (Q1, 2026-10-06). Confirm Q3 as planned: matrix-sdk `qrcode` enabled, iced `qr_code` **not** enabled (the QR code is drawn with the existing `image` widget from the SDK's own grid); and revisit any of Q1-Q19.
+- [x] Phase 3 sign-off recorded (Q1, 2026-10-06). Confirm Q3 as planned: matrix-sdk `qrcode` enabled, iced `qr_code` **not** enabled (the QR code is drawn with the existing `image` widget from the SDK's own grid); and revisit any of Q1-Q19. Human-confirmed 2026-10-07: Q3 confirmed as built; no change to Q1-Q19.
 - [ ] CI green on Linux, Windows and macOS; the `integration` job stays under its 20-minute timeout.
 - [x] Aware that the ignored suite signs out every alice and carol session on the local Synapse and resets their identities (Q2); local Element Web checks use bob. Human-confirmed 2026-10-07.
 - [x] **On a fresh install, verify this device against Element X on your phone (emoji match), and confirm encrypted history loads** (roadmap checkpoint). Human-confirmed 2026-10-07.
@@ -641,11 +641,11 @@ App:
 - [x] Clipboard history (Task 10): with a clipboard history manager running (for example KDE Klipper, GNOME clipboard extensions, Windows Win+V), copy the recovery key, then close or log out; the manager must not still hold the key after the clear. The app clears only the live clipboard, not a manager's history; note which managers keep it. Human-confirmed 2026-10-07.
 - [x] Recovery banners (Task 10): "Set up recovery" and "Enter recovery key" banners read well and can be dismissed for the session; the unverified banner has no cross. Human-confirmed 2026-10-07.
 - [x] Not built in Task 10: changing the recovery key (Q5 "Change key"). Human decision 2026-10-07: add it in Phase 4; built in Task 15 (phase4.15). Its checks are the three Task 15 items below.
-- [ ] Change key (Task 15), both themes: the Recovery line at the top of the Sessions page reads well in each state ("Recovery is on." with **Change recovery key**; "Recovery is off." with **Set up recovery**; "This device isn't connected to your recovery." with **Enter recovery key**), and its button is off while a security action runs.
-- [ ] Change key (Task 15) wording: the warning ("Change your recovery key?" and its text, which says other apps lose what they stored that this device doesn't have), the "Changing your recovery key…" wait, and the "Your new recovery key" screen.
-- [ ] Change key (Task 15) with Element: signed in to Tessera as bob (Q2: the test suite wipes alice and carol), change the key; then in Element Web, signed in as bob on a new session, the new key restores and the old key is refused.
+- [x] Change key (Task 15), both themes: the Recovery line at the top of the Sessions page reads well in each state ("Recovery is on." with **Change recovery key**; "Recovery is off." with **Set up recovery**; "This device isn't connected to your recovery." with **Enter recovery key**), and its button is off while a security action runs. Human-confirmed 2026-10-07.
+- [x] Change key (Task 15) wording: the warning ("Change your recovery key?" and its text, which says other apps lose what they stored that this device doesn't have), the "Changing your recovery key…" wait, and the "Your new recovery key" screen. Human-confirmed 2026-10-07.
+- [x] Change key (Task 15) with Element: signed in to Tessera as bob (Q2: the test suite wipes alice and carol), change the key; then in Element Web, signed in as bob on a new session, the new key restores and the old key is refused. Human-confirmed 2026-10-07.
 - [ ] Windows and macOS (added 2026-10-07): repeat the per-OS checks done on Linux only: verification emoji and their names, the lock (U+1F512), the keychain after these flows, and clearing the copied recovery key on logout or close.
-- [ ] Read the Phase 4 security review and accept or reject its residuals.
+- [x] Read the Phase 4 security review and accept or reject its residuals. Human-confirmed 2026-10-07: read, every residual accepted.
 
 ## Phase 0 steps
 - [x] 2. Cargo workspace with core, app, ptt crates (phase0.2)
