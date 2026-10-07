@@ -140,13 +140,18 @@ pub fn view(app: &App) -> Element<'_, Message> {
 /// The main column, always `[banner slot, panes, status bar]`: the slot is
 /// an empty column when there is no banner, so the panes (timeline scroll,
 /// editor focus) keep their place in the widget tree when a banner comes
-/// or goes.
+/// or goes. `from_vec` does not look at its children, so the column is told
+/// to fill the window: left at its default it shrinks to the banner slot and
+/// the whole window collapses.
 fn main_column<'a>(
     banner: Element<'a, Message>,
     panes: Element<'a, Message>,
     status: Element<'a, Message>,
 ) -> Element<'a, Message> {
-    Column::from_vec(vec![banner, panes, status]).into()
+    Column::from_vec(vec![banner, panes, status])
+        .width(Fill)
+        .height(Fill)
+        .into()
 }
 
 /// The selected room: name, timeline, composer.

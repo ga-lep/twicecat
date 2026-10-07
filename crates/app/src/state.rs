@@ -5825,4 +5825,53 @@ mod tests {
             assert!(!dbg.contains("true, true"), "QR modules printed");
         }
     }
+
+    /// Lays `app.view()` out headlessly in a 1000x700 window and returns the
+    /// size of the root.
+    fn laid_out_size(app: &App) -> iced::Size {
+        use iced::advanced::layout::Limits;
+        use iced::advanced::renderer::Headless;
+        use iced::advanced::widget::Tree;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a current-thread runtime");
+        let renderer = runtime
+            .block_on(iced::Renderer::new(
+                iced::Font::DEFAULT,
+                iced::Pixels(16.0),
+                Some("tiny-skia"),
+            ))
+            .expect("the headless tiny-skia renderer is not available");
+        let mut element = app.view();
+        let mut tree = Tree::new(element.as_widget());
+        element
+            .as_widget_mut()
+            .layout(
+                &mut tree,
+                &renderer,
+                &Limits::new(iced::Size::ZERO, iced::Size::new(1000.0, 700.0)),
+            )
+            .size()
+    }
+
+    /// The main screen collapsed to zero width (and the security card over
+    /// it with it) because its column did not fill the window: the window
+    /// went blank after a fresh login.
+    #[test]
+    fn the_main_view_and_the_security_cards_fill_the_window() {
+        let window = iced::Size::new(1000.0, 700.0);
+        let (mut app, _rx) = main_app();
+        assert_eq!(laid_out_size(&app), window, "the main view");
+        set_status(
+            &mut app,
+            DeviceVerification::Unverified,
+            RecoveryStatus::Enabled,
+        );
+        assert_eq!(laid_out_size(&app), window, "the identity screen");
+        let _ = sec(&mut app, SecurityMessage::SkipIdentity);
+        assert_eq!(laid_out_size(&app), window, "the unverified banner");
+        let (mut app, _rx) = recovery_app();
+        let _ = sec(&mut app, SecurityMessage::SetupRecovery);
+        assert_eq!(laid_out_size(&app), window, "setting up recovery");
+    }
 }
