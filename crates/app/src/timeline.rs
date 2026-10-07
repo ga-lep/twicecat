@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use tessera_core::api::{
     Block, EventId, Inline, ListDiff, PaginationState, RichText, SendStatus, TimelineItem,
-    TimelineItemKind, UserId,
+    TimelineItemKind,
 };
 
 /// How far outside the viewport rows are built, in pixels.
@@ -227,31 +227,6 @@ fn estimate_unclamped(item: &TimelineItem, continuation: bool, width: f32) -> f3
         TimelineItemKind::State { .. } => STATE_H + receipts,
         TimelineItemKind::Other => 0.0,
     }
-}
-
-/// The one other person in a direct message, read from who wrote in it:
-/// the sender of the messages, placeholders and state events that are not
-/// the logged-in user's. `None` when nobody else spoke yet, or when two
-/// others did (the core shows no trust for those either).
-pub fn dm_peer<'a>(items: &'a [TimelineItem], own: Option<&UserId>) -> Option<&'a UserId> {
-    let own = own?;
-    let mut peer: Option<&UserId> = None;
-    for item in items {
-        let sender = match &item.kind {
-            TimelineItemKind::Message { sender, .. }
-            | TimelineItemKind::Placeholder { sender, .. }
-            | TimelineItemKind::State { sender, .. } => sender,
-            _ => continue,
-        };
-        if sender == own {
-            continue;
-        }
-        match peer {
-            Some(known) if known != sender => return None,
-            _ => peer = Some(sender),
-        }
-    }
-    peer
 }
 
 /// The sender and time of a message or placeholder.
@@ -1106,47 +1081,6 @@ mod tests {
             total,
             app.timeline.prefix[1] + 64.0 + (total - app.timeline.prefix[2])
         );
-    }
-
-    #[test]
-    fn the_dm_peer_is_the_one_other_sender() {
-        let me = UserId::from("@me:x");
-        let own = TimelineItem::new(
-            "own".to_owned(),
-            TimelineItemKind::Message {
-                sender: me.clone(),
-                body: String::new(),
-                is_own: true,
-                timestamp_ms: 0,
-                sent: SendStatus::Sent,
-                details: Box::default(),
-            },
-        );
-        let bob = msg("b", "@bob:x", 0);
-        let bob_utd = utd_placeholder("u", None);
-        assert_eq!(dm_peer(&[], Some(&me)), None);
-        assert_eq!(dm_peer(std::slice::from_ref(&own), Some(&me)), None);
-        let items = [own.clone(), bob.clone(), bob_utd.clone(), divider("d")];
-        assert_eq!(dm_peer(&items, Some(&me)), Some(&UserId::from("@bob:x")));
-        // Two others: no peer.
-        let items = [bob.clone(), msg("c", "@carol:x", 0)];
-        assert_eq!(dm_peer(&items, Some(&me)), None);
-        // A state event of the peer counts, one of mine does not.
-        let mut joined = state_item("s");
-        if let TimelineItemKind::State { sender, .. } = &mut joined.kind {
-            *sender = UserId::from("@bob:x");
-        }
-        let mut mine = state_item("t");
-        if let TimelineItemKind::State { sender, .. } = &mut mine.kind {
-            *sender = me.clone();
-        }
-        assert_eq!(
-            dm_peer(&[mine.clone(), joined], Some(&me)),
-            Some(&UserId::from("@bob:x"))
-        );
-        assert_eq!(dm_peer(&[mine], Some(&me)), None);
-        // Without the own ID nothing can be told apart.
-        assert_eq!(dm_peer(&[bob], None), None);
     }
 
     // ---- estimate_height --------------------------------------------------

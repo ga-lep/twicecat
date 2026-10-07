@@ -29,7 +29,7 @@ const MAX_SAS_CHARS: usize = 32;
 /// `text` cleaned to one line and, when longer than `max_chars`, cut in the
 /// middle (an ellipsis between the start and the end). The end stays visible:
 /// the server name of a user ID is the part that tells users apart.
-fn elide_middle(text: &str, max_chars: usize) -> String {
+pub fn elide_middle(text: &str, max_chars: usize) -> String {
     let clean = name_or_placeholder(text, usize::MAX);
     let count = clean.chars().count();
     if count <= max_chars {

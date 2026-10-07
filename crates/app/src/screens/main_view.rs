@@ -18,6 +18,7 @@ use crate::screens::{room_list_pane, security, timeline_pane};
 use crate::state::{App, Message};
 use crate::text_safety::{MAX_NAME_CHARS, name_or_placeholder, one_line_capped};
 use crate::theme;
+use crate::verification::{MAX_PEER_USER_ID_CHARS, elide_middle};
 
 /// Width of the left pane.
 pub const LIST_PANE_WIDTH: f32 = 300.0;
@@ -65,6 +66,12 @@ pub fn trust_badge(trust: UserTrust) -> Option<Badge> {
     }
 }
 
+/// The peer's user ID as the header shows it: one sanitized line, never cut
+/// from the end (see [`crate::verification::elide_middle`]).
+pub fn peer_id_line(peer: &UserId) -> String {
+    elide_middle(peer.as_str(), MAX_PEER_USER_ID_CHARS)
+}
+
 /// The room header: the name, a lock for an encrypted room, and for a direct
 /// message the trust of the other person with **Verify** where it helps. Always
 /// one row, so the column around it keeps its widget types.
@@ -78,9 +85,9 @@ fn header<'a>(app: &'a App, title: String) -> Element<'a, Message> {
     if let Some(lock) = selected.and_then(room_list_pane::encrypted_mark) {
         line = line.push(text(lock).size(16));
     }
-    if let Some(badge) = app
+    if let Some((peer, badge)) = app
         .dm_peer_trust()
-        .and_then(|(_, trust)| trust_badge(trust))
+        .and_then(|(peer, trust)| trust_badge(trust).map(|badge| (peer, badge)))
     {
         line = line.push(
             text(badge.label())
@@ -93,12 +100,21 @@ fn header<'a>(app: &'a App, title: String) -> Element<'a, Message> {
                     }),
                 }),
         );
+        // Whose identity the badge vouches for: the full ID, one line, cut in
+        // the middle if at all (the server name at the end tells users apart).
+        line = line.push(
+            text(peer_id_line(peer))
+                .size(13)
+                .style(|theme: &iced::Theme| text::Style {
+                    color: Some(theme::semantic(theme).muted),
+                }),
+        );
         if badge.can_verify() {
             line = line.push(
                 button(text("Verify").size(13))
                     .padding([2, 8])
                     .style(button::secondary)
-                    .on_press(Message::VerifyPeerRequested),
+                    .on_press(Message::VerifyPeerRequested(peer.clone())),
             );
         }
     }
@@ -476,6 +492,18 @@ fn status_bar(app: &App) -> Element<'_, Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_peer_line_is_one_line_and_keeps_the_server_name() {
+        let id = UserId::from("@bob:example.org");
+        assert_eq!(peer_id_line(&id), "@bob:example.org");
+        let long = UserId::from(format!("@{}:evil.example", "a".repeat(400)));
+        let line = peer_id_line(&long);
+        assert!(line.ends_with(":evil.example"), "{line}");
+        assert!(line.chars().count() <= MAX_PEER_USER_ID_CHARS);
+        let split = UserId::from("@bo\nb:x");
+        assert!(!peer_id_line(&split).contains('\n'));
+    }
 
     #[test]
     fn trust_maps_to_a_badge() {

@@ -262,7 +262,7 @@ pub enum Message {
     /// The core did not close in time after `Shutdown`.
     ShutdownDeadline,
     /// **Verify** in the header of a direct message.
-    VerifyPeerRequested,
+    VerifyPeerRequested(UserId),
     /// A message of the security banner and screens.
     Security(SecurityMessage),
     /// A button of the verification dialog.
@@ -452,10 +452,9 @@ impl App {
         }
     }
 
-    /// The selected room's other person and the core's latest word on their
-    /// trust: `None` unless the room is a direct message with exactly one
-    /// other sender and the core reported that user. A report for anyone else
-    /// is ignored.
+    /// The selected direct message's other person and the core's latest word
+    /// on their trust: `None` unless the core named a peer for the room and
+    /// reported that user. A report for anyone else is ignored.
     pub fn dm_peer_trust(&self) -> Option<(&UserId, UserTrust)> {
         let (peer, _) = self.dm_peer()?;
         self.user_trust
@@ -464,16 +463,14 @@ impl App {
             .map(|(user, trust)| (user, *trust))
     }
 
-    /// The selected direct message's other person (see
-    /// [`timeline::dm_peer`]).
+    /// The selected direct message's other person, as the core names them in
+    /// the room's summary (`RoomSummary::dm_peer`), with that summary.
     pub fn dm_peer(&self) -> Option<(&UserId, &RoomSummary)> {
         let room = self
             .selected
             .as_ref()
-            .and_then(|id| self.rooms.iter().find(|room| room.id == *id))
-            .filter(|room| room.is_dm)?;
-        let peer = timeline::dm_peer(&self.timeline.items, self.user_id.as_ref())?;
-        Some((peer, room))
+            .and_then(|id| self.rooms.iter().find(|room| room.id == *id))?;
+        Some((room.dm_peer.as_ref()?, room))
     }
 
     /// Keeps the core's word on `user`'s trust, newest last.
@@ -721,12 +718,13 @@ impl App {
                 let flush = self.drop_secrets();
                 Task::batch([flush, self.send(Command::Logout)])
             }
-            Message::VerifyPeerRequested => match self.dm_peer() {
-                Some((peer, _)) => {
-                    let user_id = peer.clone();
+            // Only for the peer the header drew: a stale click for anyone
+            // else (the room or its peer changed) is dropped.
+            Message::VerifyPeerRequested(user_id) => match self.dm_peer() {
+                Some((peer, _)) if *peer == user_id => {
                     self.send(Command::RequestUserVerification { user_id })
                 }
-                None => Task::none(),
+                _ => Task::none(),
             },
             Message::Security(message) => self.on_security(message),
             Message::Verification(message) => self.on_verification(message),
@@ -4567,26 +4565,21 @@ mod tests {
         logged_in(&mut app);
         let mut dm = RoomSummary::new(RoomId::from("!dm:x"), "Bob".to_owned());
         dm.is_dm = true;
+        dm.dm_peer = Some(UserId::from("@bob:x"));
         let room = RoomSummary::new(RoomId::from("!room:x"), "Lounge".to_owned());
         let _ = app.update(core(CoreEvent::RoomListChanged(vec![ListDiff::Reset {
             values: vec![dm, room],
         }])));
         let _ = app.update(Message::SelectRoom(RoomId::from("!dm:x")));
-        let _ = app.update(core(CoreEvent::TimelineDiff {
-            room_id: RoomId::from("!dm:x"),
-            diffs: vec![ListDiff::Reset {
-                values: vec![from_bob()],
-            }],
-        }));
         while rx.try_recv().is_ok() {}
         (app, rx)
     }
 
-    fn from_bob() -> TimelineItem {
+    fn from_sender(sender: &str) -> TimelineItem {
         TimelineItem::new(
             "m".to_owned(),
             TimelineItemKind::Message {
-                sender: UserId::from("@bob:x"),
+                sender: UserId::from(sender),
                 body: String::new(),
                 is_own: false,
                 timestamp_ms: 0,
@@ -4635,18 +4628,10 @@ mod tests {
     }
 
     #[test]
-    fn a_trust_report_that_arrives_before_the_timeline_still_counts() {
+    fn a_dm_whose_peer_has_not_spoken_still_shows_the_badge() {
         let (mut app, _rx) = dm_app();
-        let _ = app.update(Message::SelectRoom(RoomId::from("!room:x")));
-        let _ = app.update(Message::SelectRoom(RoomId::from("!dm:x")));
+        assert!(app.timeline.items.is_empty(), "nobody has spoken");
         trust(&mut app, "@bob:x", UserTrust::Verified);
-        assert_eq!(app.dm_peer_trust(), None, "no peer known yet");
-        let _ = app.update(core(CoreEvent::TimelineDiff {
-            room_id: RoomId::from("!dm:x"),
-            diffs: vec![ListDiff::Reset {
-                values: vec![from_bob()],
-            }],
-        }));
         assert_eq!(
             app.dm_peer_trust(),
             Some((&UserId::from("@bob:x"), UserTrust::Verified))
@@ -4654,16 +4639,37 @@ mod tests {
     }
 
     #[test]
+    fn the_peer_is_the_one_the_core_names_not_a_sender() {
+        let (mut app, _rx) = dm_app();
+        let _ = app.update(core(CoreEvent::TimelineDiff {
+            room_id: RoomId::from("!dm:x"),
+            diffs: vec![ListDiff::Reset {
+                values: vec![from_sender("@mallory:x")],
+            }],
+        }));
+        trust(&mut app, "@mallory:x", UserTrust::Verified);
+        assert_eq!(app.dm_peer_trust(), None);
+        assert_eq!(app.dm_peer().map(|(p, _)| p.as_str()), Some("@bob:x"));
+    }
+
+    #[test]
+    fn the_peer_follows_the_summary_when_it_is_rebuilt() {
+        let (mut app, _rx) = dm_app();
+        let mut changed = RoomSummary::new(RoomId::from("!dm:x"), "Bob".to_owned());
+        changed.is_dm = true;
+        changed.dm_peer = Some(UserId::from("@bea:x"));
+        let _ = app.update(core(CoreEvent::RoomListChanged(vec![ListDiff::Set {
+            index: 0,
+            value: changed,
+        }])));
+        assert_eq!(app.dm_peer().map(|(p, _)| p.as_str()), Some("@bea:x"));
+    }
+
+    #[test]
     fn a_room_that_is_not_a_dm_has_no_peer_trust() {
         let (mut app, _rx) = dm_app();
         trust(&mut app, "@bob:x", UserTrust::Unverified);
         let _ = app.update(Message::SelectRoom(RoomId::from("!room:x")));
-        let _ = app.update(core(CoreEvent::TimelineDiff {
-            room_id: RoomId::from("!room:x"),
-            diffs: vec![ListDiff::Reset {
-                values: vec![from_bob()],
-            }],
-        }));
         trust(&mut app, "@bob:x", UserTrust::Unverified);
         assert_eq!(app.dm_peer_trust(), None);
     }
@@ -4683,7 +4689,7 @@ mod tests {
     fn verify_sends_a_request_for_the_peer() {
         let (mut app, mut rx) = dm_app();
         trust(&mut app, "@bob:x", UserTrust::Unverified);
-        let _ = app.update(Message::VerifyPeerRequested);
+        let _ = app.update(Message::VerifyPeerRequested(UserId::from("@bob:x")));
         let commands = drain(&mut rx);
         assert_eq!(commands.len(), 1, "{commands:?}");
         assert!(
@@ -4697,7 +4703,24 @@ mod tests {
         let (mut app, mut rx) = dm_app();
         let _ = app.update(Message::SelectRoom(RoomId::from("!room:x")));
         let _ = drain(&mut rx);
-        let _ = app.update(Message::VerifyPeerRequested);
+        let _ = app.update(Message::VerifyPeerRequested(UserId::from("@bob:x")));
         assert!(drain(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn verify_for_a_user_who_is_not_the_peer_sends_nothing() {
+        let (mut app, mut rx) = dm_app();
+        let _ = app.update(Message::VerifyPeerRequested(UserId::from("@carol:x")));
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn going_back_to_login_forgets_the_trusts() {
+        let (mut app, _rx) = dm_app();
+        trust(&mut app, "@bob:x", UserTrust::Verified);
+        assert!(!app.user_trust.is_empty());
+        let _ = app.back_to_login("signed out");
+        assert!(app.user_trust.is_empty());
+        assert_eq!(app.dm_peer_trust(), None);
     }
 }

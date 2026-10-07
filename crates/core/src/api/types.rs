@@ -318,6 +318,10 @@ pub struct RoomSummary {
     pub last_message: Option<MessagePreview>,
     /// The room is end-to-end encrypted.
     pub is_encrypted: bool,
+    /// The one other user of a direct message, as the core sees it (the user
+    /// whose trust it reports); `None` for other rooms and for DMs with no or
+    /// several other users.
+    pub dm_peer: Option<UserId>,
 }
 
 impl RoomSummary {
@@ -344,6 +348,7 @@ impl RoomSummary {
             marked_unread: false,
             last_message: None,
             is_encrypted: false,
+            dm_peer: None,
         }
     }
 }
