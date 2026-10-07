@@ -20,8 +20,29 @@ pub const QR_SCALE: u32 = 6;
 pub const QR_QUIET: u32 = 4;
 /// How many characters a peer's name may show in the dialog.
 pub const MAX_PEER_NAME_CHARS: usize = 64;
+/// How many characters the full user ID line may show (the Matrix limit is
+/// 255 bytes); a longer one is cut in the middle.
+pub const MAX_PEER_USER_ID_CHARS: usize = 255;
 /// How many characters an emoji description or symbol may show.
 const MAX_SAS_CHARS: usize = 32;
+
+/// `text` cleaned to one line and, when longer than `max_chars`, cut in the
+/// middle (an ellipsis between the start and the end). The end stays visible:
+/// the server name of a user ID is the part that tells users apart.
+fn elide_middle(text: &str, max_chars: usize) -> String {
+    let clean = name_or_placeholder(text, usize::MAX);
+    let count = clean.chars().count();
+    if count <= max_chars {
+        return clean;
+    }
+    let keep = max_chars.saturating_sub(1);
+    let tail = keep / 2;
+    let head = keep - tail;
+    let mut out: String = clean.chars().take(head).collect();
+    out.push('\u{2026}');
+    out.extend(clean.chars().skip(count - tail));
+    out
+}
 
 /// The RGBA pixels of a QR code: `(size + 2 * quiet) * scale` pixels square,
 /// black modules on a white ground in every theme (a scanner needs the
@@ -127,10 +148,17 @@ pub struct VerificationModel {
     /// The peer's name for the dialog: the device name (own account) or the
     /// user ID, cleaned, one line, capped.
     pub name: String,
+    /// The peer's full user ID, cleaned and on one line (cut in the middle
+    /// only past [`MAX_PEER_USER_ID_CHARS`]); the dialog shows it in full for
+    /// another user, because the capped `name` may hide part of it.
+    pub user_id: String,
     /// Where the flow stands.
     pub phase: Phase,
     qr: Option<Handle>,
     pub(crate) sent: Option<Sent>,
+    /// A request that came while this finished card was open; it is shown
+    /// after **Close** (a click meant for Close must not land on **Accept**).
+    queued: Option<Box<VerificationModel>>,
 }
 
 impl VerificationModel {
@@ -143,17 +171,21 @@ impl VerificationModel {
         } else {
             None
         };
-        let name = name_or_placeholder(
-            raw.unwrap_or_else(|| peer.user_id.as_str()),
-            MAX_PEER_NAME_CHARS,
-        );
+        // A device name is cut from the end; a user ID never is (its server
+        // name is at the end), so it is cut in the middle.
+        let name = match raw {
+            Some(raw) => name_or_placeholder(raw, MAX_PEER_NAME_CHARS),
+            None => elide_middle(peer.user_id.as_str(), MAX_PEER_NAME_CHARS),
+        };
         Self {
             id,
             own_account: peer.own_account,
             name,
+            user_id: elide_middle(peer.user_id.as_str(), MAX_PEER_USER_ID_CHARS),
             phase: Phase::Requested { incoming: false },
             qr: None,
             sent: None,
+            queued: None,
         }
     }
 
@@ -170,6 +202,9 @@ impl VerificationModel {
     /// Applies a phase of flow `id`. `false` when it was not applied: another
     /// flow, or this one is over.
     pub fn on_phase(&mut self, id: &VerificationId, phase: VerificationPhase) -> bool {
+        if let Some(queued) = self.queued.as_mut().filter(|q| q.id == *id) {
+            return queued.on_phase(id, phase);
+        }
         if *id != self.id || self.phase.is_over() {
             return false;
         }
@@ -235,19 +270,22 @@ pub enum VerificationMessage {
 
 impl App {
     /// A flow started or arrived. One dialog at a time: the core holds one
-    /// flow too, so a request while another runs is not shown (an ended flow
-    /// still on screen gives way).
+    /// flow too, so a request while another runs is not shown. An ended flow
+    /// still on screen stays until **Close**, and the request waits behind it.
     pub(crate) fn on_verification_requested(
         &mut self,
         id: VerificationId,
         peer: &VerificationPeer,
     ) -> Task<Message> {
-        if self.verification.as_ref().is_some_and(|m| !m.is_over()) {
-            return Task::none();
+        // The request is on screen (or queued): the identity screen may ask
+        // again later.
+        let model = VerificationModel::new(id, peer);
+        match &mut self.verification {
+            Some(shown) if !shown.is_over() => return Task::none(),
+            Some(shown) => shown.queued = Some(Box::new(model)),
+            None => self.verification = Some(model),
         }
-        // The request is on screen now: the identity screen may ask again later.
         self.security.asked_other_device = false;
-        self.verification = Some(VerificationModel::new(id, peer));
         Task::none()
     }
 
@@ -290,7 +328,8 @@ impl App {
         };
         if message == M::Close {
             if model.is_over() {
-                self.verification = None;
+                // The queued request shows next, unless it already ended.
+                self.verification = model.queued.take().filter(|q| !q.is_over()).map(|q| *q);
             }
             return Task::none();
         }
@@ -573,6 +612,35 @@ mod tests {
         };
         let m = VerificationModel::new(id("f1"), &other);
         assert_eq!(m.name, "@evil\u{FFFD}:x");
+    }
+
+    #[test]
+    fn a_long_user_id_keeps_the_end_of_the_server_name_in_the_name() {
+        let long = format!("@alice:matrix.org.{}evil.example", "a".repeat(200));
+        let other = VerificationPeer {
+            user_id: UserId::from(long.as_str()),
+            ..peer(false)
+        };
+        let m = VerificationModel::new(id("f1"), &other);
+        assert!(m.name.chars().count() <= MAX_PEER_NAME_CHARS, "{}", m.name);
+        assert!(m.name.starts_with("@alice:"), "{}", m.name);
+        assert!(m.name.ends_with("evil.example"), "{}", m.name);
+    }
+
+    #[test]
+    fn the_full_user_id_is_kept_on_its_own() {
+        let long = format!("@alice:matrix.org.{}evil.example", "a".repeat(200));
+        let other = VerificationPeer {
+            user_id: UserId::from(long.as_str()),
+            ..peer(false)
+        };
+        assert_eq!(VerificationModel::new(id("f1"), &other).user_id, long);
+        let hostile = VerificationPeer {
+            user_id: UserId::from("@evil\u{202E}:x"),
+            ..peer(false)
+        };
+        let m = VerificationModel::new(id("f1"), &hostile);
+        assert_eq!(m.user_id, "@evil\u{FFFD}:x");
     }
 
     #[test]

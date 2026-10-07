@@ -4285,19 +4285,58 @@ mod tests {
     }
 
     #[test]
-    fn a_second_request_does_not_replace_a_running_flow_but_replaces_an_ended_one() {
+    fn a_second_request_does_not_replace_a_running_flow() {
         let (mut app, _rx) = verifying(true);
-        let second = |app: &mut App| {
-            let _ = app.update(core(CoreEvent::VerificationRequested {
-                id: VerificationId::from("flow-2"),
-                peer: vpeer(false),
-            }));
-        };
-        second(&mut app);
+        let _ = app.update(core(CoreEvent::VerificationRequested {
+            id: VerificationId::from("flow-2"),
+            peer: vpeer(false),
+        }));
         assert_eq!(app.verification.as_ref().unwrap().id, vid());
+    }
+
+    #[test]
+    fn a_request_behind_a_finished_card_shows_after_close() {
+        let (mut app, mut rx) = verifying(true);
         vphase(&mut app, VP::Done);
-        second(&mut app);
-        assert_eq!(app.verification.as_ref().unwrap().id.as_str(), "flow-2");
+        let flow2 = VerificationId::from("flow-2");
+        let _ = app.update(core(CoreEvent::VerificationRequested {
+            id: flow2.clone(),
+            peer: vpeer(false),
+        }));
+        // The finished card stays, so a click meant for Close cannot Accept.
+        assert_eq!(app.verification.as_ref().unwrap().id, vid());
+        let _ = vmsg(&mut app, VM::Accept);
+        assert!(drain(&mut rx).is_empty());
+        // The queued flow keeps following its events.
+        let _ = app.update(core(CoreEvent::Verification {
+            id: flow2.clone(),
+            phase: VP::Requested { incoming: true },
+        }));
+        let _ = vmsg(&mut app, VM::Close);
+        let shown = app.verification.as_ref().expect("queued request shown");
+        assert_eq!(shown.id, flow2);
+        assert_eq!(shown.phase.kind(), "requested");
+        let _ = vmsg(&mut app, VM::Accept);
+        assert!(matches!(only(&mut rx), Command::AcceptVerification { id } if id == flow2));
+    }
+
+    #[test]
+    fn a_queued_request_that_ended_before_close_is_dropped() {
+        let (mut app, _rx) = verifying(true);
+        vphase(&mut app, VP::Done);
+        let flow2 = VerificationId::from("flow-2");
+        let _ = app.update(core(CoreEvent::VerificationRequested {
+            id: flow2.clone(),
+            peer: vpeer(false),
+        }));
+        let _ = app.update(core(CoreEvent::Verification {
+            id: flow2,
+            phase: VP::Cancelled {
+                reason: tessera_core::api::CancelReason::ByThem,
+            },
+        }));
+        let _ = vmsg(&mut app, VM::Close);
+        assert!(app.verification.is_none());
     }
 
     #[test]

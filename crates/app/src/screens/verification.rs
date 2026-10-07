@@ -79,6 +79,10 @@ fn emoji_grid(set: &[tessera_core::api::SasEmoji; 7]) -> Element<'_, Message> {
 
 fn content(model: &VerificationModel) -> Element<'_, Message> {
     let mut body = column![text(title(model)).size(22)].spacing(12);
+    // The title may cut a long user ID in the middle: show it whole, wrapped.
+    if !model.own_account && !model.is_over() {
+        body = body.push(text(model.user_id.as_str()).size(14));
+    }
     match &model.phase {
         Phase::Requested { incoming: true } => {
             body = body
