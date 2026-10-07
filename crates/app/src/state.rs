@@ -5129,6 +5129,75 @@ mod tests {
         assert!(!notice.contains('\n') && !notice.is_empty());
     }
 
+    #[test]
+    fn no_sign_out_starts_while_an_identity_reset_runs() {
+        let (mut app, mut rx) = sessions_app();
+        set_status(
+            &mut app,
+            DeviceVerification::Unverified,
+            RecoveryStatus::Enabled,
+        );
+        // One sign-out is asked before the reset begins, one is not.
+        let _ = ses(
+            &mut app,
+            SessionsMessage::SignOutAsk(DeviceId::from("PHONE")),
+        );
+        let _ = sec(&mut app, SecurityMessage::ResetRequested);
+        let _ = sec(&mut app, SecurityMessage::ResetConfirmed);
+        assert_eq!(drain(&mut rx).len(), 1, "only the reset command");
+        assert_eq!(app.security.busy, Some(Busy::Resetting));
+
+        let _ = ses(&mut app, SessionsMessage::SignOutConfirmed);
+        assert!(app.sessions.pending.is_none() && app.sessions.confirm.is_none());
+        let notice = app.sessions.notice.clone().expect("a notice");
+        assert!(!notice.contains('\n') && !notice.is_empty());
+        app.sessions.notice = None;
+        let _ = ses(
+            &mut app,
+            SessionsMessage::SignOutAsk(DeviceId::from("LAPTOP")),
+        );
+        assert!(app.sessions.confirm.is_none() && app.sessions.notice.is_some());
+        app.sessions.notice = None;
+        let _ = ses(&mut app, SessionsMessage::SignOutAllAsk);
+        assert!(app.sessions.confirm.is_none() && app.sessions.notice.is_some());
+        let _ = ses(&mut app, SessionsMessage::SignOutConfirmed);
+        assert!(drain(&mut rx).is_empty(), "no sign-out was sent");
+        assert_eq!(app.security.busy, Some(Busy::Resetting));
+    }
+
+    #[test]
+    fn no_identity_reset_starts_while_a_sign_out_is_pending() {
+        let (mut app, mut rx) = sessions_app();
+        set_status(
+            &mut app,
+            DeviceVerification::Unverified,
+            RecoveryStatus::Enabled,
+        );
+        let _ = drain(&mut rx);
+        // The warning was already up when the sign-out began.
+        let _ = sec(&mut app, SecurityMessage::ResetRequested);
+        let _ = ses(
+            &mut app,
+            SessionsMessage::SignOutAsk(DeviceId::from("PHONE")),
+        );
+        let _ = ses(&mut app, SessionsMessage::SignOutConfirmed);
+        assert_eq!(drain(&mut rx).len(), 1, "only the sign-out");
+        let _ = sec(&mut app, SecurityMessage::ResetConfirmed);
+        assert!(drain(&mut rx).is_empty(), "no reset was sent");
+        assert!(app.security.busy.is_none());
+        assert!(app.security.notice.is_some());
+        assert!(app.sessions.pending.is_some(), "the sign-out keeps going");
+
+        // A fresh request is refused too, without the warning.
+        app.security.overlay = None;
+        app.security.notice = None;
+        let _ = sec(&mut app, SecurityMessage::ResetRequested);
+        assert!(app.security.overlay.is_none() && app.security.notice.is_some());
+        let _ = sec(&mut app, SecurityMessage::ResetConfirmed);
+        assert!(drain(&mut rx).is_empty());
+        assert!(app.sessions.pending.is_some());
+    }
+
     /// Signs the phone out on an OAuth session: the core answers with a URL.
     fn oauth_url(app: &mut App, url: &str) -> Task<Message> {
         let _ = ses(app, SessionsMessage::SignOutAsk(DeviceId::from("PHONE")));

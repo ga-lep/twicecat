@@ -498,11 +498,18 @@ impl App {
                 Task::none()
             }
             M::ResetRequested => {
+                if self.refuse_reset_during_sign_out() {
+                    return Task::none();
+                }
                 self.security.overlay = Some(Overlay::ResetConfirm);
                 self.security.notice = None;
                 Task::none()
             }
             M::ResetConfirmed => {
+                if self.refuse_reset_during_sign_out() {
+                    self.security.overlay = None;
+                    return Task::none();
+                }
                 let model = &mut self.security;
                 if model.busy.is_some() || model.overlay != Some(Overlay::ResetConfirm) {
                     return Task::none();
@@ -578,6 +585,17 @@ impl App {
             }
             None => Task::none(),
         }
+    }
+
+    /// An identity reset must not start while a sign-out is pending (see
+    /// `refuse_sign_out_during_reset`). Gives a notice and answers `true`.
+    fn refuse_reset_during_sign_out(&mut self) -> bool {
+        if self.sessions.pending.is_none() {
+            return false;
+        }
+        self.security.notice =
+            Some("Wait for the sign-out to finish before resetting your identity.".to_owned());
+        true
     }
 
     /// Sends the typed password with the action that asked for it.

@@ -19,7 +19,7 @@ use tessera_core::api::{
 use crate::dates::{day_label, time_label};
 use crate::links::{self, LinkKind};
 use crate::screens::login::{self, BrowserUrl};
-use crate::security::{ReauthPrompt, SecurityMessage};
+use crate::security::{Busy, ReauthPrompt, SecurityMessage};
 use crate::state::{App, Message};
 use crate::text_safety::{NAME_PLACEHOLDER, name_or_placeholder, one_line_capped};
 use crate::verification::elide_middle;
@@ -371,6 +371,9 @@ impl App {
                 _ => Task::none(),
             },
             M::SignOutAsk(id) => {
+                if self.refuse_sign_out_during_reset() {
+                    return Task::none();
+                }
                 let model = &mut self.sessions;
                 if model.pending.is_none() && model.find(&id).is_some_and(|d| !d.current) {
                     model.confirm = Some(SignOutAsk::One(id));
@@ -379,6 +382,9 @@ impl App {
                 Task::none()
             }
             M::SignOutAllAsk => {
+                if self.refuse_sign_out_during_reset() {
+                    return Task::none();
+                }
                 let model = &mut self.sessions;
                 if model.pending.is_none() && model.other_devices().is_some_and(|n| n > 0) {
                     model.confirm = Some(SignOutAsk::AllOthers);
@@ -387,6 +393,10 @@ impl App {
                 Task::none()
             }
             M::SignOutConfirmed => {
+                if self.refuse_sign_out_during_reset() {
+                    self.sessions.confirm = None;
+                    return Task::none();
+                }
                 let model = &mut self.sessions;
                 let Some(ask) = model.confirm.take() else {
                     return Task::none();
@@ -477,6 +487,19 @@ impl App {
             device_ids,
             password: Some(password),
         })
+    }
+
+    /// A sign-out and an identity reset must not overlap: on an OAuth account
+    /// both answer with an account-page URL, and the reset's would take the
+    /// sign-out's place. While a reset runs this gives a notice and answers
+    /// `true`, and the caller starts nothing.
+    fn refuse_sign_out_during_reset(&mut self) -> bool {
+        if self.security.busy != Some(Busy::Resetting) {
+            return false;
+        }
+        self.sessions.notice =
+            Some("Wait for the identity reset to finish before signing out a session.".to_owned());
+        true
     }
 
     /// The core's list of devices.
