@@ -12,8 +12,8 @@ use iced::widget::{operation, scrollable};
 use iced::{Element, Subscription, Task, Theme, clipboard, system, window};
 use tessera_core::api::{
     ActionKind, Command, CoreError, CoreEvent, Draft, EventId, ListDiff, MessageDetails,
-    MessageText, OutgoingMessage, Password, RoomId, RoomListQuery, RoomListTab, RoomSummary,
-    SyncState, TimelineItem, TimelineItemKind, TypingUser, UserId, UserTrust,
+    MessageText, OutgoingMessage, Password, ReauthAction, RoomId, RoomListQuery, RoomListTab,
+    RoomSummary, SyncState, TimelineItem, TimelineItemKind, TypingUser, UserId, UserTrust,
 };
 use tokio::sync::mpsc;
 
@@ -27,7 +27,8 @@ use crate::rich_text::{LinkTarget, MAX_REVEALED, Revealed};
 use crate::room_list;
 use crate::screens::login::{self, BrowserUrl, LoginForm};
 use crate::screens::{self, loading, main_view};
-use crate::security::{SecurityMessage, SecurityModel};
+use crate::security::{Busy, SecurityMessage, SecurityModel};
+use crate::sessions::{SessionsMessage, SessionsModel, logout_needs_warning};
 use crate::text_safety;
 use crate::timeline::{self, Effects, TimelineView};
 use crate::verification::{VerificationMessage, VerificationModel};
@@ -267,6 +268,8 @@ pub enum Message {
     Security(SecurityMessage),
     /// A button of the verification dialog.
     Verification(VerificationMessage),
+    /// A button of the Sessions screen or the logout warning.
+    Sessions(SessionsMessage),
 }
 
 /// What `main` hands to Iced's boot function.
@@ -356,6 +359,8 @@ pub struct App {
     pub security: SecurityModel,
     /// The verification dialog, while a flow is open.
     pub verification: Option<VerificationModel>,
+    /// The Sessions screen and the logout warning.
+    pub sessions: SessionsModel,
     /// Set when the app decided to exit (the task itself is opaque to tests).
     pub exit_requested: bool,
     /// Clipboard reads sent by `drop_secrets` whose answer is still due.
@@ -380,6 +385,7 @@ impl std::fmt::Debug for App {
             .field("actions", &self.actions)
             .field("security", &self.security)
             .field("verification", &self.verification)
+            .field("sessions", &self.sessions)
             .finish_non_exhaustive()
     }
 }
@@ -430,6 +436,7 @@ impl App {
             draft_dirty: false,
             security: SecurityModel::default(),
             verification: None,
+            sessions: SessionsModel::default(),
             exit_requested: false,
             flushes_pending: 0,
             core_closed: false,
@@ -715,8 +722,12 @@ impl App {
                 }
             }
             Message::LogoutRequested => {
-                let flush = self.drop_secrets();
-                Task::batch([flush, self.send(Command::Logout)])
+                if logout_needs_warning(&self.security.status, self.sessions.other_devices()) {
+                    self.sessions.logout_warning = true;
+                    Task::none()
+                } else {
+                    self.logout()
+                }
             }
             // Only for the peer the header drew: a stale click for anyone
             // else (the room or its peer changed) is dropped.
@@ -728,6 +739,7 @@ impl App {
             },
             Message::Security(message) => self.on_security(message),
             Message::Verification(message) => self.on_verification(message),
+            Message::Sessions(message) => self.on_sessions(message),
             Message::SelectRoom(id) => {
                 if !room_list::contains(&self.rooms, &id) {
                     return Task::none();
@@ -966,6 +978,19 @@ impl App {
                 error,
                 ..
             } => task = self.on_verification_failed(&error),
+            CoreEvent::ActionFailed {
+                action: ActionKind::Devices,
+                error,
+                ..
+            } => self.on_devices_failed(&error),
+            CoreEvent::ReauthRequired {
+                action: ReauthAction::DeleteDevices,
+            } => task = self.on_sessions_reauth(),
+            CoreEvent::OpenAccountManagement(url)
+                if self.security.busy != Some(Busy::Resetting) =>
+            {
+                task = self.on_sessions_url(&url);
+            }
             // Recovery and cross-signing failures belong to the security
             // screens; other actions have no screen yet.
             event @ (CoreEvent::ActionFailed { .. }
@@ -984,7 +1009,7 @@ impl App {
                 task = self.on_verification_phase(&id, phase);
             }
             CoreEvent::UserTrust { user_id, trust } => self.remember_trust(user_id, trust),
-            CoreEvent::Devices(_) => {}
+            CoreEvent::Devices(list) => self.on_devices_event(list),
         }
         task
     }
@@ -1465,6 +1490,7 @@ impl App {
         let flush = self.drop_secrets();
         self.security = SecurityModel::default();
         self.verification = None;
+        self.sessions = SessionsModel::default();
         self.notice = Some(notice.to_owned());
         self.end_login_attempt();
         self.screen = Screen::Login;
@@ -4110,6 +4136,12 @@ mod tests {
                 &mut app,
                 SecurityMessage::RestoreInput(RecoveryKey::from("secret-input-x")),
             );
+            // With recovery set up, logout needs no warning first.
+            set_status(
+                &mut app,
+                DeviceVerification::Verified,
+                RecoveryStatus::Enabled,
+            );
             let _ = app.update(message);
             assert!(app.security.setup.is_none());
             assert!(app.security.copied.is_none());
@@ -4171,6 +4203,12 @@ mod tests {
     #[test]
     fn logout_close_and_disconnect_check_and_clear_the_clipboard_at_once() {
         let mut app = copied_app();
+        // With recovery set up, logout needs no warning first.
+        set_status(
+            &mut app,
+            DeviceVerification::Verified,
+            RecoveryStatus::Enabled,
+        );
         assert!(app.update(Message::LogoutRequested).units() > 0);
         assert!(app.security.copied.is_none());
         let mut app = copied_app();
@@ -4191,6 +4229,11 @@ mod tests {
         assert!(task.units() > 0, "a pending copy is flushed, not lost");
         // Nothing copied: nothing to check.
         let (mut app, _rx) = recovery_app();
+        set_status(
+            &mut app,
+            DeviceVerification::Verified,
+            RecoveryStatus::Enabled,
+        );
         assert_eq!(app.update(Message::LogoutRequested).units(), 0);
     }
 
@@ -4722,5 +4765,574 @@ mod tests {
         let _ = app.back_to_login("signed out");
         assert!(app.user_trust.is_empty());
         assert_eq!(app.dm_peer_trust(), None);
+    }
+
+    // ---- Task 13: sessions screen and re-authentication ----
+
+    use crate::sessions::SessionsMessage;
+    use tessera_core::api::{DeviceSummary, DeviceTrust};
+
+    fn ses(app: &mut App, message: SessionsMessage) -> Task<Message> {
+        app.update(Message::Sessions(message))
+    }
+
+    fn summary(id: &str, name: Option<&str>, current: bool, trust: DeviceTrust) -> DeviceSummary {
+        DeviceSummary {
+            device_id: DeviceId::from(id),
+            display_name: name.map(str::to_owned),
+            last_seen_ms: Some(1_000),
+            current,
+            trust,
+        }
+    }
+
+    /// Three devices: this one, a verified laptop and an unverified phone.
+    fn device_list() -> Vec<DeviceSummary> {
+        vec![
+            summary("THIS", Some("Tessera"), true, DeviceTrust::Verified),
+            summary("LAPTOP", Some("Laptop"), false, DeviceTrust::Verified),
+            summary("PHONE", Some("Phone"), false, DeviceTrust::Unverified),
+        ]
+    }
+
+    /// An app on the Sessions screen with the three devices listed.
+    fn sessions_app() -> (App, mpsc::Receiver<Command>) {
+        let (mut app, mut rx) = main_app();
+        let _ = ses(&mut app, SessionsMessage::Open);
+        let _ = app.update(core(CoreEvent::Devices(device_list())));
+        while rx.try_recv().is_ok() {}
+        (app, rx)
+    }
+
+    #[test]
+    fn opening_sessions_asks_the_core_for_the_list() {
+        let (mut app, mut rx) = main_app();
+        let _ = ses(&mut app, SessionsMessage::Open);
+        assert!(app.sessions.open && app.sessions.loading);
+        assert!(matches!(rx.try_recv(), Ok(Command::ListDevices)));
+        let _ = app.update(core(CoreEvent::Devices(device_list())));
+        assert!(!app.sessions.loading);
+        assert_eq!(app.sessions.devices.as_ref().map(Vec::len), Some(3));
+        // The core does not push other clients' changes: Refresh asks again.
+        let _ = ses(&mut app, SessionsMessage::Refresh);
+        assert!(matches!(rx.try_recv(), Ok(Command::ListDevices)));
+        let _ = ses(&mut app, SessionsMessage::Close);
+        assert!(!app.sessions.open);
+    }
+
+    #[test]
+    fn the_current_device_is_listed_first_whatever_the_order() {
+        let (mut app, _rx) = main_app();
+        let mut list = device_list();
+        list.rotate_left(1);
+        let _ = app.update(core(CoreEvent::Devices(list)));
+        let first = &app.sessions.devices.as_ref().expect("a list")[0];
+        assert!(first.current);
+    }
+
+    #[test]
+    fn renaming_sends_the_trimmed_name_on_enter() {
+        let (mut app, mut rx) = sessions_app();
+        let _ = ses(
+            &mut app,
+            SessionsMessage::RenameStart(DeviceId::from("PHONE")),
+        );
+        let edit = app.sessions.rename.as_ref().expect("an open field");
+        assert_eq!(edit.input, "Phone");
+        let _ = ses(
+            &mut app,
+            SessionsMessage::RenameInput("  Work phone ".into()),
+        );
+        let _ = ses(&mut app, SessionsMessage::RenameSubmitted);
+        let commands = drain(&mut rx);
+        assert!(
+            matches!(
+                commands.as_slice(),
+                [Command::RenameDevice { device_id, name }]
+                    if *device_id == DeviceId::from("PHONE") && name == "Work phone"
+            ),
+            "{commands:?}"
+        );
+        assert!(app.sessions.rename.is_none());
+    }
+
+    #[test]
+    fn an_empty_or_unchanged_name_sends_nothing() {
+        let (mut app, mut rx) = sessions_app();
+        let _ = ses(
+            &mut app,
+            SessionsMessage::RenameStart(DeviceId::from("PHONE")),
+        );
+        let _ = ses(&mut app, SessionsMessage::RenameSubmitted);
+        assert!(drain(&mut rx).is_empty(), "unchanged");
+        let _ = ses(
+            &mut app,
+            SessionsMessage::RenameStart(DeviceId::from("PHONE")),
+        );
+        let _ = ses(&mut app, SessionsMessage::RenameInput("   ".into()));
+        let _ = ses(&mut app, SessionsMessage::RenameSubmitted);
+        assert!(drain(&mut rx).is_empty(), "blank");
+        let _ = ses(
+            &mut app,
+            SessionsMessage::RenameStart(DeviceId::from("NOPE")),
+        );
+        assert!(app.sessions.rename.is_none(), "not in the list");
+        let _ = ses(
+            &mut app,
+            SessionsMessage::RenameStart(DeviceId::from("PHONE")),
+        );
+        let _ = ses(&mut app, SessionsMessage::RenameCancelled);
+        assert!(app.sessions.rename.is_none());
+    }
+
+    #[test]
+    fn the_rename_field_is_capped() {
+        let (mut app, _rx) = sessions_app();
+        let _ = ses(
+            &mut app,
+            SessionsMessage::RenameStart(DeviceId::from("PHONE")),
+        );
+        let _ = ses(&mut app, SessionsMessage::RenameInput("x".repeat(500)));
+        let edit = app.sessions.rename.as_ref().expect("an open field");
+        assert_eq!(edit.input.chars().count(), crate::sessions::MAX_NAME_CHARS);
+    }
+
+    #[test]
+    fn verify_is_sent_for_an_unverified_other_device_only() {
+        let (mut app, mut rx) = sessions_app();
+        for id in ["THIS", "LAPTOP", "NOPE"] {
+            let _ = ses(&mut app, SessionsMessage::Verify(DeviceId::from(id)));
+            assert!(drain(&mut rx).is_empty(), "{id}");
+        }
+        let _ = ses(&mut app, SessionsMessage::Verify(DeviceId::from("PHONE")));
+        let commands = drain(&mut rx);
+        assert!(
+            matches!(
+                commands.as_slice(),
+                [Command::RequestDeviceVerification { device_id }] if *device_id == DeviceId::from("PHONE")
+            ),
+            "{commands:?}"
+        );
+    }
+
+    #[test]
+    fn signing_out_one_device_asks_first() {
+        let (mut app, mut rx) = sessions_app();
+        let _ = ses(
+            &mut app,
+            SessionsMessage::SignOutAsk(DeviceId::from("LAPTOP")),
+        );
+        assert!(drain(&mut rx).is_empty(), "nothing before the confirmation");
+        let _ = ses(&mut app, SessionsMessage::SignOutCancelled);
+        let _ = ses(&mut app, SessionsMessage::SignOutConfirmed);
+        assert!(drain(&mut rx).is_empty(), "cancelled");
+        let _ = ses(
+            &mut app,
+            SessionsMessage::SignOutAsk(DeviceId::from("LAPTOP")),
+        );
+        let _ = ses(&mut app, SessionsMessage::SignOutConfirmed);
+        let commands = drain(&mut rx);
+        assert!(
+            matches!(
+                commands.as_slice(),
+                [Command::SignOutDevices { device_ids, password: None }]
+                    if *device_ids == [DeviceId::from("LAPTOP")]
+            ),
+            "{commands:?}"
+        );
+        assert_eq!(app.sessions.pending, Some(vec![DeviceId::from("LAPTOP")]));
+    }
+
+    #[test]
+    fn this_device_cannot_be_signed_out_from_the_list() {
+        let (mut app, mut rx) = sessions_app();
+        let _ = ses(
+            &mut app,
+            SessionsMessage::SignOutAsk(DeviceId::from("THIS")),
+        );
+        let _ = ses(&mut app, SessionsMessage::SignOutConfirmed);
+        assert!(drain(&mut rx).is_empty());
+        assert!(app.sessions.pending.is_none());
+    }
+
+    #[test]
+    fn signing_out_all_sends_every_other_device_once() {
+        let (mut app, mut rx) = main_app();
+        let mut list = device_list();
+        // A repeated entry (the core does not dedup) must not repeat in the call.
+        list.push(summary(
+            "PHONE",
+            Some("Phone"),
+            false,
+            DeviceTrust::Unverified,
+        ));
+        let _ = app.update(core(CoreEvent::Devices(list)));
+        let _ = ses(&mut app, SessionsMessage::SignOutAllAsk);
+        let _ = ses(&mut app, SessionsMessage::SignOutConfirmed);
+        let commands = drain(&mut rx);
+        assert!(
+            matches!(
+                commands.as_slice(),
+                [Command::SignOutDevices { device_ids, password: None }]
+                    if *device_ids == [DeviceId::from("LAPTOP"), DeviceId::from("PHONE")]
+            ),
+            "{commands:?}"
+        );
+    }
+
+    #[test]
+    fn nothing_is_sent_to_sign_out_all_when_there_is_no_other_device() {
+        let (mut app, mut rx) = main_app();
+        let only = vec![summary("THIS", None, true, DeviceTrust::Verified)];
+        let _ = app.update(core(CoreEvent::Devices(only)));
+        let _ = ses(&mut app, SessionsMessage::SignOutAllAsk);
+        let _ = ses(&mut app, SessionsMessage::SignOutConfirmed);
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    /// Signs the phone out and answers with `ReauthRequired`.
+    fn reauth_asked() -> (App, mpsc::Receiver<Command>) {
+        let (mut app, mut rx) = sessions_app();
+        let _ = ses(
+            &mut app,
+            SessionsMessage::SignOutAsk(DeviceId::from("PHONE")),
+        );
+        let _ = ses(&mut app, SessionsMessage::SignOutConfirmed);
+        let _ = drain(&mut rx);
+        let _ = app.update(core(CoreEvent::ReauthRequired {
+            action: ReauthAction::DeleteDevices,
+        }));
+        (app, rx)
+    }
+
+    #[test]
+    fn the_reauth_round_trip_repeats_the_command_with_the_password() {
+        let (mut app, mut rx) = reauth_asked();
+        assert!(app.sessions.reauth.is_some());
+        let _ = ses(&mut app, SessionsMessage::ReauthSubmitted);
+        assert!(drain(&mut rx).is_empty(), "an empty password is not sent");
+        let _ = ses(
+            &mut app,
+            SessionsMessage::ReauthInput(Password::from("secret-pw-x")),
+        );
+        let dbg = format!("{app:?}");
+        assert!(!dbg.contains("secret-pw-x"), "{dbg}");
+        let _ = ses(&mut app, SessionsMessage::ReauthSubmitted);
+        let commands = drain(&mut rx);
+        assert!(
+            matches!(
+                commands.as_slice(),
+                [Command::SignOutDevices { device_ids, password: Some(password) }]
+                    if *device_ids == [DeviceId::from("PHONE")] && password.expose() == "secret-pw-x"
+            ),
+            "{commands:?}"
+        );
+        // The app no longer holds the password.
+        let prompt = app.sessions.reauth.as_ref().expect("the prompt stays");
+        assert_eq!(prompt.password.expose(), "");
+        assert!(prompt.waiting);
+        let dbg = format!("{app:?} {:?}", app.sessions);
+        assert!(!dbg.contains("secret-pw-x"), "{dbg}");
+        // Success: the next list no longer has the phone.
+        let rest: Vec<_> = device_list()
+            .into_iter()
+            .filter(|d| d.device_id != DeviceId::from("PHONE"))
+            .collect();
+        let _ = app.update(core(CoreEvent::Devices(rest)));
+        assert!(app.sessions.reauth.is_none() && app.sessions.pending.is_none());
+    }
+
+    #[test]
+    fn a_wrong_password_keeps_the_prompt_and_asks_again() {
+        let (mut app, mut rx) = reauth_asked();
+        let _ = ses(
+            &mut app,
+            SessionsMessage::ReauthInput(Password::from("secret-pw-x")),
+        );
+        let _ = ses(&mut app, SessionsMessage::ReauthSubmitted);
+        let _ = drain(&mut rx);
+        // A list that still shows the phone must not close the prompt.
+        let _ = app.update(core(CoreEvent::Devices(device_list())));
+        assert!(app.sessions.reauth.is_some());
+        let _ = app.update(core(CoreEvent::ActionFailed {
+            room_id: RoomId::from(""),
+            action: ActionKind::Devices,
+            error: CoreError::ReauthFailed,
+        }));
+        let prompt = app.sessions.reauth.as_ref().expect("the prompt stays");
+        assert!(prompt.failed && !prompt.waiting);
+        assert_eq!(prompt.password.expose(), "");
+        assert_eq!(app.sessions.pending, Some(vec![DeviceId::from("PHONE")]));
+        // Typing again and submitting sends the command again.
+        let _ = ses(
+            &mut app,
+            SessionsMessage::ReauthInput(Password::from("secret-pw-y")),
+        );
+        let _ = ses(&mut app, SessionsMessage::ReauthSubmitted);
+        let commands = drain(&mut rx);
+        assert!(
+            matches!(
+                commands.as_slice(),
+                [Command::SignOutDevices { password: Some(p), .. }] if p.expose() == "secret-pw-y"
+            ),
+            "{commands:?}"
+        );
+    }
+
+    #[test]
+    fn cancelling_the_prompt_zeroizes_the_field_and_forgets_the_sign_out() {
+        let (mut app, mut rx) = reauth_asked();
+        let _ = ses(
+            &mut app,
+            SessionsMessage::ReauthInput(Password::from("secret-pw-x")),
+        );
+        let _ = ses(&mut app, SessionsMessage::ReauthCancelled);
+        assert!(app.sessions.reauth.is_none() && app.sessions.pending.is_none());
+        let _ = ses(&mut app, SessionsMessage::ReauthSubmitted);
+        assert!(drain(&mut rx).is_empty());
+        let dbg = format!("{app:?}");
+        assert!(!dbg.contains("secret-pw-x"), "{dbg}");
+    }
+
+    #[test]
+    fn a_reauth_request_nobody_asked_for_is_ignored() {
+        let (mut app, _rx) = sessions_app();
+        let _ = app.update(core(CoreEvent::ReauthRequired {
+            action: ReauthAction::DeleteDevices,
+        }));
+        assert!(app.sessions.reauth.is_none());
+    }
+
+    #[test]
+    fn logout_and_close_drop_the_sessions_password() {
+        for message in [Message::LogoutRequested, Message::CloseRequested] {
+            let (mut app, _rx) = reauth_asked();
+            let _ = ses(
+                &mut app,
+                SessionsMessage::ReauthInput(Password::from("secret-pw-x")),
+            );
+            let _ = app.update(message);
+            assert!(app.sessions.reauth.is_none());
+        }
+    }
+
+    #[test]
+    fn another_failure_ends_the_sign_out_with_a_notice() {
+        let (mut app, _rx) = reauth_asked();
+        let _ = app.update(core(CoreEvent::ActionFailed {
+            room_id: RoomId::from(""),
+            action: ActionKind::Devices,
+            error: CoreError::Internal("the device could not be renamed".into()),
+        }));
+        assert!(app.sessions.reauth.is_none() && app.sessions.pending.is_none());
+        let notice = app.sessions.notice.clone().expect("a notice");
+        assert!(!notice.contains('\n') && !notice.is_empty());
+    }
+
+    /// Signs the phone out on an OAuth session: the core answers with a URL.
+    fn oauth_url(app: &mut App, url: &str) -> Task<Message> {
+        let _ = ses(app, SessionsMessage::SignOutAsk(DeviceId::from("PHONE")));
+        let _ = ses(app, SessionsMessage::SignOutConfirmed);
+        app.update(core(CoreEvent::OpenAccountManagement(AuthUrl::from(url))))
+    }
+
+    #[test]
+    fn an_account_page_waits_for_the_go_ahead_and_shows_its_host() {
+        let (mut app, _rx) = sessions_app();
+        let task = oauth_url(
+            &mut app,
+            "https://Account.Example.org:8443/devices?state=secret-state-x",
+        );
+        assert_eq!(task.units(), 0, "nothing opens before the user agrees");
+        let approval = app.sessions.approval.as_ref().expect("a bar");
+        assert_eq!(approval.host, "account.example.org");
+        assert!(app.sessions.pending.is_none());
+        let dbg = format!("{app:?}");
+        assert!(!dbg.contains("secret-state-x"), "{dbg}");
+        let task = ses(&mut app, SessionsMessage::ApprovalConfirmed);
+        assert!(task.units() > 0, "opened inside a task");
+        assert!(app.sessions.approval.is_none());
+        // A second confirmation has nothing to open.
+        assert_eq!(ses(&mut app, SessionsMessage::ApprovalConfirmed).units(), 0);
+    }
+
+    #[test]
+    fn dismissing_the_account_page_bar_opens_nothing() {
+        let (mut app, _rx) = sessions_app();
+        let _ = oauth_url(&mut app, "https://account.example.org/devices");
+        assert_eq!(ses(&mut app, SessionsMessage::ApprovalDismissed).units(), 0);
+        assert!(app.sessions.approval.is_none());
+    }
+
+    #[test]
+    fn an_unsafe_account_page_address_is_refused() {
+        for url in [
+            "http://account.example.org/devices",
+            "https://user:pw@account.example.org/devices",
+            "javascript:alert(1)",
+            "https://account.example.org/a b",
+            "file:///etc/passwd",
+        ] {
+            let (mut app, _rx) = sessions_app();
+            let task = oauth_url(&mut app, url);
+            assert_eq!(task.units(), 0, "{url}");
+            assert!(app.sessions.approval.is_none(), "{url}");
+            assert!(app.sessions.notice.is_some(), "{url}");
+            assert_eq!(ses(&mut app, SessionsMessage::ApprovalConfirmed).units(), 0);
+        }
+    }
+
+    #[test]
+    fn an_account_page_nobody_asked_for_is_ignored() {
+        let (mut app, _rx) = sessions_app();
+        let task = app.update(core(CoreEvent::OpenAccountManagement(AuthUrl::from(
+            "https://account.example.org/devices",
+        ))));
+        assert_eq!(task.units(), 0);
+        assert!(app.sessions.approval.is_none());
+    }
+
+    #[test]
+    fn the_logout_warning_offers_recovery_or_signing_out_anyway() {
+        let (mut app, mut rx) = main_app();
+        set_status(
+            &mut app,
+            DeviceVerification::Verified,
+            RecoveryStatus::Disabled,
+        );
+        while rx.try_recv().is_ok() {}
+        let _ = app.update(Message::LogoutRequested);
+        assert!(app.sessions.logout_warning);
+        assert!(
+            drain(&mut rx).is_empty(),
+            "nothing is sent before the answer"
+        );
+        // Cancel closes it.
+        let _ = ses(&mut app, SessionsMessage::LogoutCancelled);
+        assert!(!app.sessions.logout_warning && drain(&mut rx).is_empty());
+        // Set up recovery starts it and does not log out.
+        let _ = app.update(Message::LogoutRequested);
+        let _ = ses(&mut app, SessionsMessage::LogoutSetupRecovery);
+        assert!(!app.sessions.logout_warning);
+        let commands = drain(&mut rx);
+        assert!(
+            matches!(commands.as_slice(), [Command::EnableRecovery]),
+            "{commands:?}"
+        );
+        // Sign out anyway logs out.
+        let (mut app, mut rx) = main_app();
+        set_status(
+            &mut app,
+            DeviceVerification::Verified,
+            RecoveryStatus::Disabled,
+        );
+        while rx.try_recv().is_ok() {}
+        let _ = app.update(Message::LogoutRequested);
+        let _ = ses(&mut app, SessionsMessage::LogoutAnyway);
+        assert!(matches!(drain(&mut rx).as_slice(), [Command::Logout]));
+        assert!(!app.sessions.logout_warning);
+    }
+
+    #[test]
+    fn the_answers_of_the_warning_only_count_while_it_is_shown() {
+        let (mut app, mut rx) = main_app();
+        set_status(
+            &mut app,
+            DeviceVerification::Verified,
+            RecoveryStatus::Disabled,
+        );
+        while rx.try_recv().is_ok() {}
+        let _ = ses(&mut app, SessionsMessage::LogoutAnyway);
+        let _ = ses(&mut app, SessionsMessage::LogoutSetupRecovery);
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn logout_goes_straight_through_with_recovery_or_another_session() {
+        let (mut app, mut rx) = main_app();
+        set_status(
+            &mut app,
+            DeviceVerification::Verified,
+            RecoveryStatus::Enabled,
+        );
+        while rx.try_recv().is_ok() {}
+        let _ = app.update(Message::LogoutRequested);
+        assert!(matches!(drain(&mut rx).as_slice(), [Command::Logout]));
+        let (mut app, mut rx) = main_app();
+        set_status(
+            &mut app,
+            DeviceVerification::Verified,
+            RecoveryStatus::Disabled,
+        );
+        let _ = app.update(core(CoreEvent::Devices(device_list())));
+        while rx.try_recv().is_ok() {}
+        let _ = app.update(Message::LogoutRequested);
+        assert!(matches!(drain(&mut rx).as_slice(), [Command::Logout]));
+        assert!(!app.sessions.logout_warning);
+    }
+
+    #[test]
+    fn logged_out_resets_the_sessions_state() {
+        let (mut app, _rx) = reauth_asked();
+        let _ = app.update(core(CoreEvent::LoggedOut));
+        assert!(!app.sessions.open && app.sessions.devices.is_none());
+        assert!(app.sessions.reauth.is_none() && app.sessions.pending.is_none());
+    }
+
+    #[test]
+    fn device_names_from_the_server_never_reach_the_app_debug_output_unsanitized() {
+        let (mut app, _rx) = main_app();
+        let evil = summary("D", Some("a\u{202E}b"), false, DeviceTrust::Unverified);
+        let _ = app.update(core(CoreEvent::Devices(vec![evil])));
+        // The title is what the view draws.
+        let list = app.sessions.devices.as_ref().expect("a list");
+        assert!(!crate::sessions::device_title(&list[0]).contains('\u{202E}'));
+    }
+
+    #[test]
+    fn every_sessions_state_builds_a_view() {
+        let (mut app, _rx) = sessions_app();
+        let _ = app.view();
+        let _ = ses(
+            &mut app,
+            SessionsMessage::RenameStart(DeviceId::from("PHONE")),
+        );
+        let _ = app.view();
+        let _ = ses(&mut app, SessionsMessage::SignOutAllAsk);
+        let _ = app.view();
+        let _ = ses(
+            &mut app,
+            SessionsMessage::SignOutAsk(DeviceId::from("PHONE")),
+        );
+        let _ = app.view();
+        let _ = ses(&mut app, SessionsMessage::SignOutConfirmed);
+        let _ = app.update(core(CoreEvent::ReauthRequired {
+            action: ReauthAction::DeleteDevices,
+        }));
+        let _ = app.view();
+        let _ = app.update(core(CoreEvent::ActionFailed {
+            room_id: RoomId::from(""),
+            action: ActionKind::Devices,
+            error: CoreError::ReauthFailed,
+        }));
+        let _ = app.view();
+        let _ = ses(&mut app, SessionsMessage::ReauthCancelled);
+        let _ = oauth_url(&mut app, "https://account.example.org/devices");
+        let _ = app.view();
+        set_status(
+            &mut app,
+            DeviceVerification::Verified,
+            RecoveryStatus::Disabled,
+        );
+        let _ = app.update(core(CoreEvent::Devices(vec![summary(
+            "THIS",
+            None,
+            true,
+            DeviceTrust::Verified,
+        )])));
+        let _ = app.update(Message::LogoutRequested);
+        let _ = app.view();
+        let _ = ses(&mut app, SessionsMessage::Close);
+        let _ = app.view();
     }
 }

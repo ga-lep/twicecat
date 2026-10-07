@@ -319,7 +319,7 @@ Fixes the human may want before or after the checkpoint, from the task notes and
 - [x] 10. Security state, banners, Confirm-identity and recovery screens in the app (roadmap steps 2, 4, UI) (phase4.10; rendering items stay on the human checkpoint)
 - [x] 11. Verification dialog with the emoji grid and the QR code (roadmap step 3, UI) (phase4.11; rendering and real-device items stay on the human checkpoint)
 - [x] 12. Shields, trust badges, encrypted-room marks and UTD placeholders (roadmap steps 4, 5, UI) (phase4.12; rendering items stay on the human checkpoint)
-- [ ] 13. Sessions screen and re-authentication prompt (roadmap step 6, UI)
+- [x] 13. Sessions screen and re-authentication prompt (roadmap step 6, UI) (phase4.13; rendering and real-account items stay on the human checkpoint)
 - [ ] 14. Security review and Phase 4 wrap-up (roadmap step 7)
 
 ## Phase 4 human answers (2026-10-06)
@@ -467,6 +467,29 @@ Fixes the human may want before or after the checkpoint, from the task notes and
 - Fix-round TDD note: the core mapping test and the app tests were written together with the code in this round, so no separate red run was recorded (the old timeline-peer tests were replaced).
 - Open issues: the deviation above; a changed DM target may show only on the next `Set`; the lock may appear late (core); the shield is a small "!" badge, the lock the U+1F512 glyph (font coverage unchecked).
 
+## Phase 4 / Task 13 notes (Sessions screen, re-authentication prompt, logout warning in the app)
+- Step done:
+  - `crates/app/src/sessions.rs`: pure `SessionsModel` (devices, rename field, sign-out confirmation, `pending` device IDs, `ReauthPrompt`, account-page `Approval`, notice, logout warning), `SessionsMessage`, pure helpers `logout_needs_warning`, `device_title`, `device_id_line`, `trust_label`, `can_verify`, `last_active_text` (uses `dates.rs` labels), `dedup_ids`, and the `App` handlers.
+  - `crates/app/src/screens/sessions.rs`: the page (Refresh, Close, rows, "Sign out of all other sessions"), the password card and the logout-warning card, layered over the main view; `main_view` status bar gains **Sessions**.
+  - `state.rs`: `Message::Sessions`, `App.sessions`; routes `Devices`, `ActionFailed { Devices }`, `ReauthRequired { DeleteDevices }` and `OpenAccountManagement` (to the security screens while a reset runs, otherwise to Sessions); `LogoutRequested` asks first when `logout_needs_warning`; `drop_secrets` clears the sessions password prompt; `back_to_login` resets the model.
+- Ledger notes honoured:
+  - Task 8 (no re-emit after renames and deletions by other clients): opening the screen and **Refresh** send `ListDevices`. An unseen device may list as `NoKeys` until the sync keys query; the badge says "No encryption keys" and offers no Verify (Refresh later).
+  - Task 8 (OAuth): several devices open the DevicesList page; the app just opens the URL it is given (after the checks below).
+  - Task 8 (names attacker-controlled): every name goes through `text_safety` (`name_or_placeholder`, 64 chars); a blank name shows the device ID; the ID is always shown too (elided in the middle, never cut from the end); the rename field starts with the sanitized name and caps input at 64 characters.
+  - Task 8 (`uia_password` plain String): the app keeps the typed password only in the prompt's `Password` (zeroized); on Continue it moves into the command and the field is left empty; `pending` holds device IDs only; Cancel, close, logout and a finished sign-out drop the prompt.
+  - Task 8 (no dedup or cap in `sign_out_devices`): the app dedups (`dedup_ids`), drops this device and unknown IDs, and keeps at most 500 devices from the list.
+  - Task 4/5 (`ReauthRequired(DeleteDevices)` ignored): now handled only while a sign-out of the user's is pending; a wrong password (`ReauthFailed`) keeps the prompt, empties the field and shows "Wrong password"; any other failure ends the sign-out with a one-line notice.
+  - Task 10 (OAuth URLs): the account-page URL goes through `check_browser_url`, must also pass `check_link_url` as `https`, and shows a bar naming the host; the browser starts only inside a `Task` after **Open**. A refused address gives a notice and nothing opens.
+  - Task 11: **Verify** (unverified other devices only) sends `RequestDeviceVerification`; the dialog opens from the core's events as for any request. No user or device ID is cut from the end.
+- Decisions to confirm:
+  - `logout_needs_warning(status, other_devices: Option<usize>)`: warns when recovery is `Disabled` or `Incomplete` (not `Enabled`) and there is no other session; an unknown list (Sessions never opened) warns too, to be safe. A recovery state still `Unknown` does not warn. The list is the last one the core sent, so it can be stale.
+  - The password prompt is the Sessions screen's own card (the security screens' prompt stays for reset and bootstrap).
+  - After an OAuth sign-out the app does not know the outcome: the bar tells the user to press Refresh after approving.
+- TDD: pure helpers and the `update` tests were seen failing on assertions against stubs. Two existing logout tests (Task 10) now set recovery `Enabled` first, because logout with recovery off warns. No view test beyond a smoke test that builds every Sessions state.
+- APIs confirmed in `~/.cargo/registry/src/*/`: iced_widget-0.14.2 `helpers.rs:561` (`stack(children)`), `helpers.rs:1444` (`text_input`), `text_input.rs:157,163,184,201` (`id`, `secure`, `on_input_maybe`, `on_submit_maybe`); the rest is already used elsewhere in the crate.
+- Checks: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo test --workspace` (app lib 555), `scripts/check-app-deps.sh`, `scripts/check-core-api.sh`: pass. Not run: the ignored suites (no core code changed).
+- Open issues: the Sessions row has no spinner while a sign-out waits (text only); a `WatchUserTrust` failure (also `ActionKind::Devices`) while a sign-out is pending ends it with that failure's notice.
+
 ## Phase 4 human checkpoint
 - [ ] Phase 3 sign-off recorded (Q1, 2026-10-06). Confirm Q3 as planned: matrix-sdk `qrcode` enabled, iced `qr_code` **not** enabled (the QR code is drawn with the existing `image` widget from the SDK's own grid); and revisit any of Q1-Q19.
 - [ ] CI green on Linux, Windows and macOS; the `integration` job stays under its 20-minute timeout.
@@ -490,6 +513,10 @@ Fixes the human may want before or after the checkpoint, from the task notes and
 - [ ] UTD placeholders (Task 12): each reason line reads well; after recovery or verification a placeholder becomes the message in place, with no jump of the scroll position.
 - [ ] Devices in the core (Task 8): on an OAuth account (matrix.org) signing a device out opens its account-page URL (and with several devices the devices list), and a server without an account page shows "manage your devices on your account page"; the pure URL test is the only automation.
 - [ ] Sessions screen: rename shows in Element; sign out another session with the password; wrong password re-prompts; logout warning without recovery.
+- [ ] Sessions screen (Task 13), both themes: layout of the page (this device first with "This device", name, ID line, last active, Verified / Not verified badge, Rename, Verify, Sign out, "Sign out of all other sessions"), the inline rename field (Enter saves), the inline sign-out confirmation, the password card with "Wrong password", and the logout warning card; a device named with odd characters (bidi, very long, blank) shows one clean line plus its ID.
+- [ ] Sessions (Task 13): renaming a session shows in Element; signing out another session with the password works and it disappears from the list; a wrong password shows "Wrong password" and asks again; **Verify** on an unverified session opens the verification dialog; Refresh shows a rename or sign-out done in Element.
+- [ ] Sessions (Task 13), matrix.org OAuth account (real account, human only): **Sign out** shows "Open <host>?" and then opens the account page for that device (several devices: the devices list); after approving, Refresh shows the result.
+- [ ] Logout warning (Task 13): with recovery not set up and no other session, **Log out** asks first ("You'll lose access to your encrypted messages") with **Set up recovery** and **Sign out anyway**; with recovery on, or another session listed, it logs out at once. Before Sessions was ever opened the warning also appears when recovery is off (decision: unknown list warns).
 - [ ] OAuth account (matrix.org): cross-signing set up after login, identity reset approval page, device sign-out via the account page.
 - [ ] Reset identity (Task 4 core): with an OAuth account (matrix.org) the approval page opens from `OpenAccountManagement`, approving finishes the reset, and cancelling it leaves the old identity; with the local Synapse and a password the reset needs the password and a wrong one asks again (core tests cover only the password path and the pure OAuth branch); cancelling reports `Cancelled` (not success) and no approval URL is sent after an early cancel; a wrong password still deletes the backup (SDK order), so check the app asks for the password first.
 - [ ] Cross-signing on a restored session from before Phase 4 (no identity yet) on a homeserver that demands UIA for a first upload (the local Synapse v1.151.0 does not; matrix.org may): the password prompt appears and the identity is created.

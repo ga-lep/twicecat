@@ -14,7 +14,8 @@ use crate::emoji;
 use crate::links::{CheckedUrl, LinkBar, LinkKind};
 use crate::screens::loading::sync_label;
 use crate::screens::timeline_pane::RichEnv;
-use crate::screens::{room_list_pane, security, timeline_pane};
+use crate::screens::{room_list_pane, security, sessions, timeline_pane};
+use crate::sessions::SessionsMessage;
 use crate::state::{App, Message};
 use crate::text_safety::{MAX_NAME_CHARS, name_or_placeholder, one_line_capped};
 use crate::theme;
@@ -130,7 +131,10 @@ pub fn view(app: &App) -> Element<'_, Message> {
             .into(),
         status_bar(app),
     );
-    security::layer(content, security::top_layer(app))
+    security::layer(
+        content,
+        security::top_layer(app).or_else(|| sessions::layer(app)),
+    )
 }
 
 /// The main column, always `[banner slot, panes, status bar]`: the slot is
@@ -478,6 +482,9 @@ fn status_bar(app: &App) -> Element<'_, Message> {
             }),
             space().width(Fill),
             text(account),
+            button(text("Sessions"))
+                .on_press(Message::Sessions(SessionsMessage::Open))
+                .style(button::secondary),
             button(text("Log out"))
                 .on_press(Message::LogoutRequested)
                 .style(button::secondary),

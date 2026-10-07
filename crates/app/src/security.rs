@@ -564,6 +564,8 @@ impl App {
     pub(crate) fn drop_secrets(&mut self) -> Task<Message> {
         let copied = self.security.copied.take();
         self.security.clear_secrets();
+        // The sign-out password prompt: dropping it zeroizes the field.
+        self.sessions.reauth = None;
         match copied {
             Some(key) => {
                 self.flushes_pending += 1;
