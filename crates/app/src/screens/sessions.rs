@@ -13,9 +13,11 @@ use iced::{Element, Fill, Theme};
 use tessera_core::api::{DeviceSummary, DeviceTrust, Password};
 
 use crate::screens::security::{card, secondary, wide};
+use crate::security::SecurityModel;
 use crate::sessions::{
     Approval, LOGOUT_WARNING, REAUTH_INPUT_ID, RENAME_INPUT_ID, SessionsMessage, SessionsModel,
-    SignOutAsk, can_verify, device_id_line, device_title, last_active_text, trust_label,
+    SignOutAsk, can_verify, device_id_line, device_title, last_active_text, recovery_line,
+    trust_label,
 };
 use crate::state::{App, Message};
 use crate::theme;
@@ -49,7 +51,7 @@ pub fn layer(app: &App) -> Option<Element<'_, Message>> {
     let model = &app.sessions;
     let mut layers: Vec<Element<'_, Message>> = Vec::new();
     if model.open {
-        layers.push(page(model));
+        layers.push(page(model, &app.security));
     }
     if model.open && model.reauth.is_some() {
         layers.push(reauth_card(model));
@@ -64,7 +66,7 @@ pub fn layer(app: &App) -> Option<Element<'_, Message>> {
     }
 }
 
-fn page(model: &SessionsModel) -> Element<'_, Message> {
+fn page<'a>(model: &'a SessionsModel, security: &SecurityModel) -> Element<'a, Message> {
     let now = u64::try_from(Local::now().timestamp_millis()).unwrap_or(0);
     let mut body = Column::new().spacing(12);
     body = body.push(
@@ -97,6 +99,9 @@ fn page(model: &SessionsModel) -> Element<'_, Message> {
     if let Some(approval) = &model.approval {
         body = body.push(approval_bar(approval));
     }
+    if let Some(line) = recovery_bar(security) {
+        body = body.push(line);
+    }
     let Some(devices) = &model.devices else {
         let label = if model.loading {
             "Loading\u{2026}"
@@ -115,6 +120,33 @@ fn page(model: &SessionsModel) -> Element<'_, Message> {
         body = body.push(sign_out_all(model));
     }
     page_card(body.into())
+}
+
+/// The Recovery line (plan Task 15); its button is off while the core is
+/// busy with a security action.
+fn recovery_bar(security: &SecurityModel) -> Option<Element<'static, Message>> {
+    let (label, action) = recovery_line(security.status.recovery)?;
+    let mut bar = row![text(label), space().width(Fill)]
+        .spacing(8)
+        .align_y(iced::Center);
+    if let Some(action) = action {
+        let press = security
+            .busy
+            .is_none()
+            .then(|| Message::Security(action.message()));
+        bar = bar.push(
+            button(text(action.label()))
+                .on_press_maybe(press)
+                .style(button::secondary),
+        );
+    }
+    Some(
+        container(bar)
+            .padding(10)
+            .width(Fill)
+            .style(container::bordered_box)
+            .into(),
+    )
 }
 
 fn page_card(content: Element<'_, Message>) -> Element<'_, Message> {

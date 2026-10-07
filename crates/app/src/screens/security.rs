@@ -27,6 +27,12 @@ pub const KEY_WARNING: &str = "Store this key somewhere safe, like a password ma
 /// What the reset warning says.
 pub const RESET_WARNING: &str = "Resetting your identity makes your other devices and your contacts see you as a new user, and deletes your key backup: older encrypted messages may become unreadable. Only reset if you can't use another device or your recovery key.";
 
+/// What the warning before changing the recovery key says (plan Task 15).
+pub const CHANGE_KEY_WARNING: &str = "Your current recovery key will stop working. Tessera will show you a new one, once. Other apps and devices that ask for your recovery key will need the new one. Anything another app saved in your secure storage that this device doesn't have will be lost.";
+
+/// Said while the recovery key is being changed.
+pub const CHANGE_KEY_WAIT: &str = "Changing your recovery key\u{2026}";
+
 /// Said while a reset runs.
 pub const RESET_WAIT: &str = "Resetting\u{2026} Syncing is paused and no messages arrive until this ends. With a browser approval it can take up to two minutes.";
 
@@ -136,6 +142,7 @@ pub fn screen(model: &SecurityModel) -> Option<Element<'_, Message>> {
         Visible::Overlay(Overlay::ConfirmIdentity) => identity_screen(model),
         Visible::Overlay(Overlay::Restore) => restore_screen(model),
         Visible::Overlay(Overlay::ResetConfirm) => reset_screen(model),
+        Visible::Overlay(Overlay::ChangeKeyConfirm) => change_key_screen(model),
     };
     Some(card(content))
 }
@@ -276,6 +283,26 @@ fn reset_screen(model: &SecurityModel) -> Element<'_, Message> {
     .into()
 }
 
+fn change_key_screen(model: &SecurityModel) -> Element<'_, Message> {
+    let body = column![
+        text("Change your recovery key?").size(24),
+        text(CHANGE_KEY_WARNING),
+    ]
+    .spacing(12);
+    if model.busy == Some(Busy::ChangingKey) {
+        return body.push(text(CHANGE_KEY_WAIT)).into();
+    }
+    body.push(wide(
+        "Change key",
+        Some(msg(SecurityMessage::ChangeKeyConfirmed)),
+    ))
+    .push(secondary(
+        "Cancel",
+        Some(msg(SecurityMessage::ChangeKeyCancelled)),
+    ))
+    .into()
+}
+
 fn reauth_screen(model: &SecurityModel) -> Element<'_, Message> {
     let Some(prompt) = &model.reauth else {
         return space().into();
@@ -315,7 +342,7 @@ fn key_screen(model: &SecurityModel) -> Element<'_, Message> {
     };
     let done = crate::security::can_finish_setup(setup).then_some(msg(SecurityMessage::Done));
     column![
-        text("Your recovery key").size(24),
+        text(crate::security::key_title(setup)).size(24),
         container(text(setup.key.expose()).font(Font::MONOSPACE).size(20))
             .padding(12)
             .width(Fill)

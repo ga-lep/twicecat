@@ -5874,4 +5874,127 @@ mod tests {
         let _ = sec(&mut app, SecurityMessage::SetupRecovery);
         assert_eq!(laid_out_size(&app), window, "setting up recovery");
     }
+
+    // ---- Task 15: change the recovery key ----
+
+    /// A verified app with recovery on and the Sessions page open, with the
+    /// commands drained.
+    fn change_key_app() -> (App, mpsc::Receiver<Command>) {
+        let (mut app, mut rx) = main_app();
+        set_status(
+            &mut app,
+            DeviceVerification::Verified,
+            RecoveryStatus::Enabled,
+        );
+        let _ = ses(&mut app, SessionsMessage::Open);
+        while rx.try_recv().is_ok() {}
+        (app, rx)
+    }
+
+    #[test]
+    fn change_recovery_key_asks_first_and_cancel_sends_nothing() {
+        let (mut app, mut rx) = change_key_app();
+        let _ = sec(&mut app, SecurityMessage::ChangeKeyRequested);
+        assert_eq!(
+            app.security.visible(),
+            Visible::Overlay(Overlay::ChangeKeyConfirm)
+        );
+        let _ = sec(&mut app, SecurityMessage::ChangeKeyCancelled);
+        assert_eq!(app.security.visible(), Visible::Nothing);
+        assert!(app.sessions.open, "back on the Sessions page");
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn change_key_sends_one_command_and_nothing_while_busy() {
+        let (mut app, mut rx) = change_key_app();
+        let _ = sec(&mut app, SecurityMessage::ChangeKeyRequested);
+        let _ = sec(&mut app, SecurityMessage::ChangeKeyConfirmed);
+        let _ = sec(&mut app, SecurityMessage::ChangeKeyConfirmed);
+        let _ = sec(&mut app, SecurityMessage::ChangeKeyRequested);
+        let _ = sec(&mut app, SecurityMessage::SetupRecovery);
+        let commands = drain(&mut rx);
+        assert_eq!(commands.len(), 1, "{commands:?}");
+        assert!(matches!(commands[0], Command::ChangeRecoveryKey));
+        assert_eq!(app.security.busy, Some(Busy::ChangingKey));
+        assert_eq!(
+            app.security.visible(),
+            Visible::Overlay(Overlay::ChangeKeyConfirm),
+            "the card stays, showing the wait"
+        );
+        // Cancel does nothing once the command is out.
+        let _ = sec(&mut app, SecurityMessage::ChangeKeyCancelled);
+        assert_eq!(app.security.busy, Some(Busy::ChangingKey));
+    }
+
+    #[test]
+    fn change_key_is_refused_unless_recovery_is_on() {
+        for recovery in [
+            RecoveryStatus::Disabled,
+            RecoveryStatus::Incomplete,
+            RecoveryStatus::Unknown,
+        ] {
+            let (mut app, mut rx) = change_key_app();
+            set_status(&mut app, DeviceVerification::Verified, recovery);
+            let _ = sec(&mut app, SecurityMessage::ChangeKeyRequested);
+            let _ = sec(&mut app, SecurityMessage::ChangeKeyConfirmed);
+            assert_eq!(app.security.visible(), Visible::Nothing, "{recovery:?}");
+            assert!(drain(&mut rx).is_empty(), "{recovery:?}");
+        }
+    }
+
+    #[test]
+    fn the_new_key_opens_the_show_once_screen_as_a_new_key() {
+        let (mut app, _rx) = change_key_app();
+        let _ = sec(&mut app, SecurityMessage::ChangeKeyRequested);
+        let _ = sec(&mut app, SecurityMessage::ChangeKeyConfirmed);
+        key_ready(&mut app, "secret-key-x");
+        assert_eq!(app.security.visible(), Visible::Key);
+        assert_eq!(app.security.busy, None);
+        let setup = app.security.setup.as_ref().expect("the key screen");
+        assert_eq!(crate::security::key_title(setup), "Your new recovery key");
+        let _ = sec(&mut app, SecurityMessage::Done);
+        assert_eq!(app.security.visible(), Visible::Key, "Done needs the box");
+        let _ = sec(&mut app, SecurityMessage::SavedToggled(true));
+        let _ = sec(&mut app, SecurityMessage::Done);
+        assert_eq!(app.security.visible(), Visible::Nothing);
+        assert!(app.sessions.open, "back on the Sessions page");
+    }
+
+    #[test]
+    fn a_key_from_set_up_keeps_the_first_title() {
+        let (mut app, _rx) = recovery_app();
+        let _ = sec(&mut app, SecurityMessage::SetupRecovery);
+        key_ready(&mut app, "secret-key-x");
+        let setup = app.security.setup.as_ref().expect("the key screen");
+        assert_eq!(crate::security::key_title(setup), "Your recovery key");
+    }
+
+    #[test]
+    fn a_failed_change_shows_the_reason_on_the_sessions_page() {
+        let (mut app, _rx) = change_key_app();
+        let _ = sec(&mut app, SecurityMessage::ChangeKeyRequested);
+        let _ = sec(&mut app, SecurityMessage::ChangeKeyConfirmed);
+        let _ = app.update(recovery_failed(CoreError::Internal(
+            "recovery is not complete on this device".into(),
+        )));
+        assert_eq!(app.security.busy, None);
+        assert_eq!(app.security.visible(), Visible::Nothing);
+        assert_eq!(app.security.overlay, None);
+        let notice = app.sessions.notice.clone().expect("a Sessions notice");
+        assert!(notice.contains("not complete"), "{notice}");
+    }
+
+    #[test]
+    fn the_change_key_card_fills_the_window_and_hides_no_secret() {
+        let window = iced::Size::new(1000.0, 700.0);
+        let (mut app, _rx) = change_key_app();
+        let _ = sec(&mut app, SecurityMessage::ChangeKeyRequested);
+        assert_eq!(laid_out_size(&app), window, "the warning");
+        let _ = sec(&mut app, SecurityMessage::ChangeKeyConfirmed);
+        assert_eq!(laid_out_size(&app), window, "the wait");
+        key_ready(&mut app, KEY_S);
+        assert_eq!(laid_out_size(&app), window, "the new key");
+        assert_no_sentinel("new key screen", &format!("{app:?}"), &ALL_S);
+    }
 }

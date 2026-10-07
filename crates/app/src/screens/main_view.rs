@@ -614,7 +614,7 @@ mod tests {
             Box::new(|m| m.overlay = Some(Overlay::Restore)),
             Box::new(|m| m.overlay = Some(Overlay::ResetConfirm)),
             Box::new(|m| {
-                m.setup = Some(RecoverySetup::new(RecoveryKey::from("secret-key-x")));
+                m.setup = Some(RecoverySetup::new(RecoveryKey::from("secret-key-x"), false));
             }),
             Box::new(|m| {
                 m.setup = None;

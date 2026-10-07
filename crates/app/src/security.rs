@@ -109,14 +109,17 @@ pub struct RecoverySetup {
     pub key: RecoveryKey,
     /// "I've saved my recovery key" is ticked.
     pub saved_ticked: bool,
+    /// The key replaces an earlier one (**Change recovery key**).
+    pub replaces_old: bool,
 }
 
 impl RecoverySetup {
     /// A screen for `key`, not ticked.
-    pub fn new(key: RecoveryKey) -> Self {
+    pub fn new(key: RecoveryKey, replaces_old: bool) -> Self {
         Self {
             key,
             saved_ticked: false,
+            replaces_old,
         }
     }
 }
@@ -125,7 +128,17 @@ impl fmt::Debug for RecoverySetup {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RecoverySetup")
             .field("saved_ticked", &self.saved_ticked)
+            .field("replaces_old", &self.replaces_old)
             .finish_non_exhaustive()
+    }
+}
+
+/// The title of the key screen.
+pub fn key_title(setup: &RecoverySetup) -> &'static str {
+    if setup.replaces_old {
+        "Your new recovery key"
+    } else {
+        "Your recovery key"
     }
 }
 
@@ -182,6 +195,8 @@ pub enum Overlay {
     Restore,
     /// The warning before an identity reset.
     ResetConfirm,
+    /// The warning before changing the recovery key (plan Task 15).
+    ChangeKeyConfirm,
 }
 
 /// What the core is busy with for the user.
@@ -194,6 +209,8 @@ pub enum Busy {
     /// Resetting the identity. The core pauses sync meanwhile, so no event
     /// arrives for up to about two minutes with OAuth: silence is not "unchanged".
     Resetting,
+    /// Changing the recovery key.
+    ChangingKey,
 }
 
 /// The one security screen that is on top right now.
@@ -366,6 +383,12 @@ pub enum SecurityMessage {
     DismissRecoveryBanner,
     /// The cross on the security notice.
     DismissNotice,
+    /// **Change recovery key** (Sessions page): opens the warning.
+    ChangeKeyRequested,
+    /// **Change key** after the warning.
+    ChangeKeyConfirmed,
+    /// **Cancel** on the warning.
+    ChangeKeyCancelled,
 }
 
 /// Whether `error` from `EnableRecovery` says a backup already exists.
@@ -562,6 +585,38 @@ impl App {
                 self.security.notice = None;
                 Task::none()
             }
+            M::ChangeKeyRequested => {
+                let model = &mut self.security;
+                if model.busy.is_some()
+                    || model.setup.is_some()
+                    || model.status.recovery != RecoveryStatus::Enabled
+                {
+                    return Task::none();
+                }
+                model.notice = None;
+                model.overlay = Some(Overlay::ChangeKeyConfirm);
+                Task::none()
+            }
+            M::ChangeKeyConfirmed => {
+                let model = &mut self.security;
+                if model.busy.is_some()
+                    || model.overlay != Some(Overlay::ChangeKeyConfirm)
+                    || model.status.recovery != RecoveryStatus::Enabled
+                {
+                    return Task::none();
+                }
+                model.notice = None;
+                model.busy = Some(Busy::ChangingKey);
+                self.sessions.notice = None;
+                self.send(Command::ChangeRecoveryKey)
+            }
+            M::ChangeKeyCancelled => {
+                let model = &mut self.security;
+                if model.busy.is_none() && model.overlay == Some(Overlay::ChangeKeyConfirm) {
+                    model.overlay = None;
+                }
+                Task::none()
+            }
         }
     }
 
@@ -644,7 +699,11 @@ impl App {
             }
             CoreEvent::RecoveryKeyReady(key) => {
                 let model = &mut self.security;
-                model.setup = Some(RecoverySetup::new(key));
+                let changed = model.busy == Some(Busy::ChangingKey);
+                if changed && model.overlay == Some(Overlay::ChangeKeyConfirm) {
+                    model.overlay = None;
+                }
+                model.setup = Some(RecoverySetup::new(key, changed));
                 model.busy = None;
                 model.progress = None;
                 model.notice = None;
@@ -723,6 +782,16 @@ impl App {
 
     fn on_recovery_failed(&mut self, error: &CoreError) -> Task<Message> {
         let model = &mut self.security;
+        if model.busy == Some(Busy::ChangingKey) {
+            // Started from the Sessions page, which covers the main view's
+            // notice bar: the reason goes on the page.
+            model.busy = None;
+            if model.overlay == Some(Overlay::ChangeKeyConfirm) {
+                model.overlay = None;
+            }
+            self.sessions.notice = Some(failure_line(error));
+            return Task::none();
+        }
         model.busy = None;
         model.progress = None;
         model.notice = Some(failure_line(error));
@@ -869,7 +938,7 @@ mod tests {
 
     #[test]
     fn setup_finishes_only_when_ticked() {
-        let mut setup = RecoverySetup::new(RecoveryKey::from("secret-key-x"));
+        let mut setup = RecoverySetup::new(RecoveryKey::from("secret-key-x"), false);
         assert!(!can_finish_setup(&setup));
         setup.saved_ticked = true;
         assert!(can_finish_setup(&setup));
@@ -895,7 +964,7 @@ mod tests {
             tessera_core::api::ReauthAction::ResetIdentity,
         ));
         assert_eq!(m.visible(), Visible::Reauth);
-        m.setup = Some(RecoverySetup::new(RecoveryKey::from("secret-key-x")));
+        m.setup = Some(RecoverySetup::new(RecoveryKey::from("secret-key-x"), false));
         assert_eq!(m.visible(), Visible::Key);
     }
 
@@ -903,7 +972,7 @@ mod tests {
     #[allow(clippy::field_reassign_with_default)] // the model has no const-friendly constructor with these fields
     fn debug_prints_no_key_input_or_password() {
         let mut m = SecurityModel::default();
-        m.setup = Some(RecoverySetup::new(RecoveryKey::from("secret-key-x")));
+        m.setup = Some(RecoverySetup::new(RecoveryKey::from("secret-key-x"), false));
         m.restore_input = RecoveryKey::from("secret-input-x");
         m.copied = Some(RecoveryKey::from("secret-copied-x"));
         let mut prompt = ReauthPrompt::new(tessera_core::api::ReauthAction::ResetIdentity);
@@ -924,7 +993,7 @@ mod tests {
     #[allow(clippy::field_reassign_with_default)] // as above: sets secret fields one by one
     fn clearing_secrets_drops_the_key_the_inputs_and_the_copy() {
         let mut m = SecurityModel::default();
-        m.setup = Some(RecoverySetup::new(RecoveryKey::from("secret-key-x")));
+        m.setup = Some(RecoverySetup::new(RecoveryKey::from("secret-key-x"), false));
         m.restore_input = RecoveryKey::from("secret-input-x");
         m.copied = Some(RecoveryKey::from("secret-copied-x"));
         m.reauth = Some(ReauthPrompt::new(

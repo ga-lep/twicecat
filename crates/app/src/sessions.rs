@@ -36,6 +36,51 @@ pub const MAX_SHOWN_CHARS: usize = 64;
 /// How many devices the app keeps from the core's list.
 pub const MAX_DEVICES_KEPT: usize = 500;
 
+/// The button of the Recovery line on the Sessions page (plan Task 15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryAction {
+    /// **Change recovery key**.
+    ChangeKey,
+    /// **Set up recovery**.
+    SetUp,
+    /// **Enter recovery key**.
+    EnterKey,
+}
+
+impl RecoveryAction {
+    /// The button's label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ChangeKey => "Change recovery key",
+            Self::SetUp => "Set up recovery",
+            Self::EnterKey => "Enter recovery key",
+        }
+    }
+
+    /// What pressing the button does.
+    pub fn message(self) -> SecurityMessage {
+        match self {
+            Self::ChangeKey => SecurityMessage::ChangeKeyRequested,
+            Self::SetUp => SecurityMessage::SetupRecovery,
+            Self::EnterKey => SecurityMessage::OpenRestore,
+        }
+    }
+}
+
+/// The Recovery line at the top of the Sessions page: its text and button,
+/// or nothing while the state is not known yet.
+pub fn recovery_line(state: RecoveryStatus) -> Option<(&'static str, Option<RecoveryAction>)> {
+    match state {
+        RecoveryStatus::Enabled => Some(("Recovery is on.", Some(RecoveryAction::ChangeKey))),
+        RecoveryStatus::Disabled => Some(("Recovery is off.", Some(RecoveryAction::SetUp))),
+        RecoveryStatus::Incomplete => Some((
+            "This device isn't connected to your recovery.",
+            Some(RecoveryAction::EnterKey),
+        )),
+        RecoveryStatus::Unknown => None,
+    }
+}
+
 /// What the logout warning says (plan Q12).
 pub const LOGOUT_WARNING: &str = "You'll lose access to your encrypted messages. This is your only session and recovery isn't set up, so nothing can bring them back.";
 
@@ -762,5 +807,40 @@ mod tests {
         });
         let dbg = format!("{m:?} {:?}", m.approval);
         assert!(!dbg.contains("secret-"), "{dbg}");
+    }
+
+    #[test]
+    fn the_recovery_line_follows_the_recovery_state() {
+        assert_eq!(
+            recovery_line(RecoveryStatus::Enabled),
+            Some(("Recovery is on.", Some(RecoveryAction::ChangeKey)))
+        );
+        assert_eq!(
+            recovery_line(RecoveryStatus::Disabled),
+            Some(("Recovery is off.", Some(RecoveryAction::SetUp)))
+        );
+        assert_eq!(
+            recovery_line(RecoveryStatus::Incomplete),
+            Some((
+                "This device isn't connected to your recovery.",
+                Some(RecoveryAction::EnterKey)
+            ))
+        );
+        assert_eq!(recovery_line(RecoveryStatus::Unknown), None);
+        assert_eq!(RecoveryAction::ChangeKey.label(), "Change recovery key");
+        assert_eq!(RecoveryAction::SetUp.label(), "Set up recovery");
+        assert_eq!(RecoveryAction::EnterKey.label(), "Enter recovery key");
+        assert!(matches!(
+            RecoveryAction::ChangeKey.message(),
+            SecurityMessage::ChangeKeyRequested
+        ));
+        assert!(matches!(
+            RecoveryAction::SetUp.message(),
+            SecurityMessage::SetupRecovery
+        ));
+        assert!(matches!(
+            RecoveryAction::EnterKey.message(),
+            SecurityMessage::OpenRestore
+        ));
     }
 }

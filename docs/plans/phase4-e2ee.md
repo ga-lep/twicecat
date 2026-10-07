@@ -725,6 +725,35 @@ Acceptance criteria:
 - The full ignored suite passes after `create-test-users.sh`, and again right after without it (Q2 repeat runs), with both durations recorded (under 15 minutes each, else stop and ask).
 - Gate passes. Commit: `phase4.14: security review and phase 4 wrap-up`.
 
+### Task 15: Change the recovery key from the app (Q5 "Change key", added 2026-10-07)
+Language: rust
+Files: crates/app/src/security.rs, crates/app/src/screens/security.rs, crates/app/src/sessions.rs, crates/app/src/screens/sessions.rs, crates/app/src/state.rs, PROGRESS.md
+Depends on: Task 14
+Why: Task 10 built no screen for Q5 "Change key"; the human decided on 2026-10-07 to add it before the Phase 4 sign-off. The core already does the work (Task 5: `Command::ChangeRecoveryKey` runs `Recovery::reset_key()`, matrix-sdk 0.19.1 `encryption/recovery/mod.rs:359`, which "will rotate the secret storage key and re-upload all the secrets"; `change_key_precheck` allows it only when recovery is `Enabled`; success is `RecoveryKeyReady`, failure is `ActionFailed { Recovery, .. }`). This task is app-only: no core, API or dependency change.
+Acceptance criteria:
+- **Entry point (Q-T15a, RECOMMENDED):** a **Recovery** line at the top of the Sessions page, above the device list, driven by the `Security` state the app already holds:
+  - `Enabled`: "Recovery is on." with a **Change recovery key** button;
+  - `Disabled`: "Recovery is off." with **Set up recovery** (the existing `SetupRecovery` flow);
+  - `Incomplete`: "This device isn't connected to your recovery." with **Enter recovery key** (the existing `OpenRestore`);
+  - `Unknown`: no button.
+  - Rejected: a new settings screen (one button does not justify it); a banner (recovery is fine in this state, nothing needs attention).
+- **Warning first (new `Overlay::ChangeKeyConfirm`).** **Change recovery key** opens a warning card and sends nothing yet. Draft wording (final wording is a human item):
+  - title "Change your recovery key?";
+  - "Your current recovery key will stop working. Tessera will show you a new one, once. Other apps and devices that ask for your recovery key will need the new one. Anything another app saved in your secure storage that this device doesn't have will be lost.";
+  - **Change key** (sends `Command::ChangeRecoveryKey` once and sets `Busy::ChangingKey`) and **Cancel** (closes, sends nothing).
+- **While busy:** the card shows "Changing your recovery key…" and no buttons; a second press, or **Set up recovery**, sends nothing while any `Busy` is set.
+- **Success:** `RecoveryKeyReady` while `Busy::ChangingKey` opens the existing show-once key screen with the title "Your new recovery key" (set-up keeps "Your recovery key"). Everything else is unchanged from Task 10: the "I've saved my recovery key" box gates **Done**, Copy and the 60 s clipboard clear, and the key is dropped on Done, logout and window close.
+- **Failure:** `ActionFailed { action: Recovery, .. }` while `Busy::ChangingKey` clears the busy state, closes the card and shows the core's fixed message on the Sessions page notice line. The old key still works (the core changed nothing it could not finish; this is the SDK's behaviour and is not claimed beyond that).
+- **Hygiene:** `Debug` of every new message and of the model in each new state holds no key (sentinel `secret-key-x`), and the Task 14 redaction sweep gains the "new key" screen and `ChangeKeyConfirm`.
+- **Tests (red first):**
+  - `security.rs` / `state.rs` unit tests through `update` with a plain `mpsc` sink: the button only opens the card; **Cancel** sends nothing; **Change key** sends exactly one `ChangeRecoveryKey`; a second press while busy sends nothing; `RecoveryKeyReady` shows the key screen titled "Your new recovery key" and Done needs the box; `ActionFailed` clears busy and sets the notice; the Recovery line shows the right label and button for each of the four states;
+  - no new integration test: the E2EE reset helpers (`e2ee_serial`, `reset_e2ee_account`) live in `crates/core/tests/common` and app tests can't reach them, and the core's Task 5 `change key` test already proves a new key that differs, opens a fresh store, and makes the old key fail. The app side is covered by the unit tests above.
+- **Human checkpoint items** (added to PROGRESS.md and the checklist page unasked):
+  - the Recovery line on the Sessions page in each state, in both themes;
+  - the warning wording, and the "Your new recovery key" screen;
+  - after changing bob's key in Tessera, the new key restores in Element Web (bob on a new session) and the old one is refused.
+- Gate passes (app only, no core or bridge code: no ignored run needed). Commit: `phase4.15: change the recovery key from the sessions page`.
+
 ### Phase 4 human checkpoint (collected in PROGRESS.md)
 - [ ] Phase 3 sign-off recorded (Q1, 2026-10-06). Confirm Q3 as planned: matrix-sdk `qrcode` enabled, iced `qr_code` **not** enabled (the QR code is drawn with the existing `image` widget from the SDK's own grid); and revisit any of Q1-Q19.
 - [ ] CI green on Linux, Windows and macOS; the `integration` job stays under its 20-minute timeout.
