@@ -18,6 +18,7 @@ pub mod state;
 pub mod text_safety;
 pub mod theme;
 pub mod timeline;
+pub mod verification;
 
 pub use bridge::{Bridge, BridgeEvent, EventsSlot};
 pub use state::{App, CommandSink, Message, Screen, Startup};

@@ -141,7 +141,7 @@ pub fn screen(model: &SecurityModel) -> Option<Element<'_, Message>> {
 }
 
 /// An opaque full-window layer with `content` in a centred card.
-fn card(content: Element<'_, Message>) -> Element<'_, Message> {
+pub(crate) fn card(content: Element<'_, Message>) -> Element<'_, Message> {
     opaque(
         container(
             container(content)
@@ -165,7 +165,7 @@ fn notice_line(model: &SecurityModel) -> Element<'_, Message> {
     }
 }
 
-fn wide(label: &str, press: Option<Message>) -> Element<'_, Message> {
+pub(crate) fn wide(label: &str, press: Option<Message>) -> Element<'_, Message> {
     button(text(label).center().width(Fill))
         .on_press_maybe(press)
         .width(Fill)
@@ -173,7 +173,7 @@ fn wide(label: &str, press: Option<Message>) -> Element<'_, Message> {
         .into()
 }
 
-fn secondary<'a>(label: &'a str, press: Option<Message>) -> Element<'a, Message> {
+pub(crate) fn secondary<'a>(label: &'a str, press: Option<Message>) -> Element<'a, Message> {
     button(text(label).center().width(Fill))
         .on_press_maybe(press)
         .style(button::secondary)

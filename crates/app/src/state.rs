@@ -30,6 +30,7 @@ use crate::screens::{self, loading, main_view};
 use crate::security::{SecurityMessage, SecurityModel};
 use crate::text_safety;
 use crate::timeline::{self, Effects, TimelineView};
+use crate::verification::{VerificationMessage, VerificationModel};
 
 /// How long to wait for the core to close after `Shutdown` (plan Q18).
 pub const SHUTDOWN_WAIT: Duration = Duration::from_secs(10);
@@ -258,6 +259,8 @@ pub enum Message {
     ShutdownDeadline,
     /// A message of the security banner and screens.
     Security(SecurityMessage),
+    /// A button of the verification dialog.
+    Verification(VerificationMessage),
 }
 
 /// What `main` hands to Iced's boot function.
@@ -339,6 +342,8 @@ pub struct App {
     draft_dirty: bool,
     /// The security banner and screens.
     pub security: SecurityModel,
+    /// The verification dialog, while a flow is open.
+    pub verification: Option<VerificationModel>,
     /// Set when the app decided to exit (the task itself is opaque to tests).
     pub exit_requested: bool,
     /// Clipboard reads sent by `drop_secrets` whose answer is still due.
@@ -362,6 +367,7 @@ impl std::fmt::Debug for App {
             .field("composer", &self.composer)
             .field("actions", &self.actions)
             .field("security", &self.security)
+            .field("verification", &self.verification)
             .finish_non_exhaustive()
     }
 }
@@ -410,6 +416,7 @@ impl App {
             draft_seq: 0,
             draft_dirty: false,
             security: SecurityModel::default(),
+            verification: None,
             exit_requested: false,
             flushes_pending: 0,
             core_closed: false,
@@ -669,6 +676,7 @@ impl App {
                 Task::batch([flush, self.send(Command::Logout)])
             }
             Message::Security(message) => self.on_security(message),
+            Message::Verification(message) => self.on_verification(message),
             Message::SelectRoom(id) => {
                 if !room_list::contains(&self.rooms, &id) {
                     return Task::none();
@@ -901,6 +909,11 @@ impl App {
                     self.typing = users;
                 }
             }
+            CoreEvent::ActionFailed {
+                action: ActionKind::Verification,
+                error,
+                ..
+            } => task = self.on_verification_failed(&error),
             // Recovery and cross-signing failures belong to the security
             // screens; other actions have no screen yet.
             event @ (CoreEvent::ActionFailed { .. }
@@ -912,10 +925,13 @@ impl App {
             | CoreEvent::OpenAccountManagement(_)) => {
                 task = self.on_security_event(event);
             }
-            CoreEvent::VerificationRequested { .. }
-            | CoreEvent::Verification { .. }
-            | CoreEvent::Devices(_)
-            | CoreEvent::UserTrust { .. } => {}
+            CoreEvent::VerificationRequested { id, peer } => {
+                task = self.on_verification_requested(id, &peer);
+            }
+            CoreEvent::Verification { id, phase } => {
+                task = self.on_verification_phase(&id, phase);
+            }
+            CoreEvent::Devices(_) | CoreEvent::UserTrust { .. } => {}
         }
         task
     }
@@ -1395,6 +1411,7 @@ impl App {
         self.sync_state = SyncState::Idle;
         let flush = self.drop_secrets();
         self.security = SecurityModel::default();
+        self.verification = None;
         self.notice = Some(notice.to_owned());
         self.end_login_attempt();
         self.screen = Screen::Login;
@@ -1558,9 +1575,13 @@ impl App {
             Screen::Login => login::view(self),
             Screen::WaitingForBrowser => login::waiting_view(self),
             Screen::Loading => {
-                screens::security::layer(loading::view(self), screens::security::top_layer(self))
+                let base = screens::security::layer(
+                    loading::view(self),
+                    screens::security::top_layer(self),
+                );
+                screens::verification::layer(base, self)
             }
-            Screen::Main => main_view::view(self),
+            Screen::Main => screens::verification::layer(main_view::view(self), self),
             Screen::ShuttingDown => screens::centered_text("Closing\u{2026}"),
             Screen::Disconnected => screens::centered_text("The core stopped"),
         }
@@ -4181,5 +4202,266 @@ mod tests {
             ),
         );
         assert!(!dbg.contains("secret-"), "{dbg}");
+    }
+
+    // ---- Task 11: verification dialog ----
+
+    use crate::verification::VerificationMessage as VM;
+    use tessera_core::api::{
+        CancelReason, QrImage, SasEmoji, VerificationId, VerificationPeer, VerificationPhase as VP,
+    };
+
+    fn vid() -> VerificationId {
+        VerificationId::from("flow-1")
+    }
+
+    fn vpeer(own: bool) -> VerificationPeer {
+        VerificationPeer {
+            user_id: UserId::from("@bob:x"),
+            device_id: Some(DeviceId::from("DEV")),
+            device_name: Some("Phone".to_owned()),
+            own_account: own,
+        }
+    }
+
+    fn vmsg(app: &mut App, message: VM) -> Task<Message> {
+        app.update(Message::Verification(message))
+    }
+
+    fn vphase(app: &mut App, phase: VP) {
+        let _ = app.update(core(CoreEvent::Verification { id: vid(), phase }));
+    }
+
+    fn vqr() -> QrImage {
+        QrImage {
+            size: 21,
+            dark: vec![true; 21 * 21],
+        }
+    }
+
+    fn vemojis() -> Box<[SasEmoji; 7]> {
+        Box::new(std::array::from_fn(|_| SasEmoji {
+            symbol: "\u{1F436}".to_owned(),
+            description: "Dog".to_owned(),
+        }))
+    }
+
+    /// An app with a flow with `own` peer open, commands drained.
+    fn verifying(own: bool) -> (App, mpsc::Receiver<Command>) {
+        let (mut app, mut rx) = main_app();
+        let _ = app.update(core(CoreEvent::VerificationRequested {
+            id: vid(),
+            peer: vpeer(own),
+        }));
+        while rx.try_recv().is_ok() {}
+        (app, rx)
+    }
+
+    fn only(rx: &mut mpsc::Receiver<Command>) -> Command {
+        let mut commands = drain(rx);
+        assert_eq!(commands.len(), 1, "{commands:?}");
+        commands.remove(0)
+    }
+
+    #[test]
+    fn a_request_opens_the_dialog_and_a_stale_id_changes_nothing() {
+        let (mut app, _rx) = verifying(true);
+        let flow = app.verification.as_ref().expect("dialog open");
+        assert_eq!(flow.name, "Phone");
+        let _ = app.update(core(CoreEvent::Verification {
+            id: VerificationId::from("other"),
+            phase: VP::Done,
+        }));
+        assert_eq!(app.verification.as_ref().unwrap().phase.kind(), "requested");
+        vphase(&mut app, VP::Requested { incoming: true });
+        assert_eq!(app.verification.as_ref().unwrap().phase.kind(), "requested");
+    }
+
+    #[test]
+    fn a_phase_without_a_request_opens_nothing() {
+        let (mut app, _rx) = main_app();
+        vphase(&mut app, VP::Ready);
+        assert!(app.verification.is_none());
+    }
+
+    #[test]
+    fn a_second_request_does_not_replace_a_running_flow_but_replaces_an_ended_one() {
+        let (mut app, _rx) = verifying(true);
+        let second = |app: &mut App| {
+            let _ = app.update(core(CoreEvent::VerificationRequested {
+                id: VerificationId::from("flow-2"),
+                peer: vpeer(false),
+            }));
+        };
+        second(&mut app);
+        assert_eq!(app.verification.as_ref().unwrap().id, vid());
+        vphase(&mut app, VP::Done);
+        second(&mut app);
+        assert_eq!(app.verification.as_ref().unwrap().id.as_str(), "flow-2");
+    }
+
+    #[test]
+    fn accept_and_decline_send_one_command_each() {
+        let (mut app, mut rx) = verifying(false);
+        vphase(&mut app, VP::Requested { incoming: true });
+        let _ = vmsg(&mut app, VM::Accept);
+        let _ = vmsg(&mut app, VM::Accept);
+        assert!(matches!(only(&mut rx), Command::AcceptVerification { id } if id == vid()));
+        let (mut app, mut rx) = verifying(false);
+        vphase(&mut app, VP::Requested { incoming: true });
+        let _ = vmsg(&mut app, VM::Cancel);
+        let _ = vmsg(&mut app, VM::Cancel);
+        assert!(matches!(only(&mut rx), Command::CancelVerification { id } if id == vid()));
+    }
+
+    #[test]
+    fn accept_is_only_for_an_incoming_request() {
+        let (mut app, mut rx) = verifying(false);
+        let _ = vmsg(&mut app, VM::Accept);
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn the_qr_buttons_send_start_sas_confirm_and_cancel() {
+        let (mut app, mut rx) = verifying(true);
+        vphase(&mut app, VP::ShowQr(vqr()));
+        let _ = vmsg(&mut app, VM::CompareEmoji);
+        let _ = vmsg(&mut app, VM::CompareEmoji);
+        assert!(matches!(only(&mut rx), Command::StartSas { id } if id == vid()));
+        vphase(&mut app, VP::QrScanned);
+        let _ = vmsg(&mut app, VM::QrConfirmed);
+        let _ = vmsg(&mut app, VM::QrConfirmed);
+        assert!(matches!(only(&mut rx), Command::ConfirmQrScanned { id } if id == vid()));
+        let _ = vmsg(&mut app, VM::Cancel);
+        assert!(matches!(only(&mut rx), Command::CancelVerification { id } if id == vid()));
+    }
+
+    #[test]
+    fn the_emoji_buttons_send_confirm_and_mismatch() {
+        let (mut app, mut rx) = verifying(true);
+        vphase(&mut app, VP::Emojis(vemojis()));
+        let _ = vmsg(&mut app, VM::Match);
+        let _ = vmsg(&mut app, VM::Match);
+        assert!(matches!(only(&mut rx), Command::ConfirmSas { id } if id == vid()));
+        let (mut app, mut rx) = verifying(true);
+        vphase(&mut app, VP::Decimals([1, 2, 3]));
+        let _ = vmsg(&mut app, VM::NoMatch);
+        let _ = vmsg(&mut app, VM::NoMatch);
+        assert!(matches!(only(&mut rx), Command::SasMismatch { id } if id == vid()));
+    }
+
+    #[test]
+    fn a_button_of_another_phase_sends_nothing() {
+        let (mut app, mut rx) = verifying(true);
+        vphase(&mut app, VP::Waiting);
+        for m in [VM::CompareEmoji, VM::QrConfirmed, VM::Match, VM::NoMatch] {
+            let _ = vmsg(&mut app, m);
+        }
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn close_works_only_when_the_flow_is_over() {
+        let (mut app, mut rx) = verifying(true);
+        let _ = vmsg(&mut app, VM::Close);
+        assert!(app.verification.is_some());
+        vphase(
+            &mut app,
+            VP::Cancelled {
+                reason: CancelReason::ByThem,
+            },
+        );
+        let _ = vmsg(&mut app, VM::Close);
+        assert!(app.verification.is_none());
+        assert!(drain(&mut rx).is_empty(), "closing sends nothing");
+    }
+
+    #[test]
+    fn the_qr_image_survives_unrelated_updates_and_goes_with_the_flow() {
+        let (mut app, _rx) = verifying(true);
+        vphase(&mut app, VP::ShowQr(vqr()));
+        let first = app
+            .verification
+            .as_ref()
+            .unwrap()
+            .qr_handle()
+            .map(|h| h.id());
+        assert!(first.is_some());
+        let _ = app.update(Message::WindowFocus(false));
+        let _ = app.update(core(CoreEvent::Security(status(
+            DeviceVerification::Unverified,
+            RecoveryStatus::Enabled,
+        ))));
+        assert_eq!(
+            app.verification
+                .as_ref()
+                .unwrap()
+                .qr_handle()
+                .map(|h| h.id()),
+            first
+        );
+        vphase(&mut app, VP::Emojis(vemojis()));
+        assert!(app.verification.as_ref().unwrap().qr_handle().is_none());
+    }
+
+    #[test]
+    fn debug_of_the_app_with_a_qr_flow_shows_no_module_data() {
+        let (mut app, _rx) = verifying(true);
+        vphase(&mut app, VP::ShowQr(vqr()));
+        let text = format!("{app:?}");
+        assert!(text.contains("verification"), "{text}");
+        assert!(!text.contains("dark") && !text.contains("Rgba"), "{text}");
+    }
+
+    #[test]
+    fn a_failure_in_a_running_flow_keeps_the_dialog_and_allows_a_retry() {
+        let (mut app, mut rx) = verifying(true);
+        vphase(&mut app, VP::ShowQr(vqr()));
+        let _ = vmsg(&mut app, VM::CompareEmoji);
+        let _ = drain(&mut rx);
+        let _ = app.update(core(CoreEvent::ActionFailed {
+            room_id: RoomId::from(""),
+            action: Kind::Verification,
+            error: CoreError::Internal("qr".into()),
+        }));
+        assert!(app.verification.is_some());
+        assert!(app.security.notice.is_none(), "no spurious notice");
+        let _ = vmsg(&mut app, VM::CompareEmoji);
+        assert!(matches!(only(&mut rx), Command::StartSas { .. }));
+    }
+
+    #[test]
+    fn a_failed_request_without_a_flow_shows_a_notice_and_frees_the_button() {
+        let (mut app, mut rx) = identity_app();
+        let _ = sec(&mut app, SecurityMessage::UseOtherDevice);
+        let _ = drain(&mut rx);
+        assert!(app.security.asked_other_device);
+        let _ = app.update(core(CoreEvent::ActionFailed {
+            room_id: RoomId::from(""),
+            action: Kind::Verification,
+            error: CoreError::Busy,
+        }));
+        assert!(app.verification.is_none());
+        assert!(app.security.notice.is_some());
+        assert!(!app.security.asked_other_device);
+    }
+
+    #[test]
+    fn a_request_clears_the_request_sent_state_of_the_identity_screen() {
+        let (mut app, _rx) = identity_app();
+        let _ = sec(&mut app, SecurityMessage::UseOtherDevice);
+        let _ = app.update(core(CoreEvent::VerificationRequested {
+            id: vid(),
+            peer: vpeer(true),
+        }));
+        assert!(!app.security.asked_other_device);
+    }
+
+    #[test]
+    fn logout_drops_the_flow() {
+        let (mut app, _rx) = verifying(true);
+        vphase(&mut app, VP::ShowQr(vqr()));
+        let _ = app.back_to_login("signed out");
+        assert!(app.verification.is_none());
     }
 }

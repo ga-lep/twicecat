@@ -9,6 +9,7 @@ pub mod main_view;
 pub mod room_list_pane;
 pub mod security;
 pub mod timeline_pane;
+pub mod verification;
 
 use iced::widget::{container, text};
 use iced::{Element, Fill};
