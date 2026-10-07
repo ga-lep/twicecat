@@ -323,6 +323,8 @@ Fixes the human may want before or after the checkpoint, from the task notes and
 - [x] 14. Security review and Phase 4 wrap-up (roadmap step 7) (phase4.14; the human checkpoint stays open)
 - [x] 15. Change the recovery key from the app (Q5 "Change key", added by the human 2026-10-07; plan approved 2026-10-07) (phase4.15; wording and rendering stay on the human checkpoint)
 
+Phase 4 signed off by the human on 2026-10-07 (not yet merged). Deferred or accepted as risk, not checked: the QR verification scan (no available client can scan), the matrix.org OAuth items, the green CI run (the branch was never pushed), and the Windows and macOS per-OS checks; see the Phase 4 human checkpoint.
+
 ## Phase 4 human answers (2026-10-06)
 - Q1: Phase 3 is signed off (see the sign-off line under Phase 3 steps).
 - Q2: fixed `.env.test` accounts only (alice and carol; bob untouched); no throwaway accounts, no change to `.env.test` or `scripts/create-test-users.sh`. Each E2EE test resets its accounts to a known baseline and runs serialized per test binary.
