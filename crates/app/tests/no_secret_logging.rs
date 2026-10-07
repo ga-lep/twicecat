@@ -11,8 +11,19 @@
 //! Printing and logging macros, the panicking and asserting macros (`panic!`,
 //! `assert!`, `assert_eq!`, `assert_ne!`, their `debug_` forms, `unreachable!`,
 //! `todo!`, `unimplemented!`) and the message of `.expect(` are scanned. String,
-//! raw string and character literals in the arguments are skipped, so a `)`
-//! inside one does not end the argument list.
+//! raw string and character literals and comments (`//`, nested `/* */`) are
+//! skipped by one shared lexer step in the `#[cfg(test)]` stripping, the item
+//! scan and the argument scan, so a `)` or `{` inside one does not end a list
+//! or an item, and `#[cfg(test)]` or a macro name inside a comment or a string
+//! is not code.
+//!
+//! This is a tripwire for ordinary mistakes, not a guarantee. It matches names
+//! as text, so deliberate bypasses pass: a space before `!` (`println !(..)`),
+//! raw identifiers (`r#password`), whitespace around `.` or `(`
+//! (`s .password`, `x.expect (..)`), type aliases and qualified calls
+//! (`K::expose(..)`, `Option::expect(x, msg)`), `.security` on receivers other
+//! than `self`, and macros that are not listed (`format_args!`, `write_fmt`, a
+//! bare `event!`, `log!` or `span!` after a `use`, `#[tracing::instrument]`).
 //!
 //! Limits that remain: `format!` into a local that is printed later; direct
 //! writes such as `io::stderr().write_all(..)`; a secret copied into a local
@@ -94,11 +105,32 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// If a string, raw string or character literal starts at `i`, the index just
-/// past it. A character literal closes within four bytes; a lifetime does not.
-fn skip_literal(code: &str, i: usize) -> Option<usize> {
+/// The one lexer step shared by every scan below: if a comment, string, raw
+/// string or character literal starts at `i`, the index just past it (a `//`
+/// comment stops before its newline). Block comments nest. A character literal
+/// is told from a lifetime by its closing quote.
+fn skip_trivia(code: &str, i: usize) -> Option<usize> {
     let bytes = code.as_bytes();
     match bytes[i] {
+        b'/' if bytes.get(i + 1) == Some(&b'/') => {
+            Some(code[i..].find('\n').map_or(bytes.len(), |n| i + n))
+        }
+        b'/' if bytes.get(i + 1) == Some(&b'*') => {
+            let mut depth = 1usize;
+            let mut j = i + 2;
+            while j < bytes.len() && depth > 0 {
+                if bytes[j..].starts_with(b"/*") {
+                    depth += 1;
+                    j += 2;
+                } else if bytes[j..].starts_with(b"*/") {
+                    depth -= 1;
+                    j += 2;
+                } else {
+                    j += 1;
+                }
+            }
+            Some(j)
+        }
         b'r' if matches!(bytes.get(i + 1), Some(b'"' | b'#')) => {
             let hashes = bytes[i + 1..].iter().take_while(|b| **b == b'#').count();
             if bytes.get(i + 1 + hashes) != Some(&b'"') {
@@ -120,29 +152,30 @@ fn skip_literal(code: &str, i: usize) -> Option<usize> {
             Some((j + 1).min(bytes.len()))
         }
         b'\'' => {
-            let n = code[i + 1..].bytes().take(4).position(|b| b == b'\'')?;
-            (bytes.get(i + 1) != Some(&b'\\') || n > 0).then_some(i + n + 2)
+            if bytes.get(i + 1) == Some(&b'\\') {
+                // An escape: skip the backslash and the byte after it (this
+                // covers `'\''`), then find the closing quote (`'\u{1F600}'`).
+                let from = (i + 3).min(bytes.len());
+                let n = bytes[from..].iter().take(10).position(|b| *b == b'\'')?;
+                Some(from + n + 1)
+            } else {
+                let len = code[i + 1..].chars().next()?.len_utf8();
+                (bytes.get(i + 1 + len) == Some(&b'\'')).then_some(i + len + 2)
+            }
         }
         _ => None,
     }
 }
 
 /// Index just past the item that starts at `from`: up to the first `;` at
-/// brace depth 0, or past the matching `}` of its first `{`. Skips comments,
-/// string and raw string literals and character literals, so a brace inside
-/// one does not count.
+/// brace depth 0, or past the matching `}` of its first `{`. Comments and
+/// literals are skipped, so a brace inside one does not count.
 fn item_end(code: &str, from: usize) -> usize {
     let bytes = code.as_bytes();
     let mut i = from;
     let mut depth = 0usize;
     while i < bytes.len() {
-        if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'/') {
-            while i < bytes.len() && bytes[i] != b'\n' {
-                i += 1;
-            }
-            continue;
-        }
-        if let Some(next) = skip_literal(code, i) {
+        if let Some(next) = skip_trivia(code, i) {
             i = next;
             continue;
         }
@@ -163,40 +196,53 @@ fn item_end(code: &str, from: usize) -> usize {
 }
 
 /// The source without its `#[cfg(test)]` items (test modules, test-only
-/// `use`s and statics).
+/// `use`s and statics). The attribute is matched only in code, not inside a
+/// comment or a string.
 fn production_part(source: &str) -> String {
-    const ATTR: &str = "#[cfg(test)]";
+    const ATTR: &[u8] = b"#[cfg(test)]";
+    let bytes = source.as_bytes();
     let mut kept = String::new();
-    let mut rest = source;
-    while let Some(at) = rest.find(ATTR) {
-        kept.push_str(&rest[..at]);
-        let after = at + ATTR.len();
-        let end = item_end(rest, after);
-        rest = &rest[end..];
+    let mut copied = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(next) = skip_trivia(source, i) {
+            i = next;
+        } else if bytes[i..].starts_with(ATTR) {
+            kept.push_str(&source[copied..i]);
+            i = item_end(source, i + ATTR.len());
+            copied = i;
+        } else {
+            i += 1;
+        }
     }
-    kept.push_str(rest);
+    kept.push_str(&source[copied..]);
     kept
 }
 
-/// The text between the parentheses (or brackets) after each macro name.
+/// The text between the parentheses (or brackets) after each macro name, for
+/// names that appear in code (not in a comment or a string).
 fn invocations<'a>(code: &'a str, name: &str) -> Vec<&'a str> {
+    let bytes = code.as_bytes();
+    let method = name.starts_with('.');
     let mut found = Vec::new();
-    let mut from = 0;
-    while let Some(at) = code[from..].find(name) {
-        let start = from + at + name.len();
-        from = start;
-        // Skip comments and doc lines: only code that is not behind `//`.
-        let line_start = code[..start].rfind('\n').map_or(0, |n| n + 1);
-        if code[line_start..start].trim_start().starts_with("//") {
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(next) = skip_trivia(code, i) {
+            i = next;
             continue;
         }
+        if !bytes[i..].starts_with(name.as_bytes()) {
+            i += 1;
+            continue;
+        }
+        let start = i + name.len();
         // `name` must not be the tail of a longer identifier (`my_print!`).
-        let before = code[..from - name.len()].chars().next_back();
-        let method = name.starts_with('.');
-        if before.is_some_and(|c| c.is_alphanumeric() || c == '_')
-            && !name.ends_with("::")
-            && !method
-        {
+        let tail_of_identifier = i > 0
+            && (bytes[i - 1].is_ascii_alphanumeric()
+                || bytes[i - 1] == b'_'
+                || bytes[i - 1] >= 0x80);
+        i = start;
+        if tail_of_identifier && !name.ends_with("::") && !method {
             continue;
         }
         let rest = &code[start..];
@@ -208,25 +254,25 @@ fn invocations<'a>(code: &'a str, name: &str) -> Vec<&'a str> {
         }
         let mut depth = 0usize;
         let mut end = None;
-        let bytes = rest.as_bytes();
-        let mut i = open;
-        while i < bytes.len() {
-            if let Some(next) = skip_literal(rest, i) {
-                i = next;
+        let rest_bytes = rest.as_bytes();
+        let mut j = open;
+        while j < rest_bytes.len() {
+            if let Some(next) = skip_trivia(rest, j) {
+                j = next;
                 continue;
             }
-            match bytes[i] {
+            match rest_bytes[j] {
                 b'(' | b'[' | b'{' => depth += 1,
                 b')' | b']' | b'}' => {
                     depth -= 1;
                     if depth == 0 {
-                        end = Some(i);
+                        end = Some(j);
                         break;
                     }
                 }
                 _ => {}
             }
-            i += 1;
+            j += 1;
         }
         if let Some(end) = end {
             found.push(&rest[open..end]);
@@ -272,6 +318,7 @@ fn no_app_code_logs_or_prints_a_secret_bearing_field() {
 
 #[test]
 fn the_scanner_flags_every_macro_and_ignores_test_code_and_comments() {
+    let mut missed = Vec::new();
     for planted in [
         r#"fn f(s: &S) { println!("{}", s.password); }"#,
         r#"fn f(s: &S) { eprintln!("{:?}", self.security); }"#,
@@ -298,13 +345,31 @@ fn the_scanner_flags_every_macro_and_ignores_test_code_and_comments() {
         r#"fn f(s: &S) { x().expect(&format!("{}", s.password)); }"#,
         r#"fn f(s: &S) { x()
             .expect(&s.password); }"#,
+        // An escaped quote character literal closes after its second quote.
+        r#"fn f(s: &S) { eprintln!("{}{}{}", '\'', ')', s.password); }"#,
+        // Comments inside the arguments hide nothing.
+        r#"fn f(s: &S) { println!("{}", /* ) */ s.password); }"#,
+        "fn f(s: &S) { println!(\"{}\", // )\n s.password); }",
+        r#"fn f(s: &S) { println!("{}", /* /* ) */ ) */ s.password); }"#,
+        // A brace in a comment must not swallow the rest of the file.
+        "#[cfg(test)] fn h() { /* { */ }\nfn f(s: &S) { println!(\"{}\", s.password); }",
+        // `#[cfg(test)]` inside a comment, doc line or string removes nothing.
+        "// #[cfg(test)]\nfn f(s: &S) { println!(\"{}\", s.password); }",
+        "/// uses #[cfg(test)] here\nfn f(s: &S) { println!(\"{}\", s.password); }",
+        "/* #[cfg(test)] */ fn f(s: &S) { println!(\"{}\", s.password); }",
+        "const A: &str = \"#[cfg(test)]\"; fn f(s: &S) { println!(\"{}\", s.password); }",
     ] {
-        assert!(!violations(planted).is_empty(), "not flagged: {planted}");
+        if violations(planted).is_empty() {
+            missed.push(planted);
+        }
     }
+    assert!(missed.is_empty(), "not flagged:\n{}", missed.join("\n--\n"));
     let fine = r#"
 fn f(message: &str) { eprintln!("tessera: {message}"); }
 fn g(x: Option<u8>) { x.expect("a fixed message"); assert!(x.is_some(), "fine"); panic!("fine ) text"); }
 // println!("{}", s.password);
+/* println!("{}", s.password); /* nested */ eprintln!("{}", s.password); */
+const A: &str = "println!(s.password)";
 #[cfg(test)]
 mod tests { fn t() { println!("{:?}", self.security); } }
 "#;

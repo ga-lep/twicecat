@@ -520,7 +520,7 @@ Written by the agent from the code and the tests; the human accepts or rejects t
 ### Residuals (to accept or reject)
 - **Tokens in memory:** the access and refresh tokens are plain `String`s in memory (SDK types, live `Client`); only the store passphrase and `to_bytes` output are `Zeroizing` in the core, and `SessionRecord`/`SessionAuth` are `Clone`.
 - **`RUST_LOG`:** it replaces the default filter of the stderr subscriber installed by `crates/app/src/main.rs` (`logging::init`, core `logging.rs` `build_filter`), so a user can enable SDK `debug`/`trace` request logging; not covered by `log_hygiene`.
-- **Scanner limits (`no_secret_logging.rs`):** it misses `format!` into a local that is printed later, direct writes such as `io::stderr().write_all(..)`, and a secret copied into an innocently named local; code under `#[cfg(test)]` is skipped on purpose.
+- **Scanner limits (`no_secret_logging.rs`):** it is a tripwire for ordinary mistakes, not a guarantee. It misses `format!` into a local that is printed later, direct writes such as `io::stderr().write_all(..)`, and a secret copied into an innocently named local; code under `#[cfg(test)]` is skipped on purpose. It matches names as text, so deliberate bypasses pass: a space before `!`, raw identifiers (`r#password`), whitespace around `.` or `(`, type aliases and qualified calls (`K::expose`, `Option::expect(x, msg)`), `.security` on receivers other than `self`, and unlisted macros (`format_args!`, `write_fmt`, a bare `event!`/`log!`/`span!` after `use`, `#[tracing::instrument]`). Comments, strings, raw strings and character literals are skipped by one shared lexer step.
 - **iced buffers (Q15):** `text_input` keeps plain copies of typed text (the password, the recovery key) in its own and the renderer's text and paragraph buffers; they are not zeroized. The same holds for the Phase 3 editor buffer. `Password` and `RecoveryKey` zeroize only the app's own copies. The SDK also keeps plain `String` copies of a typed key during `recover()`, and ruma's `uiaa::Password` holds the password in a plain `String` while a UIA request is built.
 - **Clipboard:** after **Copy** the key leaves `Zeroizing` (iced's clipboard takes and returns `String`); OS clipboard managers and their history can keep it after the 60 s clear, which only touches the live clipboard (checkpoint item; no clipboard-manager hint exists in iced or arboard).
 - **On-screen secrets:** the recovery key on the show-once screen and the QR code during a flow are visible to anyone who can see the screen; the QR RGBA buffer is not wiped and iced's renderer may cache the image after the handle is dropped. The SAS emoji are printed by the derived `Debug` of the core's `VerificationPhase::Emojis` (they are not logged anywhere, and only matter during the comparison).
@@ -541,7 +541,7 @@ Every Low or Medium finding from the task reviews (`docs/plans/phase4-e2ee.progr
 - **Task 11 peer user ID cut from the end (Medium):** fixed in 3cc2423 (elided in the middle, full ID on its own line); a request behind a finished card is queued.
 - **Task 12 DM Verified badge next to an attacker-settable room name, and the app guessing the DM peer from timeline senders (two Mediums):** fixed in 8a38fd5 (`RoomSummary.dm_peer` from the core, full peer ID in the header, `VerifyPeerRequested` checked against it).
 - **Task 13 sign-out and identity reset overlap (Medium, and Lows):** 87b7cc3, aeead79, ae3db3f, d00f1fb (`ActionKind::SignOutDevices`; a sign-out ends only on its own failures).
-- **Task 13 stale PROGRESS.md notes** (ignored suites "not run", `ActionFailed { Devices }`): corrected in this commit.
+- **Task 13 stale PROGRESS.md notes** (ignored suites "not run", `ActionFailed { Devices }`): corrected in acb0478.
 
 ### Also fixed in the app
 - **Task 6 and Task 8 attacker-controlled device and peer names (Info/Low):** the app sanitizes bidi, control and zero-width characters (Tasks 11 and 13).
@@ -549,6 +549,7 @@ Every Low or Medium finding from the task reviews (`docs/plans/phase4-e2ee.progr
 
 ### Open: Low or Medium findings
 Core:
+- **Cross-phase (Phase 1 limitation, re-raised in the Task 14 review):** access and refresh tokens are plain `String`s in SDK types and the live `Client`; `SessionRecord`/`SessionAuth` are `Clone`; only `store_passphrase` and the `to_bytes` output are `Zeroizing` (see Residuals).
 - **Task 1:** `seed_recovery` passphrase and key not zeroized end to end (test-only); `e2ee_serial` serializes per binary only (a parallel runner such as nextest could overlap resets); a panicking test leaves its device until the next reset; the `fetch_raw_event_type` check in the room smoke test is weak.
 - **Task 2:** `RecoveryKey` derived `PartialEq` is not constant-time; `QrImage` grid not zeroized; the CLI `recovery_key_event_prints_no_key` test is weak (does not capture output); non-room actions send `ActionFailed` with an empty `RoomId` (the app routes by action).
 - **Task 3:** `RoomSummary.is_encrypted` is false while the SDK state is Unknown (the app draws a lock for `true` only); a room that just turned encrypted may get its lock only on its next list update.
