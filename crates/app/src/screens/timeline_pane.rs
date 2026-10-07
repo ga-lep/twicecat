@@ -14,13 +14,13 @@ use chrono::{Local, TimeZone};
 use iced::font::{Style as FontStyle, Weight};
 use iced::widget::{
     Column, Row, button, column, container, mouse_area, row, rule, scrollable, sensor, space,
-    stack, text,
+    stack, text, tooltip,
 };
 use iced::{Background, Color, Element, Fill, Font, Padding, Shrink, Theme, mouse};
 use tessera_core::api::{
     Block, Inline, MessageDetails, MessageKind, MessageText, PaginationState, PlaceholderKind,
-    ReactionGroup, ReplyPreview, ReplyState, RichText, RoomSummary, SendStatus, StateChange,
-    TextStyle, TimelineItem, TimelineItemKind, TypingUser, UserId,
+    ReactionGroup, ReplyPreview, ReplyState, RichText, RoomSummary, SendStatus, Shield, ShieldCode,
+    StateChange, TextStyle, TimelineItem, TimelineItemKind, TypingUser, UserId, UtdReason,
 };
 
 use crate::actions::{self, ActionButtons, ActionState};
@@ -181,7 +181,7 @@ fn row_content<'a, Tz: TimeZone>(
                     details.sender_name_ambiguous,
                     sender,
                 );
-                content = content.push(header(name, time_label(*timestamp_ms, tz)));
+                content = content.push(header(name, time_label(*timestamp_ms, tz), details.shield));
             }
             if let Some(reply) = &details.reply_to {
                 content = content.push(reply_quote(reply));
@@ -189,14 +189,23 @@ fn row_content<'a, Tz: TimeZone>(
             // The body sits below the header in its own widget, so it cannot
             // pass for a sender line. Rich text has no muted colour and no
             // small size, so it cannot copy the time next to a name either.
-            content = content.push(body_widget(
+            let body = body_widget(
                 &items[i].id,
                 body,
                 details,
                 echo == Echo::Sending,
                 sender,
                 env,
-            ));
+            );
+            // A continuation has no header to carry the shield, so it sits
+            // beside the body (the same height: it only narrows the body).
+            content = content.push(match details.shield.filter(|_| continuation) {
+                Some(shield) => row![body, shield_view(shield)]
+                    .spacing(6)
+                    .align_y(iced::Alignment::Start)
+                    .into(),
+                None => body,
+            });
             if let Some(label) = edited_text(details) {
                 content = content.push(text(label).size(12).style(muted));
             }
@@ -223,16 +232,17 @@ fn row_content<'a, Tz: TimeZone>(
             sender_name,
             timestamp_ms,
             what,
+            utd,
             ..
         } => {
             let continuation = is_continuation(items, i);
             let mut content = Column::new().width(Fill);
             if !continuation {
                 let name = sender_label(sender_name.as_deref(), false, sender);
-                content = content.push(header(name, time_label(*timestamp_ms, tz)));
+                content = content.push(header(name, time_label(*timestamp_ms, tz), None));
             }
             content = content.push(
-                text(placeholder_text(*what))
+                text(placeholder_line(*what, *utd))
                     .font(ITALIC)
                     .style(muted)
                     .width(Fill),
@@ -511,11 +521,45 @@ fn fixed_height<'a>(label: iced::widget::Text<'a>, height: f32) -> Element<'a, M
 }
 
 /// The sender and time above a message.
-fn header<'a>(name: String, time: String) -> Element<'a, Message> {
-    row![text(name).font(BOLD), text(time).size(12).style(muted)]
+fn header<'a>(name: String, time: String, shield: Option<Shield>) -> Element<'a, Message> {
+    let mut line = row![text(name).font(BOLD), text(time).size(12).style(muted)]
         .spacing(8)
-        .align_y(iced::Center)
-        .into()
+        .align_y(iced::Center);
+    if let Some(shield) = shield {
+        line = line.push(shield_view(shield));
+    }
+    line.into()
+}
+
+/// Side of the shield mark, in pixels.
+const SHIELD_SIZE: f32 = 16.0;
+
+/// The small shield of a message: a red or grey mark with the text of its
+/// code as tooltip (plan Q10). The mark is a drawn badge, not a glyph, so it
+/// does not depend on the fonts installed.
+fn shield_view<'a>(shield: Shield) -> Element<'a, Message> {
+    let (look, label) = shield_text(shield);
+    let mark = container(text("!").size(11).color(Color::WHITE))
+        .width(SHIELD_SIZE)
+        .height(SHIELD_SIZE)
+        .center_x(SHIELD_SIZE)
+        .center_y(SHIELD_SIZE)
+        .style(move |theme: &Theme| container::Style {
+            background: Some(Background::Color(match look {
+                Look::Red => theme.palette().danger,
+                Look::Grey => theme::semantic(theme).badge,
+            })),
+            border: iced::border::rounded(SHIELD_SIZE / 4.0),
+            ..container::Style::default()
+        });
+    tooltip(
+        mark,
+        container(text(label).size(12))
+            .padding(6)
+            .style(container::bordered_box),
+        tooltip::Position::Top,
+    )
+    .into()
 }
 
 /// What decides the background of a message row.
@@ -633,6 +677,68 @@ pub fn sender_label(name: Option<&str>, ambiguous: bool, id: &UserId) -> String 
         format!("{clean} ({})", id_label())
     } else {
         clean
+    }
+}
+
+/// How a shield looks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Look {
+    /// A warning.
+    Red,
+    /// A caution.
+    Grey,
+}
+
+/// The look and the tooltip of an authenticity shield (plan Q10).
+pub fn shield_text(shield: Shield) -> (Look, &'static str) {
+    let (look, code) = match shield {
+        Shield::Red(code) => (Look::Red, code),
+        Shield::Grey(code) => (Look::Grey, code),
+    };
+    let text = match code {
+        ShieldCode::AuthenticityNotGuaranteed => {
+            "The authenticity of this encrypted message can't be guaranteed on this device"
+        }
+        ShieldCode::UnknownDevice => "Encrypted by an unknown or deleted device",
+        ShieldCode::UnsignedDevice => "Encrypted by a device not verified by its owner",
+        ShieldCode::UnverifiedIdentity => "Encrypted by an unverified user",
+        ShieldCode::VerificationViolation => "Sender's identity changed",
+        ShieldCode::MismatchedSender => {
+            "The sender of this message does not match the device that sent it"
+        }
+        ShieldCode::SentInClear => "Sent in clear in an encrypted room",
+    };
+    (look, text)
+}
+
+/// The line of a message that could not be decrypted (plan Q11).
+pub fn utd_text(reason: Option<UtdReason>) -> &'static str {
+    match reason {
+        Some(UtdReason::SentBeforeWeJoined) => "You don't have access to this message",
+        Some(UtdReason::HistoricalMessageAndDeviceIsUnverified) => {
+            "You need to verify this device for access to historical messages"
+        }
+        Some(UtdReason::HistoricalMessageAndBackupIsDisabled) => {
+            "Historical messages are not available on this device"
+        }
+        Some(UtdReason::WithheldForUnverifiedOrInsecureDevice) => {
+            "Your device doesn't meet the sender's security requirements"
+        }
+        Some(
+            UtdReason::WithheldBySender | UtdReason::UnknownDevice | UtdReason::UnsignedDevice,
+        ) => "The sender didn't share the key for this message",
+        Some(UtdReason::VerificationViolation) => "Sender's verified identity was reset",
+        // The key may still arrive.
+        Some(UtdReason::Unknown) | None => "Waiting for this message",
+    }
+}
+
+/// The line of a placeholder row: the reason-specific text for an
+/// undecryptable message, else [`placeholder_text`].
+pub fn placeholder_line(what: PlaceholderKind, utd: Option<UtdReason>) -> &'static str {
+    match what {
+        PlaceholderKind::UnableToDecrypt => utd_text(utd),
+        _ => placeholder_text(what),
     }
 }
 
@@ -936,6 +1042,97 @@ mod tests {
         assert_eq!(
             placeholder_text(PlaceholderKind::Image),
             "sent an image (not shown yet)"
+        );
+    }
+
+    #[test]
+    fn shields_have_the_look_and_wording_of_their_code() {
+        let codes = [
+            (
+                ShieldCode::AuthenticityNotGuaranteed,
+                "The authenticity of this encrypted message can't be guaranteed on this device",
+            ),
+            (
+                ShieldCode::UnknownDevice,
+                "Encrypted by an unknown or deleted device",
+            ),
+            (
+                ShieldCode::UnsignedDevice,
+                "Encrypted by a device not verified by its owner",
+            ),
+            (
+                ShieldCode::UnverifiedIdentity,
+                "Encrypted by an unverified user",
+            ),
+            (
+                ShieldCode::VerificationViolation,
+                "Sender's identity changed",
+            ),
+            (
+                ShieldCode::MismatchedSender,
+                "The sender of this message does not match the device that sent it",
+            ),
+            (
+                ShieldCode::SentInClear,
+                "Sent in clear in an encrypted room",
+            ),
+        ];
+        for (code, wording) in codes {
+            assert_eq!(shield_text(Shield::Red(code)), (Look::Red, wording));
+            assert_eq!(shield_text(Shield::Grey(code)), (Look::Grey, wording));
+        }
+    }
+
+    #[test]
+    fn every_utd_reason_has_its_line() {
+        let wait = "Waiting for this message";
+        let shared = "The sender didn't share the key for this message";
+        let cases = [
+            (None, wait),
+            (Some(UtdReason::Unknown), wait),
+            (
+                Some(UtdReason::SentBeforeWeJoined),
+                "You don't have access to this message",
+            ),
+            (
+                Some(UtdReason::HistoricalMessageAndDeviceIsUnverified),
+                "You need to verify this device for access to historical messages",
+            ),
+            (
+                Some(UtdReason::HistoricalMessageAndBackupIsDisabled),
+                "Historical messages are not available on this device",
+            ),
+            (
+                Some(UtdReason::WithheldForUnverifiedOrInsecureDevice),
+                "Your device doesn't meet the sender's security requirements",
+            ),
+            (Some(UtdReason::WithheldBySender), shared),
+            (Some(UtdReason::UnknownDevice), shared),
+            (Some(UtdReason::UnsignedDevice), shared),
+            (
+                Some(UtdReason::VerificationViolation),
+                "Sender's verified identity was reset",
+            ),
+        ];
+        for (reason, line) in cases {
+            assert_eq!(utd_text(reason), line, "{reason:?}");
+        }
+    }
+
+    #[test]
+    fn only_an_undecryptable_placeholder_uses_the_reason_line() {
+        let utd = Some(UtdReason::WithheldBySender);
+        assert_eq!(
+            placeholder_line(PlaceholderKind::UnableToDecrypt, utd),
+            utd_text(utd)
+        );
+        assert_eq!(
+            placeholder_line(PlaceholderKind::UnableToDecrypt, None),
+            "Waiting for this message"
+        );
+        assert_eq!(
+            placeholder_line(PlaceholderKind::Redacted, utd),
+            placeholder_text(PlaceholderKind::Redacted)
         );
     }
 

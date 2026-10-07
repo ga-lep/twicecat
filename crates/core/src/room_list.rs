@@ -13,6 +13,8 @@ use matrix_sdk_ui::room_list_service::{RoomListItem, RoomListLoadingState};
 use matrix_sdk_ui::timeline::{LatestEventValue, RoomExt, TimelineDetails};
 use tracing::warn;
 
+use crate::security;
+
 use crate::api::{
     AvatarId, CoreEvent, ListDiff, MessagePreview, RoomId, RoomListQuery, RoomListTab, RoomSummary,
     UserId,
@@ -227,12 +229,20 @@ pub(crate) fn summarize(item: &RoomListItem) -> RoomSummary {
             &hero_avatars,
         ),
         is_dm,
+        is_encrypted: item.encryption_state().is_encrypted(),
         is_space: item.is_space(),
         is_invite: item.state() == RoomState::Invited,
         highlights: highlights_of(mentions, item.unread_notification_counts().highlight_count),
         marked_unread: item.is_marked_unread(),
+        dm_peer: peer_field(security::dm_peer_of(item, item.client().user_id())),
         ..RoomSummary::new(id, name)
     }
+}
+
+/// The public form of a DM peer: the one other user the core watches the
+/// trust of (see `security::dm_peer_of`).
+pub(crate) fn peer_field(peer: Option<matrix_sdk::ruma::OwnedUserId>) -> Option<UserId> {
+    peer.map(|peer| UserId::from(peer.as_str()))
 }
 
 /// The preview of a room's latest message, if it is a message.
@@ -320,6 +330,17 @@ mod tests {
     use super::*;
 
     use crate::api::{RoomListQuery, RoomListTab};
+
+    #[test]
+    fn the_dm_peer_field_carries_the_core_peer() {
+        let bob = matrix_sdk::ruma::user_id!("@bob:x").to_owned();
+        assert_eq!(peer_field(Some(bob)), Some(UserId::from("@bob:x")));
+        assert_eq!(peer_field(None), None);
+        assert_eq!(
+            RoomSummary::new(RoomId::from("!r:x"), String::new()).dm_peer,
+            None
+        );
+    }
 
     fn q(tab: RoomListTab, search: &str) -> RoomListQuery {
         RoomListQuery {

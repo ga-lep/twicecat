@@ -243,6 +243,37 @@ mod tests {
         assert!(!dir.exists());
     }
 
+    /// Q16 (c): after a session starts, the data root holds only the
+    /// last-account marker and the store directory (which the SDK fills with
+    /// its encrypted store). No token or passphrase file lives next to them.
+    #[test]
+    fn the_data_root_holds_only_the_marker_and_the_sessions_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = DataPaths::at(tmp.path().join("root"));
+        p.create_session_store_dir("abc").unwrap();
+        p.write_last_account("@a:x").unwrap();
+        let mut names: Vec<String> = std::fs::read_dir(p.root())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["last_account", "sessions"]);
+        let sessions: Vec<String> = std::fs::read_dir(p.root().join("sessions"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(sessions, ["abc"]);
+        // The store directory is empty until the SDK writes its database.
+        assert_eq!(
+            std::fs::read_dir(p.root().join("sessions/abc"))
+                .unwrap()
+                .count(),
+            0
+        );
+        // The marker holds the user ID and nothing else.
+        assert_eq!(p.read_last_account().unwrap().as_deref(), Some("@a:x"));
+    }
+
     #[test]
     fn from_os_returns_some() {
         let p = DataPaths::from_os().expect("OS data dir available on the test machine");

@@ -6,7 +6,7 @@ use iced::widget::{
     text_input,
 };
 use iced::{Element, Fill};
-use tessera_core::api::{MessageText, UserId};
+use tessera_core::api::{MessageText, UserId, UserTrust};
 
 use crate::actions::{self, Picker};
 use crate::composer::{self, EditorAction, Mode, Suggestions};
@@ -14,10 +14,12 @@ use crate::emoji;
 use crate::links::{CheckedUrl, LinkBar, LinkKind};
 use crate::screens::loading::sync_label;
 use crate::screens::timeline_pane::RichEnv;
-use crate::screens::{room_list_pane, timeline_pane};
+use crate::screens::{room_list_pane, security, sessions, timeline_pane};
+use crate::sessions::SessionsMessage;
 use crate::state::{App, Message};
 use crate::text_safety::{MAX_NAME_CHARS, name_or_placeholder, one_line_capped};
 use crate::theme;
+use crate::verification::{MAX_PEER_USER_ID_CHARS, elide_middle};
 
 /// Width of the left pane.
 pub const LIST_PANE_WIDTH: f32 = 300.0;
@@ -27,13 +29,129 @@ pub fn display_name(name: &str) -> String {
     name_or_placeholder(name, MAX_NAME_CHARS)
 }
 
+/// What the header of a direct message says about the other person.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Badge {
+    /// Verified by the user.
+    Verified,
+    /// Not verified.
+    NotVerified,
+    /// A verified person's identity changed.
+    IdentityChanged,
+}
+
+impl Badge {
+    /// The badge's words.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Verified => "Verified",
+            Self::NotVerified => "Not verified",
+            Self::IdentityChanged => "Identity changed",
+        }
+    }
+
+    /// Whether the header offers **Verify** next to it.
+    pub fn can_verify(self) -> bool {
+        !matches!(self, Self::Verified)
+    }
+}
+
+/// The badge for a person's trust (plan Q10); nothing for a person without a
+/// cross-signing identity.
+pub fn trust_badge(trust: UserTrust) -> Option<Badge> {
+    match trust {
+        UserTrust::Verified => Some(Badge::Verified),
+        UserTrust::Unverified => Some(Badge::NotVerified),
+        UserTrust::IdentityChanged => Some(Badge::IdentityChanged),
+        UserTrust::NoIdentity => None,
+    }
+}
+
+/// The peer's user ID as the header shows it: one sanitized line, never cut
+/// from the end (see [`crate::verification::elide_middle`]).
+pub fn peer_id_line(peer: &UserId) -> String {
+    elide_middle(peer.as_str(), MAX_PEER_USER_ID_CHARS)
+}
+
+/// The room header: the name, a lock for an encrypted room, and for a direct
+/// message the trust of the other person with **Verify** where it helps. Always
+/// one row, so the column around it keeps its widget types.
+fn header<'a>(app: &'a App, title: String) -> Element<'a, Message> {
+    let mut line = Row::new().spacing(8).align_y(iced::Center);
+    line = line.push(text(title).size(22));
+    let selected = app
+        .selected
+        .as_ref()
+        .and_then(|id| app.rooms.iter().find(|room| room.id == *id));
+    if let Some(lock) = selected.and_then(room_list_pane::encrypted_mark) {
+        line = line.push(text(lock).size(16));
+    }
+    if let Some((peer, badge)) = app
+        .dm_peer_trust()
+        .and_then(|(peer, trust)| trust_badge(trust).map(|badge| (peer, badge)))
+    {
+        line = line.push(
+            text(badge.label())
+                .size(13)
+                .style(move |theme: &iced::Theme| text::Style {
+                    color: Some(match badge {
+                        Badge::Verified => theme.palette().success,
+                        Badge::NotVerified => theme::semantic(theme).muted,
+                        Badge::IdentityChanged => theme.palette().danger,
+                    }),
+                }),
+        );
+        // Whose identity the badge vouches for: the full ID, one line, cut in
+        // the middle if at all (the server name at the end tells users apart).
+        line = line.push(
+            text(peer_id_line(peer))
+                .size(13)
+                .style(|theme: &iced::Theme| text::Style {
+                    color: Some(theme::semantic(theme).muted),
+                }),
+        );
+        if badge.can_verify() {
+            line = line.push(
+                button(text("Verify").size(13))
+                    .padding([2, 8])
+                    .style(button::secondary)
+                    .on_press(Message::VerifyPeerRequested(peer.clone())),
+            );
+        }
+    }
+    line.into()
+}
+
 /// The main screen: panes above a status bar.
 pub fn view(app: &App) -> Element<'_, Message> {
-    column![
-        row![room_list_pane::view(app), room_pane(app)].height(Fill),
-        status_bar(app)
-    ]
-    .into()
+    let content = main_column(
+        security::banner_slot(&app.security),
+        row![room_list_pane::view(app), room_pane(app)]
+            .height(Fill)
+            .into(),
+        status_bar(app),
+    );
+    security::layer(
+        content,
+        security::top_layer(app).or_else(|| sessions::layer(app)),
+    )
+}
+
+/// The main column, always `[banner slot, panes, status bar]`: the slot is
+/// an empty column when there is no banner, so the panes (timeline scroll,
+/// editor focus) keep their place in the widget tree when a banner comes
+/// or goes. `from_vec` does not look at its children, so the column is told
+/// to fill the window: left at its default it shrinks to the banner slot and
+/// the whole window collapses.
+fn main_column<'a>(
+    banner: Element<'a, Message>,
+    panes: Element<'a, Message>,
+    status: Element<'a, Message>,
+) -> Element<'a, Message> {
+    Column::from_vec(vec![banner, panes, status])
+        .width(Fill)
+        .height(Fill)
+        .into()
 }
 
 /// The selected room: name, timeline, composer.
@@ -97,7 +215,7 @@ fn room_pane(app: &App) -> Element<'_, Message> {
         bars.push(bar);
     }
     let body = room_column(
-        text(title).size(22).into(),
+        header(app, title),
         timeline_layer(timeline.into(), picker),
         bars,
         editor(app, enabled),
@@ -369,6 +487,9 @@ fn status_bar(app: &App) -> Element<'_, Message> {
             }),
             space().width(Fill),
             text(account),
+            button(text("Sessions"))
+                .on_press(Message::Sessions(SessionsMessage::Open))
+                .style(button::secondary),
             button(text("Log out"))
                 .on_press(Message::LogoutRequested)
                 .style(button::secondary),
@@ -383,6 +504,43 @@ fn status_bar(app: &App) -> Element<'_, Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_peer_line_is_one_line_and_keeps_the_server_name() {
+        let id = UserId::from("@bob:example.org");
+        assert_eq!(peer_id_line(&id), "@bob:example.org");
+        let long = UserId::from(format!("@{}:evil.example", "a".repeat(400)));
+        let line = peer_id_line(&long);
+        assert!(line.ends_with(":evil.example"), "{line}");
+        assert!(line.chars().count() <= MAX_PEER_USER_ID_CHARS);
+        let split = UserId::from("@bo\nb:x");
+        assert!(!peer_id_line(&split).contains('\n'));
+    }
+
+    #[test]
+    fn trust_maps_to_a_badge() {
+        assert_eq!(trust_badge(UserTrust::Verified), Some(Badge::Verified));
+        assert_eq!(trust_badge(UserTrust::Unverified), Some(Badge::NotVerified));
+        assert_eq!(
+            trust_badge(UserTrust::IdentityChanged),
+            Some(Badge::IdentityChanged)
+        );
+        assert_eq!(trust_badge(UserTrust::NoIdentity), None);
+    }
+
+    #[test]
+    fn verify_is_offered_unless_already_verified() {
+        assert!(!Badge::Verified.can_verify());
+        assert!(Badge::NotVerified.can_verify());
+        assert!(Badge::IdentityChanged.can_verify());
+    }
+
+    #[test]
+    fn badges_have_distinct_words() {
+        assert_eq!(Badge::Verified.label(), "Verified");
+        assert_eq!(Badge::NotVerified.label(), "Not verified");
+        assert_eq!(Badge::IdentityChanged.label(), "Identity changed");
+    }
 
     #[test]
     fn the_editor_and_the_timeline_keep_their_place_when_bars_come_and_go() {
@@ -414,6 +572,64 @@ mod tests {
             tree.diff(build(bars, picker));
             assert_eq!(tags(&tree), before, "{bars} bars, picker {picker}");
         }
+    }
+
+    #[test]
+    fn the_panes_keep_their_place_when_the_banner_and_security_screens_come_and_go() {
+        use crate::security::{Banner, Overlay, RecoverySetup, SecurityModel};
+        use iced::advanced::widget::Tree;
+        use tessera_core::api::{DeviceVerification, RecoveryKey, RecoveryStatus};
+
+        let content = text_editor::Content::new();
+        fn build<'a>(
+            model: &'a SecurityModel,
+            content: &'a text_editor::Content,
+        ) -> Element<'a, Message> {
+            let panes = row![timeline_layer(space().into(), None), text_editor(content)].into();
+            let base = main_column(security::banner_slot(model), panes, text("status").into());
+            security::layer(base, security::screen(model))
+        }
+        let tags = |tree: &Tree| {
+            (
+                tree.children[0].tag,
+                tree.children[0]
+                    .children
+                    .iter()
+                    .map(|c| c.tag)
+                    .collect::<Vec<_>>(),
+                tree.children[0].children[1]
+                    .children
+                    .iter()
+                    .map(|c| c.tag)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let mut model = SecurityModel::default();
+        let mut tree = Tree::new(build(&model, &content));
+        let before = tags(&tree);
+        type Step = Box<dyn Fn(&mut SecurityModel)>;
+        let states: Vec<Step> = vec![
+            Box::new(|m| m.status.device = DeviceVerification::Unverified),
+            Box::new(|m| m.overlay = Some(Overlay::ConfirmIdentity)),
+            Box::new(|m| m.overlay = Some(Overlay::Restore)),
+            Box::new(|m| m.overlay = Some(Overlay::ResetConfirm)),
+            Box::new(|m| {
+                m.setup = Some(RecoverySetup::new(RecoveryKey::from("secret-key-x"), false));
+            }),
+            Box::new(|m| {
+                m.setup = None;
+                m.overlay = None;
+                m.status.device = DeviceVerification::Verified;
+                m.status.recovery = RecoveryStatus::Disabled;
+            }),
+            Box::new(|m| m.status.recovery = RecoveryStatus::Enabled),
+        ];
+        for apply in &states {
+            apply(&mut model);
+            tree.diff(build(&model, &content));
+            assert_eq!(tags(&tree), before, "{model:?}");
+        }
+        assert!(!Banner::DeviceUnverified.dismissible());
     }
 
     #[test]

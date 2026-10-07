@@ -7,7 +7,10 @@ pub mod loading;
 pub mod login;
 pub mod main_view;
 pub mod room_list_pane;
+pub mod security;
+pub mod sessions;
 pub mod timeline_pane;
+pub mod verification;
 
 use iced::widget::{container, text};
 use iced::{Element, Fill};

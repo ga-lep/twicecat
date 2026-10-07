@@ -10,7 +10,10 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tessera_core::api::CoreEvent;
+use tessera_core::api::{
+    Command, CoreEvent, ListDiff, MessageKind, MessageText, OutgoingMessage, Password, RoomId,
+    RoomSummary, SecurityStatus, SyncState, TextFormat, TimelineItem, TimelineItemKind,
+};
 use tessera_core::paths::DataPaths;
 use tessera_core::secrets::InMemorySecretStore;
 use tessera_core::{Core, CoreConfig, CoreHandle};
@@ -287,4 +290,550 @@ pub async fn send_content(
     let request = Request::new(room.to_owned(), TransactionId::new(), content)
         .expect("serialize message content");
     client.send(request).await.expect("send message").event_id
+}
+
+/// Serializes the E2EE tests of one test binary (Phase 4 Q2).
+static E2EE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Takes the per-binary E2EE lock; hold the guard for the whole test.
+///
+/// E2EE tests reset the crypto state of the fixed accounts, so two of them must
+/// never overlap. Cargo runs test binaries one at a time, so one lock per
+/// binary is enough. A test that panics while holding the guard does not block
+/// the next one (tokio's mutex does not poison).
+pub async fn e2ee_serial() -> tokio::sync::MutexGuard<'static, ()> {
+    E2EE_LOCK.lock().await
+}
+
+/// Like [`raw_login`] with a chosen device display name. The caller logs the
+/// client out, so no device is left behind.
+pub async fn raw_login_named(n: u8, device_name: &str) -> matrix_sdk::Client {
+    let env = TestEnv::load();
+    assert_local_homeserver(env.homeserver_url());
+    let client = matrix_sdk::Client::builder()
+        .homeserver_url(env.homeserver_url())
+        .build()
+        .await
+        .expect("build raw client");
+    client
+        .matrix_auth()
+        .login_username(env.user(n), env.password(n))
+        .initial_device_display_name(device_name)
+        .await
+        .expect("raw login");
+    client
+}
+
+/// Password UIA data for test user `n`, for the session in `info`.
+fn password_auth(
+    env: &TestEnv,
+    n: u8,
+    session: Option<String>,
+) -> matrix_sdk::ruma::api::client::uiaa::AuthData {
+    use matrix_sdk::ruma::api::client::uiaa::{AuthData, MatrixUserIdentifier, Password};
+    let mut password = Password::new(
+        MatrixUserIdentifier::new(env.user(n).to_owned()).into(),
+        env.password(n).to_owned(),
+    );
+    password.session = session;
+    AuthData::Password(password)
+}
+
+/// Resets test user `n` to the Q2 baseline B0 and returns the client used, still
+/// logged in (the caller must log it out), with the number of other devices
+/// removed.
+///
+/// B0: a fresh cross-signing identity whose private keys nobody else holds, no
+/// backup on the server, secret storage (4S) off, and no device but the
+/// returned client's. The client is built without encryption settings, so
+/// nothing runs automatically.
+async fn reset_to_b0(n: u8) -> (matrix_sdk::Client, usize) {
+    use matrix_sdk::encryption::CrossSigningResetAuthType;
+    let env = TestEnv::load();
+    assert_local_homeserver(env.homeserver_url());
+    let client = raw_login_named(n, "tessera-e2ee-reset").await;
+    client
+        .encryption()
+        .wait_for_e2ee_initialization_tasks()
+        .await;
+
+    // 1. Sign out every other device.
+    let own = client.device_id().expect("logged in").to_owned();
+    let others: Vec<_> = client
+        .devices()
+        .await
+        .expect("list devices")
+        .devices
+        .into_iter()
+        .map(|d| d.device_id)
+        .filter(|id| *id != own)
+        .collect();
+    let removed = others.len();
+    if !others.is_empty()
+        && let Err(error) = client.delete_devices(&others, None).await
+    {
+        let session = error
+            .as_uiaa_response()
+            .expect("device deletion fails only for user-interactive auth")
+            .session
+            .clone();
+        client
+            .delete_devices(&others, Some(password_auth(&env, n, session)))
+            .await
+            .expect("delete other devices with the password");
+    }
+
+    // 2. Delete every backup, turn 4S off, replace the identity.
+    if let Some(handle) = client
+        .encryption()
+        .recovery()
+        .reset_identity()
+        .await
+        .expect("reset identity")
+    {
+        match handle.auth_type() {
+            CrossSigningResetAuthType::Uiaa(info) => handle
+                .reset(Some(password_auth(&env, n, info.session.clone())))
+                .await
+                .expect("reset identity with the password"),
+            _ => panic!("the local homeserver asked for a non-password reset"),
+        }
+    }
+
+    // 3. Postconditions, on the same client.
+    let me = client.user_id().expect("logged in").to_owned();
+    assert!(
+        !client
+            .encryption()
+            .backups()
+            .fetch_exists_on_server()
+            .await
+            .expect("fetch backup state"),
+        "a backup survived the reset"
+    );
+    assert!(
+        !client
+            .encryption()
+            .secret_storage()
+            .is_enabled()
+            .await
+            .expect("fetch 4S state"),
+        "4S is still on after the reset"
+    );
+    assert!(
+        client
+            .encryption()
+            .request_user_identity(&me)
+            .await
+            .expect("query own identity")
+            .is_some(),
+        "no own identity after the reset"
+    );
+    assert_eq!(
+        client.devices().await.expect("list devices").devices.len(),
+        1,
+        "other devices survived the reset"
+    );
+    (client, removed)
+}
+
+/// Resets test user `n` to baseline B0 (see [`reset_to_b0`]) and logs the
+/// resetting device out. Prints the account name and the number of devices
+/// removed.
+pub async fn reset_e2ee_account(n: u8) {
+    let env = TestEnv::load();
+    assert_local_homeserver(env.homeserver_url());
+    let (client, removed) = reset_to_b0(n).await;
+    client.logout().await.expect("log the reset device out");
+    println!("e2ee reset {}: {removed} devices removed", env.user(n));
+}
+
+/// Resets test user `n` to baseline B1: like B0, then recovery is enabled
+/// (4S on, a matching backup), `passphrase` protecting the key when given. No
+/// device is left. Returns the recovery key; prints the account name and the
+/// number of devices removed.
+pub async fn seed_recovery(n: u8, passphrase: Option<&str>) -> zeroize::Zeroizing<String> {
+    let env = TestEnv::load();
+    assert_local_homeserver(env.homeserver_url());
+    let (client, removed) = reset_to_b0(n).await;
+    let recovery = client.encryption().recovery();
+    let enable = recovery.enable();
+    let key = match passphrase {
+        Some(passphrase) => enable.with_passphrase(passphrase).await,
+        None => enable.await,
+    }
+    .expect("enable recovery");
+    client.logout().await.expect("log the reset device out");
+    println!("e2ee seed {}: {removed} devices removed", env.user(n));
+    zeroize::Zeroizing::new(key)
+}
+
+/// Creates an encrypted room (initial `m.room.encryption` state,
+/// `m.megolm.v1.aes-sha2`) as `creator` and invites `invitee` when given.
+pub async fn create_encrypted_room(
+    creator: &matrix_sdk::Client,
+    name: &str,
+    invitee: Option<&str>,
+) -> matrix_sdk::ruma::OwnedRoomId {
+    use matrix_sdk::ruma::api::client::room::create_room::v3::Request;
+    use matrix_sdk::ruma::events::InitialStateEvent;
+    use matrix_sdk::ruma::events::room::encryption::RoomEncryptionEventContent;
+    let mut request = Request::new();
+    request.name = Some(name.to_owned());
+    request.initial_state = vec![
+        InitialStateEvent::with_empty_state_key(
+            RoomEncryptionEventContent::with_recommended_defaults(),
+        )
+        .to_raw_any(),
+    ];
+    if let Some(user) = invitee {
+        request
+            .invite
+            .push(user.try_into().expect("valid invitee user id"));
+    }
+    creator
+        .create_room(request)
+        .await
+        .expect("create encrypted room")
+        .room_id()
+        .to_owned()
+}
+
+/// The `type` of the event `event_id` in `room`, read raw from the server
+/// (works on a client that never synced).
+pub async fn fetch_raw_event_type(
+    client: &matrix_sdk::Client,
+    room: &matrix_sdk::ruma::RoomId,
+    event_id: &matrix_sdk::ruma::EventId,
+) -> String {
+    use matrix_sdk::ruma::api::client::room::get_room_event::v3::Request;
+    let event = client
+        .send(Request::new(room.to_owned(), event_id.to_owned()))
+        .await
+        .expect("fetch raw event")
+        .event;
+    event
+        .get_field::<String>("type")
+        .expect("event type parses")
+        .expect("event has a type")
+}
+
+/// Alice and carol (both reset to B0) in a fresh encrypted room, each with a
+/// running core that has the room open.
+pub struct EncryptedPair {
+    pub room_id: matrix_sdk::ruma::OwnedRoomId,
+    pub alice: CoreHandle,
+    pub carol: CoreHandle,
+    pub alice_rooms: Vec<RoomSummary>,
+    pub carol_rooms: Vec<RoomSummary>,
+    pub alice_items: Vec<TimelineItem>,
+    pub carol_items: Vec<TimelineItem>,
+    pub _dirs: [tempfile::TempDir; 2],
+    /// The secret stores of the two cores (alice, carol), for tests that read
+    /// the stored session record.
+    pub secrets: [Arc<InMemorySecretStore>; 2],
+}
+
+pub fn hex() -> String {
+    let mut bytes = [0u8; 8];
+    rand::fill(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+pub fn outgoing(room: &str, text: &str) -> OutgoingMessage {
+    OutgoingMessage {
+        room_id: RoomId::from(room),
+        text: MessageText::from(text),
+        mentions: Vec::new(),
+        reply_to: None,
+        kind: MessageKind::Text,
+        format: TextFormat::Markdown,
+    }
+}
+
+pub async fn login_and_run(core: &mut CoreHandle, env: &TestEnv, n: u8) {
+    core.commands
+        .send(Command::LoginPassword {
+            username: env.user(n).to_owned(),
+            password: Password::from(env.password(n)),
+            server: None,
+        })
+        .await
+        .unwrap();
+    expect_event(core, |e| matches!(e, CoreEvent::LoggedIn { .. })).await;
+    expect_event(core, |e| {
+        matches!(e, CoreEvent::SyncState(SyncState::Running))
+    })
+    .await;
+}
+
+/// Applies room list and timeline events until `done` holds.
+pub async fn pump(
+    core: &mut CoreHandle,
+    room: &str,
+    rooms: &mut Vec<RoomSummary>,
+    items: &mut Vec<TimelineItem>,
+    done: impl Fn(&[RoomSummary], &[TimelineItem]) -> bool,
+) {
+    pump_with(core, room, DEFAULT_TIMEOUT, rooms, items, |_| {}, done).await;
+}
+
+/// Like [`pump`] with an explicit timeout, and `other` called with every event
+/// that is neither a room list nor a timeline change of `room` (so a test can
+/// follow `Security` or `Recovered` while it keeps the timeline up to date).
+pub async fn pump_with(
+    core: &mut CoreHandle,
+    room: &str,
+    timeout: Duration,
+    rooms: &mut Vec<RoomSummary>,
+    items: &mut Vec<TimelineItem>,
+    other: impl FnMut(&CoreEvent),
+    done: impl Fn(&[RoomSummary], &[TimelineItem]) -> bool,
+) {
+    assert!(
+        try_pump_with(core, room, timeout, rooms, items, other, done).await,
+        "timed out waiting for the core"
+    );
+}
+
+/// Like [`pump_with`], but returns `false` on a timeout instead of panicking.
+pub async fn try_pump_with(
+    core: &mut CoreHandle,
+    room: &str,
+    timeout: Duration,
+    rooms: &mut Vec<RoomSummary>,
+    items: &mut Vec<TimelineItem>,
+    other: impl FnMut(&CoreEvent),
+    done: impl Fn(&[RoomSummary], &[TimelineItem]) -> bool,
+) -> bool {
+    let mut unused = Vec::new();
+    try_pump_recording(core, room, timeout, rooms, items, &mut unused, other, done).await
+}
+
+/// Like [`pump_with`], and appends every timeline diff of `room` to `recorded`
+/// in arrival order, so a test can check which kinds of diff produced the end
+/// state (a `Set` is an in-place update, a `Remove` plus `Insert` is not).
+pub async fn pump_recording(
+    core: &mut CoreHandle,
+    room: &str,
+    timeout: Duration,
+    items: &mut Vec<TimelineItem>,
+    recorded: &mut Vec<ListDiff<TimelineItem>>,
+    other: impl FnMut(&CoreEvent),
+    done: impl Fn(&[TimelineItem]) -> bool,
+) {
+    // The room list is followed in a scratch list; `done` only sees the items.
+    let mut rooms = Vec::new();
+    assert!(
+        try_pump_recording(
+            core,
+            room,
+            timeout,
+            &mut rooms,
+            items,
+            recorded,
+            other,
+            |_, items| done(items)
+        )
+        .await,
+        "timed out waiting for the core"
+    );
+}
+
+// Eight parameters: the shared worker of the public pump helpers, each of
+// which fixes some of them; a parameter struct would only add noise.
+#[allow(clippy::too_many_arguments)]
+async fn try_pump_recording(
+    core: &mut CoreHandle,
+    room: &str,
+    timeout: Duration,
+    rooms: &mut Vec<RoomSummary>,
+    items: &mut Vec<TimelineItem>,
+    recorded: &mut Vec<ListDiff<TimelineItem>>,
+    mut other: impl FnMut(&CoreEvent),
+    done: impl Fn(&[RoomSummary], &[TimelineItem]) -> bool,
+) -> bool {
+    let wait = async {
+        while !done(rooms, items) {
+            match core.events.recv().await {
+                Some(CoreEvent::RoomListChanged(diffs)) => {
+                    for diff in diffs {
+                        ListDiff::apply(&diff, rooms);
+                    }
+                }
+                Some(CoreEvent::TimelineDiff { room_id, diffs }) if room_id.as_str() == room => {
+                    for diff in diffs {
+                        ListDiff::apply(&diff, items);
+                        recorded.push(diff);
+                    }
+                }
+                Some(event) => other(&event),
+                None => panic!("event channel closed"),
+            }
+        }
+    };
+    tokio::time::timeout(timeout, wait).await.is_ok()
+}
+
+impl EncryptedPair {
+    pub async fn new() -> Self {
+        reset_e2ee_account(1).await;
+        reset_e2ee_account(3).await;
+        let env = TestEnv::load();
+        let alice_raw = raw_login_named(1, "tessera-e2ee-setup").await;
+        let carol_raw = raw_login_named(3, "tessera-e2ee-setup").await;
+        let room_id =
+            create_encrypted_room(&alice_raw, &unique_room_name(), Some(&env.user_id(3))).await;
+        carol_raw
+            .join_room_by_id(&room_id)
+            .await
+            .expect("carol joins the room");
+        alice_raw.logout().await.expect("alice setup logout");
+        carol_raw.logout().await.expect("carol setup logout");
+
+        let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+        let secrets = [
+            Arc::new(InMemorySecretStore::new()),
+            Arc::new(InMemorySecretStore::new()),
+        ];
+        let mut alice = start_core(dirs[0].path(), secrets[0].clone());
+        let mut carol = start_core(dirs[1].path(), secrets[1].clone());
+        login_and_run(&mut alice, &env, 1).await;
+        login_and_run(&mut carol, &env, 3).await;
+        let room = room_id.to_string();
+        let mut pair = Self {
+            room_id,
+            alice,
+            carol,
+            alice_rooms: Vec::new(),
+            carol_rooms: Vec::new(),
+            alice_items: Vec::new(),
+            carol_items: Vec::new(),
+            _dirs: dirs,
+            secrets,
+        };
+        pump(
+            &mut pair.alice,
+            &room,
+            &mut pair.alice_rooms,
+            &mut pair.alice_items,
+            |r, _| r.iter().any(|x| x.id.as_str() == room),
+        )
+        .await;
+        pump(
+            &mut pair.carol,
+            &room,
+            &mut pair.carol_rooms,
+            &mut pair.carol_items,
+            |r, _| r.iter().any(|x| x.id.as_str() == room),
+        )
+        .await;
+        for core in [&mut pair.alice, &mut pair.carol] {
+            core.commands
+                .send(Command::SelectRoom(RoomId::from(room.as_str())))
+                .await
+                .unwrap();
+        }
+        pair
+    }
+
+    pub fn room(&self) -> String {
+        self.room_id.to_string()
+    }
+
+    pub async fn finish(mut self) {
+        for core in [&mut self.alice, &mut self.carol] {
+            core.commands.send(Command::Logout).await.unwrap();
+            expect_event(core, |e| matches!(e, CoreEvent::LoggedOut)).await;
+        }
+    }
+}
+
+pub fn message_with<'a>(
+    items: &'a [TimelineItem],
+    text: &str,
+    own: bool,
+) -> Option<&'a TimelineItem> {
+    items.iter().find(|i| {
+        matches!(&i.kind, TimelineItemKind::Message { body, is_own, .. }
+            if body == text && *is_own == own)
+    })
+}
+
+/// Waits for the first `Security` event whose status satisfies `predicate`,
+/// ignoring every other event.
+pub async fn expect_security(
+    core: &mut CoreHandle,
+    predicate: impl Fn(&SecurityStatus) -> bool,
+) -> SecurityStatus {
+    match expect_event(
+        core,
+        |e| matches!(e, CoreEvent::Security(s) if predicate(s)),
+    )
+    .await
+    {
+        CoreEvent::Security(status) => status,
+        _ => unreachable!("the predicate only accepts Security events"),
+    }
+}
+
+/// On a logged-in core, resets the identity with test user `n`'s password and
+/// waits for the first-device status: the identity is complete on this
+/// device, the device is verified, and recovery is off. The reset deletes
+/// every backup and the SDK creates a fresh one (Q4 settings).
+pub async fn reset_identity_on(core: &mut CoreHandle, n: u8) {
+    use tessera_core::api::{CrossSigning, DeviceVerification, RecoveryStatus};
+    let env = TestEnv::load();
+    core.commands
+        .send(Command::ResetIdentity {
+            password: Some(Password::from(env.password(n))),
+        })
+        .await
+        .unwrap();
+    expect_security(core, |s| {
+        s.cross_signing == CrossSigning::Complete
+            && s.device == DeviceVerification::Verified
+            && s.recovery == RecoveryStatus::Disabled
+    })
+    .await;
+}
+
+/// Watches `core` for `window` and fails if the status shows an incomplete
+/// cross-signing identity (a sync-driven keys query dropped the private keys).
+pub async fn assert_identity_stays_complete(core: &mut CoreHandle, window: Duration) {
+    use tessera_core::api::CrossSigning;
+    let watch = async {
+        loop {
+            match core.events.recv().await {
+                Some(CoreEvent::Security(s)) => assert_eq!(
+                    s.cross_signing,
+                    CrossSigning::Complete,
+                    "the private keys were dropped: {s:?}"
+                ),
+                Some(_) => {}
+                None => panic!("event channel closed"),
+            }
+        }
+    };
+    // Running out of time is the expected end.
+    let _ = tokio::time::timeout(window, watch).await;
+}
+
+/// Logs `core` in as test user `n` on baseline B0 and makes it the account's
+/// first device (Q2): see [`reset_identity_on`]. Nothing is synced yet.
+pub async fn first_device(core: &mut CoreHandle, n: u8) {
+    let env = TestEnv::load();
+    core.commands
+        .send(Command::LoginPassword {
+            username: env.user(n).to_owned(),
+            password: Password::from(env.password(n)),
+            server: None,
+        })
+        .await
+        .unwrap();
+    expect_event(core, |e| matches!(e, CoreEvent::LoggedIn { .. })).await;
+    // No wait for the sync: the reset stops the sync service itself while it
+    // makes the new keys (Task 4/5 notes, `SyncPause`), so a reset right after
+    // the login is safe.
+    reset_identity_on(core, n).await;
 }

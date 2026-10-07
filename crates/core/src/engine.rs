@@ -40,11 +40,13 @@ use crate::outgoing::outgoing_content;
 use crate::paths::DataPaths;
 use crate::room_list::{Registered, build_filter, loaded_event, map_batch, map_diff};
 use crate::secrets::{SecretError, SecretStore};
+use crate::security::{self, SecurityTasks};
 use crate::session::{
     RECORD_VERSION, SessionAuth, SessionRecord, generate_session_id, generate_store_passphrase,
 };
-use crate::sync::{CancelTrigger, SyncControl, cancel_pair, run_supervised};
+use crate::sync::{CancelTrigger, SdkTarget, SyncControl, SyncPause, cancel_pair, run_supervised};
 use crate::timeline::{map_item, normalize_reaction_key, parse_room_id, rank_members};
+use crate::verification::Target;
 
 /// Events loaded by one back-pagination.
 const PAGINATION_BATCH: u16 = 20;
@@ -109,6 +111,8 @@ impl Core {
 /// A running sync service and the tasks that forward its output as events.
 struct Syncing {
     service: Arc<SyncService>,
+    /// Stops the service while an identity operation makes new keys.
+    pause: SyncPause,
     /// Asks the supervisor to end between steps (it is never aborted: an
     /// aborted `SyncService::stop` could leave SDK tasks running).
     cancel: CancelTrigger,
@@ -181,6 +185,8 @@ struct Active {
     /// Avatar fetches of this session (in flight and answered).
     avatars: Avatars,
     fetcher: Arc<SdkFetcher>,
+    /// The status forwarder and the network actions of the encryption API.
+    security: SecurityTasks,
 }
 
 impl Active {
@@ -188,7 +194,13 @@ impl Active {
     /// service, so that nothing holds the client or its store afterwards (the
     /// tasks own clones of it).
     async fn stop_tasks(&mut self) {
-        // Fetch tasks hold clones of the client, so they go first.
+        // From here a dropped identity task must not start the sync again.
+        if let Some(sync) = &self.sync {
+            sync.pause.begin_ending();
+        }
+        // The security tasks hold clones of the client too, and go first.
+        self.security.stop().await;
+        // Fetch tasks hold clones of the client, so they go next.
         self.avatars.stop().await;
         if let Some(selected) = self.selected.take() {
             selected.stop().await;
@@ -209,15 +221,20 @@ impl Active {
 }
 
 /// Production [`SyncControl`]: restarts the real service.
-struct ServiceControl(Arc<SyncService>);
+struct ServiceControl {
+    service: Arc<SyncService>,
+    /// Closed while an identity operation has the sync paused (`SyncPause`).
+    gate: Arc<tokio::sync::Mutex<()>>,
+}
 
 impl SyncControl for ServiceControl {
     async fn restart(&self) {
-        self.0.start().await;
+        let _open = self.gate.lock().await;
+        self.service.start().await;
     }
 
     async fn stop(&self) {
-        self.0.stop().await;
+        self.service.stop().await;
     }
 
     fn now(&self) -> std::time::Instant {
@@ -242,6 +259,7 @@ async fn forward_sync_state(
     client: Client,
     events: mpsc::Sender<CoreEvent>,
     cancel: crate::sync::Cancel,
+    gate: Arc<tokio::sync::Mutex<()>>,
 ) {
     // Subscribe, then mark the current value as seen: the subscriber would
     // otherwise yield it again, which the supervisor reads as a missed
@@ -257,7 +275,7 @@ async fn forward_sync_state(
             client.send_queue().set_enabled(true).await;
         }
     };
-    let control = ServiceControl(service);
+    let control = ServiceControl { service, gate };
     let supervised = run_supervised(&control, initial, subscriber, events, cancel, || {
         resumed.notify_one()
     });
@@ -833,6 +851,7 @@ impl Engine {
                 match self.login_password(&username, &password, server).await {
                     Ok(event) => {
                         self.emit(event).await;
+                        self.start_security();
                         self.start_sync().await;
                     }
                     Err(e) => self.emit(CoreEvent::LoginFailed(e)).await,
@@ -982,8 +1001,150 @@ impl Engine {
                 })
                 .await;
             }
+            // Network work runs in the security tasks, so `handle` never
+            // waits for it.
+            Command::BootstrapCrossSigning { password } => match self.active.as_mut() {
+                Some(active) => {
+                    let pause = active.sync.as_ref().map(|s| s.pause.clone());
+                    active
+                        .security
+                        .bootstrap(&active.client, pause, password, &self.events);
+                }
+                None => self.not_logged_in(ActionKind::CrossSigning).await,
+            },
+            Command::ResetIdentity { password } => match self.active.as_mut() {
+                Some(active) => {
+                    let pause = active.sync.as_ref().map(|s| s.pause.clone());
+                    active
+                        .security
+                        .reset(&active.client, pause, password, &self.events);
+                }
+                None => self.not_logged_in(ActionKind::CrossSigning).await,
+            },
+            Command::CancelIdentityReset => match self.active.as_mut() {
+                Some(active) => active.security.cancel_reset(),
+                None => self.not_logged_in(ActionKind::CrossSigning).await,
+            },
+            Command::EnableRecovery => match self.active.as_mut() {
+                Some(active) => active
+                    .security
+                    .enable_recovery(&active.client, &self.events),
+                None => self.not_logged_in(ActionKind::Recovery).await,
+            },
+            Command::Recover { key } => match self.active.as_mut() {
+                Some(active) => active.security.recover(&active.client, key, &self.events),
+                None => self.not_logged_in(ActionKind::Recovery).await,
+            },
+            Command::ChangeRecoveryKey => match self.active.as_mut() {
+                Some(active) => active
+                    .security
+                    .change_recovery_key(&active.client, &self.events),
+                None => self.not_logged_in(ActionKind::Recovery).await,
+            },
+            Command::RequestSelfVerification => match self.active.as_mut() {
+                Some(active) => {
+                    active
+                        .security
+                        .verification
+                        .request(&active.client, &self.events, Target::Own)
+                }
+                None => self.not_logged_in(ActionKind::Verification).await,
+            },
+            Command::RequestDeviceVerification { device_id } => match self.active.as_mut() {
+                Some(active) => active.security.verification.request(
+                    &active.client,
+                    &self.events,
+                    Target::Device(device_id),
+                ),
+                None => self.not_logged_in(ActionKind::Verification).await,
+            },
+            Command::RequestUserVerification { user_id } => match self.active.as_mut() {
+                Some(active) => active.security.verification.request(
+                    &active.client,
+                    &self.events,
+                    Target::User(user_id),
+                ),
+                None => self.not_logged_in(ActionKind::Verification).await,
+            },
+            Command::AcceptVerification { id } => match self.active.as_mut() {
+                Some(active) => active.security.verification.accept(&self.events, &id),
+                None => self.not_logged_in(ActionKind::Verification).await,
+            },
+            Command::StartSas { id } => match self.active.as_mut() {
+                Some(active) => active.security.verification.start_sas(&self.events, &id),
+                None => self.not_logged_in(ActionKind::Verification).await,
+            },
+            Command::ConfirmQrScanned { id } => match self.active.as_mut() {
+                Some(active) => active
+                    .security
+                    .verification
+                    .confirm_qr_scanned(&self.events, &id),
+                None => self.not_logged_in(ActionKind::Verification).await,
+            },
+            Command::ConfirmSas { id } => match self.active.as_mut() {
+                Some(active) => active.security.verification.confirm_sas(&self.events, &id),
+                None => self.not_logged_in(ActionKind::Verification).await,
+            },
+            Command::SasMismatch { id } => match self.active.as_mut() {
+                Some(active) => active.security.verification.mismatch(&self.events, &id),
+                None => self.not_logged_in(ActionKind::Verification).await,
+            },
+            Command::CancelVerification { id } => match self.active.as_mut() {
+                Some(active) => active.security.verification.cancel(&self.events, &id),
+                None => self.not_logged_in(ActionKind::Verification).await,
+            },
+            Command::WatchUserTrust { user_id } => match self.active.as_mut() {
+                Some(active) => {
+                    active
+                        .security
+                        .watch_user_trust(&active.client, &user_id, &self.events);
+                }
+                None => self.not_logged_in(ActionKind::Devices).await,
+            },
+            Command::ListDevices => match self.active.as_mut() {
+                Some(active) => active.security.list_devices(&active.client, &self.events),
+                None => self.not_logged_in(ActionKind::Devices).await,
+            },
+            Command::RenameDevice { device_id, name } => match self.active.as_mut() {
+                Some(active) => {
+                    active
+                        .security
+                        .rename_device(&active.client, &device_id, &name, &self.events);
+                }
+                None => self.not_logged_in(ActionKind::Devices).await,
+            },
+            Command::SignOutDevices {
+                device_ids,
+                password,
+            } => match self.active.as_mut() {
+                Some(active) => active.security.sign_out_devices(
+                    &active.client,
+                    &device_ids,
+                    password,
+                    &self.events,
+                ),
+                None => self.not_logged_in(ActionKind::SignOutDevices).await,
+            },
             // Handled in `run`.
             Command::Shutdown => {}
+        }
+    }
+
+    /// Answers a Phase 4 action sent without a session. These actions belong
+    /// to no room, so `room_id` is empty.
+    async fn not_logged_in(&self, action: ActionKind) {
+        self.emit(CoreEvent::ActionFailed {
+            room_id: RoomId::from(""),
+            action,
+            error: CoreError::NotLoggedIn,
+        })
+        .await;
+    }
+
+    /// Starts the security status forwarder of the new session.
+    fn start_security(&mut self) {
+        if let Some(active) = self.active.as_mut() {
+            active.security.start(&active.client, &self.events);
         }
     }
 
@@ -1077,6 +1238,7 @@ impl Engine {
             Ok((active, event)) => {
                 self.active = Some(active);
                 self.emit(event).await;
+                self.start_security();
                 self.start_sync().await;
             }
             Err(e) => {
@@ -1211,6 +1373,14 @@ impl Engine {
             members_synced: Arc::new(OnceCell::new()),
             paginating: Arc::new(AtomicBool::new(false)),
         });
+        // A DM with exactly one other user shows that user's trust (Q10).
+        if let Some(peer) = security::dm_peer_of(&room, active.client.user_id()) {
+            active.security.watch_user_trust(
+                &active.client,
+                &crate::api::UserId::from(peer.as_str()),
+                &self.events,
+            );
+        }
         Ok(())
     }
 
@@ -1376,6 +1546,7 @@ impl Engine {
                         sync: None,
                         selected: None,
                         avatars: Avatars::new(),
+                        security: SecurityTasks::new(),
                     },
                     event,
                 ))
@@ -1486,6 +1657,7 @@ impl Engine {
             Ok(Some((active, event))) => {
                 self.active = Some(active);
                 self.emit(event).await;
+                self.start_security();
                 self.start_sync().await;
             }
             Ok(None) => self.emit(CoreEvent::NoSession).await,
@@ -1552,6 +1724,7 @@ impl Engine {
                 sync: None,
                 selected: None,
                 avatars: Avatars::new(),
+                security: SecurityTasks::new(),
             },
             event,
         )))
@@ -1575,11 +1748,13 @@ impl Engine {
             }
         };
         let (cancel, cancelled) = cancel_pair();
+        let pause = SyncPause::new(SdkTarget::new(service.clone(), active.client.clone()));
         let supervisor = tokio::spawn(forward_sync_state(
             service.clone(),
             active.client.clone(),
             self.events.clone(),
             cancelled,
+            pause.gate(),
         ));
         let (more_rooms, more_rx) = mpsc::channel(8);
         let room_list = tokio::spawn(forward_room_list(
@@ -1593,6 +1768,7 @@ impl Engine {
         if let Some(active) = self.active.as_mut() {
             active.sync = Some(Syncing {
                 service,
+                pause,
                 cancel,
                 supervisor,
                 room_list,
@@ -2042,6 +2218,375 @@ mod tests {
         out
     }
 
+    /// One of every Phase 4 command, with its action kind.
+    fn security_commands() -> Vec<(Command, ActionKind)> {
+        use crate::api::{RecoveryKey, VerificationId};
+        let id = || VerificationId::from("flow");
+        let dev = || DeviceId::from("DEV");
+        let pw = || Some(Password::from("pw"));
+        vec![
+            (Command::EnableRecovery, ActionKind::Recovery),
+            (
+                Command::Recover {
+                    key: RecoveryKey::from("k"),
+                },
+                ActionKind::Recovery,
+            ),
+            (Command::ChangeRecoveryKey, ActionKind::Recovery),
+            (
+                Command::BootstrapCrossSigning { password: pw() },
+                ActionKind::CrossSigning,
+            ),
+            (
+                Command::ResetIdentity { password: None },
+                ActionKind::CrossSigning,
+            ),
+            (Command::CancelIdentityReset, ActionKind::CrossSigning),
+            (Command::RequestSelfVerification, ActionKind::Verification),
+            (
+                Command::RequestDeviceVerification { device_id: dev() },
+                ActionKind::Verification,
+            ),
+            (
+                Command::RequestUserVerification {
+                    user_id: UserId::from("@b:x"),
+                },
+                ActionKind::Verification,
+            ),
+            (
+                Command::AcceptVerification { id: id() },
+                ActionKind::Verification,
+            ),
+            (Command::StartSas { id: id() }, ActionKind::Verification),
+            (
+                Command::ConfirmQrScanned { id: id() },
+                ActionKind::Verification,
+            ),
+            (Command::ConfirmSas { id: id() }, ActionKind::Verification),
+            (Command::SasMismatch { id: id() }, ActionKind::Verification),
+            (
+                Command::CancelVerification { id: id() },
+                ActionKind::Verification,
+            ),
+            (Command::ListDevices, ActionKind::Devices),
+            (
+                Command::RenameDevice {
+                    device_id: dev(),
+                    name: "n".into(),
+                },
+                ActionKind::Devices,
+            ),
+            (
+                Command::SignOutDevices {
+                    device_ids: vec![dev()],
+                    password: pw(),
+                },
+                ActionKind::SignOutDevices,
+            ),
+            (
+                Command::WatchUserTrust {
+                    user_id: UserId::from("@b:x"),
+                },
+                ActionKind::Devices,
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn security_commands_without_a_session_fail_with_not_logged_in() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut engine, mut rx) = oauth_engine(tmp.path());
+        for (cmd, kind) in security_commands() {
+            engine.handle(cmd).await;
+            let got = drain(&mut rx).await;
+            assert!(
+                matches!(
+                    got.as_slice(),
+                    [CoreEvent::ActionFailed { action, error: CoreError::NotLoggedIn, .. }]
+                        if *action == kind
+                ),
+                "{kind:?}: {got:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn renaming_a_device_to_nothing_is_refused_before_any_request() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut engine, mut rx) = oauth_engine(tmp.path());
+        let client = Client::builder()
+            .homeserver_url("http://127.0.0.1:1")
+            .build()
+            .await
+            .unwrap();
+        engine.active = Some(Active {
+            fetcher: Arc::new(SdkFetcher(client.clone())),
+            client,
+            record: record("@alice:x", "http://127.0.0.1:1", "s1"),
+            changes: broadcast::channel(1).1,
+            sync: None,
+            selected: None,
+            avatars: Avatars::new(),
+            security: SecurityTasks::new(),
+        });
+        engine
+            .handle(Command::RenameDevice {
+                device_id: DeviceId::from("DEV"),
+                name: "   ".into(),
+            })
+            .await;
+        let got = next_event(&mut rx).await;
+        assert!(
+            matches!(
+                &got,
+                CoreEvent::ActionFailed {
+                    action: ActionKind::Devices,
+                    error: CoreError::NotAllowed,
+                    ..
+                }
+            ),
+            "{got:?}"
+        );
+        if let Some(mut active) = engine.active.take() {
+            active.stop_tasks().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sign_out_that_cannot_start_fails_with_its_own_kind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut engine, mut rx) = oauth_engine(tmp.path());
+        // This client never logged in: no user ID, so the sign-out stops at
+        // once, and not as a list or rename failure.
+        let client = Client::builder()
+            .homeserver_url("http://127.0.0.1:1")
+            .build()
+            .await
+            .unwrap();
+        engine.active = Some(Active {
+            fetcher: Arc::new(SdkFetcher(client.clone())),
+            client,
+            record: record("@alice:x", "http://127.0.0.1:1", "s1"),
+            changes: broadcast::channel(1).1,
+            sync: None,
+            selected: None,
+            avatars: Avatars::new(),
+            security: SecurityTasks::new(),
+        });
+        engine
+            .handle(Command::SignOutDevices {
+                device_ids: vec![DeviceId::from("DEV")],
+                password: None,
+            })
+            .await;
+        let got = next_event(&mut rx).await;
+        assert!(
+            matches!(
+                &got,
+                CoreEvent::ActionFailed {
+                    action: ActionKind::SignOutDevices,
+                    error: CoreError::NotLoggedIn,
+                    ..
+                }
+            ),
+            "{got:?}"
+        );
+        if let Some(mut active) = engine.active.take() {
+            active.stop_tasks().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn identity_commands_with_a_session_run_in_the_background() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut engine, mut rx) = oauth_engine(tmp.path());
+        // This client never logged in, so the task fails at once with no
+        // network (bootstrap needs the user ID first).
+        let client = Client::builder()
+            .homeserver_url("http://127.0.0.1:1")
+            .build()
+            .await
+            .unwrap();
+        engine.active = Some(Active {
+            fetcher: Arc::new(SdkFetcher(client.clone())),
+            client,
+            record: record("@alice:x", "http://127.0.0.1:1", "s1"),
+            changes: broadcast::channel(1).1,
+            sync: None,
+            selected: None,
+            avatars: Avatars::new(),
+            security: SecurityTasks::new(),
+        });
+        engine
+            .handle(Command::BootstrapCrossSigning { password: None })
+            .await;
+        // `handle` returned before the task ended; its answer arrives.
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("an answer within 5 s")
+            .expect("channel open");
+        assert!(
+            matches!(
+                &event,
+                CoreEvent::ActionFailed {
+                    action: ActionKind::CrossSigning,
+                    error: CoreError::NotLoggedIn,
+                    ..
+                }
+            ),
+            "{event:?}"
+        );
+        // Cancelling with nothing running is a no-op.
+        engine.handle(Command::CancelIdentityReset).await;
+        assert!(drain(&mut rx).await.is_empty());
+        if let Some(mut active) = engine.active.take() {
+            active.stop_tasks().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_commands_with_a_session_run_in_the_background() {
+        use crate::api::RecoveryKey;
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut engine, mut rx) = oauth_engine(tmp.path());
+        // No server and no logged-in user: each task fails on its own, and
+        // the answer names the recovery action and carries no secret.
+        let client = Client::builder()
+            .homeserver_url("http://127.0.0.1:1")
+            .build()
+            .await
+            .unwrap();
+        engine.active = Some(Active {
+            fetcher: Arc::new(SdkFetcher(client.clone())),
+            client,
+            record: record("@alice:x", "http://127.0.0.1:1", "s1"),
+            changes: broadcast::channel(1).1,
+            sync: None,
+            selected: None,
+            avatars: Avatars::new(),
+            security: SecurityTasks::new(),
+        });
+        for cmd in [
+            Command::EnableRecovery,
+            Command::Recover {
+                key: RecoveryKey::from("secret-key-x"),
+            },
+            Command::ChangeRecoveryKey,
+        ] {
+            engine.handle(cmd).await;
+            let event = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                .await
+                .expect("an answer within 10 s")
+                .expect("channel open");
+            match &event {
+                CoreEvent::ActionFailed {
+                    room_id,
+                    action: ActionKind::Recovery,
+                    error: CoreError::Internal(_),
+                } => assert!(room_id.as_str().is_empty()),
+                other => panic!("unexpected {other:?}"),
+            }
+            assert!(!format!("{event:?}").contains("secret-key-x"));
+            assert!(drain(&mut rx).await.is_empty());
+        }
+        if let Some(mut active) = engine.active.take() {
+            active.stop_tasks().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn verification_commands_with_a_session_run_in_the_background() {
+        use crate::api::VerificationId;
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut engine, mut rx) = oauth_engine(tmp.path());
+        // No server and no logged-in user: a request fails on its own and
+        // frees the slot, and an unknown flow is named as such.
+        let client = Client::builder()
+            .homeserver_url("http://127.0.0.1:1")
+            .build()
+            .await
+            .unwrap();
+        let events = engine.events.clone();
+        let mut security = SecurityTasks::new();
+        security.start(&client, &events);
+        engine.active = Some(Active {
+            fetcher: Arc::new(SdkFetcher(client.clone())),
+            client,
+            record: record("@alice:x", "http://127.0.0.1:1", "s1"),
+            changes: broadcast::channel(1).1,
+            sync: None,
+            selected: None,
+            avatars: Avatars::new(),
+            security,
+        });
+        // Twice: the failed first request must not leave a reservation behind
+        // (that would answer `Busy`).
+        for _ in 0..2 {
+            engine.handle(Command::RequestSelfVerification).await;
+            let event = next_event(&mut rx).await;
+            assert!(
+                matches!(
+                    &event,
+                    CoreEvent::ActionFailed {
+                        action: ActionKind::Verification,
+                        error: CoreError::NotLoggedIn,
+                        ..
+                    }
+                ),
+                "{event:?}"
+            );
+        }
+        for cmd in [
+            Command::AcceptVerification {
+                id: VerificationId::from("none"),
+            },
+            Command::ConfirmSas {
+                id: VerificationId::from("none"),
+            },
+            Command::SasMismatch {
+                id: VerificationId::from("none"),
+            },
+            Command::CancelVerification {
+                id: VerificationId::from("none"),
+            },
+        ] {
+            engine.handle(cmd).await;
+            let event = next_event(&mut rx).await;
+            assert!(
+                matches!(
+                    &event,
+                    CoreEvent::ActionFailed {
+                        action: ActionKind::Verification,
+                        error: CoreError::Internal(m),
+                        ..
+                    } if m == "there is no such verification"
+                ),
+                "{event:?}"
+            );
+        }
+        let rest = drain(&mut rx).await;
+        assert!(
+            rest.iter().all(|e| matches!(e, CoreEvent::Security(_))),
+            "{rest:?}"
+        );
+        if let Some(mut active) = engine.active.take() {
+            active.stop_tasks().await;
+        }
+    }
+
+    /// The next event that is not the status forwarder's.
+    async fn next_event(rx: &mut mpsc::Receiver<CoreEvent>) -> CoreEvent {
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                .await
+                .expect("an answer within 10 s")
+                .expect("channel open");
+            if !matches!(event, CoreEvent::Security(_)) {
+                return event;
+            }
+        }
+    }
+
     #[tokio::test]
     async fn new_commands_without_a_session_fail_with_not_logged_in() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2078,6 +2623,7 @@ mod tests {
             sync: None,
             selected: None,
             avatars: Avatars::new(),
+            security: SecurityTasks::new(),
         });
         let room = rid("a");
         for (cmd, kind) in action_commands(&room) {

@@ -293,6 +293,52 @@ mod tests {
         }
     }
 
+    /// Q16 (c): `to_bytes` is the only serializer of the tokens and the
+    /// passphrase, and nothing it or its errors print carries them.
+    #[test]
+    fn to_bytes_is_the_only_serializer_and_its_errors_carry_no_secret() {
+        // The oversize error quotes sizes, never content.
+        let mut big = matrix_record();
+        big.homeserver_url = format!(
+            "https://matrix.example.org/{}",
+            "a".repeat(MAX_RECORD_BYTES)
+        );
+        let err = big.to_bytes().unwrap_err();
+        for text in [err.to_string(), format!("{err:?}")] {
+            for secret in [ACCESS, REFRESH, PASS] {
+                assert!(!text.contains(secret), "a secret leaked in an error");
+            }
+        }
+        // The sentinels reach bytes only through `to_bytes`.
+        let bytes = matrix_record().to_bytes().unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains(ACCESS) && text.contains(PASS));
+        // No other module serializes anything: `Serialize` is derived only
+        // here, and `serde_json::to_*` is called only here (and in its tests).
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders = Vec::new();
+        let mut dirs = vec![src];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs")
+                    && path.file_name().is_some_and(|n| n != "session.rs")
+                {
+                    let code = std::fs::read_to_string(&path).unwrap();
+                    if code.contains("serde_json::to_") || code.contains("Serialize") {
+                        offenders.push(path.file_name().unwrap().to_string_lossy().into_owned());
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "serializers outside session.rs: {offenders:?}"
+        );
+    }
+
     #[test]
     fn json_round_trip_matrix() {
         let rec = matrix_record();

@@ -12,8 +12,8 @@ use iced::widget::{operation, scrollable};
 use iced::{Element, Subscription, Task, Theme, clipboard, system, window};
 use tessera_core::api::{
     ActionKind, Command, CoreError, CoreEvent, Draft, EventId, ListDiff, MessageDetails,
-    MessageText, OutgoingMessage, Password, RoomId, RoomListQuery, RoomListTab, RoomSummary,
-    SyncState, TimelineItem, TimelineItemKind, TypingUser, UserId,
+    MessageText, OutgoingMessage, Password, ReauthAction, RoomId, RoomListQuery, RoomListTab,
+    RoomSummary, SyncState, TimelineItem, TimelineItemKind, TypingUser, UserId, UserTrust,
 };
 use tokio::sync::mpsc;
 
@@ -27,8 +27,15 @@ use crate::rich_text::{LinkTarget, MAX_REVEALED, Revealed};
 use crate::room_list;
 use crate::screens::login::{self, BrowserUrl, LoginForm};
 use crate::screens::{self, loading, main_view};
+use crate::security::{Busy, SecurityMessage, SecurityModel};
+use crate::sessions::{SessionsMessage, SessionsModel, logout_needs_warning};
 use crate::text_safety;
 use crate::timeline::{self, Effects, TimelineView};
+use crate::verification::{VerificationMessage, VerificationModel};
+
+/// How many users' trust the app keeps: the selected peer, and a stale one or
+/// two from watchers the core replaced.
+pub const MAX_TRUST_KEPT: usize = 8;
 
 /// How long to wait for the core to close after `Shutdown` (plan Q18).
 pub const SHUTDOWN_WAIT: Duration = Duration::from_secs(10);
@@ -255,6 +262,14 @@ pub enum Message {
     CloseRequested,
     /// The core did not close in time after `Shutdown`.
     ShutdownDeadline,
+    /// **Verify** in the header of a direct message.
+    VerifyPeerRequested(UserId),
+    /// A message of the security banner and screens.
+    Security(SecurityMessage),
+    /// A button of the verification dialog.
+    Verification(VerificationMessage),
+    /// A button of the Sessions screen or the logout warning.
+    Sessions(SessionsMessage),
 }
 
 /// What `main` hands to Iced's boot function.
@@ -291,6 +306,12 @@ pub struct App {
     pub selected: Option<RoomId>,
     /// The selected room's timeline, kept in step with the core's diffs.
     pub timeline: TimelineView,
+    /// The latest trust the core reported per user, for the DM header. The
+    /// core says nothing about which room a `UserTrust` belongs to, and an
+    /// aborted watcher can still deliver one for the previous peer after the
+    /// new one, so the header looks up the selected peer by ID
+    /// ([`App::dm_peer_trust`]). Capped at [`MAX_TRUST_KEPT`].
+    pub user_trust: Vec<(UserId, UserTrust)>,
     /// The signed-in account.
     pub user_id: Option<UserId>,
     /// The last sync state.
@@ -334,8 +355,19 @@ pub struct App {
     /// The composer changed since the room was opened: only then is its
     /// draft stored (the room's own draft may still be on its way).
     draft_dirty: bool,
+    /// The security banner and screens.
+    pub security: SecurityModel,
+    /// The verification dialog, while a flow is open.
+    pub verification: Option<VerificationModel>,
+    /// The Sessions screen and the logout warning.
+    pub sessions: SessionsModel,
     /// Set when the app decided to exit (the task itself is opaque to tests).
     pub exit_requested: bool,
+    /// Clipboard reads sent by `drop_secrets` whose answer is still due.
+    pub(crate) flushes_pending: u32,
+    /// The core closed while the window was closing; exit waits for the
+    /// pending clipboard flushes.
+    pub(crate) core_closed: bool,
 }
 
 // Manual impl: the sink and the event slot are not `Debug`, and the composer
@@ -351,6 +383,9 @@ impl std::fmt::Debug for App {
             .field("login_in_flight", &self.login_in_flight)
             .field("composer", &self.composer)
             .field("actions", &self.actions)
+            .field("security", &self.security)
+            .field("verification", &self.verification)
+            .field("sessions", &self.sessions)
             .finish_non_exhaustive()
     }
 }
@@ -379,6 +414,7 @@ impl App {
             avatars: Avatars::default(),
             selected: None,
             timeline: TimelineView::default(),
+            user_trust: Vec::new(),
             user_id: None,
             sync_state: SyncState::Idle,
             login: LoginForm::new(),
@@ -398,7 +434,12 @@ impl App {
             command_bar: None,
             draft_seq: 0,
             draft_dirty: false,
+            security: SecurityModel::default(),
+            verification: None,
+            sessions: SessionsModel::default(),
             exit_requested: false,
+            flushes_pending: 0,
+            core_closed: false,
         };
         let restore = app.send(Command::RestoreSession);
         let boot = Task::batch([restore, system::theme().map(Message::ThemeMode)]);
@@ -418,8 +459,43 @@ impl App {
         }
     }
 
-    fn send(&self, command: Command) -> Task<Message> {
+    /// The selected direct message's other person and the core's latest word
+    /// on their trust: `None` unless the core named a peer for the room and
+    /// reported that user. A report for anyone else is ignored.
+    pub fn dm_peer_trust(&self) -> Option<(&UserId, UserTrust)> {
+        let (peer, _) = self.dm_peer()?;
+        self.user_trust
+            .iter()
+            .find(|(user, _)| user == peer)
+            .map(|(user, trust)| (user, *trust))
+    }
+
+    /// The selected direct message's other person, as the core names them in
+    /// the room's summary (`RoomSummary::dm_peer`), with that summary.
+    pub fn dm_peer(&self) -> Option<(&UserId, &RoomSummary)> {
+        let room = self
+            .selected
+            .as_ref()
+            .and_then(|id| self.rooms.iter().find(|room| room.id == *id))?;
+        Some((room.dm_peer.as_ref()?, room))
+    }
+
+    /// Keeps the core's word on `user`'s trust, newest last.
+    fn remember_trust(&mut self, user: UserId, trust: UserTrust) {
+        self.user_trust.retain(|(known, _)| *known != user);
+        if self.user_trust.len() >= MAX_TRUST_KEPT {
+            self.user_trust.remove(0);
+        }
+        self.user_trust.push((user, trust));
+    }
+
+    pub(crate) fn send(&self, command: Command) -> Task<Message> {
         self.sink.send(command).unwrap_or_else(Task::none)
+    }
+
+    /// A task that delivers `message` after `after`.
+    pub(crate) fn timer(&self, after: Duration, message: Message) -> Task<Message> {
+        self.sink.timer(after, message)
     }
 
     /// Applies a message.
@@ -451,10 +527,11 @@ impl App {
             Message::Core(event) => self.on_core(*event),
             Message::CoreClosed => {
                 if self.screen == Screen::ShuttingDown {
-                    self.exit()
+                    self.core_closed = true;
+                    self.exit_if_flushed(Task::none())
                 } else {
                     self.screen = Screen::Disconnected;
-                    Task::none()
+                    self.drop_secrets()
                 }
             }
             Message::ThemeMode(mode) => {
@@ -644,7 +721,25 @@ impl App {
                     Task::none()
                 }
             }
-            Message::LogoutRequested => self.send(Command::Logout),
+            Message::LogoutRequested => {
+                if logout_needs_warning(&self.security.status, self.sessions.other_devices()) {
+                    self.sessions.logout_warning = true;
+                    Task::none()
+                } else {
+                    self.logout()
+                }
+            }
+            // Only for the peer the header drew: a stale click for anyone
+            // else (the room or its peer changed) is dropped.
+            Message::VerifyPeerRequested(user_id) => match self.dm_peer() {
+                Some((peer, _)) if *peer == user_id => {
+                    self.send(Command::RequestUserVerification { user_id })
+                }
+                _ => Task::none(),
+            },
+            Message::Security(message) => self.on_security(message),
+            Message::Verification(message) => self.on_verification(message),
+            Message::Sessions(message) => self.on_sessions(message),
             Message::SelectRoom(id) => {
                 if !room_list::contains(&self.rooms, &id) {
                     return Task::none();
@@ -657,6 +752,7 @@ impl App {
                 self.draft_seq = self.draft_seq.wrapping_add(1);
                 self.selected = Some(id.clone());
                 self.timeline.reset();
+                self.user_trust.clear();
                 self.typing.clear();
                 self.actions.reset();
                 self.clear_draft();
@@ -696,8 +792,12 @@ impl App {
                     return Task::none();
                 }
                 let save = self.save_draft();
+                // The app stays alive until the core closes, so the read can
+                // still be answered.
+                let flush = self.drop_secrets();
                 self.screen = Screen::ShuttingDown;
                 Task::batch([
+                    flush,
                     save,
                     self.send(Command::Shutdown),
                     self.sink.deadline(SHUTDOWN_WAIT),
@@ -710,6 +810,18 @@ impl App {
                     Task::none()
                 }
             }
+        }
+    }
+
+    /// Exits once the core has closed and every clipboard flush has been
+    /// answered, so the clear write is issued first (`ShutdownDeadline`
+    /// stays the hard limit). Otherwise returns `task` unchanged.
+    pub(crate) fn exit_if_flushed(&mut self, task: Task<Message>) -> Task<Message> {
+        if self.screen == Screen::ShuttingDown && self.core_closed && self.flushes_pending == 0 {
+            self.exit_requested = true;
+            task.chain(iced::exit())
+        } else {
+            task
         }
     }
 
@@ -729,9 +841,15 @@ impl App {
                 self.end_login_attempt();
                 self.screen = Screen::Login;
             }
-            CoreEvent::LoggedIn { user_id, .. } => {
+            CoreEvent::LoggedIn {
+                user_id, restored, ..
+            } => {
                 // Any cancel reply would have come before this login.
                 self.pending_cancel = false;
+                // A copy still on the clipboard is checked, not forgotten.
+                task = self.drop_secrets();
+                self.security = SecurityModel::default();
+                self.security.fresh_login = !restored;
                 self.user_id = Some(user_id);
                 self.notice = None;
                 self.end_login_attempt();
@@ -755,9 +873,9 @@ impl App {
                 self.end_login_attempt();
                 self.screen = Screen::Login;
             }
-            CoreEvent::LoggedOut => self.back_to_login("You were logged out."),
+            CoreEvent::LoggedOut => task = self.back_to_login("You were logged out."),
             CoreEvent::SessionExpired => {
-                self.back_to_login("Your session expired. Please log in again.");
+                task = self.back_to_login("Your session expired. Please log in again.");
             }
             CoreEvent::OAuthUrl(url) => task = self.on_oauth_url(url.expose()),
             CoreEvent::SyncState(state) => self.sync_state = state,
@@ -855,7 +973,51 @@ impl App {
                     self.typing = users;
                 }
             }
-            CoreEvent::ActionFailed { .. } => {}
+            CoreEvent::ActionFailed {
+                action: ActionKind::Verification,
+                error,
+                ..
+            } => task = self.on_verification_failed(&error),
+            CoreEvent::ActionFailed {
+                action: ActionKind::Devices,
+                error,
+                ..
+            } => self.on_devices_failed(&error),
+            CoreEvent::ActionFailed {
+                action: ActionKind::SignOutDevices,
+                error,
+                ..
+            } => self.on_sign_out_failed(&error),
+            CoreEvent::ReauthRequired {
+                action: ReauthAction::DeleteDevices,
+            } => task = self.on_sessions_reauth(),
+            // A sign-out in flight owns the page, even with its screen closed
+            // (a reset is refused while one runs).
+            CoreEvent::OpenAccountManagement(url)
+                if self.sessions.pending.is_some()
+                    || self.security.busy != Some(Busy::Resetting) =>
+            {
+                task = self.on_sessions_url(&url);
+            }
+            // Recovery and cross-signing failures belong to the security
+            // screens; other actions have no screen yet.
+            event @ (CoreEvent::ActionFailed { .. }
+            | CoreEvent::Security(_)
+            | CoreEvent::RecoveryProgress(_)
+            | CoreEvent::RecoveryKeyReady(_)
+            | CoreEvent::Recovered
+            | CoreEvent::ReauthRequired { .. }
+            | CoreEvent::OpenAccountManagement(_)) => {
+                task = self.on_security_event(event);
+            }
+            CoreEvent::VerificationRequested { id, peer } => {
+                task = self.on_verification_requested(id, &peer);
+            }
+            CoreEvent::Verification { id, phase } => {
+                task = self.on_verification_phase(&id, phase);
+            }
+            CoreEvent::UserTrust { user_id, trust } => self.remember_trust(user_id, trust),
+            CoreEvent::Devices(list) => self.on_devices_event(list),
         }
         task
     }
@@ -1323,7 +1485,7 @@ impl App {
         self.send_error = None;
     }
 
-    fn back_to_login(&mut self, notice: &str) {
+    fn back_to_login(&mut self, notice: &str) -> Task<Message> {
         self.pending_cancel = false;
         self.user_id = None;
         self.rooms.clear();
@@ -1333,14 +1495,20 @@ impl App {
         self.list_offset_y = 0.0;
         self.deselect();
         self.sync_state = SyncState::Idle;
+        let flush = self.drop_secrets();
+        self.security = SecurityModel::default();
+        self.verification = None;
+        self.sessions = SessionsModel::default();
         self.notice = Some(notice.to_owned());
         self.end_login_attempt();
         self.screen = Screen::Login;
+        flush
     }
 
     fn deselect(&mut self) {
         self.selected = None;
         self.timeline.reset();
+        self.user_trust.clear();
         self.typing.clear();
         self.actions.reset();
         self.clear_draft();
@@ -1494,8 +1662,14 @@ impl App {
             Screen::Starting => screens::centered_text("Starting\u{2026}"),
             Screen::Login => login::view(self),
             Screen::WaitingForBrowser => login::waiting_view(self),
-            Screen::Loading => loading::view(self),
-            Screen::Main => main_view::view(self),
+            Screen::Loading => {
+                let base = screens::security::layer(
+                    loading::view(self),
+                    screens::security::top_layer(self),
+                );
+                screens::verification::layer(base, self)
+            }
+            Screen::Main => screens::verification::layer(main_view::view(self), self),
             Screen::ShuttingDown => screens::centered_text("Closing\u{2026}"),
             Screen::Disconnected => screens::centered_text("The core stopped"),
         }
@@ -3540,5 +3714,2287 @@ mod tests {
             &commands[1],
             Command::DiscardSend { room_id, item_id } if *room_id == RoomId::from("!a:x") && item_id == "bad"
         ));
+    }
+
+    // ---- Task 10: security banner and screens ----
+
+    use crate::security::{Banner, Busy, Overlay, SecurityMessage, Visible};
+    use tessera_core::api::{
+        ActionKind as Kind, CrossSigning, DeviceVerification, ReauthAction, RecoveryKey,
+        RecoveryStatus, SecurityStatus,
+    };
+
+    fn sec(app: &mut App, message: SecurityMessage) -> Task<Message> {
+        app.update(Message::Security(message))
+    }
+
+    fn status(device: DeviceVerification, recovery: RecoveryStatus) -> SecurityStatus {
+        SecurityStatus {
+            recovery,
+            device,
+            cross_signing: CrossSigning::Complete,
+            has_devices_to_verify_against: true,
+            identity_exists: true,
+        }
+    }
+
+    fn set_status(app: &mut App, device: DeviceVerification, recovery: RecoveryStatus) {
+        let _ = app.update(core(CoreEvent::Security(status(device, recovery))));
+    }
+
+    /// A freshly logged-in app whose device is unverified, on the identity
+    /// screen, with the commands drained.
+    fn identity_app() -> (App, mpsc::Receiver<Command>) {
+        let (mut app, mut rx) = main_app();
+        set_status(
+            &mut app,
+            DeviceVerification::Unverified,
+            RecoveryStatus::Enabled,
+        );
+        while rx.try_recv().is_ok() {}
+        (app, rx)
+    }
+
+    /// A verified app with recovery off, so the key can be set up.
+    fn recovery_app() -> (App, mpsc::Receiver<Command>) {
+        let (mut app, mut rx) = main_app();
+        set_status(
+            &mut app,
+            DeviceVerification::Verified,
+            RecoveryStatus::Disabled,
+        );
+        while rx.try_recv().is_ok() {}
+        (app, rx)
+    }
+
+    fn key_ready(app: &mut App, key: &str) {
+        let _ = app.update(core(CoreEvent::RecoveryKeyReady(RecoveryKey::from(key))));
+    }
+
+    fn recovery_failed(error: CoreError) -> Message {
+        core(CoreEvent::ActionFailed {
+            room_id: RoomId::from(""),
+            action: Kind::Recovery,
+            error,
+        })
+    }
+
+    #[test]
+    fn a_fresh_login_with_an_unverified_device_opens_the_identity_screen() {
+        let (app, _rx) = identity_app();
+        assert_eq!(
+            app.security.visible(),
+            Visible::Overlay(Overlay::ConfirmIdentity)
+        );
+        assert_eq!(app.security.banner(), Some(Banner::DeviceUnverified));
+    }
+
+    #[test]
+    fn a_restored_session_shows_the_banner_but_not_the_screen() {
+        let (mut app, _rx) = app_with(16);
+        let _ = app.update(core(CoreEvent::LoggedIn {
+            user_id: UserId::from("@a:x"),
+            device_id: DeviceId::from("D"),
+            restored: true,
+        }));
+        set_status(
+            &mut app,
+            DeviceVerification::Unverified,
+            RecoveryStatus::Enabled,
+        );
+        assert_eq!(app.security.visible(), Visible::Nothing);
+        assert_eq!(app.security.banner(), Some(Banner::DeviceUnverified));
+    }
+
+    #[test]
+    fn skip_leaves_the_unverified_banner_and_verify_reopens_the_screen() {
+        let (mut app, mut rx) = identity_app();
+        let _ = sec(&mut app, SecurityMessage::SkipIdentity);
+        assert!(app.security.identity_screen_skipped);
+        assert_eq!(app.security.visible(), Visible::Nothing);
+        assert_eq!(app.security.banner(), Some(Banner::DeviceUnverified));
+        // A dismiss message does not remove the persistent banner.
+        let _ = sec(&mut app, SecurityMessage::DismissRecoveryBanner);
+        assert_eq!(app.security.banner(), Some(Banner::DeviceUnverified));
+        // Later status updates do not reopen the screen by themselves.
+        set_status(
+            &mut app,
+            DeviceVerification::Unverified,
+            RecoveryStatus::Enabled,
+        );
+        assert_eq!(app.security.visible(), Visible::Nothing);
+        let _ = sec(&mut app, SecurityMessage::OpenConfirmIdentity);
+        assert_eq!(
+            app.security.visible(),
+            Visible::Overlay(Overlay::ConfirmIdentity)
+        );
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn the_unverified_banner_goes_when_the_device_is_verified() {
+        let (mut app, _rx) = identity_app();
+        set_status(
+            &mut app,
+            DeviceVerification::Verified,
+            RecoveryStatus::Enabled,
+        );
+        assert_eq!(app.security.banner(), None);
+        assert_eq!(app.security.visible(), Visible::Nothing);
+    }
+
+    #[test]
+    fn use_another_device_sends_one_self_verification_request() {
+        let (mut app, mut rx) = identity_app();
+        let _ = sec(&mut app, SecurityMessage::UseOtherDevice);
+        let _ = sec(&mut app, SecurityMessage::UseOtherDevice);
+        let commands = drain(&mut rx);
+        assert_eq!(commands.len(), 1, "{commands:?}");
+        assert!(matches!(commands[0], Command::RequestSelfVerification));
+    }
+
+    #[test]
+    fn set_up_recovery_sends_enable_once_and_the_key_opens_the_show_once_screen() {
+        let (mut app, mut rx) = recovery_app();
+        let _ = sec(&mut app, SecurityMessage::SetupRecovery);
+        let _ = sec(&mut app, SecurityMessage::SetupRecovery);
+        let commands = drain(&mut rx);
+        assert_eq!(commands.len(), 1, "{commands:?}");
+        assert!(matches!(commands[0], Command::EnableRecovery));
+        assert_eq!(app.security.busy, Some(Busy::SettingUp));
+        key_ready(&mut app, "secret-key-x");
+        assert_eq!(app.security.visible(), Visible::Key);
+        assert_eq!(app.security.busy, None);
+    }
+
+    #[test]
+    fn done_is_refused_until_the_box_is_ticked_and_then_drops_the_key() {
+        let (mut app, _rx) = recovery_app();
+        key_ready(&mut app, "secret-key-x");
+        let _ = sec(&mut app, SecurityMessage::Done);
+        assert_eq!(app.security.visible(), Visible::Key, "refused");
+        let _ = sec(&mut app, SecurityMessage::SavedToggled(true));
+        let _ = sec(&mut app, SecurityMessage::Done);
+        assert!(app.security.setup.is_none());
+        // Toggling with no key screen does nothing.
+        let _ = sec(&mut app, SecurityMessage::SavedToggled(true));
+        assert!(app.security.setup.is_none());
+    }
+
+    #[test]
+    fn copy_arms_one_timer_and_the_clipboard_is_cleared_only_if_it_still_holds_the_key() {
+        let (mut app, _rx) = recovery_app();
+        key_ready(&mut app, "secret-key-x");
+        assert!(sec(&mut app, SecurityMessage::CopyKey).units() > 0);
+        assert_eq!(app.security.copy_seq, 1);
+        // A timer of an older copy does nothing.
+        assert_eq!(sec(&mut app, SecurityMessage::ClipboardDue(0)).units(), 0);
+        // Done does not forget the copy: it is still checked.
+        let _ = sec(&mut app, SecurityMessage::SavedToggled(true));
+        let _ = sec(&mut app, SecurityMessage::Done);
+        assert!(app.security.setup.is_none());
+        assert!(sec(&mut app, SecurityMessage::ClipboardDue(1)).units() > 0);
+        let other = Some(RecoveryKey::from("something else"));
+        assert_eq!(
+            sec(&mut app, SecurityMessage::ClipboardRead(other)).units(),
+            0
+        );
+        assert!(app.security.copied.is_none());
+
+        // The clipboard still holds the key: cleared.
+        let (mut app, _rx) = recovery_app();
+        key_ready(&mut app, "secret-key-x");
+        let _ = sec(&mut app, SecurityMessage::CopyKey);
+        let _ = sec(&mut app, SecurityMessage::ClipboardDue(1));
+        let held = Some(RecoveryKey::from("secret-key-x"));
+        assert!(sec(&mut app, SecurityMessage::ClipboardRead(held)).units() > 0);
+        assert!(app.security.copied.is_none());
+    }
+
+    #[test]
+    fn restore_sends_the_trimmed_input_once_and_a_failure_keeps_it() {
+        let (mut app, mut rx) = identity_app();
+        let _ = sec(&mut app, SecurityMessage::OpenRestore);
+        assert_eq!(app.security.visible(), Visible::Overlay(Overlay::Restore));
+        // Nothing to send while the field is empty.
+        let _ = sec(&mut app, SecurityMessage::RestoreSubmitted);
+        assert!(drain(&mut rx).is_empty());
+        let typed = RecoveryKey::from("  EsTc aaaa  \n");
+        let _ = sec(&mut app, SecurityMessage::RestoreInput(typed));
+        let _ = sec(&mut app, SecurityMessage::RestoreSubmitted);
+        let _ = sec(&mut app, SecurityMessage::RestoreSubmitted);
+        let commands = drain(&mut rx);
+        assert_eq!(commands.len(), 1, "{commands:?}");
+        match &commands[0] {
+            Command::Recover { key } => assert_eq!(key.expose(), "EsTc aaaa"),
+            other => panic!("{other:?}"),
+        }
+        let _ = app.update(recovery_failed(CoreError::Internal(
+            "that recovery key or passphrase is not correct".into(),
+        )));
+        assert_eq!(app.security.busy, None);
+        let notice = app.security.notice.clone().expect("a notice");
+        assert!(notice.contains("not correct"), "{notice}");
+        assert_eq!(app.security.restore_input.expose(), "  EsTc aaaa  \n");
+        assert_eq!(app.security.visible(), Visible::Overlay(Overlay::Restore));
+        // A success empties the field and closes the screen.
+        let _ = app.update(core(CoreEvent::Recovered));
+        assert_eq!(app.security.restore_input.expose(), "");
+        assert_eq!(app.security.visible(), Visible::Nothing);
+        assert_eq!(app.security.notice, None);
+    }
+
+    #[test]
+    fn a_backup_that_already_exists_opens_the_restore_field() {
+        let (mut app, mut rx) = recovery_app();
+        let _ = sec(&mut app, SecurityMessage::SetupRecovery);
+        let _ = drain(&mut rx);
+        let _ = app.update(recovery_failed(CoreError::Internal(
+            "a key backup already exists; enter your recovery key".into(),
+        )));
+        assert_eq!(app.security.visible(), Visible::Overlay(Overlay::Restore));
+        let notice = app.security.notice.clone().expect("a notice");
+        assert!(notice.contains("backup already exists"), "{notice}");
+        assert_eq!(app.security.busy, None);
+    }
+
+    #[test]
+    fn a_recovery_failure_shows_one_capped_line() {
+        let (mut app, _rx) = recovery_app();
+        let _ = app.update(recovery_failed(CoreError::Internal(format!(
+            "bad\n{}",
+            "x".repeat(2000)
+        ))));
+        let notice = app.security.notice.clone().expect("a notice");
+        assert!(!notice.contains('\n') && notice.chars().count() <= 512);
+    }
+
+    #[test]
+    fn the_reset_warns_first_then_asks_for_the_password_and_resends_with_it() {
+        let (mut app, mut rx) = identity_app();
+        let _ = sec(&mut app, SecurityMessage::ResetRequested);
+        assert_eq!(
+            app.security.visible(),
+            Visible::Overlay(Overlay::ResetConfirm)
+        );
+        assert!(drain(&mut rx).is_empty(), "the warning sends nothing");
+        let _ = sec(&mut app, SecurityMessage::ResetConfirmed);
+        let _ = sec(&mut app, SecurityMessage::ResetConfirmed);
+        let commands = drain(&mut rx);
+        assert_eq!(commands.len(), 1, "{commands:?}");
+        assert!(matches!(
+            commands[0],
+            Command::ResetIdentity { password: None }
+        ));
+        assert_eq!(app.security.busy, Some(Busy::Resetting));
+
+        let _ = app.update(core(CoreEvent::ReauthRequired {
+            action: ReauthAction::ResetIdentity,
+        }));
+        assert_eq!(app.security.visible(), Visible::Reauth);
+        assert_eq!(app.security.busy, None);
+        // An empty password sends nothing.
+        let _ = sec(&mut app, SecurityMessage::ReauthSubmitted);
+        assert!(drain(&mut rx).is_empty());
+        let _ = sec(
+            &mut app,
+            SecurityMessage::ReauthInput(Password::from("secret-pw-x")),
+        );
+        let _ = sec(&mut app, SecurityMessage::ReauthSubmitted);
+        let _ = sec(&mut app, SecurityMessage::ReauthSubmitted);
+        let commands = drain(&mut rx);
+        assert_eq!(commands.len(), 1, "{commands:?}");
+        match &commands[0] {
+            Command::ResetIdentity {
+                password: Some(password),
+            } => assert_eq!(password.expose(), "secret-pw-x"),
+            other => panic!("{other:?}"),
+        }
+        let prompt = app.security.reauth.as_ref().expect("prompt kept");
+        assert_eq!(prompt.password.expose(), "", "the password is gone");
+        assert!(prompt.waiting);
+        assert_eq!(app.security.busy, Some(Busy::Resetting));
+
+        // The server refused it: the prompt returns with the backup warning.
+        let _ = app.update(core(CoreEvent::ActionFailed {
+            room_id: RoomId::from(""),
+            action: Kind::CrossSigning,
+            error: CoreError::ReauthFailed,
+        }));
+        let prompt = app.security.reauth.as_ref().expect("prompt kept");
+        assert!(prompt.failed && !prompt.waiting);
+        assert_eq!(app.security.busy, None);
+        let notice = app.security.notice.clone().expect("a notice");
+        assert!(notice.contains("backup"), "{notice}");
+
+        // A successful reset ends everything.
+        let _ = sec(
+            &mut app,
+            SecurityMessage::ReauthInput(Password::from("secret-pw-x")),
+        );
+        let _ = sec(&mut app, SecurityMessage::ReauthSubmitted);
+        set_status(
+            &mut app,
+            DeviceVerification::Verified,
+            RecoveryStatus::Disabled,
+        );
+        assert_eq!(app.security.visible(), Visible::Nothing);
+        assert_eq!(app.security.busy, None);
+        assert_eq!(app.security.notice, None);
+        assert_eq!(app.security.banner(), Some(Banner::RecoveryDisabled));
+    }
+
+    #[test]
+    fn a_status_from_before_the_reset_does_not_end_it() {
+        let (mut app, mut rx) = identity_app();
+        let _ = sec(&mut app, SecurityMessage::ResetRequested);
+        let _ = sec(&mut app, SecurityMessage::ResetConfirmed);
+        let _ = drain(&mut rx);
+        // A status already on its way when the reset began: still unverified.
+        set_status(
+            &mut app,
+            DeviceVerification::Unverified,
+            RecoveryStatus::Enabled,
+        );
+        assert_eq!(app.security.busy, Some(Busy::Resetting));
+        // Verified, but the backup still there: not the reset's result yet.
+        set_status(
+            &mut app,
+            DeviceVerification::Verified,
+            RecoveryStatus::Enabled,
+        );
+        assert_eq!(app.security.busy, Some(Busy::Resetting));
+        set_status(
+            &mut app,
+            DeviceVerification::Verified,
+            RecoveryStatus::Disabled,
+        );
+        assert_eq!(app.security.busy, None);
+    }
+
+    #[test]
+    fn a_failed_or_cancelled_reset_says_the_backup_is_gone() {
+        let (mut app, mut rx) = identity_app();
+        let _ = sec(&mut app, SecurityMessage::ResetRequested);
+        let _ = sec(&mut app, SecurityMessage::ResetConfirmed);
+        let _ = drain(&mut rx);
+        let _ = app.update(core(CoreEvent::ActionFailed {
+            room_id: RoomId::from(""),
+            action: Kind::CrossSigning,
+            error: CoreError::Internal("identity reset could not be completed".into()),
+        }));
+        let notice = app.security.notice.clone().expect("a notice");
+        assert!(notice.contains("backup"), "{notice}");
+        assert_eq!(app.security.busy, None);
+        assert!(app.security.reauth.is_none());
+    }
+
+    #[test]
+    fn an_account_management_url_opens_only_when_it_is_https() {
+        let (mut app, mut rx) = identity_app();
+        let _ = sec(&mut app, SecurityMessage::ResetRequested);
+        let _ = sec(&mut app, SecurityMessage::ResetConfirmed);
+        let _ = drain(&mut rx);
+        let task = app.update(core(CoreEvent::OpenAccountManagement(AuthUrl::from(
+            "https://account.example.org/reset?x=1",
+        ))));
+        assert!(task.units() > 0);
+        assert!(app.security.waiting_approval);
+        assert_eq!(app.security.busy, Some(Busy::Resetting));
+
+        let (mut app, mut rx) = identity_app();
+        let _ = sec(&mut app, SecurityMessage::ResetRequested);
+        let _ = sec(&mut app, SecurityMessage::ResetConfirmed);
+        let _ = drain(&mut rx);
+        let task = app.update(core(CoreEvent::OpenAccountManagement(AuthUrl::from(
+            "http://evil.example.org/reset",
+        ))));
+        assert_eq!(task.units(), 0);
+        assert!(!app.security.waiting_approval);
+        let commands = drain(&mut rx);
+        assert!(matches!(commands[..], [Command::CancelIdentityReset]));
+    }
+
+    #[test]
+    fn cancelling_the_approval_sends_one_cancel_and_says_the_backup_is_gone() {
+        let (mut app, mut rx) = identity_app();
+        let _ = sec(&mut app, SecurityMessage::ResetRequested);
+        let _ = sec(&mut app, SecurityMessage::ResetConfirmed);
+        let _ = app.update(core(CoreEvent::OpenAccountManagement(AuthUrl::from(
+            "https://account.example.org/reset",
+        ))));
+        let _ = drain(&mut rx);
+        let _ = sec(&mut app, SecurityMessage::CancelApproval);
+        let _ = sec(&mut app, SecurityMessage::CancelApproval);
+        let commands = drain(&mut rx);
+        assert_eq!(commands.len(), 1, "{commands:?}");
+        assert!(matches!(commands[0], Command::CancelIdentityReset));
+        assert!(!app.security.waiting_approval);
+        let notice = app.security.notice.clone().expect("a notice");
+        assert!(notice.contains("backup"), "{notice}");
+    }
+
+    #[test]
+    fn logout_and_window_close_drop_the_key_and_the_inputs() {
+        for message in [Message::LogoutRequested, Message::CloseRequested] {
+            let (mut app, _rx) = recovery_app();
+            key_ready(&mut app, "secret-key-x");
+            let _ = sec(&mut app, SecurityMessage::CopyKey);
+            let _ = sec(
+                &mut app,
+                SecurityMessage::RestoreInput(RecoveryKey::from("secret-input-x")),
+            );
+            // With recovery set up, logout needs no warning first.
+            set_status(
+                &mut app,
+                DeviceVerification::Verified,
+                RecoveryStatus::Enabled,
+            );
+            let _ = app.update(message);
+            assert!(app.security.setup.is_none());
+            assert!(app.security.copied.is_none());
+            assert_eq!(app.security.restore_input.expose(), "");
+        }
+    }
+
+    #[test]
+    fn logged_out_resets_the_security_state() {
+        let (mut app, _rx) = identity_app();
+        let _ = sec(&mut app, SecurityMessage::SkipIdentity);
+        let _ = app.update(core(CoreEvent::LoggedOut));
+        assert_eq!(app.security.banner(), None);
+        assert!(!app.security.identity_screen_skipped);
+        assert!(!app.security.fresh_login);
+    }
+
+    #[test]
+    fn a_sentinel_key_never_appears_in_the_app_debug_output() {
+        let (mut app, _rx) = recovery_app();
+        key_ready(&mut app, "secret-key-x");
+        let _ = sec(&mut app, SecurityMessage::CopyKey);
+        let _ = sec(
+            &mut app,
+            SecurityMessage::RestoreInput(RecoveryKey::from("secret-input-x")),
+        );
+        let _ = sec(
+            &mut app,
+            SecurityMessage::ReauthInput(Password::from("secret-pw-x")),
+        );
+        let dbg = format!("{app:?}");
+        assert!(dbg.contains("security"), "{dbg}");
+        for secret in ["secret-key-x", "secret-input-x", "secret-pw-x"] {
+            assert!(!dbg.contains(secret), "{dbg}");
+        }
+        let messages = format!(
+            "{:?} {:?} {:?}",
+            Message::Core(Box::new(CoreEvent::RecoveryKeyReady(RecoveryKey::from(
+                "secret-key-x"
+            )))),
+            Message::Security(SecurityMessage::RestoreInput(RecoveryKey::from(
+                "secret-input-x"
+            ))),
+            Message::Security(SecurityMessage::ClipboardRead(Some(RecoveryKey::from(
+                "secret-key-x"
+            )))),
+        );
+        assert!(!messages.contains("secret-"), "{messages}");
+    }
+
+    /// An app that has copied its recovery key just now.
+    fn copied_app() -> App {
+        let (mut app, _rx) = recovery_app();
+        key_ready(&mut app, "secret-key-x");
+        assert!(sec(&mut app, SecurityMessage::CopyKey).units() > 0);
+        app
+    }
+
+    #[test]
+    fn logout_close_and_disconnect_check_and_clear_the_clipboard_at_once() {
+        let mut app = copied_app();
+        // With recovery set up, logout needs no warning first.
+        set_status(
+            &mut app,
+            DeviceVerification::Verified,
+            RecoveryStatus::Enabled,
+        );
+        assert!(app.update(Message::LogoutRequested).units() > 0);
+        assert!(app.security.copied.is_none());
+        let mut app = copied_app();
+        assert!(app.update(Message::CloseRequested).units() > 0);
+        assert!(app.security.copied.is_none());
+        let mut app = copied_app();
+        assert!(app.update(Message::CoreClosed).units() > 0);
+        assert_eq!(app.screen, Screen::Disconnected);
+        assert!(app.security.setup.is_none() && app.security.copied.is_none());
+        let mut app = copied_app();
+        assert!(app.update(core(CoreEvent::LoggedOut)).units() > 0);
+        let mut app = copied_app();
+        let task = app.update(core(CoreEvent::LoggedIn {
+            user_id: UserId::from("@a:x"),
+            device_id: DeviceId::from("D"),
+            restored: false,
+        }));
+        assert!(task.units() > 0, "a pending copy is flushed, not lost");
+        // Nothing copied: nothing to check.
+        let (mut app, _rx) = recovery_app();
+        set_status(
+            &mut app,
+            DeviceVerification::Verified,
+            RecoveryStatus::Enabled,
+        );
+        assert_eq!(app.update(Message::LogoutRequested).units(), 0);
+    }
+
+    #[test]
+    fn close_waits_for_the_clipboard_clear_before_exiting() {
+        let key = RecoveryKey::from("secret-key-x");
+        let mut app = copied_app();
+        let _ = app.update(Message::CloseRequested);
+        // The core closes first: the flush has not been answered yet.
+        let _ = app.update(Message::CoreClosed);
+        assert!(!app.exit_requested, "exit must wait for the flush");
+        let flushed = SecurityMessage::ClipboardFlushed(Some(key.clone()), key.clone());
+        assert!(sec(&mut app, flushed).units() > 0, "the clear is written");
+        assert!(app.exit_requested);
+        // The flush answered first: the core closing then exits at once.
+        let mut app = copied_app();
+        let _ = app.update(Message::CloseRequested);
+        let flushed = SecurityMessage::ClipboardFlushed(Some(key.clone()), key);
+        let _ = sec(&mut app, flushed);
+        assert!(!app.exit_requested, "the core has not closed yet");
+        let _ = app.update(Message::CoreClosed);
+        assert!(app.exit_requested);
+        // The deadline stays the hard limit.
+        let mut app = copied_app();
+        let _ = app.update(Message::CloseRequested);
+        let _ = app.update(Message::ShutdownDeadline);
+        assert!(app.exit_requested);
+    }
+
+    #[test]
+    fn back_and_a_closed_restore_screen_empty_the_restore_field() {
+        let (mut app, _rx) = recovery_app();
+        let _ = sec(&mut app, SecurityMessage::OpenRestore);
+        let _ = sec(
+            &mut app,
+            SecurityMessage::RestoreInput(RecoveryKey::from("secret-input-x")),
+        );
+        let _ = sec(&mut app, SecurityMessage::Back);
+        assert_eq!(app.security.restore_input.expose(), "");
+    }
+
+    #[test]
+    fn the_flush_clears_only_a_clipboard_that_still_holds_the_key() {
+        let key = RecoveryKey::from("secret-key-x");
+        let (mut app, _rx) = recovery_app();
+        let same = SecurityMessage::ClipboardFlushed(Some(key.clone()), key.clone());
+        assert!(sec(&mut app, same).units() > 0);
+        let other = SecurityMessage::ClipboardFlushed(Some(RecoveryKey::from("x")), key.clone());
+        assert_eq!(sec(&mut app, other).units(), 0);
+        let none = SecurityMessage::ClipboardFlushed(None, key);
+        assert_eq!(sec(&mut app, none).units(), 0);
+    }
+
+    #[test]
+    fn security_messages_never_print_their_secrets() {
+        let dbg = format!(
+            "{:?} {:?} {:?}",
+            SecurityMessage::RestoreInput(RecoveryKey::from("secret-input-x")),
+            SecurityMessage::ReauthInput(Password::from("secret-pw-x")),
+            SecurityMessage::ClipboardFlushed(
+                Some(RecoveryKey::from("secret-key-x")),
+                RecoveryKey::from("secret-key-y")
+            ),
+        );
+        assert!(!dbg.contains("secret-"), "{dbg}");
+    }
+
+    // ---- Task 11: verification dialog ----
+
+    use crate::verification::VerificationMessage as VM;
+    use tessera_core::api::{
+        CancelReason, QrImage, SasEmoji, VerificationId, VerificationPeer, VerificationPhase as VP,
+    };
+
+    fn vid() -> VerificationId {
+        VerificationId::from("flow-1")
+    }
+
+    fn vpeer(own: bool) -> VerificationPeer {
+        VerificationPeer {
+            user_id: UserId::from("@bob:x"),
+            device_id: Some(DeviceId::from("DEV")),
+            device_name: Some("Phone".to_owned()),
+            own_account: own,
+        }
+    }
+
+    fn vmsg(app: &mut App, message: VM) -> Task<Message> {
+        app.update(Message::Verification(message))
+    }
+
+    fn vphase(app: &mut App, phase: VP) {
+        let _ = app.update(core(CoreEvent::Verification { id: vid(), phase }));
+    }
+
+    fn vqr() -> QrImage {
+        QrImage {
+            size: 21,
+            dark: vec![true; 21 * 21],
+        }
+    }
+
+    fn vemojis() -> Box<[SasEmoji; 7]> {
+        Box::new(std::array::from_fn(|_| SasEmoji {
+            symbol: "\u{1F436}".to_owned(),
+            description: "Dog".to_owned(),
+        }))
+    }
+
+    /// An app with a flow with `own` peer open, commands drained.
+    fn verifying(own: bool) -> (App, mpsc::Receiver<Command>) {
+        let (mut app, mut rx) = main_app();
+        let _ = app.update(core(CoreEvent::VerificationRequested {
+            id: vid(),
+            peer: vpeer(own),
+        }));
+        while rx.try_recv().is_ok() {}
+        (app, rx)
+    }
+
+    fn only(rx: &mut mpsc::Receiver<Command>) -> Command {
+        let mut commands = drain(rx);
+        assert_eq!(commands.len(), 1, "{commands:?}");
+        commands.remove(0)
+    }
+
+    #[test]
+    fn a_request_opens_the_dialog_and_a_stale_id_changes_nothing() {
+        let (mut app, _rx) = verifying(true);
+        let flow = app.verification.as_ref().expect("dialog open");
+        assert_eq!(flow.name, "Phone");
+        let _ = app.update(core(CoreEvent::Verification {
+            id: VerificationId::from("other"),
+            phase: VP::Done,
+        }));
+        assert_eq!(app.verification.as_ref().unwrap().phase.kind(), "requested");
+        vphase(&mut app, VP::Requested { incoming: true });
+        assert_eq!(app.verification.as_ref().unwrap().phase.kind(), "requested");
+    }
+
+    #[test]
+    fn a_phase_without_a_request_opens_nothing() {
+        let (mut app, _rx) = main_app();
+        vphase(&mut app, VP::Ready);
+        assert!(app.verification.is_none());
+    }
+
+    #[test]
+    fn a_second_request_does_not_replace_a_running_flow() {
+        let (mut app, _rx) = verifying(true);
+        let _ = app.update(core(CoreEvent::VerificationRequested {
+            id: VerificationId::from("flow-2"),
+            peer: vpeer(false),
+        }));
+        assert_eq!(app.verification.as_ref().unwrap().id, vid());
+    }
+
+    #[test]
+    fn a_request_behind_a_finished_card_shows_after_close() {
+        let (mut app, mut rx) = verifying(true);
+        vphase(&mut app, VP::Done);
+        let flow2 = VerificationId::from("flow-2");
+        let _ = app.update(core(CoreEvent::VerificationRequested {
+            id: flow2.clone(),
+            peer: vpeer(false),
+        }));
+        // The finished card stays, so a click meant for Close cannot Accept.
+        assert_eq!(app.verification.as_ref().unwrap().id, vid());
+        let _ = vmsg(&mut app, VM::Accept);
+        assert!(drain(&mut rx).is_empty());
+        // The queued flow keeps following its events.
+        let _ = app.update(core(CoreEvent::Verification {
+            id: flow2.clone(),
+            phase: VP::Requested { incoming: true },
+        }));
+        let _ = vmsg(&mut app, VM::Close);
+        let shown = app.verification.as_ref().expect("queued request shown");
+        assert_eq!(shown.id, flow2);
+        assert_eq!(shown.phase.kind(), "requested");
+        let _ = vmsg(&mut app, VM::Accept);
+        assert!(matches!(only(&mut rx), Command::AcceptVerification { id } if id == flow2));
+    }
+
+    #[test]
+    fn a_queued_request_that_ended_before_close_is_dropped() {
+        let (mut app, _rx) = verifying(true);
+        vphase(&mut app, VP::Done);
+        let flow2 = VerificationId::from("flow-2");
+        let _ = app.update(core(CoreEvent::VerificationRequested {
+            id: flow2.clone(),
+            peer: vpeer(false),
+        }));
+        let _ = app.update(core(CoreEvent::Verification {
+            id: flow2,
+            phase: VP::Cancelled {
+                reason: tessera_core::api::CancelReason::ByThem,
+            },
+        }));
+        let _ = vmsg(&mut app, VM::Close);
+        assert!(app.verification.is_none());
+    }
+
+    #[test]
+    fn accept_and_decline_send_one_command_each() {
+        let (mut app, mut rx) = verifying(false);
+        vphase(&mut app, VP::Requested { incoming: true });
+        let _ = vmsg(&mut app, VM::Accept);
+        let _ = vmsg(&mut app, VM::Accept);
+        assert!(matches!(only(&mut rx), Command::AcceptVerification { id } if id == vid()));
+        let (mut app, mut rx) = verifying(false);
+        vphase(&mut app, VP::Requested { incoming: true });
+        let _ = vmsg(&mut app, VM::Cancel);
+        let _ = vmsg(&mut app, VM::Cancel);
+        assert!(matches!(only(&mut rx), Command::CancelVerification { id } if id == vid()));
+    }
+
+    #[test]
+    fn accept_is_only_for_an_incoming_request() {
+        let (mut app, mut rx) = verifying(false);
+        let _ = vmsg(&mut app, VM::Accept);
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn the_qr_buttons_send_start_sas_confirm_and_cancel() {
+        let (mut app, mut rx) = verifying(true);
+        vphase(&mut app, VP::ShowQr(vqr()));
+        let _ = vmsg(&mut app, VM::CompareEmoji);
+        let _ = vmsg(&mut app, VM::CompareEmoji);
+        assert!(matches!(only(&mut rx), Command::StartSas { id } if id == vid()));
+        vphase(&mut app, VP::QrScanned);
+        let _ = vmsg(&mut app, VM::QrConfirmed);
+        let _ = vmsg(&mut app, VM::QrConfirmed);
+        assert!(matches!(only(&mut rx), Command::ConfirmQrScanned { id } if id == vid()));
+        let _ = vmsg(&mut app, VM::Cancel);
+        assert!(matches!(only(&mut rx), Command::CancelVerification { id } if id == vid()));
+    }
+
+    #[test]
+    fn the_emoji_buttons_send_confirm_and_mismatch() {
+        let (mut app, mut rx) = verifying(true);
+        vphase(&mut app, VP::Emojis(vemojis()));
+        let _ = vmsg(&mut app, VM::Match);
+        let _ = vmsg(&mut app, VM::Match);
+        assert!(matches!(only(&mut rx), Command::ConfirmSas { id } if id == vid()));
+        let (mut app, mut rx) = verifying(true);
+        vphase(&mut app, VP::Decimals([1, 2, 3]));
+        let _ = vmsg(&mut app, VM::NoMatch);
+        let _ = vmsg(&mut app, VM::NoMatch);
+        assert!(matches!(only(&mut rx), Command::SasMismatch { id } if id == vid()));
+    }
+
+    #[test]
+    fn a_button_of_another_phase_sends_nothing() {
+        let (mut app, mut rx) = verifying(true);
+        vphase(&mut app, VP::Waiting);
+        for m in [VM::CompareEmoji, VM::QrConfirmed, VM::Match, VM::NoMatch] {
+            let _ = vmsg(&mut app, m);
+        }
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn close_works_only_when_the_flow_is_over() {
+        let (mut app, mut rx) = verifying(true);
+        let _ = vmsg(&mut app, VM::Close);
+        assert!(app.verification.is_some());
+        vphase(
+            &mut app,
+            VP::Cancelled {
+                reason: CancelReason::ByThem,
+            },
+        );
+        let _ = vmsg(&mut app, VM::Close);
+        assert!(app.verification.is_none());
+        assert!(drain(&mut rx).is_empty(), "closing sends nothing");
+    }
+
+    #[test]
+    fn the_qr_image_survives_unrelated_updates_and_goes_with_the_flow() {
+        let (mut app, _rx) = verifying(true);
+        vphase(&mut app, VP::ShowQr(vqr()));
+        let first = app
+            .verification
+            .as_ref()
+            .unwrap()
+            .qr_handle()
+            .map(|h| h.id());
+        assert!(first.is_some());
+        let _ = app.update(Message::WindowFocus(false));
+        let _ = app.update(core(CoreEvent::Security(status(
+            DeviceVerification::Unverified,
+            RecoveryStatus::Enabled,
+        ))));
+        assert_eq!(
+            app.verification
+                .as_ref()
+                .unwrap()
+                .qr_handle()
+                .map(|h| h.id()),
+            first
+        );
+        vphase(&mut app, VP::Emojis(vemojis()));
+        assert!(app.verification.as_ref().unwrap().qr_handle().is_none());
+    }
+
+    #[test]
+    fn debug_of_the_app_with_a_qr_flow_shows_no_module_data() {
+        let (mut app, _rx) = verifying(true);
+        vphase(&mut app, VP::ShowQr(vqr()));
+        let text = format!("{app:?}");
+        assert!(text.contains("verification"), "{text}");
+        assert!(!text.contains("dark") && !text.contains("Rgba"), "{text}");
+    }
+
+    #[test]
+    fn a_failure_in_a_running_flow_keeps_the_dialog_and_allows_a_retry() {
+        let (mut app, mut rx) = verifying(true);
+        vphase(&mut app, VP::ShowQr(vqr()));
+        let _ = vmsg(&mut app, VM::CompareEmoji);
+        let _ = drain(&mut rx);
+        let _ = app.update(core(CoreEvent::ActionFailed {
+            room_id: RoomId::from(""),
+            action: Kind::Verification,
+            error: CoreError::Internal("qr".into()),
+        }));
+        assert!(app.verification.is_some());
+        assert!(app.security.notice.is_none(), "no spurious notice");
+        let _ = vmsg(&mut app, VM::CompareEmoji);
+        assert!(matches!(only(&mut rx), Command::StartSas { .. }));
+    }
+
+    #[test]
+    fn a_failed_request_without_a_flow_shows_a_notice_and_frees_the_button() {
+        let (mut app, mut rx) = identity_app();
+        let _ = sec(&mut app, SecurityMessage::UseOtherDevice);
+        let _ = drain(&mut rx);
+        assert!(app.security.asked_other_device);
+        let _ = app.update(core(CoreEvent::ActionFailed {
+            room_id: RoomId::from(""),
+            action: Kind::Verification,
+            error: CoreError::Busy,
+        }));
+        assert!(app.verification.is_none());
+        assert!(app.security.notice.is_some());
+        assert!(!app.security.asked_other_device);
+    }
+
+    #[test]
+    fn a_request_clears_the_request_sent_state_of_the_identity_screen() {
+        let (mut app, _rx) = identity_app();
+        let _ = sec(&mut app, SecurityMessage::UseOtherDevice);
+        let _ = app.update(core(CoreEvent::VerificationRequested {
+            id: vid(),
+            peer: vpeer(true),
+        }));
+        assert!(!app.security.asked_other_device);
+    }
+
+    #[test]
+    fn logout_drops_the_flow() {
+        let (mut app, _rx) = verifying(true);
+        vphase(&mut app, VP::ShowQr(vqr()));
+        let _ = app.back_to_login("signed out");
+        assert!(app.verification.is_none());
+    }
+
+    // ---- Task 12: the trust of a DM peer in the header --------------------
+
+    fn dm_app() -> (App, mpsc::Receiver<Command>) {
+        let (mut app, mut rx) = app_with(32);
+        logged_in(&mut app);
+        let mut dm = RoomSummary::new(RoomId::from("!dm:x"), "Bob".to_owned());
+        dm.is_dm = true;
+        dm.dm_peer = Some(UserId::from("@bob:x"));
+        let room = RoomSummary::new(RoomId::from("!room:x"), "Lounge".to_owned());
+        let _ = app.update(core(CoreEvent::RoomListChanged(vec![ListDiff::Reset {
+            values: vec![dm, room],
+        }])));
+        let _ = app.update(Message::SelectRoom(RoomId::from("!dm:x")));
+        while rx.try_recv().is_ok() {}
+        (app, rx)
+    }
+
+    fn from_sender(sender: &str) -> TimelineItem {
+        TimelineItem::new(
+            "m".to_owned(),
+            TimelineItemKind::Message {
+                sender: UserId::from(sender),
+                body: String::new(),
+                is_own: false,
+                timestamp_ms: 0,
+                sent: tessera_core::api::SendStatus::Sent,
+                details: Box::default(),
+            },
+        )
+    }
+
+    fn trust(app: &mut App, user: &str, trust: UserTrust) {
+        let _ = app.update(core(CoreEvent::UserTrust {
+            user_id: UserId::from(user),
+            trust,
+        }));
+    }
+
+    #[test]
+    fn the_header_shows_the_trust_of_the_selected_dm_peer() {
+        let (mut app, _rx) = dm_app();
+        assert_eq!(app.dm_peer_trust(), None, "nothing reported yet");
+        trust(&mut app, "@bob:x", UserTrust::Unverified);
+        assert_eq!(
+            app.dm_peer_trust(),
+            Some((&UserId::from("@bob:x"), UserTrust::Unverified))
+        );
+        trust(&mut app, "@bob:x", UserTrust::Verified);
+        assert_eq!(
+            app.dm_peer_trust(),
+            Some((&UserId::from("@bob:x"), UserTrust::Verified))
+        );
+    }
+
+    #[test]
+    fn a_trust_for_another_user_is_ignored_by_the_header() {
+        let (mut app, _rx) = dm_app();
+        trust(&mut app, "@bob:x", UserTrust::Unverified);
+        // A late report of an aborted watcher for the previous room's peer.
+        trust(&mut app, "@carol:x", UserTrust::Verified);
+        assert_eq!(
+            app.dm_peer_trust(),
+            Some((&UserId::from("@bob:x"), UserTrust::Unverified))
+        );
+        let (mut app, _rx) = dm_app();
+        trust(&mut app, "@carol:x", UserTrust::Verified);
+        assert_eq!(app.dm_peer_trust(), None);
+    }
+
+    #[test]
+    fn a_dm_whose_peer_has_not_spoken_still_shows_the_badge() {
+        let (mut app, _rx) = dm_app();
+        assert!(app.timeline.items.is_empty(), "nobody has spoken");
+        trust(&mut app, "@bob:x", UserTrust::Verified);
+        assert_eq!(
+            app.dm_peer_trust(),
+            Some((&UserId::from("@bob:x"), UserTrust::Verified))
+        );
+    }
+
+    #[test]
+    fn the_peer_is_the_one_the_core_names_not_a_sender() {
+        let (mut app, _rx) = dm_app();
+        let _ = app.update(core(CoreEvent::TimelineDiff {
+            room_id: RoomId::from("!dm:x"),
+            diffs: vec![ListDiff::Reset {
+                values: vec![from_sender("@mallory:x")],
+            }],
+        }));
+        trust(&mut app, "@mallory:x", UserTrust::Verified);
+        assert_eq!(app.dm_peer_trust(), None);
+        assert_eq!(app.dm_peer().map(|(p, _)| p.as_str()), Some("@bob:x"));
+    }
+
+    #[test]
+    fn the_peer_follows_the_summary_when_it_is_rebuilt() {
+        let (mut app, _rx) = dm_app();
+        let mut changed = RoomSummary::new(RoomId::from("!dm:x"), "Bob".to_owned());
+        changed.is_dm = true;
+        changed.dm_peer = Some(UserId::from("@bea:x"));
+        let _ = app.update(core(CoreEvent::RoomListChanged(vec![ListDiff::Set {
+            index: 0,
+            value: changed,
+        }])));
+        assert_eq!(app.dm_peer().map(|(p, _)| p.as_str()), Some("@bea:x"));
+    }
+
+    #[test]
+    fn a_room_that_is_not_a_dm_has_no_peer_trust() {
+        let (mut app, _rx) = dm_app();
+        trust(&mut app, "@bob:x", UserTrust::Unverified);
+        let _ = app.update(Message::SelectRoom(RoomId::from("!room:x")));
+        trust(&mut app, "@bob:x", UserTrust::Unverified);
+        assert_eq!(app.dm_peer_trust(), None);
+    }
+
+    #[test]
+    fn the_kept_trusts_are_capped_and_cleared_on_selecting_a_room() {
+        let (mut app, _rx) = dm_app();
+        for n in 0..(MAX_TRUST_KEPT * 3) {
+            trust(&mut app, &format!("@u{n}:x"), UserTrust::Verified);
+        }
+        assert_eq!(app.user_trust.len(), MAX_TRUST_KEPT);
+        let _ = app.update(Message::SelectRoom(RoomId::from("!room:x")));
+        assert!(app.user_trust.is_empty());
+    }
+
+    #[test]
+    fn verify_sends_a_request_for_the_peer() {
+        let (mut app, mut rx) = dm_app();
+        trust(&mut app, "@bob:x", UserTrust::Unverified);
+        let _ = app.update(Message::VerifyPeerRequested(UserId::from("@bob:x")));
+        let commands = drain(&mut rx);
+        assert_eq!(commands.len(), 1, "{commands:?}");
+        assert!(
+            matches!(&commands[0], Command::RequestUserVerification { user_id } if user_id.as_str() == "@bob:x"),
+            "{commands:?}"
+        );
+    }
+
+    #[test]
+    fn verify_without_a_peer_sends_nothing() {
+        let (mut app, mut rx) = dm_app();
+        let _ = app.update(Message::SelectRoom(RoomId::from("!room:x")));
+        let _ = drain(&mut rx);
+        let _ = app.update(Message::VerifyPeerRequested(UserId::from("@bob:x")));
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn verify_for_a_user_who_is_not_the_peer_sends_nothing() {
+        let (mut app, mut rx) = dm_app();
+        let _ = app.update(Message::VerifyPeerRequested(UserId::from("@carol:x")));
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn going_back_to_login_forgets_the_trusts() {
+        let (mut app, _rx) = dm_app();
+        trust(&mut app, "@bob:x", UserTrust::Verified);
+        assert!(!app.user_trust.is_empty());
+        let _ = app.back_to_login("signed out");
+        assert!(app.user_trust.is_empty());
+        assert_eq!(app.dm_peer_trust(), None);
+    }
+
+    // ---- Task 13: sessions screen and re-authentication ----
+
+    use crate::sessions::SessionsMessage;
+    use tessera_core::api::{DeviceSummary, DeviceTrust};
+
+    fn ses(app: &mut App, message: SessionsMessage) -> Task<Message> {
+        app.update(Message::Sessions(message))
+    }
+
+    fn summary(id: &str, name: Option<&str>, current: bool, trust: DeviceTrust) -> DeviceSummary {
+        DeviceSummary {
+            device_id: DeviceId::from(id),
+            display_name: name.map(str::to_owned),
+            last_seen_ms: Some(1_000),
+            current,
+            trust,
+        }
+    }
+
+    /// Three devices: this one, a verified laptop and an unverified phone.
+    fn device_list() -> Vec<DeviceSummary> {
+        vec![
+            summary("THIS", Some("Tessera"), true, DeviceTrust::Verified),
+            summary("LAPTOP", Some("Laptop"), false, DeviceTrust::Verified),
+            summary("PHONE", Some("Phone"), false, DeviceTrust::Unverified),
+        ]
+    }
+
+    /// An app on the Sessions screen with the three devices listed.
+    fn sessions_app() -> (App, mpsc::Receiver<Command>) {
+        let (mut app, mut rx) = main_app();
+        let _ = ses(&mut app, SessionsMessage::Open);
+        let _ = app.update(core(CoreEvent::Devices(device_list())));
+        while rx.try_recv().is_ok() {}
+        (app, rx)
+    }
+
+    #[test]
+    fn opening_sessions_asks_the_core_for_the_list() {
+        let (mut app, mut rx) = main_app();
+        let _ = ses(&mut app, SessionsMessage::Open);
+        assert!(app.sessions.open && app.sessions.loading);
+        assert!(matches!(rx.try_recv(), Ok(Command::ListDevices)));
+        let _ = app.update(core(CoreEvent::Devices(device_list())));
+        assert!(!app.sessions.loading);
+        assert_eq!(app.sessions.devices.as_ref().map(Vec::len), Some(3));
+        // The core does not push other clients' changes: Refresh asks again.
+        let _ = ses(&mut app, SessionsMessage::Refresh);
+        assert!(matches!(rx.try_recv(), Ok(Command::ListDevices)));
+        let _ = ses(&mut app, SessionsMessage::Close);
+        assert!(!app.sessions.open);
+    }
+
+    #[test]
+    fn the_current_device_is_listed_first_whatever_the_order() {
+        let (mut app, _rx) = main_app();
+        let mut list = device_list();
+        list.rotate_left(1);
+        let _ = app.update(core(CoreEvent::Devices(list)));
+        let first = &app.sessions.devices.as_ref().expect("a list")[0];
+        assert!(first.current);
+    }
+
+    #[test]
+    fn renaming_sends_the_trimmed_name_on_enter() {
+        let (mut app, mut rx) = sessions_app();
+        let _ = ses(
+            &mut app,
+            SessionsMessage::RenameStart(DeviceId::from("PHONE")),
+        );
+        let edit = app.sessions.rename.as_ref().expect("an open field");
+        assert_eq!(edit.input, "Phone");
+        let _ = ses(
+            &mut app,
+            SessionsMessage::RenameInput("  Work phone ".into()),
+        );
+        let _ = ses(&mut app, SessionsMessage::RenameSubmitted);
+        let commands = drain(&mut rx);
+        assert!(
+            matches!(
+                commands.as_slice(),
+                [Command::RenameDevice { device_id, name }]
+                    if *device_id == DeviceId::from("PHONE") && name == "Work phone"
+            ),
+            "{commands:?}"
+        );
+        assert!(app.sessions.rename.is_none());
+    }
+
+    #[test]
+    fn an_empty_or_unchanged_name_sends_nothing() {
+        let (mut app, mut rx) = sessions_app();
+        let _ = ses(
+            &mut app,
+            SessionsMessage::RenameStart(DeviceId::from("PHONE")),
+        );
+        let _ = ses(&mut app, SessionsMessage::RenameSubmitted);
+        assert!(drain(&mut rx).is_empty(), "unchanged");
+        let _ = ses(
+            &mut app,
+            SessionsMessage::RenameStart(DeviceId::from("PHONE")),
+        );
+        let _ = ses(&mut app, SessionsMessage::RenameInput("   ".into()));
+        let _ = ses(&mut app, SessionsMessage::RenameSubmitted);
+        assert!(drain(&mut rx).is_empty(), "blank");
+        let _ = ses(
+            &mut app,
+            SessionsMessage::RenameStart(DeviceId::from("NOPE")),
+        );
+        assert!(app.sessions.rename.is_none(), "not in the list");
+        let _ = ses(
+            &mut app,
+            SessionsMessage::RenameStart(DeviceId::from("PHONE")),
+        );
+        let _ = ses(&mut app, SessionsMessage::RenameCancelled);
+        assert!(app.sessions.rename.is_none());
+    }
+
+    #[test]
+    fn the_rename_field_is_capped() {
+        let (mut app, _rx) = sessions_app();
+        let _ = ses(
+            &mut app,
+            SessionsMessage::RenameStart(DeviceId::from("PHONE")),
+        );
+        let _ = ses(&mut app, SessionsMessage::RenameInput("x".repeat(500)));
+        let edit = app.sessions.rename.as_ref().expect("an open field");
+        assert_eq!(edit.input.chars().count(), crate::sessions::MAX_NAME_CHARS);
+    }
+
+    #[test]
+    fn verify_is_sent_for_an_unverified_other_device_only() {
+        let (mut app, mut rx) = sessions_app();
+        for id in ["THIS", "LAPTOP", "NOPE"] {
+            let _ = ses(&mut app, SessionsMessage::Verify(DeviceId::from(id)));
+            assert!(drain(&mut rx).is_empty(), "{id}");
+        }
+        let _ = ses(&mut app, SessionsMessage::Verify(DeviceId::from("PHONE")));
+        let commands = drain(&mut rx);
+        assert!(
+            matches!(
+                commands.as_slice(),
+                [Command::RequestDeviceVerification { device_id }] if *device_id == DeviceId::from("PHONE")
+            ),
+            "{commands:?}"
+        );
+    }
+
+    #[test]
+    fn signing_out_one_device_asks_first() {
+        let (mut app, mut rx) = sessions_app();
+        let _ = ses(
+            &mut app,
+            SessionsMessage::SignOutAsk(DeviceId::from("LAPTOP")),
+        );
+        assert!(drain(&mut rx).is_empty(), "nothing before the confirmation");
+        let _ = ses(&mut app, SessionsMessage::SignOutCancelled);
+        let _ = ses(&mut app, SessionsMessage::SignOutConfirmed);
+        assert!(drain(&mut rx).is_empty(), "cancelled");
+        let _ = ses(
+            &mut app,
+            SessionsMessage::SignOutAsk(DeviceId::from("LAPTOP")),
+        );
+        let _ = ses(&mut app, SessionsMessage::SignOutConfirmed);
+        let commands = drain(&mut rx);
+        assert!(
+            matches!(
+                commands.as_slice(),
+                [Command::SignOutDevices { device_ids, password: None }]
+                    if *device_ids == [DeviceId::from("LAPTOP")]
+            ),
+            "{commands:?}"
+        );
+        assert_eq!(app.sessions.pending, Some(vec![DeviceId::from("LAPTOP")]));
+    }
+
+    #[test]
+    fn this_device_cannot_be_signed_out_from_the_list() {
+        let (mut app, mut rx) = sessions_app();
+        let _ = ses(
+            &mut app,
+            SessionsMessage::SignOutAsk(DeviceId::from("THIS")),
+        );
+        let _ = ses(&mut app, SessionsMessage::SignOutConfirmed);
+        assert!(drain(&mut rx).is_empty());
+        assert!(app.sessions.pending.is_none());
+    }
+
+    #[test]
+    fn signing_out_all_sends_every_other_device_once() {
+        let (mut app, mut rx) = main_app();
+        let mut list = device_list();
+        // A repeated entry (the core does not dedup) must not repeat in the call.
+        list.push(summary(
+            "PHONE",
+            Some("Phone"),
+            false,
+            DeviceTrust::Unverified,
+        ));
+        let _ = app.update(core(CoreEvent::Devices(list)));
+        let _ = ses(&mut app, SessionsMessage::SignOutAllAsk);
+        let _ = ses(&mut app, SessionsMessage::SignOutConfirmed);
+        let commands = drain(&mut rx);
+        assert!(
+            matches!(
+                commands.as_slice(),
+                [Command::SignOutDevices { device_ids, password: None }]
+                    if *device_ids == [DeviceId::from("LAPTOP"), DeviceId::from("PHONE")]
+            ),
+            "{commands:?}"
+        );
+    }
+
+    #[test]
+    fn nothing_is_sent_to_sign_out_all_when_there_is_no_other_device() {
+        let (mut app, mut rx) = main_app();
+        let only = vec![summary("THIS", None, true, DeviceTrust::Verified)];
+        let _ = app.update(core(CoreEvent::Devices(only)));
+        let _ = ses(&mut app, SessionsMessage::SignOutAllAsk);
+        let _ = ses(&mut app, SessionsMessage::SignOutConfirmed);
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    /// Signs the phone out and answers with `ReauthRequired`.
+    fn reauth_asked() -> (App, mpsc::Receiver<Command>) {
+        let (mut app, mut rx) = sessions_app();
+        let _ = ses(
+            &mut app,
+            SessionsMessage::SignOutAsk(DeviceId::from("PHONE")),
+        );
+        let _ = ses(&mut app, SessionsMessage::SignOutConfirmed);
+        let _ = drain(&mut rx);
+        let _ = app.update(core(CoreEvent::ReauthRequired {
+            action: ReauthAction::DeleteDevices,
+        }));
+        (app, rx)
+    }
+
+    #[test]
+    fn the_reauth_round_trip_repeats_the_command_with_the_password() {
+        let (mut app, mut rx) = reauth_asked();
+        assert!(app.sessions.reauth.is_some());
+        let _ = ses(&mut app, SessionsMessage::ReauthSubmitted);
+        assert!(drain(&mut rx).is_empty(), "an empty password is not sent");
+        let _ = ses(
+            &mut app,
+            SessionsMessage::ReauthInput(Password::from("secret-pw-x")),
+        );
+        let dbg = format!("{app:?}");
+        assert!(!dbg.contains("secret-pw-x"), "{dbg}");
+        let _ = ses(&mut app, SessionsMessage::ReauthSubmitted);
+        let commands = drain(&mut rx);
+        assert!(
+            matches!(
+                commands.as_slice(),
+                [Command::SignOutDevices { device_ids, password: Some(password) }]
+                    if *device_ids == [DeviceId::from("PHONE")] && password.expose() == "secret-pw-x"
+            ),
+            "{commands:?}"
+        );
+        // The app no longer holds the password.
+        let prompt = app.sessions.reauth.as_ref().expect("the prompt stays");
+        assert_eq!(prompt.password.expose(), "");
+        assert!(prompt.waiting);
+        let dbg = format!("{app:?} {:?}", app.sessions);
+        assert!(!dbg.contains("secret-pw-x"), "{dbg}");
+        // Success: the next list no longer has the phone.
+        let rest: Vec<_> = device_list()
+            .into_iter()
+            .filter(|d| d.device_id != DeviceId::from("PHONE"))
+            .collect();
+        let _ = app.update(core(CoreEvent::Devices(rest)));
+        assert!(app.sessions.reauth.is_none() && app.sessions.pending.is_none());
+    }
+
+    #[test]
+    fn a_wrong_password_keeps_the_prompt_and_asks_again() {
+        let (mut app, mut rx) = reauth_asked();
+        let _ = ses(
+            &mut app,
+            SessionsMessage::ReauthInput(Password::from("secret-pw-x")),
+        );
+        let _ = ses(&mut app, SessionsMessage::ReauthSubmitted);
+        let _ = drain(&mut rx);
+        // A list that still shows the phone must not close the prompt.
+        let _ = app.update(core(CoreEvent::Devices(device_list())));
+        assert!(app.sessions.reauth.is_some());
+        let _ = app.update(core(CoreEvent::ActionFailed {
+            room_id: RoomId::from(""),
+            action: ActionKind::SignOutDevices,
+            error: CoreError::ReauthFailed,
+        }));
+        let prompt = app.sessions.reauth.as_ref().expect("the prompt stays");
+        assert!(prompt.failed && !prompt.waiting);
+        assert_eq!(prompt.password.expose(), "");
+        assert_eq!(app.sessions.pending, Some(vec![DeviceId::from("PHONE")]));
+        // Typing again and submitting sends the command again.
+        let _ = ses(
+            &mut app,
+            SessionsMessage::ReauthInput(Password::from("secret-pw-y")),
+        );
+        let _ = ses(&mut app, SessionsMessage::ReauthSubmitted);
+        let commands = drain(&mut rx);
+        assert!(
+            matches!(
+                commands.as_slice(),
+                [Command::SignOutDevices { password: Some(p), .. }] if p.expose() == "secret-pw-y"
+            ),
+            "{commands:?}"
+        );
+    }
+
+    #[test]
+    fn cancelling_the_prompt_zeroizes_the_field_and_forgets_the_sign_out() {
+        let (mut app, mut rx) = reauth_asked();
+        let _ = ses(
+            &mut app,
+            SessionsMessage::ReauthInput(Password::from("secret-pw-x")),
+        );
+        let _ = ses(&mut app, SessionsMessage::ReauthCancelled);
+        assert!(app.sessions.reauth.is_none() && app.sessions.pending.is_none());
+        let _ = ses(&mut app, SessionsMessage::ReauthSubmitted);
+        assert!(drain(&mut rx).is_empty());
+        let dbg = format!("{app:?}");
+        assert!(!dbg.contains("secret-pw-x"), "{dbg}");
+    }
+
+    #[test]
+    fn a_reauth_request_nobody_asked_for_is_ignored() {
+        let (mut app, _rx) = sessions_app();
+        let _ = app.update(core(CoreEvent::ReauthRequired {
+            action: ReauthAction::DeleteDevices,
+        }));
+        assert!(app.sessions.reauth.is_none());
+    }
+
+    #[test]
+    fn logout_and_close_drop_the_sessions_password() {
+        for message in [Message::LogoutRequested, Message::CloseRequested] {
+            let (mut app, _rx) = reauth_asked();
+            let _ = ses(
+                &mut app,
+                SessionsMessage::ReauthInput(Password::from("secret-pw-x")),
+            );
+            let _ = app.update(message);
+            assert!(app.sessions.reauth.is_none());
+        }
+    }
+
+    #[test]
+    fn another_failure_ends_the_sign_out_with_a_notice() {
+        let (mut app, _rx) = reauth_asked();
+        let _ = app.update(core(CoreEvent::ActionFailed {
+            room_id: RoomId::from(""),
+            action: ActionKind::SignOutDevices,
+            error: CoreError::Network("the devices could not be loaded".into()),
+        }));
+        assert!(app.sessions.reauth.is_none() && app.sessions.pending.is_none());
+        let notice = app.sessions.notice.clone().expect("a notice");
+        assert!(!notice.contains('\n') && !notice.is_empty());
+    }
+
+    #[test]
+    fn no_sign_out_starts_while_an_identity_reset_runs() {
+        let (mut app, mut rx) = sessions_app();
+        set_status(
+            &mut app,
+            DeviceVerification::Unverified,
+            RecoveryStatus::Enabled,
+        );
+        // One sign-out is asked before the reset begins, one is not.
+        let _ = ses(
+            &mut app,
+            SessionsMessage::SignOutAsk(DeviceId::from("PHONE")),
+        );
+        let _ = sec(&mut app, SecurityMessage::ResetRequested);
+        let _ = sec(&mut app, SecurityMessage::ResetConfirmed);
+        assert_eq!(drain(&mut rx).len(), 1, "only the reset command");
+        assert_eq!(app.security.busy, Some(Busy::Resetting));
+
+        let _ = ses(&mut app, SessionsMessage::SignOutConfirmed);
+        assert!(app.sessions.pending.is_none() && app.sessions.confirm.is_none());
+        let notice = app.sessions.notice.clone().expect("a notice");
+        assert!(!notice.contains('\n') && !notice.is_empty());
+        app.sessions.notice = None;
+        let _ = ses(
+            &mut app,
+            SessionsMessage::SignOutAsk(DeviceId::from("LAPTOP")),
+        );
+        assert!(app.sessions.confirm.is_none() && app.sessions.notice.is_some());
+        app.sessions.notice = None;
+        let _ = ses(&mut app, SessionsMessage::SignOutAllAsk);
+        assert!(app.sessions.confirm.is_none() && app.sessions.notice.is_some());
+        let _ = ses(&mut app, SessionsMessage::SignOutConfirmed);
+        assert!(drain(&mut rx).is_empty(), "no sign-out was sent");
+        assert_eq!(app.security.busy, Some(Busy::Resetting));
+    }
+
+    #[test]
+    fn no_identity_reset_starts_while_a_sign_out_is_pending() {
+        let (mut app, mut rx) = sessions_app();
+        set_status(
+            &mut app,
+            DeviceVerification::Unverified,
+            RecoveryStatus::Enabled,
+        );
+        let _ = drain(&mut rx);
+        // The warning was already up when the sign-out began.
+        let _ = sec(&mut app, SecurityMessage::ResetRequested);
+        let _ = ses(
+            &mut app,
+            SessionsMessage::SignOutAsk(DeviceId::from("PHONE")),
+        );
+        let _ = ses(&mut app, SessionsMessage::SignOutConfirmed);
+        assert_eq!(drain(&mut rx).len(), 1, "only the sign-out");
+        let _ = sec(&mut app, SecurityMessage::ResetConfirmed);
+        assert!(drain(&mut rx).is_empty(), "no reset was sent");
+        assert!(app.security.busy.is_none());
+        assert!(app.security.notice.is_some());
+        assert!(app.sessions.pending.is_some(), "the sign-out keeps going");
+
+        // A fresh request is refused too, without the warning.
+        app.security.overlay = None;
+        app.security.notice = None;
+        let _ = sec(&mut app, SecurityMessage::ResetRequested);
+        assert!(app.security.overlay.is_none() && app.security.notice.is_some());
+        let _ = sec(&mut app, SecurityMessage::ResetConfirmed);
+        assert!(drain(&mut rx).is_empty());
+        assert!(app.sessions.pending.is_some());
+    }
+
+    fn devices_failed(app: &mut App, error: CoreError) {
+        let _ = app.update(core(CoreEvent::ActionFailed {
+            room_id: RoomId::from(""),
+            action: ActionKind::Devices,
+            error,
+        }));
+    }
+
+    #[test]
+    fn another_devices_failure_keeps_the_sign_out_pending() {
+        let others = [
+            CoreError::Internal("the user's trust could not be watched".into()),
+            CoreError::Internal("the device could not be renamed".into()),
+            CoreError::Network("the devices could not be loaded".into()),
+            CoreError::Internal("that is not a valid user ID".into()),
+            CoreError::NotAllowed,
+            CoreError::NotLoggedIn,
+            CoreError::ReauthFailed,
+        ];
+        for error in others {
+            let (mut app, mut rx) = sessions_app();
+            set_status(
+                &mut app,
+                DeviceVerification::Unverified,
+                RecoveryStatus::Enabled,
+            );
+            let _ = ses(
+                &mut app,
+                SessionsMessage::SignOutAsk(DeviceId::from("PHONE")),
+            );
+            let _ = ses(&mut app, SessionsMessage::SignOutConfirmed);
+            let _ = drain(&mut rx);
+            devices_failed(&mut app, error.clone());
+            assert!(app.sessions.pending.is_some(), "{error:?} ended it");
+            let _ = sec(&mut app, SecurityMessage::ResetRequested);
+            let _ = sec(&mut app, SecurityMessage::ResetConfirmed);
+            assert!(drain(&mut rx).is_empty(), "{error:?}: a reset was sent");
+            assert!(app.security.busy.is_none());
+            // The later account page still goes to the approval bar.
+            let _ = app.update(core(CoreEvent::OpenAccountManagement(AuthUrl::from(
+                "https://account.example.org/devices",
+            ))));
+            assert!(app.sessions.approval.is_some(), "{error:?}");
+        }
+    }
+
+    fn sign_out_failed(app: &mut App, error: CoreError) {
+        let _ = app.update(core(CoreEvent::ActionFailed {
+            room_id: RoomId::from(""),
+            action: ActionKind::SignOutDevices,
+            error,
+        }));
+    }
+
+    #[test]
+    fn a_sign_out_failure_of_any_error_ends_it_with_a_one_line_notice() {
+        let own = [
+            CoreError::ReauthFailed,
+            CoreError::NotAllowed,
+            CoreError::NotLoggedIn,
+            CoreError::Busy,
+            CoreError::Network("the devices could not be loaded".into()),
+            CoreError::Internal("anything at all".into()),
+        ];
+        for error in own {
+            let (mut app, mut rx) = sessions_app();
+            let _ = ses(
+                &mut app,
+                SessionsMessage::SignOutAsk(DeviceId::from("PHONE")),
+            );
+            let _ = ses(&mut app, SessionsMessage::SignOutConfirmed);
+            let _ = drain(&mut rx);
+            sign_out_failed(&mut app, error.clone());
+            assert!(app.sessions.pending.is_none(), "{error:?} kept it");
+            let notice = app.sessions.notice.clone().expect("a notice");
+            assert!(!notice.contains('\n') && !notice.is_empty(), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn a_network_failure_after_the_delete_ends_the_sign_out_and_a_reset_is_allowed() {
+        let (mut app, mut rx) = signed_out_and_closed();
+        sign_out_failed(
+            &mut app,
+            CoreError::Network("the devices could not be loaded".into()),
+        );
+        assert!(app.sessions.pending.is_none());
+        let _ = sec(&mut app, SecurityMessage::ResetRequested);
+        let _ = sec(&mut app, SecurityMessage::ResetConfirmed);
+        assert!(!drain(&mut rx).is_empty(), "the reset was sent");
+    }
+
+    #[test]
+    fn the_same_failure_of_the_devices_kind_keeps_a_closed_sign_out_pending() {
+        let (mut app, mut rx) = signed_out_and_closed();
+        devices_failed(
+            &mut app,
+            CoreError::Network("the devices could not be loaded".into()),
+        );
+        assert!(app.sessions.pending.is_some());
+        let _ = sec(&mut app, SecurityMessage::ResetRequested);
+        let _ = sec(&mut app, SecurityMessage::ResetConfirmed);
+        assert!(drain(&mut rx).is_empty(), "no reset was sent");
+    }
+
+    #[test]
+    fn reopening_the_screen_lists_again_and_the_answer_ends_a_sign_out() {
+        let (mut app, mut rx) = signed_out_and_closed();
+        let _ = ses(&mut app, SessionsMessage::Open);
+        assert!(matches!(drain(&mut rx).as_slice(), [Command::ListDevices]));
+        let _ = ses(&mut app, SessionsMessage::Refresh);
+        assert!(matches!(drain(&mut rx).as_slice(), [Command::ListDevices]));
+        assert!(app.sessions.pending.is_some());
+        let _ = app.update(core(CoreEvent::Devices(vec![])));
+        assert!(app.sessions.pending.is_none());
+    }
+
+    #[test]
+    fn the_reset_password_submit_is_refused_while_a_sign_out_is_pending() {
+        let (mut app, mut rx) = sessions_app();
+        set_status(
+            &mut app,
+            DeviceVerification::Unverified,
+            RecoveryStatus::Enabled,
+        );
+        let _ = ses(
+            &mut app,
+            SessionsMessage::SignOutAsk(DeviceId::from("PHONE")),
+        );
+        let _ = ses(&mut app, SessionsMessage::SignOutConfirmed);
+        // The reset's password prompt arrives while the sign-out runs.
+        let _ = app.update(core(CoreEvent::ReauthRequired {
+            action: ReauthAction::ResetIdentity,
+        }));
+        let _ = drain(&mut rx);
+        let _ = sec(
+            &mut app,
+            SecurityMessage::ReauthInput(Password::from("secret-pw-x")),
+        );
+        let _ = sec(&mut app, SecurityMessage::ReauthSubmitted);
+        assert!(drain(&mut rx).is_empty(), "no reset was sent");
+        assert!(app.security.busy.is_none());
+        assert!(app.security.notice.is_some());
+        assert!(app.sessions.pending.is_some());
+    }
+
+    #[test]
+    fn no_sign_out_starts_while_the_reset_password_prompt_is_open() {
+        let (mut app, mut rx) = sessions_app();
+        set_status(
+            &mut app,
+            DeviceVerification::Unverified,
+            RecoveryStatus::Enabled,
+        );
+        let _ = app.update(core(CoreEvent::ReauthRequired {
+            action: ReauthAction::ResetIdentity,
+        }));
+        assert!(app.security.busy.is_none());
+        let _ = drain(&mut rx);
+        let _ = ses(
+            &mut app,
+            SessionsMessage::SignOutAsk(DeviceId::from("PHONE")),
+        );
+        assert!(app.sessions.confirm.is_none() && app.sessions.notice.is_some());
+        let _ = ses(&mut app, SessionsMessage::SignOutAllAsk);
+        let _ = ses(&mut app, SessionsMessage::SignOutConfirmed);
+        assert!(drain(&mut rx).is_empty(), "no sign-out was sent");
+        assert!(app.sessions.pending.is_none());
+    }
+
+    /// Signs the phone out on an OAuth session: the core answers with a URL.
+    fn oauth_url(app: &mut App, url: &str) -> Task<Message> {
+        let _ = ses(app, SessionsMessage::SignOutAsk(DeviceId::from("PHONE")));
+        let _ = ses(app, SessionsMessage::SignOutConfirmed);
+        app.update(core(CoreEvent::OpenAccountManagement(AuthUrl::from(url))))
+    }
+
+    #[test]
+    fn an_account_page_waits_for_the_go_ahead_and_shows_its_host() {
+        let (mut app, _rx) = sessions_app();
+        let task = oauth_url(
+            &mut app,
+            "https://Account.Example.org:8443/devices?state=secret-state-x",
+        );
+        assert_eq!(task.units(), 0, "nothing opens before the user agrees");
+        let approval = app.sessions.approval.as_ref().expect("a bar");
+        assert_eq!(approval.host, "account.example.org");
+        assert!(app.sessions.pending.is_none());
+        let dbg = format!("{app:?}");
+        assert!(!dbg.contains("secret-state-x"), "{dbg}");
+        let task = ses(&mut app, SessionsMessage::ApprovalConfirmed);
+        assert!(task.units() > 0, "opened inside a task");
+        assert!(app.sessions.approval.is_none());
+        // A second confirmation has nothing to open.
+        assert_eq!(ses(&mut app, SessionsMessage::ApprovalConfirmed).units(), 0);
+    }
+
+    #[test]
+    fn dismissing_the_account_page_bar_opens_nothing() {
+        let (mut app, _rx) = sessions_app();
+        let _ = oauth_url(&mut app, "https://account.example.org/devices");
+        assert_eq!(ses(&mut app, SessionsMessage::ApprovalDismissed).units(), 0);
+        assert!(app.sessions.approval.is_none());
+    }
+
+    #[test]
+    fn an_unsafe_account_page_address_is_refused() {
+        for url in [
+            "http://account.example.org/devices",
+            "https://user:pw@account.example.org/devices",
+            "javascript:alert(1)",
+            "https://account.example.org/a b",
+            "file:///etc/passwd",
+        ] {
+            let (mut app, _rx) = sessions_app();
+            let task = oauth_url(&mut app, url);
+            assert_eq!(task.units(), 0, "{url}");
+            assert!(app.sessions.approval.is_none(), "{url}");
+            assert!(app.sessions.notice.is_some(), "{url}");
+            assert_eq!(ses(&mut app, SessionsMessage::ApprovalConfirmed).units(), 0);
+        }
+    }
+
+    /// Signs the phone out, closes the screen at once and resets afterwards.
+    fn signed_out_and_closed() -> (App, mpsc::Receiver<Command>) {
+        let (mut app, mut rx) = sessions_app();
+        set_status(
+            &mut app,
+            DeviceVerification::Unverified,
+            RecoveryStatus::Enabled,
+        );
+        let _ = ses(
+            &mut app,
+            SessionsMessage::SignOutAsk(DeviceId::from("PHONE")),
+        );
+        let _ = ses(&mut app, SessionsMessage::SignOutConfirmed);
+        let _ = ses(&mut app, SessionsMessage::Close);
+        let _ = drain(&mut rx);
+        (app, rx)
+    }
+
+    #[test]
+    fn closing_the_screen_keeps_a_running_sign_out_from_overlapping_a_reset() {
+        let (mut app, mut rx) = signed_out_and_closed();
+        assert!(app.sessions.pending.is_some());
+        let _ = sec(&mut app, SecurityMessage::ResetRequested);
+        let _ = sec(&mut app, SecurityMessage::ResetConfirmed);
+        assert!(drain(&mut rx).is_empty(), "no reset was sent");
+        assert!(app.security.busy.is_none());
+    }
+
+    #[test]
+    fn an_account_page_after_close_goes_to_the_bar_not_the_browser() {
+        let (mut app, _rx) = signed_out_and_closed();
+        let busy = app.security.busy;
+        let task = app.update(core(CoreEvent::OpenAccountManagement(AuthUrl::from(
+            "https://account.example.org/devices",
+        ))));
+        assert_eq!(task.units(), 0, "nothing opens without a click");
+        assert_eq!(app.security.busy, busy);
+        assert!(app.sessions.approval.is_some());
+        assert!(app.sessions.pending.is_none());
+    }
+
+    #[test]
+    fn a_sign_out_closed_early_ends_on_the_cores_answer_and_a_reset_is_allowed() {
+        let (mut app, mut rx) = signed_out_and_closed();
+        let _ = app.update(core(CoreEvent::ActionFailed {
+            room_id: RoomId::from(""),
+            action: ActionKind::SignOutDevices,
+            error: CoreError::Network("the devices could not be loaded".into()),
+        }));
+        assert!(app.sessions.pending.is_none());
+        let _ = sec(&mut app, SecurityMessage::ResetRequested);
+        let _ = sec(&mut app, SecurityMessage::ResetConfirmed);
+        assert!(!drain(&mut rx).is_empty(), "the reset was sent");
+
+        let (mut app, _rx) = signed_out_and_closed();
+        let _ = app.update(core(CoreEvent::ReauthRequired {
+            action: ReauthAction::DeleteDevices,
+        }));
+        assert!(app.sessions.pending.is_none() && app.sessions.reauth.is_none());
+
+        let (mut app, _rx) = signed_out_and_closed();
+        let _ = app.update(core(CoreEvent::Devices(vec![])));
+        assert!(app.sessions.pending.is_none());
+    }
+
+    #[test]
+    fn an_account_page_nobody_asked_for_is_ignored() {
+        let (mut app, _rx) = sessions_app();
+        let task = app.update(core(CoreEvent::OpenAccountManagement(AuthUrl::from(
+            "https://account.example.org/devices",
+        ))));
+        assert_eq!(task.units(), 0);
+        assert!(app.sessions.approval.is_none());
+    }
+
+    #[test]
+    fn the_logout_warning_offers_recovery_or_signing_out_anyway() {
+        let (mut app, mut rx) = main_app();
+        set_status(
+            &mut app,
+            DeviceVerification::Verified,
+            RecoveryStatus::Disabled,
+        );
+        while rx.try_recv().is_ok() {}
+        let _ = app.update(Message::LogoutRequested);
+        assert!(app.sessions.logout_warning);
+        assert!(
+            drain(&mut rx).is_empty(),
+            "nothing is sent before the answer"
+        );
+        // Cancel closes it.
+        let _ = ses(&mut app, SessionsMessage::LogoutCancelled);
+        assert!(!app.sessions.logout_warning && drain(&mut rx).is_empty());
+        // Set up recovery starts it and does not log out.
+        let _ = app.update(Message::LogoutRequested);
+        let _ = ses(&mut app, SessionsMessage::LogoutSetupRecovery);
+        assert!(!app.sessions.logout_warning);
+        let commands = drain(&mut rx);
+        assert!(
+            matches!(commands.as_slice(), [Command::EnableRecovery]),
+            "{commands:?}"
+        );
+        // Sign out anyway logs out.
+        let (mut app, mut rx) = main_app();
+        set_status(
+            &mut app,
+            DeviceVerification::Verified,
+            RecoveryStatus::Disabled,
+        );
+        while rx.try_recv().is_ok() {}
+        let _ = app.update(Message::LogoutRequested);
+        let _ = ses(&mut app, SessionsMessage::LogoutAnyway);
+        assert!(matches!(drain(&mut rx).as_slice(), [Command::Logout]));
+        assert!(!app.sessions.logout_warning);
+    }
+
+    #[test]
+    fn the_answers_of_the_warning_only_count_while_it_is_shown() {
+        let (mut app, mut rx) = main_app();
+        set_status(
+            &mut app,
+            DeviceVerification::Verified,
+            RecoveryStatus::Disabled,
+        );
+        while rx.try_recv().is_ok() {}
+        let _ = ses(&mut app, SessionsMessage::LogoutAnyway);
+        let _ = ses(&mut app, SessionsMessage::LogoutSetupRecovery);
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn logout_goes_straight_through_with_recovery_or_another_session() {
+        let (mut app, mut rx) = main_app();
+        set_status(
+            &mut app,
+            DeviceVerification::Verified,
+            RecoveryStatus::Enabled,
+        );
+        while rx.try_recv().is_ok() {}
+        let _ = app.update(Message::LogoutRequested);
+        assert!(matches!(drain(&mut rx).as_slice(), [Command::Logout]));
+        let (mut app, mut rx) = main_app();
+        set_status(
+            &mut app,
+            DeviceVerification::Verified,
+            RecoveryStatus::Disabled,
+        );
+        let _ = app.update(core(CoreEvent::Devices(device_list())));
+        while rx.try_recv().is_ok() {}
+        let _ = app.update(Message::LogoutRequested);
+        assert!(matches!(drain(&mut rx).as_slice(), [Command::Logout]));
+        assert!(!app.sessions.logout_warning);
+    }
+
+    #[test]
+    fn logged_out_resets_the_sessions_state() {
+        let (mut app, _rx) = reauth_asked();
+        let _ = app.update(core(CoreEvent::LoggedOut));
+        assert!(!app.sessions.open && app.sessions.devices.is_none());
+        assert!(app.sessions.reauth.is_none() && app.sessions.pending.is_none());
+    }
+
+    #[test]
+    fn device_names_from_the_server_never_reach_the_app_debug_output_unsanitized() {
+        let (mut app, _rx) = main_app();
+        let evil = summary("D", Some("a\u{202E}b"), false, DeviceTrust::Unverified);
+        let _ = app.update(core(CoreEvent::Devices(vec![evil])));
+        // The title is what the view draws.
+        let list = app.sessions.devices.as_ref().expect("a list");
+        assert!(!crate::sessions::device_title(&list[0]).contains('\u{202E}'));
+    }
+
+    #[test]
+    fn every_sessions_state_builds_a_view() {
+        let (mut app, _rx) = sessions_app();
+        let _ = app.view();
+        let _ = ses(
+            &mut app,
+            SessionsMessage::RenameStart(DeviceId::from("PHONE")),
+        );
+        let _ = app.view();
+        let _ = ses(&mut app, SessionsMessage::SignOutAllAsk);
+        let _ = app.view();
+        let _ = ses(
+            &mut app,
+            SessionsMessage::SignOutAsk(DeviceId::from("PHONE")),
+        );
+        let _ = app.view();
+        let _ = ses(&mut app, SessionsMessage::SignOutConfirmed);
+        let _ = app.update(core(CoreEvent::ReauthRequired {
+            action: ReauthAction::DeleteDevices,
+        }));
+        let _ = app.view();
+        let _ = app.update(core(CoreEvent::ActionFailed {
+            room_id: RoomId::from(""),
+            action: ActionKind::SignOutDevices,
+            error: CoreError::ReauthFailed,
+        }));
+        let _ = app.view();
+        let _ = ses(&mut app, SessionsMessage::ReauthCancelled);
+        let _ = oauth_url(&mut app, "https://account.example.org/devices");
+        let _ = app.view();
+        set_status(
+            &mut app,
+            DeviceVerification::Verified,
+            RecoveryStatus::Disabled,
+        );
+        let _ = app.update(core(CoreEvent::Devices(vec![summary(
+            "THIS",
+            None,
+            true,
+            DeviceTrust::Verified,
+        )])));
+        let _ = app.update(Message::LogoutRequested);
+        let _ = app.view();
+        let _ = ses(&mut app, SessionsMessage::Close);
+        let _ = app.view();
+    }
+
+    // ---- Task 14: redaction sweep ----
+
+    /// Asserts none of `sentinels` appears in `text`; the sentinel is named,
+    /// the text (which may carry the leak) is not printed.
+    fn assert_no_sentinel(context: &str, text: &str, sentinels: &[&str]) {
+        for sentinel in sentinels {
+            assert!(
+                !text.contains(sentinel),
+                "{context}: `{sentinel}` reached a Debug string"
+            );
+        }
+    }
+
+    const KEY_S: &str = "secret-key-sweep";
+    const INPUT_S: &str = "secret-input-sweep";
+    const COPIED_S: &str = "secret-copied-sweep";
+    const PW_S: &str = "secret-pw-sweep";
+    const EMOJI_S: &str = "secret-emoji-sweep";
+    const NAME_S: &str = "secret-name-sweep";
+    const LOGIN_PW_S: &str = "secret-login-pw-sweep";
+    const URL_S: &str = "secret-url-state-sweep";
+    const TEXT_S: &str = "secret-text-sweep";
+    const PASTE_S: &str = "secret-paste-sweep";
+    const ALL_S: [&str; 10] = [
+        KEY_S, INPUT_S, COPIED_S, PW_S, EMOJI_S, NAME_S, LOGIN_PW_S, URL_S, TEXT_S, PASTE_S,
+    ];
+
+    /// The messages that carry a secret or typed text, built the way the app
+    /// and the core build them: the recovery key and its inputs, the
+    /// re-authentication passwords, the login password, the two OAuth URLs
+    /// (their `state` is a secret), the QR code, and the text typed or pasted
+    /// into the composer, the picker search and a reaction key. Not covered:
+    /// messages that carry only IDs, flags or an index.
+    fn secret_messages() -> Vec<Message> {
+        vec![
+            core(CoreEvent::RecoveryKeyReady(RecoveryKey::from(KEY_S))),
+            Message::Security(SecurityMessage::RestoreInput(RecoveryKey::from(INPUT_S))),
+            Message::Security(SecurityMessage::ClipboardRead(Some(RecoveryKey::from(
+                COPIED_S,
+            )))),
+            Message::Security(SecurityMessage::ClipboardFlushed(
+                Some(RecoveryKey::from(COPIED_S)),
+                RecoveryKey::from(KEY_S),
+            )),
+            Message::Security(SecurityMessage::ReauthInput(Password::from(PW_S))),
+            Message::Sessions(SessionsMessage::ReauthInput(Password::from(PW_S))),
+            core(CoreEvent::Verification {
+                id: vid(),
+                phase: tessera_core::api::VerificationPhase::ShowQr(vqr()),
+            }),
+            Message::PasswordChanged(Password::from(LOGIN_PW_S)),
+            core(CoreEvent::OAuthUrl(AuthUrl::from(format!(
+                "https://auth.example.org/a?state={URL_S}"
+            )))),
+            core(CoreEvent::OpenAccountManagement(AuthUrl::from(format!(
+                "https://auth.example.org/account?state={URL_S}"
+            )))),
+            Message::Composer(EditorAction(Action::Edit(Edit::Paste(Arc::new(
+                PASTE_S.to_owned(),
+            ))))),
+            Message::Composer(EditorAction(Action::Edit(Edit::Insert('x')))),
+            Message::PickerQuery(MessageText::from(TEXT_S)),
+            Message::PickerPicked(MessageText::from(TEXT_S)),
+            Message::ReactionToggled {
+                item: "item-1".to_owned(),
+                key: MessageText::from(TEXT_S),
+            },
+        ]
+    }
+
+    #[test]
+    fn the_redaction_sweep_finds_no_secret_in_any_state_or_message() {
+        use tessera_core::api::VerificationPhase;
+
+        // The show-once key screen, with a copy pending.
+        let (mut app, _rx) = recovery_app();
+        key_ready(&mut app, KEY_S);
+        app.security.copied = Some(RecoveryKey::from(COPIED_S));
+        assert!(app.security.setup.is_some(), "the key screen is open");
+        assert_no_sentinel("key screen", &format!("{app:?}"), &ALL_S);
+
+        // A restore input with typed text.
+        let (mut app, _rx) = identity_app();
+        let _ = sec(&mut app, SecurityMessage::OpenRestore);
+        let _ = sec(
+            &mut app,
+            SecurityMessage::RestoreInput(RecoveryKey::from(INPUT_S)),
+        );
+        assert_eq!(app.security.restore_input.expose(), INPUT_S);
+        assert_no_sentinel("restore input", &format!("{app:?}"), &ALL_S);
+
+        // The reset re-authentication modal with a typed password.
+        let (mut app, _rx) = recovery_app();
+        let _ = app.update(core(CoreEvent::ReauthRequired {
+            action: ReauthAction::ResetIdentity,
+        }));
+        let _ = sec(&mut app, SecurityMessage::ReauthInput(Password::from(PW_S)));
+        assert!(app.security.reauth.is_some(), "the prompt is open");
+        assert_no_sentinel("reset prompt", &format!("{app:?}"), &ALL_S);
+
+        // The Sessions password prompt (the other re-authentication modal).
+        let (mut app, _rx) = reauth_asked();
+        let _ = ses(&mut app, SessionsMessage::ReauthInput(Password::from(PW_S)));
+        assert!(app.sessions.reauth.is_some(), "the prompt is open");
+        assert_no_sentinel("sessions prompt", &format!("{app:?}"), &ALL_S);
+
+        // A verification in Emojis, and one in ShowQr.
+        let (mut app, _rx) = verifying(true);
+        let set = Box::new(std::array::from_fn(|_| SasEmoji {
+            symbol: "\u{1F436}".to_owned(),
+            description: EMOJI_S.to_owned(),
+        }));
+        let _ = app.update(core(CoreEvent::Verification {
+            id: vid(),
+            phase: VerificationPhase::Emojis(set),
+        }));
+        assert_eq!(
+            app.verification.as_ref().map(|v| v.phase.kind()),
+            Some("emojis")
+        );
+        assert_no_sentinel("emojis", &format!("{app:?}"), &ALL_S);
+
+        let (mut app, _rx) = verifying(true);
+        let _ = app.update(core(CoreEvent::Verification {
+            id: vid(),
+            phase: VerificationPhase::ShowQr(vqr()),
+        }));
+        assert_eq!(
+            app.verification.as_ref().map(|v| v.phase.kind()),
+            Some("show_qr")
+        );
+        // The test grid is all dark, so any dump of the modules repeats `true`.
+        let dbg = format!("{app:?}");
+        assert!(
+            !dbg.contains("true, true") && !dbg.contains("dark"),
+            "QR modules printed"
+        );
+
+        // The Sessions screen, with a rename in progress.
+        let (mut app, _rx) = main_app();
+        let _ = ses(&mut app, SessionsMessage::Open);
+        let _ = app.update(core(CoreEvent::Devices(vec![
+            summary("THIS", Some(NAME_S), true, DeviceTrust::Verified),
+            summary("PHONE", Some(NAME_S), false, DeviceTrust::Unverified),
+        ])));
+        let _ = ses(
+            &mut app,
+            SessionsMessage::RenameStart(DeviceId::from("PHONE")),
+        );
+        let _ = ses(&mut app, SessionsMessage::RenameInput(NAME_S.to_owned()));
+        assert!(app.sessions.open && app.sessions.rename.is_some());
+        assert_no_sentinel("sessions", &format!("{app:?}"), &ALL_S);
+
+        // The login form with a typed password, then waiting for the browser
+        // with the OAuth URL (and its `state`) held for **Copy link**.
+        let (mut app, _rx) = login_app();
+        let _ = app.update(Message::PasswordChanged(Password::from(LOGIN_PW_S)));
+        assert_no_sentinel("login form", &format!("{app:?}"), &ALL_S);
+        let (app, _rx, _task) = waiting_app(&format!("https://auth.example.org/a?state={URL_S}"));
+        assert!(app.browser_link.is_some(), "the link is held");
+        assert_no_sentinel("waiting for the browser", &format!("{app:?}"), &ALL_S);
+
+        // The composer with pasted text, and the picker with a search typed.
+        let (mut app, _rx) = main_app();
+        let _ = app.update(Message::Composer(EditorAction(Action::Edit(Edit::Paste(
+            Arc::new(PASTE_S.to_owned()),
+        )))));
+        let _ = app.update(Message::PickerQuery(MessageText::from(TEXT_S)));
+        assert_no_sentinel("composer and picker", &format!("{app:?}"), &ALL_S);
+
+        // The messages that carry secrets.
+        for message in secret_messages() {
+            let dbg = format!("{message:?}");
+            assert_no_sentinel("message", &dbg, &ALL_S);
+            assert!(!dbg.contains("true, true"), "QR modules printed");
+        }
+    }
+
+    /// Lays `app.view()` out headlessly in a 1000x700 window and returns the
+    /// size of the root.
+    fn laid_out_size(app: &App) -> iced::Size {
+        use iced::advanced::layout::Limits;
+        use iced::advanced::renderer::Headless;
+        use iced::advanced::widget::Tree;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a current-thread runtime");
+        let renderer = runtime
+            .block_on(iced::Renderer::new(
+                iced::Font::DEFAULT,
+                iced::Pixels(16.0),
+                Some("tiny-skia"),
+            ))
+            .expect("the headless tiny-skia renderer is not available");
+        let mut element = app.view();
+        let mut tree = Tree::new(element.as_widget());
+        element
+            .as_widget_mut()
+            .layout(
+                &mut tree,
+                &renderer,
+                &Limits::new(iced::Size::ZERO, iced::Size::new(1000.0, 700.0)),
+            )
+            .size()
+    }
+
+    /// The main screen collapsed to zero width (and the security card over
+    /// it with it) because its column did not fill the window: the window
+    /// went blank after a fresh login.
+    #[test]
+    fn the_main_view_and_the_security_cards_fill_the_window() {
+        let window = iced::Size::new(1000.0, 700.0);
+        let (mut app, _rx) = main_app();
+        assert_eq!(laid_out_size(&app), window, "the main view");
+        set_status(
+            &mut app,
+            DeviceVerification::Unverified,
+            RecoveryStatus::Enabled,
+        );
+        assert_eq!(laid_out_size(&app), window, "the identity screen");
+        let _ = sec(&mut app, SecurityMessage::SkipIdentity);
+        assert_eq!(laid_out_size(&app), window, "the unverified banner");
+        let (mut app, _rx) = recovery_app();
+        let _ = sec(&mut app, SecurityMessage::SetupRecovery);
+        assert_eq!(laid_out_size(&app), window, "setting up recovery");
+    }
+
+    // ---- Task 15: change the recovery key ----
+
+    /// A verified app with recovery on and the Sessions page open, with the
+    /// commands drained.
+    fn change_key_app() -> (App, mpsc::Receiver<Command>) {
+        let (mut app, mut rx) = main_app();
+        set_status(
+            &mut app,
+            DeviceVerification::Verified,
+            RecoveryStatus::Enabled,
+        );
+        let _ = ses(&mut app, SessionsMessage::Open);
+        while rx.try_recv().is_ok() {}
+        (app, rx)
+    }
+
+    #[test]
+    fn change_recovery_key_asks_first_and_cancel_sends_nothing() {
+        let (mut app, mut rx) = change_key_app();
+        let _ = sec(&mut app, SecurityMessage::ChangeKeyRequested);
+        assert_eq!(
+            app.security.visible(),
+            Visible::Overlay(Overlay::ChangeKeyConfirm)
+        );
+        let _ = sec(&mut app, SecurityMessage::ChangeKeyCancelled);
+        assert_eq!(app.security.visible(), Visible::Nothing);
+        assert!(app.sessions.open, "back on the Sessions page");
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn change_key_sends_one_command_and_nothing_while_busy() {
+        let (mut app, mut rx) = change_key_app();
+        let _ = sec(&mut app, SecurityMessage::ChangeKeyRequested);
+        let _ = sec(&mut app, SecurityMessage::ChangeKeyConfirmed);
+        let _ = sec(&mut app, SecurityMessage::ChangeKeyConfirmed);
+        let _ = sec(&mut app, SecurityMessage::ChangeKeyRequested);
+        let _ = sec(&mut app, SecurityMessage::SetupRecovery);
+        let commands = drain(&mut rx);
+        assert_eq!(commands.len(), 1, "{commands:?}");
+        assert!(matches!(commands[0], Command::ChangeRecoveryKey));
+        assert_eq!(app.security.busy, Some(Busy::ChangingKey));
+        assert_eq!(
+            app.security.visible(),
+            Visible::Overlay(Overlay::ChangeKeyConfirm),
+            "the card stays, showing the wait"
+        );
+        // Cancel does nothing once the command is out.
+        let _ = sec(&mut app, SecurityMessage::ChangeKeyCancelled);
+        assert_eq!(app.security.busy, Some(Busy::ChangingKey));
+    }
+
+    #[test]
+    fn change_key_is_refused_unless_recovery_is_on() {
+        for recovery in [
+            RecoveryStatus::Disabled,
+            RecoveryStatus::Incomplete,
+            RecoveryStatus::Unknown,
+        ] {
+            let (mut app, mut rx) = change_key_app();
+            set_status(&mut app, DeviceVerification::Verified, recovery);
+            let _ = sec(&mut app, SecurityMessage::ChangeKeyRequested);
+            let _ = sec(&mut app, SecurityMessage::ChangeKeyConfirmed);
+            assert_eq!(app.security.visible(), Visible::Nothing, "{recovery:?}");
+            assert!(drain(&mut rx).is_empty(), "{recovery:?}");
+        }
+    }
+
+    #[test]
+    fn the_new_key_opens_the_show_once_screen_as_a_new_key() {
+        let (mut app, _rx) = change_key_app();
+        let _ = sec(&mut app, SecurityMessage::ChangeKeyRequested);
+        let _ = sec(&mut app, SecurityMessage::ChangeKeyConfirmed);
+        key_ready(&mut app, "secret-key-x");
+        assert_eq!(app.security.visible(), Visible::Key);
+        assert_eq!(app.security.busy, None);
+        let setup = app.security.setup.as_ref().expect("the key screen");
+        assert_eq!(crate::security::key_title(setup), "Your new recovery key");
+        let _ = sec(&mut app, SecurityMessage::Done);
+        assert_eq!(app.security.visible(), Visible::Key, "Done needs the box");
+        let _ = sec(&mut app, SecurityMessage::SavedToggled(true));
+        let _ = sec(&mut app, SecurityMessage::Done);
+        assert_eq!(app.security.visible(), Visible::Nothing);
+        assert!(app.sessions.open, "back on the Sessions page");
+    }
+
+    #[test]
+    fn a_key_from_set_up_keeps_the_first_title() {
+        let (mut app, _rx) = recovery_app();
+        let _ = sec(&mut app, SecurityMessage::SetupRecovery);
+        key_ready(&mut app, "secret-key-x");
+        let setup = app.security.setup.as_ref().expect("the key screen");
+        assert_eq!(crate::security::key_title(setup), "Your recovery key");
+    }
+
+    #[test]
+    fn a_failed_change_shows_the_reason_on_the_sessions_page() {
+        let (mut app, _rx) = change_key_app();
+        let _ = sec(&mut app, SecurityMessage::ChangeKeyRequested);
+        let _ = sec(&mut app, SecurityMessage::ChangeKeyConfirmed);
+        let _ = app.update(recovery_failed(CoreError::Internal(
+            "recovery is not complete on this device".into(),
+        )));
+        assert_eq!(app.security.busy, None);
+        assert_eq!(app.security.visible(), Visible::Nothing);
+        assert_eq!(app.security.overlay, None);
+        let notice = app.sessions.notice.clone().expect("a Sessions notice");
+        assert!(notice.contains("not complete"), "{notice}");
+    }
+
+    #[test]
+    fn the_change_key_card_fills_the_window_and_hides_no_secret() {
+        let window = iced::Size::new(1000.0, 700.0);
+        let (mut app, _rx) = change_key_app();
+        let _ = sec(&mut app, SecurityMessage::ChangeKeyRequested);
+        assert_eq!(laid_out_size(&app), window, "the warning");
+        let _ = sec(&mut app, SecurityMessage::ChangeKeyConfirmed);
+        assert_eq!(laid_out_size(&app), window, "the wait");
+        key_ready(&mut app, KEY_S);
+        assert_eq!(laid_out_size(&app), window, "the new key");
+        assert_no_sentinel("new key screen", &format!("{app:?}"), &ALL_S);
     }
 }

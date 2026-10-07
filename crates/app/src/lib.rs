@@ -13,10 +13,13 @@ pub mod links;
 pub mod rich_text;
 pub mod room_list;
 pub mod screens;
+pub mod security;
+pub mod sessions;
 pub mod state;
 pub mod text_safety;
 pub mod theme;
 pub mod timeline;
+pub mod verification;
 
 pub use bridge::{Bridge, BridgeEvent, EventsSlot};
 pub use state::{App, CommandSink, Message, Screen, Startup};

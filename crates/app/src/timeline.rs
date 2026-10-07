@@ -914,8 +914,8 @@ mod tests {
 
     use tessera_core::api::{
         Block, Command, CoreEvent, EventId, Inline, ListDiff, MessageDetails, PaginationState,
-        PlaceholderKind, ReactionGroup, RichText, RoomId, RoomSummary, SendStatus, StateChange,
-        TextStyle, TimelineItem, TimelineItemKind, UserId,
+        PlaceholderKind, ReactionGroup, RichText, RoomId, RoomSummary, SendStatus, Shield,
+        ShieldCode, StateChange, TextStyle, TimelineItem, TimelineItemKind, UserId, UtdReason,
     };
     use tokio::sync::mpsc;
 
@@ -985,12 +985,102 @@ mod tests {
                 is_own: false,
                 timestamp_ms: ts,
                 what: PlaceholderKind::Redacted,
+                utd: None,
             },
         )
     }
 
     fn plain(kind: TimelineItemKind) -> TimelineItem {
         TimelineItem::new("p".to_owned(), kind)
+    }
+
+    // ---- Task 12: shields, UTD placeholders, DM peer ----------------------
+
+    fn utd_placeholder(id: &str, utd: Option<UtdReason>) -> TimelineItem {
+        TimelineItem::new(
+            id.to_owned(),
+            TimelineItemKind::Placeholder {
+                sender: UserId::from("@bob:x"),
+                sender_name: None,
+                is_own: false,
+                timestamp_ms: 0,
+                what: PlaceholderKind::UnableToDecrypt,
+                utd,
+            },
+        )
+    }
+
+    #[test]
+    fn a_shield_and_a_utd_reason_do_not_change_the_estimate() {
+        let plain = msg("a", "@a:x", 0);
+        let shielded = msg_with(
+            "a",
+            "@a:x",
+            0,
+            MessageDetails {
+                shield: Some(Shield::Red(ShieldCode::UnsignedDevice)),
+                ..MessageDetails::default()
+            },
+        );
+        for continuation in [false, true] {
+            assert_eq!(
+                estimate_height(&plain, continuation, 800.0),
+                estimate_height(&shielded, continuation, 800.0)
+            );
+        }
+        let waiting = utd_placeholder("u", None);
+        let reasoned = utd_placeholder("u", Some(UtdReason::SentBeforeWeJoined));
+        assert_eq!(
+            estimate_height(&waiting, false, 800.0),
+            estimate_height(&reasoned, false, 800.0)
+        );
+    }
+
+    #[test]
+    fn a_set_turns_a_utd_placeholder_into_a_message_in_place() {
+        let (mut app, _rx) = app();
+        let _ = app.update(reset(vec![
+            msg("m0", "@u:x", 0),
+            utd_placeholder("utd", Some(UtdReason::WithheldBySender)),
+            msg("m2", "@u:x", 0),
+        ]));
+        let _ = app.update(Message::RowMeasured {
+            id: "utd".into(),
+            height: 30.0,
+        });
+        let _ = app.update(diff(
+            "a",
+            vec![ListDiff::Set {
+                index: 1,
+                value: msg_with(
+                    "utd",
+                    "@bob:x",
+                    0,
+                    rich(vec![text_block(20), text_block(20)]),
+                ),
+            }],
+        ));
+        assert_eq!(app.timeline.items.len(), 3);
+        assert_eq!(app.timeline.items[1].id, "utd");
+        assert!(matches!(
+            app.timeline.items[1].kind,
+            TimelineItemKind::Message { .. }
+        ));
+        // The measurement stays until the sensor reports the new height (a
+        // row rebuilt at another size fires `on_resize`; invalidating here
+        // would leave the estimate when the size did not change).
+        assert_eq!(app.timeline.measured["utd"], 30.0);
+        assert_eq!(app.timeline.prefix[2] - app.timeline.prefix[1], 30.0);
+        let _ = app.update(Message::RowMeasured {
+            id: "utd".into(),
+            height: 64.0,
+        });
+        assert_eq!(app.timeline.prefix[2] - app.timeline.prefix[1], 64.0);
+        let total = app.timeline.prefix[3];
+        assert_eq!(
+            total,
+            app.timeline.prefix[1] + 64.0 + (total - app.timeline.prefix[2])
+        );
     }
 
     // ---- estimate_height --------------------------------------------------

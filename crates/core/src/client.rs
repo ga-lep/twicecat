@@ -6,6 +6,7 @@
 
 use std::path::Path;
 
+use matrix_sdk::encryption::{BackupDownloadStrategy, EncryptionSettings};
 use matrix_sdk::ruma::api::error::ErrorKind;
 use matrix_sdk::{Client, ClientBuildError, Error as SdkError, HttpError};
 
@@ -206,6 +207,7 @@ pub(crate) async fn build_client(
         ServerSpec::Url(u) => builder.homeserver_url(u),
     };
     let client = builder
+        .with_encryption_settings(encryption_settings())
         .sqlite_store(store_dir, Some(passphrase))
         .handle_refresh_tokens()
         // A login response's `well_known` must not move the client to another
@@ -218,6 +220,17 @@ pub(crate) async fn build_client(
         ensure_https(client.homeserver().as_str())?;
     }
     Ok(client)
+}
+
+/// The encryption settings of every client (as Element X): cross-signing on
+/// login, a backup created at once, and a per-event key download after a
+/// decryption failure.
+pub(crate) fn encryption_settings() -> EncryptionSettings {
+    EncryptionSettings {
+        auto_enable_cross_signing: true,
+        auto_enable_backups: true,
+        backup_download_strategy: BackupDownloadStrategy::AfterDecryptionFailure,
+    }
 }
 
 /// Maps a client build failure to a fixed message.
@@ -258,6 +271,18 @@ pub(crate) fn map_login_error(e: &SdkError) -> CoreError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn encryption_settings_are_the_element_x_set() {
+        use matrix_sdk::encryption::BackupDownloadStrategy;
+        let s = super::encryption_settings();
+        assert!(s.auto_enable_cross_signing);
+        assert!(s.auto_enable_backups);
+        assert_eq!(
+            s.backup_download_strategy,
+            BackupDownloadStrategy::AfterDecryptionFailure
+        );
+    }
+
     use super::*;
 
     #[test]

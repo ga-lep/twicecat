@@ -5,16 +5,18 @@
 use matrix_sdk::ruma::events::StateEventContentChange;
 use matrix_sdk::ruma::events::room::message::{MessageFormat, MessageType};
 use matrix_sdk::ruma::{OwnedRoomId, UserId as SdkUserId};
+use matrix_sdk_crypto::types::events::UtdCause;
 use matrix_sdk_ui::timeline::{
-    AnyOtherStateEventContentChange, EmbeddedEvent, EventSendState, EventTimelineItem,
-    InReplyToDetails, MembershipChange, MsgLikeKind, Profile, TimelineDetails,
-    TimelineItem as SdkItem, TimelineItemContent, VirtualTimelineItem,
+    AnyOtherStateEventContentChange, EmbeddedEvent, EncryptedMessage, EventSendState,
+    EventTimelineItem, InReplyToDetails, MembershipChange, MsgLikeKind, Profile, TimelineDetails,
+    TimelineEventShieldState, TimelineEventShieldStateCode, TimelineItem as SdkItem,
+    TimelineItemContent, VirtualTimelineItem,
 };
 
 use crate::api::{
     CoreError, EventId, ItemActions, Member, MessageDetails, MessageKind, PlaceholderKind,
-    ReactionGroup, ReplyPreview, ReplyState, RoomId, SendFailure, SendStatus, StateChange,
-    TimelineItem, TimelineItemKind, UserId,
+    ReactionGroup, ReplyPreview, ReplyState, RoomId, SendFailure, SendStatus, Shield, ShieldCode,
+    StateChange, TimelineItem, TimelineItemKind, UserId, UtdReason,
 };
 use crate::rich_text;
 
@@ -91,6 +93,7 @@ fn map_event(event: &EventTimelineItem, own: Option<&SdkUserId>) -> TimelineItem
         is_own: event.is_own(),
         timestamp_ms,
         what,
+        utd: None,
     };
     let state = |change| TimelineItemKind::State {
         sender: sender.clone(),
@@ -149,6 +152,7 @@ fn map_event(event: &EventTimelineItem, own: Option<&SdkUserId>) -> TimelineItem
                         }
                         _ => None,
                     },
+                    shield: map_shield(event.get_shield(false)),
                 };
                 // A remote event has no send state: the server accepted it.
                 let sent = event.send_state().map_or(SendStatus::Sent, map_send_state);
@@ -165,7 +169,13 @@ fn map_event(event: &EventTimelineItem, own: Option<&SdkUserId>) -> TimelineItem
             MsgLikeKind::Poll(_) => placeholder(PlaceholderKind::Poll),
             MsgLikeKind::LiveLocation(_) => placeholder(PlaceholderKind::Location),
             MsgLikeKind::Redacted => placeholder(PlaceholderKind::Redacted),
-            MsgLikeKind::UnableToDecrypt(_) => placeholder(PlaceholderKind::UnableToDecrypt),
+            MsgLikeKind::UnableToDecrypt(message) => {
+                let mut item = placeholder(PlaceholderKind::UnableToDecrypt);
+                if let TimelineItemKind::Placeholder { utd, .. } = &mut item {
+                    *utd = Some(map_utd(message));
+                }
+                item
+            }
             MsgLikeKind::Other(_) => placeholder(PlaceholderKind::Unsupported),
         },
         TimelineItemContent::MembershipChange(change) => state(match change.change() {
@@ -190,6 +200,54 @@ fn map_event(event: &EventTimelineItem, own: Option<&SdkUserId>) -> TimelineItem
         TimelineItemContent::CallInvite | TimelineItemContent::RtcNotification { .. } => {
             placeholder(PlaceholderKind::Unsupported)
         }
+    }
+}
+
+/// Maps the SDK's non-strict shield to the public one.
+pub(crate) fn map_shield(state: TimelineEventShieldState) -> Option<Shield> {
+    use TimelineEventShieldStateCode as S;
+    let code = |c: S| match c {
+        S::AuthenticityNotGuaranteed => ShieldCode::AuthenticityNotGuaranteed,
+        S::UnknownDevice => ShieldCode::UnknownDevice,
+        S::UnsignedDevice => ShieldCode::UnsignedDevice,
+        S::UnverifiedIdentity => ShieldCode::UnverifiedIdentity,
+        S::VerificationViolation => ShieldCode::VerificationViolation,
+        S::MismatchedSender => ShieldCode::MismatchedSender,
+        S::SentInClear => ShieldCode::SentInClear,
+    };
+    match state {
+        TimelineEventShieldState::Red { code: c } => Some(Shield::Red(code(c))),
+        TimelineEventShieldState::Grey { code: c } => Some(Shield::Grey(code(c))),
+        TimelineEventShieldState::None => None,
+    }
+}
+
+/// Maps the SDK's guess at why a Megolm message could not be decrypted.
+pub(crate) fn map_utd_cause(cause: UtdCause) -> UtdReason {
+    match cause {
+        UtdCause::Unknown => UtdReason::Unknown,
+        UtdCause::SentBeforeWeJoined => UtdReason::SentBeforeWeJoined,
+        UtdCause::VerificationViolation => UtdReason::VerificationViolation,
+        UtdCause::UnsignedDevice => UtdReason::UnsignedDevice,
+        UtdCause::UnknownDevice => UtdReason::UnknownDevice,
+        UtdCause::HistoricalMessageAndBackupIsDisabled => {
+            UtdReason::HistoricalMessageAndBackupIsDisabled
+        }
+        UtdCause::WithheldForUnverifiedOrInsecureDevice => {
+            UtdReason::WithheldForUnverifiedOrInsecureDevice
+        }
+        UtdCause::WithheldBySender => UtdReason::WithheldBySender,
+        UtdCause::HistoricalMessageAndDeviceIsUnverified => {
+            UtdReason::HistoricalMessageAndDeviceIsUnverified
+        }
+    }
+}
+
+/// The reason for an undecryptable message; anything but Megolm is `Unknown`.
+pub(crate) fn map_utd(message: &EncryptedMessage) -> UtdReason {
+    match message {
+        EncryptedMessage::MegolmV1AesSha2 { cause, .. } => map_utd_cause(*cause),
+        _ => UtdReason::Unknown,
     }
 }
 
@@ -441,6 +499,72 @@ mod tests {
     use matrix_sdk::ruma::event_id;
 
     use super::*;
+
+    #[test]
+    fn shield_mapping_table() {
+        use crate::api::{Shield, ShieldCode as C};
+        use matrix_sdk_ui::timeline::TimelineEventShieldStateCode as S;
+        let codes = [
+            (S::AuthenticityNotGuaranteed, C::AuthenticityNotGuaranteed),
+            (S::UnknownDevice, C::UnknownDevice),
+            (S::UnsignedDevice, C::UnsignedDevice),
+            (S::UnverifiedIdentity, C::UnverifiedIdentity),
+            (S::VerificationViolation, C::VerificationViolation),
+            (S::MismatchedSender, C::MismatchedSender),
+            (S::SentInClear, C::SentInClear),
+        ];
+        assert_eq!(map_shield(TimelineEventShieldState::None), None);
+        for (sdk, ours) in codes {
+            assert_eq!(
+                map_shield(TimelineEventShieldState::Red { code: sdk }),
+                Some(Shield::Red(ours))
+            );
+            assert_eq!(
+                map_shield(TimelineEventShieldState::Grey { code: sdk }),
+                Some(Shield::Grey(ours))
+            );
+        }
+    }
+
+    #[test]
+    fn utd_cause_mapping_table() {
+        use crate::api::UtdReason as R;
+        use matrix_sdk_crypto::types::events::UtdCause as U;
+        let table = [
+            (U::Unknown, R::Unknown),
+            (U::SentBeforeWeJoined, R::SentBeforeWeJoined),
+            (U::VerificationViolation, R::VerificationViolation),
+            (U::UnsignedDevice, R::UnsignedDevice),
+            (U::UnknownDevice, R::UnknownDevice),
+            (
+                U::HistoricalMessageAndBackupIsDisabled,
+                R::HistoricalMessageAndBackupIsDisabled,
+            ),
+            (
+                U::WithheldForUnverifiedOrInsecureDevice,
+                R::WithheldForUnverifiedOrInsecureDevice,
+            ),
+            (U::WithheldBySender, R::WithheldBySender),
+            (
+                U::HistoricalMessageAndDeviceIsUnverified,
+                R::HistoricalMessageAndDeviceIsUnverified,
+            ),
+        ];
+        for (cause, reason) in table {
+            let message = EncryptedMessage::MegolmV1AesSha2 {
+                sender_key: None,
+                device_id: None,
+                session_id: "s".to_owned(),
+                cause,
+            };
+            assert_eq!(map_utd(&message), reason);
+        }
+        let olm = EncryptedMessage::OlmV1Curve25519AesSha2 {
+            sender_key: "k".to_owned(),
+        };
+        assert_eq!(map_utd(&olm), R::Unknown);
+        assert_eq!(map_utd(&EncryptedMessage::Unknown), R::Unknown);
+    }
 
     #[test]
     fn send_state_mapping_table() {

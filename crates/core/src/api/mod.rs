@@ -6,9 +6,15 @@
 use std::fmt;
 
 mod diff;
+mod security;
 mod types;
 
 pub use diff::ListDiff;
+pub use security::{
+    CancelReason, CrossSigning, DeviceSummary, DeviceTrust, DeviceVerification, QrImage,
+    ReauthAction, RecoveryKey, RecoveryProgress, RecoveryStatus, SasEmoji, SecurityStatus, Shield,
+    ShieldCode, UserTrust, UtdReason, VerificationId, VerificationPeer, VerificationPhase,
+};
 pub use types::{
     ActionKind, AuthUrl, AvatarId, AvatarImage, Block, CoreError, DeviceId, Draft, EventId, Inline,
     ItemActions, Member, MentionRef, MentionTarget, MessageDetails, MessageKind, MessagePreview,
@@ -137,6 +143,92 @@ pub enum Command {
         /// The draft; `None` clears it.
         draft: Option<Draft>,
     },
+    /// Set up recovery; the new key comes back once as
+    /// [`CoreEvent::RecoveryKeyReady`].
+    EnableRecovery,
+    /// Restore secrets with a recovery key or passphrase.
+    Recover {
+        /// The key or passphrase.
+        key: RecoveryKey,
+    },
+    /// Replace the recovery key; the new key comes back once as
+    /// [`CoreEvent::RecoveryKeyReady`].
+    ChangeRecoveryKey,
+    /// Create the cross-signing identity.
+    BootstrapCrossSigning {
+        /// The account password, when the server asks for it.
+        password: Option<Password>,
+    },
+    /// Replace the cross-signing identity.
+    ResetIdentity {
+        /// The account password, when the server asks for it.
+        password: Option<Password>,
+    },
+    /// Abort a pending identity reset (OAuth approval).
+    CancelIdentityReset,
+    /// Verify this device against the account's other devices.
+    RequestSelfVerification,
+    /// Verify another device of this account.
+    RequestDeviceVerification {
+        /// The device.
+        device_id: DeviceId,
+    },
+    /// Verify another user (in a direct message).
+    RequestUserVerification {
+        /// The user.
+        user_id: UserId,
+    },
+    /// Accept an incoming verification request.
+    AcceptVerification {
+        /// The flow.
+        id: VerificationId,
+    },
+    /// Compare emoji instead of scanning (while a QR code is shown).
+    StartSas {
+        /// The flow.
+        id: VerificationId,
+    },
+    /// The user confirms that the other device shows success after scanning.
+    ConfirmQrScanned {
+        /// The flow.
+        id: VerificationId,
+    },
+    /// The emoji or numbers match.
+    ConfirmSas {
+        /// The flow.
+        id: VerificationId,
+    },
+    /// The emoji or numbers do not match.
+    SasMismatch {
+        /// The flow.
+        id: VerificationId,
+    },
+    /// Cancel a verification, or decline an incoming request.
+    CancelVerification {
+        /// The flow.
+        id: VerificationId,
+    },
+    /// List the account's devices; answered by [`CoreEvent::Devices`].
+    ListDevices,
+    /// Rename a device.
+    RenameDevice {
+        /// The device.
+        device_id: DeviceId,
+        /// The new display name.
+        name: String,
+    },
+    /// Sign out other devices.
+    SignOutDevices {
+        /// The devices.
+        device_ids: Vec<DeviceId>,
+        /// The account password, when the server asks for it.
+        password: Option<Password>,
+    },
+    /// Report [`CoreEvent::UserTrust`] for a user now and on every change.
+    WatchUserTrust {
+        /// The user.
+        user_id: UserId,
+    },
     /// Log out and delete the local session.
     Logout,
     /// Stop the engine.
@@ -240,6 +332,59 @@ impl fmt::Debug for Command {
                 .field("room_id", room_id)
                 .field("draft", draft)
                 .finish(),
+            Self::EnableRecovery => f.write_str("EnableRecovery"),
+            Self::Recover { key } => f.debug_struct("Recover").field("key", key).finish(),
+            Self::ChangeRecoveryKey => f.write_str("ChangeRecoveryKey"),
+            Self::BootstrapCrossSigning { password } => f
+                .debug_struct("BootstrapCrossSigning")
+                .field("password", password)
+                .finish(),
+            Self::ResetIdentity { password } => f
+                .debug_struct("ResetIdentity")
+                .field("password", password)
+                .finish(),
+            Self::CancelIdentityReset => f.write_str("CancelIdentityReset"),
+            Self::RequestSelfVerification => f.write_str("RequestSelfVerification"),
+            Self::RequestDeviceVerification { device_id } => f
+                .debug_struct("RequestDeviceVerification")
+                .field("device_id", device_id)
+                .finish(),
+            Self::RequestUserVerification { user_id } => f
+                .debug_struct("RequestUserVerification")
+                .field("user_id", user_id)
+                .finish(),
+            Self::AcceptVerification { id } => f
+                .debug_struct("AcceptVerification")
+                .field("id", id)
+                .finish(),
+            Self::StartSas { id } => f.debug_struct("StartSas").field("id", id).finish(),
+            Self::ConfirmQrScanned { id } => {
+                f.debug_struct("ConfirmQrScanned").field("id", id).finish()
+            }
+            Self::ConfirmSas { id } => f.debug_struct("ConfirmSas").field("id", id).finish(),
+            Self::SasMismatch { id } => f.debug_struct("SasMismatch").field("id", id).finish(),
+            Self::CancelVerification { id } => f
+                .debug_struct("CancelVerification")
+                .field("id", id)
+                .finish(),
+            Self::ListDevices => f.write_str("ListDevices"),
+            Self::RenameDevice { device_id, name } => f
+                .debug_struct("RenameDevice")
+                .field("device_id", device_id)
+                .field("name", name)
+                .finish(),
+            Self::SignOutDevices {
+                device_ids,
+                password,
+            } => f
+                .debug_struct("SignOutDevices")
+                .field("device_ids", device_ids)
+                .field("password", password)
+                .finish(),
+            Self::WatchUserTrust { user_id } => f
+                .debug_struct("WatchUserTrust")
+                .field("user_id", user_id)
+                .finish(),
             Self::Logout => f.write_str("Logout"),
             Self::Shutdown => f.write_str("Shutdown"),
         }
@@ -330,7 +475,9 @@ pub enum CoreEvent {
         /// The draft.
         draft: Draft,
     },
-    /// An action on a room or item failed.
+    /// An action on a room or item failed. Actions that belong to no room
+    /// (recovery, cross-signing, verification, devices) carry an empty
+    /// `room_id`.
     ActionFailed {
         /// Room.
         room_id: RoomId,
@@ -338,6 +485,46 @@ pub enum CoreEvent {
         action: ActionKind,
         /// Why.
         error: CoreError,
+    },
+    /// The account's security state, sent after login or restore and on every
+    /// change.
+    Security(SecurityStatus),
+    /// Progress of setting recovery up.
+    RecoveryProgress(RecoveryProgress),
+    /// A new recovery key. Show it once; the core never stores it.
+    RecoveryKeyReady(RecoveryKey),
+    /// [`Command::Recover`] succeeded.
+    Recovered,
+    /// The action needs the account password; resend the command with it.
+    ReauthRequired {
+        /// The action that was refused.
+        action: ReauthAction,
+    },
+    /// Open this account-management URL in a browser to approve the action
+    /// (OAuth sessions).
+    OpenAccountManagement(AuthUrl),
+    /// A verification request arrived or was started.
+    VerificationRequested {
+        /// The flow.
+        id: VerificationId,
+        /// The other side.
+        peer: VerificationPeer,
+    },
+    /// A verification flow moved to a new phase.
+    Verification {
+        /// The flow.
+        id: VerificationId,
+        /// The new phase.
+        phase: VerificationPhase,
+    },
+    /// Answer to [`Command::ListDevices`].
+    Devices(Vec<DeviceSummary>),
+    /// A watched user's trust, now or after a change.
+    UserTrust {
+        /// The user.
+        user_id: UserId,
+        /// Their trust.
+        trust: UserTrust,
     },
     /// Any other error.
     Error(CoreError),
