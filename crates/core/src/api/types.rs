@@ -945,8 +945,11 @@ pub enum ActionKind {
     CrossSigning,
     /// Request or answer a verification.
     Verification,
-    /// List, rename or sign out devices, or watch a user's trust.
+    /// List or rename devices, or watch a user's trust.
     Devices,
+    /// Sign devices out: every failure of that command, so that a caller
+    /// can tell it from the other device actions.
+    SignOutDevices,
 }
 
 /// What a timeline item is.

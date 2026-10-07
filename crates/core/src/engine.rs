@@ -1123,7 +1123,7 @@ impl Engine {
                     password,
                     &self.events,
                 ),
-                None => self.not_logged_in(ActionKind::Devices).await,
+                None => self.not_logged_in(ActionKind::SignOutDevices).await,
             },
             // Handled in `run`.
             Command::Shutdown => {}
@@ -2281,7 +2281,7 @@ mod tests {
                     device_ids: vec![dev()],
                     password: pw(),
                 },
-                ActionKind::Devices,
+                ActionKind::SignOutDevices,
             ),
             (
                 Command::WatchUserTrust {
@@ -2342,6 +2342,50 @@ mod tests {
                 CoreEvent::ActionFailed {
                     action: ActionKind::Devices,
                     error: CoreError::NotAllowed,
+                    ..
+                }
+            ),
+            "{got:?}"
+        );
+        if let Some(mut active) = engine.active.take() {
+            active.stop_tasks().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sign_out_that_cannot_start_fails_with_its_own_kind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut engine, mut rx) = oauth_engine(tmp.path());
+        // This client never logged in: no user ID, so the sign-out stops at
+        // once, and not as a list or rename failure.
+        let client = Client::builder()
+            .homeserver_url("http://127.0.0.1:1")
+            .build()
+            .await
+            .unwrap();
+        engine.active = Some(Active {
+            fetcher: Arc::new(SdkFetcher(client.clone())),
+            client,
+            record: record("@alice:x", "http://127.0.0.1:1", "s1"),
+            changes: broadcast::channel(1).1,
+            sync: None,
+            selected: None,
+            avatars: Avatars::new(),
+            security: SecurityTasks::new(),
+        });
+        engine
+            .handle(Command::SignOutDevices {
+                device_ids: vec![DeviceId::from("DEV")],
+                password: None,
+            })
+            .await;
+        let got = next_event(&mut rx).await;
+        assert!(
+            matches!(
+                &got,
+                CoreEvent::ActionFailed {
+                    action: ActionKind::SignOutDevices,
+                    error: CoreError::NotLoggedIn,
                     ..
                 }
             ),

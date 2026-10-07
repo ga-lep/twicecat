@@ -460,6 +460,7 @@ mod tests {
             ActionKind::CrossSigning,
             ActionKind::Verification,
             ActionKind::Devices,
+            ActionKind::SignOutDevices,
         ];
     }
 }

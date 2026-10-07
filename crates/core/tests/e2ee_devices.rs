@@ -272,7 +272,7 @@ async fn signing_out_another_device_needs_the_password() {
         matches!(
             &failed,
             CoreEvent::ActionFailed {
-                action: ActionKind::Devices,
+                action: ActionKind::SignOutDevices,
                 error: CoreError::ReauthFailed,
                 ..
             }
@@ -327,7 +327,7 @@ async fn the_current_device_cannot_be_signed_out_from_the_list() {
         matches!(
             e,
             CoreEvent::ActionFailed {
-                action: ActionKind::Devices,
+                action: ActionKind::SignOutDevices,
                 error: CoreError::NotAllowed,
                 ..
             }

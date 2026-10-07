@@ -711,6 +711,7 @@ impl SecurityTasks {
         let Ok(user) = OwnedUserId::try_from(user.as_str()) else {
             self.spawn_failed(
                 events,
+                ActionKind::Devices,
                 CoreError::Internal("that is not a valid user ID".into()),
             );
             return;
@@ -724,10 +725,15 @@ impl SecurityTasks {
 
     /// Sends `ActionFailed` for a devices action from a task (the handlers do
     /// not wait on the channel).
-    fn spawn_failed(&mut self, events: &mpsc::Sender<CoreEvent>, error: CoreError) {
+    fn spawn_failed(
+        &mut self,
+        events: &mpsc::Sender<CoreEvent>,
+        action: ActionKind,
+        error: CoreError,
+    ) {
         let events = events.clone();
         self.tasks.spawn(async move {
-            report(&events, ActionKind::Devices, Stop::Failed(error)).await;
+            report(&events, action, Stop::Failed(error)).await;
         });
     }
 
@@ -743,7 +749,7 @@ impl SecurityTasks {
             // Already watching: answer this request on its own.
             let (client, events) = (client.clone(), events.clone());
             self.tasks
-                .spawn(async move { send_devices(&client, &events).await });
+                .spawn(async move { send_devices(&client, &events, ActionKind::Devices).await });
         } else {
             self.devices_watch = Some(tokio::spawn(watch_devices(client.clone(), events.clone())));
         }
@@ -759,13 +765,13 @@ impl SecurityTasks {
     ) {
         let name = match clean_device_name(name) {
             Ok(name) => name,
-            Err(error) => return self.spawn_failed(events, error),
+            Err(error) => return self.spawn_failed(events, ActionKind::Devices, error),
         };
         let device = OwnedDeviceId::from(device_id.as_str());
         let (client, events) = (client.clone(), events.clone());
         self.tasks.spawn(async move {
             match client.rename_device(&device, &name).await {
-                Ok(_) => send_devices(&client, &events).await,
+                Ok(_) => send_devices(&client, &events, ActionKind::Devices).await,
                 Err(_) => {
                     let error = CoreError::Internal("the device could not be renamed".into());
                     report(&events, ActionKind::Devices, Stop::Failed(error)).await;
@@ -784,10 +790,10 @@ impl SecurityTasks {
         events: &mpsc::Sender<CoreEvent>,
     ) {
         let (Some(me), Some(current)) = (client.user_id(), client.device_id()) else {
-            return self.spawn_failed(events, CoreError::NotLoggedIn);
+            return self.spawn_failed(events, ActionKind::SignOutDevices, CoreError::NotLoggedIn);
         };
         if let Err(error) = sign_out_precheck(device_ids, current.as_str()) {
-            return self.spawn_failed(events, error);
+            return self.spawn_failed(events, ActionKind::SignOutDevices, error);
         }
         let devices: Vec<OwnedDeviceId> = device_ids
             .iter()
@@ -805,8 +811,8 @@ impl SecurityTasks {
                 devices: &devices,
             };
             match delete_flow(&api, &me, password.as_ref()).await {
-                Ok(()) => send_devices(&client, &events).await,
-                Err(stop) => report(&events, ActionKind::Devices, stop).await,
+                Ok(()) => send_devices(&client, &events, ActionKind::SignOutDevices).await,
+                Err(stop) => report(&events, ActionKind::SignOutDevices, stop).await,
             }
         });
     }
@@ -1462,7 +1468,7 @@ async fn open_account_page(
         Some(url) => CoreEvent::OpenAccountManagement(url),
         None => CoreEvent::ActionFailed {
             room_id: RoomId::from(""),
-            action: ActionKind::Devices,
+            action: ActionKind::SignOutDevices,
             error: CoreError::Internal(MANAGE_ON_ACCOUNT_PAGE.into()),
         },
     };
@@ -1507,12 +1513,12 @@ async fn read_devices(client: &Client) -> Result<Vec<DeviceSummary>, CoreError> 
 }
 
 /// Sends `Devices`, or the reason it could not be read.
-async fn send_devices(client: &Client, events: &mpsc::Sender<CoreEvent>) {
+async fn send_devices(client: &Client, events: &mpsc::Sender<CoreEvent>, failure: ActionKind) {
     let event = match read_devices(client).await {
         Ok(devices) => CoreEvent::Devices(devices),
         Err(error) => CoreEvent::ActionFailed {
             room_id: RoomId::from(""),
-            action: ActionKind::Devices,
+            action: failure,
             error,
         },
     };

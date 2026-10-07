@@ -296,22 +296,13 @@ impl SessionsModel {
     }
 }
 
-/// The core's text for a sign-out the server refused (`SIGN_OUT_FAILED`).
-const SIGN_OUT_FAILED: &str = "the devices could not be signed out";
-/// The core's text when an OAuth server has no account page
-/// (`MANAGE_ON_ACCOUNT_PAGE`).
-const MANAGE_ON_ACCOUNT_PAGE: &str = "manage your devices on your account page";
-
-/// Whether a `Devices` failure is one `SignOutDevices` emits (see the core's
-/// `sign_out_devices`). `NotAllowed` and `NotLoggedIn` are shared with a rename
-/// and a list, but the app never sends a rename that the core would call not
-/// allowed, and with no session nothing else can go on either.
-fn ends_sign_out(error: &CoreError) -> bool {
-    match error {
-        CoreError::ReauthFailed | CoreError::NotAllowed | CoreError::NotLoggedIn => true,
-        CoreError::Internal(text) => text == SIGN_OUT_FAILED || text == MANAGE_ON_ACCOUNT_PAGE,
-        _ => false,
-    }
+/// The one-line notice for a failed action.
+fn failure_line(error: &CoreError) -> String {
+    let text = match error {
+        CoreError::Internal(text) => text.clone(),
+        other => other.to_string(),
+    };
+    one_line_capped(&text, 512)
 }
 
 impl App {
@@ -569,10 +560,18 @@ impl App {
         iced::widget::operation::focus(REAUTH_INPUT_ID)
     }
 
-    /// `ActionFailed { Devices }`.
+    /// `ActionFailed { Devices }`: a list, a rename or a trust watch. It never
+    /// ends a sign-out; that is [`Self::on_sign_out_failed`]'s.
     pub(crate) fn on_devices_failed(&mut self, error: &CoreError) {
         let model = &mut self.sessions;
         model.loading = false;
+        model.notice = Some(failure_line(error));
+    }
+
+    /// `ActionFailed { SignOutDevices }`: whatever the error, the sign-out is
+    /// over. A refused password with the prompt open keeps the prompt.
+    pub(crate) fn on_sign_out_failed(&mut self, error: &CoreError) {
+        let model = &mut self.sessions;
         if let (CoreError::ReauthFailed, Some(prompt)) = (error, model.reauth.as_mut()) {
             // The prompt stays, so the password can be typed again.
             prompt.waiting = false;
@@ -580,16 +579,8 @@ impl App {
             prompt.password = Password::from(String::new());
             return;
         }
-        // `ListDevices`, `RenameDevice` and `WatchUserTrust` fail with the same
-        // kind: only the sign-out's own failures end it.
-        if ends_sign_out(error) {
-            model.end_sign_out();
-        }
-        let text = match error {
-            CoreError::Internal(text) => text.clone(),
-            other => other.to_string(),
-        };
-        model.notice = Some(one_line_capped(&text, 512));
+        model.end_sign_out();
+        model.notice = Some(failure_line(error));
     }
 
     /// `OpenAccountManagement` for a sign-out: checked now, opened only after

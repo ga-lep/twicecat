@@ -983,6 +983,11 @@ impl App {
                 error,
                 ..
             } => self.on_devices_failed(&error),
+            CoreEvent::ActionFailed {
+                action: ActionKind::SignOutDevices,
+                error,
+                ..
+            } => self.on_sign_out_failed(&error),
             CoreEvent::ReauthRequired {
                 action: ReauthAction::DeleteDevices,
             } => task = self.on_sessions_reauth(),
@@ -5059,7 +5064,7 @@ mod tests {
         assert!(app.sessions.reauth.is_some());
         let _ = app.update(core(CoreEvent::ActionFailed {
             room_id: RoomId::from(""),
-            action: ActionKind::Devices,
+            action: ActionKind::SignOutDevices,
             error: CoreError::ReauthFailed,
         }));
         let prompt = app.sessions.reauth.as_ref().expect("the prompt stays");
@@ -5124,8 +5129,8 @@ mod tests {
         let (mut app, _rx) = reauth_asked();
         let _ = app.update(core(CoreEvent::ActionFailed {
             room_id: RoomId::from(""),
-            action: ActionKind::Devices,
-            error: CoreError::Internal("the devices could not be signed out".into()),
+            action: ActionKind::SignOutDevices,
+            error: CoreError::Network("the devices could not be loaded".into()),
         }));
         assert!(app.sessions.reauth.is_none() && app.sessions.pending.is_none());
         let notice = app.sessions.notice.clone().expect("a notice");
@@ -5216,6 +5221,9 @@ mod tests {
             CoreError::Internal("the device could not be renamed".into()),
             CoreError::Network("the devices could not be loaded".into()),
             CoreError::Internal("that is not a valid user ID".into()),
+            CoreError::NotAllowed,
+            CoreError::NotLoggedIn,
+            CoreError::ReauthFailed,
         ];
         for error in others {
             let (mut app, mut rx) = sessions_app();
@@ -5244,14 +5252,23 @@ mod tests {
         }
     }
 
+    fn sign_out_failed(app: &mut App, error: CoreError) {
+        let _ = app.update(core(CoreEvent::ActionFailed {
+            room_id: RoomId::from(""),
+            action: ActionKind::SignOutDevices,
+            error,
+        }));
+    }
+
     #[test]
-    fn a_sign_outs_own_failures_end_it() {
+    fn a_sign_out_failure_of_any_error_ends_it_with_a_one_line_notice() {
         let own = [
             CoreError::ReauthFailed,
             CoreError::NotAllowed,
             CoreError::NotLoggedIn,
-            CoreError::Internal("the devices could not be signed out".into()),
-            CoreError::Internal("manage your devices on your account page".into()),
+            CoreError::Busy,
+            CoreError::Network("the devices could not be loaded".into()),
+            CoreError::Internal("anything at all".into()),
         ];
         for error in own {
             let (mut app, mut rx) = sessions_app();
@@ -5261,9 +5278,49 @@ mod tests {
             );
             let _ = ses(&mut app, SessionsMessage::SignOutConfirmed);
             let _ = drain(&mut rx);
-            devices_failed(&mut app, error.clone());
+            sign_out_failed(&mut app, error.clone());
             assert!(app.sessions.pending.is_none(), "{error:?} kept it");
+            let notice = app.sessions.notice.clone().expect("a notice");
+            assert!(!notice.contains('\n') && !notice.is_empty(), "{error:?}");
         }
+    }
+
+    #[test]
+    fn a_network_failure_after_the_delete_ends_the_sign_out_and_a_reset_is_allowed() {
+        let (mut app, mut rx) = signed_out_and_closed();
+        sign_out_failed(
+            &mut app,
+            CoreError::Network("the devices could not be loaded".into()),
+        );
+        assert!(app.sessions.pending.is_none());
+        let _ = sec(&mut app, SecurityMessage::ResetRequested);
+        let _ = sec(&mut app, SecurityMessage::ResetConfirmed);
+        assert!(!drain(&mut rx).is_empty(), "the reset was sent");
+    }
+
+    #[test]
+    fn the_same_failure_of_the_devices_kind_keeps_a_closed_sign_out_pending() {
+        let (mut app, mut rx) = signed_out_and_closed();
+        devices_failed(
+            &mut app,
+            CoreError::Network("the devices could not be loaded".into()),
+        );
+        assert!(app.sessions.pending.is_some());
+        let _ = sec(&mut app, SecurityMessage::ResetRequested);
+        let _ = sec(&mut app, SecurityMessage::ResetConfirmed);
+        assert!(drain(&mut rx).is_empty(), "no reset was sent");
+    }
+
+    #[test]
+    fn reopening_the_screen_lists_again_and_the_answer_ends_a_sign_out() {
+        let (mut app, mut rx) = signed_out_and_closed();
+        let _ = ses(&mut app, SessionsMessage::Open);
+        assert!(matches!(drain(&mut rx).as_slice(), [Command::ListDevices]));
+        let _ = ses(&mut app, SessionsMessage::Refresh);
+        assert!(matches!(drain(&mut rx).as_slice(), [Command::ListDevices]));
+        assert!(app.sessions.pending.is_some());
+        let _ = app.update(core(CoreEvent::Devices(vec![])));
+        assert!(app.sessions.pending.is_none());
     }
 
     #[test]
@@ -5418,8 +5475,8 @@ mod tests {
         let (mut app, mut rx) = signed_out_and_closed();
         let _ = app.update(core(CoreEvent::ActionFailed {
             room_id: RoomId::from(""),
-            action: ActionKind::Devices,
-            error: CoreError::Internal("the devices could not be signed out".into()),
+            action: ActionKind::SignOutDevices,
+            error: CoreError::Network("the devices could not be loaded".into()),
         }));
         assert!(app.sessions.pending.is_none());
         let _ = sec(&mut app, SecurityMessage::ResetRequested);
@@ -5567,7 +5624,7 @@ mod tests {
         let _ = app.view();
         let _ = app.update(core(CoreEvent::ActionFailed {
             room_id: RoomId::from(""),
-            action: ActionKind::Devices,
+            action: ActionKind::SignOutDevices,
             error: CoreError::ReauthFailed,
         }));
         let _ = app.view();
