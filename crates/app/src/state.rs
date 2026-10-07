@@ -986,8 +986,11 @@ impl App {
             CoreEvent::ReauthRequired {
                 action: ReauthAction::DeleteDevices,
             } => task = self.on_sessions_reauth(),
+            // A sign-out in flight owns the page, even with its screen closed
+            // (a reset is refused while one runs).
             CoreEvent::OpenAccountManagement(url)
-                if self.security.busy != Some(Busy::Resetting) =>
+                if self.sessions.pending.is_some()
+                    || self.security.busy != Some(Busy::Resetting) =>
             {
                 task = self.on_sessions_url(&url);
             }
@@ -5249,6 +5252,71 @@ mod tests {
             assert!(app.sessions.notice.is_some(), "{url}");
             assert_eq!(ses(&mut app, SessionsMessage::ApprovalConfirmed).units(), 0);
         }
+    }
+
+    /// Signs the phone out, closes the screen at once and resets afterwards.
+    fn signed_out_and_closed() -> (App, mpsc::Receiver<Command>) {
+        let (mut app, mut rx) = sessions_app();
+        set_status(
+            &mut app,
+            DeviceVerification::Unverified,
+            RecoveryStatus::Enabled,
+        );
+        let _ = ses(
+            &mut app,
+            SessionsMessage::SignOutAsk(DeviceId::from("PHONE")),
+        );
+        let _ = ses(&mut app, SessionsMessage::SignOutConfirmed);
+        let _ = ses(&mut app, SessionsMessage::Close);
+        let _ = drain(&mut rx);
+        (app, rx)
+    }
+
+    #[test]
+    fn closing_the_screen_keeps_a_running_sign_out_from_overlapping_a_reset() {
+        let (mut app, mut rx) = signed_out_and_closed();
+        assert!(app.sessions.pending.is_some());
+        let _ = sec(&mut app, SecurityMessage::ResetRequested);
+        let _ = sec(&mut app, SecurityMessage::ResetConfirmed);
+        assert!(drain(&mut rx).is_empty(), "no reset was sent");
+        assert!(app.security.busy.is_none());
+    }
+
+    #[test]
+    fn an_account_page_after_close_goes_to_the_bar_not_the_browser() {
+        let (mut app, _rx) = signed_out_and_closed();
+        let busy = app.security.busy;
+        let task = app.update(core(CoreEvent::OpenAccountManagement(AuthUrl::from(
+            "https://account.example.org/devices",
+        ))));
+        assert_eq!(task.units(), 0, "nothing opens without a click");
+        assert_eq!(app.security.busy, busy);
+        assert!(app.sessions.approval.is_some());
+        assert!(app.sessions.pending.is_none());
+    }
+
+    #[test]
+    fn a_sign_out_closed_early_ends_on_the_cores_answer_and_a_reset_is_allowed() {
+        let (mut app, mut rx) = signed_out_and_closed();
+        let _ = app.update(core(CoreEvent::ActionFailed {
+            room_id: RoomId::from(""),
+            action: ActionKind::Devices,
+            error: CoreError::Internal("nope".into()),
+        }));
+        assert!(app.sessions.pending.is_none());
+        let _ = sec(&mut app, SecurityMessage::ResetRequested);
+        let _ = sec(&mut app, SecurityMessage::ResetConfirmed);
+        assert!(!drain(&mut rx).is_empty(), "the reset was sent");
+
+        let (mut app, _rx) = signed_out_and_closed();
+        let _ = app.update(core(CoreEvent::ReauthRequired {
+            action: ReauthAction::DeleteDevices,
+        }));
+        assert!(app.sessions.pending.is_none() && app.sessions.reauth.is_none());
+
+        let (mut app, _rx) = signed_out_and_closed();
+        let _ = app.update(core(CoreEvent::Devices(vec![])));
+        assert!(app.sessions.pending.is_none());
     }
 
     #[test]

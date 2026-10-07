@@ -315,7 +315,11 @@ impl App {
                 model.confirm = None;
                 model.approval = None;
                 model.notice = None;
-                model.end_sign_out();
+                // The prompt (and its password) goes, but a sign-out the core
+                // is still running stays in `pending` until the core answers:
+                // a reset must not start meanwhile, and the account page it
+                // may answer with must not be taken for the reset's.
+                model.reauth = None;
                 Task::none()
             }
             M::Refresh => {
@@ -527,8 +531,15 @@ impl App {
     }
 
     /// `ReauthRequired { DeleteDevices }`: only for a sign-out the user sent.
+    ///
+    /// With the screen closed the sign-out ends here, quietly: no prompt
+    /// appears on its own, and the user can start the sign-out again.
     pub(crate) fn on_sessions_reauth(&mut self) -> Task<Message> {
         if self.sessions.pending.is_none() {
+            return Task::none();
+        }
+        if !self.sessions.open {
+            self.sessions.end_sign_out();
             return Task::none();
         }
         self.sessions.reauth = Some(ReauthPrompt::new(ReauthAction::DeleteDevices));
