@@ -5647,4 +5647,138 @@ mod tests {
         let _ = ses(&mut app, SessionsMessage::Close);
         let _ = app.view();
     }
+
+    // ---- Task 14: redaction sweep ----
+
+    /// Asserts none of `sentinels` appears in `text`; the sentinel is named,
+    /// the text (which may carry the leak) is not printed.
+    fn assert_no_sentinel(context: &str, text: &str, sentinels: &[&str]) {
+        for sentinel in sentinels {
+            assert!(
+                !text.contains(sentinel),
+                "{context}: `{sentinel}` reached a Debug string"
+            );
+        }
+    }
+
+    const KEY_S: &str = "secret-key-sweep";
+    const INPUT_S: &str = "secret-input-sweep";
+    const COPIED_S: &str = "secret-copied-sweep";
+    const PW_S: &str = "secret-pw-sweep";
+    const EMOJI_S: &str = "secret-emoji-sweep";
+    const NAME_S: &str = "secret-name-sweep";
+    const ALL_S: [&str; 6] = [KEY_S, INPUT_S, COPIED_S, PW_S, EMOJI_S, NAME_S];
+
+    /// Every message that can carry a secret, built the way the app and the
+    /// core build them.
+    fn secret_messages() -> Vec<Message> {
+        vec![
+            core(CoreEvent::RecoveryKeyReady(RecoveryKey::from(KEY_S))),
+            Message::Security(SecurityMessage::RestoreInput(RecoveryKey::from(INPUT_S))),
+            Message::Security(SecurityMessage::ClipboardRead(Some(RecoveryKey::from(
+                COPIED_S,
+            )))),
+            Message::Security(SecurityMessage::ClipboardFlushed(
+                Some(RecoveryKey::from(COPIED_S)),
+                RecoveryKey::from(KEY_S),
+            )),
+            Message::Security(SecurityMessage::ReauthInput(Password::from(PW_S))),
+            Message::Sessions(SessionsMessage::ReauthInput(Password::from(PW_S))),
+            core(CoreEvent::Verification {
+                id: vid(),
+                phase: tessera_core::api::VerificationPhase::ShowQr(vqr()),
+            }),
+        ]
+    }
+
+    #[test]
+    fn the_redaction_sweep_finds_no_secret_in_any_state_or_message() {
+        use tessera_core::api::VerificationPhase;
+
+        // The show-once key screen, with a copy pending.
+        let (mut app, _rx) = recovery_app();
+        key_ready(&mut app, KEY_S);
+        app.security.copied = Some(RecoveryKey::from(COPIED_S));
+        assert!(app.security.setup.is_some(), "the key screen is open");
+        assert_no_sentinel("key screen", &format!("{app:?}"), &ALL_S);
+
+        // A restore input with typed text.
+        let (mut app, _rx) = identity_app();
+        let _ = sec(&mut app, SecurityMessage::OpenRestore);
+        let _ = sec(
+            &mut app,
+            SecurityMessage::RestoreInput(RecoveryKey::from(INPUT_S)),
+        );
+        assert_eq!(app.security.restore_input.expose(), INPUT_S);
+        assert_no_sentinel("restore input", &format!("{app:?}"), &ALL_S);
+
+        // The reset re-authentication modal with a typed password.
+        let (mut app, _rx) = recovery_app();
+        let _ = app.update(core(CoreEvent::ReauthRequired {
+            action: ReauthAction::ResetIdentity,
+        }));
+        let _ = sec(&mut app, SecurityMessage::ReauthInput(Password::from(PW_S)));
+        assert!(app.security.reauth.is_some(), "the prompt is open");
+        assert_no_sentinel("reset prompt", &format!("{app:?}"), &ALL_S);
+
+        // The Sessions password prompt (the other re-authentication modal).
+        let (mut app, _rx) = reauth_asked();
+        let _ = ses(&mut app, SessionsMessage::ReauthInput(Password::from(PW_S)));
+        assert!(app.sessions.reauth.is_some(), "the prompt is open");
+        assert_no_sentinel("sessions prompt", &format!("{app:?}"), &ALL_S);
+
+        // A verification in Emojis, and one in ShowQr.
+        let (mut app, _rx) = verifying(true);
+        let set = Box::new(std::array::from_fn(|_| SasEmoji {
+            symbol: "\u{1F436}".to_owned(),
+            description: EMOJI_S.to_owned(),
+        }));
+        let _ = app.update(core(CoreEvent::Verification {
+            id: vid(),
+            phase: VerificationPhase::Emojis(set),
+        }));
+        assert_eq!(
+            app.verification.as_ref().map(|v| v.phase.kind()),
+            Some("emojis")
+        );
+        assert_no_sentinel("emojis", &format!("{app:?}"), &ALL_S);
+
+        let (mut app, _rx) = verifying(true);
+        let _ = app.update(core(CoreEvent::Verification {
+            id: vid(),
+            phase: VerificationPhase::ShowQr(vqr()),
+        }));
+        assert_eq!(
+            app.verification.as_ref().map(|v| v.phase.kind()),
+            Some("show_qr")
+        );
+        // The test grid is all dark, so any dump of the modules repeats `true`.
+        let dbg = format!("{app:?}");
+        assert!(
+            !dbg.contains("true, true") && !dbg.contains("dark"),
+            "QR modules printed"
+        );
+
+        // The Sessions screen, with a rename in progress.
+        let (mut app, _rx) = main_app();
+        let _ = ses(&mut app, SessionsMessage::Open);
+        let _ = app.update(core(CoreEvent::Devices(vec![
+            summary("THIS", Some(NAME_S), true, DeviceTrust::Verified),
+            summary("PHONE", Some(NAME_S), false, DeviceTrust::Unverified),
+        ])));
+        let _ = ses(
+            &mut app,
+            SessionsMessage::RenameStart(DeviceId::from("PHONE")),
+        );
+        let _ = ses(&mut app, SessionsMessage::RenameInput(NAME_S.to_owned()));
+        assert!(app.sessions.open && app.sessions.rename.is_some());
+        assert_no_sentinel("sessions", &format!("{app:?}"), &ALL_S);
+
+        // The messages that carry secrets.
+        for message in secret_messages() {
+            let dbg = format!("{message:?}");
+            assert_no_sentinel("message", &dbg, &ALL_S);
+            assert!(!dbg.contains("true, true"), "QR modules printed");
+        }
+    }
 }
