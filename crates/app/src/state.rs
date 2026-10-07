@@ -341,6 +341,11 @@ pub struct App {
     pub security: SecurityModel,
     /// Set when the app decided to exit (the task itself is opaque to tests).
     pub exit_requested: bool,
+    /// Clipboard reads sent by `drop_secrets` whose answer is still due.
+    pub(crate) flushes_pending: u32,
+    /// The core closed while the window was closing; exit waits for the
+    /// pending clipboard flushes.
+    pub(crate) core_closed: bool,
 }
 
 // Manual impl: the sink and the event slot are not `Debug`, and the composer
@@ -406,6 +411,8 @@ impl App {
             draft_dirty: false,
             security: SecurityModel::default(),
             exit_requested: false,
+            flushes_pending: 0,
+            core_closed: false,
         };
         let restore = app.send(Command::RestoreSession);
         let boot = Task::batch([restore, system::theme().map(Message::ThemeMode)]);
@@ -463,7 +470,8 @@ impl App {
             Message::Core(event) => self.on_core(*event),
             Message::CoreClosed => {
                 if self.screen == Screen::ShuttingDown {
-                    self.exit()
+                    self.core_closed = true;
+                    self.exit_if_flushed(Task::none())
                 } else {
                     self.screen = Screen::Disconnected;
                     self.drop_secrets()
@@ -730,6 +738,18 @@ impl App {
                     Task::none()
                 }
             }
+        }
+    }
+
+    /// Exits once the core has closed and every clipboard flush has been
+    /// answered, so the clear write is issued first (`ShutdownDeadline`
+    /// stays the hard limit). Otherwise returns `task` unchanged.
+    pub(crate) fn exit_if_flushed(&mut self, task: Task<Message>) -> Task<Message> {
+        if self.screen == Screen::ShuttingDown && self.core_closed && self.flushes_pending == 0 {
+            self.exit_requested = true;
+            task.chain(iced::exit())
+        } else {
+            task
         }
     }
 
@@ -4097,6 +4117,44 @@ mod tests {
         // Nothing copied: nothing to check.
         let (mut app, _rx) = recovery_app();
         assert_eq!(app.update(Message::LogoutRequested).units(), 0);
+    }
+
+    #[test]
+    fn close_waits_for_the_clipboard_clear_before_exiting() {
+        let key = RecoveryKey::from("secret-key-x");
+        let mut app = copied_app();
+        let _ = app.update(Message::CloseRequested);
+        // The core closes first: the flush has not been answered yet.
+        let _ = app.update(Message::CoreClosed);
+        assert!(!app.exit_requested, "exit must wait for the flush");
+        let flushed = SecurityMessage::ClipboardFlushed(Some(key.clone()), key.clone());
+        assert!(sec(&mut app, flushed).units() > 0, "the clear is written");
+        assert!(app.exit_requested);
+        // The flush answered first: the core closing then exits at once.
+        let mut app = copied_app();
+        let _ = app.update(Message::CloseRequested);
+        let flushed = SecurityMessage::ClipboardFlushed(Some(key.clone()), key);
+        let _ = sec(&mut app, flushed);
+        assert!(!app.exit_requested, "the core has not closed yet");
+        let _ = app.update(Message::CoreClosed);
+        assert!(app.exit_requested);
+        // The deadline stays the hard limit.
+        let mut app = copied_app();
+        let _ = app.update(Message::CloseRequested);
+        let _ = app.update(Message::ShutdownDeadline);
+        assert!(app.exit_requested);
+    }
+
+    #[test]
+    fn back_and_a_closed_restore_screen_empty_the_restore_field() {
+        let (mut app, _rx) = recovery_app();
+        let _ = sec(&mut app, SecurityMessage::OpenRestore);
+        let _ = sec(
+            &mut app,
+            SecurityMessage::RestoreInput(RecoveryKey::from("secret-input-x")),
+        );
+        let _ = sec(&mut app, SecurityMessage::Back);
+        assert_eq!(app.security.restore_input.expose(), "");
     }
 
     #[test]

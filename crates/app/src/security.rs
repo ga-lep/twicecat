@@ -429,11 +429,14 @@ impl App {
                 }
             }
             M::ClipboardFlushed(held, key) => {
-                if should_clear_clipboard(held.as_ref().map(RecoveryKey::expose), &key) {
+                self.flushes_pending = self.flushes_pending.saturating_sub(1);
+                let clear = if should_clear_clipboard(held.as_ref().map(RecoveryKey::expose), &key)
+                {
                     clipboard::write(String::new())
                 } else {
                     Task::none()
-                }
+                };
+                self.exit_if_flushed(clear)
             }
             M::SavedToggled(ticked) => {
                 if let Some(setup) = &mut self.security.setup {
@@ -490,6 +493,7 @@ impl App {
                 if self.security.busy.is_none() {
                     self.security.overlay = self.security.back_target();
                     self.security.notice = None;
+                    self.security.restore_input = RecoveryKey::from(String::new());
                 }
                 Task::none()
             }
@@ -561,12 +565,15 @@ impl App {
         let copied = self.security.copied.take();
         self.security.clear_secrets();
         match copied {
-            Some(key) => clipboard::read().map(move |held| {
-                Message::Security(SecurityMessage::ClipboardFlushed(
-                    held.map(RecoveryKey::from),
-                    key.clone(),
-                ))
-            }),
+            Some(key) => {
+                self.flushes_pending += 1;
+                clipboard::read().map(move |held| {
+                    Message::Security(SecurityMessage::ClipboardFlushed(
+                        held.map(RecoveryKey::from),
+                        key.clone(),
+                    ))
+                })
+            }
             None => Task::none(),
         }
     }
@@ -652,6 +659,7 @@ impl App {
 
     fn on_status(&mut self, status: SecurityStatus) -> Task<Message> {
         let model = &mut self.security;
+        let was_restore = model.overlay == Some(Overlay::Restore);
         model.status = status;
         if model.busy == Some(Busy::Resetting) && reset_finished(&status) {
             // The core holds the reset's own event until the reset is over;
@@ -678,6 +686,9 @@ impl App {
             && needs_identity_screen(&status, model.fresh_login, model.identity_screen_skipped)
         {
             model.overlay = Some(Overlay::ConfirmIdentity);
+        }
+        if was_restore && model.overlay != Some(Overlay::Restore) {
+            model.restore_input = RecoveryKey::from(String::new());
         }
         Task::none()
     }
