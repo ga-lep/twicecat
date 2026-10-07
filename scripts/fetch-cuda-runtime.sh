@@ -2,7 +2,7 @@
 # Downloads NVIDIA's CUDA 13 and cuDNN 9 runtime libraries for the opt-in
 # GPU speech enhancement (plan Task 13b) on Linux x86_64, without a system
 # CUDA install or root: NVIDIA's own PyPI wheels at pinned versions, checked
-# against the SHA-256 in scripts/cuda-runtime.sha256, their shared libraries
+# against the SHA-256 in scripts/checksums/cuda-runtime.sha256, their shared libraries
 # unpacked into one cache dir, whose path is printed. Tessera preloads the
 # libraries from there before ONNX Runtime's CUDA provider starts (or from
 # TESSERA_CUDA_DIR). With CUDA 13 and cuDNN 9 installed system-wide this is
@@ -20,7 +20,7 @@ cd "$(dirname "$0")/.."
 # CUDA 13.0 runtime, cuBLAS 13.1, cuRAND 10.4, NVRTC 13.0, cuDNN 9.24: what
 # ONNX Runtime 1.28's CUDA 13 build loads.
 version=13.0
-sums=scripts/cuda-runtime.sha256
+sums=scripts/checksums/cuda-runtime.sha256
 
 die() { echo "error: $*" >&2; exit 1; }
 

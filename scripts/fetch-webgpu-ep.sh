@@ -3,7 +3,7 @@
 # speech enhancement on GPUs that CUDA and TensorRT do not reach (plan Task
 # 13b part 4: AMD, Intel, the Steam Deck; Vulkan on Linux, Direct3D 12 on
 # Windows, Metal on macOS): Microsoft's wheel at a pinned version, checked
-# against the SHA-256 in scripts/webgpu-ep.sha256. Only the library (Dawn
+# against the SHA-256 in scripts/checksums/webgpu-ep.sha256. Only the library (Dawn
 # inside, one file), its licence and its third-party notices are unpacked.
 # Tessera registers it with ONNX Runtime from the printed directory (or
 # TESSERA_WEBGPU_EP_DIR). Needs scripts/fetch-onnxruntime.sh (1.24.4 or
@@ -18,7 +18,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 version=0.4.0
-sums=scripts/webgpu-ep.sha256
+sums=scripts/checksums/webgpu-ep.sha256
 
 die() { echo "error: $*" >&2; exit 1; }
 

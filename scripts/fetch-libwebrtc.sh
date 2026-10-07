@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Downloads LiveKit's prebuilt libwebrtc for the pinned tag, checks it against
-# the SHA-256 in scripts/libwebrtc.sha256, unpacks it into a cache dir, and
+# the SHA-256 in scripts/checksums/libwebrtc.sha256, unpacks it into a cache dir, and
 # prints the directory to export as LK_CUSTOM_WEBRTC. webrtc-sys would
 # otherwise download the same zip at build time without any checksum.
 # For a host build it also links the unpacked entries into dev/libwebrtc, which
@@ -16,7 +16,7 @@ cd "$(dirname "$0")/.."
 
 # Must match WEBRTC_TAG in the locked webrtc-sys-build (src/lib.rs).
 tag=webrtc-89d790b
-sums=scripts/libwebrtc.sha256
+sums=scripts/checksums/libwebrtc.sha256
 
 die() { echo "error: $*" >&2; exit 1; }
 

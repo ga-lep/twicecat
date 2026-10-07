@@ -2,7 +2,7 @@
 # Downloads NVIDIA's TensorRT 10 runtime for the GPU speech enhancement's
 # TensorRT backend (plan Task 13b), on Linux x86_64, without root: NVIDIA's
 # own wheel at a pinned version, checked against the SHA-256 in
-# scripts/tensorrt.sha256. Only what ONNX Runtime's TensorRT provider loads
+# scripts/checksums/tensorrt.sha256. Only what ONNX Runtime's TensorRT provider loads
 # is unpacked: the runtime, its ONNX parser and plugins, and the engine
 # builder's resources for this machine's GPU (from nvidia-smi; all Linux
 # ones when it is missing) plus the portable PTX ones. Tessera preloads them
@@ -19,7 +19,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 version=10.16.1
-sums=scripts/tensorrt.sha256
+sums=scripts/checksums/tensorrt.sha256
 
 die() { echo "error: $*" >&2; exit 1; }
 

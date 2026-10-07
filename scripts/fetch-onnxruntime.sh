@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Downloads Microsoft's prebuilt ONNX Runtime at the pinned version for the
 # opt-in GPU speech enhancement (plan Task 13b; tessera-audio feature
-# `onnxruntime`), checks the SHA-256 in scripts/onnxruntime.sha256 (GitHub
+# `onnxruntime`), checks the SHA-256 in scripts/checksums/onnxruntime.sha256 (GitHub
 # release digests), unpacks it into a cache dir, and prints the directory
 # holding the shared library. Tessera loads it from there at run time (or
 # from TESSERA_ONNXRUNTIME_DIR); nothing is linked at build time.
@@ -19,7 +19,7 @@ cd "$(dirname "$0")/.."
 
 # Matches the API level of the locked ort crate (2.0.0-rc.13, ONNX Runtime 1.28).
 version=1.28.3
-sums=scripts/onnxruntime.sha256
+sums=scripts/checksums/onnxruntime.sha256
 
 die() { echo "error: $*" >&2; exit 1; }
 

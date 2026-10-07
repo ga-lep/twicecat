@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Downloads the DeepFilterNet3 ONNX models (Rikorose/DeepFilterNet v0.5.6,
 # MIT OR Apache-2.0) at a pinned commit, checks the SHA-256 in
-# scripts/models.sha256, unpacks them into a cache dir, and prints that
+# scripts/checksums/models.sha256, unpacks them into a cache dir, and prints that
 # directory. tessera-audio looks for the models there (or in
 # TESSERA_MODEL_DIR); without them DeepFilterNet falls back to RNNoise.
 #
@@ -14,7 +14,7 @@ cd "$(dirname "$0")/.."
 # DeepFilterNet's v0.5.6 tag.
 commit=978576aa8400552a4ce9730838c635aa30db5e61
 archive=DeepFilterNet3_onnx.tar.gz
-sums=scripts/models.sha256
+sums=scripts/checksums/models.sha256
 
 die() { echo "error: $*" >&2; exit 1; }
 

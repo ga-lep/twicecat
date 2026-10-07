@@ -5,7 +5,7 @@
 #      (PyTorch's CPU build; no GPU needed),
 #   2. DeepFilterNet's sources at the pinned commit (tag v0.5.6, the release
 #      the fetched models come from) and its DeepFilterNet3 checkpoint,
-#      checked against scripts/models.sha256,
+#      checked against scripts/checksums/models.sha256,
 #   3. scripts/export-deepfilternet-stateful.py, which exports the graph and
 #      compares it frame by frame with upstream's graphs (scripts/fetch-models.sh),
 #   4. the result checked against its pinned SHA-256 (the export is
@@ -21,7 +21,7 @@ cd "$(dirname "$0")/.."
 
 commit=978576aa8400552a4ce9730838c635aa30db5e61
 torch_version=2.14.1
-sums=scripts/models.sha256
+sums=scripts/checksums/models.sha256
 model=deepfilternet3_stateful.onnx
 
 die() { echo "error: $*" >&2; exit 1; }
