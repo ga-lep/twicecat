@@ -296,6 +296,24 @@ impl SessionsModel {
     }
 }
 
+/// The core's text for a sign-out the server refused (`SIGN_OUT_FAILED`).
+const SIGN_OUT_FAILED: &str = "the devices could not be signed out";
+/// The core's text when an OAuth server has no account page
+/// (`MANAGE_ON_ACCOUNT_PAGE`).
+const MANAGE_ON_ACCOUNT_PAGE: &str = "manage your devices on your account page";
+
+/// Whether a `Devices` failure is one `SignOutDevices` emits (see the core's
+/// `sign_out_devices`). `NotAllowed` and `NotLoggedIn` are shared with a rename
+/// and a list, but the app never sends a rename that the core would call not
+/// allowed, and with no session nothing else can go on either.
+fn ends_sign_out(error: &CoreError) -> bool {
+    match error {
+        CoreError::ReauthFailed | CoreError::NotAllowed | CoreError::NotLoggedIn => true,
+        CoreError::Internal(text) => text == SIGN_OUT_FAILED || text == MANAGE_ON_ACCOUNT_PAGE,
+        _ => false,
+    }
+}
+
 impl App {
     /// Applies a message of the Sessions screen.
     pub(crate) fn on_sessions(&mut self, message: SessionsMessage) -> Task<Message> {
@@ -498,7 +516,12 @@ impl App {
     /// sign-out's place. While a reset runs this gives a notice and answers
     /// `true`, and the caller starts nothing.
     fn refuse_sign_out_during_reset(&mut self) -> bool {
-        if self.security.busy != Some(Busy::Resetting) {
+        let prompt_open = self
+            .security
+            .reauth
+            .as_ref()
+            .is_some_and(|p| p.action == ReauthAction::ResetIdentity);
+        if self.security.busy != Some(Busy::Resetting) && !prompt_open {
             return false;
         }
         self.sessions.notice =
@@ -557,7 +580,11 @@ impl App {
             prompt.password = Password::from(String::new());
             return;
         }
-        model.end_sign_out();
+        // `ListDevices`, `RenameDevice` and `WatchUserTrust` fail with the same
+        // kind: only the sign-out's own failures end it.
+        if ends_sign_out(error) {
+            model.end_sign_out();
+        }
         let text = match error {
             CoreError::Internal(text) => text.clone(),
             other => other.to_string(),

@@ -5125,7 +5125,7 @@ mod tests {
         let _ = app.update(core(CoreEvent::ActionFailed {
             room_id: RoomId::from(""),
             action: ActionKind::Devices,
-            error: CoreError::Internal("the device could not be renamed".into()),
+            error: CoreError::Internal("the devices could not be signed out".into()),
         }));
         assert!(app.sessions.reauth.is_none() && app.sessions.pending.is_none());
         let notice = app.sessions.notice.clone().expect("a notice");
@@ -5199,6 +5199,124 @@ mod tests {
         let _ = sec(&mut app, SecurityMessage::ResetConfirmed);
         assert!(drain(&mut rx).is_empty());
         assert!(app.sessions.pending.is_some());
+    }
+
+    fn devices_failed(app: &mut App, error: CoreError) {
+        let _ = app.update(core(CoreEvent::ActionFailed {
+            room_id: RoomId::from(""),
+            action: ActionKind::Devices,
+            error,
+        }));
+    }
+
+    #[test]
+    fn another_devices_failure_keeps_the_sign_out_pending() {
+        let others = [
+            CoreError::Internal("the user's trust could not be watched".into()),
+            CoreError::Internal("the device could not be renamed".into()),
+            CoreError::Network("the devices could not be loaded".into()),
+            CoreError::Internal("that is not a valid user ID".into()),
+        ];
+        for error in others {
+            let (mut app, mut rx) = sessions_app();
+            set_status(
+                &mut app,
+                DeviceVerification::Unverified,
+                RecoveryStatus::Enabled,
+            );
+            let _ = ses(
+                &mut app,
+                SessionsMessage::SignOutAsk(DeviceId::from("PHONE")),
+            );
+            let _ = ses(&mut app, SessionsMessage::SignOutConfirmed);
+            let _ = drain(&mut rx);
+            devices_failed(&mut app, error.clone());
+            assert!(app.sessions.pending.is_some(), "{error:?} ended it");
+            let _ = sec(&mut app, SecurityMessage::ResetRequested);
+            let _ = sec(&mut app, SecurityMessage::ResetConfirmed);
+            assert!(drain(&mut rx).is_empty(), "{error:?}: a reset was sent");
+            assert!(app.security.busy.is_none());
+            // The later account page still goes to the approval bar.
+            let _ = app.update(core(CoreEvent::OpenAccountManagement(AuthUrl::from(
+                "https://account.example.org/devices",
+            ))));
+            assert!(app.sessions.approval.is_some(), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn a_sign_outs_own_failures_end_it() {
+        let own = [
+            CoreError::ReauthFailed,
+            CoreError::NotAllowed,
+            CoreError::NotLoggedIn,
+            CoreError::Internal("the devices could not be signed out".into()),
+            CoreError::Internal("manage your devices on your account page".into()),
+        ];
+        for error in own {
+            let (mut app, mut rx) = sessions_app();
+            let _ = ses(
+                &mut app,
+                SessionsMessage::SignOutAsk(DeviceId::from("PHONE")),
+            );
+            let _ = ses(&mut app, SessionsMessage::SignOutConfirmed);
+            let _ = drain(&mut rx);
+            devices_failed(&mut app, error.clone());
+            assert!(app.sessions.pending.is_none(), "{error:?} kept it");
+        }
+    }
+
+    #[test]
+    fn the_reset_password_submit_is_refused_while_a_sign_out_is_pending() {
+        let (mut app, mut rx) = sessions_app();
+        set_status(
+            &mut app,
+            DeviceVerification::Unverified,
+            RecoveryStatus::Enabled,
+        );
+        let _ = ses(
+            &mut app,
+            SessionsMessage::SignOutAsk(DeviceId::from("PHONE")),
+        );
+        let _ = ses(&mut app, SessionsMessage::SignOutConfirmed);
+        // The reset's password prompt arrives while the sign-out runs.
+        let _ = app.update(core(CoreEvent::ReauthRequired {
+            action: ReauthAction::ResetIdentity,
+        }));
+        let _ = drain(&mut rx);
+        let _ = sec(
+            &mut app,
+            SecurityMessage::ReauthInput(Password::from("secret-pw-x")),
+        );
+        let _ = sec(&mut app, SecurityMessage::ReauthSubmitted);
+        assert!(drain(&mut rx).is_empty(), "no reset was sent");
+        assert!(app.security.busy.is_none());
+        assert!(app.security.notice.is_some());
+        assert!(app.sessions.pending.is_some());
+    }
+
+    #[test]
+    fn no_sign_out_starts_while_the_reset_password_prompt_is_open() {
+        let (mut app, mut rx) = sessions_app();
+        set_status(
+            &mut app,
+            DeviceVerification::Unverified,
+            RecoveryStatus::Enabled,
+        );
+        let _ = app.update(core(CoreEvent::ReauthRequired {
+            action: ReauthAction::ResetIdentity,
+        }));
+        assert!(app.security.busy.is_none());
+        let _ = drain(&mut rx);
+        let _ = ses(
+            &mut app,
+            SessionsMessage::SignOutAsk(DeviceId::from("PHONE")),
+        );
+        assert!(app.sessions.confirm.is_none() && app.sessions.notice.is_some());
+        let _ = ses(&mut app, SessionsMessage::SignOutAllAsk);
+        let _ = ses(&mut app, SessionsMessage::SignOutConfirmed);
+        assert!(drain(&mut rx).is_empty(), "no sign-out was sent");
+        assert!(app.sessions.pending.is_none());
     }
 
     /// Signs the phone out on an OAuth session: the core answers with a URL.
@@ -5301,7 +5419,7 @@ mod tests {
         let _ = app.update(core(CoreEvent::ActionFailed {
             room_id: RoomId::from(""),
             action: ActionKind::Devices,
-            error: CoreError::Internal("nope".into()),
+            error: CoreError::Internal("the devices could not be signed out".into()),
         }));
         assert!(app.sessions.pending.is_none());
         let _ = sec(&mut app, SecurityMessage::ResetRequested);

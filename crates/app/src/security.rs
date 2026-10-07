@@ -600,6 +600,14 @@ impl App {
 
     /// Sends the typed password with the action that asked for it.
     fn submit_reauth(&mut self) -> Task<Message> {
+        let resets = self
+            .security
+            .reauth
+            .as_ref()
+            .is_some_and(|p| p.action == ReauthAction::ResetIdentity);
+        if resets && self.refuse_reset_during_sign_out() {
+            return Task::none();
+        }
         let Some(prompt) = self.security.reauth.as_mut() else {
             return Task::none();
         };
