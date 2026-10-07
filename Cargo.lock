@@ -7644,6 +7644,7 @@ dependencies = [
  "matrix-sdk",
  "matrix-sdk-crypto",
  "matrix-sdk-ui",
+ "mime",
  "rand 0.10.3",
  "rpassword",
  "serde",

@@ -650,6 +650,63 @@ App:
 - ~~Windows and macOS (added 2026-10-07): repeat the per-OS checks done on Linux only: verification emoji and their names, the lock (U+1F512), the keychain after these flows, and clearing the copied recovery key on logout or close.~~ **Requirement removed (human decision, 2026-10-07):** not checked on Windows or macOS; risk accepted. These checks were done on Linux (Wayland and X11) only.
 - [x] Read the Phase 4 security review and accept or reject its residuals. Human-confirmed 2026-10-07: read, every residual accepted.
 
+## Phase 5 steps
+- [x] 1. Phase 5 ledger, sign-off record and test helpers (phase5.1)
+- [ ] 2. Phase 5 dependencies and licence triage
+- [ ] 3. Additive core API for Phase 5
+- [ ] 4. Media in the timeline: mapping, fetch and save in the core (roadmap steps 1 and 2, core side)
+- [ ] 5. Uploads with local echo and progress in the core (roadmap step 3, core side)
+- [ ] 6. Notifications, notification settings and unread totals in the core (roadmap step 4, core side)
+- [ ] 7. Rooms, members, profile and spaces in the core (roadmap step 5, core side)
+- [ ] 8. Threads in the core (roadmap step 6, core side)
+- [ ] 9. Media in the timeline in the app: thumbnails, viewer, file cards, save (roadmap steps 1 and 2, UI)
+- [ ] 10. Uploads in the app: picker, drag and drop, paste, thumbnails, progress (roadmap step 3, UI)
+- [ ] 11. Desktop notifications, notification settings UI and tray icon (roadmap step 4, UI)
+- [ ] 12. Room dialogs, room settings, member list and pills (roadmap step 5 UI; Phase 3 and 4 deferrals)
+- [ ] 13. Spaces sidebar and thread panel (roadmap steps 5 and 6, UI)
+- [ ] 14. Local settings storage in the core
+- [ ] 15. Settings screen (roadmap step 7)
+- [ ] 16. Accessibility pass: room switcher and keyboard navigation (roadmap step 8)
+- [ ] 17. Phase 5 wrap-up
+
+Phase 4 signed off by the human on 2026-10-07 and merged (PR #7, 5d2f4fb); QR scan, OAuth and Windows/macOS items deferred or accepted as recorded in the Phase 4 checkpoint. The Phase 4 open issues stay as they are.
+
+## Phase 5 human answers (2026-10-08)
+- Q3: accepted with the latest versions: `notify-rust =4.18.2` and `tray-icon =0.26.1` (not 4.18.1/0.26.0), and the scoped `ksni` Unlicense exception in `deny.toml`.
+- Q4: accepted. No drag and drop on a native Wayland window; the gap is recorded as planned.
+- Q5, Q16: accepted.
+- Q2: accepted. Linux-only human checks (Wayland and X11), no CI gate; pushing the branch for a Windows/macOS CI build is not required by any task or by the checkpoint.
+- Q1, Q6-Q15, Q17-Q21: accepted as recommended (the human gave no specific answer, approved the plan, and said to use the RECOMMENDED option for them and for any later question).
+- During implementation the human is unavailable: questions are answered by the plan's recommendation, and anything rule 8 would stop for is logged here (open issues and the checkpoint list) with the recommendation applied.
+
+## Phase 5 / Task 1 notes
+- Checks run (all pass): `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`, `cargo test --workspace --locked`, `scripts/check-app-deps.sh`, `scripts/check-core-api.sh`, `cargo deny check` (advisories, bans, licenses, sources ok; duplicate-crate warnings only).
+- Ignored run: `docker compose up -d --wait && scripts/prune-test-rooms.sh && cargo test -p tessera-core -p tessera-app --locked -- --ignored --skip keyring`, all pass, **442 s** (about 7.4 min, under the 15-minute limit); then `docker compose stop`. The real-keychain test was not run.
+- Test-first: `tests/rooms.rs` was written before the helpers and failed to compile (missing `create_room_raw` and the others); after the helpers it passes (5 ignored smoke tests: encrypted room readable by carol, plain room has no encryption event, space type and one `m.space.child`, notification baseline leaves no `tessera-kw-` keyword, raw attachment gives an `m.image` event read back with `fetch_raw_event_json`).
+- New helpers in `crates/core/tests/common/mod.rs`: `create_room_raw(n, name, encrypted, invite: &[&str])`, `create_space_raw(n, name, children)`, `leave_all_created(n, ids)`, `reset_notification_baseline(n)`, `send_attachment_raw(n, room, filename, mime, bytes)`, `fetch_raw_event_json(client, room, event)`. Each asserts the local homeserver first and prints only user numbers and counts. `send_attachment_raw` joins the room with a never-synced client, so it sends unencrypted: plain rooms only.
+- `reset_notification_baseline` removes `tessera-kw-` keywords, sets all four default modes (encrypted x one-to-one) to `AllMessages` (Synapse's default: its `.m.rule.message`, `.m.rule.encrypted`, `.m.rule.room_one_to_one` and `.m.rule.encrypted_room_one_to_one` all notify), and deletes every user-defined room rule of that account (the signature has no room list, so all of them; the test accounts only hold test rooms).
+- Fixtures in `crates/core/tests/fixtures/` (generated once with Pillow, total about 19 KiB): `photo-1200x900.png` and `small-64x48.png` (both with a `tEXt` `Comment` chunk `tessera-png-sentinel-x`), `exif-orientation-6.jpg` (80x60, EXIF orientation 6, for the Task 10 thumbnail test).
+- Dev-dependency added (needs the human's eye, rule 3 touches only pinned versions, none changed): `mime = "0.3"` in `crates/core` (dev only; locked at 0.3.17, already in the tree through matrix-sdk), because `Room::send_attachment` takes a `mime::Mime` and matrix-sdk does not re-export it. `Cargo.lock` gains the one dependency line.
+- APIs confirmed in the registry (matrix-sdk 0.19.1 under `~/.cargo/registry/src/*/`): `Client::notification_settings` (`src/client/mod.rs:3572`), `NotificationSettings::{enabled_keywords:417, remove_keyword:459, add_keyword:426, set_default_room_notification_mode:198, get_rooms_with_user_defined_rules:152, delete_user_defined_room_rules:358}` (`src/notification_settings/mod.rs`), `Room::send_attachment` (`src/room/mod.rs:2689`), `Client::join_room_by_id` (`src/client/mod.rs:1819`); ruma-client-api 0.25.0 `state/get_state_events.rs`, `membership::{invite_user::v3::InviteUserId, leave_room, forget_room}`; ruma-events 0.35.0 `InitialStateEvent::new` (`kinds.rs:560`) and `SpaceChildEventContent::new` (`space/child.rs:63`).
+- Open issues: none. New human items: none beyond the seeded checkpoint list.
+
+## Phase 5 human checkpoint
+- [ ] Phase 4 sign-off recorded (Q1). Confirm the Q3 dependencies and versions, the ksni licence exception, Q2 (Linux-only checks, no CI gate, Windows/macOS code uncompiled) and Q4 (no drag and drop on native Wayland); revisit any of Q1-Q21.
+- [ ] Images: thumbnails inline in plain and encrypted rooms, in both themes, with no scroll jump while loading; click opens the viewer (zoom, pan, Esc); a GIF shows its first frame.
+- [ ] Files, video, audio: cards read well; **Save…** opens the native dialog (GNOME Wayland, KDE Wayland, X11) and the saved file matches the original; **Open** after saving plays a video in the system player; a dangerous file offers no Open.
+- [ ] Uploads: picker; drag and drop on X11 (one and several files); confirm nothing happens when dropping on a native Wayland window (recorded gap); Ctrl+V pastes a screenshot on GNOME Wayland, KDE Wayland and X11 and text paste still works; the progress bar on a large file; the EXIF note wording; the received image and thumbnail look right in Element Web.
+- [ ] Notifications (roadmap): a DM, a mention and a keyword notify while Tessera is unfocused, on GNOME and KDE; nothing for the open room while focused; a muted room stays silent; "Show message content" off hides the text; clicking opens the room.
+- [ ] Tray badge (roadmap): the icon and red dot on KDE, and on GNOME with the AppIndicator extension (note plain GNOME's behaviour); the tooltip count; Show and Quit.
+- [ ] Rooms: create an encrypted room (lock in Tessera, shield in Element Web); a public room with an alias joined from Element Web; join by alias; accept and decline invites; invite; leave with its warnings; room settings edits seen in Element; the member list with power levels.
+- [ ] Pills: labels come from the target (an Element Web message whose pill text names someone else shows the real user); the user card and **Message**; joining from a room pill.
+- [ ] Spaces sidebar with spaces made in Element Web; Home; filtering.
+- [ ] Threads: summaries match Element Web; the panel opens, scrolls and sends; Element Web shows the reply in the thread; threaded replies are gone from the main timeline.
+- [ ] Settings: layout in both themes; display name and avatar changes seen in Element Web; the theme override survives a restart; notification toggles work; the push-to-talk placeholder wording.
+- [ ] Keyboard-only navigation (roadmap): Ctrl+K, Alt+↑/↓, Tab order, Esc on every overlay, attach and thread without the mouse; focus visible in both themes.
+- [ ] IME (deferred from Phase 3): ibus/fcitx composition in the composer behaves (Enter commits without sending, candidate window near the caret, Enter after commit sends).
+- [ ] Read `docs/accessibility.md` and the Phase 5 security notes; accept or reject the residuals (EXIF in originals, notification text in the OS, saved files in clear, no re-notify after late decryption, a lying `info.size`).
+- [ ] Rule-8 questions answered by the recommendation while the human was unavailable (none so far; later tasks list theirs here).
+
 ## Phase 0 steps
 - [x] 2. Cargo workspace with core, app, ptt crates (phase0.2)
 - [x] 3. Local Synapse homeserver and test users (phase0.3)

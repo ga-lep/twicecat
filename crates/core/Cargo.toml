@@ -41,3 +41,5 @@ gpu-enhancement = ["tessera-audio/onnxruntime"]
 
 [dev-dependencies]
 tempfile = "3"
+# Only to build the `Mime` that `Room::send_attachment` takes in the test helpers; already in the lock (matrix-sdk dependency).
+mime = "0.3"

@@ -17,20 +17,17 @@ use std::time::{Duration, Instant};
 
 use pipewire as pw;
 use pw::properties::PropertiesBox;
-use pw::spa::sys::{spa_dict, spa_thread, spa_thread_utils, spa_thread_utils_methods};
+use pw::spa::sys::{spa_thread, spa_thread_utils, spa_thread_utils_methods};
 
 use crate::AudioError;
 use crate::io::Realtime;
 
 unsafe extern "C" {
-    // Exported by libpipewire (its header makes them inline wrappers, so the
-    // bindings lack them): PipeWire's default thread utilities.
-    fn pw_thread_utils_create(
-        props: *const spa_dict,
-        start_routine: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
-        arg: *mut c_void,
-    ) -> *mut spa_thread;
-    fn pw_thread_utils_join(thread: *mut spa_thread, retval: *mut *mut c_void) -> c_int;
+    // PipeWire's default thread utilities, exported by every libpipewire
+    // since 0.3 (the bindings lack it). `pw_thread_utils_create` and `_join`
+    // are only header macros up to PipeWire 1.0, so they are called through
+    // this table instead, which is what both forms do.
+    fn pw_thread_utils_get() -> *mut spa_thread_utils;
     /// From the C library (`pthread_t` is an unsigned long on Linux).
     fn pthread_self() -> c_ulong;
 }
@@ -62,6 +59,13 @@ impl ThreadUtils {
         let object =
             unsafe { pw::sys::pw_context_get_object(context.as_raw_ptr(), type_.as_ptr().cast()) };
         NonNull::new(object.cast()).map(Self)
+    }
+
+    /// PipeWire's default utilities (plain threads, no real-time priority),
+    /// or the ones set with `pw_thread_utils_set`.
+    fn default_utils() -> Option<Self> {
+        // SAFETY: no preconditions; the table is static in libpipewire.
+        NonNull::new(unsafe { pw_thread_utils_get() }).map(Self)
     }
 
     /// The module's methods (a copy of its table) and its object.
@@ -97,17 +101,14 @@ impl PwThread {
         let Some(thread) = self.thread.take() else {
             return;
         };
-        let null = std::ptr::null_mut();
         let join = self
             .utils
+            .or_else(ThreadUtils::default_utils)
             .map(|u| u.methods())
             .and_then(|(m, o)| Some((m.join?, o)));
-        // SAFETY: a thread made by these utilities, joined once.
-        unsafe {
-            match join {
-                Some((join, object)) => join(object, thread.as_ptr(), null),
-                None => pw_thread_utils_join(thread.as_ptr(), null),
-            };
+        if let Some((join, object)) = join {
+            // SAFETY: a thread made by these utilities, joined once.
+            unsafe { join(object, thread.as_ptr(), std::ptr::null_mut()) };
         }
     }
 }
@@ -149,15 +150,14 @@ pub(crate) fn spawn(
     let arg = Box::into_raw(Box::new(body)).cast::<c_void>();
     let dict = props.dict().as_raw();
     let create = utils
+        .or_else(ThreadUtils::default_utils)
         .map(|u| u.methods())
         .and_then(|(m, o)| Some((m.create?, o)));
-    // SAFETY: the properties are only read during the call; `start` takes
-    // ownership of `arg` when the thread starts.
-    let thread = unsafe {
-        match create {
-            Some((create, object)) => create(object, dict, Some(start), arg),
-            None => pw_thread_utils_create(dict, start, arg),
-        }
+    let thread = match create {
+        // SAFETY: the properties are only read during the call; `start`
+        // takes ownership of `arg` when the thread starts.
+        Some((create, object)) => unsafe { create(object, dict, Some(start), arg) },
+        None => std::ptr::null_mut(),
     };
     let Some(thread) = NonNull::new(thread) else {
         // No thread started, so `arg` is still ours.

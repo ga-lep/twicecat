@@ -885,6 +885,203 @@ pub async fn first_device(core: &mut CoreHandle, n: u8) {
     reset_identity_on(core, n).await;
 }
 
+/// Creates a room as test user `n` (logging in a raw SDK client, never
+/// syncing), encrypted when `encrypted` is set, inviting the full user IDs in
+/// `invite`. Prints nothing.
+pub async fn create_room_raw(
+    n: u8,
+    name: &str,
+    encrypted: bool,
+    invite: &[&str],
+) -> matrix_sdk::ruma::OwnedRoomId {
+    assert_local_homeserver(TestEnv::load().homeserver_url());
+    let client = raw_login(n).await;
+    let invitees: Vec<&str> = invite.to_vec();
+    let room = if encrypted {
+        let room = create_encrypted_room(&client, name, invitees.first().copied()).await;
+        // `create_encrypted_room` takes one invitee; invite the rest here.
+        for user in invitees.iter().skip(1) {
+            invite_raw(&client, &room, user).await;
+        }
+        room
+    } else {
+        let room = create_room(&client, name, invitees.first().copied()).await;
+        for user in invitees.iter().skip(1) {
+            invite_raw(&client, &room, user).await;
+        }
+        room
+    };
+    println!(
+        "created {} room as user {n}, {} invited",
+        if encrypted { "encrypted" } else { "plain" },
+        invitees.len()
+    );
+    room
+}
+
+async fn invite_raw(client: &matrix_sdk::Client, room: &matrix_sdk::ruma::RoomId, user: &str) {
+    use matrix_sdk::ruma::api::client::membership::invite_user::v3::{
+        InvitationRecipient, InviteUserId, Request,
+    };
+    let user: matrix_sdk::ruma::OwnedUserId = user.try_into().expect("valid invitee user id");
+    client
+        .send(Request::new(
+            room.to_owned(),
+            InvitationRecipient::UserId(InviteUserId::new(user)),
+        ))
+        .await
+        .expect("invite user");
+}
+
+/// Creates a space (`creation_content.type = m.space`) as test user `n`, with
+/// an `m.space.child` state event for each of `children` in its initial state.
+/// Prints nothing but the child count.
+pub async fn create_space_raw(
+    n: u8,
+    name: &str,
+    children: &[matrix_sdk::ruma::OwnedRoomId],
+) -> matrix_sdk::ruma::OwnedRoomId {
+    use matrix_sdk::ruma::OwnedServerName;
+    use matrix_sdk::ruma::api::client::room::create_room::v3::{CreationContent, Request};
+    use matrix_sdk::ruma::events::InitialStateEvent;
+    use matrix_sdk::ruma::events::space::child::SpaceChildEventContent;
+    use matrix_sdk::ruma::room::RoomType;
+    use matrix_sdk::ruma::serde::Raw;
+    let env = TestEnv::load();
+    assert_local_homeserver(env.homeserver_url());
+    let via: OwnedServerName = env
+        .get("HOMESERVER_DOMAIN")
+        .try_into()
+        .expect("valid server name");
+    let client = raw_login(n).await;
+    let mut creation = CreationContent::new();
+    creation.room_type = Some(RoomType::Space);
+    let mut request = Request::new();
+    request.name = Some(name.to_owned());
+    request.creation_content = Some(Raw::new(&creation).expect("serialize creation content"));
+    request.initial_state = children
+        .iter()
+        .map(|child| {
+            InitialStateEvent::new(
+                child.to_owned(),
+                SpaceChildEventContent::new(vec![via.clone()]),
+            )
+            .to_raw_any()
+        })
+        .collect();
+    let space = client
+        .create_room(request)
+        .await
+        .expect("create space")
+        .room_id()
+        .to_owned();
+    println!("created space as user {n}, {} children", children.len());
+    space
+}
+
+/// Makes test user `n` leave and forget each of `ids` (rooms or spaces the
+/// test created or joined). Prints the user number and the count.
+pub async fn leave_all_created(n: u8, ids: &[matrix_sdk::ruma::OwnedRoomId]) {
+    use matrix_sdk::ruma::api::client::membership::{forget_room, leave_room};
+    assert_local_homeserver(TestEnv::load().homeserver_url());
+    let client = raw_login(n).await;
+    for id in ids {
+        client
+            .send(leave_room::v3::Request::new(id.clone()))
+            .await
+            .expect("leave room");
+        client
+            .send(forget_room::v3::Request::new(id.clone()))
+            .await
+            .expect("forget room");
+    }
+    println!("user {n} left and forgot {} rooms", ids.len());
+}
+
+/// Puts test user `n`'s notification settings in a known state (Phase 5 Q19):
+/// removes every `tessera-kw-` keyword, sets the four default room modes back
+/// to the Synapse default (all messages) and deletes every user-defined room
+/// rule. Prints the user number and counts.
+pub async fn reset_notification_baseline(n: u8) {
+    use matrix_sdk::notification_settings::{IsEncrypted, IsOneToOne, RoomNotificationMode};
+    assert_local_homeserver(TestEnv::load().homeserver_url());
+    let client = raw_login(n).await;
+    let settings = client.notification_settings().await;
+    let mut keywords = 0usize;
+    for keyword in settings.enabled_keywords().await {
+        if keyword.starts_with("tessera-kw-") {
+            settings
+                .remove_keyword(&keyword)
+                .await
+                .expect("remove test keyword");
+            keywords += 1;
+        }
+    }
+    for encrypted in [IsEncrypted::Yes, IsEncrypted::No] {
+        for one_to_one in [IsOneToOne::Yes, IsOneToOne::No] {
+            settings
+                .set_default_room_notification_mode(
+                    encrypted,
+                    one_to_one,
+                    RoomNotificationMode::AllMessages,
+                )
+                .await
+                .expect("reset default notification mode");
+        }
+    }
+    let mut rooms = 0usize;
+    for id in settings.get_rooms_with_user_defined_rules(None).await {
+        let id = <&matrix_sdk::ruma::RoomId>::try_from(id.as_str()).expect("room id in rule");
+        settings
+            .delete_user_defined_room_rules(id)
+            .await
+            .expect("delete room rules");
+        rooms += 1;
+    }
+    println!("notification baseline user {n}: {keywords} keywords, {rooms} room rules removed");
+}
+
+/// Sends `bytes` as an attachment to `room` as test user `n`, with the raw SDK
+/// client (for download tests before the core can upload). The client joins
+/// the room first (a no-op when already joined) and never syncs, so it sends
+/// the attachment unencrypted: use plain rooms only. Prints nothing but counts.
+pub async fn send_attachment_raw(
+    n: u8,
+    room: &matrix_sdk::ruma::RoomId,
+    filename: &str,
+    mime: &str,
+    bytes: Vec<u8>,
+) -> matrix_sdk::ruma::OwnedEventId {
+    use matrix_sdk::attachment::AttachmentConfig;
+    assert_local_homeserver(TestEnv::load().homeserver_url());
+    let client = raw_login(n).await;
+    let room = client.join_room_by_id(room).await.expect("join room");
+    let mime: mime::Mime = mime.parse().expect("valid mime type");
+    let len = bytes.len();
+    let response = room
+        .send_attachment(filename, &mime, bytes, AttachmentConfig::new())
+        .await
+        .expect("send attachment");
+    println!("user {n} sent an attachment of {len} bytes");
+    response.event_id
+}
+
+/// The full JSON of the event `event_id` in `room`, read raw from the server
+/// (works on a client that never synced).
+pub async fn fetch_raw_event_json(
+    client: &matrix_sdk::Client,
+    room: &matrix_sdk::ruma::RoomId,
+    event_id: &matrix_sdk::ruma::EventId,
+) -> serde_json::Value {
+    use matrix_sdk::ruma::api::client::room::get_room_event::v3::Request;
+    let event = client
+        .send(Request::new(room.to_owned(), event_id.to_owned()))
+        .await
+        .expect("fetch raw event")
+        .event;
+    serde_json::from_str(event.json().get()).expect("event is JSON")
+}
+
 /// Waits until the room list contains `room_id`, so `SelectRoom` can find it.
 pub async fn wait_for_room(core: &mut CoreHandle, room_id: &str) {
     let mut rooms: Vec<RoomSummary> = Vec::new();
