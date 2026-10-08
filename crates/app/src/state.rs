@@ -11,9 +11,10 @@ use iced::theme;
 use iced::widget::{operation, scrollable};
 use iced::{Element, Subscription, Task, Theme, clipboard, system, window};
 use tessera_core::api::{
-    ActionKind, Command, CoreError, CoreEvent, Draft, EventId, ListDiff, MessageDetails,
-    MessageText, OutgoingMessage, Password, ReauthAction, RoomId, RoomListQuery, RoomListTab,
-    RoomSummary, SyncState, TimelineItem, TimelineItemKind, TypingUser, UserId, UserTrust,
+    ActionKind, Command, CoreError, CoreEvent, Draft, EventId, ListDiff, MediaBytes, MediaKind,
+    MediaSize, MessageDetails, MessageText, OutgoingMessage, Password, ReauthAction, RoomId,
+    RoomListQuery, RoomListTab, RoomSummary, SyncState, TimelineItem, TimelineItemKind, TypingUser,
+    UserId, UserTrust,
 };
 use tokio::sync::mpsc;
 
@@ -21,8 +22,10 @@ use crate::actions::{self, ActionButtons, ActionState, NOTICE_DURATION, Notice, 
 use crate::avatars::Avatars;
 use crate::bridge::{self, Bridge, EventsSlot};
 use crate::composer::{self, Composer, ComposerKey, EditorAction, SearchStep};
+use crate::dialogs::{self, Dialogs, SystemDialogs};
 use crate::emoji;
 use crate::links::{self, LinkBar};
+use crate::media::{self, Decoded, MediaModel, SavePath};
 use crate::rich_text::{LinkTarget, MAX_REVEALED, Revealed};
 use crate::room_list;
 use crate::screens::login::{self, BrowserUrl, LoginForm};
@@ -270,6 +273,44 @@ pub enum Message {
     Verification(VerificationMessage),
     /// A button of the Sessions screen or the logout warning.
     Sessions(SessionsMessage),
+    /// An inline image was clicked: open the full-size viewer.
+    MediaClicked(String),
+    /// The viewer was closed (**Close**, Esc).
+    ViewerClosed,
+    /// **Save...** on a media message.
+    SaveRequested(String),
+    /// The save dialog answered; `None` when the user cancelled. The path is
+    /// redacted in `Debug`.
+    SavePicked {
+        /// Room of the item.
+        room_id: RoomId,
+        /// The media message.
+        item_id: String,
+        /// The path the user chose.
+        path: Option<SavePath>,
+    },
+    /// **Open** on a saved file (asks first).
+    OpenRequested(String),
+    /// The user confirmed opening the saved file.
+    OpenConfirmed,
+    /// The user backed out of opening the saved file.
+    OpenDismissed,
+    /// The system handler was started (or failed to start) for a saved file.
+    MediaOpened {
+        /// Whether the handler started without error.
+        ok: bool,
+    },
+    /// The task that decoded fetched image bytes finished.
+    MediaDecoded {
+        /// Room of the item.
+        room_id: RoomId,
+        /// The media message.
+        item_id: String,
+        /// Thumbnail or full image.
+        size: MediaSize,
+        /// The pixels, or `None` when the bytes were refused.
+        decoded: Option<Decoded>,
+    },
 }
 
 /// What `main` hands to Iced's boot function.
@@ -312,6 +353,9 @@ pub struct App {
     /// new one, so the header looks up the selected peer by ID
     /// ([`App::dm_peer_trust`]). Capped at [`MAX_TRUST_KEPT`].
     pub user_trust: Vec<(UserId, UserTrust)>,
+    /// Thumbnails, the viewer and saves (plan Q7, Q8).
+    pub media: MediaModel,
+    dialogs: Box<dyn Dialogs>,
     /// The signed-in account.
     pub user_id: Option<UserId>,
     /// The last sync state.
@@ -379,6 +423,7 @@ impl std::fmt::Debug for App {
             .field("rooms", &self.rooms.len())
             .field("timeline", &self.timeline)
             .field("selected", &self.selected)
+            .field("media", &self.media)
             .field("login", &self.login)
             .field("login_in_flight", &self.login_in_flight)
             .field("composer", &self.composer)
@@ -415,6 +460,8 @@ impl App {
             selected: None,
             timeline: TimelineView::default(),
             user_trust: Vec::new(),
+            media: MediaModel::default(),
+            dialogs: Box::new(SystemDialogs),
             user_id: None,
             sync_state: SyncState::Idle,
             login: LoginForm::new(),
@@ -457,6 +504,11 @@ impl App {
                 .expect("iced boots the application exactly once");
             App::new(startup)
         }
+    }
+
+    /// Replaces the system dialogs (tests use a fake).
+    pub fn set_dialogs(&mut self, dialogs: Box<dyn Dialogs>) {
+        self.dialogs = dialogs;
     }
 
     /// The selected direct message's other person and the core's latest word
@@ -740,6 +792,59 @@ impl App {
             Message::Security(message) => self.on_security(message),
             Message::Verification(message) => self.on_verification(message),
             Message::Sessions(message) => self.on_sessions(message),
+            Message::MediaClicked(item_id) => self.open_viewer(item_id),
+            Message::ViewerClosed => {
+                self.media.close_viewer();
+                Task::none()
+            }
+            Message::SaveRequested(item_id) => self.request_save(&item_id),
+            Message::SavePicked {
+                room_id,
+                item_id,
+                path,
+            } => self.save_picked(room_id, item_id, path),
+            Message::OpenRequested(item_id) => {
+                if let (Some(room_id), Some(name)) =
+                    (self.selected.clone(), self.media_filename(&item_id))
+                {
+                    let name = name.to_owned();
+                    self.media.ask_open(&(room_id, item_id), &name);
+                }
+                Task::none()
+            }
+            Message::OpenConfirmed => match self.media.open_bar.take() {
+                Some(bar) => {
+                    let path = bar.path().to_path_buf();
+                    Task::perform(async move { dialogs::open_file(&path) }, |ok| {
+                        Message::MediaOpened { ok }
+                    })
+                }
+                None => Task::none(),
+            },
+            Message::OpenDismissed => {
+                self.media.open_bar = None;
+                Task::none()
+            }
+            Message::MediaOpened { ok } => {
+                if ok {
+                    Task::none()
+                } else {
+                    self.show_notice_text("The file could not be opened.".to_owned())
+                }
+            }
+            Message::MediaDecoded {
+                room_id,
+                item_id,
+                size,
+                decoded,
+            } => {
+                let key = (room_id, item_id);
+                match size {
+                    MediaSize::Thumbnail => self.media.thumb_decoded(&key, decoded),
+                    MediaSize::Full => self.media.viewer_decoded(&key, decoded),
+                }
+                Task::none()
+            }
             Message::SelectRoom(id) => {
                 if !room_list::contains(&self.rooms, &id) {
                     return Task::none();
@@ -752,6 +857,7 @@ impl App {
                 self.draft_seq = self.draft_seq.wrapping_add(1);
                 self.selected = Some(id.clone());
                 self.timeline.reset();
+                self.media.reset_view();
                 self.user_trust.clear();
                 self.typing.clear();
                 self.actions.reset();
@@ -969,6 +1075,16 @@ impl App {
                     task = self.show_notice(action, &error);
                 }
             }
+            CoreEvent::ActionFailed {
+                room_id,
+                action: ActionKind::Media,
+                ..
+            } => {
+                self.media.fail_saves(&room_id);
+                if self.selected.as_ref() == Some(&room_id) {
+                    task = self.show_notice_text("The file could not be saved.".to_owned());
+                }
+            }
             CoreEvent::Typing { room_id, mut users } => {
                 if self.selected.as_ref() == Some(&room_id) {
                     users.truncate(timeline::MAX_TYPING_KEPT);
@@ -1022,9 +1138,16 @@ impl App {
             CoreEvent::Devices(list) => self.on_devices_event(list),
             // Phase 5 events: the app screens that show them arrive with the
             // UI tasks of the Phase 5 plan; until then they are ignored.
-            CoreEvent::Media { .. }
-            | CoreEvent::MediaSaved { .. }
-            | CoreEvent::MediaLimits { .. }
+            CoreEvent::Media {
+                room_id,
+                item_id,
+                size,
+                result,
+            } => task = self.on_media(room_id, item_id, size, result),
+            CoreEvent::MediaSaved { room_id, item_id } => {
+                self.media.finish_save(&(room_id, item_id));
+            }
+            CoreEvent::MediaLimits { .. }
             | CoreEvent::Notification(_)
             | CoreEvent::NotificationSettings(_)
             | CoreEvent::UnreadTotals { .. }
@@ -1522,6 +1645,7 @@ impl App {
         self.total_rooms = None;
         self.load_more_at = None;
         self.avatars.clear();
+        self.media.clear();
         self.list_offset_y = 0.0;
         self.deselect();
         self.sync_state = SyncState::Idle;
@@ -1538,6 +1662,7 @@ impl App {
     fn deselect(&mut self) {
         self.selected = None;
         self.timeline.reset();
+        self.media.reset_view();
         self.user_trust.clear();
         self.typing.clear();
         self.actions.reset();
@@ -1639,8 +1764,185 @@ impl App {
         if effects.jump_failed {
             tasks.push(self.show_notice_text(JUMP_FAILED_TEXT.to_owned()));
         }
+        tasks.push(self.fetch_visible_media());
         tasks.push(self.read_receipt(Instant::now()));
         Task::batch(tasks)
+    }
+
+    /// Asks for the thumbnail of every image within one screen of the
+    /// viewport that is neither cached nor on its way (plan Q7). Rows far
+    /// away ask for nothing, and an answer already in the cache is never
+    /// asked for again.
+    fn fetch_visible_media(&mut self) -> Task<Message> {
+        let Some(room_id) = self.selected.clone() else {
+            return Task::none();
+        };
+        let view = &self.timeline;
+        let range = timeline::visible_window(
+            &view.prefix,
+            view.offset_from_bottom,
+            view.viewport_h,
+            view.viewport_h,
+        );
+        let wanted: Vec<String> = view
+            .items
+            .get(range)
+            .unwrap_or_default()
+            .iter()
+            .filter(|item| {
+                matches!(
+                    &item.kind,
+                    TimelineItemKind::Message { details, .. }
+                        if details.media.as_ref().is_some_and(|m| m.kind == MediaKind::Image)
+                )
+            })
+            .map(|item| item.id.clone())
+            .collect();
+        let mut tasks = Vec::new();
+        for item_id in wanted {
+            if self.media.needs_fetch(&(room_id.clone(), item_id.clone())) {
+                tasks.push(self.send(Command::FetchMedia {
+                    room_id: room_id.clone(),
+                    item_id,
+                    size: MediaSize::Thumbnail,
+                }));
+            }
+        }
+        Task::batch(tasks)
+    }
+
+    /// The core answered a `FetchMedia`. The bytes are untrusted: they are
+    /// decoded in a task, never here, and only if somebody still waits.
+    fn on_media(
+        &mut self,
+        room_id: RoomId,
+        item_id: String,
+        size: MediaSize,
+        result: Result<MediaBytes, CoreError>,
+    ) -> Task<Message> {
+        let key = (room_id.clone(), item_id.clone());
+        let wanted = match size {
+            MediaSize::Thumbnail => self.media.is_pending(&key),
+            MediaSize::Full => self.media.viewer_wants(&key),
+        };
+        if !wanted {
+            return Task::none();
+        }
+        let Ok(bytes) = result else {
+            match size {
+                MediaSize::Thumbnail => self.media.thumb_failed(&key),
+                MediaSize::Full => self.media.viewer_decoded(&key, None),
+            }
+            return Task::none();
+        };
+        Task::perform(
+            async move {
+                match size {
+                    MediaSize::Thumbnail => media::decode_thumbnail(bytes.as_bytes()),
+                    MediaSize::Full => media::decode_full(bytes.as_bytes()),
+                }
+            },
+            move |decoded| Message::MediaDecoded {
+                room_id: room_id.clone(),
+                item_id: item_id.clone(),
+                size,
+                decoded,
+            },
+        )
+    }
+
+    /// The sender-given file name of media message `item_id` in the open
+    /// room.
+    fn media_filename(&self, item_id: &str) -> Option<&str> {
+        let (_, _, details) = self.find_message(item_id)?;
+        details.media.as_deref().map(|m| m.filename.as_str())
+    }
+
+    /// When the message `item_id` was sent.
+    fn message_timestamp_ms(&self, item_id: &str) -> Option<u64> {
+        self.timeline
+            .items
+            .iter()
+            .find(|item| item.id == item_id)
+            .and_then(|item| match &item.kind {
+                TimelineItemKind::Message { timestamp_ms, .. } => Some(*timestamp_ms),
+                _ => None,
+            })
+    }
+
+    /// Opens the viewer on an image of the open room and asks for the file.
+    fn open_viewer(&mut self, item_id: String) -> Task<Message> {
+        let Some(room_id) = self.selected.clone() else {
+            return Task::none();
+        };
+        let is_image = self
+            .find_message(&item_id)
+            .and_then(|(_, _, details)| details.media.as_deref())
+            .is_some_and(|m| m.kind == MediaKind::Image);
+        if !is_image {
+            return Task::none();
+        }
+        self.media.open_viewer((room_id.clone(), item_id.clone()));
+        self.send(Command::FetchMedia {
+            room_id,
+            item_id,
+            size: MediaSize::Full,
+        })
+    }
+
+    /// **Save...**: the dialog proposes a name made from the sender's and
+    /// the sent time by [`media::save_name`]; the answer comes back as
+    /// `SavePicked`.
+    fn request_save(&mut self, item_id: &str) -> Task<Message> {
+        let Some(room_id) = self.selected.clone() else {
+            return Task::none();
+        };
+        let Some(filename) = self.media_filename(item_id) else {
+            return Task::none();
+        };
+        let sent = self
+            .message_timestamp_ms(item_id)
+            .and_then(|ms| i64::try_from(ms).ok())
+            .and_then(|ms| chrono::TimeZone::timestamp_millis_opt(&chrono::Local, ms).single());
+        let suggested = match sent {
+            Some(sent) => media::save_name(filename, &sent),
+            None => media::suggested_file_name(filename),
+        };
+        let item_id = item_id.to_owned();
+        self.dialogs
+            .save_file(&suggested)
+            .map(move |path| Message::SavePicked {
+                room_id: room_id.clone(),
+                item_id: item_id.clone(),
+                path: path.map(SavePath::from),
+            })
+    }
+
+    /// The user picked a path: send it to the core as it is. The path is
+    /// never built from the sender's file name.
+    fn save_picked(
+        &mut self,
+        room_id: RoomId,
+        item_id: String,
+        path: Option<SavePath>,
+    ) -> Task<Message> {
+        let Some(path) = path else {
+            return Task::none();
+        };
+        let path = path.as_path();
+        if self.selected.as_ref() != Some(&room_id) || self.media_filename(&item_id).is_none() {
+            return Task::none();
+        }
+        if !media::save_path_usable(path) {
+            return self.show_notice_text("The file could not be saved there.".to_owned());
+        }
+        self.media
+            .begin_save((room_id.clone(), item_id.clone()), path.to_path_buf());
+        self.send(Command::SaveMedia {
+            room_id,
+            item_id,
+            path: path.to_path_buf(),
+        })
     }
 
     /// Sends the read receipt when one is due, or starts the timer that
@@ -1699,7 +2001,10 @@ impl App {
                 );
                 screens::verification::layer(base, self)
             }
-            Screen::Main => screens::verification::layer(main_view::view(self), self),
+            Screen::Main => screens::verification::layer(
+                screens::media_viewer::layer(main_view::view(self), self),
+                self,
+            ),
             Screen::ShuttingDown => screens::centered_text("Closing\u{2026}"),
             Screen::Disconnected => screens::centered_text("The core stopped"),
         }
@@ -1716,7 +2021,22 @@ impl App {
                 _ => None,
             }),
             system::theme_changes().map(Message::ThemeMode),
+            self.viewer_keys(),
         ])
+    }
+
+    /// Esc closes the viewer while it is open; no listener otherwise.
+    fn viewer_keys(&self) -> Subscription<Message> {
+        if self.media.viewer.is_none() {
+            return Subscription::none();
+        }
+        iced::event::listen_with(|event, _status, _id| match event {
+            iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+                ..
+            }) => Some(Message::ViewerClosed),
+            _ => None,
+        })
     }
 
     /// The theme for the current system mode (plan Q13).
@@ -6026,5 +6346,590 @@ mod tests {
         key_ready(&mut app, KEY_S);
         assert_eq!(laid_out_size(&app), window, "the new key");
         assert_no_sentinel("new key screen", &format!("{app:?}"), &ALL_S);
+    }
+
+    // ---- Phase 5 Task 9: media in the timeline ----
+
+    use std::path::PathBuf;
+
+    use tessera_core::api::{MediaBytes, MediaContent, MediaKind, MediaSize};
+
+    use crate::dialogs::RecordingDialogs;
+    use crate::media::{self, Decoded, SavePath, Thumb};
+
+    const FILE_SENTINEL: &str = "sentinel-file-name-x";
+
+    fn media_item(id: &str, kind: MediaKind, filename: &str, w: u32, h: u32) -> TimelineItem {
+        let mut content = MediaContent::new(kind, filename.to_owned());
+        content.width = Some(w);
+        content.height = Some(h);
+        content.size = Some(2048);
+        TimelineItem::new(
+            id.to_owned(),
+            TimelineItemKind::Message {
+                sender: UserId::from("@them:x"),
+                body: filename.to_owned(),
+                is_own: false,
+                timestamp_ms: 1,
+                sent: SendStatus::Sent,
+                details: Box::new(MessageDetails {
+                    media: Some(Box::new(content)),
+                    ..MessageDetails::default()
+                }),
+            },
+        )
+    }
+
+    fn room_a() -> RoomId {
+        RoomId::from("!a:x")
+    }
+
+    fn key_of(id: &str) -> media::Key {
+        (room_a(), id.to_owned())
+    }
+
+    /// `main_app` with `count` images `img0` ... in room `a`, and the fake
+    /// dialogs installed.
+    fn media_app(count: usize) -> (App, mpsc::Receiver<Command>, RecordingDialogs) {
+        let (mut app, mut rx) = main_app();
+        let dialogs = RecordingDialogs::default();
+        app.set_dialogs(Box::new(dialogs.clone()));
+        let values = (0..count)
+            .map(|n| media_item(&format!("img{n}"), MediaKind::Image, "pic.png", 640, 480))
+            .collect();
+        let _ = app.update(core(CoreEvent::TimelineDiff {
+            room_id: room_a(),
+            diffs: vec![ListDiff::Append { values }],
+        }));
+        let _ = drain(&mut rx);
+        (app, rx, dialogs)
+    }
+
+    fn fetches(commands: &[Command], wanted: MediaSize) -> Vec<String> {
+        commands
+            .iter()
+            .filter_map(|c| match c {
+                Command::FetchMedia { item_id, size, .. } if *size == wanted => {
+                    Some(item_id.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn png(width: u32, height: u32) -> MediaBytes {
+        let img = image::RgbaImage::from_pixel(width, height, image::Rgba([1, 2, 3, 255]));
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, image::ImageFormat::Png)
+            .expect("encode");
+        MediaBytes::from(out.into_inner())
+    }
+
+    fn media_event(id: &str, size: MediaSize, result: Result<MediaBytes, CoreError>) -> Message {
+        core(CoreEvent::Media {
+            room_id: room_a(),
+            item_id: id.to_owned(),
+            size,
+            result,
+        })
+    }
+
+    fn decoded(width: u32, height: u32) -> Decoded {
+        let (handle, w, h) =
+            media::decode_media(png(width, height).as_bytes(), media::decode_limits())
+                .expect("decodes");
+        Decoded {
+            handle,
+            width: w,
+            height: h,
+        }
+    }
+
+    fn arrive(app: &mut App, id: &str, d: Option<Decoded>) {
+        let _ = app.update(Message::MediaDecoded {
+            room_id: room_a(),
+            item_id: id.to_owned(),
+            size: MediaSize::Thumbnail,
+            decoded: d,
+        });
+    }
+
+    #[test]
+    fn only_rows_in_the_window_plus_one_screen_ask_for_a_thumbnail() {
+        let (mut app, mut rx) = main_app();
+        let values = (0..60)
+            .map(|n| media_item(&format!("img{n}"), MediaKind::Image, "pic.png", 640, 480))
+            .collect();
+        let _ = app.update(core(CoreEvent::TimelineDiff {
+            room_id: room_a(),
+            diffs: vec![ListDiff::Append { values }],
+        }));
+        let asked = fetches(&drain(&mut rx), MediaSize::Thumbnail);
+        assert!(asked.contains(&"img59".to_owned()), "{asked:?}");
+        assert!(!asked.contains(&"img0".to_owned()), "{asked:?}");
+        assert!(asked.len() < 20, "{} requests", asked.len());
+        let unique: std::collections::HashSet<_> = asked.iter().collect();
+        assert_eq!(unique.len(), asked.len(), "each at most once");
+    }
+
+    #[test]
+    fn a_thumbnail_is_requested_once_while_it_is_pending_or_cached() {
+        let (mut app, mut rx, _) = media_app(3);
+        // The diff already asked once. Anything that runs the effects again
+        // (a measured row, a scroll) must not ask again.
+        let _ = app.update(Message::RowMeasured {
+            id: "img2".into(),
+            height: 230.0,
+        });
+        let _ = app.on_timeline_scrolled(0.0, 600.0, 800.0);
+        assert!(fetches(&drain(&mut rx), MediaSize::Thumbnail).is_empty());
+        arrive(&mut app, "img2", Some(decoded(4, 3)));
+        let _ = app.on_timeline_scrolled(0.0, 600.0, 800.0);
+        assert!(fetches(&drain(&mut rx), MediaSize::Thumbnail).is_empty());
+        assert!(matches!(
+            app.media.thumb(&key_of("img2")),
+            Some(Thumb::Ready(_))
+        ));
+    }
+
+    #[test]
+    fn scrolling_up_asks_for_the_rows_that_come_into_range() {
+        let (mut app, mut rx) = main_app();
+        let values = (0..60)
+            .map(|n| media_item(&format!("img{n}"), MediaKind::Image, "pic.png", 640, 480))
+            .collect();
+        let _ = app.update(core(CoreEvent::TimelineDiff {
+            room_id: room_a(),
+            diffs: vec![ListDiff::Append { values }],
+        }));
+        let _ = drain(&mut rx);
+        let _ = app.on_timeline_scrolled(5000.0, 600.0, 800.0);
+        let asked = fetches(&drain(&mut rx), MediaSize::Thumbnail);
+        assert!(!asked.is_empty(), "new rows came into range");
+        assert!(!asked.contains(&"img59".to_owned()), "{asked:?}");
+    }
+
+    #[test]
+    fn a_non_image_and_a_text_message_never_ask_for_a_thumbnail() {
+        let (mut app, mut rx) = main_app();
+        let _ = app.update(core(CoreEvent::TimelineDiff {
+            room_id: room_a(),
+            diffs: vec![ListDiff::Append {
+                values: vec![
+                    media_item("f", MediaKind::File, "a.zip", 0, 0),
+                    media_item("v", MediaKind::Video, "a.mp4", 10, 10),
+                    media_item("a", MediaKind::Audio, "a.ogg", 0, 0),
+                    message_item("t", "hello", false, ALL_ACTIONS),
+                ],
+            }],
+        }));
+        assert!(fetches(&drain(&mut rx), MediaSize::Thumbnail).is_empty());
+    }
+
+    #[test]
+    fn an_arriving_thumbnail_changes_no_row_height() {
+        let (mut app, _rx, _) = media_app(4);
+        for n in 0..4 {
+            let _ = app.update(Message::RowMeasured {
+                id: format!("img{n}"),
+                height: 233.0,
+            });
+        }
+        let before = (app.timeline.prefix.clone(), app.timeline.measured.clone());
+        let _ = app.update(media_event("img3", MediaSize::Thumbnail, Ok(png(8, 6))));
+        arrive(&mut app, "img3", Some(decoded(8, 6)));
+        arrive(&mut app, "img2", None);
+        assert_eq!(app.timeline.prefix, before.0);
+        assert_eq!(app.timeline.measured, before.1);
+        // The estimate of an unmeasured row does not read the cache either.
+        let item = app.timeline.items[3].clone();
+        let est = timeline::estimate_height(&item, false, 800.0);
+        arrive(&mut app, "img3", Some(decoded(8, 6)));
+        assert_eq!(timeline::estimate_height(&item, false, 800.0), est);
+    }
+
+    #[test]
+    fn the_bytes_are_decoded_in_a_task_not_in_update() {
+        let (mut app, _rx, _) = media_app(1);
+        let _ = app.update(media_event("img0", MediaSize::Thumbnail, Ok(png(8, 6))));
+        assert!(
+            app.media.thumb(&key_of("img0")).is_none(),
+            "nothing is cached until the decode task answers"
+        );
+        arrive(&mut app, "img0", Some(decoded(8, 6)));
+        assert!(app.media.thumb(&key_of("img0")).is_some());
+    }
+
+    #[test]
+    fn a_failed_or_undecodable_thumbnail_is_unavailable_and_not_retried() {
+        let (mut app, mut rx, _) = media_app(2);
+        let _ = app.update(media_event(
+            "img0",
+            MediaSize::Thumbnail,
+            Err(CoreError::Internal("no".into())),
+        ));
+        arrive(&mut app, "img1", None);
+        assert!(matches!(
+            app.media.thumb(&key_of("img0")),
+            Some(Thumb::Unavailable)
+        ));
+        assert!(matches!(
+            app.media.thumb(&key_of("img1")),
+            Some(Thumb::Unavailable)
+        ));
+        let _ = app.on_timeline_scrolled(0.0, 600.0, 800.0);
+        assert!(fetches(&drain(&mut rx), MediaSize::Thumbnail).is_empty());
+    }
+
+    #[test]
+    fn an_answer_nobody_asked_for_is_dropped() {
+        let (mut app, _rx, _) = media_app(1);
+        arrive(&mut app, "stranger", Some(decoded(2, 2)));
+        assert!(app.media.thumb(&key_of("stranger")).is_none());
+        let task = app.update(media_event("stranger", MediaSize::Thumbnail, Ok(png(2, 2))));
+        drop(task);
+        assert!(app.media.thumb(&key_of("stranger")).is_none());
+        // A full-size answer with no viewer open is dropped too.
+        let _ = app.update(media_event("img0", MediaSize::Full, Ok(png(2, 2))));
+        assert!(app.media.viewer.is_none());
+    }
+
+    #[test]
+    fn clicking_an_image_opens_the_viewer_and_asks_for_the_full_file() {
+        let (mut app, mut rx, _) = media_app(1);
+        let _ = app.update(Message::MediaClicked("img0".into()));
+        assert!(app.media.viewer.is_some());
+        let commands = drain(&mut rx);
+        assert_eq!(fetches(&commands, MediaSize::Full), vec!["img0".to_owned()]);
+        // The full image arrives, is decoded, and is shown.
+        let _ = app.update(media_event("img0", MediaSize::Full, Ok(png(9, 7))));
+        let _ = app.update(Message::MediaDecoded {
+            room_id: room_a(),
+            item_id: "img0".into(),
+            size: MediaSize::Full,
+            decoded: Some(decoded(9, 7)),
+        });
+        let viewer = app.media.viewer.as_ref().expect("viewer");
+        assert!(viewer.decoded().is_some());
+        // Close drops the full image; a late answer does not bring it back.
+        let _ = app.update(Message::ViewerClosed);
+        assert!(app.media.viewer.is_none());
+        let _ = app.update(Message::MediaDecoded {
+            room_id: room_a(),
+            item_id: "img0".into(),
+            size: MediaSize::Full,
+            decoded: Some(decoded(9, 7)),
+        });
+        assert!(app.media.viewer.is_none());
+    }
+
+    #[test]
+    fn only_an_image_opens_the_viewer() {
+        let (mut app, mut rx, _) = media_app(0);
+        let _ = app.update(core(CoreEvent::TimelineDiff {
+            room_id: room_a(),
+            diffs: vec![ListDiff::Append {
+                values: vec![
+                    media_item("f", MediaKind::File, "a.zip", 0, 0),
+                    message_item("t", "hello", false, ALL_ACTIONS),
+                ],
+            }],
+        }));
+        for id in ["f", "t", "missing"] {
+            let _ = app.update(Message::MediaClicked(id.into()));
+            assert!(app.media.viewer.is_none(), "{id}");
+        }
+        assert!(fetches(&drain(&mut rx), MediaSize::Full).is_empty());
+    }
+
+    #[test]
+    fn a_failed_full_fetch_shows_the_failure_in_the_viewer() {
+        let (mut app, _rx, _) = media_app(1);
+        let _ = app.update(Message::MediaClicked("img0".into()));
+        let _ = app.update(media_event(
+            "img0",
+            MediaSize::Full,
+            Err(CoreError::Internal("too big".into())),
+        ));
+        let viewer = app.media.viewer.as_ref().expect("viewer");
+        assert!(viewer.failed());
+        assert!(viewer.decoded().is_none());
+    }
+
+    #[test]
+    fn leaving_the_room_closes_the_viewer() {
+        let (mut app, _rx, _) = media_app(1);
+        let _ = app.update(Message::MediaClicked("img0".into()));
+        let _ = app.update(Message::SelectRoom(RoomId::from("!b:x")));
+        assert!(app.media.viewer.is_none());
+    }
+
+    fn file_app() -> (App, mpsc::Receiver<Command>, RecordingDialogs) {
+        let (mut app, mut rx, dialogs) = media_app(0);
+        let _ = app.update(core(CoreEvent::TimelineDiff {
+            room_id: room_a(),
+            diffs: vec![ListDiff::Append {
+                values: vec![
+                    media_item("doc", MediaKind::File, "../../report.pdf", 0, 0),
+                    media_item("prog", MediaKind::File, "setup.exe", 0, 0),
+                    media_item("bare", MediaKind::File, "README", 0, 0),
+                ],
+            }],
+        }));
+        let _ = drain(&mut rx);
+        (app, rx, dialogs)
+    }
+
+    fn picked(id: &str, path: Option<&str>) -> Message {
+        Message::SavePicked {
+            room_id: room_a(),
+            item_id: id.to_owned(),
+            path: path.map(|p| SavePath::from(PathBuf::from(p))),
+        }
+    }
+
+    #[test]
+    fn save_proposes_a_sanitised_name_and_sends_the_path_the_user_picked() {
+        let (mut app, mut rx, dialogs) = file_app();
+        let _ = app.update(Message::SaveRequested("doc".into()));
+        assert_eq!(
+            *dialogs.asked.lock().expect("mutex"),
+            vec!["report.pdf".to_owned()]
+        );
+        assert!(
+            drain(&mut rx).is_empty(),
+            "nothing is saved before the pick"
+        );
+        let _ = app.update(picked("doc", Some("/home/u/Documents/mine.pdf")));
+        let commands = drain(&mut rx);
+        assert_eq!(commands.len(), 1, "{commands:?}");
+        match &commands[0] {
+            Command::SaveMedia {
+                room_id,
+                item_id,
+                path,
+            } => {
+                assert_eq!(room_id, &room_a());
+                assert_eq!(item_id, "doc");
+                assert_eq!(path, &PathBuf::from("/home/u/Documents/mine.pdf"));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn save_adds_the_sent_time_to_a_generic_name() {
+        let (mut app, mut rx, dialogs) = media_app(0);
+        let _ = app.update(core(CoreEvent::TimelineDiff {
+            room_id: room_a(),
+            diffs: vec![ListDiff::Append {
+                values: vec![media_item("pasted", MediaKind::Image, "image.png", 4, 4)],
+            }],
+        }));
+        let _ = drain(&mut rx);
+        let _ = app.update(Message::SaveRequested("pasted".into()));
+        // `media_item` sends at 1 ms after the epoch, shown in local time.
+        let sent = chrono::TimeZone::timestamp_millis_opt(&chrono::Local, 1).unwrap();
+        assert_eq!(
+            *dialogs.asked.lock().expect("mutex"),
+            vec![format!("image-{}.png", sent.format("%Y%m%d-%H%M%S"))]
+        );
+    }
+
+    #[test]
+    fn a_cancelled_or_unusable_pick_saves_nothing() {
+        let (mut app, mut rx, _) = file_app();
+        for path in [
+            None,
+            Some("relative/file.pdf"),
+            Some("file.pdf"),
+            Some("/"),
+            Some(""),
+            Some("/home/u/.."),
+        ] {
+            let _ = app.update(picked("doc", path));
+            assert!(drain(&mut rx).is_empty(), "{path:?}");
+        }
+    }
+
+    #[test]
+    fn a_pick_for_an_item_that_is_not_media_or_in_another_room_saves_nothing() {
+        let (mut app, mut rx, dialogs) = file_app();
+        let _ = app.update(Message::SaveRequested("missing".into()));
+        assert!(dialogs.asked.lock().expect("mutex").is_empty());
+        let _ = app.update(picked("missing", Some("/tmp/x.bin")));
+        let _ = app.update(Message::SavePicked {
+            room_id: RoomId::from("!b:x"),
+            item_id: "doc".into(),
+            path: Some(SavePath::from(PathBuf::from("/tmp/x.bin"))),
+        });
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn open_is_offered_for_any_file_once_it_is_saved() {
+        let (mut app, mut rx, _) = file_app();
+        let doc = key_of("doc");
+        assert!(!app.media.open_allowed(&doc));
+        let _ = app.update(picked("doc", Some("/home/u/mine.pdf")));
+        assert!(!app.media.open_allowed(&doc), "not saved yet");
+        let _ = app.update(core(CoreEvent::MediaSaved {
+            room_id: room_a(),
+            item_id: "doc".into(),
+        }));
+        assert!(app.media.open_allowed(&doc));
+        // Programs and names without an extension too: the bar asks first.
+        for (id, path) in [("prog", "/home/u/setup.exe"), ("bare", "/home/u/README")] {
+            let _ = app.update(picked(id, Some(path)));
+            let _ = app.update(core(CoreEvent::MediaSaved {
+                room_id: room_a(),
+                item_id: id.into(),
+            }));
+            assert!(app.media.open_allowed(&key_of(id)), "{id}");
+        }
+        let _ = drain(&mut rx);
+    }
+
+    fn saved_and_asked(app: &mut App, id: &str, path: &str) -> Option<(String, Option<String>)> {
+        let _ = app.update(picked(id, Some(path)));
+        let _ = app.update(core(CoreEvent::MediaSaved {
+            room_id: room_a(),
+            item_id: id.into(),
+        }));
+        let _ = app.update(Message::OpenRequested(id.into()));
+        let bar = app.media.open_bar.as_ref()?;
+        Some((bar.question(), bar.warning().map(str::to_owned)))
+    }
+
+    #[test]
+    fn open_asks_first_and_warns_before_a_program() {
+        let (mut app, _rx, _) = file_app();
+        let (question, warning) =
+            saved_and_asked(&mut app, "doc", "/home/u/mine.pdf").expect("bar");
+        assert_eq!(question, "Open mine.pdf?");
+        assert_eq!(warning, None, "a document gets the plain question");
+        let _ = app.update(Message::OpenDismissed);
+        assert!(app.media.open_bar.is_none());
+        // The sender named it a program.
+        let (question, warning) =
+            saved_and_asked(&mut app, "prog", "/home/u/setup.exe").expect("bar");
+        assert_eq!(question, "Open setup.exe?");
+        assert_eq!(
+            warning.as_deref(),
+            Some(
+                "This file can run a program on your computer. Open it only if you trust the sender."
+            )
+        );
+        // A document saved under a program's name warns too.
+        let (_, warning) = saved_and_asked(&mut app, "doc", "/home/u/innocent.sh").expect("bar");
+        assert!(warning.is_some(), "the saved name decides as well");
+        // Never saved: no bar.
+        let _ = app.update(Message::OpenDismissed);
+        let _ = app.update(Message::OpenRequested("bare".into()));
+        assert!(app.media.open_bar.is_none());
+    }
+
+    #[test]
+    fn a_failed_save_shows_a_notice_and_forgets_the_pending_path() {
+        let (mut app, _rx, _) = file_app();
+        let _ = app.update(picked("doc", Some("/home/u/mine.pdf")));
+        let _ = app.update(core(CoreEvent::ActionFailed {
+            room_id: room_a(),
+            action: ActionKind::Media,
+            error: CoreError::Internal("disk full".into()),
+        }));
+        assert!(app.actions.notice.is_some());
+        let _ = app.update(core(CoreEvent::MediaSaved {
+            room_id: room_a(),
+            item_id: "doc".into(),
+        }));
+        assert!(
+            !app.media.open_allowed(&key_of("doc")),
+            "a late success for a save that was reported failed opens nothing"
+        );
+    }
+
+    #[test]
+    fn debug_of_the_app_and_its_media_messages_shows_no_bytes_or_names() {
+        let (mut app, mut rx, _) = media_app(0);
+        let _ = app.update(core(CoreEvent::TimelineDiff {
+            room_id: room_a(),
+            diffs: vec![ListDiff::Append {
+                values: vec![
+                    media_item("pic", MediaKind::Image, FILE_SENTINEL, 640, 480),
+                    media_item("doc", MediaKind::File, FILE_SENTINEL, 0, 0),
+                ],
+            }],
+        }));
+        let _ = drain(&mut rx);
+        arrive(&mut app, "pic", Some(decoded(8, 6)));
+        let _ = app.update(Message::MediaClicked("pic".into()));
+        let _ = app.update(media_event("pic", MediaSize::Full, Ok(png(9, 7))));
+        let _ = app.update(Message::MediaDecoded {
+            room_id: room_a(),
+            item_id: "pic".into(),
+            size: MediaSize::Full,
+            decoded: Some(decoded(9, 7)),
+        });
+        let _ = app.update(picked("doc", Some("/home/u/sentinel-file-name-x")));
+        let _ = app.update(core(CoreEvent::MediaSaved {
+            room_id: room_a(),
+            item_id: "doc".into(),
+        }));
+        let _ = app.update(Message::OpenRequested("doc".into()));
+        assert!(app.media.viewer.is_some());
+        let dbg = format!("{app:?}");
+        assert!(!dbg.contains(FILE_SENTINEL), "{dbg}");
+        assert!(!dbg.contains("/home/u"), "{dbg}");
+        assert!(dbg.contains("media"), "the app Debug still reports media");
+        let message = Message::MediaDecoded {
+            room_id: room_a(),
+            item_id: "x".into(),
+            size: MediaSize::Full,
+            decoded: Some(decoded(9, 7)),
+        };
+        let dbg = format!(
+            "{message:?} {:?}",
+            picked("doc", Some("/home/u/sentinel-file-name-x"))
+        );
+        assert!(
+            !dbg.contains(FILE_SENTINEL) && !dbg.contains("/home/u"),
+            "{dbg}"
+        );
+        assert!(!dbg.contains("pixels"), "{dbg}");
+    }
+
+    /// The tags of the first-child chain of a laid-out tree.
+    fn tag_path(app: &App) -> Vec<iced::advanced::widget::tree::Tag> {
+        use iced::advanced::widget::Tree;
+        let element = app.view();
+        let tree = Tree::new(element.as_widget());
+        let mut tags = vec![tree.tag];
+        let mut node = &tree;
+        while let Some(child) = node.children.first() {
+            tags.push(child.tag);
+            node = child;
+        }
+        tags
+    }
+
+    #[test]
+    fn opening_the_viewer_keeps_the_widget_tree_under_it() {
+        let (mut app, _rx, _) = media_app(2);
+        let closed = tag_path(&app);
+        let _ = app.update(Message::MediaClicked("img0".into()));
+        assert_eq!(tag_path(&app), closed, "the base keeps its place");
+        let _ = app.update(Message::ViewerClosed);
+        assert_eq!(tag_path(&app), closed);
+    }
+
+    #[test]
+    fn logging_out_forgets_the_media() {
+        let (mut app, _rx, _) = media_app(2);
+        arrive(&mut app, "img1", Some(decoded(8, 6)));
+        let _ = app.update(Message::MediaClicked("img0".into()));
+        let _ = app.update(core(CoreEvent::LoggedOut));
+        assert!(app.media.viewer.is_none());
+        assert!(app.media.thumb(&key_of("img1")).is_none());
     }
 }

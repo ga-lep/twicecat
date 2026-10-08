@@ -6,6 +6,7 @@
 pub mod loading;
 pub mod login;
 pub mod main_view;
+pub mod media_viewer;
 pub mod room_list_pane;
 pub mod security;
 pub mod sessions;

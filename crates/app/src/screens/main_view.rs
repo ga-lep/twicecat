@@ -14,7 +14,7 @@ use crate::emoji;
 use crate::links::{CheckedUrl, LinkBar, LinkKind};
 use crate::screens::loading::sync_label;
 use crate::screens::timeline_pane::RichEnv;
-use crate::screens::{room_list_pane, security, sessions, timeline_pane};
+use crate::screens::{media_viewer, room_list_pane, security, sessions, timeline_pane};
 use crate::sessions::SessionsMessage;
 use crate::state::{App, Message};
 use crate::text_safety::{MAX_NAME_CHARS, name_or_placeholder, one_line_capped};
@@ -172,6 +172,8 @@ fn room_pane(app: &App) -> Element<'_, Message> {
         revealed: &app.revealed,
         actions: &app.actions,
         rooms: &app.rooms,
+        media: &app.media,
+        room: app.selected.as_ref(),
     };
     let timeline = container(timeline_pane::view(&app.timeline, env)).height(Fill);
     // The picker floats over the timeline's bottom right corner.
@@ -187,6 +189,9 @@ fn room_pane(app: &App) -> Element<'_, Message> {
     let mut bars: Vec<Element<'_, Message>> = Vec::new();
     if let Some(bar) = &app.link_bar {
         bars.push(link_bar(bar));
+    }
+    if let Some(bar) = &app.media.open_bar {
+        bars.push(media_viewer::open_bar(bar));
     }
     if let Some(name) = &app.command_bar {
         bars.push(command_bar(name));
