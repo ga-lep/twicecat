@@ -10,16 +10,16 @@ use std::time::Duration;
 use futures_util::{Stream, StreamExt as _, pin_mut};
 use matrix_sdk::event_cache::PaginationStatus;
 use matrix_sdk::room::edit::EditedContent;
-use matrix_sdk::ruma::OwnedUserId;
 use matrix_sdk::ruma::api::client::receipt::create_receipt::v3::ReceiptType;
 use matrix_sdk::ruma::events::room::message::{MessageType, RoomMessageEventContent};
+use matrix_sdk::ruma::{OwnedEventId, OwnedUserId};
 use matrix_sdk::send_queue::SendHandle;
 use matrix_sdk::{Client, Room, RoomMemberships, RoomState, SessionChange};
 use matrix_sdk_ui::eyeball_im::{Vector, VectorDiff};
 use matrix_sdk_ui::sync_service::SyncService;
 use matrix_sdk_ui::timeline::{
-    EventSendState, MsgLikeKind, RoomExt as _, Timeline, TimelineItem as SdkTimelineItem,
-    TimelineItemContent,
+    EventSendState, MsgLikeKind, RoomExt as _, Timeline, TimelineFocus,
+    TimelineItem as SdkTimelineItem, TimelineItemContent,
 };
 use tokio::sync::{Notify, OnceCell, broadcast, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
@@ -30,7 +30,7 @@ use crate::api::{
     ActionKind, AudioBackend, AudioDevice, AudioDeviceId, AudioDevices, AudioSettings,
     CallEndReason, CallState, Command, CoreError, CoreEvent, DeviceId, Draft, ListDiff, MediaSize,
     Member, MessageText, OutgoingAttachment, OutgoingMessage, PaginationState, Password, RoomId,
-    RoomListQuery, RoomNotificationModeView, TypingUser, UserId,
+    RoomListQuery, RoomNotificationModeView, TimelineItem, TypingUser, UserId,
 };
 use crate::audio_session::{AudioSession, Mode};
 use crate::avatars::{Avatars, SdkFetcher, answer_unavailable};
@@ -56,12 +56,13 @@ use crate::session::{
 };
 use crate::spaces::SpaceChildren;
 use crate::sync::{CancelTrigger, SdkTarget, SyncControl, SyncPause, cancel_pair, run_supervised};
+use crate::threads::{self, OpenThread, Route, route_item};
 use crate::timeline::{map_item, normalize_reaction_key, parse_room_id, rank_members};
 use crate::upload;
 use crate::verification::Target;
 
 /// Events loaded by one back-pagination.
-const PAGINATION_BATCH: u16 = 20;
+pub(crate) const PAGINATION_BATCH: u16 = 20;
 
 /// Most typing users reported at once (a hostile room could list thousands).
 const MAX_TYPING_USERS: usize = 16;
@@ -166,22 +167,47 @@ struct Selected {
     members_synced: Arc<OnceCell<()>>,
     /// Set while a back-pagination of this room runs.
     paginating: Arc<AtomicBool>,
+    /// The open thread of this room, if any. It ends with the selection.
+    thread: Option<OpenThread>,
 }
 
 impl Selected {
     /// Ends the forwarder and the action tasks; the timeline is dropped with
     /// `self`, after the tasks that hold clones of it.
     async fn stop(mut self) {
+        if let Some(thread) = self.thread.take() {
+            thread.stop().await;
+        }
         self.task.abort();
         // An aborted task ends with a cancellation error; that is expected.
         let _ = self.task.await;
         self.tasks.shutdown().await;
     }
 
-    /// Runs `work` on the timeline in the action tasks. Its error, if any,
-    /// is reported as `ActionFailed`.
+    /// The timeline `target` names, or why there is none.
+    fn timeline_for(&self, target: TimelineTarget<'_>) -> Result<Arc<Timeline>, CoreError> {
+        match target {
+            TimelineTarget::Main => Ok(self.timeline.clone()),
+            TimelineTarget::Item(item_id) => match route_item(item_id) {
+                Route::Main => Ok(self.timeline.clone()),
+                Route::Thread => self
+                    .thread
+                    .as_ref()
+                    .map(|t| t.timeline.clone())
+                    .ok_or(CoreError::ItemNotFound),
+            },
+            TimelineTarget::Thread(root) => match &self.thread {
+                Some(t) if t.root == *root => Ok(t.timeline.clone()),
+                _ => Err(CoreError::NotAllowed),
+            },
+        }
+    }
+
+    /// Runs `work` on `timeline` in the action tasks. Its error, if any, is
+    /// reported as `ActionFailed`.
     fn spawn_action<F, Fut>(
         &mut self,
+        timeline: Arc<Timeline>,
         action: ActionKind,
         events: &mpsc::Sender<CoreEvent>,
         work: F,
@@ -191,7 +217,7 @@ impl Selected {
     {
         // Forget finished tasks, so the set does not grow with every action.
         while self.tasks.try_join_next().is_some() {}
-        let fut = work(self.timeline.clone());
+        let fut = work(timeline);
         let events = events.clone();
         let room_id = self.room_id.clone();
         self.tasks.spawn(async move {
@@ -206,6 +232,17 @@ impl Selected {
             }
         });
     }
+}
+
+/// Which of the selected room's timelines a command acts on.
+#[derive(Clone, Copy)]
+enum TimelineTarget<'a> {
+    /// The room's live timeline.
+    Main,
+    /// The timeline the item ID belongs to (see `route_item`).
+    Item(&'a str),
+    /// The open thread, which must be the one rooted at this event.
+    Thread(&'a matrix_sdk::ruma::EventId),
 }
 
 struct Active {
@@ -420,30 +457,25 @@ async fn forward_room_list(
 /// Forwards the initial timeline items as one `Reset`, then the room's stored
 /// draft (after the items, so a reply draft can find its message), then every
 /// diff batch.
-async fn forward_timeline(
-    room_id: RoomId,
+///
+/// `wrap` makes the event for a batch of diffs (the room's `TimelineDiff` or
+/// the open thread's `ThreadDiff`); `after_first` follows the first batch.
+pub(crate) async fn forward_timeline(
     items: Vector<Arc<SdkTimelineItem>>,
     stream: impl Stream<Item = Vec<VectorDiff<Arc<SdkTimelineItem>>>>,
     events: mpsc::Sender<CoreEvent>,
     own: Option<OwnedUserId>,
-    draft: Option<Draft>,
+    wrap: impl Fn(Vec<ListDiff<TimelineItem>>) -> CoreEvent,
+    after_first: Vec<CoreEvent>,
 ) {
     let initial = ListDiff::Reset {
         values: items.iter().map(|i| map_item(i, own.as_deref())).collect(),
     };
-    let first = CoreEvent::TimelineDiff {
-        room_id: room_id.clone(),
-        diffs: vec![initial],
-    };
-    if events.send(first).await.is_err() {
+    if events.send(wrap(vec![initial])).await.is_err() {
         return;
     }
-    if let Some(draft) = draft {
-        let loaded = CoreEvent::DraftLoaded {
-            room_id: room_id.clone(),
-            draft,
-        };
-        if events.send(loaded).await.is_err() {
+    for event in after_first {
+        if events.send(event).await.is_err() {
             return;
         }
     }
@@ -453,11 +485,7 @@ async fn forward_timeline(
             .into_iter()
             .map(|d| map_diff(d, |item| map_item(&item, own.as_deref())))
             .collect();
-        let event = CoreEvent::TimelineDiff {
-            room_id: room_id.clone(),
-            diffs,
-        };
-        if events.send(event).await.is_err() {
+        if events.send(wrap(diffs)).await.is_err() {
             return;
         }
     }
@@ -763,11 +791,11 @@ async fn discard_task(timeline: Arc<Timeline>, item_id: String) -> Result<(), Co
 
 /// Marks a back-pagination as running; at most one runs per selection.
 /// Dropping the permit frees the slot.
-struct PaginationPermit(Arc<AtomicBool>);
+pub(crate) struct PaginationPermit(Arc<AtomicBool>);
 
 impl PaginationPermit {
     /// Takes the slot, or `None` while another pagination holds it.
-    fn try_acquire(flag: &Arc<AtomicBool>) -> Option<Self> {
+    pub(crate) fn try_acquire(flag: &Arc<AtomicBool>) -> Option<Self> {
         flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .ok()
             .map(|_| Self(flag.clone()))
@@ -906,18 +934,9 @@ async fn forward_typing(room_id: RoomId, timeline: Arc<Timeline>, events: mpsc::
     }
 }
 
-/// The room (empty for commands that name none) and action kind a Phase 5
-/// command fails under while the core has no handler for it (threads); `None`
-/// for every other command.
-fn unimplemented_target(cmd: &Command) -> Option<(RoomId, ActionKind)> {
-    let none = || RoomId::from("");
-    Some(match cmd {
-        Command::OpenThread { room_id, .. } | Command::PaginateThread { room_id, .. } => {
-            (room_id.clone(), ActionKind::Thread)
-        }
-        Command::CloseThread => (none(), ActionKind::Thread),
-        _ => return None,
-    })
+/// Parses an event ID; a malformed one is refused.
+fn parse_event_id(id: &crate::api::EventId) -> Result<OwnedEventId, CoreError> {
+    OwnedEventId::try_from(id.as_str()).map_err(|_| CoreError::NotAllowed)
 }
 
 /// Parses a user ID; a malformed one is refused.
@@ -988,10 +1007,6 @@ impl Engine {
     }
 
     async fn handle(&mut self, cmd: Command) {
-        if let Some((room_id, action)) = unimplemented_target(&cmd) {
-            self.answer_unimplemented(room_id, action).await;
-            return;
-        }
         match cmd {
             Command::RestoreSession => self.restore().await,
             Command::LoginPassword {
@@ -1066,27 +1081,43 @@ impl Engine {
             },
             Command::Send(message) => {
                 let room_id = message.room_id.clone();
-                self.run_action(room_id, ActionKind::Send, |timeline| {
+                // A threaded message goes through the thread's timeline,
+                // which adds the relation.
+                let root = match message.thread_root.as_ref().map(parse_event_id) {
+                    None => None,
+                    Some(Ok(root)) => Some(root),
+                    Some(Err(error)) => {
+                        self.fail(room_id, ActionKind::Send, error).await;
+                        return;
+                    }
+                };
+                let target = root
+                    .as_deref()
+                    .map_or(TimelineTarget::Main, TimelineTarget::Thread);
+                self.run_action_on(room_id, ActionKind::Send, target, |timeline| {
                     send_task(timeline, message)
                 })
                 .await;
             }
             Command::RetrySend { room_id, item_id } => {
-                self.run_action(room_id, ActionKind::Retry, |timeline| {
-                    retry_task(timeline, item_id)
+                let target = TimelineTarget::Item(&item_id);
+                self.run_action_on(room_id, ActionKind::Retry, target, |timeline| {
+                    retry_task(timeline, item_id.clone())
                 })
                 .await;
             }
             Command::DiscardSend { room_id, item_id } => {
-                self.run_action(room_id, ActionKind::Discard, |timeline| {
-                    discard_task(timeline, item_id)
+                let target = TimelineTarget::Item(&item_id);
+                self.run_action_on(room_id, ActionKind::Discard, target, |timeline| {
+                    discard_task(timeline, item_id.clone())
                 })
                 .await;
             }
             Command::Edit { item_id, message } => {
                 let room_id = message.room_id.clone();
-                self.run_action(room_id, ActionKind::Edit, |timeline| {
-                    edit_task(timeline, item_id, message)
+                let target = TimelineTarget::Item(&item_id);
+                self.run_action_on(room_id, ActionKind::Edit, target, |timeline| {
+                    edit_task(timeline, item_id.clone(), message)
                 })
                 .await;
             }
@@ -1095,8 +1126,9 @@ impl Engine {
                 item_id,
                 reason,
             } => {
-                self.run_action(room_id, ActionKind::Redact, |timeline| {
-                    redact_task(timeline, item_id, reason)
+                let target = TimelineTarget::Item(&item_id);
+                self.run_action_on(room_id, ActionKind::Redact, target, |timeline| {
+                    redact_task(timeline, item_id.clone(), reason)
                 })
                 .await;
             }
@@ -1105,8 +1137,9 @@ impl Engine {
                 item_id,
                 key,
             } => {
-                self.run_action(room_id, ActionKind::React, |timeline| {
-                    react_task(timeline, item_id, key)
+                let target = TimelineTarget::Item(&item_id);
+                self.run_action_on(room_id, ActionKind::React, target, |timeline| {
+                    react_task(timeline, item_id.clone(), key)
                 })
                 .await;
             }
@@ -1510,9 +1543,11 @@ impl Engine {
                 })
                 .await;
             }
-            // Answered by `unimplemented_target` at the top, until the tasks
-            // that implement them land.
-            Command::OpenThread { .. } | Command::CloseThread | Command::PaginateThread { .. } => {}
+            Command::OpenThread { room_id, root } => self.open_thread(room_id, root).await,
+            Command::CloseThread => self.close_thread().await,
+            Command::PaginateThread { room_id, root } => {
+                self.paginate_thread(room_id, root).await;
+            }
         }
     }
 
@@ -1980,22 +2015,6 @@ impl Engine {
         self.notification_job(room_id, job).await;
     }
 
-    /// Fails a command that has no handler yet: `NotLoggedIn` without a
-    /// session, an internal "not implemented yet" with one.
-    async fn answer_unimplemented(&self, room_id: RoomId, action: ActionKind) {
-        let error = if self.active.is_some() {
-            CoreError::Internal("not implemented yet".to_owned())
-        } else {
-            CoreError::NotLoggedIn
-        };
-        self.emit(CoreEvent::ActionFailed {
-            room_id,
-            action,
-            error,
-        })
-        .await;
-    }
-
     /// Answers a Phase 4 action sent without a session. These actions belong
     /// to no room, so `room_id` is empty.
     async fn not_logged_in(&self, action: ActionKind) {
@@ -2034,7 +2053,8 @@ impl Engine {
             .as_ref()
             .filter(|s| s.room_id == *room_id)
             .ok_or(CoreError::NoRoomSelected)?;
-        let item = find_item(&selected.timeline, item_id).await?;
+        let timeline = selected.timeline_for(TimelineTarget::Item(item_id))?;
+        let item = find_item(&timeline, item_id).await?;
         let event = item.as_event().ok_or(CoreError::NotAllowed)?;
         match event.content() {
             TimelineItemContent::MsgLike(content) => match &content.kind {
@@ -2362,8 +2382,14 @@ impl Engine {
         if let Some(previous) = active.selected.take() {
             previous.stop().await;
         }
+        // Threaded replies belong to their thread's timeline (Q16); the
+        // builder from `RoomExt` keeps the read receipt tracking.
         let timeline = room
-            .timeline()
+            .timeline_builder()
+            .with_focus(TimelineFocus::Live {
+                hide_threaded_events: true,
+            })
+            .build()
             .await
             .map_err(|_| CoreError::Internal("could not open the room timeline".into()))?;
         // Typing and receipts of the open room arrive through sliding sync
@@ -2382,13 +2408,25 @@ impl Engine {
             .flatten()
             .and_then(drafts::from_sdk);
         let (items, stream) = timeline.subscribe().await;
+        let wrap_room = room_id.clone();
         let task = tokio::spawn(forward_timeline(
-            room_id.clone(),
             items,
             stream,
             self.events.clone(),
             active.client.user_id().map(ToOwned::to_owned),
-            draft,
+            move |diffs| CoreEvent::TimelineDiff {
+                room_id: wrap_room.clone(),
+                diffs,
+            },
+            // The draft follows the items, so a reply draft can find its
+            // message.
+            draft
+                .map(|draft| CoreEvent::DraftLoaded {
+                    room_id: room_id.clone(),
+                    draft,
+                })
+                .into_iter()
+                .collect(),
         ));
         let timeline = Arc::new(timeline);
         // Both forwarders live in the action set, so they end with the
@@ -2411,6 +2449,7 @@ impl Engine {
             tasks,
             members_synced: Arc::new(OnceCell::new()),
             paginating: Arc::new(AtomicBool::new(false)),
+            thread: None,
         });
         // A DM with exactly one other user shows that user's trust (Q10).
         if let Some(peer) = security::dm_peer_of(&room, active.client.user_id()) {
@@ -2431,23 +2470,118 @@ impl Engine {
         F: FnOnce(Arc<Timeline>) -> Fut,
         Fut: std::future::Future<Output = Result<(), CoreError>> + Send + 'static,
     {
+        self.run_action_on(room_id, action, TimelineTarget::Main, work)
+            .await;
+    }
+
+    /// Like [`Self::run_action`] on the timeline `target` names: the room's,
+    /// or the open thread's. A target that is not there (no open thread, or
+    /// another one) fails the action.
+    async fn run_action_on<F, Fut>(
+        &mut self,
+        room_id: RoomId,
+        action: ActionKind,
+        target: TimelineTarget<'_>,
+        work: F,
+    ) where
+        F: FnOnce(Arc<Timeline>) -> Fut,
+        Fut: std::future::Future<Output = Result<(), CoreError>> + Send + 'static,
+    {
         let events = self.events.clone();
         let error = match self.active.as_mut() {
             None => CoreError::NotLoggedIn,
             Some(active) => match active.selected.as_mut().filter(|s| s.room_id == room_id) {
-                Some(selected) => {
-                    selected.spawn_action(action, &events, work);
-                    return;
-                }
+                Some(selected) => match selected.timeline_for(target) {
+                    Ok(timeline) => {
+                        selected.spawn_action(timeline, action, &events, work);
+                        return;
+                    }
+                    Err(error) => error,
+                },
                 None => CoreError::NoRoomSelected,
             },
         };
+        self.fail(room_id, action, error).await;
+    }
+
+    /// Answers a command with `ActionFailed`.
+    async fn fail(&self, room_id: RoomId, action: ActionKind, error: CoreError) {
         self.emit(CoreEvent::ActionFailed {
             room_id,
             action,
             error,
         })
         .await;
+    }
+
+    /// Opens the thread rooted at `root` in the selected room, closing the
+    /// open one. The thread's items arrive as `ThreadDiff`s.
+    async fn open_thread(&mut self, room_id: RoomId, root: crate::api::EventId) {
+        let result = match self.active.as_mut() {
+            None => Err(CoreError::NotLoggedIn),
+            Some(active) => {
+                let own = active.client.user_id().map(ToOwned::to_owned);
+                match active.selected.as_mut().filter(|s| s.room_id == room_id) {
+                    None => Err(CoreError::NoRoomSelected),
+                    Some(selected) => match parse_event_id(&root) {
+                        Err(error) => Err(error),
+                        Ok(id) => {
+                            if let Some(old) = selected.thread.take() {
+                                old.stop().await;
+                            }
+                            let room = selected.timeline.room().clone();
+                            threads::open(&room, &room_id, id, own, &self.events)
+                                .await
+                                .map(|thread| selected.thread = Some(thread))
+                        }
+                    },
+                }
+            }
+        };
+        match result {
+            // A new thread timeline is empty until it paginates once: the
+            // root and the replies the sync did not bring come from there.
+            Ok(()) => self.paginate_thread(room_id, root).await,
+            Err(error) => self.fail(room_id, ActionKind::Thread, error).await,
+        }
+    }
+
+    /// Closes the open thread, if any.
+    async fn close_thread(&mut self) {
+        let Some(active) = self.active.as_mut() else {
+            return self
+                .fail(RoomId::from(""), ActionKind::Thread, CoreError::NotLoggedIn)
+                .await;
+        };
+        if let Some(thread) = active.selected.as_mut().and_then(|s| s.thread.take()) {
+            thread.stop().await;
+        }
+    }
+
+    /// Loads older events of the open thread.
+    async fn paginate_thread(&mut self, room_id: RoomId, root: crate::api::EventId) {
+        let parsed = parse_event_id(&root);
+        let events = self.events.clone();
+        let (room, event) = (room_id.clone(), root.clone());
+        let flag = self
+            .active
+            .as_ref()
+            .and_then(|a| a.selected.as_ref())
+            .and_then(|s| s.thread.as_ref())
+            .map(|t| t.paginating.clone())
+            .unwrap_or_default();
+        match parsed {
+            Ok(id) => {
+                self.run_action_on(
+                    room_id,
+                    ActionKind::Thread,
+                    TimelineTarget::Thread(&id),
+                    |timeline| threads::paginate_task(timeline, flag, events, room, event),
+                )
+                .await;
+            }
+            Err(error) => self.fail(room_id, ActionKind::Thread, error).await,
+        }
     }
 
     /// Sends a text message to the selected room.
@@ -3861,7 +3995,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn phase5_commands_with_a_session_are_not_implemented_yet() {
+    async fn thread_commands_without_a_selected_room_fail_or_do_nothing() {
         let tmp = tempfile::tempdir().unwrap();
         let (mut engine, mut rx) = oauth_engine(tmp.path());
         let client = Client::builder()
@@ -3882,28 +4016,51 @@ mod tests {
             notifications: None,
             rooms: RoomTasks::new(),
         });
-        // Uploads, notification settings, rooms and the profile are
-        // implemented: see the tests after this one.
-        for (cmd, kind, room) in phase5_commands().into_iter().filter(|(_, kind, _)| {
-            !matches!(
-                kind,
-                ActionKind::Upload
-                    | ActionKind::Notifications
-                    | ActionKind::Rooms
-                    | ActionKind::Profile
-            )
-        }) {
+        let room = rid("a");
+        let root = crate::api::EventId::from("$root:x");
+        for cmd in [
+            Command::OpenThread {
+                room_id: room.clone(),
+                root: root.clone(),
+            },
+            Command::PaginateThread {
+                room_id: room.clone(),
+                root: root.clone(),
+            },
+        ] {
             engine.handle(cmd).await;
             let got = drain(&mut rx).await;
             assert!(
                 matches!(
                     got.as_slice(),
-                    [CoreEvent::ActionFailed { room_id, action, error: CoreError::Internal(why) }]
-                        if *room_id == room && *action == kind && why == "not implemented yet"
+                    [CoreEvent::ActionFailed { room_id, action: ActionKind::Thread, error: CoreError::NoRoomSelected }]
+                        if *room_id == room
                 ),
-                "{kind:?}: {got:?}"
+                "{got:?}"
             );
         }
+        // Nothing to close: no answer.
+        engine.handle(Command::CloseThread).await;
+        assert!(drain(&mut rx).await.is_empty());
+        // A threaded send and an action on a thread item need the thread.
+        let Some((Command::Send(mut message), _)) = action_commands(&room).into_iter().next()
+        else {
+            unreachable!("the first action command is a send")
+        };
+        message.thread_root = Some(root);
+        engine.handle(Command::Send(message)).await;
+        let got = drain(&mut rx).await;
+        assert!(
+            matches!(
+                got.as_slice(),
+                [CoreEvent::ActionFailed {
+                    action: ActionKind::Send,
+                    error: CoreError::NoRoomSelected,
+                    ..
+                }]
+            ),
+            "{got:?}"
+        );
         if let Some(mut active) = engine.active.take() {
             active.stop_tasks().await;
         }

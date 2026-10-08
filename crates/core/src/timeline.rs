@@ -8,15 +8,16 @@ use matrix_sdk::ruma::{OwnedRoomId, UserId as SdkUserId};
 use matrix_sdk_crypto::types::events::UtdCause;
 use matrix_sdk_ui::timeline::{
     AnyOtherStateEventContentChange, EmbeddedEvent, EncryptedMessage, EventSendState,
-    EventTimelineItem, InReplyToDetails, MembershipChange, MsgLikeKind, Profile, TimelineDetails,
-    TimelineEventShieldState, TimelineEventShieldStateCode, TimelineItem as SdkItem,
-    TimelineItemContent, VirtualTimelineItem,
+    EventTimelineItem, InReplyToDetails, MembershipChange, MsgLikeKind, Profile, ThreadSummary,
+    TimelineDetails, TimelineEventShieldState, TimelineEventShieldStateCode,
+    TimelineItem as SdkItem, TimelineItemContent, VirtualTimelineItem,
 };
 
 use crate::api::{
     CoreError, EventId, ItemActions, Member, MessageDetails, MessageKind, PlaceholderKind,
     ReactionGroup, ReplyPreview, ReplyState, RoomId, SendFailure, SendStatus, Shield, ShieldCode,
-    StateChange, TimelineItem, TimelineItemKind, UploadProgress, UserId, UtdReason,
+    StateChange, ThreadSummaryView, TimelineItem, TimelineItemKind, UploadProgress, UserId,
+    UtdReason,
 };
 use crate::{media, rich_text};
 
@@ -179,7 +180,7 @@ fn map_event(event: &EventTimelineItem, own: Option<&SdkUserId>) -> TimelineItem
                         m.upload = map_upload_progress(event.send_state());
                         Box::new(m)
                     }),
-                    thread: None,
+                    thread: content.thread_summary.as_ref().map(map_thread_summary),
                 };
                 // A remote event has no send state: the server accepted it.
                 let sent = event.send_state().map_or(SendStatus::Sent, map_send_state);
@@ -384,6 +385,42 @@ fn map_reply(reply: &InReplyToDetails) -> ReplyPreview {
     }
 }
 
+/// What the thread summary needs of the latest reply.
+struct LatestReply<'a> {
+    sender: &'a SdkUserId,
+    sender_name: Option<String>,
+    /// The reply's text; `None` for anything that is not a message.
+    body: Option<&'a str>,
+}
+
+/// Builds the summary of a thread from its reply count and latest reply.
+/// `None` means the latest reply is not known (yet).
+fn thread_view(replies: u32, latest: Option<LatestReply<'_>>) -> ThreadSummaryView {
+    ThreadSummaryView {
+        replies,
+        latest_sender: latest.as_ref().map(|l| user(l.sender)),
+        latest_sender_name: latest.as_ref().and_then(|l| l.sender_name.clone()),
+        latest_preview: latest
+            .and_then(|l| l.body)
+            .map(reply_body)
+            .filter(|p| !p.is_empty()),
+    }
+}
+
+/// Maps the thread summary of a root message. A latest reply that is not
+/// loaded leaves the sender and preview empty; the count stays.
+pub(crate) fn map_thread_summary(summary: &ThreadSummary) -> ThreadSummaryView {
+    let latest = match &summary.latest_event {
+        TimelineDetails::Ready(embedded) => Some(LatestReply {
+            sender: &embedded.sender,
+            sender_name: profile_name(&embedded.sender_profile),
+            body: embedded.content.as_message().map(|m| m.body()),
+        }),
+        _ => None,
+    };
+    thread_view(summary.num_replies, latest)
+}
+
 /// The first line of `body`, cut to 200 characters (never inside one).
 pub(crate) fn reply_body(body: &str) -> String {
     body.lines()
@@ -536,9 +573,120 @@ pub(crate) fn item_actions(
 
 #[cfg(test)]
 mod tests {
-    use matrix_sdk::ruma::event_id;
+    use matrix_sdk::ruma::{event_id, user_id};
 
     use super::*;
+
+    #[test]
+    fn thread_summary_table() {
+        let carol = user_id!("@carol:x");
+        let latest = |name: Option<&str>, body: Option<&'static str>| {
+            Some(LatestReply {
+                sender: carol,
+                sender_name: name.map(str::to_owned),
+                body,
+            })
+        };
+        let long = "x".repeat(300);
+        let cases: Vec<(u32, Option<LatestReply<'_>>, ThreadSummaryView)> = vec![
+            // Unknown latest reply: only the count.
+            (
+                3,
+                None,
+                ThreadSummaryView {
+                    replies: 3,
+                    latest_sender: None,
+                    latest_sender_name: None,
+                    latest_preview: None,
+                },
+            ),
+            // Known sender, name and text.
+            (
+                1,
+                latest(Some("Carol"), Some("hello")),
+                ThreadSummaryView {
+                    replies: 1,
+                    latest_sender: Some(UserId::from("@carol:x")),
+                    latest_sender_name: Some("Carol".into()),
+                    latest_preview: Some("hello".into()),
+                },
+            ),
+            // No profile yet: the ID is still there.
+            (
+                2,
+                latest(None, Some("hi")),
+                ThreadSummaryView {
+                    replies: 2,
+                    latest_sender: Some(UserId::from("@carol:x")),
+                    latest_sender_name: None,
+                    latest_preview: Some("hi".into()),
+                },
+            ),
+            // Not a message (a redaction, say): no preview.
+            (
+                0,
+                latest(Some("Carol"), None),
+                ThreadSummaryView {
+                    replies: 0,
+                    latest_sender: Some(UserId::from("@carol:x")),
+                    latest_sender_name: Some("Carol".into()),
+                    latest_preview: None,
+                },
+            ),
+            // Only the first line, cut like a reply quote.
+            (
+                4,
+                latest(None, Some("first\nsecond")),
+                ThreadSummaryView {
+                    replies: 4,
+                    latest_sender: Some(UserId::from("@carol:x")),
+                    latest_sender_name: None,
+                    latest_preview: Some("first".into()),
+                },
+            ),
+            (
+                5,
+                Some(LatestReply {
+                    sender: carol,
+                    sender_name: None,
+                    body: Some(long.as_str()),
+                }),
+                ThreadSummaryView {
+                    replies: 5,
+                    latest_sender: Some(UserId::from("@carol:x")),
+                    latest_sender_name: None,
+                    latest_preview: Some("x".repeat(REPLY_BODY_CHARS)),
+                },
+            ),
+            // An empty body gives no preview.
+            (
+                6,
+                latest(None, Some("")),
+                ThreadSummaryView {
+                    replies: 6,
+                    latest_sender: Some(UserId::from("@carol:x")),
+                    latest_sender_name: None,
+                    latest_preview: None,
+                },
+            ),
+        ];
+        for (replies, latest, expected) in cases {
+            assert_eq!(thread_view(replies, latest), expected);
+        }
+    }
+
+    #[test]
+    fn unloaded_latest_reply_keeps_the_count() {
+        for details in [TimelineDetails::Unavailable, TimelineDetails::Pending] {
+            let summary = ThreadSummary {
+                latest_event: details,
+                num_replies: 7,
+            };
+            let view = map_thread_summary(&summary);
+            assert_eq!(view.replies, 7);
+            assert!(view.latest_sender.is_none() && view.latest_preview.is_none());
+        }
+    }
 
     #[test]
     fn shield_mapping_table() {

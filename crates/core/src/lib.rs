@@ -29,6 +29,7 @@ mod security;
 mod session;
 mod spaces;
 mod sync;
+mod threads;
 mod timeline;
 mod upload;
 mod verification;
