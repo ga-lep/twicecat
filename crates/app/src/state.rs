@@ -37,7 +37,9 @@ use crate::screens::login::{self, BrowserUrl, LoginForm};
 use crate::screens::{self, loading, main_view};
 use crate::security::{Busy, SecurityMessage, SecurityModel};
 use crate::sessions::{SessionsMessage, SessionsModel, logout_needs_warning};
+use crate::spaces::{SpacesMessage, SpacesModel};
 use crate::text_safety;
+use crate::threads::{ThreadsMessage, ThreadsModel};
 use crate::timeline::{self, Effects, TimelineView};
 use crate::tray::{self, NoTrayFactory, SystemTrayFactory, TrayAction, TrayFactory, TrayModel};
 use crate::upload::{self, Outcome, UploadModel, UploadPaths};
@@ -371,6 +373,10 @@ pub enum Message {
     Tray(TrayAction),
     /// A message of the room dialogs, panels, user card and join bar.
     Rooms(RoomsMessage),
+    /// A button of the spaces sidebar.
+    Spaces(SpacesMessage),
+    /// A thread summary row or a control of the thread panel.
+    Threads(ThreadsMessage),
     /// The task that decoded fetched image bytes finished.
     MediaDecoded {
         /// Room of the item.
@@ -442,6 +448,10 @@ pub struct App {
     pub tray: TrayModel,
     /// Room dialogs, settings, members, the user card and the join bar.
     pub rooms_ui: RoomsModel,
+    /// The spaces the user is in (the sidebar).
+    pub spaces: SpacesModel,
+    /// The thread panel.
+    pub threads: ThreadsModel,
     notifier: Box<dyn Notifier>,
     folding: Folding,
     pub(crate) dialogs: Box<dyn Dialogs>,
@@ -516,6 +526,8 @@ impl std::fmt::Debug for App {
             .field("media", &self.media)
             .field("uploads", &self.uploads)
             .field("rooms_ui", &self.rooms_ui)
+            .field("spaces", &self.spaces)
+            .field("threads", &self.threads)
             .field("login", &self.login)
             .field("login_in_flight", &self.login_in_flight)
             .field("composer", &self.composer)
@@ -561,6 +573,8 @@ impl App {
             // touch the desktop.
             tray: TrayModel::new(Box::new(NoTrayFactory)),
             rooms_ui: RoomsModel::default(),
+            spaces: SpacesModel::default(),
+            threads: ThreadsModel::default(),
             notifier: Box::new(NoNotifier),
             folding: Folding::default(),
             dialogs: Box::new(SystemDialogs),
@@ -1021,7 +1035,12 @@ impl App {
             Message::Verification(message) => self.on_verification(message),
             Message::Sessions(message) => self.on_sessions(message),
             Message::Rooms(message) => self.on_rooms(message),
-            Message::AttachRequested => self.attach_requested(),
+            Message::Spaces(SpacesMessage::Select(space)) => self.select_space(space),
+            Message::Threads(message) => self.on_threads(message),
+            Message::AttachRequested => {
+                self.uploads_for_room();
+                self.attach_requested()
+            }
             Message::FilesChosen(paths) => self.files_added(paths.0),
             Message::FileHovered => {
                 self.uploads.hovering = self.upload_room().is_some();
@@ -1031,13 +1050,19 @@ impl App {
                 self.uploads.hovering = false;
                 Task::none()
             }
-            Message::FileDropped(paths) => self.files_dropped(paths.0),
+            Message::FileDropped(paths) => {
+                self.uploads_for_room();
+                self.files_dropped(paths.0)
+            }
             Message::DropsDue(seq) => self.drops_due(seq),
             Message::UploadPrepared { entry, outcome } => {
                 self.upload_prepared(entry, *outcome);
                 Task::none()
             }
-            Message::PasteRequested => self.paste_requested(),
+            Message::PasteRequested => {
+                self.uploads_for_room();
+                self.paste_requested()
+            }
             Message::Pasted(content) => self.pasted(content),
             Message::PasteFallback(text) => self.paste_fallback(text),
             Message::UploadConfirmed => self.upload_confirmed(),
@@ -1108,6 +1133,9 @@ impl App {
                 let save = self.save_draft();
                 self.draft_dirty = false;
                 self.draft_seq = self.draft_seq.wrapping_add(1);
+                // The core closes the thread with the old room; this is for
+                // picking the open room again.
+                let close_thread = self.close_thread_panel();
                 self.selected = Some(id.clone());
                 self.timeline.reset();
                 self.media.reset_view();
@@ -1122,6 +1150,7 @@ impl App {
                     stop_typing,
                     marker,
                     save,
+                    close_thread,
                     self.send(Command::SelectRoom(id)),
                 ])
             }
@@ -1335,6 +1364,15 @@ impl App {
             }
             CoreEvent::ActionFailed {
                 room_id,
+                action: ActionKind::Thread,
+                ..
+            } => {
+                if self.selected.as_ref() == Some(&room_id) {
+                    task = self.show_notice_text("The thread could not be loaded.".to_owned());
+                }
+            }
+            CoreEvent::ActionFailed {
+                room_id,
                 action: ActionKind::Media,
                 ..
             } => {
@@ -1460,10 +1498,11 @@ impl App {
                 members,
                 truncated,
             } => task = self.on_room_members(room_id, members, truncated),
-            CoreEvent::OwnProfile(_)
-            | CoreEvent::Spaces(_)
-            | CoreEvent::ThreadDiff { .. }
-            | CoreEvent::ThreadPagination { .. } => {}
+            CoreEvent::Spaces(spaces) => task = self.on_spaces(spaces),
+            event @ (CoreEvent::ThreadDiff { .. } | CoreEvent::ThreadPagination { .. }) => {
+                task = self.thread_event(event);
+            }
+            CoreEvent::OwnProfile(_) => {}
             // Calls and audio have no UI yet (Phase 6 UI tasks).
             CoreEvent::CallState(_)
             | CoreEvent::CallParticipants { .. }
@@ -1581,7 +1620,7 @@ impl App {
 
     /// Keeps `query` and asks the core for it, unless it is the query the core
     /// already has. The list comes back as a `Reset`, so paging may ask again.
-    fn set_query(&mut self, query: RoomListQuery) -> Task<Message> {
+    pub(crate) fn set_query(&mut self, query: RoomListQuery) -> Task<Message> {
         if query == self.query {
             return Task::none();
         }
@@ -1715,9 +1754,13 @@ impl App {
     /// The message `id` of the open timeline: its plain body, whether it is
     /// the user's own, and its details. `None` for other kinds of item.
     fn find_message(&self, id: &str) -> Option<(&str, bool, &MessageDetails)> {
+        // Thread item IDs carry their root and never equal a room item's,
+        // so one search over both lists finds the right item.
+        let thread = self.threads.panel.iter().flat_map(|p| &p.timeline.items);
         self.timeline
             .items
             .iter()
+            .chain(thread)
             .find(|item| item.id == id)
             .and_then(|item| match &item.kind {
                 TimelineItemKind::Message {
@@ -1728,6 +1771,14 @@ impl App {
                 } => Some((body.as_str(), *is_own, details.as_ref())),
                 _ => None,
             })
+    }
+
+    /// Whether `id` is an item of the thread panel.
+    fn is_thread_item(&self, id: &str) -> bool {
+        self.threads
+            .panel
+            .as_ref()
+            .is_some_and(|p| p.timeline.items.iter().any(|item| item.id == id))
     }
 
     /// The buttons message `id` offers right now, or `None` when it is gone.
@@ -1760,7 +1811,11 @@ impl App {
 
     /// **Reply**: quote message `id` in the next send.
     fn request_reply(&mut self, id: String) -> Task<Message> {
-        if self.selected.is_none() || !self.buttons_for(&id).is_some_and(|b| b.reply) {
+        // The room's composer cannot quote a thread item.
+        if self.selected.is_none()
+            || self.is_thread_item(&id)
+            || !self.buttons_for(&id).is_some_and(|b| b.reply)
+        {
             return Task::none();
         }
         let was_edit = matches!(self.composer.mode, composer::Mode::Edit(_));
@@ -1776,7 +1831,10 @@ impl App {
 
     /// **Edit**: load the plain body of the user's own message `id`.
     fn request_edit(&mut self, id: String) -> Task<Message> {
-        if self.selected.is_none() || !self.buttons_for(&id).is_some_and(|b| b.edit) {
+        if self.selected.is_none()
+            || self.is_thread_item(&id)
+            || !self.buttons_for(&id).is_some_and(|b| b.edit)
+        {
             return Task::none();
         }
         let Some(body) = self.find_message(&id).map(|(body, ..)| body.to_owned()) else {
@@ -1960,6 +2018,8 @@ impl App {
         self.verification = None;
         self.sessions = SessionsModel::default();
         self.rooms_ui = RoomsModel::default();
+        self.spaces.clear();
+        self.reset_threads();
         self.notice = Some(notice.to_owned());
         self.end_login_attempt();
         self.screen = Screen::Login;
@@ -1968,6 +2028,7 @@ impl App {
 
     pub(crate) fn deselect(&mut self) {
         self.selected = None;
+        self.reset_threads();
         self.timeline.reset();
         self.media.reset_view();
         self.uploads.reset_view();
@@ -2086,27 +2147,22 @@ impl App {
         let Some(room_id) = self.selected.clone() else {
             return Task::none();
         };
-        let view = &self.timeline;
-        let range = timeline::visible_window(
-            &view.prefix,
-            view.offset_from_bottom,
-            view.viewport_h,
-            view.viewport_h,
-        );
-        let wanted: Vec<String> = view
-            .items
-            .get(range)
-            .unwrap_or_default()
-            .iter()
-            .filter(|item| {
-                matches!(
-                    &item.kind,
-                    TimelineItemKind::Message { details, .. }
-                        if details.media.as_ref().is_some_and(|m| m.kind == MediaKind::Image)
-                )
-            })
-            .map(|item| item.id.clone())
-            .collect();
+        let wanted = visible_images(&self.timeline);
+        self.fetch_thumbnails(&room_id, wanted)
+    }
+
+    /// The same for the thread panel's timeline, whose item IDs
+    /// (`thread:{root}:{n}`) share the media cache with the room's.
+    pub(crate) fn fetch_visible_thread_media(&mut self) -> Task<Message> {
+        let Some(panel) = &self.threads.panel else {
+            return Task::none();
+        };
+        let room_id = panel.room_id.clone();
+        let wanted = visible_images(&panel.timeline);
+        self.fetch_thumbnails(&room_id, wanted)
+    }
+
+    fn fetch_thumbnails(&mut self, room_id: &RoomId, wanted: Vec<String>) -> Task<Message> {
         let mut tasks = Vec::new();
         for item_id in wanted {
             if self.media.needs_fetch(&(room_id.clone(), item_id.clone())) {
@@ -2171,11 +2227,13 @@ impl App {
         details.media.as_deref().map(|m| m.filename.as_str())
     }
 
-    /// When the message `item_id` was sent.
+    /// When the message `item_id` of the room or the thread panel was sent.
     fn message_timestamp_ms(&self, item_id: &str) -> Option<u64> {
+        let thread = self.threads.panel.iter().flat_map(|p| &p.timeline.items);
         self.timeline
             .items
             .iter()
+            .chain(thread)
             .find(|item| item.id == item_id)
             .and_then(|item| match &item.kind {
                 TimelineItemKind::Message { timestamp_ms, .. } => Some(*timestamp_ms),
@@ -2348,6 +2406,7 @@ impl App {
             }),
             self.upload_keys(),
             self.rooms_keys(),
+            self.thread_keys(),
             system::theme_changes().map(Message::ThemeMode),
             self.viewer_keys(),
             window::open_events().map(Message::WindowOpened),
@@ -2385,6 +2444,27 @@ impl App {
         })
     }
 
+    /// Esc closes the thread panel, unless something above it is open or a
+    /// widget used the key (the composer's reply bar, say); no listener while
+    /// the panel is closed.
+    fn thread_keys(&self) -> Subscription<Message> {
+        let covered = self.uploads.dialog.is_some()
+            || self.media.viewer.is_some()
+            || self.rooms_ui.overlay_open();
+        if self.threads.panel.is_none() || covered {
+            return Subscription::none();
+        }
+        iced::event::listen_with(|event, status, _id| match event {
+            iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+                ..
+            }) if status == iced::event::Status::Ignored => {
+                Some(Message::Threads(ThreadsMessage::Close))
+            }
+            _ => None,
+        })
+    }
+
     fn viewer_keys(&self) -> Subscription<Message> {
         if self.media.viewer.is_none() {
             return Subscription::none();
@@ -2402,6 +2482,29 @@ impl App {
     pub fn theme(&self) -> Option<Theme> {
         Some(crate::theme::theme_for(self.theme_mode))
     }
+}
+
+/// The IDs of the image messages within one screen of `view`'s viewport.
+fn visible_images(view: &TimelineView) -> Vec<String> {
+    let range = timeline::visible_window(
+        &view.prefix,
+        view.offset_from_bottom,
+        view.viewport_h,
+        view.viewport_h,
+    );
+    view.items
+        .get(range)
+        .unwrap_or_default()
+        .iter()
+        .filter(|item| {
+            matches!(
+                &item.kind,
+                TimelineItemKind::Message { details, .. }
+                    if details.media.as_ref().is_some_and(|m| m.kind == MediaKind::Image)
+            )
+        })
+        .map(|item| item.id.clone())
+        .collect()
 }
 
 #[cfg(test)]
@@ -9218,6 +9321,576 @@ mod tests {
                 assert!(!format!("{message:?}").contains("sentinel"));
             }
             let _ = drain(&mut rx);
+        }
+    }
+    // ---- Task 13: spaces and threads ----
+
+    mod spaces_and_threads {
+        use iced::advanced::widget::{Tree, tree::Tag};
+        use tessera_core::api::{
+            ActionKind, MediaKind, PaginationState, RoomListQuery, RoomListTab, SpaceView,
+        };
+
+        use super::*;
+        use crate::dialogs::RecordingDialogs;
+        use crate::spaces::SpacesMessage;
+        use crate::threads::ThreadsMessage;
+
+        fn room() -> RoomId {
+            RoomId::from("!a:x")
+        }
+
+        fn root(n: &str) -> EventId {
+            EventId::from(format!("${n}:x"))
+        }
+
+        fn space(id: &str, level: u32) -> SpaceView {
+            SpaceView {
+                id: RoomId::from(id),
+                name: id.to_owned(),
+                avatar: None,
+                level,
+                children: 0,
+            }
+        }
+
+        fn queries(commands: &[Command]) -> Vec<&RoomListQuery> {
+            commands
+                .iter()
+                .filter_map(|c| match c {
+                    Command::SetRoomListQuery(q) => Some(q),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn thread_item(root: &EventId, n: u32, body: &str) -> TimelineItem {
+            message_item(
+                &format!("thread:{}:{n}", root.as_str()),
+                body,
+                false,
+                ALL_ACTIONS,
+            )
+        }
+
+        fn thread_diff(root: &EventId, items: Vec<TimelineItem>) -> Message {
+            core(CoreEvent::ThreadDiff {
+                room_id: room(),
+                root: root.clone(),
+                diffs: vec![ListDiff::Append { values: items }],
+            })
+        }
+
+        /// `main_app` with a space list and room `a` selected.
+        fn spaces_app() -> (App, mpsc::Receiver<Command>) {
+            let (mut app, mut rx) = main_app();
+            let _ = app.update(core(CoreEvent::Spaces(vec![
+                space("!s1:x", 0),
+                space("!s1c:x", 1),
+                space("!s2:x", 0),
+            ])));
+            let _ = drain(&mut rx);
+            (app, rx)
+        }
+
+        /// `main_app` with the thread `$r:x` open.
+        fn thread_app() -> (App, mpsc::Receiver<Command>) {
+            let (mut app, mut rx) = main_app();
+            let _ = app.update(Message::Threads(ThreadsMessage::Open(root("r"))));
+            let _ = drain(&mut rx);
+            (app, rx)
+        }
+
+        fn open_panel(app: &App) -> &crate::threads::ThreadPanel {
+            app.threads.panel.as_ref().expect("an open thread")
+        }
+
+        // ---- spaces ----
+
+        #[test]
+        fn selecting_a_space_filters_the_list_and_keeps_tab_and_search() {
+            let (mut app, mut rx) = spaces_app();
+            let _ = app.update(Message::TabSelected(RoomListTab::People));
+            let _ = app.update(Message::SearchChanged("  lo ".into()));
+            let _ = drain(&mut rx);
+            let _ = app.update(Message::Spaces(SpacesMessage::Select(Some(RoomId::from(
+                "!s1:x",
+            )))));
+            let sent = drain(&mut rx);
+            let [q] = queries(&sent)[..] else {
+                panic!("one query expected: {sent:?}")
+            };
+            assert_eq!(q.space, Some(RoomId::from("!s1:x")));
+            assert_eq!(q.tab, RoomListTab::People);
+            assert_eq!(q.search, "lo");
+            // Back to Home: the tab and the search stay.
+            let _ = app.update(Message::Spaces(SpacesMessage::Select(None)));
+            let sent = drain(&mut rx);
+            let [q] = queries(&sent)[..] else {
+                panic!("one query expected: {sent:?}")
+            };
+            assert_eq!(q.space, None);
+            assert_eq!((q.tab, q.search.as_str()), (RoomListTab::People, "lo"));
+        }
+
+        #[test]
+        fn selecting_the_same_space_again_or_an_unknown_one_sends_nothing() {
+            let (mut app, mut rx) = spaces_app();
+            let s1 = Some(RoomId::from("!s1:x"));
+            let _ = app.update(Message::Spaces(SpacesMessage::Select(s1.clone())));
+            let _ = drain(&mut rx);
+            let _ = app.update(Message::Spaces(SpacesMessage::Select(s1)));
+            let _ = app.update(Message::Spaces(SpacesMessage::Select(Some(RoomId::from(
+                "!nope:x",
+            )))));
+            assert!(drain(&mut rx).is_empty());
+            assert_eq!(app.query.space, Some(RoomId::from("!s1:x")));
+        }
+
+        #[test]
+        fn a_space_that_vanishes_resets_the_filter_to_home() {
+            let (mut app, mut rx) = spaces_app();
+            let _ = app.update(Message::TabSelected(RoomListTab::Rooms));
+            let _ = app.update(Message::Spaces(SpacesMessage::Select(Some(RoomId::from(
+                "!s2:x",
+            )))));
+            let _ = drain(&mut rx);
+            // Still there: nothing happens.
+            let _ = app.update(core(CoreEvent::Spaces(vec![space("!s2:x", 0)])));
+            assert!(queries(&drain(&mut rx)).is_empty());
+            // Gone: Home, with the tab kept.
+            let _ = app.update(core(CoreEvent::Spaces(vec![space("!s1:x", 0)])));
+            let sent = drain(&mut rx);
+            let [q] = queries(&sent)[..] else {
+                panic!("one query expected: {sent:?}")
+            };
+            assert_eq!((q.space.clone(), q.tab), (None, RoomListTab::Rooms));
+            assert_eq!(app.query.space, None);
+        }
+
+        #[test]
+        fn space_avatars_are_requested_once() {
+            let (mut app, mut rx) = main_app();
+            let mut s = space("!s1:x", 0);
+            s.avatar = Some(tessera_core::api::AvatarId::from("mxc://x/a"));
+            let _ = app.update(core(CoreEvent::Spaces(vec![s.clone()])));
+            let first = drain(&mut rx);
+            assert!(matches!(first.as_slice(), [Command::FetchAvatars(ids)] if ids.len() == 1));
+            let _ = app.update(core(CoreEvent::Spaces(vec![s])));
+            assert!(drain(&mut rx).is_empty());
+        }
+
+        #[test]
+        fn logging_out_forgets_the_spaces_and_the_thread() {
+            let (mut app, _rx) = spaces_app();
+            let _ = app.update(Message::Threads(ThreadsMessage::Open(root("r"))));
+            let _ = app.update(core(CoreEvent::LoggedOut));
+            assert!(app.spaces.is_empty());
+            assert!(app.threads.panel.is_none());
+        }
+
+        // ---- the thread panel ----
+
+        #[test]
+        fn opening_a_thread_sends_open_thread_once() {
+            let (mut app, mut rx) = main_app();
+            let _ = app.update(Message::Threads(ThreadsMessage::Open(root("r"))));
+            let sent = drain(&mut rx);
+            assert!(
+                matches!(
+                    sent.as_slice(),
+                    [Command::OpenThread { room_id, root: r }] if *room_id == room() && r.as_str() == "$r:x"
+                ),
+                "{sent:?}"
+            );
+            assert!(open_panel(&app).is(&room(), &root("r")));
+            // Clicking the summary again does not reopen it.
+            let _ = app.update(Message::Threads(ThreadsMessage::Open(root("r"))));
+            assert!(drain(&mut rx).is_empty());
+        }
+
+        #[test]
+        fn without_a_room_nothing_opens() {
+            let (mut app, mut rx) = login_app();
+            logged_in(&mut app);
+            let _ = drain(&mut rx);
+            let _ = app.update(Message::Threads(ThreadsMessage::Open(root("r"))));
+            assert!(drain(&mut rx).is_empty() && app.threads.panel.is_none());
+        }
+
+        #[test]
+        fn thread_diffs_go_to_the_panel_and_not_to_the_room_timeline() {
+            let (mut app, _rx) = thread_app();
+            let r = root("r");
+            let before = app.timeline.items.len();
+            let _ = app.update(thread_diff(
+                &r,
+                vec![thread_item(&r, 0, "root"), thread_item(&r, 1, "reply")],
+            ));
+            assert_eq!(open_panel(&app).timeline.items.len(), 2);
+            assert_eq!(app.timeline.items.len(), before);
+            // A second batch applies in order.
+            let _ = app.update(thread_diff(&r, vec![thread_item(&r, 2, "more")]));
+            assert_eq!(open_panel(&app).timeline.items.len(), 3);
+        }
+
+        #[test]
+        fn an_image_in_the_thread_panel_asks_for_its_thumbnail() {
+            let (mut app, mut rx) = thread_app();
+            let r = root("r");
+            let image = media_item(
+                &format!("thread:{}:0", r.as_str()),
+                MediaKind::Image,
+                "pic.png",
+                640,
+                480,
+            );
+            let _ = app.update(thread_diff(&r, vec![image]));
+            let asked = fetches(&drain(&mut rx), MediaSize::Thumbnail);
+            assert_eq!(asked, vec!["thread:$r:x:0".to_owned()]);
+        }
+
+        #[test]
+        fn events_of_another_thread_or_room_are_ignored() {
+            let (mut app, mut rx) = thread_app();
+            let other = root("other");
+            let _ = app.update(thread_diff(&other, vec![thread_item(&other, 0, "x")]));
+            let _ = app.update(core(CoreEvent::ThreadDiff {
+                room_id: RoomId::from("!b:x"),
+                root: root("r"),
+                diffs: vec![ListDiff::Append {
+                    values: vec![thread_item(&root("r"), 0, "x")],
+                }],
+            }));
+            let _ = app.update(core(CoreEvent::ThreadPagination {
+                room_id: room(),
+                root: other,
+                state: PaginationState::ReachedStart,
+            }));
+            assert!(open_panel(&app).timeline.items.is_empty());
+            assert_eq!(open_panel(&app).timeline.pagination, PaginationState::Idle);
+            assert!(drain(&mut rx).is_empty());
+            // Nothing open: nothing happens either.
+            let _ = app.update(Message::Threads(ThreadsMessage::Close));
+            let _ = drain(&mut rx);
+            let r = root("r");
+            let _ = app.update(thread_diff(&r, vec![thread_item(&r, 0, "late")]));
+            assert!(app.threads.panel.is_none());
+        }
+
+        #[test]
+        fn pagination_state_applies_to_the_open_thread() {
+            let (mut app, _rx) = thread_app();
+            let _ = app.update(core(CoreEvent::ThreadPagination {
+                room_id: room(),
+                root: root("r"),
+                state: PaginationState::ReachedStart,
+            }));
+            assert_eq!(
+                open_panel(&app).timeline.pagination,
+                PaginationState::ReachedStart
+            );
+        }
+
+        #[test]
+        fn a_new_root_starts_with_a_fresh_model_and_one_open_thread() {
+            let (mut app, mut rx) = thread_app();
+            let r = root("r");
+            let _ = app.update(thread_diff(&r, vec![thread_item(&r, 0, "old")]));
+            let _ = app.update(Message::Threads(ThreadsMessage::Draft(MessageText::from(
+                "half typed",
+            ))));
+            // A short thread asks for older events by itself.
+            assert!(
+                drain(&mut rx)
+                    .iter()
+                    .any(|c| matches!(c, Command::PaginateThread { .. }))
+            );
+            let _ = app.update(Message::Threads(ThreadsMessage::Open(root("s"))));
+            let sent = drain(&mut rx);
+            assert!(
+                matches!(sent.as_slice(), [Command::OpenThread { root: n, .. }] if n.as_str() == "$s:x"),
+                "{sent:?}"
+            );
+            let panel = open_panel(&app);
+            assert!(panel.is(&room(), &root("s")));
+            assert!(panel.timeline.items.is_empty() && panel.draft.is_empty());
+            // A straggler of the old thread cannot get in.
+            let _ = app.update(thread_diff(&r, vec![thread_item(&r, 1, "late")]));
+            assert!(open_panel(&app).timeline.items.is_empty());
+        }
+
+        #[test]
+        fn closing_sends_close_thread_and_drops_the_model() {
+            let (mut app, mut rx) = thread_app();
+            let _ = app.update(Message::Threads(ThreadsMessage::Close));
+            assert!(matches!(drain(&mut rx).as_slice(), [Command::CloseThread]));
+            assert!(app.threads.panel.is_none());
+            // A second close has nothing to close.
+            let _ = app.update(Message::Threads(ThreadsMessage::Close));
+            assert!(drain(&mut rx).is_empty());
+        }
+
+        #[test]
+        fn selecting_another_room_closes_the_panel() {
+            let (mut app, mut rx) = thread_app();
+            let _ = app.update(Message::SelectRoom(RoomId::from("!b:x")));
+            let sent = drain(&mut rx);
+            let close = sent
+                .iter()
+                .position(|c| matches!(c, Command::CloseThread))
+                .expect("CloseThread");
+            let select = sent
+                .iter()
+                .position(|c| matches!(c, Command::SelectRoom(_)))
+                .expect("SelectRoom");
+            assert!(close < select, "the thread closes before the room changes");
+            assert!(app.threads.panel.is_none());
+        }
+
+        #[test]
+        fn the_panel_composer_sends_into_the_thread() {
+            let (mut app, mut rx) = thread_app();
+            let _ = app.update(Message::Threads(ThreadsMessage::Draft(MessageText::from(
+                "in the thread",
+            ))));
+            let _ = app.update(Message::Threads(ThreadsMessage::Submit));
+            let sent = drain(&mut rx);
+            let [Command::Send(m)] = sent.as_slice() else {
+                panic!("{sent:?}")
+            };
+            assert_eq!(m.text.expose(), "in the thread");
+            assert_eq!(m.thread_root.as_ref().map(EventId::as_str), Some("$r:x"));
+            assert_eq!(m.room_id, room());
+            assert!(open_panel(&app).draft.is_empty());
+            // Blank text sends nothing.
+            let _ = app.update(Message::Threads(ThreadsMessage::Submit));
+            assert!(drain(&mut rx).is_empty());
+        }
+
+        #[test]
+        fn actions_on_panel_items_carry_their_thread_ids() {
+            let (mut app, mut rx) = thread_app();
+            let r = root("r");
+            let _ = app.update(thread_diff(&r, vec![thread_item(&r, 4, "reply")]));
+            let id = "thread:$r:x:4".to_owned();
+            let _ = drain(&mut rx);
+            let _ = app.update(Message::ReactionToggled {
+                item: id.clone(),
+                key: MessageText::from("\u{1F44D}"),
+            });
+            let _ = app.update(Message::DeleteRequested(id.clone()));
+            let _ = app.update(Message::DeleteConfirmed);
+            let sent = drain(&mut rx);
+            assert!(
+                matches!(&sent[0], Command::ToggleReaction { room_id, item_id, .. } if *room_id == room() && *item_id == id),
+                "{sent:?}"
+            );
+            assert!(
+                matches!(&sent[1], Command::Redact { room_id, item_id, .. } if *room_id == room() && *item_id == id),
+                "{sent:?}"
+            );
+        }
+
+        #[test]
+        fn reply_and_edit_stay_with_the_room_composer() {
+            let (mut app, _rx) = thread_app();
+            let r = root("r");
+            let _ = app.update(thread_diff(&r, vec![thread_item(&r, 0, "reply")]));
+            let _ = app.update(Message::ReplyRequested("thread:$r:x:0".into()));
+            let _ = app.update(Message::EditRequested("thread:$r:x:0".into()));
+            assert!(matches!(app.composer.mode, composer::Mode::Normal));
+        }
+
+        #[test]
+        fn thread_media_opens_with_its_thread_id() {
+            let (mut app, mut rx) = thread_app();
+            let r = root("r");
+            let mut image = media_item("thread:$r:x:0", MediaKind::Image, "pic.png", 64, 48);
+            // The same counter in the room's own timeline is another key.
+            let mut main = media_item("0", MediaKind::Image, "pic.png", 64, 48);
+            std::mem::swap(&mut image, &mut main);
+            let _ = app.update(core(CoreEvent::TimelineDiff {
+                room_id: room(),
+                diffs: vec![ListDiff::Append {
+                    values: vec![image],
+                }],
+            }));
+            let _ = app.update(thread_diff(&r, vec![main]));
+            let _ = drain(&mut rx);
+            let _ = app.update(Message::MediaClicked("thread:$r:x:0".into()));
+            let viewer = app.media.viewer.as_ref().expect("viewer");
+            assert_eq!(viewer.key, (room(), "thread:$r:x:0".to_owned()));
+            assert!(matches!(
+                drain(&mut rx).as_slice(),
+                [Command::FetchMedia { item_id, .. }] if item_id == "thread:$r:x:0"
+            ));
+        }
+
+        #[test]
+        fn a_failed_thread_action_says_so_and_keeps_the_panel() {
+            let (mut app, _rx) = thread_app();
+            let _ = app.update(core(CoreEvent::ActionFailed {
+                room_id: room(),
+                action: ActionKind::Thread,
+                error: CoreError::Internal("x".into()),
+            }));
+            assert!(app.actions.notice.is_some());
+            assert!(app.threads.panel.is_some());
+        }
+
+        // ---- uploads from the panel ----
+
+        #[test]
+        fn attach_in_the_panel_targets_the_thread_and_the_room_attach_does_not() {
+            let (mut app, mut rx) = thread_app();
+            app.set_dialogs(Box::new(RecordingDialogs::default()));
+            let _ = app.update(Message::Threads(ThreadsMessage::Attach));
+            assert_eq!(
+                app.uploads.thread_root.as_ref().map(EventId::as_str),
+                Some("$r:x")
+            );
+            // The room's own Attach (no confirmation open) goes to the room.
+            let _ = app.update(Message::AttachRequested);
+            assert_eq!(app.uploads.thread_root, None);
+            let _ = drain(&mut rx);
+        }
+
+        #[test]
+        fn closing_the_panel_drops_its_upload_confirmation() {
+            let (mut app, _rx) = thread_app();
+            app.set_dialogs(Box::new(RecordingDialogs::default()));
+            let _ = app.update(Message::Threads(ThreadsMessage::Attach));
+            app.uploads.dialog = Some(crate::upload::UploadDialog {
+                room_id: room(),
+                entries: Vec::new(),
+            });
+            let _ = app.update(Message::Threads(ThreadsMessage::Close));
+            assert!(app.uploads.dialog.is_none() && app.uploads.thread_root.is_none());
+        }
+
+        // ---- the room pane is not disturbed ----
+
+        #[test]
+        fn opening_and_closing_the_panel_keeps_the_room_scroll_and_draft() {
+            let (mut app, mut rx) = main_app();
+            type_in(&mut app, "half a message");
+            let _ = app.on_timeline_scrolled(120.0, 600.0, 800.0);
+            let _ = drain(&mut rx);
+            let before = (
+                app.timeline.offset_from_bottom,
+                app.timeline.anchor.clone(),
+                app.timeline.last_scroll_request,
+                app.timeline.items.len(),
+                app.composer.text(),
+            );
+            let _ = app.update(Message::Threads(ThreadsMessage::Open(root("r"))));
+            let r = root("r");
+            let _ = app.update(thread_diff(&r, vec![thread_item(&r, 0, "x")]));
+            let _ = app.update(Message::Threads(ThreadsMessage::Close));
+            let after = (
+                app.timeline.offset_from_bottom,
+                app.timeline.anchor.clone(),
+                app.timeline.last_scroll_request,
+                app.timeline.items.len(),
+                app.composer.text(),
+            );
+            assert_eq!(before, after);
+            assert!(
+                !drain(&mut rx).iter().any(|c| matches!(
+                    c,
+                    Command::SaveDraft { .. } | Command::PaginateBackwards { .. }
+                )),
+                "the panel sends no room commands"
+            );
+        }
+
+        /// Every widget tag of a tree, depth first.
+        fn tags(tree: &Tree, out: &mut Vec<Tag>) {
+            out.push(tree.tag);
+            for child in &tree.children {
+                tags(child, out);
+            }
+        }
+
+        #[test]
+        fn the_panes_row_keeps_four_slots_and_the_room_pane_its_tree() {
+            let (mut app, _rx) = main_app();
+            let slots = |app: &App| {
+                let element = crate::screens::main_view::main_row(app);
+                let tree = Tree::new(element.as_widget());
+                let mut room_tags = Vec::new();
+                tags(&tree.children[2], &mut room_tags);
+                (tree.children.len(), room_tags)
+            };
+            let (n_closed, room_closed) = slots(&app);
+            assert_eq!(n_closed, 4);
+            let _ = app.update(Message::Threads(ThreadsMessage::Open(root("r"))));
+            let (n_open, room_open) = slots(&app);
+            assert_eq!(n_open, 4);
+            assert_eq!(room_open, room_closed, "the room pane keeps its widgets");
+            let _ = app.update(core(CoreEvent::Spaces(vec![space("!s1:x", 0)])));
+            let (n_spaces, room_spaces) = slots(&app);
+            assert_eq!(n_spaces, 4);
+            assert_eq!(room_spaces, room_closed);
+        }
+
+        /// The widths of the panes row and of its four slots, laid out in a
+        /// 1000 x 700 window.
+        fn pane_widths(app: &App) -> (f32, Vec<f32>) {
+            use iced::advanced::layout::Limits;
+            use iced::advanced::renderer::Headless;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("a current-thread runtime");
+            let renderer = runtime
+                .block_on(iced::Renderer::new(
+                    iced::Font::DEFAULT,
+                    iced::Pixels(16.0),
+                    Some("tiny-skia"),
+                ))
+                .expect("the headless tiny-skia renderer is not available");
+            let mut element = crate::screens::main_view::main_row(app);
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &Limits::new(iced::Size::ZERO, iced::Size::new(1000.0, 700.0)),
+            );
+            let slots = node.children().iter().map(|c| c.size().width).collect();
+            (node.size().width, slots)
+        }
+
+        /// The panes row was built with `Row::from_vec`, which does not look
+        /// at its children, and only told to fill the height: it shrank to its
+        /// content and the room pane lost the free width.
+        #[test]
+        fn the_panes_fill_the_window_with_and_without_a_thread() {
+            let (mut app, _rx) = spaces_app();
+            let (row, slots) = pane_widths(&app);
+            assert_eq!(row, 1000.0, "the row fills the window: {slots:?}");
+            let room_alone = slots[2];
+            assert_eq!(slots[3], 0.0, "no thread, no panel");
+            let r = root("r");
+            let _ = app.update(Message::Threads(ThreadsMessage::Open(r.clone())));
+            let _ = app.update(thread_diff(&r, vec![thread_item(&r, 0, "x")]));
+            let (row, slots) = pane_widths(&app);
+            assert_eq!(row, 1000.0, "the row fills the window: {slots:?}");
+            assert!(slots[3] > 0.0, "the panel has its width: {slots:?}");
+            assert_eq!(
+                slots[2],
+                room_alone - slots[3],
+                "the panel takes its width from the room pane only: {slots:?}"
+            );
+        }
+
+        #[test]
+        fn the_whole_window_builds_with_spaces_and_a_thread() {
+            let (mut app, _rx) = spaces_app();
+            let r = root("r");
+            let _ = app.update(Message::Threads(ThreadsMessage::Open(r.clone())));
+            let _ = app.update(thread_diff(&r, vec![thread_item(&r, 0, "x")]));
+            let _ = app.view();
         }
     }
 }

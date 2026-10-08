@@ -280,12 +280,9 @@ async fn thread_timeline_has_prefixed_ids_and_sending_in_it_updates_the_summary(
             message(&s.thread, &root_text).is_some() && message(&s.thread, &reply).is_some()
         })
         .await;
+    let prefix = format!("thread:{}:", root.as_str());
     for item in &rig.alice.thread {
-        assert!(
-            item.id.starts_with("thread:"),
-            "thread item id {:?}",
-            item.id
-        );
+        assert!(item.id.starts_with(&prefix), "thread item id {:?}", item.id);
     }
     for item in &rig.alice.main {
         assert!(!item.id.starts_with("thread:"));
@@ -327,7 +324,7 @@ async fn actions_in_a_thread_use_its_item_ids() {
         })
         .await;
     let item_id = message(&rig.alice.thread, &reply).unwrap().0.id.clone();
-    assert!(item_id.starts_with("thread:"));
+    assert!(item_id.starts_with(&format!("thread:{}:", root.as_str())));
     rig.alice
         .send(Command::ToggleReaction {
             room_id: RoomId::from(room.as_str()),
@@ -341,6 +338,52 @@ async fn actions_in_a_thread_use_its_item_ids() {
                 .is_some_and(|(_, d)| matches!(d.reactions.as_slice(), [g] if g.key == "👍" && g.count == 1 && !g.own))
         })
         .await;
+    rig.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "needs local homeserver: docker compose up -d --wait"]
+async fn a_thread_item_id_of_another_thread_is_not_found() {
+    let mut rig = rig().await;
+    let (_, root) = rig.root().await;
+    let reply = marker();
+    rig.carol_replies(&root, &reply).await;
+
+    let room = rig.room.clone();
+    rig.alice
+        .send(Command::OpenThread {
+            room_id: RoomId::from(room.as_str()),
+            root: root.clone(),
+        })
+        .await;
+    rig.alice
+        .wait(&room, "alice's thread shows carol's reply", |s| {
+            message(&s.thread, &reply).is_some_and(|(i, _)| i.event_id.is_some())
+        })
+        .await;
+    let item_id = message(&rig.alice.thread, &reply).unwrap().0.id.clone();
+    let counter = item_id.rsplit(':').next().unwrap().to_owned();
+    // The same counter in another thread, and the old unbound form.
+    for foreign in [
+        format!("thread:$other:{counter}"),
+        format!("thread:{counter}"),
+    ] {
+        rig.alice
+            .send(Command::ToggleReaction {
+                room_id: RoomId::from(room.as_str()),
+                item_id: foreign,
+                key: "👍".into(),
+            })
+            .await;
+        let event = expect_event(&mut rig.alice.core, |e| {
+            matches!(e, CoreEvent::ActionFailed { .. })
+        })
+        .await;
+        let CoreEvent::ActionFailed { error, .. } = event else {
+            unreachable!()
+        };
+        assert_eq!(error, CoreError::ItemNotFound);
+    }
     rig.finish().await;
 }
 

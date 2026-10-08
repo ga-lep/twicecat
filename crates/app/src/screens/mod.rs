@@ -13,6 +13,8 @@ pub mod room_list_pane;
 pub mod room_settings;
 pub mod security;
 pub mod sessions;
+pub mod spaces_sidebar;
+pub mod thread_panel;
 pub mod timeline_pane;
 pub mod upload_dialog;
 pub mod verification;

@@ -17,7 +17,8 @@ use crate::rooms::RoomsMessage;
 use crate::screens::loading::sync_label;
 use crate::screens::timeline_pane::RichEnv;
 use crate::screens::{
-    media_viewer, room_dialogs, room_list_pane, security, sessions, timeline_pane,
+    media_viewer, room_dialogs, room_list_pane, security, sessions, spaces_sidebar, thread_panel,
+    timeline_pane,
 };
 use crate::sessions::SessionsMessage;
 use crate::state::{App, Message};
@@ -191,15 +192,46 @@ fn notification_menu<'a>(app: &'a App, room: &RoomId) -> Element<'a, Message> {
 pub fn view(app: &App) -> Element<'_, Message> {
     let content = main_column(
         security::banner_slot(&app.security),
-        row![room_list_pane::view(app), room_pane(app)]
-            .height(Fill)
-            .into(),
+        main_row(app),
         status_bar(app),
     );
     security::layer(
         content,
         security::top_layer(app).or_else(|| sessions::layer(app)),
     )
+}
+
+/// The panes, always `[spaces sidebar, room list, room pane, thread panel]`:
+/// the sidebar and the panel are empty spaces when they have nothing to show,
+/// so the room pane (timeline scroll, editor focus) keeps its place in the
+/// widget tree when a thread opens or closes. `from_vec` does not look at its
+/// children, so the row is told to fill the window both ways: left at its
+/// default width it shrinks to its content and the room pane loses the free
+/// width.
+pub(crate) fn main_row(app: &App) -> Element<'_, Message> {
+    Row::from_vec(vec![
+        spaces_sidebar::view(app),
+        room_list_pane::view(app),
+        room_pane(app),
+        thread_panel::slot(app),
+    ])
+    .width(Fill)
+    .height(Fill)
+    .into()
+}
+
+/// What the timeline pane needs besides the timeline, for the open room.
+pub fn rich_env<'a>(app: &'a App, theme: &'a iced::Theme) -> RichEnv<'a> {
+    RichEnv {
+        theme,
+        own_user: app.user_id.as_ref(),
+        revealed: &app.revealed,
+        actions: &app.actions,
+        rooms: &app.rooms,
+        members: app.known_members(),
+        media: &app.media,
+        room: app.selected.as_ref(),
+    }
 }
 
 /// The main column, always `[banner slot, panes, status bar]`: the slot is
@@ -231,16 +263,7 @@ fn room_pane(app: &App) -> Element<'_, Message> {
     );
 
     let theme = theme::theme_for(app.theme_mode);
-    let env = RichEnv {
-        theme: &theme,
-        own_user: app.user_id.as_ref(),
-        revealed: &app.revealed,
-        actions: &app.actions,
-        rooms: &app.rooms,
-        members: app.known_members(),
-        media: &app.media,
-        room: app.selected.as_ref(),
-    };
+    let env = rich_env(app, &theme);
     let timeline = container(timeline_pane::view(&app.timeline, env)).height(Fill);
     // The picker floats over the timeline's bottom right corner.
     let picker = app.actions.picker.as_ref().map(|picker| {

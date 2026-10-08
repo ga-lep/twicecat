@@ -394,6 +394,11 @@ pub enum Command {
     /// Remove the user's avatar.
     RemoveAvatar,
     /// Open a thread in a second timeline, closing any other one.
+    ///
+    /// The thread's items have IDs of the form `thread:{root}:{n}`: an item
+    /// command (react, redact, edit, fetch, save, retry, discard) with an ID of
+    /// another thread, or of a thread that is not open, fails with
+    /// `ItemNotFound`.
     OpenThread {
         /// Room.
         room_id: RoomId,

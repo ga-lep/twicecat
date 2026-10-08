@@ -81,6 +81,8 @@ const REACTIONS_H: f32 = 30.0;
 const RECEIPTS_H: f32 = 18.0;
 const FAILURE_H: f32 = 22.0;
 const EDITED_H: f32 = 18.0;
+/// Height of the "N replies" line under a thread root.
+pub const THREAD_ROW_H: f32 = 22.0;
 /// Height of a day divider row.
 pub const DIVIDER_H: f32 = 36.0;
 /// Estimated height of a state event row.
@@ -230,6 +232,9 @@ fn estimate_unclamped(item: &TimelineItem, continuation: bool, width: f32) -> f3
             }
             if details.edited {
                 h += EDITED_H;
+            }
+            if details.thread.is_some() {
+                h += THREAD_ROW_H;
             }
             if !details.reactions.is_empty() {
                 h += REACTIONS_H;

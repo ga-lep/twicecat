@@ -190,9 +190,12 @@ impl Selected {
             TimelineTarget::Main => Ok(self.timeline.clone()),
             TimelineTarget::Item(item_id) => match route_item(item_id) {
                 Route::Main => Ok(self.timeline.clone()),
+                // The ID names its thread: one of another (or a closed)
+                // thread is not found, never an item of the open one.
                 Route::Thread => self
                     .thread
                     .as_ref()
+                    .filter(|t| threads::item_in_thread(item_id, &t.root))
                     .map(|t| t.timeline.clone())
                     .ok_or(CoreError::ItemNotFound),
             },
@@ -2567,20 +2570,23 @@ impl Engine {
         let parsed = parse_event_id(&root);
         let events = self.events.clone();
         let (room, event) = (room_id.clone(), root.clone());
-        let flag = self
+        let (flag, cancelled) = self
             .active
             .as_ref()
             .and_then(|a| a.selected.as_ref())
             .and_then(|s| s.thread.as_ref())
-            .map(|t| t.paginating.clone())
-            .unwrap_or_default();
+            .map(|t| (t.paginating.clone(), t.cancelled()))
+            .unwrap_or_else(|| (Arc::default(), tokio::sync::watch::channel(false).1));
+        // Without an open thread the action below fails before it runs.
         match parsed {
             Ok(id) => {
                 self.run_action_on(
                     room_id,
                     ActionKind::Thread,
                     TimelineTarget::Thread(&id),
-                    |timeline| threads::paginate_task(timeline, flag, events, room, event),
+                    |timeline| {
+                        threads::paginate_task(timeline, flag, events, room, event, cancelled)
+                    },
                 )
                 .await;
             }

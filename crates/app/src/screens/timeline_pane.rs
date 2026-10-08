@@ -20,10 +20,11 @@ use iced::{
     Background, Color, ContentFit, Element, Fill, Font, Length, Padding, Shrink, Theme, mouse,
 };
 use tessera_core::api::{
-    Block, Inline, MediaContent, MediaKind, MessageDetails, MessageKind, MessageText,
+    Block, EventId, Inline, MediaContent, MediaKind, MessageDetails, MessageKind, MessageText,
     PaginationState, PlaceholderKind, ReactionGroup, ReplyPreview, ReplyState, RichText, RoomId,
     RoomMemberView, RoomSummary, SendStatus, Shield, ShieldCode, StateChange, TextStyle,
-    TimelineItem, TimelineItemKind, TypingUser, UploadProgress, UserId, UtdReason,
+    ThreadSummaryView, TimelineItem, TimelineItemKind, TypingUser, UploadProgress, UserId,
+    UtdReason,
 };
 
 use crate::actions::{self, ActionButtons, ActionState};
@@ -40,7 +41,7 @@ use crate::text_safety::{
 use crate::theme;
 use crate::timeline::{
     CARD_H, CONTINUATION_PAD, DIVIDER_H, INDENT_PX, MARKER_H, OVERSCAN_PX, SIDE_PAD_PX, START_H,
-    TIMELINE_ID, TOP_PAD, TimelineView, is_continuation, spacer_heights,
+    THREAD_ROW_H, TIMELINE_ID, TOP_PAD, TimelineView, is_continuation, spacer_heights,
 };
 use crate::upload;
 
@@ -73,6 +74,55 @@ pub struct RichEnv<'a> {
     pub room: Option<&'a RoomId>,
 }
 
+/// What differs between the room's timeline pane and the thread panel's: the
+/// scrollable's ID, the messages the scroll and the row sensors send, and the
+/// actions a row offers.
+#[derive(Clone, Copy)]
+pub struct Pane {
+    /// The scrollable's widget ID, which scroll tasks name.
+    pub scroll_id: &'static str,
+    /// The message for a scroll of the pane.
+    pub on_scroll: fn(scrollable::Viewport) -> Message,
+    /// The message for a measured row: the item's ID and its height.
+    pub on_measure: fn(String, f32) -> Message,
+    /// The pane is the thread panel: no **Reply** or **Edit** (they belong to
+    /// the room's composer) and no thread summary row.
+    pub thread: bool,
+}
+
+impl Pane {
+    /// The room's timeline.
+    pub const MAIN: Self = Self {
+        scroll_id: TIMELINE_ID,
+        on_scroll: Message::TimelineScrolled,
+        on_measure: |id, height| Message::RowMeasured { id, height },
+        thread: false,
+    };
+
+    /// The thread panel's timeline.
+    pub const THREAD: Self = Self {
+        scroll_id: crate::threads::THREAD_SCROLL_ID,
+        on_scroll: |viewport| Message::Threads(crate::threads::ThreadsMessage::Scrolled(viewport)),
+        on_measure: |id, height| {
+            Message::Threads(crate::threads::ThreadsMessage::Measured { id, height })
+        },
+        thread: true,
+    };
+
+    /// The buttons a row of this pane offers, from what the core allows.
+    fn limit(self, buttons: ActionButtons) -> ActionButtons {
+        if self.thread {
+            ActionButtons {
+                reply: false,
+                edit: false,
+                ..buttons
+            }
+        } else {
+            buttons
+        }
+    }
+}
+
 /// The pane for the selected room's timeline, in the local time zone.
 pub fn view<'a>(timeline: &'a TimelineView, env: RichEnv<'_>) -> Element<'a, Message> {
     let now = Local::now().timestamp_millis();
@@ -91,18 +141,29 @@ pub fn view_in<'a, Tz: TimeZone>(
     tz: &Tz,
     env: RichEnv<'_>,
 ) -> Element<'a, Message> {
+    view_pane(timeline, now_ms, tz, env, Pane::MAIN)
+}
+
+/// [`view_in`] for the pane `pane` names.
+pub fn view_pane<'a, Tz: TimeZone>(
+    timeline: &'a TimelineView,
+    now_ms: u64,
+    tz: &Tz,
+    env: RichEnv<'_>,
+    pane: Pane,
+) -> Element<'a, Message> {
     let window = timeline.window();
     let (above, below) = spacer_heights(&timeline.prefix, &window);
     let mut rows: Vec<Element<'a, Message>> = Vec::with_capacity(window.len() + 2);
     rows.push(space().height(above).into());
-    rows.extend(window.map(|i| built_row(timeline, i, now_ms, tz, env)));
+    rows.extend(window.map(|i| built_row(timeline, i, now_ms, tz, env, pane)));
     rows.push(space().height(below).into());
     // `from_vec`, because `Column::push` drops zero-size children, and the
     // content is always the two spacers plus the window.
     let list = scrollable(Column::from_vec(rows).width(Fill))
-        .id(TIMELINE_ID)
+        .id(pane.scroll_id)
         .anchor_bottom()
-        .on_scroll(Message::TimelineScrolled)
+        .on_scroll(pane.on_scroll)
         .width(Fill)
         .height(Fill);
     // Always a stack with the list first: iced keeps a widget's state only
@@ -149,22 +210,17 @@ fn built_row<'a, Tz: TimeZone>(
     now_ms: u64,
     tz: &Tz,
     env: RichEnv<'_>,
+    pane: Pane,
 ) -> Element<'a, Message> {
     #[cfg(test)]
     BUILT_ROWS.with(|built| built.set(built.get() + 1));
     let id = timeline.items[i].id.clone();
     let on_resize_id = id.clone();
-    sensor(row_content(timeline, i, now_ms, tz, env))
+    sensor(row_content(timeline, i, now_ms, tz, env, pane))
         .key(id.clone())
         .anticipate(OVERSCAN_PX)
-        .on_show(move |size| Message::RowMeasured {
-            id: id.clone(),
-            height: size.height,
-        })
-        .on_resize(move |size| Message::RowMeasured {
-            id: on_resize_id.clone(),
-            height: size.height,
-        })
+        .on_show(move |size| (pane.on_measure)(id.clone(), size.height))
+        .on_resize(move |size| (pane.on_measure)(on_resize_id.clone(), size.height))
         .into()
 }
 
@@ -174,6 +230,7 @@ fn row_content<'a, Tz: TimeZone>(
     now_ms: u64,
     tz: &Tz,
     env: RichEnv<'_>,
+    pane: Pane,
 ) -> Element<'a, Message> {
     let items = &timeline.items;
     match &items[i].kind {
@@ -237,7 +294,12 @@ fn row_content<'a, Tz: TimeZone>(
             if let Some(label) = edited_text(details) {
                 content = content.push(text(label).size(12).style(muted));
             }
-            let buttons = actions::action_buttons(details, *is_own);
+            let buttons = pane.limit(actions::action_buttons(details, *is_own));
+            if !pane.thread
+                && let (Some(summary), Some(root)) = (&details.thread, &items[i].event_id)
+            {
+                content = content.push(thread_row(root, summary));
+            }
             if !details.reactions.is_empty() {
                 content = content.push(reactions_row(&items[i].id, &details.reactions, buttons));
             }
@@ -323,6 +385,24 @@ fn row_content<'a, Tz: TimeZone>(
         ),
         TimelineItemKind::Other => space().height(0).into(),
     }
+}
+
+/// The line under a thread root, "N replies · name: preview"; clicking it
+/// opens the thread panel.
+fn thread_row<'a>(root: &EventId, summary: &ThreadSummaryView) -> Element<'a, Message> {
+    button(
+        text(crate::threads::summary_text(summary))
+            .size(13)
+            .style(accent)
+            .wrapping(text::Wrapping::None),
+    )
+    .padding([2, 0])
+    .height(Length::Fixed(THREAD_ROW_H))
+    .style(button::text)
+    .on_press(Message::Threads(crate::threads::ThreadsMessage::Open(
+        root.clone(),
+    )))
+    .into()
 }
 
 /// The media of a message: an image in its fixed box, or a card.
