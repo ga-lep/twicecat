@@ -17,6 +17,7 @@ mod gpu_enhancement;
 pub mod logging;
 mod media;
 mod media_fetch;
+mod notifications;
 mod oauth;
 mod outgoing;
 pub mod paths;

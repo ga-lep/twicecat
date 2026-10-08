@@ -43,3 +43,5 @@ gpu-enhancement = ["tessera-audio/onnxruntime"]
 
 [dev-dependencies]
 tempfile = "3"
+# Paused time for the unread-totals throttle test; a feature of the pinned-in-lock tokio, no new packages.
+tokio = { version = "1", features = ["test-util"] }

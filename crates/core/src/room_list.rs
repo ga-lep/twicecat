@@ -116,7 +116,7 @@ pub(crate) fn highlights_of(mentions: u64, server_highlights: u64) -> u64 {
 
 /// Whether `c` could reorder or disguise the text around it (bidirectional
 /// controls) and so must not reach a one-line preview.
-fn is_bidi_control(c: char) -> bool {
+pub(crate) fn is_bidi_control(c: char) -> bool {
     matches!(
         c,
         '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
@@ -235,6 +235,9 @@ pub(crate) fn summarize(item: &RoomListItem) -> RoomSummary {
         is_invite: item.state() == RoomState::Invited,
         highlights: highlights_of(mentions, item.unread_notification_counts().highlight_count),
         marked_unread: item.is_marked_unread(),
+        notification_mode: item
+            .cached_user_defined_notification_mode()
+            .map(crate::notifications::mode_view),
         dm_peer: peer_field(security::dm_peer_of(item, item.client().user_id())),
         ..RoomSummary::new(id, name)
     }

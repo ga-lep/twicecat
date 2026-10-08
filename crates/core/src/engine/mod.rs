@@ -30,7 +30,7 @@ use crate::api::{
     ActionKind, AudioBackend, AudioDevice, AudioDeviceId, AudioDevices, AudioSettings,
     CallEndReason, CallState, Command, CoreError, CoreEvent, DeviceId, Draft, ListDiff, MediaSize,
     Member, MessageText, OutgoingAttachment, OutgoingMessage, PaginationState, Password, RoomId,
-    RoomListQuery, TypingUser, UserId,
+    RoomListQuery, RoomNotificationModeView, TypingUser, UserId,
 };
 use crate::audio_session::{AudioSession, Mode};
 use crate::avatars::{Avatars, SdkFetcher, answer_unavailable};
@@ -43,6 +43,7 @@ use crate::client::{
 };
 use crate::drafts;
 use crate::media::{self, MediaTasks};
+use crate::notifications::{self, NotificationTasks};
 use crate::oauth::authorize;
 use crate::outgoing::outgoing_content;
 use crate::paths::DataPaths;
@@ -218,6 +219,9 @@ struct Active {
     security: SecurityTasks,
     /// Media fetches and saves, and the upload limit request.
     media: MediaTasks,
+    /// The notification handler, settings and unread totals; `None` until
+    /// the session has started them.
+    notifications: Option<NotificationTasks>,
 }
 
 impl Active {
@@ -231,6 +235,9 @@ impl Active {
         }
         // The security tasks hold clones of the client too, and go first.
         self.security.stop().await;
+        if let Some(mut notifications) = self.notifications.take() {
+            notifications.stop().await;
+        }
         // Fetch tasks hold clones of the client, so they go next.
         self.media.stop().await;
         self.avatars.stop().await;
@@ -887,12 +894,6 @@ async fn forward_typing(room_id: RoomId, timeline: Arc<Timeline>, events: mpsc::
 fn unimplemented_target(cmd: &Command) -> Option<(RoomId, ActionKind)> {
     let none = || RoomId::from("");
     Some(match cmd {
-        Command::SetRoomNotificationMode { room_id, .. } => {
-            (room_id.clone(), ActionKind::Notifications)
-        }
-        Command::SetDefaultNotificationMode { .. }
-        | Command::AddKeyword { .. }
-        | Command::RemoveKeyword { .. } => (none(), ActionKind::Notifications),
         Command::CreateRoom(_) | Command::CreateDm { .. } | Command::JoinRoom { .. } => {
             (none(), ActionKind::Rooms)
         }
@@ -974,7 +975,7 @@ impl Engine {
                 match self.login_password(&username, &password, server).await {
                     Ok(event) => {
                         self.emit(event).await;
-                        self.start_security();
+                        self.start_security().await;
                         self.start_sync().await;
                     }
                     Err(e) => self.emit(CoreEvent::LoginFailed(e)).await,
@@ -1338,15 +1339,35 @@ impl Engine {
                 path,
             } => self.save_media(room_id, item_id, path).await,
             Command::SendAttachment(attachment) => self.send_attachment(attachment).await,
+            Command::SetRoomNotificationMode { room_id, mode } => {
+                self.set_room_notification_mode(room_id, mode).await;
+            }
+            Command::SetDefaultNotificationMode { one_to_one, mode } => {
+                self.notification_job(
+                    RoomId::from(""),
+                    Ok(notifications::Job::DefaultMode { one_to_one, mode }),
+                )
+                .await;
+            }
+            Command::AddKeyword { keyword } => {
+                self.notification_job(
+                    RoomId::from(""),
+                    Ok(notifications::Job::AddKeyword(keyword)),
+                )
+                .await;
+            }
+            Command::RemoveKeyword { keyword } => {
+                self.notification_job(
+                    RoomId::from(""),
+                    Ok(notifications::Job::RemoveKeyword(keyword)),
+                )
+                .await;
+            }
             // Handled in `run`.
             Command::Shutdown => {}
             // Answered by `unimplemented_target` at the top, until the tasks
             // that implement them land.
-            Command::SetRoomNotificationMode { .. }
-            | Command::SetDefaultNotificationMode { .. }
-            | Command::AddKeyword { .. }
-            | Command::RemoveKeyword { .. }
-            | Command::CreateRoom(_)
+            Command::CreateRoom(_)
             | Command::CreateDm { .. }
             | Command::JoinRoom { .. }
             | Command::AcceptInvite { .. }
@@ -1697,6 +1718,26 @@ impl Engine {
         }
     }
 
+    /// Queues a notification settings change, or answers why it can't be.
+    async fn notification_job(&self, room_id: RoomId, job: Result<notifications::Job, CoreError>) {
+        let result = match (&self.active, job) {
+            (None, _) => Err(CoreError::NotLoggedIn),
+            (_, Err(e)) => Err(e),
+            (Some(active), Ok(job)) => match &active.notifications {
+                Some(tasks) => tasks.submit(job),
+                None => Err(CoreError::Internal("notifications have not started".into())),
+            },
+        };
+        if let Err(error) = result {
+            self.emit(CoreEvent::ActionFailed {
+                room_id,
+                action: ActionKind::Notifications,
+                error,
+            })
+            .await;
+        }
+    }
+
     /// Opens the microphone (and, with `loopback`, the speakers) and starts
     /// reporting levels; replaces a running mic test.
     async fn start_mic_test(&mut self, loopback: bool) {
@@ -1716,6 +1757,25 @@ impl Engine {
             Ok((session, _)) => self.audio_session = Some(session),
             Err(e) => self.emit(CoreEvent::Error(e)).await,
         }
+    }
+
+    async fn set_room_notification_mode(
+        &self,
+        room_id: RoomId,
+        mode: Option<RoomNotificationModeView>,
+    ) {
+        let job = parse_room_id(&room_id).and_then(|room| {
+            let known = self
+                .active
+                .as_ref()
+                .is_none_or(|active| active.client.get_room(&room).is_some());
+            if known {
+                Ok(notifications::Job::RoomMode { room, mode })
+            } else {
+                Err(CoreError::UnknownRoom(room_id.clone()))
+            }
+        });
+        self.notification_job(room_id, job).await;
     }
 
     /// Fails a command that has no handler yet: `NotLoggedIn` without a
@@ -1746,8 +1806,11 @@ impl Engine {
     }
 
     /// Starts the security status forwarder of the new session.
-    fn start_security(&mut self) {
+    async fn start_security(&mut self) {
         if let Some(active) = self.active.as_mut() {
+            // Before the sync starts, so that no notification is missed.
+            active.notifications =
+                Some(NotificationTasks::start(&active.client, &self.events).await);
             active.security.start(&active.client, &self.events);
             active.media.send_limits(&active.client, &self.events);
             // Local echoes of uploads carry progress.
@@ -2011,7 +2074,7 @@ impl Engine {
             Ok((active, event)) => {
                 self.active = Some(active);
                 self.emit(event).await;
-                self.start_security();
+                self.start_security().await;
                 self.start_sync().await;
             }
             Err(e) => {
@@ -2321,6 +2384,7 @@ impl Engine {
                         avatars: Avatars::new(),
                         security: SecurityTasks::new(),
                         media: MediaTasks::new(),
+                        notifications: None,
                     },
                     event,
                 ))
@@ -2431,7 +2495,7 @@ impl Engine {
             Ok(Some((active, event))) => {
                 self.active = Some(active);
                 self.emit(event).await;
-                self.start_security();
+                self.start_security().await;
                 self.start_sync().await;
             }
             Ok(None) => self.emit(CoreEvent::NoSession).await,
@@ -2500,6 +2564,7 @@ impl Engine {
                 avatars: Avatars::new(),
                 security: SecurityTasks::new(),
                 media: MediaTasks::new(),
+                notifications: None,
             },
             event,
         )))
@@ -3132,6 +3197,7 @@ mod tests {
             avatars: Avatars::new(),
             security: SecurityTasks::new(),
             media: MediaTasks::new(),
+            notifications: None,
         });
         engine
             .handle(Command::RenameDevice {
@@ -3177,6 +3243,7 @@ mod tests {
             avatars: Avatars::new(),
             security: SecurityTasks::new(),
             media: MediaTasks::new(),
+            notifications: None,
         });
         engine
             .handle(Command::SignOutDevices {
@@ -3222,6 +3289,7 @@ mod tests {
             avatars: Avatars::new(),
             security: SecurityTasks::new(),
             media: MediaTasks::new(),
+            notifications: None,
         });
         engine
             .handle(Command::BootstrapCrossSigning { password: None })
@@ -3272,6 +3340,7 @@ mod tests {
             avatars: Avatars::new(),
             security: SecurityTasks::new(),
             media: MediaTasks::new(),
+            notifications: None,
         });
         for cmd in [
             Command::EnableRecovery,
@@ -3326,6 +3395,7 @@ mod tests {
             avatars: Avatars::new(),
             security,
             media: MediaTasks::new(),
+            notifications: None,
         });
         // Twice: the failed first request must not leave a reservation behind
         // (that would answer `Busy`).
@@ -3598,11 +3668,13 @@ mod tests {
             avatars: Avatars::new(),
             security: SecurityTasks::new(),
             media: MediaTasks::new(),
+            notifications: None,
         });
-        // Uploads are implemented: see the next test.
+        // Uploads and notification settings are implemented: see the tests
+        // after this one.
         for (cmd, kind, room) in phase5_commands()
             .into_iter()
-            .filter(|(_, kind, _)| *kind != ActionKind::Upload)
+            .filter(|(_, kind, _)| !matches!(kind, ActionKind::Upload | ActionKind::Notifications))
         {
             engine.handle(cmd).await;
             let got = drain(&mut rx).await;
@@ -3613,6 +3685,78 @@ mod tests {
                         if *room_id == room && *action == kind && why == "not implemented yet"
                 ),
                 "{kind:?}: {got:?}"
+            );
+        }
+        if let Some(mut active) = engine.active.take() {
+            active.stop_tasks().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn notification_commands_name_the_room_and_the_reason_they_fail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut engine, mut rx) = oauth_engine(tmp.path());
+        let client = Client::builder()
+            .homeserver_url("http://127.0.0.1:1")
+            .build()
+            .await
+            .unwrap();
+        engine.active = Some(Active {
+            fetcher: Arc::new(SdkFetcher(client.clone())),
+            client,
+            record: record("@alice:x", "http://127.0.0.1:1", "s1"),
+            changes: broadcast::channel(1).1,
+            sync: None,
+            selected: None,
+            avatars: Avatars::new(),
+            security: SecurityTasks::new(),
+            media: MediaTasks::new(),
+            notifications: None,
+        });
+        // A room the account does not know is refused before anything is
+        // queued; a malformed ID is too.
+        for bad in [rid("nowhere"), RoomId::from("not a room id")] {
+            engine
+                .handle(Command::SetRoomNotificationMode {
+                    room_id: bad.clone(),
+                    mode: None,
+                })
+                .await;
+            let got = drain(&mut rx).await;
+            assert!(
+                matches!(
+                    got.as_slice(),
+                    [CoreEvent::ActionFailed {
+                        room_id,
+                        action: ActionKind::Notifications,
+                        error: CoreError::UnknownRoom(named),
+                    }] if *room_id == bad && *named == bad
+                ),
+                "{got:?}"
+            );
+        }
+        // The other commands go to the worker, which a session without
+        // started notifications doesn't have.
+        for cmd in [
+            Command::AddKeyword {
+                keyword: "k".into(),
+            },
+            Command::RemoveKeyword {
+                keyword: "k".into(),
+            },
+        ] {
+            engine.handle(cmd).await;
+            let got = drain(&mut rx).await;
+            assert!(
+                matches!(
+                    got.as_slice(),
+                    [CoreEvent::ActionFailed {
+                        action: ActionKind::Notifications,
+                        error: CoreError::Internal(_),
+                        ..
+                    }]
+                ),
+                "{got:?}"
             );
         }
         if let Some(mut active) = engine.active.take() {
@@ -3640,6 +3784,7 @@ mod tests {
             avatars: Avatars::new(),
             security: SecurityTasks::new(),
             media: MediaTasks::new(),
+            notifications: None,
         });
         let attachment = |room: &str, mimetype: &str| OutgoingAttachment {
             room_id: rid(room),
@@ -3730,6 +3875,7 @@ mod tests {
             avatars: Avatars::new(),
             security: SecurityTasks::new(),
             media: MediaTasks::new(),
+            notifications: None,
         });
         let room = rid("a");
         for (cmd, kind) in action_commands(&room) {
@@ -3814,6 +3960,7 @@ mod tests {
             avatars: Avatars::new(),
             security: SecurityTasks::new(),
             media: MediaTasks::new(),
+            notifications: None,
         });
         let [fetch, save] = media_answers(&mut engine, &mut rx).await;
         assert!(
