@@ -4,6 +4,7 @@
 //! [`Task`]s. It never awaits, never touches the network and never sees an SDK
 //! type.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -12,9 +13,10 @@ use iced::widget::{operation, scrollable};
 use iced::{Element, Subscription, Task, Theme, clipboard, system, window};
 use tessera_core::api::{
     ActionKind, Command, CoreError, CoreEvent, Draft, EventId, ListDiff, MediaBytes, MediaKind,
-    MediaSize, MessageDetails, MessageText, OutgoingMessage, Password, ReauthAction, RoomId,
-    RoomListQuery, RoomListTab, RoomSummary, SyncState, TimelineItem, TimelineItemKind, TypingUser,
-    UserId, UserTrust,
+    MediaSize, MessageDetails, MessageText, NotificationKind, NotificationSettingsView,
+    NotificationView, OutgoingMessage, Password, ReauthAction, RoomId, RoomListQuery, RoomListTab,
+    RoomNotificationModeView, RoomSummary, SyncState, TimelineItem, TimelineItemKind, TypingUser,
+    UiSettings, UserId, UserTrust,
 };
 use tokio::sync::mpsc;
 
@@ -27,6 +29,7 @@ use crate::dialogs::{self, Clipboard, ClipboardContent, Dialogs, SystemClipboard
 use crate::emoji;
 use crate::links::{self, LinkBar};
 use crate::media::{self, Decoded, MediaModel, SavePath};
+use crate::notifications::{self, Folding, ModeChoice, NoNotifier, Notifier};
 use crate::rich_text::{LinkTarget, MAX_REVEALED, Revealed};
 use crate::room_list;
 use crate::screens::login::{self, BrowserUrl, LoginForm};
@@ -35,12 +38,16 @@ use crate::security::{Busy, SecurityMessage, SecurityModel};
 use crate::sessions::{SessionsMessage, SessionsModel, logout_needs_warning};
 use crate::text_safety;
 use crate::timeline::{self, Effects, TimelineView};
+use crate::tray::{self, NoTrayFactory, SystemTrayFactory, TrayAction, TrayFactory, TrayModel};
 use crate::upload::{self, Outcome, UploadModel, UploadPaths};
 use crate::verification::{VerificationMessage, VerificationModel};
 
 /// How many users' trust the app keeps: the selected peer, and a stale one or
 /// two from watchers the core replaced.
 pub const MAX_TRUST_KEPT: usize = 8;
+
+/// How many room mode choices the app keeps until the list shows them.
+pub const MAX_LOCAL_MODES: usize = 64;
 
 /// How long to wait for the core to close after `Shutdown` (plan Q18).
 pub const SHUTDOWN_WAIT: Duration = Duration::from_secs(10);
@@ -64,6 +71,20 @@ pub const JUMP_FAILED_TEXT: &str =
     "Could not find the original message (searched about 1,000 earlier messages)";
 
 /// Starts the system handler for a checked link, away from `update`.
+/// Brings the window to the front: un-minimises it and takes the focus.
+fn focus_window() -> Task<Message> {
+    window::oldest()
+        .and_then(|id| Task::batch([window::minimize(id, false), window::gain_focus(id)]))
+}
+
+/// Asks the window system to flag the window (taskbar, dock) without taking
+/// the focus.
+fn attention() -> Task<Message> {
+    window::oldest().and_then(|id| {
+        window::request_user_attention(id, Some(window::UserAttention::Informational))
+    })
+}
+
 fn open_link_task(url: links::CheckedUrl) -> Task<Message> {
     Task::perform(async move { links::open_link(&url) }, |ok| {
         Message::LinkOpened { ok }
@@ -332,6 +353,21 @@ pub enum Message {
     UploadConfirmed,
     /// **Cancel** in the confirmation (or Esc).
     UploadCancelled,
+    /// A window opened (the first one creates the tray).
+    WindowOpened(window::Id),
+    /// The desktop gave the room's notification this ID.
+    NotificationShown {
+        /// The room.
+        room_id: RoomId,
+        /// The desktop's ID, used to update the notification.
+        id: u32,
+    },
+    /// The user clicked a desktop notification.
+    OpenRoomFromNotification(RoomId),
+    /// A choice in the room header's notification menu.
+    RoomModeChosen(ModeChoice),
+    /// **Show Tessera** or **Quit** in the tray, or a click on the icon.
+    Tray(TrayAction),
     /// The task that decoded fetched image bytes finished.
     MediaDecoded {
         /// Room of the item.
@@ -389,6 +425,20 @@ pub struct App {
     pub media: MediaModel,
     /// Files being sent: the confirmation, drops and the server's limit.
     pub uploads: UploadModel,
+    /// Notification, tray and theme settings kept on this device. Until the
+    /// local settings storage exists these are the defaults.
+    pub ui_settings: UiSettings,
+    /// The account's notification defaults and keywords, as the core last
+    /// reported them.
+    pub notification_settings: Option<NotificationSettingsView>,
+    /// Notification modes the user picked that the room list has not shown
+    /// yet (`None` is "use default"). The SDK does not refresh a room's
+    /// summary right after a mode change, so the menu reads these first.
+    pub room_modes: HashMap<RoomId, Option<RoomNotificationModeView>>,
+    /// The tray icon and the unread count it shows.
+    pub tray: TrayModel,
+    notifier: Box<dyn Notifier>,
+    folding: Folding,
     pub(crate) dialogs: Box<dyn Dialogs>,
     pub(crate) clipboard: Box<dyn Clipboard>,
     /// The signed-in account.
@@ -498,6 +548,14 @@ impl App {
             user_trust: Vec::new(),
             media: MediaModel::default(),
             uploads: UploadModel::default(),
+            ui_settings: UiSettings::default(),
+            notification_settings: None,
+            room_modes: HashMap::new(),
+            // Inert until `booter` installs the real ones, so tests never
+            // touch the desktop.
+            tray: TrayModel::new(Box::new(NoTrayFactory)),
+            notifier: Box::new(NoNotifier),
+            folding: Folding::default(),
             dialogs: Box::new(SystemDialogs),
             clipboard: Box::new(SystemClipboard),
             user_id: None,
@@ -540,8 +598,111 @@ impl App {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .take()
                 .expect("iced boots the application exactly once");
-            App::new(startup)
+            let (mut app, task) = App::new(startup);
+            app.set_notifier(Box::new(notifications::SystemNotifier));
+            app.set_tray_factory(Box::new(SystemTrayFactory));
+            (app, task)
         }
+    }
+
+    /// Replaces the desktop notification service (tests use a fake).
+    pub fn set_notifier(&mut self, notifier: Box<dyn Notifier>) {
+        self.notifier = notifier;
+    }
+
+    /// Replaces the tray factory (tests use a fake). Only before the tray is
+    /// created.
+    pub fn set_tray_factory(&mut self, factory: Box<dyn TrayFactory>) {
+        self.tray = TrayModel::new(factory);
+    }
+
+    /// The choice the room header's menu shows for `room`: what the user
+    /// picked and the list has not caught up with, else the list's mode.
+    pub fn room_mode_choice(&self, room: &RoomId) -> ModeChoice {
+        ModeChoice::from_mode(self.effective_room_mode(room))
+    }
+
+    /// The mode of `room` for the list and the menu.
+    pub fn effective_room_mode(&self, room: &RoomId) -> Option<RoomNotificationModeView> {
+        match self.room_modes.get(room) {
+            Some(mode) => *mode,
+            None => self
+                .rooms
+                .iter()
+                .find(|r| r.id == *room)
+                .and_then(|r| r.notification_mode),
+        }
+    }
+
+    /// Forgets local mode choices that the room list now agrees with.
+    fn reconcile_room_modes(&mut self) {
+        let rooms = &self.rooms;
+        self.room_modes.retain(|id, mode| {
+            rooms
+                .iter()
+                .find(|r| r.id == *id)
+                .is_none_or(|r| r.notification_mode != *mode)
+        });
+    }
+
+    fn choose_room_mode(&mut self, choice: ModeChoice) -> Task<Message> {
+        let Some(room) = self.selected.clone() else {
+            return Task::none();
+        };
+        if self.room_mode_choice(&room) == choice {
+            return Task::none();
+        }
+        if self.room_modes.len() >= MAX_LOCAL_MODES && !self.room_modes.contains_key(&room) {
+            self.room_modes.clear();
+        }
+        self.room_modes.insert(room.clone(), choice.mode());
+        self.send(Command::SetRoomNotificationMode {
+            room_id: room,
+            mode: choice.mode(),
+        })
+    }
+
+    /// Creates the tray once, on the main thread.
+    fn ensure_tray(&mut self) {
+        if self.tray.ensure(self.ui_settings.tray_badge) {
+            eprintln!("tessera: the tray icon is not available");
+        }
+    }
+
+    fn on_notification(&mut self, mut view: NotificationView) -> Task<Message> {
+        if !notifications::should_show(self.window_focused, &self.ui_settings) {
+            return Task::none();
+        }
+        let show_content = self.ui_settings.show_message_content;
+        if !show_content {
+            // The core always sends a preview; it stops here.
+            view.preview = None;
+        }
+        let (folded, replace) = match self.folding.admit(&view.room_id, Instant::now()) {
+            notifications::Delivery::New => (None, None),
+            notifications::Delivery::Fold { count, replace } => (Some(count), replace),
+        };
+        let toast = notifications::build_toast(&view, show_content, folded);
+        let show = self.notifier.show(notifications::Request {
+            room_id: view.room_id,
+            toast,
+            replace,
+        });
+        if view.kind == NotificationKind::Mention {
+            Task::batch([show, attention()])
+        } else {
+            show
+        }
+    }
+
+    fn open_room_from_notification(&mut self, room: RoomId) -> Task<Message> {
+        let select =
+            if self.selected.as_ref() != Some(&room) && room_list::contains(&self.rooms, &room) {
+                self.update_inner(Message::SelectRoom(room))
+            } else {
+                Task::none()
+            };
+        Task::batch([select, focus_window()])
     }
 
     /// Replaces the system dialogs (tests use a fake).
@@ -726,8 +887,23 @@ impl App {
                 }
                 Task::none()
             }
+            Message::WindowOpened(_) => {
+                self.ensure_tray();
+                Task::none()
+            }
+            Message::NotificationShown { room_id, id } => {
+                self.folding.shown(&room_id, id);
+                Task::none()
+            }
+            Message::OpenRoomFromNotification(room) => self.open_room_from_notification(room),
+            Message::RoomModeChosen(choice) => self.choose_room_mode(choice),
+            Message::Tray(TrayAction::Show) => focus_window(),
+            Message::Tray(TrayAction::Quit) => self.update_inner(Message::CloseRequested),
             Message::WindowFocus(focused) => {
                 self.window_focused = focused;
+                // A second chance to create the tray, should the first
+                // window event not have reached the app.
+                self.ensure_tray();
                 self.read_receipt(Instant::now())
             }
             Message::ReadDue(room_id) => {
@@ -1028,6 +1204,8 @@ impl App {
                 task = self.drop_secrets();
                 self.security = SecurityModel::default();
                 self.security.fresh_login = !restored;
+                self.room_modes.clear();
+                self.folding.clear();
                 self.user_id = Some(user_id);
                 self.notice = None;
                 self.end_login_attempt();
@@ -1059,6 +1237,7 @@ impl App {
             CoreEvent::SyncState(state) => self.sync_state = state,
             CoreEvent::RoomListChanged(diffs) => {
                 room_list::apply_room_diffs(&mut self.rooms, &diffs);
+                self.reconcile_room_modes();
                 // A search or tab filters the list, so an open room missing
                 // from it is only hidden: keep it and its draft. Without a
                 // filter, a missing room has really gone.
@@ -1157,6 +1336,19 @@ impl App {
             }
             CoreEvent::ActionFailed {
                 room_id,
+                action: ActionKind::Notifications,
+                ..
+            } => {
+                // The change did not happen: show what the list says again.
+                self.room_modes.remove(&room_id);
+                if self.selected.as_ref() == Some(&room_id) {
+                    task = self.show_notice_text(
+                        "The notification setting could not be changed.".to_owned(),
+                    );
+                }
+            }
+            CoreEvent::ActionFailed {
+                room_id,
                 action: ActionKind::Discard,
                 ..
             } => {
@@ -1238,10 +1430,15 @@ impl App {
             CoreEvent::MediaLimits { max_upload_bytes } => {
                 self.uploads.max_upload_bytes = max_upload_bytes;
             }
-            CoreEvent::Notification(_)
-            | CoreEvent::NotificationSettings(_)
-            | CoreEvent::UnreadTotals { .. }
-            | CoreEvent::RoomCreated { .. }
+            CoreEvent::Notification(view) => task = self.on_notification(view),
+            CoreEvent::NotificationSettings(settings) => {
+                self.notification_settings = Some(settings);
+            }
+            CoreEvent::UnreadTotals { notifications, .. } => {
+                self.tray
+                    .set_unread(notifications, self.ui_settings.tray_badge);
+            }
+            CoreEvent::RoomCreated { .. }
             | CoreEvent::RoomJoined { .. }
             | CoreEvent::RoomDetails(_)
             | CoreEvent::RoomMembers { .. }
@@ -2129,6 +2326,8 @@ impl App {
             self.upload_keys(),
             system::theme_changes().map(Message::ThemeMode),
             self.viewer_keys(),
+            window::open_events().map(Message::WindowOpened),
+            tray::subscription(),
         ])
     }
 
@@ -7622,6 +7821,386 @@ mod tests {
             assert_eq!(tag_path(&app), closed, "the base keeps its place");
             let _ = app.update(Message::UploadCancelled);
             assert_eq!(tag_path(&app), closed);
+        }
+    }
+
+    mod notification_flow {
+        use tessera_core::api::{
+            EventId, NotificationKind, NotificationView, RoomNotificationModeView,
+        };
+
+        use super::*;
+        use crate::notifications::{ModeChoice, RecordingNotifier, Request};
+        use crate::tray::{FakeTray, FakeTrayFactory, TrayAction};
+
+        struct Rig {
+            app: App,
+            rx: mpsc::Receiver<Command>,
+            shown: Arc<std::sync::Mutex<Vec<Request>>>,
+            tray: FakeTray,
+        }
+
+        fn rig_with(tray_fails: bool) -> Rig {
+            let (mut app, rx) = main_app();
+            let notifier = RecordingNotifier::default();
+            let shown = notifier.shown.clone();
+            app.set_notifier(Box::new(notifier));
+            let factory = FakeTrayFactory {
+                fail: tray_fails,
+                ..FakeTrayFactory::default()
+            };
+            let tray = factory.tray.clone();
+            app.set_tray_factory(Box::new(factory));
+            Rig {
+                app,
+                rx,
+                shown,
+                tray,
+            }
+        }
+
+        fn rig() -> Rig {
+            rig_with(false)
+        }
+
+        fn unfocus(app: &mut App) {
+            let _ = app.update(Message::WindowFocus(false));
+        }
+
+        fn view(room: &str, kind: NotificationKind, is_dm: bool) -> NotificationView {
+            NotificationView {
+                room_id: RoomId::from(format!("!{room}:x")),
+                event_id: EventId::from("$e"),
+                room_name: room.to_owned(),
+                sender: UserId::from("@bob:x"),
+                sender_name: Some("Bob".into()),
+                is_dm,
+                kind,
+                preview: Some(MessageText::from("secret preview text")),
+            }
+        }
+
+        fn notify(app: &mut App, v: NotificationView) -> Task<Message> {
+            app.update(core(CoreEvent::Notification(v)))
+        }
+
+        fn requests(rig: &Rig) -> Vec<Request> {
+            rig.shown.lock().expect("test mutex").clone()
+        }
+
+        #[test]
+        fn an_unfocused_window_shows_a_dm_and_a_focused_one_does_not() {
+            let mut rig = rig();
+            let _ = notify(&mut rig.app, view("b", NotificationKind::Message, true));
+            assert!(requests(&rig).is_empty(), "the window has focus");
+            unfocus(&mut rig.app);
+            let _ = notify(&mut rig.app, view("b", NotificationKind::Message, true));
+            let shown = requests(&rig);
+            assert_eq!(shown.len(), 1);
+            assert_eq!(shown[0].room_id, RoomId::from("!b:x"));
+            assert_eq!(shown[0].toast.title, "Bob");
+            assert_eq!(shown[0].toast.body, "secret preview text");
+        }
+
+        #[test]
+        fn the_selected_room_notifies_only_while_unfocused() {
+            let mut rig = rig();
+            assert_eq!(rig.app.selected, Some(RoomId::from("!a:x")));
+            let _ = notify(&mut rig.app, view("a", NotificationKind::Message, false));
+            assert!(requests(&rig).is_empty());
+            unfocus(&mut rig.app);
+            let _ = notify(&mut rig.app, view("a", NotificationKind::Message, false));
+            assert_eq!(requests(&rig).len(), 1);
+        }
+
+        #[test]
+        fn desktop_notifications_off_shows_nothing() {
+            let mut rig = rig();
+            rig.app.ui_settings.desktop_notifications = false;
+            unfocus(&mut rig.app);
+            let task = notify(&mut rig.app, view("b", NotificationKind::Mention, false));
+            assert!(requests(&rig).is_empty());
+            assert_eq!(task.units(), 0, "no attention request either");
+        }
+
+        #[test]
+        fn with_content_off_the_preview_never_reaches_the_notifier() {
+            let mut rig = rig();
+            rig.app.ui_settings.show_message_content = false;
+            unfocus(&mut rig.app);
+            for (kind, is_dm) in [
+                (NotificationKind::Message, false),
+                (NotificationKind::Message, true),
+                (NotificationKind::Mention, false),
+                (NotificationKind::Encrypted, false),
+                (NotificationKind::Invite, false),
+            ] {
+                let _ = notify(
+                    &mut rig.app,
+                    view(&format!("r{is_dm}{kind:?}"), kind, is_dm),
+                );
+            }
+            let shown = requests(&rig);
+            assert_eq!(shown.len(), 5);
+            let bodies: Vec<&str> = shown.iter().map(|r| r.toast.body.as_str()).collect();
+            assert_eq!(
+                bodies,
+                [
+                    "New message",
+                    "New message",
+                    "Mentioned you",
+                    "New message",
+                    "Invited you"
+                ]
+            );
+            for request in &shown {
+                let text = format!("{} {}", request.toast.title, request.toast.body);
+                assert!(!text.contains("secret"), "{text}");
+                assert!(!text.contains("Bob"), "{text}");
+            }
+        }
+
+        #[test]
+        fn a_burst_in_one_room_folds_into_the_shown_notification() {
+            let mut rig = rig();
+            unfocus(&mut rig.app);
+            let _ = notify(&mut rig.app, view("b", NotificationKind::Message, false));
+            let _ = rig.app.update(Message::NotificationShown {
+                room_id: RoomId::from("!b:x"),
+                id: 7,
+            });
+            let _ = notify(&mut rig.app, view("b", NotificationKind::Message, false));
+            let _ = notify(&mut rig.app, view("b", NotificationKind::Message, false));
+            let shown = requests(&rig);
+            assert_eq!(shown.len(), 3);
+            assert_eq!(shown[0].replace, None);
+            assert_eq!(shown[1].replace, Some(7));
+            assert_eq!(shown[1].toast.body, "2 new messages");
+            assert_eq!(shown[2].toast.body, "3 new messages");
+            // Another room is not folded in.
+            let _ = notify(&mut rig.app, view("a", NotificationKind::Message, false));
+            assert_eq!(requests(&rig)[3].replace, None);
+        }
+
+        #[test]
+        fn a_mention_asks_for_attention_and_a_plain_message_does_not() {
+            let mut rig = rig();
+            unfocus(&mut rig.app);
+            let plain = notify(&mut rig.app, view("b", NotificationKind::Message, false));
+            assert_eq!(plain.units(), 0);
+            let mention = notify(&mut rig.app, view("a", NotificationKind::Mention, false));
+            assert!(mention.units() > 0);
+        }
+
+        #[test]
+        fn clicking_a_notification_selects_the_room_and_focuses_the_window() {
+            let mut rig = rig();
+            let task = rig
+                .app
+                .update(Message::OpenRoomFromNotification(RoomId::from("!b:x")));
+            assert!(task.units() > 0);
+            assert_eq!(rig.app.selected, Some(RoomId::from("!b:x")));
+            let commands = drain(&mut rig.rx);
+            assert!(
+                commands
+                    .iter()
+                    .any(|c| matches!(c, Command::SelectRoom(id) if *id == RoomId::from("!b:x")))
+            );
+            // The same room again: only the focus.
+            let task = rig
+                .app
+                .update(Message::OpenRoomFromNotification(RoomId::from("!b:x")));
+            assert!(task.units() > 0);
+            assert!(drain(&mut rig.rx).is_empty());
+            // A room that is not listed is not selected.
+            let _ = rig
+                .app
+                .update(Message::OpenRoomFromNotification(RoomId::from("!zz:x")));
+            assert_eq!(rig.app.selected, Some(RoomId::from("!b:x")));
+        }
+
+        fn mode_commands(rig: &mut Rig) -> Vec<Command> {
+            drain(&mut rig.rx)
+                .into_iter()
+                .filter(|c| matches!(c, Command::SetRoomNotificationMode { .. }))
+                .collect()
+        }
+
+        #[test]
+        fn each_menu_choice_sends_its_command_once() {
+            let mut rig = rig();
+            let room = RoomId::from("!a:x");
+            for (choice, mode) in [
+                (
+                    ModeChoice::AllMessages,
+                    Some(RoomNotificationModeView::AllMessages),
+                ),
+                (
+                    ModeChoice::MentionsAndKeywords,
+                    Some(RoomNotificationModeView::MentionsAndKeywords),
+                ),
+                (ModeChoice::Mute, Some(RoomNotificationModeView::Mute)),
+                (ModeChoice::Default, None),
+            ] {
+                let _ = rig.app.update(Message::RoomModeChosen(choice));
+                let commands = mode_commands(&mut rig);
+                assert_eq!(commands.len(), 1, "{choice:?}");
+                assert!(
+                    matches!(&commands[0], Command::SetRoomNotificationMode { room_id, mode: m }
+                        if *room_id == room && *m == mode),
+                    "{choice:?}: {commands:?}"
+                );
+                // The menu shows the choice at once, before the list catches up.
+                assert_eq!(rig.app.room_mode_choice(&room), choice);
+                // Choosing it again changes nothing.
+                let _ = rig.app.update(Message::RoomModeChosen(choice));
+                assert!(mode_commands(&mut rig).is_empty(), "{choice:?} twice");
+            }
+        }
+
+        #[test]
+        fn choosing_a_mode_without_a_room_sends_nothing() {
+            let mut rig = rig();
+            let _ = rig
+                .app
+                .update(core(CoreEvent::RoomListChanged(vec![ListDiff::Clear])));
+            let _ = drain(&mut rig.rx);
+            let _ = rig.app.update(Message::RoomModeChosen(ModeChoice::Mute));
+            assert!(mode_commands(&mut rig).is_empty());
+        }
+
+        #[test]
+        fn a_failed_change_goes_back_to_what_the_list_says() {
+            let mut rig = rig();
+            let room = RoomId::from("!a:x");
+            let _ = rig.app.update(Message::RoomModeChosen(ModeChoice::Mute));
+            assert_eq!(rig.app.room_mode_choice(&room), ModeChoice::Mute);
+            let _ = rig.app.update(core(CoreEvent::ActionFailed {
+                room_id: room.clone(),
+                action: ActionKind::Notifications,
+                error: CoreError::NotAllowed,
+            }));
+            assert_eq!(rig.app.room_mode_choice(&room), ModeChoice::Default);
+        }
+
+        #[test]
+        fn the_list_taking_over_drops_the_local_choice() {
+            let mut rig = rig();
+            let room = RoomId::from("!a:x");
+            let _ = rig.app.update(Message::RoomModeChosen(ModeChoice::Mute));
+            let mut changed = RoomSummary::new(room.clone(), "a".into());
+            changed.notification_mode = Some(RoomNotificationModeView::Mute);
+            let _ = rig
+                .app
+                .update(core(CoreEvent::RoomListChanged(vec![ListDiff::Set {
+                    index: 0,
+                    value: changed,
+                }])));
+            assert!(rig.app.room_modes.is_empty());
+            assert_eq!(rig.app.room_mode_choice(&room), ModeChoice::Mute);
+        }
+
+        #[test]
+        fn the_tray_appears_on_the_first_window_and_only_once() {
+            let mut rig = rig();
+            assert!(rig.tray.created.lock().expect("test mutex").is_empty());
+            let id = iced::window::Id::unique();
+            let _ = rig.app.update(Message::WindowOpened(id));
+            let _ = rig.app.update(Message::WindowOpened(id));
+            assert_eq!(rig.tray.created.lock().expect("test mutex").len(), 1);
+        }
+
+        #[test]
+        fn a_tray_failure_leaves_the_app_working() {
+            let mut rig = rig_with(true);
+            let _ = rig
+                .app
+                .update(Message::WindowOpened(iced::window::Id::unique()));
+            let _ = rig.app.update(core(CoreEvent::UnreadTotals {
+                notifications: 3,
+                highlights: 0,
+            }));
+            assert!(rig.tray.badges.lock().expect("test mutex").is_empty());
+            assert_eq!(rig.app.screen, Screen::Main);
+        }
+
+        #[test]
+        fn unread_totals_update_the_tray_only_when_the_look_changes() {
+            let mut rig = rig();
+            let _ = rig
+                .app
+                .update(Message::WindowOpened(iced::window::Id::unique()));
+            let totals = |n| {
+                core(CoreEvent::UnreadTotals {
+                    notifications: n,
+                    highlights: 0,
+                })
+            };
+            let _ = rig.app.update(totals(3));
+            let _ = rig.app.update(totals(3));
+            assert_eq!(*rig.tray.badges.lock().expect("test mutex"), [true]);
+            assert_eq!(rig.tray.tooltips.lock().expect("test mutex").len(), 1);
+            let _ = rig.app.update(totals(0));
+            assert_eq!(*rig.tray.badges.lock().expect("test mutex"), [true, false]);
+        }
+
+        #[test]
+        fn totals_that_arrive_before_the_tray_are_used_at_creation() {
+            let mut rig = rig();
+            let _ = rig.app.update(core(CoreEvent::UnreadTotals {
+                notifications: 5,
+                highlights: 1,
+            }));
+            let _ = rig
+                .app
+                .update(Message::WindowOpened(iced::window::Id::unique()));
+            let created = rig.tray.created.lock().expect("test mutex");
+            assert_eq!(created.len(), 1);
+            assert!(created[0].badge);
+        }
+
+        #[test]
+        fn the_badge_setting_off_keeps_the_tray_plain() {
+            let mut rig = rig();
+            rig.app.ui_settings.tray_badge = false;
+            let _ = rig
+                .app
+                .update(Message::WindowOpened(iced::window::Id::unique()));
+            let _ = rig.app.update(core(CoreEvent::UnreadTotals {
+                notifications: 5,
+                highlights: 0,
+            }));
+            assert!(rig.tray.badges.lock().expect("test mutex").is_empty());
+        }
+
+        #[test]
+        fn tray_show_focuses_the_window_and_quit_takes_the_close_path() {
+            let mut rig = rig();
+            let show = rig.app.update(Message::Tray(TrayAction::Show));
+            assert!(show.units() > 0);
+            assert_ne!(rig.app.screen, Screen::ShuttingDown);
+            let _ = drain(&mut rig.rx);
+            let _ = rig.app.update(Message::Tray(TrayAction::Quit));
+            assert_eq!(rig.app.screen, Screen::ShuttingDown);
+            assert!(
+                drain(&mut rig.rx)
+                    .iter()
+                    .any(|c| matches!(c, Command::Shutdown))
+            );
+        }
+
+        #[test]
+        fn the_notification_settings_event_is_kept() {
+            let mut rig = rig();
+            let settings = tessera_core::api::NotificationSettingsView {
+                group_default: RoomNotificationModeView::AllMessages,
+                dm_default: RoomNotificationModeView::Mute,
+                keywords: vec!["kw".into()],
+            };
+            let _ = rig
+                .app
+                .update(core(CoreEvent::NotificationSettings(settings.clone())));
+            assert_eq!(rig.app.notification_settings.as_ref(), Some(&settings));
         }
     }
 }

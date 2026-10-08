@@ -2,16 +2,17 @@
 //! (timeline pane and composer) on the right.
 
 use iced::widget::{
-    Column, Row, button, column, container, opaque, row, space, stack, text, text_editor,
-    text_input,
+    Column, Row, button, column, container, opaque, pick_list, row, space, stack, text,
+    text_editor, text_input,
 };
 use iced::{Element, Fill};
-use tessera_core::api::{MessageText, UserId, UserTrust};
+use tessera_core::api::{MessageText, RoomId, UserId, UserTrust};
 
 use crate::actions::{self, Picker};
 use crate::composer::{self, EditorAction, Mode, Suggestions};
 use crate::emoji;
 use crate::links::{CheckedUrl, LinkBar, LinkKind};
+use crate::notifications::ModeChoice;
 use crate::screens::loading::sync_label;
 use crate::screens::timeline_pane::RichEnv;
 use crate::screens::{media_viewer, room_list_pane, security, sessions, timeline_pane};
@@ -86,6 +87,9 @@ fn header<'a>(app: &'a App, title: String) -> Element<'a, Message> {
     if let Some(lock) = selected.and_then(room_list_pane::encrypted_mark) {
         line = line.push(text(lock).size(16));
     }
+    if let Some(room) = selected.filter(|room| !room.is_invite) {
+        line = line.push(notification_menu(app, &room.id));
+    }
     if let Some((peer, badge)) = app
         .dm_peer_trust()
         .and_then(|(peer, trust)| trust_badge(trust).map(|badge| (peer, badge)))
@@ -120,6 +124,25 @@ fn header<'a>(app: &'a App, title: String) -> Element<'a, Message> {
         }
     }
     line.into()
+}
+
+/// The room's notification menu: a drop-down with the four choices of plan
+/// Q11. It shows what the user picked at once, since the room list lags
+/// behind a change.
+fn notification_menu<'a>(app: &'a App, room: &RoomId) -> Element<'a, Message> {
+    let label = text("Notifications")
+        .size(13)
+        .style(|theme: &iced::Theme| text::Style {
+            color: Some(theme::semantic(theme).muted),
+        });
+    let menu = pick_list(
+        ModeChoice::ALL,
+        Some(app.room_mode_choice(room)),
+        Message::RoomModeChosen,
+    )
+    .text_size(13)
+    .padding([2, 8]);
+    row![label, menu].spacing(6).align_y(iced::Center).into()
 }
 
 /// The main screen: panes above a status bar.

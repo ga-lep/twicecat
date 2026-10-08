@@ -13,6 +13,7 @@ pub mod dialogs;
 pub mod emoji;
 pub mod links;
 pub mod media;
+pub mod notifications;
 pub mod rich_text;
 pub mod room_list;
 pub mod screens;
@@ -22,6 +23,7 @@ pub mod state;
 pub mod text_safety;
 pub mod theme;
 pub mod timeline;
+pub mod tray;
 pub mod upload;
 pub mod verification;
 

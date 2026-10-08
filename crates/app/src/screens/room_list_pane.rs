@@ -8,9 +8,10 @@
 use iced::widget::text::Wrapping;
 use iced::widget::{button, column, container, image, row, scrollable, space, text, text_input};
 use iced::{Background, Color, Element, Fill, Length, border};
-use tessera_core::api::{RoomListTab, RoomSummary};
+use tessera_core::api::{RoomListTab, RoomNotificationModeView, RoomSummary};
 
 use crate::avatars::{AvatarState, Avatars, NEUTRAL_INITIALS, initials, placeholder_color};
+use crate::notifications::muted_mark;
 use crate::room_list::{
     Badge, OVERSCAN_ROWS, ROW_HEIGHT, badge_for, empty_label, preview_line, row_name,
     spacer_heights, visible_range,
@@ -107,9 +108,14 @@ fn windowed_list(app: &App) -> Element<'_, Message> {
         OVERSCAN_ROWS,
     );
     let (top, bottom) = spacer_heights(&range, len, ROW_HEIGHT);
-    let rows = app.rooms[range]
-        .iter()
-        .map(|room| room_row(room, &app.avatars, app.selected.as_ref() == Some(&room.id)));
+    let rows = app.rooms[range].iter().map(|room| {
+        room_row(
+            room,
+            &app.avatars,
+            app.selected.as_ref() == Some(&room.id),
+            app.effective_room_mode(&room.id),
+        )
+    });
     let content = column![space().height(top)]
         .extend(rows)
         .push(space().height(bottom));
@@ -122,8 +128,14 @@ fn windowed_list(app: &App) -> Element<'_, Message> {
         .into()
 }
 
-/// One fixed-height row: avatar, name (and "Invite"), preview, badge.
-fn room_row<'a>(room: &'a RoomSummary, avatars: &Avatars, selected: bool) -> Element<'a, Message> {
+/// One fixed-height row: avatar, name (and "Invite" or "Muted"), preview,
+/// badge. `mode` is the room's notification mode as the app knows it.
+fn room_row<'a>(
+    room: &'a RoomSummary,
+    avatars: &Avatars,
+    selected: bool,
+    mode: Option<RoomNotificationModeView>,
+) -> Element<'a, Message> {
     let muted = |t: &iced::Theme| text::Style {
         color: Some(theme::semantic(t).muted),
     };
@@ -138,6 +150,9 @@ fn room_row<'a>(room: &'a RoomSummary, avatars: &Avatars, selected: bool) -> Ele
     if room.is_invite {
         name_line = name_line.push(tag("Invite"));
     }
+    if let Some(mark) = muted_mark(mode) {
+        name_line = name_line.push(tag(mark));
+    }
     let preview = preview_line(room).unwrap_or_default();
     let body = column![
         name_line,
@@ -145,9 +160,13 @@ fn room_row<'a>(room: &'a RoomSummary, avatars: &Avatars, selected: bool) -> Ele
     ]
     .spacing(2)
     .width(Fill);
-    let content = row![avatar, body, badge_view(badge_for(room)),]
-        .spacing(8)
-        .align_y(iced::Center);
+    let content = row![
+        avatar,
+        body,
+        badge_view(badge_for(room), muted_mark(mode).is_some()),
+    ]
+    .spacing(8)
+    .align_y(iced::Center);
     button(content)
         .on_press(Message::SelectRoom(room.id.clone()))
         .width(Fill)
@@ -221,12 +240,15 @@ fn tag(label: &str) -> Element<'_, Message> {
         .into()
 }
 
-/// The badge at the right of a row.
-fn badge_view<'a>(badge: Badge) -> Element<'a, Message> {
+/// The badge at the right of a row. A muted room's count is drawn as an
+/// outline in the muted text colour instead of a filled badge; mentions keep
+/// their highlight.
+fn badge_view<'a>(badge: Badge, muted: bool) -> Element<'a, Message> {
     match badge {
         Badge::None => space().width(0).into(),
-        Badge::Highlight(count) => pill(count_label(count), true),
-        Badge::Count(count) => pill(count_label(count), false),
+        Badge::Highlight(count) => pill(count_label(count), Tone::Highlight),
+        Badge::Count(count) if muted => pill(count_label(count), Tone::Muted),
+        Badge::Count(count) => pill(count_label(count), Tone::Normal),
         Badge::Dot => container(space().width(10).height(10))
             .style(|t| container::Style {
                 background: Some(Background::Color(theme::semantic(t).badge)),
@@ -237,22 +259,43 @@ fn badge_view<'a>(badge: Badge) -> Element<'a, Message> {
     }
 }
 
-/// A rounded badge with a count; the highlight colour for mentions.
-fn pill<'a>(label: String, highlight: bool) -> Element<'a, Message> {
+/// How a count badge is drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tone {
+    /// Mentions.
+    Highlight,
+    /// Ordinary unread notifications.
+    Normal,
+    /// Unread notifications of a muted room.
+    Muted,
+}
+
+/// A rounded badge with a count; the highlight colour for mentions, an
+/// outline for a muted room.
+fn pill<'a>(label: String, tone: Tone) -> Element<'a, Message> {
     container(text(label).size(12))
         .padding([1, 7])
         .style(move |t| {
             let colours = theme::semantic(t);
-            let (background, foreground) = if highlight {
-                (colours.highlight, colours.highlight_text)
-            } else {
-                (colours.badge, colours.badge_text)
-            };
-            container::Style {
-                text_color: Some(foreground),
-                background: Some(Background::Color(background)),
-                border: border::rounded(10.0),
-                ..container::Style::default()
+            match tone {
+                Tone::Highlight | Tone::Normal => {
+                    let (background, foreground) = if tone == Tone::Highlight {
+                        (colours.highlight, colours.highlight_text)
+                    } else {
+                        (colours.badge, colours.badge_text)
+                    };
+                    container::Style {
+                        text_color: Some(foreground),
+                        background: Some(Background::Color(background)),
+                        border: border::rounded(10.0),
+                        ..container::Style::default()
+                    }
+                }
+                Tone::Muted => container::Style {
+                    text_color: Some(colours.muted),
+                    border: border::rounded(10.0).color(colours.muted).width(1),
+                    ..container::Style::default()
+                },
             }
         })
         .into()
@@ -268,6 +311,24 @@ mod tests {
         assert_eq!(encrypted_mark(&room), None);
         room.is_encrypted = true;
         assert_eq!(encrypted_mark(&room), Some(LOCK_MARK));
+    }
+
+    #[test]
+    fn rows_build_in_every_notification_mode() {
+        let mut room = RoomSummary::new(tessera_core::api::RoomId::from("!r:x"), "r".to_owned());
+        room.unread_notifications = 3;
+        let avatars = Avatars::default();
+        for mode in [
+            None,
+            Some(RoomNotificationModeView::AllMessages),
+            Some(RoomNotificationModeView::MentionsAndKeywords),
+            Some(RoomNotificationModeView::Mute),
+        ] {
+            let _: Element<'_, Message> = room_row(&room, &avatars, false, mode);
+        }
+        room.highlights = 1;
+        let _: Element<'_, Message> =
+            room_row(&room, &avatars, true, Some(RoomNotificationModeView::Mute));
     }
 
     #[test]
