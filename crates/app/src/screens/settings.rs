@@ -16,7 +16,7 @@ use tessera_core::api::ThemeChoice;
 use crate::screens::room_dialogs::{modal, muted};
 use crate::settings::{
     DRAG_AND_DROP_NOTE, DefaultChoice, KEYWORD_INPUT_ID, NAME_INPUT_ID, PUSH_TO_TALK_LINE,
-    SHORTCUTS, SettingsMessage,
+    SettingsMessage,
 };
 use crate::state::{App, Message};
 
@@ -201,7 +201,7 @@ fn appearance_section(app: &App) -> Element<'_, Message> {
 
 fn shortcuts_section<'a>() -> Element<'a, Message> {
     let mut list = Column::new().spacing(4);
-    for shortcut in SHORTCUTS {
+    for shortcut in crate::keys::SHORTCUTS {
         list = list.push(
             row![
                 text(shortcut.keys).width(160).font(iced::Font::MONOSPACE),

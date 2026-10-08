@@ -46,56 +46,6 @@ pub const PUSH_TO_TALK_LINE: &str = "Push-to-talk arrives with voice calls in a 
 /// The note under the shortcut list.
 pub const DRAG_AND_DROP_NOTE: &str = "Dragging files into the window does not work on a native Wayland window (an upstream limit). Use Attach (Ctrl+U) or paste instead.";
 
-/// One row of the shortcut list.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Shortcut {
-    /// The keys, as shown.
-    pub keys: &'static str,
-    /// What they do.
-    pub action: &'static str,
-}
-
-/// Every keyboard shortcut. The Settings list shows this table, and the key
-/// handling (`settings_shortcut`, `upload::event_message`) matches the first
-/// two rows; Task 16 adds its rows here too.
-pub const SHORTCUTS: &[Shortcut] = &[
-    Shortcut {
-        keys: "Ctrl+,",
-        action: "Open Settings",
-    },
-    Shortcut {
-        keys: "Ctrl+U",
-        action: "Attach a file to the open room",
-    },
-    Shortcut {
-        keys: "Enter",
-        action: "Send the message",
-    },
-    Shortcut {
-        keys: "Shift+Enter",
-        action: "New line in the message",
-    },
-    Shortcut {
-        keys: "Esc",
-        action: "Close the open dialog, panel or Settings",
-    },
-];
-
-/// The message Ctrl+, (Cmd+, on macOS) stands for.
-pub fn settings_shortcut(event: &iced::Event) -> Option<Message> {
-    use iced::keyboard;
-    match event {
-        iced::Event::Keyboard(keyboard::Event::KeyPressed {
-            modified_key: keyboard::Key::Character(c),
-            modifiers,
-            ..
-        }) if modifiers.command() && !modifiers.alt() && c.as_str() == "," => {
-            Some(Message::Settings(SettingsMessage::Open))
-        }
-        _ => None,
-    }
-}
-
 /// Why a field is not sent, or a change did not happen. The words are fixed;
 /// they never repeat the input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

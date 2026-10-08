@@ -27,6 +27,7 @@ use crate::bridge::{self, Bridge, EventsSlot};
 use crate::composer::{self, Composer, ComposerKey, EditorAction, SearchStep};
 use crate::dialogs::{self, Clipboard, ClipboardContent, Dialogs, SystemClipboard, SystemDialogs};
 use crate::emoji;
+use crate::keys;
 use crate::links::{self, LinkBar};
 use crate::media::{self, Decoded, MediaModel, SavePath};
 use crate::notifications::{self, Folding, ModeChoice, NoNotifier, Notifier};
@@ -37,7 +38,7 @@ use crate::screens::login::{self, BrowserUrl, LoginForm};
 use crate::screens::{self, loading, main_view};
 use crate::security::{Busy, SecurityMessage, SecurityModel};
 use crate::sessions::{SessionsMessage, SessionsModel, logout_needs_warning};
-use crate::settings::{self, NoSettingsStore, SettingsMessage, SettingsModel, SettingsStore};
+use crate::settings::{NoSettingsStore, SettingsMessage, SettingsModel, SettingsStore};
 use crate::spaces::{SpacesMessage, SpacesModel};
 use crate::text_safety;
 use crate::threads::{ThreadsMessage, ThreadsModel};
@@ -380,6 +381,16 @@ pub enum Message {
     Spaces(SpacesMessage),
     /// A thread summary row or a control of the thread panel.
     Threads(ThreadsMessage),
+    /// A keyboard shortcut (see `keys`); `captured` says a widget used the
+    /// key already.
+    Shortcut {
+        /// What the keys stand for.
+        shortcut: crate::keys::Shortcut,
+        /// A widget used the key.
+        captured: bool,
+    },
+    /// The room switcher's field, list and rows.
+    Switcher(crate::switcher::SwitcherMessage),
     /// The task that decoded fetched image bytes finished.
     MediaDecoded {
         /// Room of the item.
@@ -458,6 +469,11 @@ pub struct App {
     pub spaces: SpacesModel,
     /// The thread panel.
     pub threads: ThreadsModel,
+    /// The room switcher (Ctrl+K).
+    pub switcher: crate::switcher::SwitcherModel,
+    /// The composer's own Esc just did something; the window listener's
+    /// copy of the same key press must not close another layer.
+    pub(crate) escape_spent: bool,
     notifier: Box<dyn Notifier>,
     folding: Folding,
     pub(crate) dialogs: Box<dyn Dialogs>,
@@ -583,6 +599,8 @@ impl App {
             settings_store: Box::new(NoSettingsStore),
             spaces: SpacesModel::default(),
             threads: ThreadsModel::default(),
+            switcher: crate::switcher::SwitcherModel::default(),
+            escape_spent: false,
             notifier: Box::new(NoNotifier),
             folding: Folding::default(),
             dialogs: Box::new(SystemDialogs),
@@ -1071,6 +1089,8 @@ impl App {
             Message::Settings(message) => self.on_settings(message),
             Message::Spaces(SpacesMessage::Select(space)) => self.select_space(space),
             Message::Threads(message) => self.on_threads(message),
+            Message::Shortcut { shortcut, captured } => self.on_shortcut(shortcut, captured),
+            Message::Switcher(message) => self.on_switcher(message),
             Message::AttachRequested => {
                 self.uploads_for_room();
                 self.attach_requested()
@@ -1783,6 +1803,7 @@ impl App {
                 Task::none()
             }
             ComposerKey::Escape => {
+                self.escape_spent = self.composer_has_escape_work();
                 let was_edit = matches!(self.composer.mode, composer::Mode::Edit(_));
                 self.composer.escape();
                 self.after_edit_left(was_edit)
@@ -2421,10 +2442,13 @@ impl App {
                 screens::verification::layer(base, self)
             }
             Screen::Main => screens::verification::layer(
-                screens::upload_dialog::layer(
-                    screens::media_viewer::layer(
-                        screens::settings::layer(
-                            screens::room_dialogs::layer(main_view::view(self), self),
+                screens::switcher::layer(
+                    screens::upload_dialog::layer(
+                        screens::media_viewer::layer(
+                            screens::settings::layer(
+                                screens::room_dialogs::layer(main_view::view(self), self),
+                                self,
+                            ),
                             self,
                         ),
                         self,
@@ -2446,98 +2470,14 @@ impl App {
             iced::event::listen_with(|event, status, _id| match event {
                 iced::Event::Window(window::Event::Focused) => Some(Message::WindowFocus(true)),
                 iced::Event::Window(window::Event::Unfocused) => Some(Message::WindowFocus(false)),
-                other => upload::event_message(&other, status)
-                    .or_else(|| settings::settings_shortcut(&other)),
+                other => upload::event_message(&other).or_else(|| {
+                    keys::event_message(&other, status == iced::event::Status::Captured)
+                }),
             }),
-            self.upload_keys(),
-            self.rooms_keys(),
-            self.settings_keys(),
-            self.thread_keys(),
             system::theme_changes().map(Message::ThemeMode),
-            self.viewer_keys(),
             window::open_events().map(Message::WindowOpened),
             tray::subscription(),
         ])
-    }
-
-    /// Esc closes the upload confirmation while it is open; no listener
-    /// otherwise.
-    fn upload_keys(&self) -> Subscription<Message> {
-        if self.uploads.dialog.is_none() {
-            return Subscription::none();
-        }
-        iced::event::listen_with(|event, _status, _id| match event {
-            iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
-                key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
-                ..
-            }) => Some(Message::UploadCancelled),
-            _ => None,
-        })
-    }
-
-    /// Esc closes the viewer while it is open; no listener otherwise.
-    /// Esc closes the room dialogs, panels and card while one is open.
-    fn rooms_keys(&self) -> Subscription<Message> {
-        if !self.rooms_ui.overlay_open() {
-            return Subscription::none();
-        }
-        iced::event::listen_with(|event, _status, _id| match event {
-            iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
-                key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
-                ..
-            }) => Some(Message::Rooms(RoomsMessage::Escape)),
-            _ => None,
-        })
-    }
-
-    /// Esc closes the Settings screen while it is open; no listener
-    /// otherwise.
-    fn settings_keys(&self) -> Subscription<Message> {
-        if !self.settings_ui.open {
-            return Subscription::none();
-        }
-        iced::event::listen_with(|event, _status, _id| match event {
-            iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
-                key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
-                ..
-            }) => Some(Message::Settings(SettingsMessage::Close)),
-            _ => None,
-        })
-    }
-
-    /// Esc closes the thread panel, unless something above it is open or a
-    /// widget used the key (the composer's reply bar, say); no listener while
-    /// the panel is closed.
-    fn thread_keys(&self) -> Subscription<Message> {
-        let covered = self.uploads.dialog.is_some()
-            || self.settings_ui.open
-            || self.media.viewer.is_some()
-            || self.rooms_ui.overlay_open();
-        if self.threads.panel.is_none() || covered {
-            return Subscription::none();
-        }
-        iced::event::listen_with(|event, status, _id| match event {
-            iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
-                key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
-                ..
-            }) if status == iced::event::Status::Ignored => {
-                Some(Message::Threads(ThreadsMessage::Close))
-            }
-            _ => None,
-        })
-    }
-
-    fn viewer_keys(&self) -> Subscription<Message> {
-        if self.media.viewer.is_none() {
-            return Subscription::none();
-        }
-        iced::event::listen_with(|event, _status, _id| match event {
-            iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
-                key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
-                ..
-            }) => Some(Message::ViewerClosed),
-            _ => None,
-        })
     }
 
     /// The theme for the current system mode (plan Q13).
@@ -9991,8 +9931,7 @@ mod tests {
         use crate::notifications::RecordingNotifier;
         use crate::rooms::{AvatarRefusal, AvatarUpload};
         use crate::settings::{
-            RecordingSettings, SHORTCUTS, SettingsError, SettingsMessage as S, check_keyword,
-            settings_shortcut,
+            RecordingSettings, SettingsError, SettingsMessage as S, check_keyword,
         };
         use crate::tray::{FakeTray, FakeTrayFactory};
 
@@ -10080,32 +10019,6 @@ mod tests {
             let _ = rig.app.update(Message::Sessions(SessionsMessage::Open));
             let _ = rig.app.update(Message::Settings(S::Open));
             assert!(!rig.app.settings_open(), "Sessions is open");
-        }
-
-        #[test]
-        fn ctrl_comma_is_the_settings_shortcut() {
-            use iced::keyboard::{Event, Key, Location, Modifiers, key::Physical};
-            let press = |c: &str, modifiers: Modifiers| {
-                iced::Event::Keyboard(Event::KeyPressed {
-                    key: Key::Character(c.into()),
-                    modified_key: Key::Character(c.into()),
-                    physical_key: Physical::Unidentified(
-                        iced::keyboard::key::NativeCode::Unidentified,
-                    ),
-                    location: Location::Standard,
-                    modifiers,
-                    text: None,
-                    repeat: false,
-                })
-            };
-            assert!(matches!(
-                settings_shortcut(&press(",", Modifiers::COMMAND)),
-                Some(Message::Settings(S::Open))
-            ));
-            assert!(settings_shortcut(&press(",", Modifiers::empty())).is_none());
-            assert!(settings_shortcut(&press(".", Modifiers::COMMAND)).is_none());
-            assert!(SHORTCUTS.iter().any(|s| s.keys == "Ctrl+,"));
-            assert!(SHORTCUTS.iter().any(|s| s.keys == "Ctrl+U"));
         }
 
         #[test]
@@ -10587,6 +10500,451 @@ mod tests {
             assert!(!rig.app.settings_open());
             assert!(rig.app.settings_ui.profile.is_none());
             assert!(rig.app.notification_settings.is_none());
+        }
+    }
+
+    mod keyboard {
+        use tessera_core::api::{ListDiff, RoomListQuery, RoomListTab};
+
+        use super::*;
+        use crate::dialogs::RecordingDialogs;
+        use crate::keys::Shortcut;
+        use crate::rooms::RoomsMessage as R;
+        use crate::settings::SettingsMessage as S;
+        use crate::switcher::SwitcherMessage as W;
+        use crate::threads::ThreadsMessage;
+
+        fn key(app: &mut App, shortcut: Shortcut) -> Task<Message> {
+            app.update(Message::Shortcut {
+                shortcut,
+                captured: false,
+            })
+        }
+
+        fn sw(app: &mut App, message: W) {
+            let _ = app.update(Message::Switcher(message));
+        }
+
+        fn id(n: &str) -> RoomId {
+            RoomId::from(format!("!{n}:x"))
+        }
+
+        fn list(app: &mut App, rooms: Vec<RoomSummary>) {
+            let _ = app.update(core(CoreEvent::RoomListChanged(vec![ListDiff::Reset {
+                values: rooms,
+            }])));
+        }
+
+        fn named(n: &str) -> RoomSummary {
+            RoomSummary::new(id(n), n.to_owned())
+        }
+
+        fn unread(n: &str) -> RoomSummary {
+            let mut room = named(n);
+            room.unread_messages = 2;
+            room
+        }
+
+        /// Rooms `alpha`, `beta`, `gamma`, `delta`, with `alpha` open.
+        fn app4() -> (App, mpsc::Receiver<Command>) {
+            let (mut app, mut rx) = main_app();
+            list(
+                &mut app,
+                vec![
+                    named("alpha"),
+                    named("beta"),
+                    named("gamma"),
+                    named("delta"),
+                ],
+            );
+            let _ = app.update(Message::SelectRoom(id("alpha")));
+            let _ = drain(&mut rx);
+            (app, rx)
+        }
+
+        fn queries(commands: &[Command]) -> Vec<&RoomListQuery> {
+            commands
+                .iter()
+                .filter_map(|c| match c {
+                    Command::SetRoomListQuery(q) => Some(q),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        // ---- the switcher ----
+
+        #[test]
+        fn ctrl_k_opens_the_switcher_with_the_field_focused() {
+            let (mut app, _rx) = app4();
+            let task = key(&mut app, Shortcut::Switcher);
+            assert!(app.switcher.open);
+            assert_eq!(task.units(), 1, "one operation: focus the field");
+        }
+
+        #[test]
+        fn the_switcher_does_not_open_over_another_overlay_or_off_the_main_screen() {
+            let (mut app, _rx) = app4();
+            let _ = app.update(Message::Settings(S::Open));
+            let _ = key(&mut app, Shortcut::Switcher);
+            assert!(!app.switcher.open);
+            let (mut login, _rx) = login_app();
+            let _ = key(&mut login, Shortcut::Switcher);
+            assert!(!login.switcher.open);
+        }
+
+        #[test]
+        fn typing_ranks_rooms_and_the_arrows_move_the_highlight() {
+            let (mut app, _rx) = app4();
+            let _ = key(&mut app, Shortcut::Switcher);
+            // Blank query: every room, in list order.
+            let all = app.switcher.results(&app.rooms);
+            assert_eq!(all, [id("alpha"), id("beta"), id("gamma"), id("delta")]);
+            sw(&mut app, W::Input("DE".into()));
+            assert_eq!(app.switcher.results(&app.rooms), [id("delta")]);
+            sw(&mut app, W::Input("".into()));
+            assert_eq!(app.switcher.selected, 0);
+            let _ = key(&mut app, Shortcut::SwitcherNext);
+            let _ = key(&mut app, Shortcut::SwitcherNext);
+            assert_eq!(app.switcher.selected, 2);
+            let _ = key(&mut app, Shortcut::SwitcherPrevious);
+            assert_eq!(app.switcher.selected, 1);
+            // Wraps at both ends.
+            let _ = key(&mut app, Shortcut::SwitcherPrevious);
+            let _ = key(&mut app, Shortcut::SwitcherPrevious);
+            assert_eq!(app.switcher.selected, 3);
+            let _ = key(&mut app, Shortcut::SwitcherNext);
+            assert_eq!(app.switcher.selected, 0);
+        }
+
+        #[test]
+        fn the_arrows_are_the_composers_while_the_switcher_is_closed() {
+            let (mut app, _rx) = app4();
+            let task = key(&mut app, Shortcut::SwitcherNext);
+            assert_eq!(task.units(), 0);
+            assert_eq!(app.switcher.selected, 0);
+        }
+
+        #[test]
+        fn enter_opens_the_highlighted_room_and_closes_the_switcher() {
+            let (mut app, mut rx) = app4();
+            let _ = key(&mut app, Shortcut::Switcher);
+            sw(&mut app, W::Input("ga".into()));
+            let _ = drain(&mut rx);
+            let task = app.update(Message::Switcher(W::Submit));
+            assert!(!app.switcher.open);
+            assert_eq!(app.selected, Some(id("gamma")));
+            assert!(task.units() >= 1, "the composer gets the focus back");
+            assert!(drain(&mut rx).iter().any(|c| matches!(
+                c,
+                Command::SelectRoom(r) if *r == id("gamma")
+            )));
+        }
+
+        #[test]
+        fn enter_with_no_match_keeps_the_switcher_open() {
+            let (mut app, _rx) = app4();
+            let _ = key(&mut app, Shortcut::Switcher);
+            sw(&mut app, W::Input("nothing like it".into()));
+            sw(&mut app, W::Submit);
+            assert!(app.switcher.open);
+            assert_eq!(app.selected, Some(id("alpha")));
+        }
+
+        #[test]
+        fn clicking_a_row_selects_it_too() {
+            let (mut app, _rx) = app4();
+            let _ = key(&mut app, Shortcut::Switcher);
+            sw(&mut app, W::Pick(id("delta")));
+            assert!(!app.switcher.open);
+            assert_eq!(app.selected, Some(id("delta")));
+        }
+
+        #[test]
+        fn esc_closes_the_switcher_and_focuses_the_composer() {
+            let (mut app, _rx) = app4();
+            let _ = key(&mut app, Shortcut::Switcher);
+            let task = key(&mut app, Shortcut::Escape);
+            assert!(!app.switcher.open);
+            assert_eq!(task.units(), 1, "focus the composer");
+            assert_eq!(app.selected, Some(id("alpha")));
+        }
+
+        #[test]
+        fn few_local_matches_also_search_in_the_core_and_closing_restores_the_list() {
+            let (mut app, mut rx) = app4();
+            let before = app.query.clone();
+            let _ = key(&mut app, Shortcut::Switcher);
+            // Four local matches: no core search.
+            sw(&mut app, W::Input("a".into()));
+            assert!(queries(&drain(&mut rx)).is_empty());
+            // One local match: the core searches too.
+            sw(&mut app, W::Input("delta".into()));
+            let commands = drain(&mut rx);
+            assert_eq!(
+                queries(&commands),
+                [&RoomListQuery {
+                    tab: RoomListTab::All,
+                    search: "delta".into(),
+                    space: None,
+                }]
+            );
+            // The core's answer replaces the sidebar list; the rooms from
+            // before stay among the switcher's candidates.
+            list(&mut app, vec![named("delta"), named("delta two")]);
+            assert_eq!(
+                app.switcher.results(&app.rooms),
+                [id("delta"), id("delta two")]
+            );
+            sw(&mut app, W::Input("gam".into()));
+            let _ = drain(&mut rx);
+            assert_eq!(app.switcher.results(&app.rooms), [id("gamma")]);
+            // Choosing a room only the opening list knew selects it, and the
+            // list query is put back.
+            sw(&mut app, W::Submit);
+            assert_eq!(app.selected, Some(id("gamma")));
+            let commands = drain(&mut rx);
+            assert_eq!(queries(&commands).last().copied(), Some(&before));
+            assert!(!app.switcher.open);
+        }
+
+        #[test]
+        fn a_long_query_is_cut_and_a_closed_switcher_ignores_messages() {
+            let (mut app, _rx) = app4();
+            sw(&mut app, W::Input("x".into()));
+            assert!(app.switcher.query.is_empty());
+            let _ = key(&mut app, Shortcut::Switcher);
+            sw(&mut app, W::Input("y".repeat(500)));
+            assert_eq!(
+                app.switcher.query.chars().count(),
+                crate::switcher::MAX_QUERY_CHARS
+            );
+        }
+
+        #[test]
+        fn opening_the_switcher_keeps_the_widget_tree_under_it() {
+            let (mut app, _rx) = app4();
+            let closed = tag_path(&app);
+            let _ = key(&mut app, Shortcut::Switcher);
+            sw(&mut app, W::Input("al".into()));
+            assert_eq!(tag_path(&app), closed, "the base keeps its place");
+            let _ = key(&mut app, Shortcut::Escape);
+            assert_eq!(tag_path(&app), closed);
+        }
+
+        // ---- stepping through rooms ----
+
+        #[test]
+        fn alt_down_and_up_step_through_the_list_and_wrap() {
+            let (mut app, _rx) = app4();
+            let _ = key(&mut app, Shortcut::NextRoom);
+            assert_eq!(app.selected, Some(id("beta")));
+            let _ = key(&mut app, Shortcut::PreviousRoom);
+            let _ = key(&mut app, Shortcut::PreviousRoom);
+            assert_eq!(app.selected, Some(id("delta")), "wraps to the end");
+            let _ = key(&mut app, Shortcut::NextRoom);
+            assert_eq!(app.selected, Some(id("alpha")), "and back");
+        }
+
+        #[test]
+        fn ctrl_shift_arrows_find_the_next_room_with_unread_messages() {
+            let (mut app, _rx) = main_app();
+            list(
+                &mut app,
+                vec![named("a"), named("b"), unread("c"), named("d"), unread("e")],
+            );
+            let _ = app.update(Message::SelectRoom(id("a")));
+            let _ = key(&mut app, Shortcut::NextUnread);
+            assert_eq!(app.selected, Some(id("c")));
+            let _ = key(&mut app, Shortcut::NextUnread);
+            assert_eq!(app.selected, Some(id("e")));
+            let _ = key(&mut app, Shortcut::NextUnread);
+            assert_eq!(app.selected, Some(id("c")), "wraps");
+            let _ = key(&mut app, Shortcut::PreviousUnread);
+            assert_eq!(app.selected, Some(id("e")));
+        }
+
+        #[test]
+        fn nothing_unread_means_no_move_and_spaces_and_invites_are_skipped() {
+            let (mut app, mut rx) = main_app();
+            let mut space = named("s");
+            space.is_space = true;
+            let mut invite = named("i");
+            invite.is_invite = true;
+            list(&mut app, vec![named("a"), space, invite, named("b")]);
+            let _ = app.update(Message::SelectRoom(id("a")));
+            let _ = drain(&mut rx);
+            let _ = key(&mut app, Shortcut::NextUnread);
+            assert_eq!(app.selected, Some(id("a")));
+            assert!(drain(&mut rx).is_empty());
+            let _ = key(&mut app, Shortcut::NextRoom);
+            assert_eq!(app.selected, Some(id("b")));
+        }
+
+        #[test]
+        fn room_shortcuts_wait_while_an_overlay_is_open() {
+            let (mut app, _rx) = app4();
+            let _ = app.update(Message::Settings(S::Open));
+            let _ = key(&mut app, Shortcut::NextRoom);
+            assert_eq!(app.selected, Some(id("alpha")));
+        }
+
+        #[test]
+        fn a_key_a_widget_used_is_not_taken_twice() {
+            let (mut app, _rx) = app4();
+            let _ = app.update(Message::Shortcut {
+                shortcut: Shortcut::NextRoom,
+                captured: true,
+            });
+            assert_eq!(app.selected, Some(id("alpha")));
+            let _ = app.update(Message::Shortcut {
+                shortcut: Shortcut::Switcher,
+                captured: true,
+            });
+            assert!(!app.switcher.open);
+        }
+
+        #[test]
+        fn ctrl_comma_opens_settings_and_ctrl_u_asks_for_files() {
+            let (mut app, _rx) = app4();
+            let dialogs = RecordingDialogs::default();
+            app.set_dialogs(Box::new(dialogs.clone()));
+            let _ = key(&mut app, Shortcut::Attach);
+            assert_eq!(*dialogs.picked.lock().expect("test mutex"), 1);
+            let _ = key(&mut app, Shortcut::Settings);
+            assert!(app.settings_ui.open);
+        }
+
+        // ---- focus order ----
+
+        #[test]
+        fn tab_and_shift_tab_move_the_focus_unless_a_widget_used_the_key() {
+            let (mut app, _rx) = app4();
+            assert_eq!(key(&mut app, Shortcut::FocusNext).units(), 1);
+            assert_eq!(key(&mut app, Shortcut::FocusPrevious).units(), 1);
+            let used = app.update(Message::Shortcut {
+                shortcut: Shortcut::FocusNext,
+                captured: true,
+            });
+            assert_eq!(used.units(), 0, "the editor's Tab is not stolen");
+        }
+
+        // ---- Esc closes every overlay ----
+
+        #[test]
+        fn esc_closes_the_upload_confirmation() {
+            let (mut app, _rx) = app4();
+            app.uploads.dialog = Some(crate::upload::UploadDialog {
+                room_id: id("alpha"),
+                entries: Vec::new(),
+            });
+            let _ = key(&mut app, Shortcut::Escape);
+            assert!(app.uploads.dialog.is_none());
+        }
+
+        #[test]
+        fn esc_closes_the_viewer() {
+            let (mut app, _rx, _) = media_app(1);
+            let _ = app.update(Message::MediaClicked("img0".into()));
+            assert!(app.media.viewer.is_some());
+            let _ = key(&mut app, Shortcut::Escape);
+            assert!(app.media.viewer.is_none());
+        }
+
+        #[test]
+        fn esc_closes_settings() {
+            let (mut app, _rx) = app4();
+            let _ = app.update(Message::Settings(S::Open));
+            let _ = key(&mut app, Shortcut::Escape);
+            assert!(!app.settings_ui.open);
+        }
+
+        #[test]
+        fn esc_closes_a_room_dialog() {
+            let (mut app, _rx) = app4();
+            let _ = app.update(Message::Rooms(R::OpenCreate));
+            assert!(app.rooms_ui.overlay_open());
+            let _ = key(&mut app, Shortcut::Escape);
+            assert!(!app.rooms_ui.overlay_open());
+        }
+
+        #[test]
+        fn esc_closes_the_thread_panel() {
+            let (mut app, _rx) = app4();
+            let _ = app.update(Message::Threads(ThreadsMessage::Open(EventId::from(
+                "$r:x",
+            ))));
+            assert!(app.threads.panel.is_some());
+            let _ = key(&mut app, Shortcut::Escape);
+            assert!(app.threads.panel.is_none());
+        }
+
+        #[test]
+        fn esc_with_nothing_open_does_nothing() {
+            let (mut app, mut rx) = app4();
+            assert_eq!(key(&mut app, Shortcut::Escape).units(), 0);
+            assert!(drain(&mut rx).is_empty());
+        }
+
+        #[test]
+        fn esc_closes_one_layer_per_press_topmost_first() {
+            let (mut app, _rx) = app4();
+            let _ = app.update(Message::Threads(ThreadsMessage::Open(EventId::from(
+                "$r:x",
+            ))));
+            let _ = app.update(Message::Settings(S::Open));
+            let _ = key(&mut app, Shortcut::Escape);
+            assert!(!app.settings_ui.open);
+            assert!(app.threads.panel.is_some(), "the panel waits its turn");
+            let _ = key(&mut app, Shortcut::Escape);
+            assert!(app.threads.panel.is_none());
+        }
+
+        #[test]
+        fn esc_cancels_a_reply_before_it_closes_the_panel() {
+            let (mut app, _rx) = app4();
+            let _ = app.update(Message::Threads(ThreadsMessage::Open(EventId::from(
+                "$r:x",
+            ))));
+            app.composer.mode = composer::Mode::Reply("x".into());
+            let _ = key(&mut app, Shortcut::Escape);
+            assert!(matches!(app.composer.mode, composer::Mode::Normal));
+            assert!(app.threads.panel.is_some());
+        }
+
+        #[test]
+        fn the_composers_own_esc_is_not_taken_twice_with_the_apps() {
+            let (mut app, _rx) = app4();
+            let _ = app.update(Message::Threads(ThreadsMessage::Open(EventId::from(
+                "$r:x",
+            ))));
+            app.composer.mode = composer::Mode::Reply("x".into());
+            // One key press, two messages: the composer's binding, and the
+            // window listener, which saw the editor take the key.
+            let _ = app.update(Message::ComposerKey(ComposerKey::Escape));
+            let _ = app.update(Message::Shortcut {
+                shortcut: Shortcut::Escape,
+                captured: true,
+            });
+            assert!(matches!(app.composer.mode, composer::Mode::Normal));
+            assert!(app.threads.panel.is_some(), "one layer per press");
+            let _ = key(&mut app, Shortcut::Escape);
+            assert!(app.threads.panel.is_none());
+        }
+
+        #[test]
+        fn a_text_fields_esc_closes_the_panel_behind_it() {
+            let (mut app, _rx) = app4();
+            let _ = app.update(Message::Threads(ThreadsMessage::Open(EventId::from(
+                "$r:x",
+            ))));
+            // The composer has nothing to cancel; the key was taken by a
+            // field that dropped its focus.
+            let _ = app.update(Message::Shortcut {
+                shortcut: Shortcut::Escape,
+                captured: true,
+            });
+            assert!(app.threads.panel.is_none());
         }
     }
 }

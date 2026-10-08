@@ -14,7 +14,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, TimeZone};
-use iced::keyboard;
 use iced::widget::image::Handle;
 use iced::widget::text_editor::{Action, Edit};
 use iced::{Task, clipboard, window};
@@ -671,26 +670,14 @@ pub fn fraction(progress: UploadProgress) -> f32 {
     (progress.sent as f64 / progress.total as f64).clamp(0.0, 1.0) as f32
 }
 
-/// The messages window events and shortcuts stand for. Files hovering and
-/// dropping come from the window system; Ctrl+U only when no widget took
-/// the key (the composer takes it itself).
-pub fn event_message(event: &iced::Event, status: iced::event::Status) -> Option<Message> {
+/// The messages the window system's file events stand for: files hovering
+/// and dropping. Keys (Ctrl+U) are in `keys`.
+pub fn event_message(event: &iced::Event) -> Option<Message> {
     match event {
         iced::Event::Window(window::Event::FileHovered(_)) => Some(Message::FileHovered),
         iced::Event::Window(window::Event::FilesHoveredLeft) => Some(Message::FilesHoveredLeft),
         iced::Event::Window(window::Event::FileDropped(path)) => {
             Some(Message::FileDropped(UploadPaths(vec![path.clone()])))
-        }
-        iced::Event::Keyboard(keyboard::Event::KeyPressed {
-            modified_key: keyboard::Key::Character(c),
-            modifiers,
-            ..
-        }) if status == iced::event::Status::Ignored
-            && modifiers.command()
-            && !modifiers.alt()
-            && c.as_str().eq_ignore_ascii_case("u") =>
-        {
-            Some(Message::AttachRequested)
         }
         _ => None,
     }
@@ -1272,45 +1259,36 @@ mod tests {
     }
 
     #[test]
-    fn window_events_and_the_shortcut_map_to_messages() {
-        use iced::event::Status;
-        let ignored = Status::Ignored;
+    fn window_events_map_to_messages() {
         let hovered = iced::Event::Window(window::Event::FileHovered(PathBuf::from("/x")));
         assert!(matches!(
-            event_message(&hovered, ignored),
+            event_message(&hovered),
             Some(Message::FileHovered)
         ));
         let left = iced::Event::Window(window::Event::FilesHoveredLeft);
         assert!(matches!(
-            event_message(&left, ignored),
+            event_message(&left),
             Some(Message::FilesHoveredLeft)
         ));
         let dropped = iced::Event::Window(window::Event::FileDropped(PathBuf::from("/x/y")));
         assert!(matches!(
-            event_message(&dropped, ignored),
+            event_message(&dropped),
             Some(Message::FileDropped(UploadPaths(p))) if p == [PathBuf::from("/x/y")]
         ));
-        let key = |ch: &str, modifiers| {
-            iced::Event::Keyboard(keyboard::Event::KeyPressed {
-                key: keyboard::Key::Character(ch.into()),
-                modified_key: keyboard::Key::Character(ch.into()),
-                physical_key: keyboard::key::Physical::Unidentified(
-                    keyboard::key::NativeCode::Unidentified,
-                ),
-                location: keyboard::Location::Standard,
-                modifiers,
-                text: None,
-                repeat: false,
-            })
-        };
-        let ctrl = keyboard::Modifiers::COMMAND;
-        assert!(matches!(
-            event_message(&key("u", ctrl), ignored),
-            Some(Message::AttachRequested)
-        ));
-        assert!(event_message(&key("u", ctrl), Status::Captured).is_none());
-        assert!(event_message(&key("u", keyboard::Modifiers::empty()), ignored).is_none());
-        assert!(event_message(&key("x", ctrl), ignored).is_none());
+        // Keys are the shortcut table's, not this function's.
+        use iced::keyboard;
+        let ctrl_u = iced::Event::Keyboard(keyboard::Event::KeyPressed {
+            key: keyboard::Key::Character("u".into()),
+            modified_key: keyboard::Key::Character("u".into()),
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::COMMAND,
+            text: None,
+            repeat: false,
+        });
+        assert!(event_message(&ctrl_u).is_none());
     }
 
     #[test]
