@@ -13,9 +13,12 @@ use crate::composer::{self, EditorAction, Mode, Suggestions};
 use crate::emoji;
 use crate::links::{CheckedUrl, LinkBar, LinkKind};
 use crate::notifications::ModeChoice;
+use crate::rooms::RoomsMessage;
 use crate::screens::loading::sync_label;
 use crate::screens::timeline_pane::RichEnv;
-use crate::screens::{media_viewer, room_list_pane, security, sessions, timeline_pane};
+use crate::screens::{
+    media_viewer, room_dialogs, room_list_pane, security, sessions, timeline_pane,
+};
 use crate::sessions::SessionsMessage;
 use crate::state::{App, Message};
 use crate::text_safety::{MAX_NAME_CHARS, name_or_placeholder, one_line_capped};
@@ -89,6 +92,10 @@ fn header<'a>(app: &'a App, title: String) -> Element<'a, Message> {
     }
     if let Some(room) = selected.filter(|room| !room.is_invite) {
         line = line.push(notification_menu(app, &room.id));
+        line = line.push(room_buttons());
+    }
+    if let Some(room) = selected.filter(|room| room.is_invite) {
+        line = line.push(invite_buttons(app, &room.id));
     }
     if let Some((peer, badge)) = app
         .dm_peer_trust()
@@ -124,6 +131,41 @@ fn header<'a>(app: &'a App, title: String) -> Element<'a, Message> {
         }
     }
     line.into()
+}
+
+/// **Members** and **Settings**, in the header of a joined room.
+fn room_buttons<'a>() -> Element<'a, Message> {
+    row![
+        button(text("Members").size(13))
+            .padding([2, 8])
+            .style(button::secondary)
+            .on_press(Message::Rooms(RoomsMessage::OpenMembers)),
+        button(text("Settings").size(13))
+            .padding([2, 8])
+            .style(button::secondary)
+            .on_press(Message::Rooms(RoomsMessage::OpenSettings)),
+    ]
+    .spacing(6)
+    .into()
+}
+
+/// **Accept** and **Decline**, in the header of an invitation. They are off
+/// while the answer is on its way.
+fn invite_buttons<'a>(app: &App, room: &RoomId) -> Element<'a, Message> {
+    let idle = !app.rooms_ui.invite_busy.contains(room);
+    row![
+        text("You were invited").size(13),
+        button(text("Accept").size(13))
+            .padding([2, 8])
+            .on_press_maybe(idle.then(|| Message::Rooms(RoomsMessage::Accept(room.clone())))),
+        button(text("Decline").size(13))
+            .padding([2, 8])
+            .style(button::secondary)
+            .on_press_maybe(idle.then(|| Message::Rooms(RoomsMessage::Decline(room.clone())))),
+    ]
+    .spacing(6)
+    .align_y(iced::Center)
+    .into()
 }
 
 /// The room's notification menu: a drop-down with the four choices of plan
@@ -195,6 +237,7 @@ fn room_pane(app: &App) -> Element<'_, Message> {
         revealed: &app.revealed,
         actions: &app.actions,
         rooms: &app.rooms,
+        members: app.known_members(),
         media: &app.media,
         room: app.selected.as_ref(),
     };
@@ -212,6 +255,9 @@ fn room_pane(app: &App) -> Element<'_, Message> {
     let mut bars: Vec<Element<'_, Message>> = Vec::new();
     if let Some(bar) = &app.link_bar {
         bars.push(link_bar(bar));
+    }
+    if let Some(bar) = &app.rooms_ui.join_bar {
+        bars.push(room_dialogs::join_bar(bar));
     }
     if let Some(bar) = &app.media.open_bar {
         bars.push(media_viewer::open_bar(bar));

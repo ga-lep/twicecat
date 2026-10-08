@@ -17,8 +17,11 @@ use iced::font::{Style as FontStyle, Weight};
 use iced::widget::text::{Span, Wrapping};
 use iced::widget::{Column, container, rich_text, row, rule, text};
 use iced::{Background, Border, Color, Element, Fill, Font, Length, Pixels, Shrink, Theme};
-use tessera_core::api::{Block, Inline, MentionTarget, RichText, RoomSummary, TextStyle, UserId};
+use tessera_core::api::{
+    Block, Inline, MentionTarget, RichText, RoomMemberView, RoomSummary, TextStyle, UserId,
+};
 
+use crate::rooms::pill_label;
 use crate::state::Message;
 use crate::text_safety::{
     ELLIPSIS, MAX_BODY_CHARS, MAX_NAME_CHARS, multi_line_capped, name_or_placeholder,
@@ -115,6 +118,9 @@ pub struct Ctx<'a> {
     pub revealed: &'a Revealed,
     /// Known rooms, so a room pill can show the room's name.
     pub rooms: &'a [RoomSummary],
+    /// Known members of the open room, so a user pill can show the current
+    /// display name.
+    pub members: &'a [RoomMemberView],
 }
 
 /// Running state of one message: what is left of its budget, and how many
@@ -223,20 +229,11 @@ fn push_spans(inlines: &[Inline], ctx: &Ctx<'_>, walk: &mut Walk, out: &mut Vec<
                     });
                 }
             }
-            Inline::Mention { target, label } => {
-                // A pill labelled with the bare room ID (a pasted permalink)
-                // shows the room's name when the room is known, as Element.
-                let shown = match target {
-                    MentionTarget::Room(room) if label == room => ctx
-                        .rooms
-                        .iter()
-                        .find(|r| r.id.as_str() == room)
-                        .map(|r| r.name.as_str())
-                        .filter(|name| !name.trim().is_empty())
-                        .unwrap_or(label),
-                    _ => label,
-                };
-                let label = walk.take_label(shown);
+            Inline::Mention { target, .. } => {
+                // The label comes from the target (plan Q14): the sender's
+                // own label can name anyone.
+                let pill = pill_label(target, ctx.members, ctx.rooms);
+                let label = walk.take_label(&pill.text);
                 if label.is_empty() {
                     continue;
                 }
@@ -563,11 +560,12 @@ mod tests {
             item: "item1",
             revealed,
             rooms: &[],
+            members: &[],
         }
     }
 
     #[test]
-    fn a_room_pill_without_its_own_label_shows_the_known_room_name() {
+    fn a_room_pill_is_labelled_from_its_target_never_from_the_senders_label() {
         use tessera_core::api::RoomId;
         let rooms = [RoomSummary::new(
             RoomId::from("!r:x"),
@@ -590,13 +588,46 @@ mod tests {
         assert_eq!(pill("!r:x", "!r:x"), "Lobby\u{FFFD}", "named, sanitised");
         assert_eq!(
             pill("!r:x", "our room"),
-            "our room",
-            "the sender's label stays"
+            "Lobby\u{FFFD}",
+            "the sender's label is ignored"
         );
         assert_eq!(
-            pill("!other:x", "!other:x"),
+            pill("!other:x", "Totally the admin room"),
             "!other:x",
-            "unknown room: the ID"
+            "unknown room: the ID, not the label"
+        );
+    }
+
+    #[test]
+    fn a_user_pill_is_labelled_from_its_target_never_from_the_senders_label() {
+        use tessera_core::api::{MembershipView, PowerLevelView, Role, RoomMemberView};
+        let members = [RoomMemberView {
+            user_id: UserId::from("@bob:x"),
+            display_name: Some("Bob".into()),
+            avatar: None,
+            power: PowerLevelView::Level(0),
+            role: Role::User,
+            membership: MembershipView::Joined,
+        }];
+        let revealed = Revealed::new();
+        let ctx = Ctx {
+            members: &members,
+            ..ctx(&revealed, None)
+        };
+        let pill = |user: &str, label: &str| {
+            let inline = Inline::Mention {
+                target: MentionTarget::User(UserId::from(user)),
+                label: label.into(),
+            };
+            spans_for(&[inline], &ctx, &mut Walk::default())[0]
+                .text
+                .clone()
+        };
+        assert_eq!(pill("@bob:x", "Alice"), "Bob", "a known member: their name");
+        assert_eq!(
+            pill("@eve:x", "Bob"),
+            "@eve:x",
+            "an unknown user shows the real ID, not the name they claim"
         );
     }
 
@@ -639,7 +670,7 @@ mod tests {
             &ctx(&revealed, Some(&other)),
             &mut Walk::default(),
         );
-        assert_eq!(out[0].text, "Alice");
+        assert_eq!(out[0].text, "@alice:x", "the target, not the label");
         assert_eq!(out[0].look, Look::Mention { own: false });
         assert_eq!(out[0].link, Some(LinkTarget::User(alice.clone())));
         let out = spans_for(
@@ -744,16 +775,19 @@ mod tests {
 
     #[test]
     fn a_pill_label_is_one_line_and_capped() {
+        let long = format!("@{}:evil.example", "n".repeat(5000));
         let out = spans(&[Inline::Mention {
-            target: MentionTarget::User(UserId::from("@a:x")),
+            target: MentionTarget::User(UserId::from(long.as_str())),
             label: "n".repeat(5000),
         }]);
-        assert_eq!(out[0].text.chars().count(), MAX_NAME_CHARS);
+        assert_eq!(out[0].text.chars().count(), crate::rooms::MAX_PILL_CHARS);
+        assert!(out[0].text.ends_with(":evil.example"));
+        // A blank label changes nothing: the label is not used.
         let blank = spans(&[Inline::Mention {
             target: MentionTarget::User(UserId::from("@a:x")),
             label: "  ".into(),
         }]);
-        assert_eq!(blank[0].text, crate::text_safety::NAME_PLACEHOLDER);
+        assert_eq!(blank[0].text, "@a:x");
     }
 
     fn every_look() -> Vec<SpanModel> {

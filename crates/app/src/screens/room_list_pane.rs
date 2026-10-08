@@ -16,9 +16,27 @@ use crate::room_list::{
     Badge, OVERSCAN_ROWS, ROW_HEIGHT, badge_for, empty_label, preview_line, row_name,
     spacer_heights, visible_range,
 };
+use crate::rooms::RoomsMessage;
 use crate::screens::centered_text;
 use crate::state::{App, Message};
 use crate::theme;
+
+/// **New room**, **Direct message** and **Join**, above the tabs.
+fn room_actions<'a>() -> Element<'a, Message> {
+    let action = |label: &'static str, message: RoomsMessage| {
+        button(text(label).size(13))
+            .on_press(Message::Rooms(message))
+            .padding([4, 8])
+            .style(button::secondary)
+    };
+    row![
+        action("New room", RoomsMessage::OpenCreate),
+        action("Direct message", RoomsMessage::OpenDm),
+        action("Join", RoomsMessage::OpenJoin),
+    ]
+    .spacing(4)
+    .into()
+}
 
 /// The tabs, left to right.
 pub const TABS: [RoomListTab; 4] = [
@@ -90,7 +108,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
     } else {
         windowed_list(app)
     };
-    container(column![tabs, search, list].spacing(8))
+    container(column![room_actions(), tabs, search, list].spacing(8))
         .width(Length::Fixed(crate::screens::main_view::LIST_PANE_WIDTH))
         .height(Fill)
         .padding(8)

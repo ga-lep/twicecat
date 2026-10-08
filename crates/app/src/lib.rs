@@ -16,6 +16,7 @@ pub mod media;
 pub mod notifications;
 pub mod rich_text;
 pub mod room_list;
+pub mod rooms;
 pub mod screens;
 pub mod security;
 pub mod sessions;

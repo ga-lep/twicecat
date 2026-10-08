@@ -28,6 +28,10 @@ pub trait Dialogs: Send {
     /// A dialog to choose files to send. The task yields the chosen paths,
     /// empty when the user cancelled.
     fn pick_files(&self) -> Task<Vec<PathBuf>>;
+
+    /// A dialog to choose one picture (a room picture). The task yields the
+    /// chosen path, or `None` when the user cancelled.
+    fn pick_image(&self) -> Task<Option<PathBuf>>;
 }
 
 /// The desktop's own dialogs through `rfd`.
@@ -84,6 +88,18 @@ impl Dialogs for SystemDialogs {
                     .iter()
                     .map(|h| h.path().to_path_buf())
                     .collect()
+            })
+        })
+    }
+
+    fn pick_image(&self) -> Task<Option<PathBuf>> {
+        parented("Choose a picture", None, |dialog| {
+            Box::pin(async move {
+                dialog
+                    .add_filter("Pictures", &["png", "jpg", "jpeg", "gif", "webp"])
+                    .pick_file()
+                    .await
+                    .map(|h| h.path().to_path_buf())
             })
         })
     }
@@ -196,6 +212,8 @@ mod fake {
         pub asked: Arc<Mutex<Vec<String>>>,
         /// How many times the file picker was opened.
         pub picked: Arc<Mutex<usize>>,
+        /// How many times the picture picker was opened.
+        pub images: Arc<Mutex<usize>>,
     }
 
     /// A fake clipboard that counts reads and yields nothing; tests send the
@@ -224,6 +242,11 @@ mod fake {
 
         fn pick_files(&self) -> Task<Vec<PathBuf>> {
             *self.picked.lock().expect("test mutex") += 1;
+            Task::none()
+        }
+
+        fn pick_image(&self) -> Task<Option<PathBuf>> {
+            *self.images.lock().expect("test mutex") += 1;
             Task::none()
         }
     }

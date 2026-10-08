@@ -90,6 +90,7 @@ fn content_node_with(
         revealed: &revealed,
         actions: &actions,
         rooms: &[],
+        members: &[],
         media,
         room,
     };

@@ -22,8 +22,8 @@ use iced::{
 use tessera_core::api::{
     Block, Inline, MediaContent, MediaKind, MessageDetails, MessageKind, MessageText,
     PaginationState, PlaceholderKind, ReactionGroup, ReplyPreview, ReplyState, RichText, RoomId,
-    RoomSummary, SendStatus, Shield, ShieldCode, StateChange, TextStyle, TimelineItem,
-    TimelineItemKind, TypingUser, UploadProgress, UserId, UtdReason,
+    RoomMemberView, RoomSummary, SendStatus, Shield, ShieldCode, StateChange, TextStyle,
+    TimelineItem, TimelineItemKind, TypingUser, UploadProgress, UserId, UtdReason,
 };
 
 use crate::actions::{self, ActionButtons, ActionState};
@@ -65,6 +65,8 @@ pub struct RichEnv<'a> {
     pub actions: &'a ActionState,
     /// Known rooms, for the names on room pills.
     pub rooms: &'a [RoomSummary],
+    /// The open room's members, for the names on user pills.
+    pub members: &'a [RoomMemberView],
     /// Thumbnails and saved files, for media messages.
     pub media: &'a MediaModel,
     /// The open room, which keys the media cache.
@@ -592,6 +594,7 @@ fn body_widget<'a>(
         item: id,
         revealed: env.revealed,
         rooms: env.rooms,
+        members: env.members,
     };
     match &emote {
         Some(name) => blocks_view(&with_emote_prefix(&details.content, name), &ctx, env.theme),
@@ -1707,6 +1710,7 @@ mod tests {
             revealed: &revealed,
             actions: &actions,
             rooms: &[],
+            members: &[],
             media: &NO_MEDIA,
             room: None,
         };
@@ -1728,6 +1732,7 @@ mod tests {
             revealed: &revealed,
             actions: &actions,
             rooms: &[],
+            members: &[],
             media: &NO_MEDIA,
             room: None,
         };
@@ -1797,6 +1802,7 @@ mod tests {
             revealed,
             actions: &NO_ACTIONS,
             rooms: &[],
+            members: &[],
             media: &NO_MEDIA,
             room: None,
         }

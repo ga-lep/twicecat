@@ -32,6 +32,7 @@ use crate::media::{self, Decoded, MediaModel, SavePath};
 use crate::notifications::{self, Folding, ModeChoice, NoNotifier, Notifier};
 use crate::rich_text::{LinkTarget, MAX_REVEALED, Revealed};
 use crate::room_list;
+use crate::rooms::{RoomsMessage, RoomsModel};
 use crate::screens::login::{self, BrowserUrl, LoginForm};
 use crate::screens::{self, loading, main_view};
 use crate::security::{Busy, SecurityMessage, SecurityModel};
@@ -368,6 +369,8 @@ pub enum Message {
     RoomModeChosen(ModeChoice),
     /// **Show Tessera** or **Quit** in the tray, or a click on the icon.
     Tray(TrayAction),
+    /// A message of the room dialogs, panels, user card and join bar.
+    Rooms(RoomsMessage),
     /// The task that decoded fetched image bytes finished.
     MediaDecoded {
         /// Room of the item.
@@ -437,6 +440,8 @@ pub struct App {
     pub room_modes: HashMap<RoomId, Option<RoomNotificationModeView>>,
     /// The tray icon and the unread count it shows.
     pub tray: TrayModel,
+    /// Room dialogs, settings, members, the user card and the join bar.
+    pub rooms_ui: RoomsModel,
     notifier: Box<dyn Notifier>,
     folding: Folding,
     pub(crate) dialogs: Box<dyn Dialogs>,
@@ -510,6 +515,7 @@ impl std::fmt::Debug for App {
             .field("selected", &self.selected)
             .field("media", &self.media)
             .field("uploads", &self.uploads)
+            .field("rooms_ui", &self.rooms_ui)
             .field("login", &self.login)
             .field("login_in_flight", &self.login_in_flight)
             .field("composer", &self.composer)
@@ -554,6 +560,7 @@ impl App {
             // Inert until `booter` installs the real ones, so tests never
             // touch the desktop.
             tray: TrayModel::new(Box::new(NoTrayFactory)),
+            rooms_ui: RoomsModel::default(),
             notifier: Box::new(NoNotifier),
             folding: Folding::default(),
             dialogs: Box::new(SystemDialogs),
@@ -1013,6 +1020,7 @@ impl App {
             Message::Security(message) => self.on_security(message),
             Message::Verification(message) => self.on_verification(message),
             Message::Sessions(message) => self.on_sessions(message),
+            Message::Rooms(message) => self.on_rooms(message),
             Message::AttachRequested => self.attach_requested(),
             Message::FilesChosen(paths) => self.files_added(paths.0),
             Message::FileHovered => {
@@ -1109,6 +1117,7 @@ impl App {
                 self.actions.reset();
                 self.clear_draft();
                 self.reset_link_state();
+                self.rooms_ui.reset_room();
                 Task::batch([
                     stop_typing,
                     marker,
@@ -1257,7 +1266,7 @@ impl App {
                 if self.screen == Screen::Loading && !self.rooms.is_empty() {
                     self.screen = Screen::Main;
                 }
-                task = self.after_list_change();
+                task = Task::batch([self.after_list_change(), self.rooms_after_list_change()]);
             }
             CoreEvent::RoomListLoaded { total_rooms } => {
                 self.total_rooms = total_rooms;
@@ -1349,6 +1358,11 @@ impl App {
             }
             CoreEvent::ActionFailed {
                 room_id,
+                action: ActionKind::Rooms,
+                error,
+            } => task = self.on_rooms_failed(&room_id, &error),
+            CoreEvent::ActionFailed {
+                room_id,
                 action: ActionKind::Discard,
                 ..
             } => {
@@ -1438,11 +1452,15 @@ impl App {
                 self.tray
                     .set_unread(notifications, self.ui_settings.tray_badge);
             }
-            CoreEvent::RoomCreated { .. }
-            | CoreEvent::RoomJoined { .. }
-            | CoreEvent::RoomDetails(_)
-            | CoreEvent::RoomMembers { .. }
-            | CoreEvent::OwnProfile(_)
+            CoreEvent::RoomCreated { room_id } => task = self.on_room_created(room_id),
+            CoreEvent::RoomJoined { room_id } => task = self.on_room_joined(room_id),
+            CoreEvent::RoomDetails(details) => task = self.on_room_details(details),
+            CoreEvent::RoomMembers {
+                room_id,
+                members,
+                truncated,
+            } => task = self.on_room_members(room_id, members, truncated),
+            CoreEvent::OwnProfile(_)
             | CoreEvent::Spaces(_)
             | CoreEvent::ThreadDiff { .. }
             | CoreEvent::ThreadPagination { .. } => {}
@@ -1941,13 +1959,14 @@ impl App {
         self.security = SecurityModel::default();
         self.verification = None;
         self.sessions = SessionsModel::default();
+        self.rooms_ui = RoomsModel::default();
         self.notice = Some(notice.to_owned());
         self.end_login_attempt();
         self.screen = Screen::Login;
         flush
     }
 
-    fn deselect(&mut self) {
+    pub(crate) fn deselect(&mut self) {
         self.selected = None;
         self.timeline.reset();
         self.media.reset_view();
@@ -1957,6 +1976,7 @@ impl App {
         self.actions.reset();
         self.clear_draft();
         self.reset_link_state();
+        self.rooms_ui.reset_room();
     }
 
     /// Forgets revealed spoilers, the link bar and the unknown-command bar
@@ -1980,15 +2000,14 @@ impl App {
                 Task::none()
             }
             LinkTarget::Room(room) => {
-                let id = RoomId::from(room);
+                let id = RoomId::from(room.as_str());
                 if room_list::contains(&self.rooms, &id) {
                     self.update(Message::SelectRoom(id))
                 } else {
-                    Task::none()
+                    self.room_pill_clicked(&room)
                 }
             }
-            // Profiles are Phase 5.
-            LinkTarget::User(_) => Task::none(),
+            LinkTarget::User(user) => self.user_pill_clicked(user),
             LinkTarget::Spoiler { item, index } => {
                 let key = (item, index);
                 if !self.revealed.remove(&key) && self.revealed.len() < MAX_REVEALED {
@@ -2009,7 +2028,8 @@ impl App {
             return Task::none();
         }
         let effects = self.timeline.apply_diffs(diffs);
-        self.timeline_effects(effects)
+        let members = self.members_for_pills();
+        Task::batch([self.timeline_effects(effects), members])
     }
 
     /// The timeline scrolled to `offset_from_bottom` pixels from the bottom
@@ -2303,7 +2323,10 @@ impl App {
             }
             Screen::Main => screens::verification::layer(
                 screens::upload_dialog::layer(
-                    screens::media_viewer::layer(main_view::view(self), self),
+                    screens::media_viewer::layer(
+                        screens::room_dialogs::layer(main_view::view(self), self),
+                        self,
+                    ),
                     self,
                 ),
                 self,
@@ -2324,6 +2347,7 @@ impl App {
                 other => upload::event_message(&other, status),
             }),
             self.upload_keys(),
+            self.rooms_keys(),
             system::theme_changes().map(Message::ThemeMode),
             self.viewer_keys(),
             window::open_events().map(Message::WindowOpened),
@@ -2347,6 +2371,20 @@ impl App {
     }
 
     /// Esc closes the viewer while it is open; no listener otherwise.
+    /// Esc closes the room dialogs, panels and card while one is open.
+    fn rooms_keys(&self) -> Subscription<Message> {
+        if !self.rooms_ui.overlay_open() {
+            return Subscription::none();
+        }
+        iced::event::listen_with(|event, _status, _id| match event {
+            iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+                ..
+            }) => Some(Message::Rooms(RoomsMessage::Escape)),
+            _ => None,
+        })
+    }
+
     fn viewer_keys(&self) -> Subscription<Message> {
         if self.media.viewer.is_none() {
             return Subscription::none();
@@ -8201,6 +8239,985 @@ mod tests {
                 .app
                 .update(core(CoreEvent::NotificationSettings(settings.clone())));
             assert_eq!(rig.app.notification_settings.as_ref(), Some(&settings));
+        }
+    }
+
+    // ---- Phase 5 Task 12: room dialogs, settings, members and pills ----
+
+    mod rooms_ui {
+        use std::path::PathBuf;
+
+        use tessera_core::api::{
+            Block, Inline, MediaBytes, MembershipView, MentionTarget, MessageDetails,
+            PowerLevelView, RichText, Role, RoomDetailsView, RoomMemberView, RoomPermissions,
+            SendStatus, TimelineItemKind,
+        };
+
+        use super::*;
+        use crate::dialogs::RecordingDialogs;
+        use crate::links::RoomTarget;
+        use crate::rooms::{AvatarRefusal, AvatarUpload, Dialog, MEMBERS_PAGE, RoomsMessage as R};
+
+        fn rig() -> (App, mpsc::Receiver<Command>, RecordingDialogs) {
+            let (mut app, rx) = main_app();
+            let dialogs = RecordingDialogs::default();
+            app.set_dialogs(Box::new(dialogs.clone()));
+            (app, rx, dialogs)
+        }
+
+        fn rooms(app: &mut App, message: R) {
+            let _ = app.update(Message::Rooms(message));
+        }
+
+        fn t(text: &str) -> MessageText {
+            MessageText::from(text)
+        }
+
+        fn id(room: &str) -> RoomId {
+            RoomId::from(room)
+        }
+
+        fn all(can: bool) -> RoomPermissions {
+            RoomPermissions {
+                can_set_name: can,
+                can_set_topic: can,
+                can_set_avatar: can,
+                can_enable_encryption: can,
+                can_invite: can,
+            }
+        }
+
+        fn details(room: &str, encrypted: bool, permissions: RoomPermissions) -> RoomDetailsView {
+            RoomDetailsView {
+                room_id: id(room),
+                name: "Lounge".into(),
+                topic: Some("Chat".into()),
+                avatar: None,
+                is_encrypted: encrypted,
+                alias: None,
+                permissions,
+            }
+        }
+
+        fn member(user: &str, name: Option<&str>, role: Role) -> RoomMemberView {
+            RoomMemberView {
+                user_id: UserId::from(user),
+                display_name: name.map(str::to_owned),
+                avatar: None,
+                power: PowerLevelView::Level(0),
+                role,
+                membership: MembershipView::Joined,
+            }
+        }
+
+        fn open_settings(app: &mut App, rx: &mut mpsc::Receiver<Command>, perms: RoomPermissions) {
+            rooms(app, R::OpenSettings);
+            let _ = drain(rx);
+            let _ = app.update(core(CoreEvent::RoomDetails(details("!a:x", false, perms))));
+        }
+
+        #[test]
+        fn new_room_opens_with_encryption_on_and_a_bad_form_sends_nothing() {
+            let (mut app, mut rx, _) = rig();
+            rooms(&mut app, R::OpenCreate);
+            let Some(Dialog::Create(dialog)) = &app.rooms_ui.dialog else {
+                panic!("the create dialog is open");
+            };
+            assert!(dialog.form.encrypted);
+            rooms(&mut app, R::CreateSubmit);
+            assert!(drain(&mut rx).is_empty(), "an empty name sends nothing");
+            let Some(Dialog::Create(dialog)) = &app.rooms_ui.dialog else {
+                panic!("still open");
+            };
+            assert!(dialog.error.is_some());
+            assert!(!dialog.busy);
+        }
+
+        #[test]
+        fn create_sends_one_command_even_when_pressed_twice() {
+            let (mut app, mut rx, _) = rig();
+            rooms(&mut app, R::OpenCreate);
+            rooms(&mut app, R::CreateName(t(" Lounge ")));
+            rooms(&mut app, R::CreateTopic(t("Chat")));
+            rooms(&mut app, R::CreateInvitees(t("@bob:x")));
+            rooms(&mut app, R::CreateSubmit);
+            rooms(&mut app, R::CreateSubmit);
+            let sent = drain(&mut rx);
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            let Command::CreateRoom(request) = &sent[0] else {
+                panic!("{sent:?}");
+            };
+            assert_eq!(request.name, "Lounge");
+            assert!(request.encrypted);
+            assert_eq!(request.invitees, [UserId::from("@bob:x")]);
+        }
+
+        #[test]
+        fn an_unencrypted_public_room_is_asked_for_as_typed() {
+            let (mut app, mut rx, _) = rig();
+            rooms(&mut app, R::OpenCreate);
+            rooms(&mut app, R::CreateName(t("Open")));
+            rooms(&mut app, R::CreateEncrypted(false));
+            rooms(&mut app, R::CreatePublic(true));
+            rooms(&mut app, R::CreateAlias(t("open-room")));
+            rooms(&mut app, R::CreateSubmit);
+            let sent = drain(&mut rx);
+            let Command::CreateRoom(request) = &sent[0] else {
+                panic!("{sent:?}");
+            };
+            assert!(!request.encrypted);
+            assert_eq!(
+                request.visibility,
+                tessera_core::api::RoomVisibility::Public {
+                    alias: "open-room".into()
+                }
+            );
+        }
+
+        #[test]
+        fn a_created_room_is_selected_when_it_appears_in_the_list() {
+            let (mut app, mut rx, _) = rig();
+            rooms(&mut app, R::OpenCreate);
+            rooms(&mut app, R::CreateName(t("Lounge")));
+            rooms(&mut app, R::CreateSubmit);
+            let _ = drain(&mut rx);
+            let _ = app.update(core(CoreEvent::RoomCreated {
+                room_id: id("!new:x"),
+            }));
+            assert!(app.rooms_ui.dialog.is_none(), "the dialog closes");
+            assert!(drain(&mut rx).is_empty(), "the room is not listed yet");
+            assert_eq!(app.selected, Some(id("!a:x")));
+            let _ = app.update(core(CoreEvent::RoomListChanged(vec![ListDiff::PushBack {
+                value: RoomSummary::new(id("!new:x"), "Lounge".into()),
+            }])));
+            let sent = drain(&mut rx);
+            assert!(
+                sent.iter()
+                    .any(|c| matches!(c, Command::SelectRoom(r) if *r == id("!new:x"))),
+                "{sent:?}"
+            );
+            assert_eq!(app.selected, Some(id("!new:x")));
+            assert_eq!(app.rooms_ui.select_when_listed, None);
+            // A later list change does not select it again.
+            let _ = app.update(core(CoreEvent::RoomListChanged(vec![ListDiff::Clear])));
+            assert!(
+                !drain(&mut rx)
+                    .iter()
+                    .any(|c| matches!(c, Command::SelectRoom(_)))
+            );
+        }
+
+        #[test]
+        fn a_room_that_is_already_listed_is_selected_at_once() {
+            let (mut app, mut rx, _) = rig();
+            let _ = app.update(core(CoreEvent::RoomCreated {
+                room_id: id("!b:x"),
+            }));
+            assert_eq!(app.selected, Some(id("!b:x")));
+            assert!(
+                drain(&mut rx)
+                    .iter()
+                    .any(|c| matches!(c, Command::SelectRoom(r) if *r == id("!b:x")))
+            );
+        }
+
+        #[test]
+        fn a_failed_create_shows_a_fixed_line_and_allows_another_try() {
+            let (mut app, mut rx, _) = rig();
+            rooms(&mut app, R::OpenCreate);
+            rooms(&mut app, R::CreateName(t("Lounge")));
+            rooms(&mut app, R::CreateSubmit);
+            let _ = drain(&mut rx);
+            let _ = app.update(core(CoreEvent::ActionFailed {
+                room_id: id(""),
+                action: ActionKind::Rooms,
+                error: CoreError::Internal("sentinel-secret-text".into()),
+            }));
+            let Some(Dialog::Create(dialog)) = &app.rooms_ui.dialog else {
+                panic!("the dialog stays open");
+            };
+            assert!(!dialog.busy);
+            let line = dialog.error.expect("an error line");
+            assert!(!line.contains("sentinel"));
+            rooms(&mut app, R::CreateSubmit);
+            assert_eq!(drain(&mut rx).len(), 1);
+        }
+
+        #[test]
+        fn a_dm_needs_a_user_id_and_is_sent_once() {
+            let (mut app, mut rx, _) = rig();
+            rooms(&mut app, R::OpenDm);
+            rooms(&mut app, R::DmInput(t("bob")));
+            rooms(&mut app, R::DmSubmit);
+            assert!(drain(&mut rx).is_empty());
+            rooms(&mut app, R::DmInput(t(" @bob:x ")));
+            rooms(&mut app, R::DmSubmit);
+            rooms(&mut app, R::DmSubmit);
+            let sent = drain(&mut rx);
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            assert!(
+                matches!(&sent[0], Command::CreateDm { user_id } if user_id.as_str() == "@bob:x")
+            );
+        }
+
+        #[test]
+        fn join_takes_an_alias_an_id_or_a_link_and_sends_once() {
+            for (typed, target, via) in [
+                ("#lounge:x", "#lounge:x", vec![]),
+                ("!abc:x", "!abc:x", vec![]),
+                (
+                    "https://matrix.to/#/!abc:x?via=h.example",
+                    "!abc:x",
+                    vec!["h.example".to_owned()],
+                ),
+            ] {
+                let (mut app, mut rx, _) = rig();
+                rooms(&mut app, R::OpenJoin);
+                rooms(&mut app, R::JoinInput(t(typed)));
+                rooms(&mut app, R::JoinSubmit);
+                rooms(&mut app, R::JoinSubmit);
+                let sent = drain(&mut rx);
+                assert_eq!(sent.len(), 1, "{typed}: {sent:?}");
+                match &sent[0] {
+                    Command::JoinRoom { target: t, via: v } => {
+                        assert_eq!(t, target);
+                        assert_eq!(*v, via);
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+        }
+
+        #[test]
+        fn join_refuses_junk_without_sending() {
+            let (mut app, mut rx, _) = rig();
+            rooms(&mut app, R::OpenJoin);
+            for bad in ["", "lounge", "@bob:x", "https://evil.example/#/!a:x"] {
+                rooms(&mut app, R::JoinInput(t(bad)));
+                rooms(&mut app, R::JoinSubmit);
+            }
+            assert!(drain(&mut rx).is_empty());
+            let Some(Dialog::Join(dialog)) = &app.rooms_ui.dialog else {
+                panic!("still open");
+            };
+            assert!(dialog.error.is_some() && !dialog.busy);
+        }
+
+        #[test]
+        fn a_joined_room_is_selected_and_the_dialog_closes() {
+            let (mut app, mut rx, _) = rig();
+            rooms(&mut app, R::OpenJoin);
+            rooms(&mut app, R::JoinInput(t("!j:x")));
+            rooms(&mut app, R::JoinSubmit);
+            let _ = drain(&mut rx);
+            let _ = app.update(core(CoreEvent::RoomJoined {
+                room_id: id("!j:x"),
+            }));
+            assert!(app.rooms_ui.dialog.is_none());
+            let _ = app.update(core(CoreEvent::RoomListChanged(vec![ListDiff::PushBack {
+                value: RoomSummary::new(id("!j:x"), "J".into()),
+            }])));
+            assert_eq!(app.selected, Some(id("!j:x")));
+        }
+
+        fn with_invite(app: &mut App) {
+            let mut invite = RoomSummary::new(id("!inv:x"), "Invited".into());
+            invite.is_invite = true;
+            let _ = app.update(core(CoreEvent::RoomListChanged(vec![ListDiff::PushBack {
+                value: invite,
+            }])));
+        }
+
+        #[test]
+        fn accept_and_decline_send_their_command_once_each() {
+            let (mut app, mut rx, _) = rig();
+            with_invite(&mut app);
+            rooms(&mut app, R::Accept(id("!inv:x")));
+            rooms(&mut app, R::Accept(id("!inv:x")));
+            rooms(&mut app, R::Decline(id("!inv:x")));
+            let sent = drain(&mut rx);
+            assert_eq!(sent.len(), 1, "one answer per invitation: {sent:?}");
+            assert!(
+                matches!(&sent[0], Command::AcceptInvite { room_id } if *room_id == id("!inv:x"))
+            );
+
+            let (mut app, mut rx, _) = rig();
+            with_invite(&mut app);
+            rooms(&mut app, R::Decline(id("!inv:x")));
+            rooms(&mut app, R::Decline(id("!inv:x")));
+            let sent = drain(&mut rx);
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            assert!(
+                matches!(&sent[0], Command::DeclineInvite { room_id } if *room_id == id("!inv:x"))
+            );
+        }
+
+        #[test]
+        fn only_invitations_can_be_accepted_or_declined() {
+            let (mut app, mut rx, _) = rig();
+            rooms(&mut app, R::Accept(id("!b:x")));
+            rooms(&mut app, R::Decline(id("!b:x")));
+            rooms(&mut app, R::Accept(id("!unknown:x")));
+            assert!(drain(&mut rx).is_empty());
+        }
+
+        #[test]
+        fn a_failed_answer_can_be_tried_again() {
+            let (mut app, mut rx, _) = rig();
+            with_invite(&mut app);
+            rooms(&mut app, R::Accept(id("!inv:x")));
+            let _ = drain(&mut rx);
+            let _ = app.update(core(CoreEvent::ActionFailed {
+                room_id: id("!inv:x"),
+                action: ActionKind::Rooms,
+                error: CoreError::Network("x".into()),
+            }));
+            assert!(app.actions.notice.is_some(), "the failure is shown");
+            rooms(&mut app, R::Accept(id("!inv:x")));
+            assert_eq!(drain(&mut rx).len(), 1);
+        }
+
+        #[test]
+        fn settings_ask_for_details_and_members() {
+            let (mut app, mut rx, _) = rig();
+            rooms(&mut app, R::OpenSettings);
+            let sent = drain(&mut rx);
+            assert!(sent.iter().any(
+                |c| matches!(c, Command::OpenRoomDetails { room_id } if *room_id == id("!a:x"))
+            ));
+            assert!(sent.iter().any(
+                |c| matches!(c, Command::ListRoomMembers { room_id } if *room_id == id("!a:x"))
+            ));
+            let panel = app.rooms_ui.settings.as_ref().expect("open");
+            assert_eq!(panel.room, id("!a:x"));
+        }
+
+        #[test]
+        fn settings_without_a_selected_room_do_not_open() {
+            let (mut app, mut rx) = login_app();
+            logged_in(&mut app);
+            rooms(&mut app, R::OpenSettings);
+            rooms(&mut app, R::OpenMembers);
+            assert!(app.rooms_ui.settings.is_none() && app.rooms_ui.members_panel.is_none());
+            assert!(drain(&mut rx).is_empty());
+        }
+
+        #[test]
+        fn details_fill_the_fields_until_the_user_edits_them() {
+            let (mut app, mut rx, _) = rig();
+            open_settings(&mut app, &mut rx, all(true));
+            let panel = app.rooms_ui.settings.as_ref().expect("open");
+            assert_eq!(
+                (panel.name.as_str(), panel.topic.as_str()),
+                ("Lounge", "Chat")
+            );
+            rooms(&mut app, R::NameInput(t("Typed")));
+            let mut newer = details("!a:x", false, all(true));
+            newer.name = "From server".into();
+            newer.topic = Some("Server topic".into());
+            let _ = app.update(core(CoreEvent::RoomDetails(newer)));
+            let panel = app.rooms_ui.settings.as_ref().expect("open");
+            assert_eq!(panel.name, "Typed", "an edited field is kept");
+            assert_eq!(panel.topic, "Server topic");
+        }
+
+        #[test]
+        fn details_of_another_room_are_ignored() {
+            let (mut app, mut rx, _) = rig();
+            rooms(&mut app, R::OpenSettings);
+            let _ = drain(&mut rx);
+            let _ = app.update(core(CoreEvent::RoomDetails(details(
+                "!b:x",
+                false,
+                all(true),
+            ))));
+            assert!(app.rooms_ui.details.is_none());
+        }
+
+        #[test]
+        fn name_and_topic_are_saved_only_with_permission() {
+            let (mut app, mut rx, _) = rig();
+            open_settings(&mut app, &mut rx, all(false));
+            rooms(&mut app, R::NameInput(t("New")));
+            rooms(&mut app, R::TopicInput(t("Topic")));
+            rooms(&mut app, R::SaveName);
+            rooms(&mut app, R::SaveTopic);
+            assert!(drain(&mut rx).is_empty(), "no permission, no command");
+
+            let (mut app, mut rx, _) = rig();
+            open_settings(&mut app, &mut rx, all(true));
+            rooms(&mut app, R::NameInput(t("  New name ")));
+            rooms(&mut app, R::TopicInput(t("  ")));
+            rooms(&mut app, R::SaveName);
+            rooms(&mut app, R::SaveTopic);
+            let sent = drain(&mut rx);
+            assert_eq!(sent.len(), 2, "{sent:?}");
+            assert!(matches!(&sent[0], Command::SetRoomName { name, .. } if name == "New name"));
+            assert!(matches!(
+                &sent[1],
+                Command::SetRoomTopic { topic: None, .. }
+            ));
+        }
+
+        #[test]
+        fn a_bad_name_is_not_sent() {
+            let (mut app, mut rx, _) = rig();
+            open_settings(&mut app, &mut rx, all(true));
+            rooms(&mut app, R::NameInput(t("   ")));
+            rooms(&mut app, R::SaveName);
+            rooms(&mut app, R::NameInput(t("a\u{202E}b")));
+            rooms(&mut app, R::SaveName);
+            assert!(drain(&mut rx).is_empty());
+            assert!(
+                app.rooms_ui
+                    .settings
+                    .as_ref()
+                    .expect("open")
+                    .error
+                    .is_some()
+            );
+        }
+
+        #[test]
+        fn the_picture_goes_through_the_picker_and_is_sent_once() {
+            let (mut app, mut rx, dialogs) = rig();
+            open_settings(&mut app, &mut rx, all(true));
+            rooms(&mut app, R::ChooseAvatar);
+            assert_eq!(*dialogs.images.lock().expect("mutex"), 1);
+            rooms(&mut app, R::AvatarPicked(None));
+            assert!(!app.rooms_ui.settings.as_ref().expect("open").avatar_busy);
+            // A path starts the read; the scaled picture arrives as a message.
+            rooms(
+                &mut app,
+                R::AvatarPicked(Some(PathBuf::from("/nonexistent/p.png").into())),
+            );
+            assert!(app.rooms_ui.settings.as_ref().expect("open").avatar_busy);
+            let upload = AvatarUpload {
+                data: vec![1, 2, 3],
+                mimetype: "image/png",
+                width: 2,
+                height: 2,
+            };
+            let ready = R::AvatarReady {
+                room: id("!a:x"),
+                result: Ok(Box::new(upload)),
+            };
+            rooms(&mut app, ready.clone());
+            rooms(&mut app, ready);
+            let sent = drain(&mut rx);
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            match &sent[0] {
+                Command::SetRoomAvatar {
+                    room_id,
+                    data,
+                    mimetype,
+                } => {
+                    assert_eq!(*room_id, id("!a:x"));
+                    assert_eq!(data, &MediaBytes::from(vec![1, 2, 3]));
+                    assert_eq!(mimetype, "image/png");
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+
+        #[test]
+        fn a_refused_picture_shows_a_line_and_sends_nothing() {
+            let (mut app, mut rx, _) = rig();
+            open_settings(&mut app, &mut rx, all(true));
+            rooms(
+                &mut app,
+                R::AvatarPicked(Some(PathBuf::from("/nonexistent/p.png").into())),
+            );
+            rooms(
+                &mut app,
+                R::AvatarReady {
+                    room: id("!a:x"),
+                    result: Err(AvatarRefusal::NotAPicture),
+                },
+            );
+            let panel = app.rooms_ui.settings.as_ref().expect("open");
+            assert!(!panel.avatar_busy);
+            assert_eq!(panel.error, Some(AvatarRefusal::NotAPicture.text()));
+            assert!(drain(&mut rx).is_empty());
+        }
+
+        #[test]
+        fn a_picture_for_another_room_or_a_closed_panel_is_dropped() {
+            let (mut app, mut rx, _) = rig();
+            open_settings(&mut app, &mut rx, all(true));
+            let upload = || AvatarUpload {
+                data: vec![1],
+                mimetype: "image/png",
+                width: 1,
+                height: 1,
+            };
+            rooms(
+                &mut app,
+                R::AvatarReady {
+                    room: id("!b:x"),
+                    result: Ok(Box::new(upload())),
+                },
+            );
+            rooms(&mut app, R::CloseSettings);
+            rooms(
+                &mut app,
+                R::AvatarReady {
+                    room: id("!a:x"),
+                    result: Ok(Box::new(upload())),
+                },
+            );
+            assert!(drain(&mut rx).is_empty());
+        }
+
+        #[test]
+        fn enabling_encryption_needs_the_warning_card_and_permission() {
+            let (mut app, mut rx, _) = rig();
+            open_settings(&mut app, &mut rx, all(true));
+            rooms(&mut app, R::EncryptConfirm);
+            assert!(drain(&mut rx).is_empty(), "no confirm without the card");
+            rooms(&mut app, R::EncryptAsk);
+            assert!(app.rooms_ui.settings.as_ref().expect("open").encrypt_ask);
+            rooms(&mut app, R::EncryptCancel);
+            rooms(&mut app, R::EncryptConfirm);
+            assert!(drain(&mut rx).is_empty(), "cancel withdraws the card");
+            rooms(&mut app, R::EncryptAsk);
+            rooms(&mut app, R::EncryptConfirm);
+            rooms(&mut app, R::EncryptConfirm);
+            let sent = drain(&mut rx);
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            assert!(
+                matches!(&sent[0], Command::EnableRoomEncryption { room_id } if *room_id == id("!a:x"))
+            );
+
+            let (mut app, mut rx, _) = rig();
+            open_settings(&mut app, &mut rx, all(false));
+            rooms(&mut app, R::EncryptAsk);
+            rooms(&mut app, R::EncryptConfirm);
+            assert!(drain(&mut rx).is_empty(), "no permission");
+
+            let (mut app, mut rx, _) = rig();
+            rooms(&mut app, R::OpenSettings);
+            let _ = drain(&mut rx);
+            let _ = app.update(core(CoreEvent::RoomDetails(details(
+                "!a:x",
+                true,
+                all(true),
+            ))));
+            rooms(&mut app, R::EncryptAsk);
+            rooms(&mut app, R::EncryptConfirm);
+            assert!(drain(&mut rx).is_empty(), "already encrypted");
+        }
+
+        #[test]
+        fn leaving_asks_first_then_sends_once_and_closes_the_room() {
+            let (mut app, mut rx, _) = rig();
+            open_settings(&mut app, &mut rx, all(true));
+            rooms(&mut app, R::LeaveConfirm);
+            assert!(drain(&mut rx).is_empty(), "no confirm without the question");
+            rooms(&mut app, R::LeaveAsk);
+            rooms(&mut app, R::LeaveCancel);
+            rooms(&mut app, R::LeaveConfirm);
+            assert!(drain(&mut rx).is_empty());
+            rooms(&mut app, R::LeaveAsk);
+            rooms(&mut app, R::LeaveConfirm);
+            rooms(&mut app, R::LeaveConfirm);
+            let sent = drain(&mut rx);
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            assert!(matches!(&sent[0], Command::LeaveRoom { room_id } if *room_id == id("!a:x")));
+            assert!(app.rooms_ui.settings.is_none());
+            assert_eq!(app.selected, None, "the timeline is closed");
+            // The list still shows the room until the next sync says more.
+            assert!(room_list::contains(&app.rooms, &id("!a:x")));
+        }
+
+        #[test]
+        fn a_refused_leave_is_reported() {
+            let (mut app, mut rx, _) = rig();
+            open_settings(&mut app, &mut rx, all(true));
+            rooms(&mut app, R::LeaveAsk);
+            rooms(&mut app, R::LeaveConfirm);
+            let _ = drain(&mut rx);
+            let _ = app.update(core(CoreEvent::ActionFailed {
+                room_id: id("!a:x"),
+                action: ActionKind::Rooms,
+                error: CoreError::NotAllowed,
+            }));
+            assert!(app.actions.notice.is_some());
+        }
+
+        #[test]
+        fn the_leave_warning_follows_what_is_known() {
+            let (mut app, mut rx, _) = rig();
+            open_settings(&mut app, &mut rx, all(true));
+            assert!(app.leave_warning_now().unknown, "members not listed yet");
+            let _ = app.update(core(CoreEvent::RoomDetails(details(
+                "!a:x",
+                true,
+                all(true),
+            ))));
+            let _ = app.update(core(CoreEvent::RoomMembers {
+                room_id: id("!a:x"),
+                members: vec![
+                    member("@a:x", None, Role::Admin),
+                    member("@b:x", None, Role::User),
+                ],
+                truncated: false,
+            }));
+            let w = app.leave_warning_now();
+            assert!(w.encrypted && w.last_admin && !w.unknown, "{w:?}");
+        }
+
+        #[test]
+        fn members_open_with_details_and_a_list_sorted_by_role_then_name() {
+            let (mut app, mut rx, _) = rig();
+            rooms(&mut app, R::OpenMembers);
+            let sent = drain(&mut rx);
+            assert!(
+                sent.iter()
+                    .any(|c| matches!(c, Command::ListRoomMembers { .. }))
+            );
+            assert!(
+                sent.iter()
+                    .any(|c| matches!(c, Command::OpenRoomDetails { .. }))
+            );
+            let _ = app.update(core(CoreEvent::RoomMembers {
+                room_id: id("!a:x"),
+                members: vec![
+                    member("@z:x", Some("Zed"), Role::User),
+                    member("@m:x", Some("Mod"), Role::Moderator),
+                    member("@c:x", Some("Boss"), Role::Creator),
+                    member("@a:x", Some("alice"), Role::User),
+                ],
+                truncated: true,
+            }));
+            let known = app.rooms_ui.known.as_ref().expect("listed");
+            let ids: Vec<&str> = known.members.iter().map(|m| m.user_id.as_str()).collect();
+            assert_eq!(ids, ["@c:x", "@m:x", "@a:x", "@z:x"]);
+            assert!(known.truncated);
+        }
+
+        #[test]
+        fn a_member_list_for_another_room_is_ignored() {
+            let (mut app, _rx, _) = rig();
+            let _ = app.update(core(CoreEvent::RoomMembers {
+                room_id: id("!b:x"),
+                members: vec![member("@z:x", Some("Zed"), Role::User)],
+                truncated: false,
+            }));
+            assert!(app.rooms_ui.known.is_none());
+        }
+
+        #[test]
+        fn invites_are_validated_in_the_app_and_need_permission() {
+            let (mut app, mut rx, _) = rig();
+            rooms(&mut app, R::OpenMembers);
+            let _ = drain(&mut rx);
+            let _ = app.update(core(CoreEvent::RoomDetails(details(
+                "!a:x",
+                false,
+                all(true),
+            ))));
+            rooms(&mut app, R::InviteInput(t("bob")));
+            rooms(&mut app, R::InviteSubmit);
+            assert!(drain(&mut rx).is_empty(), "not a user ID");
+            rooms(&mut app, R::InviteInput(t(" @bob:x ")));
+            rooms(&mut app, R::InviteSubmit);
+            let sent = drain(&mut rx);
+            assert!(
+                matches!(&sent[0], Command::InviteUser { room_id, user_id }
+                    if *room_id == id("!a:x") && user_id.as_str() == "@bob:x"),
+                "{sent:?}"
+            );
+            assert_eq!(
+                sent.iter()
+                    .filter(|c| matches!(c, Command::InviteUser { .. }))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                app.rooms_ui.members_panel.as_ref().expect("open").invite,
+                "",
+                "the field is emptied"
+            );
+
+            let (mut app, mut rx, _) = rig();
+            rooms(&mut app, R::OpenMembers);
+            let _ = drain(&mut rx);
+            let _ = app.update(core(CoreEvent::RoomDetails(details(
+                "!a:x",
+                false,
+                all(false),
+            ))));
+            rooms(&mut app, R::InviteInput(t("@bob:x")));
+            rooms(&mut app, R::InviteSubmit);
+            assert!(drain(&mut rx).is_empty(), "no permission");
+        }
+
+        #[test]
+        fn the_member_list_grows_page_by_page() {
+            let (mut app, mut rx, _) = rig();
+            rooms(&mut app, R::OpenMembers);
+            let _ = drain(&mut rx);
+            let many: Vec<RoomMemberView> = (0..MEMBERS_PAGE + 50)
+                .map(|i| member(&format!("@u{i:04}:x"), None, Role::User))
+                .collect();
+            let _ = app.update(core(CoreEvent::RoomMembers {
+                room_id: id("!a:x"),
+                members: many,
+                truncated: false,
+            }));
+            let panel = app.rooms_ui.members_panel.as_ref().expect("open");
+            assert_eq!(panel.shown, MEMBERS_PAGE);
+            rooms(&mut app, R::ShowMoreMembers);
+            let panel = app.rooms_ui.members_panel.as_ref().expect("open");
+            assert!(panel.shown > MEMBERS_PAGE);
+        }
+
+        fn user_pill_item(label: &str, user: &str) -> TimelineItem {
+            let details = MessageDetails {
+                content: RichText {
+                    blocks: vec![Block::Paragraph(vec![Inline::Mention {
+                        target: MentionTarget::User(UserId::from(user)),
+                        label: label.to_owned(),
+                    }])],
+                },
+                ..MessageDetails::default()
+            };
+            TimelineItem::new(
+                format!("m-{user}"),
+                TimelineItemKind::Message {
+                    sender: UserId::from("@s:x"),
+                    body: label.to_owned(),
+                    is_own: false,
+                    timestamp_ms: 1,
+                    sent: SendStatus::Sent,
+                    details: Box::new(details),
+                },
+            )
+        }
+
+        #[test]
+        fn the_members_are_asked_for_once_when_a_user_pill_shows() {
+            let (mut app, mut rx, _) = rig();
+            let plain = TimelineItem::new("x".into(), TimelineItemKind::ReadMarker);
+            let _ = app.update(core(CoreEvent::TimelineDiff {
+                room_id: id("!a:x"),
+                diffs: vec![ListDiff::Append {
+                    values: vec![plain],
+                }],
+            }));
+            assert!(
+                !drain(&mut rx)
+                    .iter()
+                    .any(|c| matches!(c, Command::ListRoomMembers { .. })),
+                "no pill, no request"
+            );
+            let diff = |label: &str| CoreEvent::TimelineDiff {
+                room_id: id("!a:x"),
+                diffs: vec![ListDiff::PushBack {
+                    value: user_pill_item(label, "@bob:x"),
+                }],
+            };
+            let _ = app.update(core(diff("Not Bob")));
+            let _ = app.update(core(diff("Again")));
+            let sent = drain(&mut rx);
+            let asked = sent
+                .iter()
+                .filter(
+                    |c| matches!(c, Command::ListRoomMembers { room_id } if *room_id == id("!a:x")),
+                )
+                .count();
+            assert_eq!(asked, 1, "{sent:?}");
+        }
+
+        #[test]
+        fn a_user_pill_opens_the_card_for_its_target_and_message_starts_a_dm() {
+            let (mut app, mut rx, _) = rig();
+            let _ = app.update(Message::LinkClicked(LinkTarget::User(UserId::from(
+                "@bob:x",
+            ))));
+            let card = app.rooms_ui.card.clone().expect("the card");
+            assert_eq!(card.user, UserId::from("@bob:x"));
+            assert!(drain(&mut rx).is_empty(), "opening the card sends nothing");
+            rooms(&mut app, R::CardMessage);
+            rooms(&mut app, R::CardMessage);
+            let sent = drain(&mut rx);
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            assert!(
+                matches!(&sent[0], Command::CreateDm { user_id } if user_id.as_str() == "@bob:x")
+            );
+            let _ = app.update(core(CoreEvent::RoomCreated {
+                room_id: id("!dm:x"),
+            }));
+            assert!(app.rooms_ui.card.is_none(), "the card closes");
+        }
+
+        #[test]
+        fn the_card_of_your_own_pill_does_not_open() {
+            let (mut app, mut rx, _) = rig();
+            let _ = app.update(Message::LinkClicked(LinkTarget::User(UserId::from("@a:x"))));
+            assert!(app.rooms_ui.card.is_none());
+            assert!(drain(&mut rx).is_empty());
+        }
+
+        #[test]
+        fn a_failed_message_from_the_card_can_be_pressed_again() {
+            let (mut app, mut rx, _) = rig();
+            let _ = app.update(Message::LinkClicked(LinkTarget::User(UserId::from(
+                "@bob:x",
+            ))));
+            rooms(&mut app, R::CardMessage);
+            let _ = drain(&mut rx);
+            let _ = app.update(core(CoreEvent::ActionFailed {
+                room_id: id(""),
+                action: ActionKind::Rooms,
+                error: CoreError::Busy,
+            }));
+            assert!(app.rooms_ui.card.is_some());
+            rooms(&mut app, R::CardMessage);
+            assert_eq!(drain(&mut rx).len(), 1);
+        }
+
+        #[test]
+        fn a_listed_room_pill_selects_the_room() {
+            let (mut app, mut rx, _) = rig();
+            let _ = app.update(Message::LinkClicked(LinkTarget::Room("!b:x".into())));
+            assert_eq!(app.selected, Some(id("!b:x")));
+            assert!(app.rooms_ui.join_bar.is_none());
+            let _ = drain(&mut rx);
+        }
+
+        #[test]
+        fn an_unjoined_room_pill_asks_before_joining_and_join_sends_once() {
+            let (mut app, mut rx, _) = rig();
+            let _ = app.update(Message::LinkClicked(LinkTarget::Room("#new:x".into())));
+            assert!(drain(&mut rx).is_empty(), "clicking joins nothing");
+            let bar = app.rooms_ui.join_bar.clone().expect("the bar");
+            assert_eq!(bar.id, "#new:x");
+            rooms(&mut app, R::JoinBarJoin);
+            rooms(&mut app, R::JoinBarJoin);
+            let sent = drain(&mut rx);
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            assert!(matches!(&sent[0], Command::JoinRoom { target, via }
+                if target == "#new:x" && via.is_empty()));
+            let _ = app.update(core(CoreEvent::RoomJoined {
+                room_id: id("!new:x"),
+            }));
+            assert!(app.rooms_ui.join_bar.is_none());
+        }
+
+        #[test]
+        fn cancel_closes_the_join_bar_and_junk_pill_targets_open_nothing() {
+            let (mut app, mut rx, _) = rig();
+            let _ = app.update(Message::LinkClicked(LinkTarget::Room("#new:x".into())));
+            rooms(&mut app, R::JoinBarCancel);
+            assert!(app.rooms_ui.join_bar.is_none());
+            rooms(&mut app, R::JoinBarJoin);
+            let _ = app.update(Message::LinkClicked(LinkTarget::Room("junk".into())));
+            assert!(app.rooms_ui.join_bar.is_none());
+            assert!(drain(&mut rx).is_empty());
+            let target: Option<RoomTarget> = crate::links::parse_room_target("junk");
+            assert!(target.is_none());
+        }
+
+        #[test]
+        fn leaving_the_room_view_closes_everything_of_that_room() {
+            let (mut app, mut rx, _) = rig();
+            open_settings(&mut app, &mut rx, all(true));
+            rooms(&mut app, R::OpenMembers);
+            let _ = app.update(Message::LinkClicked(LinkTarget::User(UserId::from(
+                "@bob:x",
+            ))));
+            let _ = app.update(Message::LinkClicked(LinkTarget::Room("#new:x".into())));
+            let _ = app.update(Message::SelectRoom(id("!b:x")));
+            assert!(app.rooms_ui.settings.is_none());
+            assert!(app.rooms_ui.members_panel.is_none());
+            assert!(app.rooms_ui.card.is_none());
+            assert!(app.rooms_ui.join_bar.is_none());
+            assert!(app.rooms_ui.known.is_none());
+            let _ = drain(&mut rx);
+        }
+
+        #[test]
+        fn logging_out_forgets_the_room_screens() {
+            let (mut app, _rx, _) = rig();
+            rooms(&mut app, R::OpenCreate);
+            rooms(&mut app, R::OpenSettings);
+            let _ = app.update(core(CoreEvent::LoggedOut));
+            assert!(app.rooms_ui.dialog.is_none());
+            assert!(app.rooms_ui.settings.is_none());
+        }
+
+        #[test]
+        fn escape_closes_the_topmost_screen_first() {
+            let (mut app, _rx, _) = rig();
+            rooms(&mut app, R::OpenSettings);
+            rooms(&mut app, R::OpenCreate);
+            rooms(&mut app, R::Escape);
+            assert!(app.rooms_ui.dialog.is_none());
+            assert!(app.rooms_ui.settings.is_some());
+            rooms(&mut app, R::Escape);
+            assert!(app.rooms_ui.settings.is_none());
+        }
+
+        #[test]
+        fn debug_output_shows_no_names_topics_or_ids_typed() {
+            let (mut app, mut rx, _) = rig();
+            rooms(&mut app, R::OpenCreate);
+            rooms(&mut app, R::CreateName(t("sentinel-name")));
+            rooms(&mut app, R::CreateTopic(t("sentinel-topic")));
+            rooms(&mut app, R::CreateAlias(t("sentinel-alias")));
+            rooms(&mut app, R::CreateInvitees(t("@sentinel-invitee:x")));
+            let shown = format!("{:?}", app.rooms_ui);
+            assert!(!shown.contains("sentinel"), "{shown}");
+            rooms(&mut app, R::CloseDialog);
+            rooms(&mut app, R::OpenDm);
+            rooms(&mut app, R::DmInput(t("@sentinel-dm:x")));
+            rooms(&mut app, R::CloseDialog);
+            rooms(&mut app, R::OpenJoin);
+            rooms(&mut app, R::JoinInput(t("#sentinel-join:x")));
+            let shown = format!("{:?}", app.rooms_ui);
+            assert!(!shown.contains("sentinel"), "{shown}");
+            rooms(&mut app, R::CloseDialog);
+            open_settings(&mut app, &mut rx, all(true));
+            rooms(&mut app, R::NameInput(t("sentinel-room-name")));
+            rooms(&mut app, R::TopicInput(t("sentinel-room-topic")));
+            let mut with_sentinels = details("!a:x", false, all(true));
+            with_sentinels.name = "sentinel-details-name".into();
+            with_sentinels.topic = Some("sentinel-details-topic".into());
+            let _ = app.update(core(CoreEvent::RoomDetails(with_sentinels)));
+            rooms(&mut app, R::OpenMembers);
+            rooms(&mut app, R::InviteInput(t("@sentinel-inv:x")));
+            let _ = app.update(core(CoreEvent::RoomMembers {
+                room_id: id("!a:x"),
+                members: vec![member(
+                    "@sentinel-member:x",
+                    Some("sentinel-person"),
+                    Role::User,
+                )],
+                truncated: false,
+            }));
+            let _ = app.update(Message::LinkClicked(LinkTarget::Room(
+                "#sentinel-pill:x".into(),
+            )));
+            let shown = format!("{:?} {:?}", app.rooms_ui, app);
+            assert!(
+                !shown.contains("sentinel-room")
+                    && !shown.contains("sentinel-details")
+                    && !shown.contains("sentinel-person")
+                    && !shown.contains("sentinel-inv")
+                    && !shown.contains("sentinel-pill"),
+                "{shown}"
+            );
+            for message in [
+                R::NameInput(t("sentinel-msg")),
+                R::CreateInvitees(t("sentinel-msg")),
+                R::InviteInput(t("sentinel-msg")),
+                R::AvatarPicked(Some(PathBuf::from("/sentinel-msg/p.png").into())),
+            ] {
+                assert!(!format!("{message:?}").contains("sentinel"));
+            }
+            let _ = drain(&mut rx);
         }
     }
 }
