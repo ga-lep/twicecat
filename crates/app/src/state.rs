@@ -611,7 +611,11 @@ impl App {
     }
 
     /// A boot function for `iced::application`; Iced calls it once.
-    pub fn booter(startup: Startup) -> impl Fn() -> (App, Task<Message>) {
+    ///
+    /// `ui_settings` are the local settings read from disk before the core
+    /// started; they decide notifications, previews and the tray badge from
+    /// the first event.
+    pub fn booter(startup: Startup, ui_settings: UiSettings) -> impl Fn() -> (App, Task<Message>) {
         let startup = Mutex::new(Some(startup));
         move || {
             let startup = startup
@@ -620,10 +624,16 @@ impl App {
                 .take()
                 .expect("iced boots the application exactly once");
             let (mut app, task) = App::new(startup);
+            app.set_ui_settings(ui_settings);
             app.set_notifier(Box::new(notifications::SystemNotifier));
             app.set_tray_factory(Box::new(SystemTrayFactory));
             (app, task)
         }
+    }
+
+    /// Replaces the local settings (read from the settings file at boot).
+    pub fn set_ui_settings(&mut self, settings: UiSettings) {
+        self.ui_settings = settings;
     }
 
     /// Replaces the desktop notification service (tests use a fake).
@@ -8062,6 +8072,26 @@ mod tests {
             let task = notify(&mut rig.app, view("b", NotificationKind::Mention, false));
             assert!(requests(&rig).is_empty());
             assert_eq!(task.units(), 0, "no attention request either");
+        }
+
+        #[test]
+        fn settings_stored_on_disk_reach_the_notification_path() {
+            let mut rig = rig();
+            rig.app.set_ui_settings(UiSettings {
+                show_message_content: false,
+                ..UiSettings::default()
+            });
+            unfocus(&mut rig.app);
+            let _ = notify(&mut rig.app, view("b", NotificationKind::Message, false));
+            let shown = requests(&rig);
+            assert_eq!(shown.len(), 1);
+            assert_eq!(shown[0].toast.body, "New message");
+            rig.app.set_ui_settings(UiSettings {
+                desktop_notifications: false,
+                ..UiSettings::default()
+            });
+            let _ = notify(&mut rig.app, view("c", NotificationKind::Message, false));
+            assert_eq!(requests(&rig).len(), 1, "notifications off shows nothing");
         }
 
         #[test]

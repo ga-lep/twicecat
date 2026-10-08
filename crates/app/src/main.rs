@@ -112,6 +112,8 @@ fn run(options: Options) -> Result<(), String> {
                 None,
             )
         };
+    // Read before the window opens so the stored choices apply from the start.
+    let ui_settings = data.read_settings();
     let config = CoreConfig {
         data,
         homeserver_override: options.homeserver,
@@ -129,7 +131,7 @@ fn run(options: Options) -> Result<(), String> {
 
     // The app (and with it the bridge and the core's runtime) is dropped when
     // `run` returns, before the temporary directory is removed.
-    let result = iced::application(App::booter(startup), App::update, App::view)
+    let result = iced::application(App::booter(startup, ui_settings), App::update, App::view)
         .title(TITLE)
         .subscription(App::subscription)
         .theme(App::theme)

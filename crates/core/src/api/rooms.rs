@@ -349,7 +349,7 @@ impl fmt::Debug for ThreadSummaryView {
 // ---- Local settings ------------------------------------------------------
 
 /// The theme the user picked.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
 pub enum ThemeChoice {
     /// Follow the system.
     #[default]
@@ -368,7 +368,8 @@ pub enum ThemeChoice {
 /// assert_eq!(s.theme, ThemeChoice::System);
 /// assert!(s.desktop_notifications && s.show_message_content && s.tray_badge);
 /// ```
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(default)]
 pub struct UiSettings {
     /// Theme override.
     pub theme: ThemeChoice,
