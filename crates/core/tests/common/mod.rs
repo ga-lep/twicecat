@@ -124,6 +124,7 @@ pub fn start_core_with_call_service(
             data: DataPaths::at(dir),
             homeserver_override: Some(env.homeserver_url().to_owned()),
             room_list_page_size: tessera_core::DEFAULT_ROOM_LIST_PAGE_SIZE,
+            max_upload_bytes_override: None,
             audio,
             call_service_override: call_service,
         },
@@ -159,12 +160,36 @@ pub fn start_core_with_page_size(
     secrets: Arc<InMemorySecretStore>,
     room_list_page_size: usize,
 ) -> CoreHandle {
+    start_core_with(dir, secrets, room_list_page_size, None)
+}
+
+/// Like [`start_core`] with a fake upload limit that replaces the server's.
+pub fn start_core_with_upload_limit(
+    dir: &Path,
+    secrets: Arc<InMemorySecretStore>,
+    max_upload_bytes: u64,
+) -> CoreHandle {
+    start_core_with(
+        dir,
+        secrets,
+        tessera_core::DEFAULT_ROOM_LIST_PAGE_SIZE,
+        Some(max_upload_bytes),
+    )
+}
+
+fn start_core_with(
+    dir: &Path,
+    secrets: Arc<InMemorySecretStore>,
+    room_list_page_size: usize,
+    max_upload_bytes_override: Option<u64>,
+) -> CoreHandle {
     let env = TestEnv::load();
     Core::start(
         CoreConfig {
             data: DataPaths::at(dir),
             homeserver_override: Some(env.homeserver_url().to_owned()),
             room_list_page_size,
+            max_upload_bytes_override,
             audio: silence(),
             call_service_override: None,
         },

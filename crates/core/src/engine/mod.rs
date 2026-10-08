@@ -14,7 +14,7 @@ use matrix_sdk::ruma::OwnedUserId;
 use matrix_sdk::ruma::api::client::receipt::create_receipt::v3::ReceiptType;
 use matrix_sdk::ruma::events::room::message::{MessageType, RoomMessageEventContent};
 use matrix_sdk::send_queue::SendHandle;
-use matrix_sdk::{Client, RoomMemberships, SessionChange};
+use matrix_sdk::{Client, RoomMemberships, RoomState, SessionChange};
 use matrix_sdk_ui::eyeball_im::{Vector, VectorDiff};
 use matrix_sdk_ui::sync_service::SyncService;
 use matrix_sdk_ui::timeline::{
@@ -29,8 +29,8 @@ use zeroize::Zeroizing;
 use crate::api::{
     ActionKind, AudioBackend, AudioDevice, AudioDeviceId, AudioDevices, AudioSettings,
     CallEndReason, CallState, Command, CoreError, CoreEvent, DeviceId, Draft, ListDiff, MediaSize,
-    Member, MessageText, OutgoingMessage, PaginationState, Password, RoomId, RoomListQuery,
-    TypingUser, UserId,
+    Member, MessageText, OutgoingAttachment, OutgoingMessage, PaginationState, Password, RoomId,
+    RoomListQuery, TypingUser, UserId,
 };
 use crate::audio_session::{AudioSession, Mode};
 use crate::avatars::{Avatars, SdkFetcher, answer_unavailable};
@@ -54,6 +54,7 @@ use crate::session::{
 };
 use crate::sync::{CancelTrigger, SdkTarget, SyncControl, SyncPause, cancel_pair, run_supervised};
 use crate::timeline::{map_item, normalize_reaction_key, parse_room_id, rank_members};
+use crate::upload;
 use crate::verification::Target;
 
 /// Events loaded by one back-pagination.
@@ -78,6 +79,9 @@ pub struct CoreConfig {
     pub homeserver_override: Option<String>,
     /// Page size of the room list (`DEFAULT_ROOM_LIST_PAGE_SIZE` is 500).
     pub room_list_page_size: usize,
+    /// Replaces the upload limit the server reports (tests). `None` uses the
+    /// server's.
+    pub max_upload_bytes_override: Option<u64>,
     /// Audio devices for calls and the mic test (`AudioBackend::System`
     /// unless testing).
     pub audio: AudioBackend,
@@ -883,7 +887,6 @@ async fn forward_typing(room_id: RoomId, timeline: Arc<Timeline>, events: mpsc::
 fn unimplemented_target(cmd: &Command) -> Option<(RoomId, ActionKind)> {
     let none = || RoomId::from("");
     Some(match cmd {
-        Command::SendAttachment(a) => (a.room_id.clone(), ActionKind::Upload),
         Command::SetRoomNotificationMode { room_id, .. } => {
             (room_id.clone(), ActionKind::Notifications)
         }
@@ -1334,12 +1337,12 @@ impl Engine {
                 item_id,
                 path,
             } => self.save_media(room_id, item_id, path).await,
+            Command::SendAttachment(attachment) => self.send_attachment(attachment).await,
             // Handled in `run`.
             Command::Shutdown => {}
             // Answered by `unimplemented_target` at the top, until the tasks
             // that implement them land.
-            Command::SendAttachment(_)
-            | Command::SetRoomNotificationMode { .. }
+            Command::SetRoomNotificationMode { .. }
             | Command::SetDefaultNotificationMode { .. }
             | Command::AddKeyword { .. }
             | Command::RemoveKeyword { .. }
@@ -1747,6 +1750,8 @@ impl Engine {
         if let Some(active) = self.active.as_mut() {
             active.security.start(&active.client, &self.events);
             active.media.send_limits(&active.client, &self.events);
+            // Local echoes of uploads carry progress.
+            active.client.send_queue().enable_upload_progress(true);
         }
     }
 
@@ -1820,6 +1825,51 @@ impl Engine {
             result,
         })
         .await;
+    }
+
+    /// Queues a file as a media message. Anything refused here sends nothing
+    /// (no request, no local echo); later failures arrive as `ActionFailed`.
+    async fn send_attachment(&mut self, attachment: OutgoingAttachment) {
+        let room_id = attachment.room_id.clone();
+        let result = self.try_queue_attachment(attachment);
+        if let Err(error) = result {
+            self.emit(CoreEvent::ActionFailed {
+                room_id,
+                action: ActionKind::Upload,
+                error,
+            })
+            .await;
+        }
+    }
+
+    fn try_queue_attachment(&mut self, attachment: OutgoingAttachment) -> Result<(), CoreError> {
+        let limit = self.config.max_upload_bytes_override;
+        let active = self.active.as_mut().ok_or(CoreError::NotLoggedIn)?;
+        let mime = upload::validate(&attachment)?;
+        // Only a joined room takes a file.
+        let joined = parse_room_id(&attachment.room_id)
+            .ok()
+            .and_then(|id| active.client.get_room(&id))
+            .is_some_and(|room| room.state() == RoomState::Joined);
+        if !joined {
+            return Err(CoreError::NotAllowed);
+        }
+        // The local echo appears in the selected room's timeline.
+        let timeline = active
+            .selected
+            .as_ref()
+            .filter(|s| s.room_id == attachment.room_id)
+            .ok_or(CoreError::NoRoomSelected)?
+            .timeline
+            .clone();
+        let job = upload::Job {
+            timeline,
+            attachment,
+            mime,
+        };
+        active
+            .media
+            .queue_upload(&active.client, &self.events, limit, job)
     }
 
     /// Answers `SaveMedia` with `MediaSaved` or `ActionFailed { Media, .. }`.
@@ -2590,6 +2640,7 @@ mod tests {
                 data: DataPaths::at(std::env::temp_dir().join("tessera-unused")),
                 homeserver_override: None,
                 room_list_page_size: DEFAULT_ROOM_LIST_PAGE_SIZE,
+                max_upload_bytes_override: None,
                 audio: AudioBackend::default(),
                 call_service_override: None,
             },
@@ -2684,6 +2735,7 @@ mod tests {
                 data: DataPaths::at(dir),
                 homeserver_override: None,
                 room_list_page_size: DEFAULT_ROOM_LIST_PAGE_SIZE,
+                max_upload_bytes_override: None,
                 audio: AudioBackend::default(),
                 call_service_override: None,
             },
@@ -3547,7 +3599,11 @@ mod tests {
             security: SecurityTasks::new(),
             media: MediaTasks::new(),
         });
-        for (cmd, kind, room) in phase5_commands() {
+        // Uploads are implemented: see the next test.
+        for (cmd, kind, room) in phase5_commands()
+            .into_iter()
+            .filter(|(_, kind, _)| *kind != ActionKind::Upload)
+        {
             engine.handle(cmd).await;
             let got = drain(&mut rx).await;
             assert!(
@@ -3557,6 +3613,65 @@ mod tests {
                         if *room_id == room && *action == kind && why == "not implemented yet"
                 ),
                 "{kind:?}: {got:?}"
+            );
+        }
+        if let Some(mut active) = engine.active.take() {
+            active.stop_tasks().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn an_attachment_for_an_unjoined_room_or_a_bad_mime_is_refused() {
+        use crate::api::{AttachmentData, MediaBytes, MediaKind, OutgoingAttachment};
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut engine, mut rx) = oauth_engine(tmp.path());
+        let client = Client::builder()
+            .homeserver_url("http://127.0.0.1:1")
+            .build()
+            .await
+            .unwrap();
+        engine.active = Some(Active {
+            fetcher: Arc::new(SdkFetcher(client.clone())),
+            client,
+            record: record("@alice:x", "http://127.0.0.1:1", "s1"),
+            changes: broadcast::channel(1).1,
+            sync: None,
+            selected: None,
+            avatars: Avatars::new(),
+            security: SecurityTasks::new(),
+            media: MediaTasks::new(),
+        });
+        let attachment = |room: &str, mimetype: &str| OutgoingAttachment {
+            room_id: rid(room),
+            filename: "a.png".into(),
+            mimetype: mimetype.into(),
+            data: AttachmentData::Bytes(MediaBytes::from(vec![1])),
+            kind: MediaKind::Image,
+            width: None,
+            height: None,
+            thumbnail: None,
+            reply_to: None,
+            thread_root: None,
+        };
+        for (room, mimetype) in [
+            ("!unknown:x", "image/png"),
+            ("!unknown:x", "bad"),
+            ("", "x/y"),
+        ] {
+            engine
+                .handle(Command::SendAttachment(attachment(room, mimetype)))
+                .await;
+            let got = drain(&mut rx).await;
+            assert!(
+                matches!(
+                    got.as_slice(),
+                    [CoreEvent::ActionFailed {
+                        action: ActionKind::Upload,
+                        error: CoreError::NotAllowed,
+                        ..
+                    }]
+                ),
+                "{room:?} {mimetype:?}: {got:?}"
             );
         }
         if let Some(mut active) = engine.active.take() {

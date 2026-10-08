@@ -27,6 +27,7 @@ mod security;
 mod session;
 mod sync;
 mod timeline;
+mod upload;
 mod verification;
 
 pub use cpu_level::require_cpu_level;

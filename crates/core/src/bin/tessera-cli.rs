@@ -946,6 +946,7 @@ async fn main() -> ExitCode {
             data,
             homeserver_override: options.homeserver,
             room_list_page_size: DEFAULT_ROOM_LIST_PAGE_SIZE,
+            max_upload_bytes_override: None,
             audio: if options.silent_audio {
                 AudioBackend::Virtual(Arc::new(Silence))
             } else {

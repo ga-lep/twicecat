@@ -16,7 +16,7 @@ use matrix_sdk_ui::timeline::{
 use crate::api::{
     CoreError, EventId, ItemActions, Member, MessageDetails, MessageKind, PlaceholderKind,
     ReactionGroup, ReplyPreview, ReplyState, RoomId, SendFailure, SendStatus, Shield, ShieldCode,
-    StateChange, TimelineItem, TimelineItemKind, UserId, UtdReason,
+    StateChange, TimelineItem, TimelineItemKind, UploadProgress, UserId, UtdReason,
 };
 use crate::{media, rich_text};
 
@@ -42,6 +42,19 @@ pub(crate) fn map_send_state(state: &EventSendState) -> SendStatus {
         EventSendState::NotSentYet { .. } => SendStatus::Sending,
         EventSendState::SendingFailed { .. } => SendStatus::Failed,
         EventSendState::Sent { .. } => SendStatus::Sent,
+    }
+}
+
+/// The upload progress of a local echo, when the SDK reports one.
+pub(crate) fn map_upload_progress(state: Option<&EventSendState>) -> Option<UploadProgress> {
+    match state {
+        Some(EventSendState::NotSentYet {
+            progress: Some(p), ..
+        }) => Some(UploadProgress {
+            sent: p.progress.current as u64,
+            total: p.progress.total as u64,
+        }),
+        _ => None,
     }
 }
 
@@ -162,7 +175,10 @@ fn map_event(event: &EventTimelineItem, own: Option<&SdkUserId>) -> TimelineItem
                         _ => None,
                     },
                     shield: map_shield(event.get_shield(false)),
-                    media: media.map(Box::new),
+                    media: media.map(|mut m| {
+                        m.upload = map_upload_progress(event.send_state());
+                        Box::new(m)
+                    }),
                     thread: None,
                 };
                 // A remote event has no send state: the server accepted it.
@@ -603,6 +619,43 @@ mod tests {
         assert_eq!(map_send_state(&not_yet), SendStatus::Sending);
         assert_eq!(map_send_state(&failed), SendStatus::Failed);
         assert_eq!(map_send_state(&sent), SendStatus::Sent);
+    }
+
+    #[test]
+    fn upload_progress_mapping_table() {
+        use matrix_sdk::send_queue::AbstractProgress;
+        use matrix_sdk_ui::timeline::MediaUploadProgress;
+        let progress = |current, total| EventSendState::NotSentYet {
+            progress: Some(MediaUploadProgress {
+                index: 0,
+                progress: AbstractProgress { current, total },
+            }),
+        };
+        let failed = EventSendState::SendingFailed {
+            error: std::sync::Arc::new(matrix_sdk::Error::AuthenticationRequired),
+            is_recoverable: true,
+        };
+        let sent = EventSendState::Sent {
+            event_id: event_id!("$e:localhost").to_owned(),
+        };
+        assert_eq!(
+            map_upload_progress(Some(&progress(5, 20))),
+            Some(UploadProgress { sent: 5, total: 20 })
+        );
+        assert_eq!(
+            map_upload_progress(Some(&progress(0, 0))),
+            Some(UploadProgress { sent: 0, total: 0 })
+        );
+        for other in [
+            None,
+            Some(&EventSendState::NotSentYet { progress: None }),
+            Some(&failed),
+            Some(&sent),
+        ] {
+            assert_eq!(map_upload_progress(other), None);
+        }
+        // A progress state is still "sending".
+        assert_eq!(map_send_state(&progress(1, 2)), SendStatus::Sending);
     }
 
     fn uid(s: &str) -> matrix_sdk::ruma::OwnedUserId {

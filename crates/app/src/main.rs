@@ -116,6 +116,7 @@ fn run(options: Options) -> Result<(), String> {
         data,
         homeserver_override: options.homeserver,
         room_list_page_size: DEFAULT_ROOM_LIST_PAGE_SIZE,
+        max_upload_bytes_override: None,
         audio: AudioBackend::System,
         call_service_override: None,
     };

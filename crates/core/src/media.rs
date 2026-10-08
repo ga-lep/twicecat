@@ -19,6 +19,7 @@ use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinSet;
 
 use crate::api::{CoreError, CoreEvent, MediaBytes, MediaContent, MediaKind, MediaSize};
+use crate::upload::UploadQueue;
 
 /// Fetches running at the same time (thumbnails and files together).
 pub(crate) const MAX_CONCURRENT_FETCHES: usize = 4;
@@ -399,6 +400,8 @@ pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()>
 pub(crate) struct MediaTasks {
     pub(crate) permits: std::sync::Arc<Semaphore>,
     tasks: JoinSet<()>,
+    /// Queues attachments in order; started by the first upload.
+    uploads: Option<UploadQueue>,
 }
 
 impl MediaTasks {
@@ -406,7 +409,24 @@ impl MediaTasks {
         Self {
             permits: std::sync::Arc::new(Semaphore::new(MAX_CONCURRENT_FETCHES)),
             tasks: JoinSet::new(),
+            uploads: None,
         }
+    }
+
+    /// Queues an upload behind the earlier ones. The worker starts with the
+    /// first call; `limit_override` replaces the server's limit.
+    pub(crate) fn queue_upload(
+        &mut self,
+        client: &Client,
+        events: &mpsc::Sender<CoreEvent>,
+        limit_override: Option<u64>,
+        job: crate::upload::Job,
+    ) -> Result<(), CoreError> {
+        self.uploads
+            .get_or_insert_with(|| {
+                UploadQueue::start(client.clone(), events.clone(), limit_override)
+            })
+            .submit(job)
     }
 
     /// Runs `work` in the background. `false` when too many are pending.
@@ -441,6 +461,9 @@ impl MediaTasks {
 
     /// Ends every task; they hold clones of the client.
     pub(crate) async fn stop(&mut self) {
+        if let Some(uploads) = self.uploads.take() {
+            uploads.stop().await;
+        }
         self.tasks.shutdown().await;
     }
 }
