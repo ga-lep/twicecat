@@ -550,6 +550,9 @@ impl std::fmt::Debug for App {
             .field("rooms_ui", &self.rooms_ui)
             .field("spaces", &self.spaces)
             .field("threads", &self.threads)
+            .field("settings_ui", &self.settings_ui)
+            .field("switcher", &self.switcher)
+            .field("notification_settings", &self.notification_settings)
             .field("login", &self.login)
             .field("login_in_flight", &self.login_in_flight)
             .field("composer", &self.composer)
@@ -10945,6 +10948,259 @@ mod tests {
                 captured: true,
             });
             assert!(app.threads.panel.is_none());
+        }
+    }
+
+    // ---- Task 17: Phase 5 redaction sweep ----
+
+    /// One sentinel per kind of Phase 5 text. Each is built into the state
+    /// or message that carries it, and none may come back out in a `Debug`
+    /// string of the app or of any message.
+    mod redaction_sweep {
+        use std::path::PathBuf;
+
+        use tessera_core::api::{
+            AvatarId, EventId, MediaKind, MembershipView, NotificationKind,
+            NotificationSettingsView, NotificationView, OwnProfileView, PowerLevelView, Role,
+            RoomDetailsView, RoomMemberView, RoomNotificationModeView as Mode, RoomPermissions,
+        };
+
+        use super::*;
+        use crate::dialogs::{ClipboardContent, RecordingDialogs};
+        use crate::notifications::RecordingNotifier;
+        use crate::rooms::RoomsMessage as R;
+        use crate::settings::SettingsMessage as S;
+        use crate::switcher::SwitcherMessage as W;
+        use crate::threads::ThreadsMessage as T;
+        use crate::upload::UploadPaths;
+
+        const SENTINELS: [&str; 12] = [
+            "sweep-file-name",
+            "sweep-save-path",
+            "sweep-upload-name",
+            "sweep-upload-body",
+            "sweep-preview",
+            "sweep-room-name",
+            "sweep-sender-name",
+            "sweep-topic",
+            "sweep-member",
+            "sweep-draft",
+            "sweep-keyword",
+            "sweep-query",
+        ];
+
+        fn text(s: &str) -> MessageText {
+            MessageText::from(s)
+        }
+
+        /// Fails if a sentinel is in the app's `Debug` or in the `Debug` of
+        /// any of `messages`.
+        fn sweep(context: &str, app: &App, messages: &[Message]) {
+            assert_no_sentinel(context, &format!("{app:?}"), &SENTINELS);
+            for message in messages {
+                assert_no_sentinel(context, &format!("{message:?}"), &SENTINELS);
+            }
+        }
+
+        #[test]
+        fn the_media_viewer_and_cache_hold_no_names_or_paths_in_debug() {
+            let (mut app, mut rx, _) = media_app(0);
+            let item = media_item("pic", MediaKind::Image, "sweep-file-name.png", 640, 480);
+            let _ = app.update(core(CoreEvent::TimelineDiff {
+                room_id: room_a(),
+                diffs: vec![ListDiff::Append { values: vec![item] }],
+            }));
+            let _ = drain(&mut rx);
+            arrive(&mut app, "pic", Some(decoded(8, 6)));
+            let _ = app.update(Message::MediaClicked("pic".into()));
+            let _ = app.update(media_event("pic", MediaSize::Full, Ok(png(9, 7))));
+            let decoded_full = Message::MediaDecoded {
+                room_id: room_a(),
+                item_id: "pic".into(),
+                size: MediaSize::Full,
+                decoded: Some(decoded(9, 7)),
+            };
+            let _ = app.update(decoded_full.clone());
+            let chosen = Message::SavePicked {
+                room_id: room_a(),
+                item_id: "pic".into(),
+                path: Some(media::SavePath::from(PathBuf::from(
+                    "/home/u/sweep-save-path",
+                ))),
+            };
+            let _ = app.update(chosen.clone());
+            assert!(app.media.viewer.is_some(), "the viewer is open");
+            sweep(
+                "media viewer and cache",
+                &app,
+                &[
+                    decoded_full,
+                    chosen,
+                    media_event("pic", MediaSize::Full, Ok(png(2, 2))),
+                ],
+            );
+        }
+
+        #[test]
+        fn the_upload_confirmation_with_a_pasted_image_holds_no_names_or_bytes_in_debug() {
+            let (mut app, _rx) = main_app();
+            let dialogs = RecordingDialogs::default();
+            app.set_dialogs(Box::new(dialogs));
+            let pasted = Message::Pasted(ClipboardContent::Image {
+                width: 2,
+                height: 2,
+                rgba: Arc::new(vec![171; 16]),
+            });
+            let _ = app.update(pasted.clone());
+            // A drop waits for its debounce with the path in the model.
+            let dropped = Message::FileDropped(UploadPaths(vec![PathBuf::from(
+                "/home/u/sweep-upload-name-dropped.txt",
+            )]));
+            let _ = app.update(dropped.clone());
+            assert!(!app.uploads.dropped.is_empty(), "the drop is waiting");
+            sweep("dropped file in its debounce", &app, &[dropped]);
+            app.uploads.dropped.clear();
+            let chosen = Message::FilesChosen(UploadPaths(vec![PathBuf::from(
+                "/home/u/sweep-upload-name.txt",
+            )]));
+            let _ = app.update(chosen.clone());
+            let dialog = app.uploads.dialog.as_ref().expect("a confirmation");
+            assert_eq!(dialog.entries.len(), 2, "the picture and the file");
+            let ids: Vec<u64> = dialog.entries.iter().map(|e| e.id).collect();
+            let prepared = Message::UploadPrepared {
+                entry: ids[1],
+                outcome: Box::new(crate::upload::prepare_bytes(
+                    "sweep-upload-name.txt".to_owned(),
+                    b"sweep-upload-body".to_vec(),
+                    None,
+                )),
+            };
+            let _ = app.update(prepared.clone());
+            sweep("upload confirmation", &app, &[pasted, chosen, prepared]);
+            assert!(!format!("{app:?}").contains("171, 171"), "no pixels");
+        }
+
+        #[test]
+        fn a_pending_notification_holds_no_text_in_debug() {
+            let (mut app, _rx) = main_app();
+            let notifier = RecordingNotifier::default();
+            let shown = notifier.shown.clone();
+            app.set_notifier(Box::new(notifier));
+            let _ = app.update(Message::WindowFocus(false));
+            let view = NotificationView {
+                room_id: RoomId::from("!b:x"),
+                event_id: EventId::from("$e"),
+                room_name: "sweep-room-name".into(),
+                sender: UserId::from("@bob:x"),
+                sender_name: Some("sweep-sender-name".into()),
+                is_dm: false,
+                kind: NotificationKind::Message,
+                preview: Some(text("sweep-preview")),
+            };
+            let event = core(CoreEvent::Notification(view));
+            let _ = app.update(event.clone());
+            let requests = shown.lock().expect("test mutex").clone();
+            assert_eq!(requests.len(), 1, "the notification reached the desktop");
+            assert_no_sentinel("notification request", &format!("{requests:?}"), &SENTINELS);
+            sweep("pending notification", &app, &[event]);
+        }
+
+        #[test]
+        fn room_settings_with_a_topic_and_the_member_list_hold_no_text_in_debug() {
+            let (mut app, mut rx) = main_app();
+            let rooms = |app: &mut App, m: R| {
+                let _ = app.update(Message::Rooms(m));
+            };
+            rooms(&mut app, R::OpenSettings);
+            let _ = drain(&mut rx);
+            let details = core(CoreEvent::RoomDetails(RoomDetailsView {
+                room_id: room_a(),
+                name: "sweep-room-name".into(),
+                topic: Some("sweep-topic".into()),
+                avatar: None,
+                is_encrypted: false,
+                alias: None,
+                permissions: RoomPermissions {
+                    can_set_name: true,
+                    can_set_topic: true,
+                    can_set_avatar: true,
+                    can_enable_encryption: true,
+                    can_invite: true,
+                },
+            }));
+            let _ = app.update(details.clone());
+            let typed = Message::Rooms(R::TopicInput(text("sweep-topic")));
+            let _ = app.update(typed.clone());
+            rooms(&mut app, R::OpenMembers);
+            let members = core(CoreEvent::RoomMembers {
+                room_id: room_a(),
+                members: vec![RoomMemberView {
+                    user_id: UserId::from("@bob:x"),
+                    display_name: Some("sweep-member".into()),
+                    avatar: None,
+                    power: PowerLevelView::Level(0),
+                    role: Role::User,
+                    membership: MembershipView::Joined,
+                }],
+                truncated: false,
+            });
+            let _ = app.update(members.clone());
+            sweep(
+                "room settings and members",
+                &app,
+                &[details, typed, members],
+            );
+        }
+
+        #[test]
+        fn the_thread_panel_with_a_draft_holds_no_text_in_debug() {
+            let (mut app, _rx) = main_app();
+            let root = EventId::from("$r:x");
+            let _ = app.update(Message::Threads(T::Open(root)));
+            let draft = Message::Threads(T::Draft(text("sweep-draft")));
+            let _ = app.update(draft.clone());
+            let panel = app.threads.panel.as_ref().expect("an open thread");
+            assert_eq!(panel.draft, "sweep-draft", "the draft is kept");
+            sweep("thread panel", &app, &[draft]);
+        }
+
+        #[test]
+        fn the_settings_screen_with_keywords_holds_no_text_in_debug() {
+            let (mut app, _rx) = main_app();
+            let _ = app.update(Message::Settings(S::Open));
+            let _ = app.update(core(CoreEvent::OwnProfile(OwnProfileView {
+                display_name: Some("sweep-member".into()),
+                avatar: Some(AvatarId::from("mxc://x/a")),
+            })));
+            let settings = core(CoreEvent::NotificationSettings(NotificationSettingsView {
+                group_default: Mode::AllMessages,
+                dm_default: Mode::AllMessages,
+                keywords: vec!["sweep-keyword".into()],
+            }));
+            let _ = app.update(settings.clone());
+            let typed = Message::Settings(S::KeywordInput(text("sweep-keyword")));
+            let _ = app.update(typed.clone());
+            let removal = Message::Settings(S::RemoveKeyword(text("sweep-keyword")));
+            assert!(app.settings_ui.open, "the screen is open");
+            sweep("settings screen", &app, &[settings, typed, removal]);
+        }
+
+        #[test]
+        fn the_switcher_with_a_query_holds_no_text_in_debug() {
+            let (mut app, _rx) = main_app();
+            let _ = app.open_switcher();
+            let typed = Message::Switcher(W::Input("sweep-query".into()));
+            let _ = app.update(typed.clone());
+            assert_eq!(app.switcher.query, "sweep-query", "the query is kept");
+            sweep("switcher", &app, &[typed]);
+        }
+
+        #[test]
+        fn the_app_debug_reports_the_settings_screen_and_the_switcher() {
+            let (app, _rx) = main_app();
+            let shown = format!("{app:?}");
+            assert!(shown.contains("settings_ui"), "{shown}");
+            assert!(shown.contains("switcher"), "{shown}");
         }
     }
 }

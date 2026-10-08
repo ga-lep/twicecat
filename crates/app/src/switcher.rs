@@ -6,6 +6,8 @@
 //! matches also asks the core to search (`SetRoomListQuery`), which changes
 //! the sidebar list for as long as the switcher is open.
 
+use std::fmt;
+
 use iced::Task;
 use tessera_core::api::{RoomId, RoomListQuery, RoomListTab, RoomSummary};
 
@@ -117,8 +119,8 @@ pub fn rank_rooms<'a>(
         .collect()
 }
 
-/// The switcher's state.
-#[derive(Debug, Clone, Default)]
+/// The switcher's state. `Debug` hides the query and the room names.
+#[derive(Clone, Default)]
 pub struct SwitcherModel {
     /// The switcher is open.
     pub open: bool,
@@ -133,8 +135,20 @@ pub struct SwitcherModel {
     pub seed: Vec<RoomSummary>,
 }
 
-/// A message of the switcher.
-#[derive(Debug, Clone)]
+impl fmt::Debug for SwitcherModel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SwitcherModel")
+            .field("open", &self.open)
+            .field("query", &self.query.chars().count())
+            .field("selected", &self.selected)
+            .field("restore", &self.restore.is_some())
+            .field("seed", &self.seed.len())
+            .finish()
+    }
+}
+
+/// A message of the switcher. `Debug` hides the typed text.
+#[derive(Clone)]
 pub enum SwitcherMessage {
     /// The field changed.
     Input(String),
@@ -148,6 +162,19 @@ pub enum SwitcherMessage {
     Pick(RoomId),
     /// Close without choosing.
     Close,
+}
+
+impl fmt::Debug for SwitcherMessage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Input(text) => write!(f, "Input({} chars)", text.chars().count()),
+            Self::Next => f.write_str("Next"),
+            Self::Previous => f.write_str("Previous"),
+            Self::Submit => f.write_str("Submit"),
+            Self::Pick(id) => f.debug_tuple("Pick").field(id).finish(),
+            Self::Close => f.write_str("Close"),
+        }
+    }
 }
 
 impl SwitcherModel {

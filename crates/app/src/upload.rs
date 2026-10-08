@@ -602,8 +602,9 @@ impl UploadDialog {
     }
 }
 
-/// Everything the app keeps about uploads.
-#[derive(Debug, Default)]
+/// Everything the app keeps about uploads. `Debug` shows how many files wait
+/// for the drop debounce, not their paths.
+#[derive(Default)]
 pub struct UploadModel {
     /// The server's upload limit, once it has said.
     pub max_upload_bytes: Option<u64>,
@@ -619,6 +620,20 @@ pub struct UploadModel {
     /// open, `None` for the room's own timeline.
     pub thread_root: Option<EventId>,
     next_entry: u64,
+}
+
+impl fmt::Debug for UploadModel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UploadModel")
+            .field("max_upload_bytes", &self.max_upload_bytes)
+            .field("hovering", &self.hovering)
+            .field("dropped", &self.dropped.len())
+            .field("drop_seq", &self.drop_seq)
+            .field("dialog", &self.dialog)
+            .field("thread_root", &self.thread_root)
+            .field("next_entry", &self.next_entry)
+            .finish()
+    }
 }
 
 impl UploadModel {
