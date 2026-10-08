@@ -475,6 +475,7 @@ async fn report(
                 max_wake_us: u32::try_from(io.take_recent_max_wake_us()).unwrap_or(u32::MAX),
                 capture_overruns: since(now.capture_overruns, last_io.capture_overruns),
                 playback_underruns: since(now.playback_underruns, last_io.playback_underruns),
+                remote_cleaning: remote_cleaning.lock().ok().and_then(|r| *r),
             });
             last_io = now;
             if events.send(stats).await.is_err() {
