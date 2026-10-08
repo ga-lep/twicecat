@@ -5,3 +5,20 @@ edition.workspace = true
 repository.workspace = true
 license.workspace = true
 publish = false
+
+[dependencies]
+# X11, Windows and macOS hotkeys (the key is grabbed: other apps do not see it).
+global-hotkey = "=0.8.0"
+# Gamepads (Steam Input's virtual pads included).
+gilrs = "=0.11.2"
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+tracing = "0.1"
+
+# Wayland: the xdg-desktop-portal GlobalShortcuts portal (KDE, GNOME).
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd = { version = "=0.13.13", default-features = false, features = ["tokio", "global_shortcuts"] }
+futures-util = "0.3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }

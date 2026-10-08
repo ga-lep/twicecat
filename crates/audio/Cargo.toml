@@ -1,0 +1,54 @@
+[package]
+name = "tessera-audio"
+version = "0.1.0"
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+cpal = "=0.18.2"
+rtrb = "=0.4.0"
+rubato = "=5.0.1"
+sonora = "=0.2.0"
+nnnoiseless = { version = "=0.5.2", default-features = false }
+thiserror = "2"
+tracing = "0.1"
+# DeepFilterNet3 (Task 13): its ONNX graphs, run frame by frame with their
+# state by tract-pulse; the STFT and features are ours (crate::dfn).
+tract-onnx = "=0.23.8"
+tract-pulse = "=0.23.8"
+realfft = "3"
+# Opt-in GPU speech enhancement (Task 13b): ONNX Runtime, loaded at run time
+# from the pinned download of scripts/fetch-onnxruntime.sh; nothing is
+# downloaded or linked at build time (`load-dynamic`).
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "load-dynamic", "api-28", "tracing", "cuda", "tensorrt", "directml", "coreml"], optional = true }
+
+# The CUDA runtime's copy functions for the GPU loop (src/onnx/stateful_loop.rs),
+# from the library ONNX Runtime's CUDA provider loaded; already ort's own
+# loader, same version.
+libloading = { version = "=0.9.0", optional = true }
+
+[features]
+# GPU speech enhancement through ONNX Runtime (plan Task 13b). Off by default.
+onnxruntime = ["dep:ort", "dep:libloading"]
+
+# Windows and macOS: real-time priority for the processing thread through
+# the system's audio scheduling (MMCSS; the time-constraint policy), as
+# Firefox does (plan Task 15). The 0.35 line is the one cpal accepts, so one
+# copy serves both; on Windows cpal's own WASAPI threads use it too
+# (`realtime`). On Linux PipeWire's real-time module does this (src/pw).
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+audio_thread_priority = { version = "=0.35.1", default-features = false }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+cpal = { version = "=0.18.2", features = ["realtime"] }
+
+# Linux: our own PipeWire client (src/pw, plan decision 12): call-role
+# streams in the graph's real-time cycle, devices and changes from the
+# registry. cpal is used only without a PipeWire daemon (ALSA then). The
+# pw_* stubs in libwebrtc, which would take libpipewire's place, are renamed
+# by scripts/fetch-libwebrtc.sh.
+[target.'cfg(target_os = "linux")'.dependencies]
+pipewire = { version = "=0.10.1", features = ["v0_3_53"] }
+serde_json = "1"

@@ -1018,6 +1018,18 @@ impl App {
             }
             CoreEvent::UserTrust { user_id, trust } => self.remember_trust(user_id, trust),
             CoreEvent::Devices(list) => self.on_devices_event(list),
+            // Calls and audio have no UI yet (Phase 6 UI tasks).
+            CoreEvent::CallState(_)
+            | CoreEvent::CallParticipants { .. }
+            | CoreEvent::ActiveCall { .. }
+            | CoreEvent::IncomingCall { .. }
+            | CoreEvent::RingingStopped { .. }
+            | CoreEvent::CallDeclined { .. }
+            | CoreEvent::AudioDevices(_)
+            | CoreEvent::AudioSettings(_)
+            | CoreEvent::InputLevel(_)
+            | CoreEvent::AudioStats(_)
+            | CoreEvent::GpuEnhancement(_) => {}
         }
         task
     }

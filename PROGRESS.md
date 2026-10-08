@@ -9,6 +9,7 @@
 - Phase 1 Task 4 (human-approved, rule 3): zeroize 1.9.0 (`zeroize = { version = "1.9", features = ["serde"] }`, already in Cargo.lock; lock diff only adds the edge and zeroize's serde edge)
 - Phase 2 Task 1 (plan Q1, adopted under the human's standing pre-authorization 2026-10-01; revisit at checkpoint): `crates/app` gains `iced = { version = "=0.14.0", features = ["image-without-codecs"] }` (pin unchanged), `image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }`, `tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }`, `open = "5"` (5.4.4). `Cargo.lock` adds packages only (16): the 13 image crates (byteorder-lite 0.1.0, fdeflate 0.3.7, image 0.25.10, image-webp 0.2.4, kamadak-exif 0.6.1, miniz_oxide 0.8.9, moxcms 0.8.1, mutate_once 0.1.2, png 0.18.1, pxfm 0.1.30, quick-error 2.0.1, zune-core 0.5.3, zune-jpeg 0.5.15) plus open 5.4.4, is-wsl 0.4.0, is-docker 0.2.0. No existing version changed; the only edit to an existing entry is flate2's `miniz_oxide` dependency line, which becomes `miniz_oxide 0.9.1` because two versions now coexist. `deny.toml` unchanged.
 - Phase 3 Task 1 (plan Q2, Q3; approved by the human 2026-10-02): matrix-sdk keeps the pin `=0.19.1` and gains the `markdown` feature; `crates/app` gains `emojis = "0.9"` (0.9.0), `chrono = { version = "0.4", default-features = false, features = ["clock"] }` (0.4.45) and a dev-only `iced = { version = "=0.14.0", features = ["image-without-codecs", "advanced"] }`. `Cargo.lock` adds exactly pulldown-cmark 0.13.4, pulldown-cmark-escape 0.11.0 and unicase 2.9.0 (sorted name/version comparison before vs after: only those three lines differ; no existing version changed). `deny.toml` gains only the RUSTSEC-2026-0319 ignore (anymap2 unmaintained via matrix-sdk 0.19.1); that advisory failure was pre-existing on `main`.
+- Phase 6 (calls, human-approved 2026-10-02, newest releases, exact pins; each crate is added in the task that first uses it): livekit =0.9.3 (`default-features = false`, features `native`, `rustls-tls-native-roots`; pulls libwebrtc 0.3.50 and webrtc-sys 0.3.47); prebuilt libwebrtc tag `webrtc-89d790b`, SHA-256 pinned in scripts/libwebrtc.sha256. Planned: cpal =0.18.2, rtrb =0.4.0, rubato =5.0.1, sonora =0.2.0, nnnoiseless =0.5.2, tract-onnx =0.23.8, global-hotkey =0.8.0, ashpd =0.13.13, gilrs =0.11.2, matrix-sdk feature `experimental-send-custom-to-device`. Compose: livekit/livekit-server:v1.13.7, ghcr.io/element-hq/lk-jwt-service:v0.7.0.
 
 ## Phase 3 steps
 - [x] 1. Phase 3 dependencies, advisory triage, ledger (phase3.1)
@@ -1172,3 +1173,162 @@ Phase 2 signed off by the human on 2026-10-02 (merge of PR #3). Every other unti
 - A first bridge run failed (my bug, not a flake): a `Security` status already in flight ended the reset wait early. Fixed test-first (`a_status_from_before_the_reset_does_not_end_it`): a running reset ends only on a status with the device verified and recovery disabled (`reset_finished`), or on a failure event.
 - Checks: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo test --workspace` (app lib 461), `scripts/check-app-deps.sh`, `scripts/check-core-api.sh` all pass. Ignored: `cargo test -p tessera-app --test bridge -- --ignored` (3 tests, about 5 s) right after `scripts/create-test-users.sh`, then repeated: both green.
 - Fix round (phase4.10): on close, exit now waits until the clipboard read has been answered and the clear write issued (`flushes_pending`, `core_closed`, `App::exit_if_flushed`); `ShutdownDeadline` still exits at once. The restore field is emptied on **Back** and whenever `on_status` closes the Restore screen. Tests first (both failed before the code).
+
+## Phase 6 steps (calls: MatrixRTC, LiveKit SFU, native audio; plan docs/plans/phase6-calls.md)
+Order (revised 2026-10-02, plan decision 12; again 2026-10-03 by the human): 1–8, 8b, 9, 10, 11, 12, 14, 13, then 15 and 13b. Deferred options (audio-only libwebrtc build, pure-Rust WebRTC stack, PulseAudio backend) are recorded in the plan.
+- [x] 1. libwebrtc supply chain (pinned SHA-256 fetch script, fail-closed build) and livekit dependency (phase6.1)
+- [x] 2. Local SFU stack (LiveKit server, lk-jwt-service, Synapse MatrixRTC config)
+- [x] 3. Call API contract and settings persistence
+- [x] 4. Audio devices and I/O threads (tessera-audio, cpal PipeWire)
+- [x] 5. Processing chain (sonora AEC3/NS/AGC2, denormal guard, RNNoise, gate, PTT tail)
+- [x] 6. Mixer and playout (per-user volume, deafen, AEC render tap, mic test)
+- [x] 7. MatrixRTC signalling (transports, JWT, m.call.member, delayed leave)
+- [x] 8. LiveKit media (publish, subscribe, reconnection; own SFU)
+- [x] 8b. Multi-SFU (subscribe to other members' SFUs; cross-homeserver calls)
+- [x] 9. Call E2EE (per-sender keys over to-device)
+- [x] 10. Ringing and voice rooms (MSC4075 notifications, MSC4310 declines, call counts, MSC3417 rooms)
+- [x] 11. Push-to-talk service (global-hotkey, portal, gamepad, in-window)
+- [x] 12. CLI call commands
+- [x] 13. DeepFilterNet3 via tract-onnx + tract-pulse, pluggable enhancer
+- [x] 13b. GPU speech enhancement, opt-in (part 1: pinned ONNX Runtime, `onnxruntime` feature, accelerator probing and CPU fallback; part 2: stateful DeepFilterNet3 export, CUDA graph loop, `gpu` setting, probe and status; part 3: TensorRT, preferred; part 4: WebGPU plugin provider for other GPUs, with graph capture; batching (Task 16) and Maxine not done)
+- [x] 14. Own PipeWire client on Linux (communication role, latency, registry events, system-mix echo reference)
+- [ ] 15. Steam Frame performance (CPU budget per mode, Frame defaults, rtkit priority) — part 1 done: profiling harness and x86_64 per-stage numbers; part 3: real-time priority on Linux, wake-ups; part 4: Windows and macOS priority, lateness in `AudioStats`, Opus cost; open: aarch64 numbers and Frame defaults
+- [ ] 16. Cleaning other people's voices, opt-in (added 2026-10-03; batched on the GPU; skip voices whose clients say they are already clean) — part 1 done: on the CPU, settings, per-person choice, status, limit; part 1b: silent voices rest, loudest talkers first; part 2 done: the skip signal and policy; part 3 done: batched GPU (open: the human checks)
+
+## Phase 6 summary (compacted 2026-10-04 for review)
+The per-task notes (checks run, every API read with its source line, every measurement) were compacted here on 2026-10-04; the full text is in git history (`git show fd452df..HEAD -- PROGRESS.md`, or `PROGRESS.md` at the branch's commits). The plan (`docs/plans/phase6-calls.md`) keeps the design and the measurements per task.
+
+### What each task built
+| Task | Built | Where |
+|---|---|---|
+| 1 | libwebrtc fetched by `scripts/fetch-libwebrtc.sh` (pinned SHA-256, fails closed; webrtc-sys never downloads: `dev/libwebrtc` always exists); its weak `pw_*` stubs renamed so they cannot shadow libpipewire; livekit =0.9.3 | `scripts/`, `.cargo/config.toml` |
+| 2 | Local SFU stack: two LiveKit servers and two lk-jwt-services (multi-SFU tests), Synapse with MatrixRTC transports and delayed events | `docker-compose.yml`, `dev/` |
+| 3 | Call and audio API (SDK-free), `call_settings.json` (versioned, atomic, 0600) | `core/src/api/{call,audio}.rs`, `core/src/call_settings.rs` |
+| 4, 14 | Device I/O: our own PipeWire client on Linux (communication role, 10 ms quanta, hot-plug from registry events, the system mix as echo reference), cpal elsewhere; resampling to 48 kHz 10 ms frames; lock-free rings | `audio/src/{io,pw,pipeline,resample,devices}` |
+| 5 | Processing chain: high-pass, AEC3, WebRTC NS / RNNoise / a plugged enhancer, AGC2, gain, gate or push-to-talk, limiter (sonora, nnnoiseless); denormal guard | `audio/src/{chain,gate,denormals}.rs` |
+| 6 | Voice engine: per-source volume, deafen, mic-test loopback, the echo reference is exactly what is played | `audio/src/voice/` |
+| 7 | MatrixRTC signalling as Element Call's compatibility mode: transports (MSC4143), JWT, `m.call.member`, delayed leave (MSC4140) restarted every 4 s, refresh before expiry, rejoin when the membership vanishes | `core/src/call/{membership,own_membership,jwt}.rs` |
+| 8, 8b | LiveKit media: publish the processed microphone, play members' tracks; one connection per SFU (other homeservers' SFUs subscribe-only), only active members played; call audio on its own thread | `core/src/call/{media,sfus,participants}.rs` |
+| 9 | Call E2EE as Element Call (per-sender keys over Olm to-device, rotation on leave, keys only from verified Olm senders) | `core/src/call/e2ee.rs` |
+| 10 | Ringing and voice rooms (MSC4075 notifications, MSC4310 declines, call counts, MSC3417 rooms) | `core/src/call/{ringing,watcher}.rs` |
+| 11 | Push-to-talk service: global hotkey (X11, Windows, macOS), the GlobalShortcuts portal (Wayland), gamepad, in-window | `crates/ptt` |
+| 12 | `tessera-cli` call and audio commands | `core/src/bin/tessera-cli/calls/` |
+| 13 | DeepFilterNet3 on tract (our STFT, features and deep filter around the pulsed networks), pinned models | `audio/src/dfn/` |
+| 13b | Opt-in GPU DeepFilterNet3 through ONNX Runtime (feature `onnxruntime` / `gpu-enhancement`): pinned runtime, stateful export, TensorRT then CUDA (state on the GPU, captured CUDA graph), WebGPU plugin for other GPUs; CPU fallback on error or missed deadlines | `audio/src/onnx/`, `audio/src/dfn/{filter,gpu,stateful}.rs`, `core/src/gpu_enhancement.rs` |
+| 15 | Profiling harness, x86-64-v3 builds with a CPUID check, real-time priority (PipeWire's module on Linux, MMCSS / time-constraint elsewhere), lateness and xruns in `AudioStats`, Opus cost measured | `audio/examples/voice_profile.rs`, `core/src/cpu_level.rs`, `core/examples/opus_profile.rs` |
+| 16 | Cleaning other people's voices, opt-in: per-voice CPU filters for the talkers (quiet voices rest, loudest first, at most 4 at once, 16 per call); skip voices cleaned at their source (our LiveKit attribute `tessera.voice_cleaning`, LiveKit track flags); one batched GPU call per frame for all voices | `core/src/call/cleaning/`, `audio/src/voice/sources.rs`, `audio/src/dfn/bank.rs` |
+
+### Measurements that matter (i9-14900K, release, per 10 ms frame)
+| Path | P-core | E-core |
+|---|---|---|
+| Default chain (HPF, AEC3, RNNoise, AGC2) | 80 µs | 158 µs |
+| Mixing | 0.8 µs per voice | |
+| DeepFilterNet3 on the CPU (microphone) | 270 µs | 517 µs |
+| Engine, 4 voices talking, all cleaned on the CPU | 1.18 ms | 2.25 ms |
+| Engine, 16 voices cleaned in the GPU bank (TensorRT, RTX 5090) | 290 µs | 470 µs |
+| DeepFilterNet3 on the GPU, one voice: TensorRT / CUDA / WebGPU | 0.13 / 0.35 / 0.59 ms (37 / 58 / 420 µs of CPU) | |
+| Opus encode, 64 kb/s complexity 9: voice / room noise / digital silence | 20.6 / 68 / 30.6 µs | silence 210 µs |
+| Wake latency under full CPU load: real-time / normal priority | worst 0.1 ms / 3.2–4.4 ms | |
+
+Quality: DeepFilterNet3 lifts speech in noise from 5.1 to 14.6 dB SNR (RNNoise 8.7 dB) on DeepFilterNet's sample clips; the GPU paths agree with the CPU within 63 dB or better; AEC3 removes 20 dB or more of a synthetic echo.
+
+### Findings that shaped the code
+- webrtc-sys downloads libwebrtc whenever `LK_CUSTOM_WEBRTC` points at a missing directory (Task 1); libwebrtc's weak `pw_*` stubs crashed cpal's PipeWire backend in the same binary (renamed by the fetch script).
+- Calls need the call-member power level at 0 (Element sets it in rooms it creates); Synapse drops a delayed event that hits `rc_message`.
+- LiveKit's audio queues are short (100 ms decoded, 50 ms microphone): call audio runs on its own thread, not the core's runtime. `ActiveSpeakersChanged` lists only the participants that started speaking.
+- sonora AEC3 slows 5× on a silent far end after speech without the denormal guard (upstream #34); it allocates about 40 times per frame (#39/#40).
+- DeepFilterNet3 needs upstream's binary's local-SNR thresholds (−15/35/35), not the library defaults.
+- ONNX Runtime: TensorRT replays on its own stream (one CUDA stream of ours for everything, or outputs drift); CUDA's global capture mode broke a loop when another thread opened a session (thread-local mode); WebGPU sessions share one device and crash when used from two threads (one thread at a time, runs skipped, never waited for); a WebGPU device alive at exit crashed NVIDIA's Vulkan driver (the plugin is registered only while sessions live); the plugin's grouped convolution is wrong on some inputs (reported upstream: microsoft/onnxruntime#33086; the export avoids it); TensorRT's engine cache must carry the batch size.
+- Opus on digital silence underflows into microcode assists on Intel E-cores (7× slower); dithering defeats DTX; the fix belongs upstream (decision pending).
+- Leftover test devices (thousands) delayed call keys by seconds: `scripts/prune-test-devices.sh` signs them out (run by `create-test-users.sh`).
+
+### `unsafe` (rule: only where needed, SAFETY comments on each)
+`audio/src/denormals.rs` (FTZ/DAZ, decision 7); `audio/src/pw/thread.rs` (PipeWire's thread utilities, `pthread_self`); `audio/src/onnx/mod.rs` (`ComputeStream`, the providers' compute stream); `audio/src/onnx/stateful_loop/cuda.rs` (the CUDA runtime: streams, copies, fills, the thread's capture mode); `audio/src/onnx/stateful_loop/webgpu.rs` (ONNX Runtime's `CopyTensors`); `core/src/cpu_level.rs` (CPUID check in assembly, run before Rust code); `core/examples/opus_profile.rs` (libwebrtc's Opus) and `audio/examples/voice_profile.rs` (a counting allocator), measuring tools, not shipped. All approved (2026-10-03, 2026-10-04).
+
+### Review of the branch (2026-10-04)
+- **Layout:** large files split by concern, one commit's worth each, folded into the commits that wrote them:
+  - audio: `voice/` (`mod`, `control`, `sources`, `tests`), `dfn/` (`signal`, `filter`, `bank`, `gpu`), `onnx/` (`nvidia`, `webgpu`, `stateful_loop/`), `io/` (`cpal`), `enhancer.rs` (the plug-in traits), `paths.rs` (the cache directory, once instead of five copies);
+  - core: `call/` (`own_membership`, `participants`, `sfus`, `cleaning/` with its `policy`), `engine/calls.rs`, `api/audio.rs`;
+  - CLI: `calls/` (`mod`, `parse`, `show`).
+  - Public API unchanged (`scripts/check-core-api.sh`).
+  - Not split, as they are older phases' code (rule 8, for the human): `core/src/engine/mod.rs` (login and sync, 1,442 lines) and `app/src/state.rs`.
+- **Single source of truth:**
+  - The cleaning wire values are constants.
+  - One lock helper for the voice control.
+  - One place builds call audio.
+  - The GPU parts are looked up once.
+  - The CPU and GPU DeepFilterNet paths share their signal code (`NetIo`).
+- **Dead code removed:**
+  - `DeepFilter::local_snr_db`.
+  - `OnnxLoop::rows`.
+  - The `latency_samples` and `rows` methods of the `Enhancer` and `BatchCleaner` traits, which nothing read.
+  - The redundant test that the chain is `Send`, which the compiler already checks through `FrameProcessor`.
+- **Performance** (`voice_profile` before and after, same core):
+  - Timing is unchanged.
+  - DeepFilterNet3's CPU output is byte-identical.
+  - Allocations: the GPU bank with 16 voices went from 103.5 to 55.5 per frame (network buffers reused per voice), and a CPU filter from 1028 to 1023.
+  - No bottleneck in our code. What remains is upstream or the human's call:
+    - Opus on digital silence on E-cores;
+    - sonora's allocations and AGC2's VAD;
+    - tract's allocations against shipping ONNX Runtime's CPU path.
+- **Coverage** (llvm-cov, every suite but `keyring` and `hardware_*`, GPU suites included): 88.3% of lines in the workspace, 87.6% in the files this branch changed; by crate, core 89.7%, audio 88.5%, app 88.4%, ptt 56.8%. The CLI's call commands went from 75% to 92%, `gpu_enhancement.rs` from 81% to 92%.
+  - Under 80%, and why:
+    - `ptt` (hotkey, portal, gamepad: a desktop session or a device; human checks);
+    - `audio/src/io/cpal.rs` and `devices.rs` (cpal, used off Linux);
+    - GPU and server failure branches (`dfn/bank.rs`, `dfn/filter.rs`, `onnx/stateful_loop/mod.rs`, `call/sfus.rs`, `call/own_membership.rs`, `engine/calls.rs`: reconnection and lost SFUs);
+    - Phase 1/2 files (`app` screens, `secrets.rs`).
+  - Added:
+    - the GPU probe from a fresh start (`gpu_enhancement`, never run before);
+    - every CLI settings command and the per-person cleaning, mic test and call events.
+
+### How to run the checks
+- Gate: `cargo fmt --all --check`; `cargo clippy --workspace --all-targets -- -D warnings` and again with `--all-features`; `cargo test --workspace`; `scripts/check-app-deps.sh` (and `livekit`); `scripts/check-core-api.sh`; `scripts/check-no-webrtc-download.sh`; `scripts/check-commits.sh main`.
+- Local stack: `docker compose up -d --wait && scripts/create-test-users.sh`, then `cargo test --workspace -- --ignored --skip keyring --skip hardware_` (the agent never runs `keyring` or `hardware_*`).
+- GPU (Task 13b parts installed): `cargo test --release -p tessera-audio --features onnxruntime --test onnxruntime --test deepfilter -- --ignored` (exits cleanly: a crash at exit is a regression) and `cargo test -p tessera-core --features gpu-enhancement --test call_media --test gpu_enhancement -- --ignored`.
+- Real speech: `TESSERA_SPEECH_WAV` and `TESSERA_NOISE_WAV` (DeepFilterNet's `assets/clean_freesound_33711.wav` and `noise_freesound_2530.wav` work) for `on_real_speech_deep_filter_improves_the_snr_more_than_rnnoise`, which skips without them.
+- Cross-checks: `CC_x86_64_pc_windows_msvc=clang-cl AR_x86_64_pc_windows_msvc=llvm-lib cargo clippy -p tessera-audio --all-targets --target x86_64-pc-windows-msvc -- -D warnings`; `CC_aarch64_apple_darwin=clang AR_aarch64_apple_darwin=llvm-ar cargo clippy -p tessera-audio --all-targets --target aarch64-apple-darwin -- -D warnings`.
+- Coverage: `rustup component add llvm-tools --toolchain 1.97.1` (the system's LLVM 23 cannot read rustc 1.97's profiles), then build and run the tests with `RUSTFLAGS="-C target-cpu=x86-64-v3 -C instrument-coverage" LLVM_PROFILE_FILE=<dir>/%p-%m.profraw CARGO_TARGET_DIR=<another dir>` and `--all-features` (the unit tests, then the ignored suites as above), `llvm-profdata merge -sparse`, `llvm-cov report` over the test binaries.
+- Profiles: `cargo run --release -p tessera-audio [--features onnxruntime] --example voice_profile` (pin with `taskset -c <cpu>`; `VOICE_PROFILE_TRACE=n` names who allocates), `--example dfn_profile`, `cargo run --release -p tessera-core --example opus_profile`.
+
+## Phase 6 known limitations
+- Denormal guard (decision 7, human-approved 2026-10-02, pre-production): `crates/audio/src/denormals.rs` is the one audited `unsafe` function. It sets FTZ/DAZ (x86_64) or FZ (aarch64) on the audio processing thread, because sonora 0.2.0 AEC3 slows down on a silent far end after speech (upstream issue #34; measured 5.5× here, see Task 5). Remove it once a sonora release with upstream PR #38 ships (version bump asked first, rule 3).
+- sonora 0.2.0 allocates about 40 times per 10 ms frame in AEC3 (upstream #39/#40). The processing thread is not a device callback, so this is tolerable, but not real-time clean until upstream ships the fix.
+
+## Phase 6 human checkpoint
+- [x] Plan questions answered and plan approved (2026-10-02).
+- [ ] Push the branch and confirm CI is green on Linux x64 and arm64 (`ubuntu-26.04`, `ubuntu-26.04-arm`), Windows and macOS with livekit/libwebrtc in the tree; check build time and disk.
+- [ ] Locally: clang >= 21 and the glib headers (Arch/SteamOS: `sudo pacman -S clang glib2 lld`; Ubuntu 26.04: `clang-22 libglib2.0-dev lld` with `CXX=clang++-22`; Ubuntu 24.04's clang 18 is too old), then `scripts/fetch-libwebrtc.sh` once before building.
+- [ ] Call API additions (Task 3) approved as the UI-phase contract.
+- [ ] Confirm the deny.toml ignore of RUSTSEC-2026-0319 (anymap2 unmaintained, via pinned matrix-sdk 0.19.1; also affects main's CI).
+- [ ] `cargo test -p tessera-core -- --ignored hardware_` passes (opens the microphone; the agent does not run it), and the mic test loopback sounds right on headphones.
+- [ ] DeepFilterNet3 by ear (`scripts/fetch-models.sh`, then `/ns deepfilter` in the CLI): keyboard, fan and other voices in the room; whether its 30 ms of added latency is noticeable in a call.
+- [ ] Audio quality by ear: real mic and speakers; echo cancellation on open speakers (sonora AEC3; the libwebrtc APM A/B was dropped in Task 8); RNNoise on keyboard and fan noise; AGC level; VAD gate threshold.
+- [ ] Device hot-plug (USB headset in and out, Bluetooth) on each OS you use; macOS microphone permission prompt.
+- [ ] PipeWire client (Task 14) on your desktop and SteamOS: the device list shows your microphones, speakers and virtual sources (EasyEffects, noise filters) but no other apps' streams; plugging a USB headset in and out updates it at once; a Bluetooth headset switches to its headset profile during a call (`media.role = Communication`); `pw-top` shows Tessera's streams at 480/48000; with `/aec system on`, a game or video playing on open speakers is not heard by the others (the 52.7 dB measured locally is a perfect digital echo path; a room is harder).
+- [ ] Interop with Element Call, both directions, in unencrypted and encrypted rooms, on a real homeserver with a real SFU. For encrypted rooms (Task 9), check both Element Web (js-sdk) and Element X (Element Call as a widget): keys arrive and media decrypts in both directions, including after someone leaves and rejoins.
+- [ ] Cross-homeserver call (Task 8b): members on two homeservers with their own call services hear each other. The subscribe-only token path for a non-full-access homeserver cannot be exercised with the single local Synapse.
+- [ ] Double talk by ear: talking while others talk, on open speakers and headphones (AEC3 cut a member's microphone to near silence in a virtual test while loud audio played on their speakers; Task 8b notes).
+- [ ] Ringing (Task 10) with Element Web and Element X, both directions: a DM call rings and shows the caller, a group call notifies quietly, declining on one side stops the ring on the other, answering on another device stops it here.
+- [ ] GPU DeepFilterNet by ear on your RTX 5090 (Task 13b): the agent ran it on this machine with `scripts/fetch-onnxruntime.sh cuda13`, `scripts/fetch-cuda-runtime.sh` (or a system CUDA 13 + cuDNN 9), `scripts/fetch-tensorrt.sh` (optional, faster; first use builds an engine for about 20 s), `scripts/fetch-models.sh` and `scripts/export-deepfilternet.sh`; build the CLI with `--features gpu-enhancement`, then `/gpu` and `/ns deepfilter gpu` with `/mictest loopback`: same sound as `/ns deepfilter`, and `/gpu` says it runs on tensorrt (or cuda without TensorRT). Then start a GPU-heavy game and check whether it stays on the GPU or moves to the CPU (and that the audio never glitches when it does).
+- [x] Approve the `unsafe` in the CUDA loop (Task 13b) and in the x86-64-v3 check (Task 15, assembly), beyond decision 7's single function. Approved 2026-10-03, with the rule: `unsafe` only where needed, for low-level work or a hard dependency (FFI, CPU state, assembly), each with SAFETY comments.
+- [ ] Approve the Task 13b part 2 API additions and `libloading` as a direct dependency (see the Task 13b part 2 notes); review NVIDIA's licences for fetching their runtime and TensorRT by script (not shipped).
+- [ ] Galep, AMD (Ryzen 7 7800X3D, Radeon RX 6950 XT), the WebGPU path (Task 13b part 4), Linux: `scripts/fetch-onnxruntime.sh`, `scripts/fetch-webgpu-ep.sh`, `scripts/fetch-models.sh`, `scripts/export-deepfilternet.sh`; then `cargo run --release -p tessera-audio --features onnxruntime --example dfn_profile -- webgpu 3000` and `-- cpu 3000` (latency and CPU per frame), and `cargo test --release -p tessera-audio --features onnxruntime --test onnxruntime -- --ignored --nocapture` (quality against the CPU). For the trace: `TESSERA_ONNX_PROFILE=/tmp/webgpu` (ONNX Runtime's per-node JSON), `perf record --call-graph dwarf` on the `dfn_profile` binary, or Radeon GPU Profiler. Also once with `TESSERA_WEBGPU_EP_OPTIONS="maxNumPendingDispatches=512"`. Then by ear in a call with DeepFilterNet on the GPU.
+- [x] Approve the Task 13b part 4 additions: fetching Microsoft's `onnxruntime-ep-webgpu` 0.4.0 wheel from PyPI (MIT; third-party notices copied beside the library) and `GpuBackend::WebGpu` (API addition, Task 3 contract). Approved 2026-10-04.
+- [x] Post the WebGPU grouped-convolution report to microsoft/onnxruntime (decided 2026-10-04; the agent drafted the text). Posted by the human 2026-10-04: https://github.com/microsoft/onnxruntime/issues/33086. No existing issue or pull request covers it (related, different: #32928, #29651, #32478). Cause, from main's source: for a channels-last grouped Conv, `conv.cc` sizes the vector width from the total output channels, while `grouped_conv.cc` derives the group once per vector. A vector spanning two groups reads the first group's inputs whenever `output_channels_per_group % components != 0` (`df_convp`: 10 outputs, 2 groups, 2 components). `preferredLayout=NCHW` is correct. JSEP's `conv-grouped.ts` has the same logic (not tested).
+- [ ] GPU enhancement (Task 13b): each offered backend on real hardware (NVIDIA and Intel CPU on the human's machine; AMD CPU and GPU on Galep's: Ryzen 7 7800X3D and Radeon RX 6950 XT, for the WebGPU/Vulkan path of Task 13b part 4, with the same latency and CPU numbers as CUDA, and the x86-64-v3 build on Zen 4), by ear and with the recorded latency; the fallback when the GPU is busy with a game.
+- [ ] Global PTT hotkey on X11, Wayland (KDE/GNOME portal), Windows and macOS; gamepad PTT. On Linux: `cargo run -p tessera-ptt --example ptt_probe -- --key ctrl+shift+KeyT --button left_thumb` prints `Transmit(true)`/`Transmit(false)` while the key or button is held; on Wayland the portal's dialog appears once and the confirmed key is printed (`Ready`); on SteamOS (desktop and game mode) the Steam Input pad works. Windows and macOS keys are checked once the app starts the service (call UI).
+- [x] Choose how the processing thread gets real-time priority on Windows and macOS: Mozilla's `audio_thread_priority` =0.35.1 (MPL-2.0), with cpal's `realtime` feature on Windows. Chosen 2026-10-04.
+- [x] Approve the Task 15 part 4 API addition: `AudioStats::{late_wakes, max_wake_us, capture_overruns, playback_underruns}`. Approved 2026-10-04.
+- [ ] Real-time priority on Windows and macOS (Task 15 part 4): in a call or `/mictest`, the core logs "audio processing runs at real-time priority (MMCSS Audio task)" on Windows, "(time-constraint policy)" on macOS, or why not; no crackles while a game loads the CPU.
+- [x] Approve the Task 16 part 1 API additions (see the Task 16 notes): `RemoteCleaning`, `VoiceCleaning`, `CleaningStatus`, `SkipReason`, the two `AudioSettings` fields, `Command::SetUserCleaning`, `Participant::cleaning`, `limits::CLEANED_VOICES`. Approved 2026-10-04.
+- [x] Approve the Task 16 part 1b API change: `limits::CLEANED_VOICES` now counts voices cleaned at the same time (talking at once), new `limits::CLEANING_FILTERS` (16, filters per call), `SkipReason::Limit` covers both. Approved 2026-10-04.
+- [x] Approve the Task 16 part 2 API additions (see the Task 16 notes): `RemoteCleaning::skip_cleaned` (`SkipCleaned`), `AudioSettings::announce_cleaning` (`CleaningAnnouncement`), `SkipReason::AlreadyClean`, and the participant attribute `tessera.voice_cleaning` with its values as the wire format other Tessera clients read. Approved 2026-10-04.
+- [x] Approve the Task 16 part 3 API additions: `RemoteCleaning::gpu`, `AudioStats::remote_cleaning`, and the `unsafe` call `cudaThreadExchangeStreamCaptureMode` in the CUDA loop (under the `unsafe` rule). Approved 2026-10-04.
+- [ ] GPU cleaning of other voices by ear (Task 16 part 3), with a `gpu-enhancement` build: `/clean on`, `/clean gpu on`, a call with several people talking at once; all are cleaned, the CLI says "Other voices are cleaned on tensorrt"; then start a GPU-heavy game: the cleaning stays on the GPU or moves to the CPU with a message, and the audio does not glitch either way. On Galep's AMD machine the same on WebGPU.
+- [x] Decide on the heap corruption at the GPU test binary's exit: investigate and fix (human, 2026-10-04). Fixed: the WebGPU device is released with its last session (Task 16 part 3 notes).
+- [ ] Skipping voices cleaned at their source, with Element Call (Task 16 part 2): with the browser's noise suppression on (Element Call's default) the voice is still cleaned under the default policy and skipped under `/clean skip any`; a Tessera peer with RNNoise is shown "not cleaned (cleaned at their end)".
+- [ ] Cleaning other voices by ear (Task 16 part 1): in a call with someone in a noisy room, `/clean on`: their keyboard and fan go, their voice stays natural; `/who` shows "cleaned"; the 30 ms added on their voice is not noticed; `/clean <n> never` brings them back as they were.
+- [ ] Decide whether to report the Opus silence cost upstream (xiph/opus; the agent can draft it): `tone_lpc` underflows on digital silence, about 7× slower on Intel E-cores (210 against 32 µs per 10 ms at 64 kb/s), also in Opus 1.6.1; and whether to ask LiveKit/WebRTC to flush denormals on the audio encoder thread.
+- [ ] Decide the Frame's call defaults from the Opus numbers (Task 15 part 4): 64 kb/s costs less CPU than 32 kb/s on speech (20.6 against 69 µs per 10 ms here); complexity 5 halves the cost at 32 kb/s; silence (muted, gate closed) costs the most in a call (denormals on WebRTC's encoder thread). Options to measure next: stopping frames while silent, or a tiny dither instead of digital silence.
+- [ ] Steam Frame: aarch64 build runs on the device (desktop mode and game mode); built-in mic and speakers with AEC; game audio cancelled with the system-mix reference (Task 14); PipeWire device switching; CPU/battery cost of each NS mode within the Task 15 budget while a standalone VR game runs; rtkit real-time priority granted (the core logs "audio processing runs at real-time priority N", or why not; also in the Flatpak).
+- [ ] CLI call against a real account (`tessera-cli`, then `/rooms`, `/call <n>`, `/who`, `/mute`, `/leave`; Element users hear you and you hear them); leave by crash (kill -9) clears the membership within the delayed-event timeout; `/mictest loopback` sounds right on headphones.

@@ -17,27 +17,50 @@ env:
 
 jobs:
   lint:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
+          # Full history for scripts/check-commits.sh.
+          fetch-depth: 0
+      # AGENTS.md rule 5: feature branches carry only feat/docs commits.
+      - name: Conventional Commits (pull requests)
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: scripts/check-commits.sh "origin/$BASE_REF" "$HEAD_SHA"
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libdbus-1-dev libssl-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libdbus-1-dev libssl-dev pkg-config libglib2.0-dev lld libasound2-dev libpipewire-0.3-dev libudev-dev
+      # webrtc-sys needs clang >= 21 on Linux (Chromium libc++); the image has 22.
+      - name: Use clang 22
+        if: runner.os == 'Linux'
+        run: |
+          clang++-22 --version
+          { echo CC=clang-22; echo CXX=clang++-22; } >> "$GITHUB_ENV"
+      # webrtc-sys would download libwebrtc unverified; use the pinned SHA-256.
+      - name: Fetch pinned libwebrtc
+        shell: bash
+        run: echo "LK_CUSTOM_WEBRTC=$(scripts/fetch-libwebrtc.sh)" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - uses: EmbarkStudios/cargo-deny-action@v2
       - run: scripts/check-app-deps.sh
+      - run: scripts/check-app-deps.sh livekit
       - run: scripts/check-core-api.sh
+      - run: scripts/check-no-webrtc-download.sh
 
   test:
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        # Linux runners are 26.04: libwebrtc's hermetic libc++ needs clang >= 21
+        # (24.04 has 18). ubuntu-26.04-arm is aarch64 Linux, the Steam Frame target.
+        os: [ubuntu-26.04, ubuntu-26.04-arm, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
@@ -45,31 +68,56 @@ jobs:
           persist-credentials: false
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libdbus-1-dev libssl-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libdbus-1-dev libssl-dev pkg-config libglib2.0-dev lld libasound2-dev libpipewire-0.3-dev libudev-dev
+      # webrtc-sys needs clang >= 21 on Linux (Chromium libc++); the image has 22.
+      - name: Use clang 22
+        if: runner.os == 'Linux'
+        run: |
+          clang++-22 --version
+          { echo CC=clang-22; echo CXX=clang++-22; } >> "$GITHUB_ENV"
+      # webrtc-sys would download libwebrtc unverified; use the pinned SHA-256.
+      - name: Fetch pinned libwebrtc
+        shell: bash
+        run: echo "LK_CUSTOM_WEBRTC=$(scripts/fetch-libwebrtc.sh)" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
       # The lint job already runs clippy on Linux.
       - name: Clippy (non-Linux only)
         if: runner.os != 'Linux'
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: cargo test --workspace --locked
+      - name: No unverified libwebrtc download
+        shell: bash
+        run: scripts/check-no-webrtc-download.sh
 
   integration:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
       - name: Install Linux build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libdbus-1-dev libssl-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libdbus-1-dev libssl-dev pkg-config libglib2.0-dev lld libasound2-dev libpipewire-0.3-dev libudev-dev
+      # webrtc-sys needs clang >= 21 on Linux (Chromium libc++); the image has 22.
+      - name: Use clang 22
+        if: runner.os == 'Linux'
+        run: |
+          clang++-22 --version
+          { echo CC=clang-22; echo CXX=clang++-22; } >> "$GITHUB_ENV"
+      # webrtc-sys would download libwebrtc unverified; use the pinned SHA-256.
+      - name: Fetch pinned libwebrtc
+        shell: bash
+        run: echo "LK_CUSTOM_WEBRTC=$(scripts/fetch-libwebrtc.sh)" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
       - name: Start local Synapse
         run: docker compose up -d --wait
       - name: Register test users
         run: scripts/create-test-users.sh
-      # The real-keychain test needs a desktop session, hence --skip keyring.
+      # The real-keychain test needs a desktop session, and hardware_ tests a
+      # microphone or speakers; both are human-run.
       - name: Run homeserver integration tests
-        run: cargo test -p tessera-core -p tessera-app --locked -- --ignored --skip keyring
+        run: cargo test -p tessera-core -p tessera-app --locked -- --ignored --skip keyring --skip hardware_
+      - run: scripts/check-no-webrtc-download.sh
       - name: Stop local Synapse
         if: always()
         run: docker compose down -v

@@ -22,6 +22,8 @@ async fn http_non_loopback_homeserver_is_refused_before_login() {
             data: DataPaths::at(dir.path()),
             homeserver_override: Some("http://matrix.example.invalid".to_owned()),
             room_list_page_size: tessera_core::DEFAULT_ROOM_LIST_PAGE_SIZE,
+            audio: Default::default(),
+            call_service_override: None,
         },
         secrets.clone(),
     );

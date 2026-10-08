@@ -231,6 +231,7 @@ pub(crate) fn summarize(item: &RoomListItem) -> RoomSummary {
         is_dm,
         is_encrypted: item.encryption_state().is_encrypted(),
         is_space: item.is_space(),
+        is_call_room: item.is_call(),
         is_invite: item.state() == RoomState::Invited,
         highlights: highlights_of(mentions, item.unread_notification_counts().highlight_count),
         marked_unread: item.is_marked_unread(),

@@ -11,7 +11,8 @@ name = "tessera-cli"
 path = "src/bin/tessera-cli.rs"
 
 [dependencies]
-matrix-sdk = { version = "=0.19.1", features = ["bundled-sqlite", "local-server", "markdown", "qrcode"] }
+# experimental-send-custom-to-device: Olm-encrypted call keys (Phase 6 Task 9).
+matrix-sdk = { version = "=0.19.1", features = ["bundled-sqlite", "local-server", "markdown", "qrcode", "experimental-send-custom-to-device"] }
 matrix-sdk-ui = "=0.19.1"
 # Only to name `UtdCause` (not re-exported by matrix-sdk or matrix-sdk-ui); same pin as matrix-sdk.
 matrix-sdk-crypto = "=0.19.1"
@@ -28,6 +29,15 @@ url = "2"
 rand = "0.10"
 rpassword = "7"
 zeroize = { version = "1.9", features = ["serde"] }
+# Build with LK_CUSTOM_WEBRTC from scripts/fetch-libwebrtc.sh (pinned SHA-256);
+# without it webrtc-sys downloads libwebrtc unverified.
+tessera-audio = { path = "../audio" }
+livekit = { version = "=0.9.3", default-features = false, features = ["native", "rustls-tls-native-roots"] }
+
+[features]
+# GPU speech enhancement (plan Task 13b): DeepFilterNet3 on ONNX Runtime,
+# fetched and loaded at run time. Off by default.
+gpu-enhancement = ["tessera-audio/onnxruntime"]
 
 [dev-dependencies]
 tempfile = "3"

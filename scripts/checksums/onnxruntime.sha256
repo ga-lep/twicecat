@@ -1,0 +1,9 @@
+db14e4863bd37893fc59729d986ab2a0d043d10b7d44da1913c4982b7e3d009c  onnxruntime-linux-x64-1.28.3.tgz
+6c6b1ae96d7b0be9f555092857c6a4f2b0b5587a5298d732d9e52e8253038ce7  onnxruntime-linux-aarch64-1.28.3.tgz
+33e91f819324449bede2d1e853c8d46bb6253fa8890bac98ae676f041c8f73a6  onnxruntime-linux-x64-gpu_cuda13-1.28.3.tgz
+4e16d2ec66521a24fe917bd848eb8ae3a9107cb8b4aec978fb2b3ab1a640fcb7  onnxruntime-linux-x64-gpu_cuda12-1.28.3.tgz
+c436bd9f47dbce6f6311ccc21de97f829b3c862c09d24aa321958cb72f0a1d32  onnxruntime-osx-arm64-1.28.3.tgz
+1d6fab48e85f948436af7c8c971d2c145cf224e2c444755dec894f8b0de11a83  onnxruntime-win-x64-1.28.3.zip
+a7216e498c14fb4783a42667ffddcf1590ae262429307ed0dc5889d9c365584e  onnxruntime-win-x64-gpu_cuda13-1.28.3.zip
+65d7f956649df80a8ccdcafa7843e4b02f38bfc9e6de28711ed8384508040330  onnxruntime-win-x64-gpu_cuda12-1.28.3.zip
+76d5e5a23fb7fdbc2ca0c3214bad1b58b2a41016c7052e74e60ed8004bea71b1  onnxruntime-win-arm64-1.28.3.zip

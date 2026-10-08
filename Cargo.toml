@@ -6,3 +6,68 @@ members = ["crates/*"]
 edition = "2024"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/ga-lep/tessera"
+
+# Real-time DSP is far too slow unoptimised: debug AEC3 cannot keep up with
+# 10 ms frames. Optimise these crates in dev and test builds too.
+# Each test binary statically links libwebrtc; with full debug info for every
+# dependency that is ~1.1 GB per binary (130 GB of target/ after a few
+# rebuilds). Dependencies keep line tables (backtraces and gdb still show
+# functions and lines); our own crates keep full debug info.
+[profile.dev]
+debug = "line-tables-only"
+[profile.dev.package.tessera-core]
+debug = true
+[profile.dev.package.tessera-audio]
+debug = true
+[profile.dev.package.tessera-ptt]
+debug = true
+[profile.dev.package.tessera-app]
+debug = true
+
+[profile.dev.package.sonora]
+opt-level = 3
+[profile.dev.package.sonora-aec3]
+opt-level = 3
+[profile.dev.package.sonora-agc2]
+opt-level = 3
+[profile.dev.package.sonora-ns]
+opt-level = 3
+[profile.dev.package.sonora-common-audio]
+opt-level = 3
+[profile.dev.package.sonora-fft]
+opt-level = 3
+[profile.dev.package.sonora-simd]
+opt-level = 3
+[profile.dev.package.nnnoiseless]
+opt-level = 3
+[profile.dev.package.rubato]
+opt-level = 3
+[profile.dev.package.rustfft]
+opt-level = 3
+[profile.dev.package.realfft]
+opt-level = 3
+# DeepFilterNet3 inference (Task 13) runs in every 10 ms frame.
+[profile.dev.package.tract-core]
+opt-level = 3
+[profile.dev.package.tract-data]
+opt-level = 3
+[profile.dev.package.tract-linalg]
+opt-level = 3
+[profile.dev.package.tract-hir]
+opt-level = 3
+[profile.dev.package.tract-onnx]
+opt-level = 3
+[profile.dev.package.tract-onnx-opl]
+opt-level = 3
+[profile.dev.package.tract-nnef]
+opt-level = 3
+[profile.dev.package.tract-pulse]
+opt-level = 3
+[profile.dev.package.tract-pulse-opl]
+opt-level = 3
+[profile.dev.package.tract-transformers]
+opt-level = 3
+[profile.dev.package.ndarray]
+opt-level = 3
+[profile.dev.package.matrixmultiply]
+opt-level = 3

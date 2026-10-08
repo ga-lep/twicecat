@@ -165,6 +165,8 @@ fn login_reaches_main_with_rooms_and_shutdown_closes_the_bridge() {
             data: DataPaths::at(&dir),
             homeserver_override: Some(base),
             room_list_page_size: tessera_core::DEFAULT_ROOM_LIST_PAGE_SIZE,
+            audio: Default::default(),
+            call_service_override: None,
         },
         Arc::new(InMemorySecretStore::new()),
     )
@@ -278,6 +280,8 @@ fn typing_markdown_and_pressing_enter_shows_a_bold_message_in_the_timeline() {
             data: DataPaths::at(&dir),
             homeserver_override: Some(base),
             room_list_page_size: tessera_core::DEFAULT_ROOM_LIST_PAGE_SIZE,
+            audio: Default::default(),
+            call_service_override: None,
         },
         Arc::new(InMemorySecretStore::new()),
     )
@@ -378,6 +382,8 @@ fn carol_resets_her_identity_sets_up_recovery_and_logs_out() {
             data: DataPaths::at(&dir),
             homeserver_override: Some(base),
             room_list_page_size: tessera_core::DEFAULT_ROOM_LIST_PAGE_SIZE,
+            audio: Default::default(),
+            call_service_override: None,
         },
         Arc::new(InMemorySecretStore::new()),
     )

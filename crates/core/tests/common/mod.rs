@@ -100,7 +100,55 @@ pub fn parse_env(text: &str) -> HashMap<String, String> {
         .collect()
 }
 
-/// Starts a core on `dir` against the local homeserver.
+/// Starts a core on `dir` against the local homeserver, with `audio` as
+/// its audio devices.
+pub fn start_core_with_audio(
+    dir: &Path,
+    secrets: Arc<InMemorySecretStore>,
+    audio: tessera_core::api::AudioBackend,
+) -> CoreHandle {
+    start_core_with_call_service(dir, secrets, audio, None)
+}
+
+/// Like [`start_core_with_audio`], publishing calls on `call_service`
+/// instead of the homeserver's call service.
+pub fn start_core_with_call_service(
+    dir: &Path,
+    secrets: Arc<InMemorySecretStore>,
+    audio: tessera_core::api::AudioBackend,
+    call_service: Option<String>,
+) -> CoreHandle {
+    let env = TestEnv::load();
+    Core::start(
+        CoreConfig {
+            data: DataPaths::at(dir),
+            homeserver_override: Some(env.homeserver_url().to_owned()),
+            room_list_page_size: tessera_core::DEFAULT_ROOM_LIST_PAGE_SIZE,
+            audio,
+            call_service_override: call_service,
+        },
+        secrets,
+    )
+}
+
+/// Virtual devices that capture silence and drop what they play. Tests
+/// never open the real microphone or speakers (a call opens them); only
+/// the human-run `hardware_*` tests ask for `AudioBackend::System`.
+struct Silence;
+
+impl tessera_core::api::VirtualAudio for Silence {
+    fn capture(&self, frame: &mut [f32; tessera_core::api::AUDIO_FRAME_LEN]) {
+        frame.fill(0.0);
+    }
+    fn playback(&self, _: &[f32; tessera_core::api::AUDIO_FRAME_LEN]) {}
+}
+
+fn silence() -> tessera_core::api::AudioBackend {
+    tessera_core::api::AudioBackend::Virtual(Arc::new(Silence))
+}
+
+/// Starts a core on `dir` against the local homeserver, with silent
+/// virtual audio devices.
 pub fn start_core(dir: &Path, secrets: Arc<InMemorySecretStore>) -> CoreHandle {
     start_core_with_page_size(dir, secrets, tessera_core::DEFAULT_ROOM_LIST_PAGE_SIZE)
 }
@@ -117,6 +165,8 @@ pub fn start_core_with_page_size(
             data: DataPaths::at(dir),
             homeserver_override: Some(env.homeserver_url().to_owned()),
             room_list_page_size,
+            audio: silence(),
+            call_service_override: None,
         },
         secrets,
     )
@@ -182,9 +232,37 @@ pub async fn create_room(
     name: &str,
     invitee: Option<&str>,
 ) -> matrix_sdk::ruma::OwnedRoomId {
+    create_room_with(creator, name, invitee, false).await
+}
+
+/// Like [`create_room`], with Megolm encryption enabled from the start.
+pub async fn create_encrypted_room(
+    creator: &matrix_sdk::Client,
+    name: &str,
+    invitee: Option<&str>,
+) -> matrix_sdk::ruma::OwnedRoomId {
+    create_room_with(creator, name, invitee, true).await
+}
+
+async fn create_room_with(
+    creator: &matrix_sdk::Client,
+    name: &str,
+    invitee: Option<&str>,
+    encrypted: bool,
+) -> matrix_sdk::ruma::OwnedRoomId {
     use matrix_sdk::ruma::api::client::room::create_room::v3::Request;
+    use matrix_sdk::ruma::events::InitialStateEvent;
+    use matrix_sdk::ruma::events::room::encryption::RoomEncryptionEventContent;
     let mut request = Request::new();
     request.name = Some(name.to_owned());
+    if encrypted {
+        request.initial_state = vec![
+            InitialStateEvent::with_empty_state_key(
+                RoomEncryptionEventContent::with_recommended_defaults(),
+            )
+            .to_raw_any(),
+        ];
+    }
     if let Some(user) = invitee {
         request
             .invite
@@ -466,37 +544,6 @@ pub async fn seed_recovery(n: u8, passphrase: Option<&str>) -> zeroize::Zeroizin
     client.logout().await.expect("log the reset device out");
     println!("e2ee seed {}: {removed} devices removed", env.user(n));
     zeroize::Zeroizing::new(key)
-}
-
-/// Creates an encrypted room (initial `m.room.encryption` state,
-/// `m.megolm.v1.aes-sha2`) as `creator` and invites `invitee` when given.
-pub async fn create_encrypted_room(
-    creator: &matrix_sdk::Client,
-    name: &str,
-    invitee: Option<&str>,
-) -> matrix_sdk::ruma::OwnedRoomId {
-    use matrix_sdk::ruma::api::client::room::create_room::v3::Request;
-    use matrix_sdk::ruma::events::InitialStateEvent;
-    use matrix_sdk::ruma::events::room::encryption::RoomEncryptionEventContent;
-    let mut request = Request::new();
-    request.name = Some(name.to_owned());
-    request.initial_state = vec![
-        InitialStateEvent::with_empty_state_key(
-            RoomEncryptionEventContent::with_recommended_defaults(),
-        )
-        .to_raw_any(),
-    ];
-    if let Some(user) = invitee {
-        request
-            .invite
-            .push(user.try_into().expect("valid invitee user id"));
-    }
-    creator
-        .create_room(request)
-        .await
-        .expect("create encrypted room")
-        .room_id()
-        .to_owned()
 }
 
 /// The `type` of the event `event_id` in `room`, read raw from the server
@@ -836,4 +883,25 @@ pub async fn first_device(core: &mut CoreHandle, n: u8) {
     // makes the new keys (Task 4/5 notes, `SyncPause`), so a reset right after
     // the login is safe.
     reset_identity_on(core, n).await;
+}
+
+/// Waits until the room list contains `room_id`, so `SelectRoom` can find it.
+pub async fn wait_for_room(core: &mut CoreHandle, room_id: &str) {
+    let mut rooms: Vec<RoomSummary> = Vec::new();
+    let wait = async {
+        while !rooms.iter().any(|r| r.id.as_str() == room_id) {
+            match core.events.recv().await {
+                Some(CoreEvent::RoomListChanged(diffs)) => {
+                    for diff in diffs {
+                        ListDiff::apply(&diff, &mut rooms);
+                    }
+                }
+                Some(_) => {}
+                None => panic!("event channel closed"),
+            }
+        }
+    };
+    tokio::time::timeout(DEFAULT_TIMEOUT, wait)
+        .await
+        .expect("timed out waiting for the room to sync");
 }

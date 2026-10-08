@@ -1,0 +1,7 @@
+# Python packages for scripts/export-deepfilternet.sh (PyTorch itself is
+# installed from its CPU index by that script, at the version it pins).
+onnx==1.23.1
+onnxruntime==1.30.0
+numpy==2.5.3
+loguru==0.7.3
+typing-extensions==4.16.0

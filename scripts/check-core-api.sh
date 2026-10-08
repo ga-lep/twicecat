@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
-# Fails if the public core API leaks SDK types: crates/core/src/api/ and the
-# other public modules (paths, secrets, logging) must not mention matrix_sdk,
-# ruma, eyeball or imbl, and crates/core/src/lib.rs must not
-# `pub use` any of them. Fails closed: a missing path or grep error is an error.
+# Fails if the public core API leaks SDK or media types: crates/core/src/api/
+# and the other public modules (paths, secrets, logging) must not mention
+# matrix_sdk, ruma, eyeball or imbl, nor the media crates (livekit, libwebrtc,
+# webrtc-sys, cpal, sonora, nnnoiseless, tract), and crates/core/src/lib.rs
+# must not `pub use` any of them. Fails closed: a missing path or grep error is
+# an error.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 api_dir="crates/core/src/api"
 lib_rs="crates/core/src/lib.rs"
-crates='(matrix_sdk|matrix-sdk|ruma|eyeball|imbl)'
+# Media crate names are matched as whole words, so "contract" is not "tract".
+crates='(matrix_sdk|matrix-sdk|ruma|eyeball|imbl|\blivekit|\blibwebrtc|\bwebrtc[_-]sys|\bcpal\b|\bsonora|\bnnnoiseless|\btract(_onnx|_core)?\b)'
 [ -d "$api_dir" ] || { echo "error: $api_dir not found" >&2; exit 2; }
 [ -f "$lib_rs" ] || { echo "error: $lib_rs not found" >&2; exit 2; }
 
@@ -16,7 +19,7 @@ status=0
 rc=0
 grep -rnE "${crates}" "$api_dir" || rc=$?
 if [ "$rc" -eq 0 ]; then
-    echo "error: $api_dir must not mention SDK crates" >&2
+    echo "error: $api_dir must not mention SDK or media crates" >&2
     status=1
 elif [ "$rc" -ne 1 ]; then
     echo "error: grep failed (status ${rc})" >&2
@@ -28,7 +31,7 @@ fi
 rc=0
 grep -Pzo "pub\s*(\(\s*[a-z]+\s*\)\s*)?(use|extern\s+crate)[^;]*${crates}" "$lib_rs" >/dev/null || rc=$?
 if [ "$rc" -eq 0 ]; then
-    echo "error: $lib_rs must not re-export SDK crates" >&2
+    echo "error: $lib_rs must not re-export SDK or media crates" >&2
     status=1
 elif [ "$rc" -ne 1 ]; then
     echo "error: grep failed (status ${rc})" >&2
@@ -74,7 +77,7 @@ for mod in paths secrets logging; do
         rc=0
         grep -rnE "${crates}" "$path" || rc=$?
         if [ "$rc" -eq 0 ]; then
-            echo "error: $path must not mention SDK crates" >&2
+            echo "error: $path must not mention SDK or media crates" >&2
             status=1
         elif [ "$rc" -ne 1 ]; then
             echo "error: grep failed (status ${rc})" >&2

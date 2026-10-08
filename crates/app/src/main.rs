@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use tessera_app::state::App;
 use tessera_app::{Bridge, Startup, TITLE};
+use tessera_core::api::AudioBackend;
 use tessera_core::logging;
 use tessera_core::paths::DataPaths;
 use tessera_core::secrets::{
@@ -115,6 +116,8 @@ fn run(options: Options) -> Result<(), String> {
         data,
         homeserver_override: options.homeserver,
         room_list_page_size: DEFAULT_ROOM_LIST_PAGE_SIZE,
+        audio: AudioBackend::System,
+        call_service_override: None,
     };
     let (bridge, events) = Bridge::start(config, secrets)
         .map_err(|error| format!("could not start the core runtime: {error}"))?;
@@ -139,6 +142,7 @@ fn run(options: Options) -> Result<(), String> {
 }
 
 fn main() -> ExitCode {
+    tessera_core::require_cpu_level();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let options = match parse_args(&args) {
         Ok(Parsed::Run(options)) => options,
