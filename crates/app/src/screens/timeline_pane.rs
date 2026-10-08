@@ -13,8 +13,8 @@ use std::cell::Cell;
 use chrono::{Local, TimeZone};
 use iced::font::{Style as FontStyle, Weight};
 use iced::widget::{
-    Column, Row, button, column, container, image, mouse_area, row, rule, scrollable, sensor,
-    space, stack, text, tooltip,
+    Column, Row, button, column, container, image, mouse_area, progress_bar, row, rule, scrollable,
+    sensor, space, stack, text, tooltip,
 };
 use iced::{
     Background, Color, ContentFit, Element, Fill, Font, Length, Padding, Shrink, Theme, mouse,
@@ -23,7 +23,7 @@ use tessera_core::api::{
     Block, Inline, MediaContent, MediaKind, MessageDetails, MessageKind, MessageText,
     PaginationState, PlaceholderKind, ReactionGroup, ReplyPreview, ReplyState, RichText, RoomId,
     RoomSummary, SendStatus, Shield, ShieldCode, StateChange, TextStyle, TimelineItem,
-    TimelineItemKind, TypingUser, UserId, UtdReason,
+    TimelineItemKind, TypingUser, UploadProgress, UserId, UtdReason,
 };
 
 use crate::actions::{self, ActionButtons, ActionState};
@@ -42,6 +42,7 @@ use crate::timeline::{
     CARD_H, CONTINUATION_PAD, DIVIDER_H, INDENT_PX, MARKER_H, OVERSCAN_PX, SIDE_PAD_PX, START_H,
     TIMELINE_ID, TOP_PAD, TimelineView, is_continuation, spacer_heights,
 };
+use crate::upload;
 
 /// How many lines of a body are shown.
 pub const MAX_BODY_LINES: usize = 200;
@@ -238,7 +239,8 @@ fn row_content<'a, Tz: TimeZone>(
             if !details.reactions.is_empty() {
                 content = content.push(reactions_row(&items[i].id, &details.reactions, buttons));
             }
-            if let Some(line) = echo_row(&items[i].id, echo) {
+            let upload = details.media.as_deref().and_then(|m| m.upload);
+            if let Some(line) = echo_row(&items[i].id, echo, upload) {
                 content = content.push(line);
             }
             if let Some(line) = receipts_row(items, i) {
@@ -602,12 +604,39 @@ pub fn edited_text(details: &MessageDetails) -> Option<&'static str> {
     details.edited.then_some("(edited)")
 }
 
+/// Width of the upload progress bar, in pixels.
+const UPLOAD_BAR_W: f32 = 160.0;
+
+/// "42 %" for a fraction of one.
+pub fn upload_percent(fraction: f32) -> String {
+    format!("{} %", (fraction.clamp(0.0, 1.0) * 100.0).floor() as u32)
+}
+
 /// The status line of a local echo: muted while sending, in the danger
 /// colour when failed, with **Retry** and **Discard**.
-fn echo_row<'a>(id: &str, echo: Echo) -> Option<Element<'a, Message>> {
+fn echo_row<'a>(
+    id: &str,
+    echo: Echo,
+    upload: Option<UploadProgress>,
+) -> Option<Element<'a, Message>> {
     let label = echo_text(echo)?;
     Some(match echo {
         Echo::Delivered => return None,
+        // An upload on its way: a bar, and **Cancel** (a discard).
+        Echo::Sending if upload.is_some() => {
+            let progress = upload.map_or(0.0, upload::fraction);
+            row![
+                text(label).size(12).style(muted),
+                progress_bar(0.0..=1.0, progress)
+                    .length(Length::Fixed(UPLOAD_BAR_W))
+                    .girth(Length::Fixed(6.0)),
+                text(upload_percent(progress)).size(12).style(muted),
+                bar_button("Cancel", Message::DiscardRequested(id.to_owned())),
+            ]
+            .spacing(8)
+            .align_y(iced::Center)
+            .into()
+        }
         Echo::Sending => text(label).size(12).style(muted).into(),
         Echo::Failed { .. } => row![
             text(label).size(13).style(text::danger),
@@ -1125,6 +1154,15 @@ thread_local! {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_upload_percent_is_a_whole_number() {
+        assert_eq!(upload_percent(0.0), "0 %");
+        assert_eq!(upload_percent(0.426), "42 %");
+        assert_eq!(upload_percent(1.0), "100 %");
+        assert_eq!(upload_percent(7.0), "100 %");
+        assert_eq!(upload_percent(-1.0), "0 %");
+    }
+
     use tessera_core::api::EventId;
 
     use super::*;

@@ -128,10 +128,31 @@ impl Decision {
     }
 }
 
+/// Ctrl+V (paste, which may be a picture the editor cannot take) and Ctrl+U
+/// (attach files). Alt makes them ordinary keys again.
+fn shortcut(press: &KeyPress) -> Option<Message> {
+    if !press.modifiers.command() || press.modifiers.alt() {
+        return None;
+    }
+    let keyboard::Key::Character(ch) = press.modified_key.as_ref() else {
+        return None;
+    };
+    if ch.eq_ignore_ascii_case("v") {
+        Some(Message::PasteRequested)
+    } else if ch.eq_ignore_ascii_case("u") {
+        Some(Message::AttachRequested)
+    } else {
+        None
+    }
+}
+
 /// The adapter for `text_editor::key_binding`.
 pub fn binding(press: KeyPress, suggestions_open: bool) -> Option<Binding<Message>> {
     if !matches!(press.status, Status::Focused { .. }) {
         return None;
+    }
+    if let Some(message) = shortcut(&press) {
+        return Some(Binding::Custom(message));
     }
     let key = match press.modified_key.as_ref() {
         keyboard::Key::Named(key::Named::Enter) => Key::Enter,
@@ -1117,6 +1138,42 @@ mod tests {
                 false
             ),
             Some(Binding::Insert('a'))
+        ));
+    }
+
+    #[test]
+    fn ctrl_v_and_ctrl_u_are_the_apps_paste_and_attach() {
+        let press = |ch: &str, modifiers: keyboard::Modifiers| KeyPress {
+            key: keyboard::Key::Character(ch.into()),
+            modified_key: keyboard::Key::Character(ch.into()),
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            modifiers,
+            text: None,
+            status: Status::Focused { is_hovered: false },
+        };
+        let ctrl = keyboard::Modifiers::COMMAND;
+        assert!(matches!(
+            binding(press("v", ctrl), false),
+            Some(Binding::Custom(Message::PasteRequested))
+        ));
+        assert!(matches!(
+            binding(press("V", ctrl | keyboard::Modifiers::SHIFT), false),
+            Some(Binding::Custom(Message::PasteRequested))
+        ));
+        assert!(matches!(
+            binding(press("u", ctrl), false),
+            Some(Binding::Custom(Message::AttachRequested))
+        ));
+        // Without the modifier, and with Alt, the keys are ordinary.
+        assert!(!matches!(
+            binding(press("v", keyboard::Modifiers::empty()), false),
+            Some(Binding::Custom(_))
+        ));
+        assert!(!matches!(
+            binding(press("v", ctrl | keyboard::Modifiers::ALT), false),
+            Some(Binding::Custom(_))
         ));
     }
 

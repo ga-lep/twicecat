@@ -2140,14 +2140,18 @@ impl Engine {
         if !joined {
             return Err(CoreError::NotAllowed);
         }
-        // The local echo appears in the selected room's timeline.
-        let timeline = active
+        // The local echo appears in the selected room's timeline, or in the
+        // open thread's when the attachment names a thread root (the thread
+        // timeline adds the relation).
+        let selected = active
             .selected
             .as_ref()
             .filter(|s| s.room_id == attachment.room_id)
-            .ok_or(CoreError::NoRoomSelected)?
-            .timeline
-            .clone();
+            .ok_or(CoreError::NoRoomSelected)?;
+        let timeline = match attachment.thread_root.as_ref().map(parse_event_id) {
+            None => selected.timeline_for(TimelineTarget::Main)?,
+            Some(root) => selected.timeline_for(TimelineTarget::Thread(&root?))?,
+        };
         let job = upload::Job {
             timeline,
             attachment,

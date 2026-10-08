@@ -11,6 +11,7 @@ pub mod room_list_pane;
 pub mod security;
 pub mod sessions;
 pub mod timeline_pane;
+pub mod upload_dialog;
 pub mod verification;
 
 use iced::widget::{container, text};

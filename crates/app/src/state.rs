@@ -20,9 +20,10 @@ use tokio::sync::mpsc;
 
 use crate::actions::{self, ActionButtons, ActionState, NOTICE_DURATION, Notice, Picker};
 use crate::avatars::Avatars;
+use crate::blocking;
 use crate::bridge::{self, Bridge, EventsSlot};
 use crate::composer::{self, Composer, ComposerKey, EditorAction, SearchStep};
-use crate::dialogs::{self, Dialogs, SystemDialogs};
+use crate::dialogs::{self, Clipboard, ClipboardContent, Dialogs, SystemClipboard, SystemDialogs};
 use crate::emoji;
 use crate::links::{self, LinkBar};
 use crate::media::{self, Decoded, MediaModel, SavePath};
@@ -34,6 +35,7 @@ use crate::security::{Busy, SecurityMessage, SecurityModel};
 use crate::sessions::{SessionsMessage, SessionsModel, logout_needs_warning};
 use crate::text_safety;
 use crate::timeline::{self, Effects, TimelineView};
+use crate::upload::{self, Outcome, UploadModel, UploadPaths};
 use crate::verification::{VerificationMessage, VerificationModel};
 
 /// How many users' trust the app keeps: the selected peer, and a stale one or
@@ -300,6 +302,36 @@ pub enum Message {
         /// Whether the handler started without error.
         ok: bool,
     },
+    /// **Attach** or Ctrl+U: choose files to send.
+    AttachRequested,
+    /// The file picker answered; the paths are redacted in `Debug`.
+    FilesChosen(UploadPaths),
+    /// Files are being dragged over the window.
+    FileHovered,
+    /// The files left the window without being dropped.
+    FilesHoveredLeft,
+    /// A file was dropped on the window.
+    FileDropped(UploadPaths),
+    /// The pause after the last dropped file ended; the number says which
+    /// drop started it, so only the last one opens the confirmation.
+    DropsDue(u64),
+    /// A file of the confirmation was read and checked.
+    UploadPrepared {
+        /// The line of the confirmation.
+        entry: u64,
+        /// What was found.
+        outcome: Box<Outcome>,
+    },
+    /// Ctrl+V in the composer.
+    PasteRequested,
+    /// What the clipboard held; redacted in `Debug`.
+    Pasted(ClipboardContent),
+    /// The window system's text paste, after the clipboard could not be read.
+    PasteFallback(Option<MessageText>),
+    /// **Send** in the confirmation.
+    UploadConfirmed,
+    /// **Cancel** in the confirmation (or Esc).
+    UploadCancelled,
     /// The task that decoded fetched image bytes finished.
     MediaDecoded {
         /// Room of the item.
@@ -355,7 +387,10 @@ pub struct App {
     pub user_trust: Vec<(UserId, UserTrust)>,
     /// Thumbnails, the viewer and saves (plan Q7, Q8).
     pub media: MediaModel,
-    dialogs: Box<dyn Dialogs>,
+    /// Files being sent: the confirmation, drops and the server's limit.
+    pub uploads: UploadModel,
+    pub(crate) dialogs: Box<dyn Dialogs>,
+    pub(crate) clipboard: Box<dyn Clipboard>,
     /// The signed-in account.
     pub user_id: Option<UserId>,
     /// The last sync state.
@@ -424,6 +459,7 @@ impl std::fmt::Debug for App {
             .field("timeline", &self.timeline)
             .field("selected", &self.selected)
             .field("media", &self.media)
+            .field("uploads", &self.uploads)
             .field("login", &self.login)
             .field("login_in_flight", &self.login_in_flight)
             .field("composer", &self.composer)
@@ -461,7 +497,9 @@ impl App {
             timeline: TimelineView::default(),
             user_trust: Vec::new(),
             media: MediaModel::default(),
+            uploads: UploadModel::default(),
             dialogs: Box::new(SystemDialogs),
+            clipboard: Box::new(SystemClipboard),
             user_id: None,
             sync_state: SyncState::Idle,
             login: LoginForm::new(),
@@ -509,6 +547,11 @@ impl App {
     /// Replaces the system dialogs (tests use a fake).
     pub fn set_dialogs(&mut self, dialogs: Box<dyn Dialogs>) {
         self.dialogs = dialogs;
+    }
+
+    /// Replaces the system clipboard (tests use a fake).
+    pub fn set_clipboard(&mut self, clipboard: Box<dyn Clipboard>) {
+        self.clipboard = clipboard;
     }
 
     /// The selected direct message's other person and the core's latest word
@@ -560,6 +603,8 @@ impl App {
                 | Message::ReplyRequested(_)
                 | Message::EditRequested(_)
                 | Message::ModeCancelled
+                | Message::Pasted(_)
+                | Message::PasteFallback(_)
         );
         let task = self.update_inner(message);
         if touches_composer && self.selected.is_some() {
@@ -792,6 +837,30 @@ impl App {
             Message::Security(message) => self.on_security(message),
             Message::Verification(message) => self.on_verification(message),
             Message::Sessions(message) => self.on_sessions(message),
+            Message::AttachRequested => self.attach_requested(),
+            Message::FilesChosen(paths) => self.files_added(paths.0),
+            Message::FileHovered => {
+                self.uploads.hovering = self.upload_room().is_some();
+                Task::none()
+            }
+            Message::FilesHoveredLeft => {
+                self.uploads.hovering = false;
+                Task::none()
+            }
+            Message::FileDropped(paths) => self.files_dropped(paths.0),
+            Message::DropsDue(seq) => self.drops_due(seq),
+            Message::UploadPrepared { entry, outcome } => {
+                self.upload_prepared(entry, *outcome);
+                Task::none()
+            }
+            Message::PasteRequested => self.paste_requested(),
+            Message::Pasted(content) => self.pasted(content),
+            Message::PasteFallback(text) => self.paste_fallback(text),
+            Message::UploadConfirmed => self.upload_confirmed(),
+            Message::UploadCancelled => {
+                self.uploads.dialog = None;
+                Task::none()
+            }
             Message::MediaClicked(item_id) => self.open_viewer(item_id),
             Message::ViewerClosed => {
                 self.media.close_viewer();
@@ -858,6 +927,7 @@ impl App {
                 self.selected = Some(id.clone());
                 self.timeline.reset();
                 self.media.reset_view();
+                self.uploads.reset_view();
                 self.user_trust.clear();
                 self.typing.clear();
                 self.actions.reset();
@@ -1085,6 +1155,24 @@ impl App {
                     task = self.show_notice_text("The file could not be saved.".to_owned());
                 }
             }
+            CoreEvent::ActionFailed {
+                room_id,
+                action: ActionKind::Discard,
+                ..
+            } => {
+                if self.selected.as_ref() == Some(&room_id) {
+                    task = self.show_notice_text(upload::CANCEL_REFUSED.to_owned());
+                }
+            }
+            CoreEvent::ActionFailed {
+                room_id,
+                action: ActionKind::Upload,
+                error,
+            } => {
+                if self.selected.as_ref() == Some(&room_id) {
+                    task = self.show_notice_text(upload::failure_text(&error).to_owned());
+                }
+            }
             CoreEvent::Typing { room_id, mut users } => {
                 if self.selected.as_ref() == Some(&room_id) {
                     users.truncate(timeline::MAX_TYPING_KEPT);
@@ -1147,8 +1235,10 @@ impl App {
             CoreEvent::MediaSaved { room_id, item_id } => {
                 self.media.finish_save(&(room_id, item_id));
             }
-            CoreEvent::MediaLimits { .. }
-            | CoreEvent::Notification(_)
+            CoreEvent::MediaLimits { max_upload_bytes } => {
+                self.uploads.max_upload_bytes = max_upload_bytes;
+            }
+            CoreEvent::Notification(_)
             | CoreEvent::NotificationSettings(_)
             | CoreEvent::UnreadTotals { .. }
             | CoreEvent::RoomCreated { .. }
@@ -1339,7 +1429,7 @@ impl App {
 
     /// Applies an editor action to the composer of the open room and sends
     /// what that asks for: typing notices and member searches.
-    fn composer_action_at(
+    pub(crate) fn composer_action_at(
         &mut self,
         action: iced::widget::text_editor::Action,
         now: Instant,
@@ -1560,7 +1650,7 @@ impl App {
     }
 
     /// Shows a failure line for 5 seconds.
-    fn show_notice_text(&mut self, text: String) -> Task<Message> {
+    pub(crate) fn show_notice_text(&mut self, text: String) -> Task<Message> {
         let seq = self.actions.notice_seq.saturating_add(1);
         self.actions.notice_seq = seq;
         self.actions.notice = Some(Notice { seq, text });
@@ -1646,6 +1736,7 @@ impl App {
         self.load_more_at = None;
         self.avatars.clear();
         self.media.clear();
+        self.uploads.clear();
         self.list_offset_y = 0.0;
         self.deselect();
         self.sync_state = SyncState::Idle;
@@ -1663,6 +1754,7 @@ impl App {
         self.selected = None;
         self.timeline.reset();
         self.media.reset_view();
+        self.uploads.reset_view();
         self.user_trust.clear();
         self.typing.clear();
         self.actions.reset();
@@ -1835,12 +1927,16 @@ impl App {
             }
             return Task::none();
         };
+        // Decoding untrusted bytes is CPU work: off the executor, and only
+        // a couple at a time.
         Task::perform(
             async move {
-                match size {
+                blocking::run(move || match size {
                     MediaSize::Thumbnail => media::decode_thumbnail(bytes.as_bytes()),
                     MediaSize::Full => media::decode_full(bytes.as_bytes()),
-                }
+                })
+                .await
+                .flatten()
             },
             move |decoded| Message::MediaDecoded {
                 room_id: room_id.clone(),
@@ -1975,10 +2071,17 @@ impl App {
     /// **Retry** or **Discard** for item `id`, only while it is a failed
     /// local echo.
     fn echo_command(&mut self, item_id: String, discard: bool) -> Task<Message> {
-        let failed = self
-            .find_message(&item_id)
-            .is_some_and(|(_, _, details)| details.send_failure.is_some());
-        let Some(room_id) = self.selected.clone().filter(|_| failed) else {
+        // A failed echo can be retried or discarded; an upload that is on
+        // its way can be cancelled, which is a discard.
+        let allowed = self.find_message(&item_id).is_some_and(|(_, _, details)| {
+            details.send_failure.is_some()
+                || (discard
+                    && details
+                        .media
+                        .as_deref()
+                        .is_some_and(|media| media.upload.is_some()))
+        });
+        let Some(room_id) = self.selected.clone().filter(|_| allowed) else {
             return Task::none();
         };
         self.send(if discard {
@@ -2002,7 +2105,10 @@ impl App {
                 screens::verification::layer(base, self)
             }
             Screen::Main => screens::verification::layer(
-                screens::media_viewer::layer(main_view::view(self), self),
+                screens::upload_dialog::layer(
+                    screens::media_viewer::layer(main_view::view(self), self),
+                    self,
+                ),
                 self,
             ),
             Screen::ShuttingDown => screens::centered_text("Closing\u{2026}"),
@@ -2015,14 +2121,30 @@ impl App {
         Subscription::batch([
             bridge::events_subscription(self.events.clone()),
             window::close_requests().map(|_| Message::CloseRequested),
-            iced::event::listen_with(|event, _status, _id| match event {
+            iced::event::listen_with(|event, status, _id| match event {
                 iced::Event::Window(window::Event::Focused) => Some(Message::WindowFocus(true)),
                 iced::Event::Window(window::Event::Unfocused) => Some(Message::WindowFocus(false)),
-                _ => None,
+                other => upload::event_message(&other, status),
             }),
+            self.upload_keys(),
             system::theme_changes().map(Message::ThemeMode),
             self.viewer_keys(),
         ])
+    }
+
+    /// Esc closes the upload confirmation while it is open; no listener
+    /// otherwise.
+    fn upload_keys(&self) -> Subscription<Message> {
+        if self.uploads.dialog.is_none() {
+            return Subscription::none();
+        }
+        iced::event::listen_with(|event, _status, _id| match event {
+            iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+                ..
+            }) => Some(Message::UploadCancelled),
+            _ => None,
+        })
     }
 
     /// Esc closes the viewer while it is open; no listener otherwise.
@@ -6931,5 +7053,575 @@ mod tests {
         let _ = app.update(core(CoreEvent::LoggedOut));
         assert!(app.media.viewer.is_none());
         assert!(app.media.thumb(&key_of("img1")).is_none());
+    }
+
+    // ---- Task 10: uploads ----
+
+    mod uploads {
+        use std::path::PathBuf;
+        use std::sync::Arc;
+
+        use tessera_core::api::{
+            ActionKind, AttachmentData, MediaContent, MediaKind, MessageText, UploadProgress,
+        };
+
+        use super::*;
+        use crate::dialogs::{ClipboardContent, RecordingClipboard, RecordingDialogs};
+        use crate::upload::{self, EntryState, Outcome, Refusal, TooLarge, UploadPaths};
+
+        fn rig() -> (
+            App,
+            mpsc::Receiver<Command>,
+            RecordingDialogs,
+            RecordingClipboard,
+        ) {
+            let (mut app, rx) = main_app();
+            let dialogs = RecordingDialogs::default();
+            let clipboard = RecordingClipboard::default();
+            app.set_dialogs(Box::new(dialogs.clone()));
+            app.set_clipboard(Box::new(clipboard.clone()));
+            (app, rx, dialogs, clipboard)
+        }
+
+        fn paths(names: &[&str]) -> UploadPaths {
+            UploadPaths(
+                names
+                    .iter()
+                    .map(|n| PathBuf::from(format!("/x/{n}")))
+                    .collect(),
+            )
+        }
+
+        fn outcome_for(name: &str, bytes: Vec<u8>, limit: Option<u64>) -> Outcome {
+            upload::prepare_bytes(name.to_owned(), bytes, limit)
+        }
+
+        fn prepared(entry: u64, name: &str, bytes: Vec<u8>) -> Message {
+            Message::UploadPrepared {
+                entry,
+                outcome: Box::new(outcome_for(name, bytes, None)),
+            }
+        }
+
+        fn attachments(commands: &[Command]) -> Vec<&tessera_core::api::OutgoingAttachment> {
+            commands
+                .iter()
+                .filter_map(|c| match c {
+                    Command::SendAttachment(a) => Some(a),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        #[test]
+        fn attach_opens_the_picker_only_with_a_room() {
+            let (mut app, _rx, dialogs, _) = rig();
+            let _ = app.update(Message::AttachRequested);
+            assert_eq!(*dialogs.picked.lock().expect("mutex"), 1);
+            let _ = app.update(Message::SelectRoom(RoomId::from("!a:x")));
+            app.deselect();
+            let _ = app.update(Message::AttachRequested);
+            assert_eq!(
+                *dialogs.picked.lock().expect("mutex"),
+                1,
+                "no room, no dialog"
+            );
+        }
+
+        #[test]
+        fn chosen_files_open_one_confirmation_in_order() {
+            let (mut app, _rx, _, _) = rig();
+            let task = app.update(Message::FilesChosen(paths(&["b.txt", "a.txt"])));
+            assert!(task.units() >= 2, "one read per file, in tasks");
+            let dialog = app.uploads.dialog.as_ref().expect("a confirmation");
+            assert_eq!(dialog.room_id, room_a());
+            let names: Vec<_> = dialog.entries.iter().map(|e| e.name.as_str()).collect();
+            assert_eq!(names, ["b.txt", "a.txt"]);
+            assert!(dialog.loading());
+            assert!(!dialog.can_send());
+        }
+
+        #[test]
+        fn an_empty_answer_opens_nothing() {
+            let (mut app, _rx, _, _) = rig();
+            let _ = app.update(Message::FilesChosen(UploadPaths(Vec::new())));
+            assert!(app.uploads.dialog.is_none());
+        }
+
+        #[test]
+        fn at_most_twenty_files_are_taken() {
+            let (mut app, _rx, _, _) = rig();
+            let many: Vec<String> = (0..30).map(|n| format!("f{n}.txt")).collect();
+            let many: Vec<&str> = many.iter().map(String::as_str).collect();
+            let _ = app.update(Message::FilesChosen(paths(&many)));
+            let dialog = app.uploads.dialog.as_ref().expect("dialog");
+            assert_eq!(dialog.entries.len(), upload::MAX_FILES);
+            let _ = app.update(Message::FilesChosen(paths(&["more.txt"])));
+            let dialog = app.uploads.dialog.as_ref().expect("dialog");
+            assert_eq!(dialog.entries.len(), upload::MAX_FILES, "the cap holds");
+        }
+
+        #[test]
+        fn names_are_base_names_without_separators_or_controls() {
+            let (mut app, _rx, _, _) = rig();
+            let evil = UploadPaths(vec![PathBuf::from("/tmp/dir/sub/na\u{202E}me\n.txt")]);
+            let _ = app.update(Message::FilesChosen(evil));
+            let dialog = app.uploads.dialog.as_ref().expect("dialog");
+            assert_eq!(dialog.entries[0].name, "name.txt");
+        }
+
+        #[test]
+        fn prepared_files_fill_their_lines_and_unlock_send() {
+            let (mut app, _rx, _, _) = rig();
+            let _ = app.update(Message::FilesChosen(paths(&["a.txt", "b.txt"])));
+            let ids: Vec<u64> = app
+                .uploads
+                .dialog
+                .as_ref()
+                .expect("dialog")
+                .entries
+                .iter()
+                .map(|e| e.id)
+                .collect();
+            let _ = app.update(prepared(ids[1], "b.txt", b"bee".to_vec()));
+            assert!(
+                !app.uploads.dialog.as_ref().expect("dialog").can_send(),
+                "a.txt still loads"
+            );
+            let _ = app.update(prepared(ids[0], "a.txt", b"ay".to_vec()));
+            let dialog = app.uploads.dialog.as_ref().expect("dialog");
+            assert!(dialog.can_send());
+            assert_eq!(dialog.sendable(), 2);
+        }
+
+        #[test]
+        fn a_late_answer_for_a_closed_confirmation_is_ignored() {
+            let (mut app, _rx, _, _) = rig();
+            let _ = app.update(Message::FilesChosen(paths(&["a.txt"])));
+            let id = app.uploads.dialog.as_ref().expect("dialog").entries[0].id;
+            let _ = app.update(Message::UploadCancelled);
+            let _ = app.update(prepared(id, "a.txt", b"x".to_vec()));
+            assert!(app.uploads.dialog.is_none());
+        }
+
+        #[test]
+        fn over_limit_files_are_refused_with_the_limit_shown() {
+            let (mut app, _rx, _, _) = rig();
+            let _ = app.update(core(CoreEvent::MediaLimits {
+                max_upload_bytes: Some(10),
+            }));
+            assert_eq!(app.uploads.max_upload_bytes, Some(10));
+            let refused = outcome_for("big.bin", vec![0; 11], Some(10));
+            assert!(matches!(
+                refused,
+                Outcome::Refused(Refusal::TooLarge(TooLarge { limit: 10 }))
+            ));
+            let _ = app.update(Message::FilesChosen(paths(&["big.bin"])));
+            let id = app.uploads.dialog.as_ref().expect("dialog").entries[0].id;
+            let _ = app.update(Message::UploadPrepared {
+                entry: id,
+                outcome: Box::new(refused),
+            });
+            let dialog = app.uploads.dialog.as_ref().expect("dialog");
+            assert!(matches!(
+                dialog.entries[0].state,
+                EntryState::Refused(Refusal::TooLarge(_))
+            ));
+            assert!(!dialog.can_send());
+            assert!(
+                Refusal::TooLarge(TooLarge { limit: 10_000_000 })
+                    .text()
+                    .contains("10.0 MB")
+            );
+        }
+
+        #[test]
+        fn hovering_shows_the_drop_layer_and_leaving_hides_it() {
+            let (mut app, _rx, _, _) = rig();
+            let _ = app.update(Message::FileHovered);
+            assert!(app.uploads.hovering);
+            let _ = app.update(Message::FilesHoveredLeft);
+            assert!(!app.uploads.hovering);
+        }
+
+        #[test]
+        fn dropped_files_gather_into_one_confirmation_after_the_pause() {
+            let (mut app, _rx, _, _) = rig();
+            let _ = app.update(Message::FileHovered);
+            let _ = app.update(Message::FileDropped(paths(&["one.txt"])));
+            let first_seq = app.uploads.drop_seq;
+            let _ = app.update(Message::FileDropped(paths(&["two.txt"])));
+            assert!(!app.uploads.hovering, "a drop ends the hover");
+            assert!(
+                app.uploads.dialog.is_none(),
+                "nothing opens before the pause"
+            );
+            // The timer of the first drop is stale.
+            let _ = app.update(Message::DropsDue(first_seq));
+            assert!(app.uploads.dialog.is_none());
+            let _ = app.update(Message::DropsDue(app.uploads.drop_seq));
+            let dialog = app.uploads.dialog.as_ref().expect("a confirmation");
+            let names: Vec<_> = dialog.entries.iter().map(|e| e.name.as_str()).collect();
+            assert_eq!(names, ["one.txt", "two.txt"]);
+            assert!(app.uploads.dropped.is_empty());
+        }
+
+        #[test]
+        fn drops_without_a_room_are_ignored() {
+            let (mut app, _rx, _, _) = rig();
+            app.deselect();
+            let _ = app.update(Message::FileHovered);
+            assert!(!app.uploads.hovering);
+            let _ = app.update(Message::FileDropped(paths(&["a.txt"])));
+            assert!(app.uploads.dropped.is_empty());
+        }
+
+        #[test]
+        fn paste_reads_the_clipboard_in_a_task() {
+            let (mut app, _rx, _, clipboard) = rig();
+            let _ = app.update(Message::PasteRequested);
+            assert_eq!(*clipboard.reads.lock().expect("mutex"), 1);
+        }
+
+        #[test]
+        fn pasted_text_goes_into_the_composer() {
+            let (mut app, _rx, _, _) = rig();
+            type_in(&mut app, "ab");
+            let _ = app.update(Message::Pasted(ClipboardContent::Text(MessageText::from(
+                "XY",
+            ))));
+            assert_eq!(app.composer.text(), "abXY");
+            assert!(app.uploads.dialog.is_none());
+        }
+
+        #[test]
+        fn a_pasted_picture_opens_the_confirmation_with_a_png() {
+            let (mut app, _rx, _, _) = rig();
+            let task = app.update(Message::Pasted(ClipboardContent::Image {
+                width: 2,
+                height: 2,
+                rgba: Arc::new(vec![255; 16]),
+            }));
+            assert!(task.units() >= 1, "the PNG is made in a task");
+            let dialog = app.uploads.dialog.as_ref().expect("a confirmation");
+            assert_eq!(dialog.entries.len(), 1);
+            assert!(dialog.loading());
+            assert_eq!(composer_text(&app), "");
+        }
+
+        #[test]
+        fn pixels_become_a_png_file() {
+            let rgba = vec![200u8; 4 * 3 * 4];
+            let Outcome::Ready(p) = upload::prepare_pixels("p.png".into(), 4, 3, &rgba, None)
+            else {
+                panic!("ready");
+            };
+            assert_eq!(p.mime, "image/png");
+            assert_eq!(p.kind, MediaKind::Image);
+            assert_eq!((p.width, p.height), (Some(4), Some(3)));
+            assert!(
+                matches!(&p.source, upload::Source::Bytes(b) if b.starts_with(&[0x89, b'P', b'N', b'G']))
+            );
+            // A size that does not match the pixels is refused.
+            assert!(matches!(
+                upload::prepare_pixels("p.png".into(), 4, 3, &rgba[..10], None),
+                Outcome::Refused(Refusal::BadPicture)
+            ));
+        }
+
+        #[test]
+        fn an_unreadable_clipboard_falls_back_to_the_window_systems_text_paste() {
+            let (mut app, _rx, _, _) = rig();
+            let task = app.update(Message::Pasted(ClipboardContent::Unavailable));
+            assert!(task.units() >= 1, "iced::clipboard::read");
+            assert!(app.uploads.dialog.is_none());
+            type_in(&mut app, "a");
+            let _ = app.update(Message::PasteFallback(Some(MessageText::from("bc"))));
+            assert_eq!(app.composer.text(), "abc");
+            let _ = app.update(Message::PasteFallback(None));
+            assert_eq!(app.composer.text(), "abc");
+        }
+
+        fn composer_text(app: &App) -> String {
+            app.composer.text()
+        }
+
+        /// Confirms two ready files with a reply and a thread root set.
+        fn two_ready(app: &mut App) {
+            let _ = app.update(Message::FilesChosen(paths(&["a.txt", "b.png"])));
+            let ids: Vec<u64> = app
+                .uploads
+                .dialog
+                .as_ref()
+                .expect("dialog")
+                .entries
+                .iter()
+                .map(|e| e.id)
+                .collect();
+            let _ = app.update(prepared(ids[0], "a.txt", b"ay".to_vec()));
+            let _ = app.update(prepared(ids[1], "b.txt", b"bee".to_vec()));
+        }
+
+        #[test]
+        fn send_queues_one_attachment_per_file_in_order() {
+            let (mut app, mut rx, _, _) = rig();
+            two_ready(&mut app);
+            let _ = drain(&mut rx);
+            let _ = app.update(Message::UploadConfirmed);
+            let commands = drain(&mut rx);
+            let sent = attachments(&commands);
+            assert_eq!(sent.len(), 2);
+            assert_eq!(sent[0].filename, "a.txt");
+            assert_eq!(sent[1].filename, "b.txt");
+            assert!(sent.iter().all(|a| a.room_id == room_a()));
+            assert!(
+                sent.iter()
+                    .all(|a| a.reply_to.is_none() && a.thread_root.is_none())
+            );
+            assert_eq!(sent[0].mimetype, "text/plain");
+            assert!(matches!(&sent[0].data, AttachmentData::Bytes(b) if b.as_bytes() == b"ay"));
+            assert!(app.uploads.dialog.is_none());
+        }
+
+        #[test]
+        fn path_files_go_to_the_core_as_paths_with_the_base_name_only() {
+            let (mut app, mut rx, _, _) = rig();
+            let _ = app.update(Message::FilesChosen(paths(&["a.txt"])));
+            let id = app.uploads.dialog.as_ref().expect("dialog").entries[0].id;
+            let outcome = Outcome::Ready(Box::new(upload::Prepared {
+                name: "a.txt".into(),
+                size: 3,
+                source: upload::Source::Path(PathBuf::from("/x/a.txt")),
+                mime: "text/plain",
+                kind: MediaKind::File,
+                width: None,
+                height: None,
+                thumbnail: None,
+                preview: None,
+            }));
+            let _ = app.update(Message::UploadPrepared {
+                entry: id,
+                outcome: Box::new(outcome),
+            });
+            let _ = drain(&mut rx);
+            let _ = app.update(Message::UploadConfirmed);
+            let commands = drain(&mut rx);
+            let sent = attachments(&commands);
+            assert_eq!(sent.len(), 1);
+            assert_eq!(sent[0].filename, "a.txt");
+            assert!(
+                matches!(&sent[0].data, AttachmentData::Path(p) if p == &PathBuf::from("/x/a.txt"))
+            );
+        }
+
+        #[test]
+        fn send_carries_the_reply_target_and_the_thread_root() {
+            let (mut app, mut rx, _, _) = rig();
+            let mut target = media_item("m1", MediaKind::File, "f.bin", 1, 1);
+            target.event_id = Some(EventId::from("$target:x"));
+            let _ = app.update(core(CoreEvent::TimelineDiff {
+                room_id: room_a(),
+                diffs: vec![ListDiff::Append {
+                    values: vec![target],
+                }],
+            }));
+            app.composer.mode = composer::Mode::Reply("m1".into());
+            app.uploads.thread_root = Some(EventId::from("$root:x"));
+            two_ready(&mut app);
+            let _ = drain(&mut rx);
+            let _ = app.update(Message::UploadConfirmed);
+            let commands = drain(&mut rx);
+            let sent = attachments(&commands);
+            assert_eq!(sent.len(), 2);
+            for a in &sent {
+                assert_eq!(a.reply_to.as_ref().map(EventId::as_str), Some("$target:x"));
+                assert_eq!(a.thread_root.as_ref().map(EventId::as_str), Some("$root:x"));
+            }
+            assert_eq!(
+                app.composer.mode,
+                composer::Mode::Normal,
+                "the reply is used up"
+            );
+        }
+
+        #[test]
+        fn send_skips_refused_files_and_waits_for_loading_ones() {
+            let (mut app, mut rx, _, _) = rig();
+            let _ = app.update(Message::FilesChosen(paths(&["a.txt", "b.txt"])));
+            let ids: Vec<u64> = app
+                .uploads
+                .dialog
+                .as_ref()
+                .expect("dialog")
+                .entries
+                .iter()
+                .map(|e| e.id)
+                .collect();
+            let _ = app.update(prepared(ids[0], "a.txt", b"x".to_vec()));
+            let _ = drain(&mut rx);
+            let _ = app.update(Message::UploadConfirmed);
+            assert!(attachments(&drain(&mut rx)).is_empty(), "b.txt still loads");
+            assert!(app.uploads.dialog.is_some());
+            let _ = app.update(Message::UploadPrepared {
+                entry: ids[1],
+                outcome: Box::new(Outcome::Refused(Refusal::Unreadable)),
+            });
+            let _ = app.update(Message::UploadConfirmed);
+            let commands = drain(&mut rx);
+            assert_eq!(attachments(&commands).len(), 1);
+        }
+
+        #[test]
+        fn cancel_and_changing_rooms_close_the_confirmation() {
+            let (mut app, mut rx, _, _) = rig();
+            two_ready(&mut app);
+            let _ = app.update(Message::UploadCancelled);
+            assert!(app.uploads.dialog.is_none());
+            assert!(attachments(&drain(&mut rx)).is_empty());
+            two_ready(&mut app);
+            let _ = app.update(Message::SelectRoom(RoomId::from("!b:x")));
+            assert!(app.uploads.dialog.is_none());
+        }
+
+        #[test]
+        fn logging_out_forgets_uploads() {
+            let (mut app, _rx, _, _) = rig();
+            two_ready(&mut app);
+            app.uploads.max_upload_bytes = Some(5);
+            let _ = app.update(core(CoreEvent::LoggedOut));
+            assert!(app.uploads.dialog.is_none());
+            assert_eq!(app.uploads.max_upload_bytes, None);
+        }
+
+        #[test]
+        fn messages_and_state_never_print_paths_names_or_pixels() {
+            let (mut app, _rx, _, _) = rig();
+            let secret = UploadPaths(vec![PathBuf::from("/home/u/secret-sentinel.txt")]);
+            let shown = format!("{:?}", Message::FilesChosen(secret.clone()));
+            assert!(!shown.contains("secret-sentinel"), "{shown}");
+            let shown = format!("{:?}", Message::FileDropped(secret.clone()));
+            assert!(!shown.contains("secret-sentinel"), "{shown}");
+            let _ = app.update(Message::FilesChosen(secret));
+            let id = app.uploads.dialog.as_ref().expect("dialog").entries[0].id;
+            let _ = app.update(prepared(
+                id,
+                "secret-sentinel.txt",
+                b"body-sentinel".to_vec(),
+            ));
+            let shown = format!("{app:?}");
+            assert!(!shown.contains("secret-sentinel"), "{shown}");
+            assert!(!shown.contains("body-sentinel"), "{shown}");
+            let message = prepared(id, "secret-sentinel.txt", b"body-sentinel".to_vec());
+            let shown = format!("{message:?}");
+            assert!(
+                !shown.contains("secret-sentinel") && !shown.contains("body-sentinel"),
+                "{shown}"
+            );
+            let clip = format!(
+                "{:?}",
+                Message::Pasted(ClipboardContent::Text(MessageText::from("clip-sentinel")))
+            );
+            assert!(!clip.contains("clip-sentinel"), "{clip}");
+        }
+
+        // ---- progress and cancel ----
+
+        fn upload_echo(
+            id: &str,
+            sent: SendStatus,
+            progress: Option<UploadProgress>,
+        ) -> TimelineItem {
+            let mut content = MediaContent::new(MediaKind::File, "f.bin".to_owned());
+            content.upload = progress;
+            TimelineItem::new(
+                id.to_owned(),
+                TimelineItemKind::Message {
+                    sender: UserId::from("@a:x"),
+                    body: "f.bin".to_owned(),
+                    is_own: true,
+                    timestamp_ms: 1,
+                    sent,
+                    details: Box::new(MessageDetails {
+                        media: Some(Box::new(content)),
+                        ..MessageDetails::default()
+                    }),
+                },
+            )
+        }
+
+        fn show(app: &mut App, item: TimelineItem) {
+            let _ = app.update(core(CoreEvent::TimelineDiff {
+                room_id: room_a(),
+                diffs: vec![ListDiff::Append { values: vec![item] }],
+            }));
+        }
+
+        #[test]
+        fn cancel_discards_an_upload_that_is_in_progress() {
+            let (mut app, mut rx, _, _) = rig();
+            show(
+                &mut app,
+                upload_echo(
+                    "up",
+                    SendStatus::Sending,
+                    Some(UploadProgress { sent: 1, total: 4 }),
+                ),
+            );
+            let _ = drain(&mut rx);
+            let _ = app.update(Message::DiscardRequested("up".into()));
+            assert!(matches!(
+                drain(&mut rx).as_slice(),
+                [Command::DiscardSend { item_id, .. }] if item_id == "up"
+            ));
+        }
+
+        #[test]
+        fn a_plain_message_that_is_sending_cannot_be_discarded() {
+            let (mut app, mut rx, _, _) = rig();
+            show(&mut app, upload_echo("up", SendStatus::Sending, None));
+            let _ = drain(&mut rx);
+            let _ = app.update(Message::DiscardRequested("up".into()));
+            assert!(drain(&mut rx).is_empty());
+        }
+
+        #[test]
+        fn failures_of_cancel_and_upload_show_a_notice_in_the_open_room() {
+            let (mut app, _rx, _, _) = rig();
+            let _ = app.update(core(CoreEvent::ActionFailed {
+                room_id: room_a(),
+                action: ActionKind::Discard,
+                error: CoreError::Internal("x".into()),
+            }));
+            let notice = app.actions.notice.as_ref().expect("a notice").text.clone();
+            assert!(notice.contains("cancel"), "{notice}");
+            let _ = app.update(core(CoreEvent::ActionFailed {
+                room_id: room_a(),
+                action: ActionKind::Upload,
+                error: CoreError::NotAllowed,
+            }));
+            let notice = app.actions.notice.as_ref().expect("a notice").text.clone();
+            assert!(notice.contains("not sent"), "{notice}");
+            // Another room's failure is not shown here.
+            app.actions.notice = None;
+            let _ = app.update(core(CoreEvent::ActionFailed {
+                room_id: RoomId::from("!b:x"),
+                action: ActionKind::Upload,
+                error: CoreError::NotAllowed,
+            }));
+            assert!(app.actions.notice.is_none());
+        }
+
+        #[test]
+        fn opening_the_confirmation_keeps_the_widget_tree_under_it() {
+            let (mut app, _rx, _, _) = rig();
+            let closed = tag_path(&app);
+            let _ = app.update(Message::FileHovered);
+            assert_eq!(tag_path(&app), closed);
+            let _ = app.update(Message::FilesHoveredLeft);
+            two_ready(&mut app);
+            assert_eq!(tag_path(&app), closed, "the base keeps its place");
+            let _ = app.update(Message::UploadCancelled);
+            assert_eq!(tag_path(&app), closed);
+        }
     }
 }

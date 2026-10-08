@@ -66,13 +66,14 @@ fn thumbnail(t: &UploadThumbnail) -> Result<Thumbnail, CoreError> {
 /// The SDK's description of an outgoing attachment of `size` bytes.
 ///
 /// Refuses what the core cannot send: an empty file name, a bad thumbnail
-/// type or an oversized thumbnail, a malformed reply target, and thread
-/// attachments (they need a thread-focused timeline).
+/// type or an oversized thumbnail, and a malformed reply target. A thread
+/// root is not part of the config: the thread timeline the job is queued on
+/// adds the relation.
 pub(crate) fn attachment_config(
     a: &OutgoingAttachment,
     size: u64,
 ) -> Result<AttachmentConfig, CoreError> {
-    if a.filename.trim().is_empty() || a.thread_root.is_some() {
+    if a.filename.trim().is_empty() {
         return Err(CoreError::NotAllowed);
     }
     let size = Some(UInt::try_from(size).map_err(|_| CoreError::NotAllowed)?);
@@ -331,7 +332,7 @@ mod tests {
     }
 
     #[test]
-    fn bad_thumbnail_and_thread_requests_are_refused() {
+    fn bad_thumbnails_are_refused() {
         let mut a = attachment(MediaKind::Image);
         let mut t = thumb();
         t.mimetype = "nope".into();
@@ -343,9 +344,13 @@ mod tests {
             ..thumb()
         });
         assert_eq!(attachment_config(&a, 1).unwrap_err(), CoreError::NotAllowed);
-        // Threads need a thread-focused timeline (a later task).
+    }
+
+    #[test]
+    fn a_thread_attachment_is_valid_the_engine_picks_the_thread_timeline() {
         let mut a = attachment(MediaKind::File);
         a.thread_root = Some(EventId::from("$root:x"));
-        assert_eq!(attachment_config(&a, 1).unwrap_err(), CoreError::NotAllowed);
+        assert!(attachment_config(&a, 1).is_ok());
+        assert!(validate(&a).is_ok());
     }
 }

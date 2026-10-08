@@ -21,8 +21,9 @@ use matrix_sdk::ruma::events::room::message::{Relation, RoomMessageEventContent}
 use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId};
 use tessera_core::CoreHandle;
 use tessera_core::api::{
-    ActionKind, Command, CoreError, CoreEvent, EventId, ListDiff, MessageDetails, PaginationState,
-    RoomId, RoomSummary, TimelineItem, TimelineItemKind,
+    ActionKind, AttachmentData, Command, CoreError, CoreEvent, EventId, ListDiff, MediaBytes,
+    MediaKind, MessageDetails, OutgoingAttachment, PaginationState, RoomId, RoomSummary,
+    TimelineItem, TimelineItemKind,
 };
 use tessera_core::secrets::InMemorySecretStore;
 
@@ -405,6 +406,110 @@ async fn a_closed_thread_takes_no_sends_and_selecting_another_room_closes_it() {
         })
         .await;
     expect_refused(&mut rig.alice, ActionKind::Thread).await;
+    rig.finish().await;
+}
+
+fn thread_file(room: &str, name: &str, root: &EventId) -> OutgoingAttachment {
+    OutgoingAttachment {
+        room_id: RoomId::from(room),
+        filename: name.to_owned(),
+        mimetype: "application/octet-stream".into(),
+        data: AttachmentData::Bytes(MediaBytes::from(vec![7; 2048])),
+        kind: MediaKind::File,
+        width: None,
+        height: None,
+        thumbnail: None,
+        reply_to: None,
+        thread_root: Some(root.clone()),
+    }
+}
+
+/// The message whose media has this file name.
+fn named_file<'a>(items: &'a [TimelineItem], name: &str) -> Option<&'a TimelineItem> {
+    items.iter().find(|i| match &i.kind {
+        TimelineItemKind::Message { details, .. } => {
+            details.media.as_deref().is_some_and(|m| m.filename == name)
+        }
+        _ => false,
+    })
+}
+
+#[tokio::test]
+#[ignore = "needs local homeserver: docker compose up -d --wait"]
+async fn an_attachment_sent_into_an_open_thread_lands_in_the_thread() {
+    let mut rig = rig().await;
+    let (root_text, root) = rig.root().await;
+    let room = rig.room.clone();
+    rig.carol
+        .send(Command::OpenThread {
+            room_id: RoomId::from(room.as_str()),
+            root: root.clone(),
+        })
+        .await;
+    rig.carol
+        .wait(&room, "carol's thread opens", |s| !s.thread.is_empty())
+        .await;
+    let name = format!("thread-file-{}.bin", common::hex());
+    rig.carol
+        .send(Command::SendAttachment(thread_file(&room, &name, &root)))
+        .await;
+    rig.carol
+        .wait(&room, "carol's thread shows the file", |s| {
+            named_file(&s.thread, &name).is_some()
+        })
+        .await;
+    rig.alice
+        .wait(&room, "alice's summary counts the file", |s| {
+            summary_of(s, &root_text).is_some_and(|t| t.replies == 1)
+        })
+        .await;
+    // It is a thread reply: it never shows in either main timeline.
+    let _ = tokio::time::timeout(
+        Duration::from_secs(3),
+        rig.alice.wait(&room, "never", |_| false),
+    )
+    .await;
+    assert!(named_file(&rig.alice.main, &name).is_none());
+    assert!(named_file(&rig.carol.main, &name).is_none());
+    // Alice opens the thread and finds it there.
+    rig.alice
+        .send(Command::OpenThread {
+            room_id: RoomId::from(room.as_str()),
+            root: root.clone(),
+        })
+        .await;
+    rig.alice
+        .wait(&room, "alice's thread shows the file", |s| {
+            named_file(&s.thread, &name).is_some()
+        })
+        .await;
+    rig.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "needs local homeserver: docker compose up -d --wait"]
+async fn an_attachment_for_a_thread_that_is_not_open_is_refused() {
+    let mut rig = rig().await;
+    let (_, root) = rig.root().await;
+    let room = rig.room.clone();
+    let name = format!("thread-file-{}.bin", common::hex());
+    rig.alice
+        .send(Command::SendAttachment(thread_file(&room, &name, &root)))
+        .await;
+    let event = expect_event(&mut rig.alice.core, |e| {
+        matches!(
+            e,
+            CoreEvent::ActionFailed {
+                action: ActionKind::Upload,
+                ..
+            }
+        )
+    })
+    .await;
+    let CoreEvent::ActionFailed { error, .. } = event else {
+        unreachable!()
+    };
+    assert_eq!(error, CoreError::NotAllowed);
     rig.finish().await;
 }
 

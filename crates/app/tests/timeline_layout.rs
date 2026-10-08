@@ -283,3 +283,51 @@ fn a_thumbnail_arriving_changes_no_laid_out_row_height() {
     let after = row_heights(&content_node_with(&view, &renderer, &media, Some(&room)));
     assert_eq!(after, before);
 }
+
+/// A file being uploaded: a local echo with progress.
+fn uploading(id: &str, sent: u64) -> TimelineItem {
+    let mut media =
+        tessera_core::api::MediaContent::new(tessera_core::api::MediaKind::File, "f.bin".into());
+    media.upload = Some(tessera_core::api::UploadProgress { sent, total: 100 });
+    TimelineItem::new(
+        id.to_owned(),
+        TimelineItemKind::Message {
+            sender: UserId::from("@a:x"),
+            body: "f.bin".to_owned(),
+            is_own: true,
+            timestamp_ms: NOW,
+            sent: SendStatus::Sending,
+            details: Box::new(MessageDetails {
+                media: Some(Box::new(media)),
+                ..MessageDetails::default()
+            }),
+        },
+    )
+}
+
+#[test]
+fn upload_progress_changes_no_laid_out_row_height() {
+    let renderer = renderer();
+    let heights = |sent| {
+        let mut view = TimelineView::default();
+        view.apply_diffs(vec![ListDiff::Reset {
+            values: vec![uploading("u", sent)],
+        }]);
+        view.scrolled(0.0, HEIGHT, WIDTH);
+        row_heights(&content_node(&view, &renderer))
+    };
+    let (start, middle, end) = (heights(0), heights(50), heights(100));
+    assert_eq!(start.len(), 1);
+    assert_eq!(start, middle);
+    assert_eq!(middle, end);
+    // The bar and **Cancel** add a line under the card.
+    let plain = {
+        let mut view = TimelineView::default();
+        view.apply_diffs(vec![ListDiff::Reset {
+            values: vec![media_message("p", tessera_core::api::MediaKind::File, 0, 0)],
+        }]);
+        view.scrolled(0.0, HEIGHT, WIDTH);
+        row_heights(&content_node(&view, &renderer))
+    };
+    assert!(start[0] > plain[0], "{start:?} vs {plain:?}");
+}

@@ -272,7 +272,15 @@ fn editor(app: &App, enabled: bool) -> Element<'_, Message> {
     if enabled {
         editor = editor.on_action(|action| Message::Composer(EditorAction(action)));
     }
-    editor.into()
+    // The button is always there, so the editor keeps its place in the tree;
+    // without a room it does nothing.
+    let attach = button(text("Attach\u{2026}"))
+        .on_press_maybe(enabled.then_some(Message::AttachRequested))
+        .style(button::secondary);
+    row![attach, editor]
+        .spacing(8)
+        .align_y(iced::Alignment::End)
+        .into()
 }
 
 /// The text of the bar above the editor: the quote of the message being

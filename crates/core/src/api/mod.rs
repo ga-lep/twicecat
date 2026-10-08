@@ -273,7 +273,10 @@ pub enum Command {
         /// Where to write the file.
         path: PathBuf,
     },
-    /// Send a file as a media message.
+    /// Send a file as a media message into the selected room (a room that is
+    /// joined but not selected fails with `NoRoomSelected`). With a
+    /// `thread_root` the thread must be open (`OpenThread`), or the upload is
+    /// refused with `NotAllowed`. Failures are `ActionFailed { Upload, .. }`.
     SendAttachment(OutgoingAttachment),
     /// Set a room's own notification mode; `None` goes back to the account
     /// default.

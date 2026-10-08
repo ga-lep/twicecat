@@ -5,6 +5,7 @@
 
 pub mod actions;
 pub mod avatars;
+pub mod blocking;
 pub mod bridge;
 pub mod composer;
 pub mod dates;
@@ -21,6 +22,7 @@ pub mod state;
 pub mod text_safety;
 pub mod theme;
 pub mod timeline;
+pub mod upload;
 pub mod verification;
 
 pub use bridge::{Bridge, BridgeEvent, EventsSlot};
