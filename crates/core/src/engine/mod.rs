@@ -12,13 +12,14 @@ use matrix_sdk::event_cache::PaginationStatus;
 use matrix_sdk::room::edit::EditedContent;
 use matrix_sdk::ruma::OwnedUserId;
 use matrix_sdk::ruma::api::client::receipt::create_receipt::v3::ReceiptType;
-use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
+use matrix_sdk::ruma::events::room::message::{MessageType, RoomMessageEventContent};
 use matrix_sdk::send_queue::SendHandle;
 use matrix_sdk::{Client, RoomMemberships, SessionChange};
 use matrix_sdk_ui::eyeball_im::{Vector, VectorDiff};
 use matrix_sdk_ui::sync_service::SyncService;
 use matrix_sdk_ui::timeline::{
-    EventSendState, RoomExt as _, Timeline, TimelineItem as SdkTimelineItem,
+    EventSendState, MsgLikeKind, RoomExt as _, Timeline, TimelineItem as SdkTimelineItem,
+    TimelineItemContent,
 };
 use tokio::sync::{Notify, OnceCell, broadcast, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
@@ -27,9 +28,9 @@ use zeroize::Zeroizing;
 
 use crate::api::{
     ActionKind, AudioBackend, AudioDevice, AudioDeviceId, AudioDevices, AudioSettings,
-    CallEndReason, CallState, Command, CoreError, CoreEvent, DeviceId, Draft, ListDiff, Member,
-    MessageText, OutgoingMessage, PaginationState, Password, RoomId, RoomListQuery, TypingUser,
-    UserId,
+    CallEndReason, CallState, Command, CoreError, CoreEvent, DeviceId, Draft, ListDiff, MediaSize,
+    Member, MessageText, OutgoingMessage, PaginationState, Password, RoomId, RoomListQuery,
+    TypingUser, UserId,
 };
 use crate::audio_session::{AudioSession, Mode};
 use crate::avatars::{Avatars, SdkFetcher, answer_unavailable};
@@ -41,6 +42,7 @@ use crate::client::{
     ensure_homeserver_after_login, map_login_error, same_origin,
 };
 use crate::drafts;
+use crate::media::{self, MediaTasks};
 use crate::oauth::authorize;
 use crate::outgoing::outgoing_content;
 use crate::paths::DataPaths;
@@ -210,6 +212,8 @@ struct Active {
     fetcher: Arc<SdkFetcher>,
     /// The status forwarder and the network actions of the encryption API.
     security: SecurityTasks,
+    /// Media fetches and saves, and the upload limit request.
+    media: MediaTasks,
 }
 
 impl Active {
@@ -224,6 +228,7 @@ impl Active {
         // The security tasks hold clones of the client too, and go first.
         self.security.stop().await;
         // Fetch tasks hold clones of the client, so they go next.
+        self.media.stop().await;
         self.avatars.stop().await;
         if let Some(selected) = self.selected.take() {
             selected.stop().await;
@@ -878,9 +883,6 @@ async fn forward_typing(room_id: RoomId, timeline: Arc<Timeline>, events: mpsc::
 fn unimplemented_target(cmd: &Command) -> Option<(RoomId, ActionKind)> {
     let none = || RoomId::from("");
     Some(match cmd {
-        Command::FetchMedia { room_id, .. } | Command::SaveMedia { room_id, .. } => {
-            (room_id.clone(), ActionKind::Media)
-        }
         Command::SendAttachment(a) => (a.room_id.clone(), ActionKind::Upload),
         Command::SetRoomNotificationMode { room_id, .. } => {
             (room_id.clone(), ActionKind::Notifications)
@@ -1322,13 +1324,21 @@ impl Engine {
                     session.push_to_talk(pressed);
                 }
             }
+            Command::FetchMedia {
+                room_id,
+                item_id,
+                size,
+            } => self.fetch_media(room_id, item_id, size).await,
+            Command::SaveMedia {
+                room_id,
+                item_id,
+                path,
+            } => self.save_media(room_id, item_id, path).await,
             // Handled in `run`.
             Command::Shutdown => {}
             // Answered by `unimplemented_target` at the top, until the tasks
             // that implement them land.
-            Command::FetchMedia { .. }
-            | Command::SaveMedia { .. }
-            | Command::SendAttachment(_)
+            Command::SendAttachment(_)
             | Command::SetRoomNotificationMode { .. }
             | Command::SetDefaultNotificationMode { .. }
             | Command::AddKeyword { .. }
@@ -1736,7 +1746,129 @@ impl Engine {
     fn start_security(&mut self) {
         if let Some(active) = self.active.as_mut() {
             active.security.start(&active.client, &self.events);
+            active.media.send_limits(&active.client, &self.events);
         }
+    }
+
+    /// The message type of a media item of the selected room, and whether the
+    /// item is a local echo.
+    async fn media_item(
+        &self,
+        room_id: &RoomId,
+        item_id: &str,
+    ) -> Result<(MessageType, bool), CoreError> {
+        let active = self.active.as_ref().ok_or(CoreError::NotLoggedIn)?;
+        let selected = active
+            .selected
+            .as_ref()
+            .filter(|s| s.room_id == *room_id)
+            .ok_or(CoreError::NoRoomSelected)?;
+        let item = find_item(&selected.timeline, item_id).await?;
+        let event = item.as_event().ok_or(CoreError::NotAllowed)?;
+        match event.content() {
+            TimelineItemContent::MsgLike(content) => match &content.kind {
+                MsgLikeKind::Message(message) if media::map_media(message.msgtype()).is_some() => {
+                    Ok((message.msgtype().clone(), event.is_local_echo()))
+                }
+                _ => Err(CoreError::NotAllowed),
+            },
+            _ => Err(CoreError::NotAllowed),
+        }
+    }
+
+    /// Answers `FetchMedia` with `Media`. Network work runs in the media
+    /// tasks, so `handle` never waits on it.
+    async fn fetch_media(&mut self, room_id: RoomId, item_id: String, size: MediaSize) {
+        let found = self.media_item(&room_id, &item_id).await;
+        let events = self.events.clone();
+        let result = match (found, self.active.as_mut()) {
+            (Ok((msgtype, local_echo)), Some(active)) => {
+                let fetcher = media::SdkContentFetcher(active.client.clone());
+                let permits = active.media.permits.clone();
+                let deadline = match size {
+                    MediaSize::Thumbnail => media::THUMBNAIL_DEADLINE,
+                    MediaSize::Full => media::FULL_DEADLINE,
+                };
+                let (room, item) = (room_id.clone(), item_id.clone());
+                let out = events.clone();
+                let queued = active.media.spawn(async move {
+                    let result = media::fetch_media(
+                        &fetcher, &msgtype, size, local_echo, &permits, deadline,
+                    )
+                    .await;
+                    let _ = out
+                        .send(CoreEvent::Media {
+                            room_id: room,
+                            item_id: item,
+                            size,
+                            result,
+                        })
+                        .await;
+                });
+                if queued {
+                    return;
+                }
+                Err(CoreError::Busy)
+            }
+            (Err(e), _) => Err(e),
+            (Ok(_), None) => Err(CoreError::NotLoggedIn),
+        };
+        self.emit(CoreEvent::Media {
+            room_id,
+            item_id,
+            size,
+            result,
+        })
+        .await;
+    }
+
+    /// Answers `SaveMedia` with `MediaSaved` or `ActionFailed { Media, .. }`.
+    async fn save_media(&mut self, room_id: RoomId, item_id: String, path: std::path::PathBuf) {
+        let error = match self.media_item(&room_id, &item_id).await {
+            Ok((msgtype, local_echo)) => match self.active.as_mut() {
+                Some(active) => {
+                    let fetcher = media::SdkContentFetcher(active.client.clone());
+                    let permits = active.media.permits.clone();
+                    let out = self.events.clone();
+                    let (room, item) = (room_id.clone(), item_id.clone());
+                    let queued = active.media.spawn(async move {
+                        let saved = media::save_media(
+                            &fetcher,
+                            &msgtype,
+                            local_echo,
+                            &permits,
+                            media::FULL_DEADLINE,
+                            path,
+                        )
+                        .await;
+                        let event = match saved {
+                            Ok(()) => CoreEvent::MediaSaved {
+                                room_id: room,
+                                item_id: item,
+                            },
+                            Err(error) => CoreEvent::ActionFailed {
+                                room_id: room,
+                                action: ActionKind::Media,
+                                error,
+                            },
+                        };
+                        let _ = out.send(event).await;
+                    });
+                    if queued {
+                        return;
+                    }
+                    CoreError::Busy
+                }
+                None => CoreError::NotLoggedIn,
+            },
+            Err(e) => e,
+        };
+        self.emit(CoreEvent::ActionFailed {
+            room_id,
+            action: ActionKind::Media,
+            error,
+        })
+        .await;
     }
 
     /// Why a new login cannot start now, if so.
@@ -2138,6 +2270,7 @@ impl Engine {
                         selected: None,
                         avatars: Avatars::new(),
                         security: SecurityTasks::new(),
+                        media: MediaTasks::new(),
                     },
                     event,
                 ))
@@ -2316,6 +2449,7 @@ impl Engine {
                 selected: None,
                 avatars: Avatars::new(),
                 security: SecurityTasks::new(),
+                media: MediaTasks::new(),
             },
             event,
         )))
@@ -2945,6 +3079,7 @@ mod tests {
             selected: None,
             avatars: Avatars::new(),
             security: SecurityTasks::new(),
+            media: MediaTasks::new(),
         });
         engine
             .handle(Command::RenameDevice {
@@ -2989,6 +3124,7 @@ mod tests {
             selected: None,
             avatars: Avatars::new(),
             security: SecurityTasks::new(),
+            media: MediaTasks::new(),
         });
         engine
             .handle(Command::SignOutDevices {
@@ -3033,6 +3169,7 @@ mod tests {
             selected: None,
             avatars: Avatars::new(),
             security: SecurityTasks::new(),
+            media: MediaTasks::new(),
         });
         engine
             .handle(Command::BootstrapCrossSigning { password: None })
@@ -3082,6 +3219,7 @@ mod tests {
             selected: None,
             avatars: Avatars::new(),
             security: SecurityTasks::new(),
+            media: MediaTasks::new(),
         });
         for cmd in [
             Command::EnableRecovery,
@@ -3135,6 +3273,7 @@ mod tests {
             selected: None,
             avatars: Avatars::new(),
             security,
+            media: MediaTasks::new(),
         });
         // Twice: the failed first request must not leave a reservation behind
         // (that would answer `Busy`).
@@ -3195,32 +3334,14 @@ mod tests {
     /// under while the core has no handler for it.
     fn phase5_commands() -> Vec<(Command, ActionKind, RoomId)> {
         use crate::api::{
-            AttachmentData, CreateRoomRequest, EventId, MediaBytes, MediaKind, MediaSize,
-            OutgoingAttachment, RoomNotificationModeView, RoomVisibility,
+            AttachmentData, CreateRoomRequest, EventId, MediaBytes, MediaKind, OutgoingAttachment,
+            RoomNotificationModeView, RoomVisibility,
         };
         let room = || rid("p5");
         let none = || RoomId::from("");
         let user = || crate::api::UserId::from("@bob:x");
         let event = || EventId::from("$root");
         vec![
-            (
-                Command::FetchMedia {
-                    room_id: room(),
-                    item_id: "i".into(),
-                    size: MediaSize::Thumbnail,
-                },
-                ActionKind::Media,
-                room(),
-            ),
-            (
-                Command::SaveMedia {
-                    room_id: room(),
-                    item_id: "i".into(),
-                    path: "/tmp/x".into(),
-                },
-                ActionKind::Media,
-                room(),
-            ),
             (
                 Command::SendAttachment(OutgoingAttachment {
                     room_id: room(),
@@ -3424,6 +3545,7 @@ mod tests {
             selected: None,
             avatars: Avatars::new(),
             security: SecurityTasks::new(),
+            media: MediaTasks::new(),
         });
         for (cmd, kind, room) in phase5_commands() {
             engine.handle(cmd).await;
@@ -3492,6 +3614,7 @@ mod tests {
             selected: None,
             avatars: Avatars::new(),
             security: SecurityTasks::new(),
+            media: MediaTasks::new(),
         });
         let room = rid("a");
         for (cmd, kind) in action_commands(&room) {
@@ -3505,6 +3628,102 @@ mod tests {
                 ),
                 "{kind:?}: {got:?}"
             );
+        }
+    }
+
+    /// The media commands answer on their own channels: `Media` for a fetch,
+    /// `ActionFailed { Media, .. }` for a save.
+    async fn media_answers(
+        engine: &mut Engine,
+        rx: &mut mpsc::Receiver<CoreEvent>,
+    ) -> [CoreEvent; 2] {
+        let room = rid("a");
+        engine
+            .handle(Command::FetchMedia {
+                room_id: room.clone(),
+                item_id: "i".into(),
+                size: crate::api::MediaSize::Thumbnail,
+            })
+            .await;
+        let fetch = next_event(rx).await;
+        engine
+            .handle(Command::SaveMedia {
+                room_id: room,
+                item_id: "i".into(),
+                path: "/nonexistent/x".into(),
+            })
+            .await;
+        let save = next_event(rx).await;
+        [fetch, save]
+    }
+
+    #[tokio::test]
+    async fn media_commands_without_a_session_fail_with_not_logged_in() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut engine, mut rx) = oauth_engine(tmp.path());
+        let [fetch, save] = media_answers(&mut engine, &mut rx).await;
+        assert!(
+            matches!(&fetch, CoreEvent::Media { room_id, item_id, result: Err(CoreError::NotLoggedIn), .. }
+                if *room_id == rid("a") && item_id == "i"),
+            "{fetch:?}"
+        );
+        assert!(
+            matches!(
+                &save,
+                CoreEvent::ActionFailed {
+                    action: ActionKind::Media,
+                    error: CoreError::NotLoggedIn,
+                    ..
+                }
+            ),
+            "{save:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn media_commands_without_a_selected_room_fail_with_no_room_selected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut engine, mut rx) = oauth_engine(tmp.path());
+        let client = Client::builder()
+            .homeserver_url("http://127.0.0.1:1")
+            .build()
+            .await
+            .unwrap();
+        engine.active = Some(Active {
+            fetcher: Arc::new(SdkFetcher(client.clone())),
+            client,
+            record: record("@alice:x", "http://127.0.0.1:1", "s1"),
+            changes: broadcast::channel(1).1,
+            sync: None,
+            selected: None,
+            avatars: Avatars::new(),
+            security: SecurityTasks::new(),
+            media: MediaTasks::new(),
+        });
+        let [fetch, save] = media_answers(&mut engine, &mut rx).await;
+        assert!(
+            matches!(
+                &fetch,
+                CoreEvent::Media {
+                    result: Err(CoreError::NoRoomSelected),
+                    ..
+                }
+            ),
+            "{fetch:?}"
+        );
+        assert!(
+            matches!(
+                &save,
+                CoreEvent::ActionFailed {
+                    action: ActionKind::Media,
+                    error: CoreError::NoRoomSelected,
+                    ..
+                }
+            ),
+            "{save:?}"
+        );
+        if let Some(mut active) = engine.active.take() {
+            active.stop_tasks().await;
         }
     }
 }

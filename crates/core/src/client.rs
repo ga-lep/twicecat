@@ -210,6 +210,9 @@ pub(crate) async fn build_client(
         .with_encryption_settings(encryption_settings())
         .sqlite_store(store_dir, Some(passphrase))
         .handle_refresh_tokens()
+        // Media downloads stop at a size cap instead of buffering what the
+        // server sends (see `media_fetch`).
+        .media_fetcher(std::sync::Arc::new(crate::media_fetch::CappedMediaFetcher))
         // A login response's `well_known` must not move the client to another
         // (possibly cleartext) homeserver after the policy check above.
         .respect_login_well_known(false)

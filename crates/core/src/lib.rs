@@ -15,6 +15,8 @@ mod drafts;
 mod engine;
 mod gpu_enhancement;
 pub mod logging;
+mod media;
+mod media_fetch;
 mod oauth;
 mod outgoing;
 pub mod paths;

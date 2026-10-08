@@ -1044,8 +1044,11 @@ pub async fn reset_notification_baseline(n: u8) {
 
 /// Sends `bytes` as an attachment to `room` as test user `n`, with the raw SDK
 /// client (for download tests before the core can upload). The client joins
-/// the room first (a no-op when already joined) and never syncs, so it sends
-/// the attachment unencrypted: use plain rooms only. Prints nothing but counts.
+/// the room first (a no-op when already joined) and never syncs; the SDK asks
+/// the server for the room's encryption state before it uploads, so an
+/// encrypted room gets an encrypted upload. A PNG gets its width and height
+/// (read from the header) and size in the image info. Prints nothing but
+/// counts.
 pub async fn send_attachment_raw(
     n: u8,
     room: &matrix_sdk::ruma::RoomId,
@@ -1053,17 +1056,75 @@ pub async fn send_attachment_raw(
     mime: &str,
     bytes: Vec<u8>,
 ) -> matrix_sdk::ruma::OwnedEventId {
-    use matrix_sdk::attachment::AttachmentConfig;
     assert_local_homeserver(TestEnv::load().homeserver_url());
     let client = raw_login(n).await;
+    let event = send_attachment_with(&client, room, filename, mime, bytes).await;
+    println!("user {n} sent an attachment");
+    event
+}
+
+/// Like [`send_attachment_raw`] with the caller's client, so the caller can
+/// read its own encrypted event back afterwards (the client holds the room key
+/// it made). The caller logs the client out.
+pub async fn send_attachment_with(
+    client: &matrix_sdk::Client,
+    room: &matrix_sdk::ruma::RoomId,
+    filename: &str,
+    mime: &str,
+    bytes: Vec<u8>,
+) -> matrix_sdk::ruma::OwnedEventId {
+    use matrix_sdk::attachment::AttachmentConfig;
     let room = client.join_room_by_id(room).await.expect("join room");
     let mime: mime::Mime = mime.parse().expect("valid mime type");
     let len = bytes.len();
+    let mut config = AttachmentConfig::new();
+    if mime.essence_str() == "image/png" && bytes.len() > 24 && &bytes[12..16] == b"IHDR" {
+        use matrix_sdk::attachment::{AttachmentInfo, BaseImageInfo};
+        let be = |at: usize| u32::from_be_bytes(bytes[at..at + 4].try_into().expect("4 bytes"));
+        config = config.info(AttachmentInfo::Image(BaseImageInfo {
+            width: Some(be(16).into()),
+            height: Some(be(20).into()),
+            size: Some((len as u32).into()),
+            ..BaseImageInfo::default()
+        }));
+    }
+    if !mime.essence_str().starts_with("image/") {
+        use matrix_sdk::attachment::{AttachmentInfo, BaseFileInfo};
+        config = config.info(AttachmentInfo::File(BaseFileInfo {
+            size: Some((len as u32).into()),
+        }));
+    }
     let response = room
-        .send_attachment(filename, &mime, bytes, AttachmentConfig::new())
+        .send_attachment(filename, &mime, bytes, config)
         .await
         .expect("send attachment");
-    println!("user {n} sent an attachment of {len} bytes");
+    println!("an attachment of {len} bytes was sent");
+    response.event_id
+}
+
+/// Sends a plain file whose event declares `declared` bytes in `info.size`
+/// whatever its real size, like a sender that lies. User `n` sends; the
+/// caller's room must already have them as a member.
+pub async fn send_file_declaring_size(
+    n: u8,
+    room: &matrix_sdk::ruma::RoomId,
+    filename: &str,
+    bytes: Vec<u8>,
+    declared: u64,
+) -> matrix_sdk::ruma::OwnedEventId {
+    use matrix_sdk::attachment::{AttachmentConfig, AttachmentInfo, BaseFileInfo};
+    assert_local_homeserver(TestEnv::load().homeserver_url());
+    let client = raw_login(n).await;
+    let room = client.join_room_by_id(room).await.expect("join room");
+    let config = AttachmentConfig::new().info(AttachmentInfo::File(BaseFileInfo {
+        size: Some(declared.try_into().expect("a size an event can carry")),
+    }));
+    let mime: mime::Mime = "application/octet-stream".parse().expect("valid mime type");
+    let response = room
+        .send_attachment(filename, &mime, bytes, config)
+        .await
+        .expect("send attachment");
+    println!("a file declaring {declared} bytes was sent");
     response.event_id
 }
 

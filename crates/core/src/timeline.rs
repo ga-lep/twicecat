@@ -18,7 +18,7 @@ use crate::api::{
     ReactionGroup, ReplyPreview, ReplyState, RoomId, SendFailure, SendStatus, Shield, ShieldCode,
     StateChange, TimelineItem, TimelineItemKind, UserId, UtdReason,
 };
-use crate::rich_text;
+use crate::{media, rich_text};
 
 /// Longest quoted line of a reply, in characters.
 const REPLY_BODY_CHARS: usize = 200;
@@ -108,12 +108,20 @@ fn map_event(event: &EventTimelineItem, own: Option<&SdkUserId>) -> TimelineItem
                     MessageType::Text(_) => MessageKind::Text,
                     MessageType::Notice(_) => MessageKind::Notice,
                     MessageType::Emote(_) => MessageKind::Emote,
-                    MessageType::Image(_) => return placeholder(PlaceholderKind::Image),
-                    MessageType::Video(_) => return placeholder(PlaceholderKind::Video),
-                    MessageType::Audio(_) => return placeholder(PlaceholderKind::Audio),
-                    MessageType::File(_) => return placeholder(PlaceholderKind::File),
+                    // Media is a text message with a description of the file;
+                    // the body is the caption or the file name.
+                    MessageType::Image(_)
+                    | MessageType::Video(_)
+                    | MessageType::Audio(_)
+                    | MessageType::File(_) => MessageKind::Text,
                     MessageType::Location(_) => return placeholder(PlaceholderKind::Location),
                     _ => return placeholder(PlaceholderKind::Unsupported),
+                };
+                let media = media::map_media(message.msgtype());
+                let media_input = match &media {
+                    None => MediaInput::NotMedia,
+                    Some(_) if media::has_caption(message.msgtype()) => MediaInput::Captioned,
+                    Some(_) => MediaInput::Bare,
                 };
                 let details = MessageDetails {
                     sender_name: sender_name.clone(),
@@ -143,6 +151,7 @@ fn map_event(event: &EventTimelineItem, own: Option<&SdkUserId>) -> TimelineItem
                         event.is_own(),
                         event.is_remote_event(),
                         event.is_local_echo(),
+                        media_input,
                     ),
                     send_failure: match event.send_state() {
                         Some(EventSendState::SendingFailed { is_recoverable, .. }) => {
@@ -153,7 +162,7 @@ fn map_event(event: &EventTimelineItem, own: Option<&SdkUserId>) -> TimelineItem
                         _ => None,
                     },
                     shield: map_shield(event.get_shield(false)),
-                    media: None,
+                    media: media.map(Box::new),
                     thread: None,
                 };
                 // A remote event has no send state: the server accepted it.
@@ -477,19 +486,32 @@ fn sdk_formatted_html(msgtype: &MessageType) -> Option<&str> {
     matches!(formatted.format, MessageFormat::Html).then_some(formatted.body.as_str())
 }
 
+/// Whether a message is media, as far as editing is concerned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MediaInput {
+    /// Not a media message.
+    NotMedia,
+    /// Media with a caption.
+    Captioned,
+    /// Media without a caption: there is nothing to edit.
+    Bare,
+}
+
 /// What the user may do with a message. Redacting is offered on own and on
 /// remote events (the server decides about other people's), reacting on
-/// remote events and local echoes.
+/// remote events and local echoes. Media can be edited only through its
+/// caption.
 pub(crate) fn item_actions(
     can_reply: bool,
     can_edit: bool,
     is_own: bool,
     is_remote: bool,
     is_local: bool,
+    media: MediaInput,
 ) -> ItemActions {
     ItemActions {
         can_reply,
-        can_edit,
+        can_edit: can_edit && media != MediaInput::Bare,
         can_redact: is_own || is_remote,
         can_react: is_remote || is_local,
         can_copy: true,
@@ -834,15 +856,32 @@ mod tests {
     #[test]
     fn actions_table() {
         // (replyable, editable, own, remote, local)
-        let a = item_actions(true, true, true, true, false);
+        let a = item_actions(true, true, true, true, false, MediaInput::NotMedia);
         assert!(a.can_reply && a.can_edit && a.can_redact && a.can_react && a.can_copy);
-        let remote_other = item_actions(true, false, false, true, false);
+        let remote_other = item_actions(true, false, false, true, false, MediaInput::NotMedia);
         assert!(!remote_other.can_edit && remote_other.can_redact && remote_other.can_react);
-        let local = item_actions(false, true, true, false, true);
+        let local = item_actions(false, true, true, false, true, MediaInput::NotMedia);
         assert!(!local.can_reply && local.can_redact && local.can_react);
-        let neither = item_actions(false, false, false, false, false);
+        let neither = item_actions(false, false, false, false, false, MediaInput::NotMedia);
         assert!(!neither.can_redact && !neither.can_react);
         assert!(neither.can_copy);
+    }
+
+    #[test]
+    fn media_is_editable_only_with_a_caption() {
+        // (media, editable by the SDK, expected can_edit)
+        let table = [
+            (MediaInput::NotMedia, true, true),
+            (MediaInput::Captioned, true, true),
+            (MediaInput::Bare, true, false),
+            (MediaInput::Captioned, false, false),
+        ];
+        for (media, editable, expected) in table {
+            let a = item_actions(true, editable, true, true, false, media);
+            assert_eq!(a.can_edit, expected, "{media:?} editable={editable}");
+            // Reply, react, redact and copy do not depend on the caption.
+            assert!(a.can_reply && a.can_redact && a.can_react && a.can_copy);
+        }
     }
 
     #[test]
