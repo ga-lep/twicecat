@@ -673,7 +673,10 @@ impl fmt::Debug for Command {
                 .finish(),
             Self::JoinRoom { target, via } => f
                 .debug_struct("JoinRoom")
-                .field("target", target)
+                .field(
+                    "target",
+                    &format_args!("<redacted, {} bytes>", target.len()),
+                )
                 .field("via", via)
                 .finish(),
             Self::AcceptInvite { room_id } => f
@@ -1585,6 +1588,10 @@ mod tests {
             Command::SetRoomTopic {
                 room_id: RoomId::from("!r:x"),
                 topic: Some("secret-name-x".into()),
+            },
+            Command::JoinRoom {
+                target: "#secret-name-x:localhost".into(),
+                via: Vec::new(),
             },
             Command::CreateRoom(CreateRoomRequest {
                 name: "secret-name-x".into(),

@@ -153,6 +153,12 @@ fn message_kind(highlight: bool) -> NotificationKind {
 /// One line of at most [`PREVIEW_MAX_CHARS`] characters: whitespace runs
 /// become one space, other control and bidirectional characters are removed.
 fn clean_preview(text: &str) -> String {
+    clean_line(text, PREVIEW_MAX_CHARS)
+}
+
+/// One line of at most `max_chars` characters: whitespace runs become one
+/// space, other control and bidirectional characters are removed.
+pub(crate) fn clean_line(text: &str, max_chars: usize) -> String {
     let mut out = String::new();
     let mut chars = 0;
     let mut pending_space = false;
@@ -169,7 +175,7 @@ fn clean_preview(text: &str) -> String {
             chars += 1;
             pending_space = false;
         }
-        if chars >= PREVIEW_MAX_CHARS {
+        if chars >= max_chars {
             break;
         }
         out.push(c);
