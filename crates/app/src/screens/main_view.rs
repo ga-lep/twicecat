@@ -21,6 +21,7 @@ use crate::screens::{
     timeline_pane,
 };
 use crate::sessions::SessionsMessage;
+use crate::settings::SettingsMessage;
 use crate::state::{App, Message};
 use crate::text_safety::{MAX_NAME_CHARS, name_or_placeholder, one_line_capped};
 use crate::theme;
@@ -262,7 +263,7 @@ fn room_pane(app: &App) -> Element<'_, Message> {
         |room| display_name(&room.name),
     );
 
-    let theme = theme::theme_for(app.theme_mode);
+    let theme = app.current_theme();
     let env = rich_env(app, &theme);
     let timeline = container(timeline_pane::view(&app.timeline, env)).height(Fill);
     // The picker floats over the timeline's bottom right corner.
@@ -592,6 +593,9 @@ fn status_bar(app: &App) -> Element<'_, Message> {
             }),
             space().width(Fill),
             text(account),
+            button(text("Settings"))
+                .on_press(Message::Settings(SettingsMessage::Open))
+                .style(button::secondary),
             button(text("Sessions"))
                 .on_press(Message::Sessions(SessionsMessage::Open))
                 .style(button::secondary),

@@ -37,6 +37,7 @@ use crate::screens::login::{self, BrowserUrl, LoginForm};
 use crate::screens::{self, loading, main_view};
 use crate::security::{Busy, SecurityMessage, SecurityModel};
 use crate::sessions::{SessionsMessage, SessionsModel, logout_needs_warning};
+use crate::settings::{self, NoSettingsStore, SettingsMessage, SettingsModel, SettingsStore};
 use crate::spaces::{SpacesMessage, SpacesModel};
 use crate::text_safety;
 use crate::threads::{ThreadsMessage, ThreadsModel};
@@ -373,6 +374,8 @@ pub enum Message {
     Tray(TrayAction),
     /// A message of the room dialogs, panels, user card and join bar.
     Rooms(RoomsMessage),
+    /// A control of the Settings screen, or Ctrl+,.
+    Settings(SettingsMessage),
     /// A button of the spaces sidebar.
     Spaces(SpacesMessage),
     /// A thread summary row or a control of the thread panel.
@@ -448,6 +451,9 @@ pub struct App {
     pub tray: TrayModel,
     /// Room dialogs, settings, members, the user card and the join bar.
     pub rooms_ui: RoomsModel,
+    /// The Settings screen.
+    pub settings_ui: SettingsModel,
+    pub(crate) settings_store: Box<dyn SettingsStore>,
     /// The spaces the user is in (the sidebar).
     pub spaces: SpacesModel,
     /// The thread panel.
@@ -573,6 +579,8 @@ impl App {
             // touch the desktop.
             tray: TrayModel::new(Box::new(NoTrayFactory)),
             rooms_ui: RoomsModel::default(),
+            settings_ui: SettingsModel::default(),
+            settings_store: Box::new(NoSettingsStore),
             spaces: SpacesModel::default(),
             threads: ThreadsModel::default(),
             notifier: Box::new(NoNotifier),
@@ -613,9 +621,13 @@ impl App {
     /// A boot function for `iced::application`; Iced calls it once.
     ///
     /// `ui_settings` are the local settings read from disk before the core
-    /// started; they decide notifications, previews and the tray badge from
-    /// the first event.
-    pub fn booter(startup: Startup, ui_settings: UiSettings) -> impl Fn() -> (App, Task<Message>) {
+    /// started; they decide the theme, notifications, previews and the tray
+    /// badge from the first frame. `store` writes them back on each change.
+    pub fn booter(
+        startup: Startup,
+        ui_settings: UiSettings,
+        store: impl SettingsStore + Clone + 'static,
+    ) -> impl Fn() -> (App, Task<Message>) {
         let startup = Mutex::new(Some(startup));
         move || {
             let startup = startup
@@ -625,6 +637,7 @@ impl App {
                 .expect("iced boots the application exactly once");
             let (mut app, task) = App::new(startup);
             app.set_ui_settings(ui_settings);
+            app.set_settings_store(Box::new(store.clone()));
             app.set_notifier(Box::new(notifications::SystemNotifier));
             app.set_tray_factory(Box::new(SystemTrayFactory));
             (app, task)
@@ -634,6 +647,16 @@ impl App {
     /// Replaces the local settings (read from the settings file at boot).
     pub fn set_ui_settings(&mut self, settings: UiSettings) {
         self.ui_settings = settings;
+    }
+
+    /// Replaces where the local settings are written (tests use a fake).
+    pub fn set_settings_store(&mut self, store: Box<dyn SettingsStore>) {
+        self.settings_store = store;
+    }
+
+    /// The theme the window uses: the user's override, else the system's.
+    pub fn current_theme(&self) -> Theme {
+        crate::theme::theme_for_choice(self.theme_mode, self.ui_settings.theme)
     }
 
     /// Replaces the desktop notification service (tests use a fake).
@@ -1045,6 +1068,7 @@ impl App {
             Message::Verification(message) => self.on_verification(message),
             Message::Sessions(message) => self.on_sessions(message),
             Message::Rooms(message) => self.on_rooms(message),
+            Message::Settings(message) => self.on_settings(message),
             Message::Spaces(SpacesMessage::Select(space)) => self.select_space(space),
             Message::Threads(message) => self.on_threads(message),
             Message::AttachRequested => {
@@ -1398,12 +1422,19 @@ impl App {
             } => {
                 // The change did not happen: show what the list says again.
                 self.room_modes.remove(&room_id);
+                if room_id.as_str().is_empty() {
+                    self.on_account_notification_failed();
+                }
                 if self.selected.as_ref() == Some(&room_id) {
                     task = self.show_notice_text(
                         "The notification setting could not be changed.".to_owned(),
                     );
                 }
             }
+            CoreEvent::ActionFailed {
+                action: ActionKind::Profile,
+                ..
+            } => self.on_profile_failed(),
             CoreEvent::ActionFailed {
                 room_id,
                 action: ActionKind::Rooms,
@@ -1493,9 +1524,7 @@ impl App {
                 self.uploads.max_upload_bytes = max_upload_bytes;
             }
             CoreEvent::Notification(view) => task = self.on_notification(view),
-            CoreEvent::NotificationSettings(settings) => {
-                self.notification_settings = Some(settings);
-            }
+            CoreEvent::NotificationSettings(settings) => self.on_notification_settings(settings),
             CoreEvent::UnreadTotals { notifications, .. } => {
                 self.tray
                     .set_unread(notifications, self.ui_settings.tray_badge);
@@ -1512,7 +1541,7 @@ impl App {
             event @ (CoreEvent::ThreadDiff { .. } | CoreEvent::ThreadPagination { .. }) => {
                 task = self.thread_event(event);
             }
-            CoreEvent::OwnProfile(_) => {}
+            CoreEvent::OwnProfile(view) => self.on_own_profile(&view),
             // Calls and audio have no UI yet (Phase 6 UI tasks).
             CoreEvent::CallState(_)
             | CoreEvent::CallParticipants { .. }
@@ -2028,6 +2057,8 @@ impl App {
         self.verification = None;
         self.sessions = SessionsModel::default();
         self.rooms_ui = RoomsModel::default();
+        self.settings_ui = SettingsModel::default();
+        self.notification_settings = None;
         self.spaces.clear();
         self.reset_threads();
         self.notice = Some(notice.to_owned());
@@ -2392,7 +2423,10 @@ impl App {
             Screen::Main => screens::verification::layer(
                 screens::upload_dialog::layer(
                     screens::media_viewer::layer(
-                        screens::room_dialogs::layer(main_view::view(self), self),
+                        screens::settings::layer(
+                            screens::room_dialogs::layer(main_view::view(self), self),
+                            self,
+                        ),
                         self,
                     ),
                     self,
@@ -2412,10 +2446,12 @@ impl App {
             iced::event::listen_with(|event, status, _id| match event {
                 iced::Event::Window(window::Event::Focused) => Some(Message::WindowFocus(true)),
                 iced::Event::Window(window::Event::Unfocused) => Some(Message::WindowFocus(false)),
-                other => upload::event_message(&other, status),
+                other => upload::event_message(&other, status)
+                    .or_else(|| settings::settings_shortcut(&other)),
             }),
             self.upload_keys(),
             self.rooms_keys(),
+            self.settings_keys(),
             self.thread_keys(),
             system::theme_changes().map(Message::ThemeMode),
             self.viewer_keys(),
@@ -2454,11 +2490,27 @@ impl App {
         })
     }
 
+    /// Esc closes the Settings screen while it is open; no listener
+    /// otherwise.
+    fn settings_keys(&self) -> Subscription<Message> {
+        if !self.settings_ui.open {
+            return Subscription::none();
+        }
+        iced::event::listen_with(|event, _status, _id| match event {
+            iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+                ..
+            }) => Some(Message::Settings(SettingsMessage::Close)),
+            _ => None,
+        })
+    }
+
     /// Esc closes the thread panel, unless something above it is open or a
     /// widget used the key (the composer's reply bar, say); no listener while
     /// the panel is closed.
     fn thread_keys(&self) -> Subscription<Message> {
         let covered = self.uploads.dialog.is_some()
+            || self.settings_ui.open
             || self.media.viewer.is_some()
             || self.rooms_ui.overlay_open();
         if self.threads.panel.is_none() || covered {
@@ -2490,7 +2542,7 @@ impl App {
 
     /// The theme for the current system mode (plan Q13).
     pub fn theme(&self) -> Option<Theme> {
-        Some(crate::theme::theme_for(self.theme_mode))
+        Some(self.current_theme())
     }
 }
 
@@ -9921,6 +9973,620 @@ mod tests {
             let _ = app.update(Message::Threads(ThreadsMessage::Open(r.clone())));
             let _ = app.update(thread_diff(&r, vec![thread_item(&r, 0, "x")]));
             let _ = app.view();
+        }
+    }
+
+    // ---- Phase 5 Task 15: the Settings screen ----
+
+    mod settings_ui {
+        use std::path::PathBuf;
+
+        use tessera_core::api::{
+            AvatarId, EventId, MediaBytes, NotificationKind, NotificationSettingsView,
+            OwnProfileView, RoomNotificationModeView as Mode, ThemeChoice,
+        };
+
+        use super::*;
+        use crate::dialogs::RecordingDialogs;
+        use crate::notifications::RecordingNotifier;
+        use crate::rooms::{AvatarRefusal, AvatarUpload};
+        use crate::settings::{
+            RecordingSettings, SHORTCUTS, SettingsError, SettingsMessage as S, check_keyword,
+            settings_shortcut,
+        };
+        use crate::tray::{FakeTray, FakeTrayFactory};
+
+        struct Rig {
+            app: App,
+            rx: mpsc::Receiver<Command>,
+            dialogs: RecordingDialogs,
+            saved: Arc<std::sync::Mutex<Vec<UiSettings>>>,
+            shown: Arc<std::sync::Mutex<Vec<crate::notifications::Request>>>,
+            tray: FakeTray,
+        }
+
+        fn rig() -> Rig {
+            let (mut app, rx) = main_app();
+            let dialogs = RecordingDialogs::default();
+            app.set_dialogs(Box::new(dialogs.clone()));
+            let store = RecordingSettings::default();
+            let saved = store.saved.clone();
+            app.set_settings_store(Box::new(store));
+            let notifier = RecordingNotifier::default();
+            let shown = notifier.shown.clone();
+            app.set_notifier(Box::new(notifier));
+            let factory = FakeTrayFactory::default();
+            let tray = factory.tray.clone();
+            app.set_tray_factory(Box::new(factory));
+            Rig {
+                app,
+                rx,
+                dialogs,
+                saved,
+                shown,
+                tray,
+            }
+        }
+
+        fn open(rig: &mut Rig) {
+            let _ = rig.app.update(Message::Settings(S::Open));
+            assert!(rig.app.settings_ui.open);
+        }
+
+        fn st(rig: &mut Rig, message: S) {
+            let _ = rig.app.update(Message::Settings(message));
+        }
+
+        fn profile(name: Option<&str>, avatar: bool) -> CoreEvent {
+            CoreEvent::OwnProfile(OwnProfileView {
+                display_name: name.map(str::to_owned),
+                avatar: avatar.then(|| AvatarId::from("mxc://x/a")),
+            })
+        }
+
+        fn settings_event(group: Mode, dm: Mode, keywords: &[&str]) -> CoreEvent {
+            CoreEvent::NotificationSettings(NotificationSettingsView {
+                group_default: group,
+                dm_default: dm,
+                keywords: keywords.iter().map(|k| (*k).to_owned()).collect(),
+            })
+        }
+
+        fn text(s: &str) -> MessageText {
+            MessageText::from(s)
+        }
+
+        fn writes(rig: &Rig) -> Vec<UiSettings> {
+            rig.saved.lock().expect("test mutex").clone()
+        }
+
+        #[test]
+        fn settings_open_from_the_button_and_close_again() {
+            let mut rig = rig();
+            assert!(!rig.app.settings_open());
+            open(&mut rig);
+            st(&mut rig, S::Close);
+            assert!(!rig.app.settings_open());
+            assert!(drain(&mut rig.rx).is_empty(), "opening sends nothing");
+        }
+
+        #[test]
+        fn settings_do_not_open_on_the_login_screen_or_over_another_modal() {
+            let (mut app, _rx) = login_app();
+            let _ = app.update(Message::Settings(S::Open));
+            assert!(!app.settings_open());
+
+            let mut rig = rig();
+            let _ = rig.app.update(Message::Sessions(SessionsMessage::Open));
+            let _ = rig.app.update(Message::Settings(S::Open));
+            assert!(!rig.app.settings_open(), "Sessions is open");
+        }
+
+        #[test]
+        fn ctrl_comma_is_the_settings_shortcut() {
+            use iced::keyboard::{Event, Key, Location, Modifiers, key::Physical};
+            let press = |c: &str, modifiers: Modifiers| {
+                iced::Event::Keyboard(Event::KeyPressed {
+                    key: Key::Character(c.into()),
+                    modified_key: Key::Character(c.into()),
+                    physical_key: Physical::Unidentified(
+                        iced::keyboard::key::NativeCode::Unidentified,
+                    ),
+                    location: Location::Standard,
+                    modifiers,
+                    text: None,
+                    repeat: false,
+                })
+            };
+            assert!(matches!(
+                settings_shortcut(&press(",", Modifiers::COMMAND)),
+                Some(Message::Settings(S::Open))
+            ));
+            assert!(settings_shortcut(&press(",", Modifiers::empty())).is_none());
+            assert!(settings_shortcut(&press(".", Modifiers::COMMAND)).is_none());
+            assert!(SHORTCUTS.iter().any(|s| s.keys == "Ctrl+,"));
+            assert!(SHORTCUTS.iter().any(|s| s.keys == "Ctrl+U"));
+        }
+
+        #[test]
+        fn the_profile_fills_the_name_field_until_the_user_edits_it() {
+            let mut rig = rig();
+            let _ = rig.app.update(core(profile(Some("Alice"), false)));
+            assert_eq!(rig.app.settings_ui.name.expose(), "Alice");
+            st(&mut rig, S::NameInput(text("Alicia")));
+            let _ = rig.app.update(core(profile(Some("Alice B"), false)));
+            assert_eq!(rig.app.settings_ui.name.expose(), "Alicia");
+        }
+
+        #[test]
+        fn saving_the_name_sends_one_command() {
+            let mut rig = rig();
+            let _ = rig.app.update(core(profile(Some("Alice"), false)));
+            st(&mut rig, S::NameInput(text("  Alicia  ")));
+            st(&mut rig, S::SaveName);
+            st(&mut rig, S::SaveName);
+            let sent = drain(&mut rig.rx);
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            assert!(matches!(&sent[0], Command::SetDisplayName { name } if name == "Alicia"));
+        }
+
+        #[test]
+        fn an_unchanged_name_sends_nothing_and_a_bad_one_is_refused() {
+            let mut rig = rig();
+            let _ = rig.app.update(core(profile(Some("Alice"), false)));
+            st(&mut rig, S::NameInput(text("Alice")));
+            st(&mut rig, S::SaveName);
+            assert!(drain(&mut rig.rx).is_empty());
+            for (bad, error) in [
+                ("   ", SettingsError::NameEmpty),
+                (&"a".repeat(256), SettingsError::NameTooLong),
+                ("a\u{7}b", SettingsError::NameUnsafe),
+                ("a\u{202E}b", SettingsError::NameUnsafe),
+            ] {
+                st(&mut rig, S::NameInput(text(bad)));
+                st(&mut rig, S::SaveName);
+                assert_eq!(rig.app.settings_ui.error, Some(error), "{bad:?}");
+            }
+            assert!(drain(&mut rig.rx).is_empty());
+        }
+
+        #[test]
+        fn the_picture_goes_through_the_picker_and_is_sent_once() {
+            let mut rig = rig();
+            st(&mut rig, S::ChooseAvatar);
+            st(&mut rig, S::ChooseAvatar);
+            assert_eq!(*rig.dialogs.images.lock().expect("mutex"), 1);
+            st(&mut rig, S::AvatarPicked(None));
+            assert!(!rig.app.settings_ui.avatar_busy);
+            st(&mut rig, S::ChooseAvatar);
+            st(
+                &mut rig,
+                S::AvatarPicked(Some(PathBuf::from("/nonexistent/p.png").into())),
+            );
+            let ready = S::AvatarReady(Ok(Box::new(AvatarUpload {
+                data: vec![1, 2, 3],
+                mimetype: "image/png",
+                width: 2,
+                height: 2,
+            })));
+            st(&mut rig, ready.clone());
+            st(&mut rig, ready);
+            let sent = drain(&mut rig.rx);
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            match &sent[0] {
+                Command::SetAvatar { data, mimetype } => {
+                    assert_eq!(data, &MediaBytes::from(vec![1, 2, 3]));
+                    assert_eq!(mimetype, "image/png");
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+
+        #[test]
+        fn a_refused_picture_shows_a_line_and_sends_nothing() {
+            let mut rig = rig();
+            st(&mut rig, S::ChooseAvatar);
+            st(&mut rig, S::AvatarReady(Err(AvatarRefusal::NotAPicture)));
+            assert_eq!(
+                rig.app.settings_ui.error,
+                Some(SettingsError::Picture(AvatarRefusal::NotAPicture))
+            );
+            assert!(!rig.app.settings_ui.avatar_busy);
+            assert!(drain(&mut rig.rx).is_empty());
+        }
+
+        #[test]
+        fn remove_picture_needs_a_picture_and_sends_once() {
+            let mut rig = rig();
+            let _ = rig.app.update(core(profile(Some("A"), false)));
+            st(&mut rig, S::RemoveAvatar);
+            assert!(drain(&mut rig.rx).is_empty(), "there is no picture");
+            let _ = rig.app.update(core(profile(Some("A"), true)));
+            st(&mut rig, S::RemoveAvatar);
+            st(&mut rig, S::RemoveAvatar);
+            let sent = drain(&mut rig.rx);
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            assert!(matches!(sent[0], Command::RemoveAvatar));
+        }
+
+        #[test]
+        fn a_failed_profile_change_shows_a_line_and_frees_the_buttons() {
+            let mut rig = rig();
+            let _ = rig.app.update(core(profile(Some("A"), true)));
+            st(&mut rig, S::RemoveAvatar);
+            assert!(rig.app.settings_ui.profile_pending);
+            let _ = rig.app.update(core(CoreEvent::ActionFailed {
+                room_id: RoomId::from(""),
+                action: ActionKind::Profile,
+                error: CoreError::Internal("x".into()),
+            }));
+            assert_eq!(
+                rig.app.settings_ui.error,
+                Some(SettingsError::ProfileFailed)
+            );
+            assert!(!rig.app.settings_ui.profile_pending);
+        }
+
+        #[test]
+        fn a_default_mode_sends_once_and_the_same_mode_sends_nothing() {
+            let mut rig = rig();
+            let _ = rig.app.update(core(settings_event(
+                Mode::AllMessages,
+                Mode::AllMessages,
+                &[],
+            )));
+            let pick = S::DefaultMode {
+                one_to_one: false,
+                mode: Mode::Mute,
+            };
+            st(&mut rig, pick.clone());
+            st(&mut rig, pick);
+            st(
+                &mut rig,
+                S::DefaultMode {
+                    one_to_one: true,
+                    mode: Mode::AllMessages,
+                },
+            );
+            let sent = drain(&mut rig.rx);
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            assert!(matches!(
+                sent[0],
+                Command::SetDefaultNotificationMode {
+                    one_to_one: false,
+                    mode: Mode::Mute
+                }
+            ));
+        }
+
+        #[test]
+        fn a_late_echo_of_the_old_mode_does_not_undo_the_pick() {
+            let mut rig = rig();
+            let shown = |rig: &Rig| {
+                rig.app
+                    .settings_ui
+                    .shown_default(rig.app.notification_settings.as_ref(), false)
+            };
+            let event = |mode| core(settings_event(mode, Mode::AllMessages, &[]));
+            let _ = rig.app.update(event(Mode::AllMessages));
+            st(
+                &mut rig,
+                S::DefaultMode {
+                    one_to_one: false,
+                    mode: Mode::MentionsAndKeywords,
+                },
+            );
+            // The first events after the change still carry the old value.
+            let _ = rig.app.update(event(Mode::AllMessages));
+            assert_eq!(shown(&rig), Some(Mode::MentionsAndKeywords));
+            let _ = rig.app.update(event(Mode::AllMessages));
+            assert_eq!(shown(&rig), Some(Mode::MentionsAndKeywords));
+            // The event that agrees settles it.
+            let _ = rig.app.update(event(Mode::MentionsAndKeywords));
+            assert!(rig.app.settings_ui.pending_group.is_none());
+            assert_eq!(shown(&rig), Some(Mode::MentionsAndKeywords));
+        }
+
+        #[test]
+        fn a_change_the_core_never_confirms_is_not_shown_for_ever() {
+            let mut rig = rig();
+            let event = || core(settings_event(Mode::AllMessages, Mode::AllMessages, &[]));
+            let _ = rig.app.update(event());
+            st(
+                &mut rig,
+                S::DefaultMode {
+                    one_to_one: false,
+                    mode: Mode::Mute,
+                },
+            );
+            for _ in 0..crate::settings::MAX_STALE_EVENTS {
+                let _ = rig.app.update(event());
+            }
+            assert_eq!(
+                rig.app
+                    .settings_ui
+                    .shown_default(rig.app.notification_settings.as_ref(), false),
+                Some(Mode::AllMessages)
+            );
+        }
+
+        #[test]
+        fn a_failed_default_mode_shows_what_the_core_reports_again() {
+            let mut rig = rig();
+            let _ = rig.app.update(core(settings_event(
+                Mode::AllMessages,
+                Mode::AllMessages,
+                &[],
+            )));
+            st(
+                &mut rig,
+                S::DefaultMode {
+                    one_to_one: true,
+                    mode: Mode::Mute,
+                },
+            );
+            let _ = rig.app.update(core(CoreEvent::ActionFailed {
+                room_id: RoomId::from(""),
+                action: ActionKind::Notifications,
+                error: CoreError::Internal("x".into()),
+            }));
+            assert_eq!(
+                rig.app
+                    .settings_ui
+                    .shown_default(rig.app.notification_settings.as_ref(), true),
+                Some(Mode::AllMessages)
+            );
+            assert_eq!(
+                rig.app.settings_ui.error,
+                Some(SettingsError::NotificationFailed)
+            );
+        }
+
+        #[test]
+        fn a_keyword_is_validated_sent_once_and_the_field_cleared() {
+            let mut rig = rig();
+            st(&mut rig, S::KeywordInput(text("  lunch  ")));
+            st(&mut rig, S::AddKeyword);
+            st(&mut rig, S::AddKeyword);
+            let sent = drain(&mut rig.rx);
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            assert!(matches!(&sent[0], Command::AddKeyword { keyword } if keyword == "lunch"));
+            assert_eq!(rig.app.settings_ui.keyword_input.expose(), "");
+        }
+
+        #[test]
+        fn a_keyword_over_64_characters_is_refused() {
+            let mut rig = rig();
+            st(&mut rig, S::KeywordInput(text(&"k".repeat(65))));
+            st(&mut rig, S::AddKeyword);
+            assert!(drain(&mut rig.rx).is_empty());
+            assert_eq!(
+                rig.app.settings_ui.error,
+                Some(SettingsError::KeywordTooLong)
+            );
+            // The field keeps the text so it can be shortened.
+            assert_eq!(rig.app.settings_ui.keyword_input.expose().len(), 65);
+            st(&mut rig, S::KeywordInput(text(&"k".repeat(64))));
+            st(&mut rig, S::AddKeyword);
+            assert_eq!(drain(&mut rig.rx).len(), 1, "64 characters are fine");
+        }
+
+        #[test]
+        fn keyword_checks_cover_blank_control_limit_and_duplicates() {
+            assert_eq!(check_keyword("  ", 0, false), Ok(None));
+            assert_eq!(
+                check_keyword("a\nb", 0, false),
+                Err(SettingsError::KeywordUnsafe)
+            );
+            assert_eq!(
+                check_keyword("é".repeat(64).as_str(), 0, false).map(|k| k.is_some()),
+                Ok(true)
+            );
+            assert_eq!(
+                check_keyword("x", 50, false),
+                Err(SettingsError::TooManyKeywords)
+            );
+            assert_eq!(check_keyword("x", 50, true), Ok(Some("x".to_owned())));
+        }
+
+        #[test]
+        fn a_known_keyword_is_not_sent_again_and_remove_sends_only_known_ones() {
+            let mut rig = rig();
+            let _ = rig.app.update(core(settings_event(
+                Mode::AllMessages,
+                Mode::AllMessages,
+                &["lunch"],
+            )));
+            st(&mut rig, S::KeywordInput(text("lunch")));
+            st(&mut rig, S::AddKeyword);
+            st(&mut rig, S::RemoveKeyword(text("dinner")));
+            assert!(drain(&mut rig.rx).is_empty());
+            st(&mut rig, S::RemoveKeyword(text("lunch")));
+            let sent = drain(&mut rig.rx);
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            assert!(matches!(&sent[0], Command::RemoveKeyword { keyword } if keyword == "lunch"));
+        }
+
+        #[test]
+        fn each_local_toggle_writes_the_settings_once() {
+            let mut rig = rig();
+            st(&mut rig, S::DesktopNotifications(false));
+            st(&mut rig, S::DesktopNotifications(false));
+            st(&mut rig, S::ShowMessageContent(false));
+            st(&mut rig, S::TrayBadge(false));
+            st(&mut rig, S::Theme(ThemeChoice::Dark));
+            st(&mut rig, S::Theme(ThemeChoice::Dark));
+            let saved = writes(&rig);
+            assert_eq!(saved.len(), 4, "{saved:?}");
+            assert_eq!(
+                saved[3],
+                UiSettings {
+                    theme: ThemeChoice::Dark,
+                    desktop_notifications: false,
+                    show_message_content: false,
+                    tray_badge: false,
+                }
+            );
+            assert!(
+                drain(&mut rig.rx).is_empty(),
+                "local settings are not commands"
+            );
+        }
+
+        #[test]
+        fn a_failed_write_shows_a_line() {
+            let mut rig = rig();
+            st(&mut rig, S::Saved(true));
+            assert!(rig.app.settings_ui.error.is_none());
+            st(&mut rig, S::Saved(false));
+            assert_eq!(rig.app.settings_ui.error, Some(SettingsError::SaveFailed));
+        }
+
+        fn notification(kind: NotificationKind) -> NotificationView {
+            NotificationView {
+                room_id: RoomId::from("!b:x"),
+                event_id: EventId::from("$e"),
+                room_name: "b".into(),
+                sender: UserId::from("@bob:x"),
+                sender_name: Some("Bob".into()),
+                is_dm: false,
+                kind,
+                preview: Some(MessageText::from("secret preview text")),
+            }
+        }
+
+        #[test]
+        fn turning_desktop_notifications_off_stops_notifier_calls_at_once() {
+            let mut rig = rig();
+            let _ = rig.app.update(Message::WindowFocus(false));
+            let _ = rig.app.update(core(CoreEvent::Notification(notification(
+                NotificationKind::Message,
+            ))));
+            assert_eq!(rig.shown.lock().expect("mutex").len(), 1);
+            st(&mut rig, S::DesktopNotifications(false));
+            let _ = rig.app.update(core(CoreEvent::Notification(notification(
+                NotificationKind::Mention,
+            ))));
+            assert_eq!(rig.shown.lock().expect("mutex").len(), 1);
+            st(&mut rig, S::DesktopNotifications(true));
+            let _ = rig.app.update(core(CoreEvent::Notification(notification(
+                NotificationKind::Message,
+            ))));
+            assert_eq!(rig.shown.lock().expect("mutex").len(), 2);
+        }
+
+        #[test]
+        fn turning_content_off_drops_the_preview_and_the_sender_at_once() {
+            let mut rig = rig();
+            let _ = rig.app.update(Message::WindowFocus(false));
+            st(&mut rig, S::ShowMessageContent(false));
+            let _ = rig.app.update(core(CoreEvent::Notification(notification(
+                NotificationKind::Message,
+            ))));
+            let shown = rig.shown.lock().expect("mutex").clone();
+            assert_eq!(shown.len(), 1);
+            let all = format!("{} {}", shown[0].toast.title, shown[0].toast.body);
+            assert!(!all.contains("secret") && !all.contains("Bob"), "{all}");
+            assert_eq!(shown[0].toast.body, "New message");
+        }
+
+        #[test]
+        fn the_tray_badge_toggle_redraws_the_icon_without_a_new_count() {
+            let mut rig = rig();
+            let _ = rig
+                .app
+                .update(Message::WindowOpened(iced::window::Id::unique()));
+            let _ = rig.app.update(core(CoreEvent::UnreadTotals {
+                notifications: 5,
+                highlights: 0,
+            }));
+            assert_eq!(*rig.tray.badges.lock().expect("mutex"), [true]);
+            st(&mut rig, S::TrayBadge(false));
+            assert_eq!(*rig.tray.badges.lock().expect("mutex"), [true, false]);
+            st(&mut rig, S::TrayBadge(true));
+            assert_eq!(*rig.tray.badges.lock().expect("mutex"), [true, false, true]);
+        }
+
+        #[test]
+        fn the_theme_choice_overrides_the_system_mode_live() {
+            let mut rig = rig();
+            let _ = rig.app.update(Message::ThemeMode(theme::Mode::Dark));
+            let dark = |app: &App| app.theme().expect("a theme").extended_palette().is_dark;
+            assert!(dark(&rig.app));
+            st(&mut rig, S::Theme(ThemeChoice::Light));
+            assert!(!dark(&rig.app));
+            st(&mut rig, S::Theme(ThemeChoice::System));
+            assert!(dark(&rig.app));
+        }
+
+        #[test]
+        fn the_sessions_link_closes_settings_and_opens_the_sessions_page() {
+            let mut rig = rig();
+            open(&mut rig);
+            st(&mut rig, S::OpenSessions);
+            assert!(!rig.app.settings_open());
+            assert!(rig.app.sessions.open);
+            assert!(
+                drain(&mut rig.rx)
+                    .iter()
+                    .any(|c| matches!(c, Command::ListDevices))
+            );
+        }
+
+        #[test]
+        fn opening_settings_keeps_the_widget_tree_under_it() {
+            let mut rig = rig();
+            let closed = tag_path(&rig.app);
+            open(&mut rig);
+            assert_eq!(tag_path(&rig.app), closed, "the base keeps its place");
+            st(&mut rig, S::Close);
+            assert_eq!(tag_path(&rig.app), closed);
+        }
+
+        #[test]
+        fn the_screen_builds_with_every_section() {
+            let mut rig = rig();
+            let _ = rig.app.update(core(profile(Some("Alice"), true)));
+            let _ = rig.app.update(core(settings_event(
+                Mode::Mute,
+                Mode::AllMessages,
+                &["lunch"],
+            )));
+            open(&mut rig);
+            let _ = rig.app.view();
+        }
+
+        #[test]
+        fn names_and_keywords_stay_out_of_debug_output() {
+            let mut rig = rig();
+            let _ = rig
+                .app
+                .update(core(profile(Some("sentinel-name-x"), false)));
+            let _ = rig.app.update(core(settings_event(
+                Mode::AllMessages,
+                Mode::AllMessages,
+                &["sentinel-kw-x"],
+            )));
+            st(&mut rig, S::KeywordInput(text("sentinel-typed-x")));
+            let dbg = format!(
+                "{:?} {:?} {:?} {:?}",
+                rig.app,
+                rig.app.settings_ui,
+                S::NameInput(text("sentinel-name-x")),
+                S::RemoveKeyword(text("sentinel-kw-x")),
+            );
+            assert!(!dbg.contains("sentinel"), "{dbg}");
+        }
+
+        #[test]
+        fn logging_out_closes_settings_and_forgets_the_profile() {
+            let mut rig = rig();
+            let _ = rig.app.update(core(profile(Some("Alice"), true)));
+            open(&mut rig);
+            let _ = rig.app.update(core(CoreEvent::LoggedOut));
+            assert!(!rig.app.settings_open());
+            assert!(rig.app.settings_ui.profile.is_none());
+            assert!(rig.app.notification_settings.is_none());
         }
     }
 }

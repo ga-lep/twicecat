@@ -218,7 +218,7 @@ fn is_bidi_control(c: char) -> bool {
 }
 
 /// Control or direction characters, as the core refuses them.
-fn has_unsafe_char(text: &str, allow_newline: bool) -> bool {
+pub(crate) fn has_unsafe_char(text: &str, allow_newline: bool) -> bool {
     text.chars()
         .any(|c| (c.is_control() && !(allow_newline && c == '\n')) || is_bidi_control(c))
 }

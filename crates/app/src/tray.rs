@@ -208,6 +208,12 @@ impl TrayModel {
         }
     }
 
+    /// Redraws the tray for the last unread count after the badge setting
+    /// changed; like [`TrayModel::set_unread`], only what differs is touched.
+    pub fn refresh(&mut self, badge_enabled: bool) {
+        self.set_unread(self.unread, badge_enabled);
+    }
+
     /// Whether a tray is running.
     pub fn is_active(&self) -> bool {
         matches!(self.state, State::Active { .. })

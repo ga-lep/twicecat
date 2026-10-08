@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use tessera_app::settings::DiskSettings;
 use tessera_app::state::App;
 use tessera_app::{Bridge, Startup, TITLE};
 use tessera_core::api::AudioBackend;
@@ -114,6 +115,7 @@ fn run(options: Options) -> Result<(), String> {
         };
     // Read before the window opens so the stored choices apply from the start.
     let ui_settings = data.read_settings();
+    let settings_store = DiskSettings::new(data.clone());
     let config = CoreConfig {
         data,
         homeserver_override: options.homeserver,
@@ -131,12 +133,16 @@ fn run(options: Options) -> Result<(), String> {
 
     // The app (and with it the bridge and the core's runtime) is dropped when
     // `run` returns, before the temporary directory is removed.
-    let result = iced::application(App::booter(startup, ui_settings), App::update, App::view)
-        .title(TITLE)
-        .subscription(App::subscription)
-        .theme(App::theme)
-        .exit_on_close_request(false)
-        .run();
+    let result = iced::application(
+        App::booter(startup, ui_settings, settings_store),
+        App::update,
+        App::view,
+    )
+    .title(TITLE)
+    .subscription(App::subscription)
+    .theme(App::theme)
+    .exit_on_close_request(false)
+    .run();
     if let Some(dir) = cleanup {
         // Best effort: nothing useful to do if it fails.
         let _ = std::fs::remove_dir_all(dir);

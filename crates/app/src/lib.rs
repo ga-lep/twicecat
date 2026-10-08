@@ -20,6 +20,7 @@ pub mod rooms;
 pub mod screens;
 pub mod security;
 pub mod sessions;
+pub mod settings;
 pub mod spaces;
 pub mod state;
 pub mod text_safety;

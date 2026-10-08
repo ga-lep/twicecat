@@ -14,7 +14,6 @@ use tessera_core::api::MessageText;
 use crate::screens::main_view::rich_env;
 use crate::screens::timeline_pane::{self, Pane};
 use crate::state::{App, Message};
-use crate::theme;
 use crate::threads::{PANEL_WIDTH, THREAD_INPUT_ID, ThreadPanel, ThreadsMessage};
 
 /// The panel, or an empty slot when no thread is open.
@@ -34,7 +33,7 @@ fn view<'a>(app: &'a App, panel: &'a ThreadPanel) -> Element<'a, Message> {
     ]
     .spacing(8)
     .align_y(iced::Center);
-    let theme = theme::theme_for(app.theme_mode);
+    let theme = app.current_theme();
     let now = Local::now().timestamp_millis();
     let timeline = container(timeline_pane::view_pane(
         &panel.timeline,
