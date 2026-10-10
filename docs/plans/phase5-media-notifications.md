@@ -347,7 +347,7 @@ Registry root: `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/`. Each i
     - **Push rules are account data** and survive between runs. `tests/common` gains `reset_notification_baseline(n)`, which the notification tests call first. It removes every keyword starting with `tessera-kw-`, sets both default modes back to the server defaults, and deletes user-defined rules for rooms the test created. Keywords are unique per run (`tessera-kw-<hex>`).
     - **Negative tests** ("no notification") are bounded: after the event that must not notify, the test sends a second, notifying sentinel in another room. It asserts the sentinel arrives first and nothing for the muted event arrived in between, with a 30 s overall limit (no fixed sleeps).
     - **Room growth:** every task's acceptance runs `scripts/prune-test-rooms.sh` before an ignored run. Room and space tests leave the rooms they create at the end.
-    - **Time:** each task records the ignored-run duration. If the full suite passes 15 minutes, stop and ask (rule 8). A test failing twice in a row is a rule-8 stop.
+    - **Time:** each task records the ignored-run duration. If the full suite passes 25 minutes, stop and ask (rule 8). (Raised from 15 minutes by the human on 2026-10-11: the suite ran 15 min 6 s after pruning.) A test failing twice in a row is a rule-8 stop.
     - Rejected: new test accounts (Phase 4 Q2 answer); mock-server tests for these flows.
 20. **Q20: content and secret hygiene (rule 6).** ACCEPTED AS RECOMMENDED (2026-10-08):
     - **Never logged:** media bytes, file names, captions, notification previews and keywords. Every new public type that holds them has a redacted `Debug`, tested with sentinels (`secret-body-x`, `secret-name-x.png`).
@@ -399,7 +399,7 @@ Registry root: `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/`. Each i
 - **Stop and ask (rule 8)** if:
   - an API above behaves differently from this plan (for example thread summaries need `ThreadingSupport`, the send queue refuses encrypted attachments, the notification handler never fires under sliding sync, or Synapse refuses `initial_state` encryption);
   - a test is flaky twice in a row;
-  - the ignored suite passes 15 minutes;
+  - the ignored suite passes 25 minutes (raised from 15 on 2026-10-11);
   - `cargo deny` flags something beyond the ksni licence;
   - a step needs a real account or a non-Linux machine.
 
@@ -765,7 +765,7 @@ Acceptance criteria:
   - marks the Phase 5 agent work done (the human checkpoint stays open);
   - consolidates "Phase 5 open issues (summary)": the Q21 scope cuts, the Q4 Wayland drag-and-drop gap, the Q2 untested Windows/macOS code, the Q20 residuals, every Low or Medium review finding, and the test durations;
   - adds a short "Phase 5 security notes" section (media at rest, notification content, saved files, EXIF).
-- The full ignored suite passes after `scripts/prune-test-rooms.sh`, and again right after it, with both durations recorded (under 15 minutes each, else stop and ask).
+- The full ignored suite passes after `scripts/prune-test-rooms.sh`, and again right after it, with both durations recorded (under 25 minutes each, else stop and ask; raised from 15 on 2026-10-11).
 - Gate passes. Commit: `phase5.17: phase 5 wrap-up`.
 
 ### Phase 5 human checkpoint (collected in PROGRESS.md)
