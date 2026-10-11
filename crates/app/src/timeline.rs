@@ -15,9 +15,11 @@ use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use tessera_core::api::{
-    Block, EventId, Inline, ListDiff, PaginationState, RichText, SendStatus, TimelineItem,
-    TimelineItemKind,
+    Block, EventId, Inline, ListDiff, MediaContent, MediaKind, PaginationState, RichText,
+    SendStatus, TimelineItem, TimelineItemKind,
 };
+
+use crate::media::{has_caption, media_box};
 
 /// How far outside the viewport rows are built, in pixels.
 pub const OVERSCAN_PX: f32 = 600.0;
@@ -79,6 +81,8 @@ const REACTIONS_H: f32 = 30.0;
 const RECEIPTS_H: f32 = 18.0;
 const FAILURE_H: f32 = 22.0;
 const EDITED_H: f32 = 18.0;
+/// Height of the "N replies" line under a thread root.
+pub const THREAD_ROW_H: f32 = 22.0;
 /// Height of a day divider row.
 pub const DIVIDER_H: f32 = 36.0;
 /// Estimated height of a state event row.
@@ -88,6 +92,8 @@ pub const MARKER_H: f32 = 24.0;
 /// Height of the start-of-room row.
 pub const START_H: f32 = 40.0;
 const RULE_H: f32 = 8.0;
+/// The height of a file, video or audio card (a fixed box, like an image).
+pub const CARD_H: f32 = 64.0;
 
 fn clean_width(width: f32) -> f32 {
     if width.is_finite() {
@@ -178,6 +184,16 @@ fn rich_height(content: &RichText, body: &str, cpl: usize) -> f32 {
     }
 }
 
+/// The height of the media box of a message: the fixed box of an image (from
+/// the sender's size, never from the bytes), or a card. Nothing the cache
+/// holds changes it, so a thumbnail arriving moves no row.
+pub fn media_height(media: &MediaContent) -> f32 {
+    match media.kind {
+        MediaKind::Image => media_box(media.width, media.height).height,
+        MediaKind::Video | MediaKind::Audio | MediaKind::File => CARD_H,
+    }
+}
+
 /// The height of a row before it was measured.
 ///
 /// `continuation` rows have no header and less padding. The estimate grows
@@ -205,12 +221,20 @@ fn estimate_unclamped(item: &TimelineItem, continuation: bool, width: f32) -> f3
             sent,
             ..
         } => {
-            let mut h = lead + rich_height(&details.content, body, cpl);
+            let text = match details.media.as_deref() {
+                Some(media) if !has_caption(body, media) => media_height(media),
+                Some(media) => media_height(media) + rich_height(&details.content, body, cpl),
+                None => rich_height(&details.content, body, cpl),
+            };
+            let mut h = lead + text;
             if details.reply_to.is_some() {
                 h += REPLY_H;
             }
             if details.edited {
                 h += EDITED_H;
+            }
+            if details.thread.is_some() {
+                h += THREAD_ROW_H;
             }
             if !details.reactions.is_empty() {
                 h += REACTIONS_H;

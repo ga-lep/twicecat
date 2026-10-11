@@ -68,7 +68,7 @@ const MACROS: [&str; 26] = [
 /// Names that must not appear in the arguments of those macros: the fields
 /// and types that hold the recovery key, typed inputs, passwords, the QR grid
 /// and the verification and sessions state (plan Q15).
-const FORBIDDEN: [&str; 23] = [
+const FORBIDDEN: [&str; 42] = [
     "RecoveryKey",
     "Password",
     "RecoverySetup",
@@ -92,6 +92,27 @@ const FORBIDDEN: [&str; 23] = [
     "self.security",
     "self.sessions",
     "self.verification",
+    // Phase 5: media bytes and file names, notification text, keywords, and
+    // the models that hold typed text (task 17).
+    "MediaBytes",
+    "MediaModel",
+    "UploadModel",
+    "SavePath",
+    "Toast",
+    "NotificationView",
+    "SettingsModel",
+    "SwitcherModel",
+    ".preview",
+    ".sender_name",
+    ".room_name",
+    ".filename",
+    ".keywords",
+    ".keyword_input",
+    ".switcher",
+    ".settings_ui",
+    ".viewer",
+    ".dropped",
+    ".draft",
 ];
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -325,6 +346,19 @@ fn the_scanner_flags_every_macro_and_ignores_test_code_and_comments() {
         r#"fn f(k: &RecoveryKey) { dbg!(k as &RecoveryKey); }"#,
         r#"fn f(m: &M) { tracing::info!(setup = ?m.setup, "x"); }"#,
         r#"fn f(m: &M) { debug!("{:?}", m.qr_handle()); }"#,
+        // Phase 5: media bytes, notification text, file names, keywords.
+        r#"fn f(b: &MediaBytes) { println!("{:?}", MediaBytes::from(b)); }"#,
+        r#"fn f(v: &V) { println!("{}", v.preview); }"#,
+        r#"fn f(t: &Toast) { eprintln!("{:?}", Toast::from(t)); }"#,
+        r#"fn f(n: &NotificationView) { debug!("{:?}", n.sender_name); }"#,
+        r#"fn f(c: &C) { warn!("{}", c.filename); }"#,
+        r#"fn f(s: &S) { info!("{:?}", s.keywords); }"#,
+        r#"fn f(s: &S) { info!("{:?}", s.keyword_input); }"#,
+        r#"fn f(s: &S) { info!("{:?}", s.switcher); }"#,
+        r#"fn f(s: &S) { info!("{:?}", s.draft); }"#,
+        r#"fn f(s: &S) { info!("{:?}", s.settings_ui.name); }"#,
+        r#"fn f(s: &S) { info!("{:?}", s.dropped); }"#,
+        r#"fn f(s: &S) { info!("{:?}", s.viewer); }"#,
         r#"fn f(m: &M) { log::warn!("{}", m.restore_input.expose()); }"#,
         // A `)` inside a string literal must not end the argument list early.
         r#"fn f(s: &S) { eprintln!(") {}", s.password); }"#,

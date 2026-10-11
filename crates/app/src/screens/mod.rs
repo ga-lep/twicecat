@@ -6,10 +6,19 @@
 pub mod loading;
 pub mod login;
 pub mod main_view;
+pub mod media_viewer;
+pub mod members;
+pub mod room_dialogs;
 pub mod room_list_pane;
+pub mod room_settings;
 pub mod security;
 pub mod sessions;
+pub mod settings;
+pub mod spaces_sidebar;
+pub mod switcher;
+pub mod thread_panel;
 pub mod timeline_pane;
+pub mod upload_dialog;
 pub mod verification;
 
 use iced::widget::{container, text};

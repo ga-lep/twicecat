@@ -13,18 +13,26 @@ use std::cell::Cell;
 use chrono::{Local, TimeZone};
 use iced::font::{Style as FontStyle, Weight};
 use iced::widget::{
-    Column, Row, button, column, container, mouse_area, row, rule, scrollable, sensor, space,
-    stack, text, tooltip,
+    Column, Row, button, column, container, image, mouse_area, progress_bar, row, rule, scrollable,
+    sensor, space, stack, text, tooltip,
 };
-use iced::{Background, Color, Element, Fill, Font, Padding, Shrink, Theme, mouse};
+use iced::{
+    Background, Color, ContentFit, Element, Fill, Font, Length, Padding, Shrink, Theme, mouse,
+};
 use tessera_core::api::{
-    Block, Inline, MessageDetails, MessageKind, MessageText, PaginationState, PlaceholderKind,
-    ReactionGroup, ReplyPreview, ReplyState, RichText, RoomSummary, SendStatus, Shield, ShieldCode,
-    StateChange, TextStyle, TimelineItem, TimelineItemKind, TypingUser, UserId, UtdReason,
+    Block, EventId, Inline, MediaContent, MediaKind, MessageDetails, MessageKind, MessageText,
+    PaginationState, PlaceholderKind, ReactionGroup, ReplyPreview, ReplyState, RichText, RoomId,
+    RoomMemberView, RoomSummary, SendStatus, Shield, ShieldCode, StateChange, TextStyle,
+    ThreadSummaryView, TimelineItem, TimelineItemKind, TypingUser, UploadProgress, UserId,
+    UtdReason,
 };
 
 use crate::actions::{self, ActionButtons, ActionState};
 use crate::dates::{day_label, time_label};
+use crate::media::{
+    BOX_MAX_W, MediaModel, Thumb, card_name, has_caption, kind_label, media_box, size_label,
+    type_label,
+};
 use crate::rich_text::{Ctx, Revealed, blocks_view};
 use crate::state::Message;
 use crate::text_safety::{
@@ -32,9 +40,10 @@ use crate::text_safety::{
 };
 use crate::theme;
 use crate::timeline::{
-    CONTINUATION_PAD, DIVIDER_H, INDENT_PX, MARKER_H, OVERSCAN_PX, SIDE_PAD_PX, START_H,
-    TIMELINE_ID, TOP_PAD, TimelineView, is_continuation, spacer_heights,
+    CARD_H, CONTINUATION_PAD, DIVIDER_H, INDENT_PX, MARKER_H, OVERSCAN_PX, SIDE_PAD_PX, START_H,
+    THREAD_ROW_H, TIMELINE_ID, TOP_PAD, TimelineView, is_continuation, spacer_heights,
 };
+use crate::upload;
 
 /// How many lines of a body are shown.
 pub const MAX_BODY_LINES: usize = 200;
@@ -57,6 +66,61 @@ pub struct RichEnv<'a> {
     pub actions: &'a ActionState,
     /// Known rooms, for the names on room pills.
     pub rooms: &'a [RoomSummary],
+    /// The open room's members, for the names on user pills.
+    pub members: &'a [RoomMemberView],
+    /// Thumbnails and saved files, for media messages.
+    pub media: &'a MediaModel,
+    /// The open room, which keys the media cache.
+    pub room: Option<&'a RoomId>,
+}
+
+/// What differs between the room's timeline pane and the thread panel's: the
+/// scrollable's ID, the messages the scroll and the row sensors send, and the
+/// actions a row offers.
+#[derive(Clone, Copy)]
+pub struct Pane {
+    /// The scrollable's widget ID, which scroll tasks name.
+    pub scroll_id: &'static str,
+    /// The message for a scroll of the pane.
+    pub on_scroll: fn(scrollable::Viewport) -> Message,
+    /// The message for a measured row: the item's ID and its height.
+    pub on_measure: fn(String, f32) -> Message,
+    /// The pane is the thread panel: no **Reply** or **Edit** (they belong to
+    /// the room's composer) and no thread summary row.
+    pub thread: bool,
+}
+
+impl Pane {
+    /// The room's timeline.
+    pub const MAIN: Self = Self {
+        scroll_id: TIMELINE_ID,
+        on_scroll: Message::TimelineScrolled,
+        on_measure: |id, height| Message::RowMeasured { id, height },
+        thread: false,
+    };
+
+    /// The thread panel's timeline.
+    pub const THREAD: Self = Self {
+        scroll_id: crate::threads::THREAD_SCROLL_ID,
+        on_scroll: |viewport| Message::Threads(crate::threads::ThreadsMessage::Scrolled(viewport)),
+        on_measure: |id, height| {
+            Message::Threads(crate::threads::ThreadsMessage::Measured { id, height })
+        },
+        thread: true,
+    };
+
+    /// The buttons a row of this pane offers, from what the core allows.
+    fn limit(self, buttons: ActionButtons) -> ActionButtons {
+        if self.thread {
+            ActionButtons {
+                reply: false,
+                edit: false,
+                ..buttons
+            }
+        } else {
+            buttons
+        }
+    }
 }
 
 /// The pane for the selected room's timeline, in the local time zone.
@@ -77,18 +141,29 @@ pub fn view_in<'a, Tz: TimeZone>(
     tz: &Tz,
     env: RichEnv<'_>,
 ) -> Element<'a, Message> {
+    view_pane(timeline, now_ms, tz, env, Pane::MAIN)
+}
+
+/// [`view_in`] for the pane `pane` names.
+pub fn view_pane<'a, Tz: TimeZone>(
+    timeline: &'a TimelineView,
+    now_ms: u64,
+    tz: &Tz,
+    env: RichEnv<'_>,
+    pane: Pane,
+) -> Element<'a, Message> {
     let window = timeline.window();
     let (above, below) = spacer_heights(&timeline.prefix, &window);
     let mut rows: Vec<Element<'a, Message>> = Vec::with_capacity(window.len() + 2);
     rows.push(space().height(above).into());
-    rows.extend(window.map(|i| built_row(timeline, i, now_ms, tz, env)));
+    rows.extend(window.map(|i| built_row(timeline, i, now_ms, tz, env, pane)));
     rows.push(space().height(below).into());
     // `from_vec`, because `Column::push` drops zero-size children, and the
     // content is always the two spacers plus the window.
     let list = scrollable(Column::from_vec(rows).width(Fill))
-        .id(TIMELINE_ID)
+        .id(pane.scroll_id)
         .anchor_bottom()
-        .on_scroll(Message::TimelineScrolled)
+        .on_scroll(pane.on_scroll)
         .width(Fill)
         .height(Fill);
     // Always a stack with the list first: iced keeps a widget's state only
@@ -135,22 +210,17 @@ fn built_row<'a, Tz: TimeZone>(
     now_ms: u64,
     tz: &Tz,
     env: RichEnv<'_>,
+    pane: Pane,
 ) -> Element<'a, Message> {
     #[cfg(test)]
     BUILT_ROWS.with(|built| built.set(built.get() + 1));
     let id = timeline.items[i].id.clone();
     let on_resize_id = id.clone();
-    sensor(row_content(timeline, i, now_ms, tz, env))
+    sensor(row_content(timeline, i, now_ms, tz, env, pane))
         .key(id.clone())
         .anticipate(OVERSCAN_PX)
-        .on_show(move |size| Message::RowMeasured {
-            id: id.clone(),
-            height: size.height,
-        })
-        .on_resize(move |size| Message::RowMeasured {
-            id: on_resize_id.clone(),
-            height: size.height,
-        })
+        .on_show(move |size| (pane.on_measure)(id.clone(), size.height))
+        .on_resize(move |size| (pane.on_measure)(on_resize_id.clone(), size.height))
         .into()
 }
 
@@ -160,6 +230,7 @@ fn row_content<'a, Tz: TimeZone>(
     now_ms: u64,
     tz: &Tz,
     env: RichEnv<'_>,
+    pane: Pane,
 ) -> Element<'a, Message> {
     let items = &timeline.items;
     match &items[i].kind {
@@ -186,34 +257,54 @@ fn row_content<'a, Tz: TimeZone>(
             if let Some(reply) = &details.reply_to {
                 content = content.push(reply_quote(reply));
             }
+            if let Some(media) = details.media.as_deref() {
+                content = content.push(media_view(&items[i].id, media, env));
+            }
+            // A media message with no caption has no text: its body is the
+            // file name, which the card or the image already shows.
+            let shows_text = details
+                .media
+                .as_deref()
+                .is_none_or(|media| has_caption(body, media));
             // The body sits below the header in its own widget, so it cannot
             // pass for a sender line. Rich text has no muted colour and no
             // small size, so it cannot copy the time next to a name either.
-            let body = body_widget(
-                &items[i].id,
-                body,
-                details,
-                echo == Echo::Sending,
-                sender,
-                env,
-            );
-            // A continuation has no header to carry the shield, so it sits
-            // beside the body (the same height: it only narrows the body).
-            content = content.push(match details.shield.filter(|_| continuation) {
-                Some(shield) => row![body, shield_view(shield)]
-                    .spacing(6)
-                    .align_y(iced::Alignment::Start)
-                    .into(),
-                None => body,
-            });
+            if shows_text {
+                let body = body_widget(
+                    &items[i].id,
+                    body,
+                    details,
+                    echo == Echo::Sending,
+                    sender,
+                    env,
+                );
+                // A continuation has no header to carry the shield, so it
+                // sits beside the body (the same height: it only narrows the
+                // body).
+                content = content.push(match details.shield.filter(|_| continuation) {
+                    Some(shield) => row![body, shield_view(shield)]
+                        .spacing(6)
+                        .align_y(iced::Alignment::Start)
+                        .into(),
+                    None => body,
+                });
+            } else if let Some(shield) = details.shield.filter(|_| continuation) {
+                content = content.push(shield_view(shield));
+            }
             if let Some(label) = edited_text(details) {
                 content = content.push(text(label).size(12).style(muted));
             }
-            let buttons = actions::action_buttons(details, *is_own);
+            let buttons = pane.limit(actions::action_buttons(details, *is_own));
+            if !pane.thread
+                && let (Some(summary), Some(root)) = (&details.thread, &items[i].event_id)
+            {
+                content = content.push(thread_row(root, summary));
+            }
             if !details.reactions.is_empty() {
                 content = content.push(reactions_row(&items[i].id, &details.reactions, buttons));
             }
-            if let Some(line) = echo_row(&items[i].id, echo) {
+            let upload = details.media.as_deref().and_then(|m| m.upload);
+            if let Some(line) = echo_row(&items[i].id, echo, upload) {
                 content = content.push(line);
             }
             if let Some(line) = receipts_row(items, i) {
@@ -294,6 +385,116 @@ fn row_content<'a, Tz: TimeZone>(
         ),
         TimelineItemKind::Other => space().height(0).into(),
     }
+}
+
+/// The line under a thread root, "N replies · name: preview"; clicking it
+/// opens the thread panel.
+fn thread_row<'a>(root: &EventId, summary: &ThreadSummaryView) -> Element<'a, Message> {
+    button(
+        text(crate::threads::summary_text(summary))
+            .size(13)
+            .style(accent)
+            .wrapping(text::Wrapping::None),
+    )
+    .padding([2, 0])
+    .height(Length::Fixed(THREAD_ROW_H))
+    .style(button::text)
+    .on_press(Message::Threads(crate::threads::ThreadsMessage::Open(
+        root.clone(),
+    )))
+    .into()
+}
+
+/// The media of a message: an image in its fixed box, or a card.
+fn media_view<'a>(id: &str, media: &MediaContent, env: RichEnv<'_>) -> Element<'a, Message> {
+    match media.kind {
+        MediaKind::Image => {
+            let thumb = env
+                .room
+                .and_then(|room| env.media.thumb(&(room.clone(), id.to_owned())));
+            image_box(id, media, thumb)
+        }
+        MediaKind::Video | MediaKind::Audio | MediaKind::File => {
+            let open = env
+                .room
+                .is_some_and(|room| env.media.open_allowed(&(room.clone(), id.to_owned())));
+            file_card(id, media, open)
+        }
+    }
+}
+
+/// A note in the middle of an image box.
+fn box_note<'a>(label: &'static str) -> Element<'a, Message> {
+    container(text(label).size(13).style(muted))
+        .center(Fill)
+        .style(container::bordered_box)
+        .into()
+}
+
+/// An image in the box [`media_box`] gives, whatever has arrived: the box is
+/// fixed by the sender's size, so the row never changes height when the
+/// thumbnail comes (Q7). Clicking opens the viewer.
+fn image_box<'a>(id: &str, media: &MediaContent, thumb: Option<&Thumb>) -> Element<'a, Message> {
+    let size = media_box(media.width, media.height);
+    let inner: Element<'a, Message> = match thumb {
+        Some(Thumb::Ready(decoded)) => image(decoded.handle.clone())
+            .width(Length::Fixed(size.width))
+            .height(Length::Fixed(size.height))
+            .content_fit(ContentFit::Contain)
+            .into(),
+        Some(Thumb::Unavailable) => box_note("No preview"),
+        None => box_note("Loading\u{2026}"),
+    };
+    button(
+        container(inner)
+            .width(Length::Fixed(size.width))
+            .height(Length::Fixed(size.height)),
+    )
+    .padding(0)
+    .style(button::text)
+    .on_press(Message::MediaClicked(id.to_owned()))
+    .into()
+}
+
+/// A card for a file, video or audio message: kind, sanitised name, size and
+/// type, **Save...** and, after a save of a safe file, **Open**.
+fn file_card<'a>(id: &str, media: &MediaContent, open: bool) -> Element<'a, Message> {
+    let detail = format!("{} \u{b7} {}", size_label(media.size), type_label(media));
+    let mut actions = row![
+        button(text("Save\u{2026}").size(13))
+            .on_press(Message::SaveRequested(id.to_owned()))
+            .style(button::secondary)
+    ]
+    .spacing(4);
+    if open {
+        actions = actions.push(
+            button(text("Open").size(13))
+                .on_press(Message::OpenRequested(id.to_owned()))
+                .style(button::secondary),
+        );
+    }
+    let label = column![
+        text(card_name(&media.filename)).wrapping(text::Wrapping::None),
+        text(detail)
+            .size(12)
+            .style(muted)
+            .wrapping(text::Wrapping::None),
+    ]
+    .width(Fill);
+    container(
+        row![
+            text(kind_label(media.kind)).size(13).style(muted).width(44),
+            label,
+            actions
+        ]
+        .spacing(8)
+        .align_y(iced::Center),
+    )
+    .padding(8)
+    .width(Length::Fixed(BOX_MAX_W))
+    .height(Length::Fixed(CARD_H))
+    .style(container::bordered_box)
+    .into()
 }
 
 /// Whether the action bar of message `id` is drawn: the pointer is over it,
@@ -473,6 +674,7 @@ fn body_widget<'a>(
         item: id,
         revealed: env.revealed,
         rooms: env.rooms,
+        members: env.members,
     };
     match &emote {
         Some(name) => blocks_view(&with_emote_prefix(&details.content, name), &ctx, env.theme),
@@ -485,12 +687,39 @@ pub fn edited_text(details: &MessageDetails) -> Option<&'static str> {
     details.edited.then_some("(edited)")
 }
 
+/// Width of the upload progress bar, in pixels.
+const UPLOAD_BAR_W: f32 = 160.0;
+
+/// "42 %" for a fraction of one.
+pub fn upload_percent(fraction: f32) -> String {
+    format!("{} %", (fraction.clamp(0.0, 1.0) * 100.0).floor() as u32)
+}
+
 /// The status line of a local echo: muted while sending, in the danger
 /// colour when failed, with **Retry** and **Discard**.
-fn echo_row<'a>(id: &str, echo: Echo) -> Option<Element<'a, Message>> {
+fn echo_row<'a>(
+    id: &str,
+    echo: Echo,
+    upload: Option<UploadProgress>,
+) -> Option<Element<'a, Message>> {
     let label = echo_text(echo)?;
     Some(match echo {
         Echo::Delivered => return None,
+        // An upload on its way: a bar, and **Cancel** (a discard).
+        Echo::Sending if upload.is_some() => {
+            let progress = upload.map_or(0.0, upload::fraction);
+            row![
+                text(label).size(12).style(muted),
+                progress_bar(0.0..=1.0, progress)
+                    .length(Length::Fixed(UPLOAD_BAR_W))
+                    .girth(Length::Fixed(6.0)),
+                text(upload_percent(progress)).size(12).style(muted),
+                bar_button("Cancel", Message::DiscardRequested(id.to_owned())),
+            ]
+            .spacing(8)
+            .align_y(iced::Center)
+            .into()
+        }
         Echo::Sending => text(label).size(12).style(muted).into(),
         Echo::Failed { .. } => row![
             text(label).size(13).style(text::danger),
@@ -1008,6 +1237,15 @@ thread_local! {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_upload_percent_is_a_whole_number() {
+        assert_eq!(upload_percent(0.0), "0 %");
+        assert_eq!(upload_percent(0.426), "42 %");
+        assert_eq!(upload_percent(1.0), "100 %");
+        assert_eq!(upload_percent(7.0), "100 %");
+        assert_eq!(upload_percent(-1.0), "0 %");
+    }
+
     use tessera_core::api::EventId;
 
     use super::*;
@@ -1552,6 +1790,9 @@ mod tests {
             revealed: &revealed,
             actions: &actions,
             rooms: &[],
+            members: &[],
+            media: &NO_MEDIA,
+            room: None,
         };
         BUILT_ROWS.with(|built| built.set(0));
         let _ = view_in(&view, 0, &chrono::Utc, env);
@@ -1571,6 +1812,9 @@ mod tests {
             revealed: &revealed,
             actions: &actions,
             rooms: &[],
+            members: &[],
+            media: &NO_MEDIA,
+            room: None,
         };
         let mut view = TimelineView::default();
         let mut tree = Tree::new(view_in(&view, 0, &chrono::Utc, env));
@@ -1587,6 +1831,7 @@ mod tests {
 
     use std::time::{Duration, Instant};
 
+    use ::image as image_crate;
     use chrono::Utc;
     use tessera_core::api::{ListDiff, SendFailure};
 
@@ -1637,8 +1882,14 @@ mod tests {
             revealed,
             actions: &NO_ACTIONS,
             rooms: &[],
+            members: &[],
+            media: &NO_MEDIA,
+            room: None,
         }
     }
+
+    static NO_MEDIA: std::sync::LazyLock<MediaModel> =
+        std::sync::LazyLock::new(MediaModel::default);
 
     static NO_ACTIONS: std::sync::LazyLock<ActionState> =
         std::sync::LazyLock::new(ActionState::default);
@@ -1831,5 +2082,120 @@ mod tests {
             };
             assert_eq!(built_by_with(&timeline, env), 1);
         }
+    }
+
+    // ---- Phase 5 Task 9: media rows ----
+
+    fn laid_out(element: Element<'_, Message>) -> iced::Size {
+        use iced::advanced::layout::Limits;
+        use iced::advanced::renderer::Headless;
+        use iced::advanced::widget::Tree;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a current-thread runtime");
+        let renderer = runtime
+            .block_on(iced::Renderer::new(
+                iced::Font::DEFAULT,
+                iced::Pixels(16.0),
+                Some("tiny-skia"),
+            ))
+            .expect("the headless tiny-skia renderer is not available");
+        let mut element = element;
+        let mut tree = Tree::new(element.as_widget());
+        element
+            .as_widget_mut()
+            .layout(
+                &mut tree,
+                &renderer,
+                &Limits::new(iced::Size::ZERO, iced::Size::new(1000.0, 2000.0)),
+            )
+            .size()
+    }
+
+    fn content(kind: MediaKind, w: Option<u32>, h: Option<u32>, name: &str) -> MediaContent {
+        let mut media = MediaContent::new(kind, name.to_owned());
+        media.width = w;
+        media.height = h;
+        media
+    }
+
+    #[test]
+    fn an_image_box_has_one_size_whatever_has_arrived() {
+        use crate::media::{Decoded, Thumb};
+        let media = content(MediaKind::Image, Some(1600), Some(900), "p.png");
+        let wanted = media_box(media.width, media.height);
+        let (handle, w, h) = crate::media::decode_media(
+            &{
+                let img = image_crate::RgbaImage::new(40, 30);
+                let mut out = std::io::Cursor::new(Vec::new());
+                img.write_to(&mut out, image_crate::ImageFormat::Png)
+                    .expect("encode");
+                out.into_inner()
+            },
+            crate::media::decode_limits(),
+        )
+        .expect("decodes");
+        let ready = Thumb::Ready(Decoded {
+            handle,
+            width: w,
+            height: h,
+        });
+        for thumb in [None, Some(&Thumb::Unavailable), Some(&ready)] {
+            assert_eq!(laid_out(image_box("i", &media, thumb)), wanted, "{thumb:?}");
+        }
+    }
+
+    #[test]
+    fn a_card_has_a_fixed_height_whatever_the_name_and_the_buttons() {
+        let long = "x".repeat(5000);
+        for name in ["a.txt", long.as_str(), "\u{202E}gnp.exe", ""] {
+            for open in [false, true] {
+                let media = content(MediaKind::File, None, None, name);
+                let size = laid_out(file_card("i", &media, open));
+                assert_eq!(size.height, CARD_H, "{name:?} {open}");
+                assert_eq!(size.width, BOX_MAX_W);
+            }
+        }
+    }
+
+    #[test]
+    fn the_estimate_matches_the_media_box_it_draws() {
+        let image = content(MediaKind::Image, Some(1600), Some(900), "p.png");
+        let box_h = media_box(image.width, image.height).height;
+        assert_eq!(crate::timeline::media_height(&image), box_h);
+        let file = content(MediaKind::Audio, None, None, "a.ogg");
+        assert_eq!(crate::timeline::media_height(&file), CARD_H);
+    }
+
+    #[test]
+    fn media_rows_build_with_and_without_a_caption() {
+        let mut timeline = TimelineView::default();
+        let item = |id: &str, kind: MediaKind, body: &str| {
+            let details = MessageDetails {
+                media: Some(Box::new(content(kind, Some(10), Some(10), "p.png"))),
+                ..MessageDetails::default()
+            };
+            TimelineItem::new(
+                id.to_owned(),
+                TimelineItemKind::Message {
+                    sender: UserId::from("@a:x"),
+                    body: body.to_owned(),
+                    is_own: false,
+                    timestamp_ms: NOW,
+                    sent: SendStatus::Sent,
+                    details: Box::new(details),
+                },
+            )
+        };
+        timeline.apply_diffs(vec![ListDiff::Reset {
+            values: vec![
+                item("a", MediaKind::Image, "p.png"),
+                item("b", MediaKind::Image, "look at this"),
+                item("c", MediaKind::File, "p.png"),
+                item("d", MediaKind::Video, "p.png"),
+            ],
+        }]);
+        let (theme, revealed) = (theme(), Revealed::new());
+        assert_eq!(built_by_with(&timeline, env(&theme, &revealed)), 4);
     }
 }

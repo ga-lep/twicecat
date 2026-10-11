@@ -8,17 +8,18 @@ use matrix_sdk::ruma::{OwnedRoomId, UserId as SdkUserId};
 use matrix_sdk_crypto::types::events::UtdCause;
 use matrix_sdk_ui::timeline::{
     AnyOtherStateEventContentChange, EmbeddedEvent, EncryptedMessage, EventSendState,
-    EventTimelineItem, InReplyToDetails, MembershipChange, MsgLikeKind, Profile, TimelineDetails,
-    TimelineEventShieldState, TimelineEventShieldStateCode, TimelineItem as SdkItem,
-    TimelineItemContent, VirtualTimelineItem,
+    EventTimelineItem, InReplyToDetails, MembershipChange, MsgLikeKind, Profile, ThreadSummary,
+    TimelineDetails, TimelineEventShieldState, TimelineEventShieldStateCode,
+    TimelineItem as SdkItem, TimelineItemContent, VirtualTimelineItem,
 };
 
 use crate::api::{
     CoreError, EventId, ItemActions, Member, MessageDetails, MessageKind, PlaceholderKind,
     ReactionGroup, ReplyPreview, ReplyState, RoomId, SendFailure, SendStatus, Shield, ShieldCode,
-    StateChange, TimelineItem, TimelineItemKind, UserId, UtdReason,
+    StateChange, ThreadSummaryView, TimelineItem, TimelineItemKind, UploadProgress, UserId,
+    UtdReason,
 };
-use crate::rich_text;
+use crate::{media, rich_text};
 
 /// Longest quoted line of a reply, in characters.
 const REPLY_BODY_CHARS: usize = 200;
@@ -42,6 +43,19 @@ pub(crate) fn map_send_state(state: &EventSendState) -> SendStatus {
         EventSendState::NotSentYet { .. } => SendStatus::Sending,
         EventSendState::SendingFailed { .. } => SendStatus::Failed,
         EventSendState::Sent { .. } => SendStatus::Sent,
+    }
+}
+
+/// The upload progress of a local echo, when the SDK reports one.
+pub(crate) fn map_upload_progress(state: Option<&EventSendState>) -> Option<UploadProgress> {
+    match state {
+        Some(EventSendState::NotSentYet {
+            progress: Some(p), ..
+        }) => Some(UploadProgress {
+            sent: p.progress.current as u64,
+            total: p.progress.total as u64,
+        }),
+        _ => None,
     }
 }
 
@@ -108,12 +122,20 @@ fn map_event(event: &EventTimelineItem, own: Option<&SdkUserId>) -> TimelineItem
                     MessageType::Text(_) => MessageKind::Text,
                     MessageType::Notice(_) => MessageKind::Notice,
                     MessageType::Emote(_) => MessageKind::Emote,
-                    MessageType::Image(_) => return placeholder(PlaceholderKind::Image),
-                    MessageType::Video(_) => return placeholder(PlaceholderKind::Video),
-                    MessageType::Audio(_) => return placeholder(PlaceholderKind::Audio),
-                    MessageType::File(_) => return placeholder(PlaceholderKind::File),
+                    // Media is a text message with a description of the file;
+                    // the body is the caption or the file name.
+                    MessageType::Image(_)
+                    | MessageType::Video(_)
+                    | MessageType::Audio(_)
+                    | MessageType::File(_) => MessageKind::Text,
                     MessageType::Location(_) => return placeholder(PlaceholderKind::Location),
                     _ => return placeholder(PlaceholderKind::Unsupported),
+                };
+                let media = media::map_media(message.msgtype());
+                let media_input = match &media {
+                    None => MediaInput::NotMedia,
+                    Some(_) if media::has_caption(message.msgtype()) => MediaInput::Captioned,
+                    Some(_) => MediaInput::Bare,
                 };
                 let details = MessageDetails {
                     sender_name: sender_name.clone(),
@@ -143,6 +165,7 @@ fn map_event(event: &EventTimelineItem, own: Option<&SdkUserId>) -> TimelineItem
                         event.is_own(),
                         event.is_remote_event(),
                         event.is_local_echo(),
+                        media_input,
                     ),
                     send_failure: match event.send_state() {
                         Some(EventSendState::SendingFailed { is_recoverable, .. }) => {
@@ -153,6 +176,11 @@ fn map_event(event: &EventTimelineItem, own: Option<&SdkUserId>) -> TimelineItem
                         _ => None,
                     },
                     shield: map_shield(event.get_shield(false)),
+                    media: media.map(|mut m| {
+                        m.upload = map_upload_progress(event.send_state());
+                        Box::new(m)
+                    }),
+                    thread: content.thread_summary.as_ref().map(map_thread_summary),
                 };
                 // A remote event has no send state: the server accepted it.
                 let sent = event.send_state().map_or(SendStatus::Sent, map_send_state);
@@ -357,6 +385,42 @@ fn map_reply(reply: &InReplyToDetails) -> ReplyPreview {
     }
 }
 
+/// What the thread summary needs of the latest reply.
+struct LatestReply<'a> {
+    sender: &'a SdkUserId,
+    sender_name: Option<String>,
+    /// The reply's text; `None` for anything that is not a message.
+    body: Option<&'a str>,
+}
+
+/// Builds the summary of a thread from its reply count and latest reply.
+/// `None` means the latest reply is not known (yet).
+fn thread_view(replies: u32, latest: Option<LatestReply<'_>>) -> ThreadSummaryView {
+    ThreadSummaryView {
+        replies,
+        latest_sender: latest.as_ref().map(|l| user(l.sender)),
+        latest_sender_name: latest.as_ref().and_then(|l| l.sender_name.clone()),
+        latest_preview: latest
+            .and_then(|l| l.body)
+            .map(reply_body)
+            .filter(|p| !p.is_empty()),
+    }
+}
+
+/// Maps the thread summary of a root message. A latest reply that is not
+/// loaded leaves the sender and preview empty; the count stays.
+pub(crate) fn map_thread_summary(summary: &ThreadSummary) -> ThreadSummaryView {
+    let latest = match &summary.latest_event {
+        TimelineDetails::Ready(embedded) => Some(LatestReply {
+            sender: &embedded.sender,
+            sender_name: profile_name(&embedded.sender_profile),
+            body: embedded.content.as_message().map(|m| m.body()),
+        }),
+        _ => None,
+    };
+    thread_view(summary.num_replies, latest)
+}
+
 /// The first line of `body`, cut to 200 characters (never inside one).
 pub(crate) fn reply_body(body: &str) -> String {
     body.lines()
@@ -475,19 +539,32 @@ fn sdk_formatted_html(msgtype: &MessageType) -> Option<&str> {
     matches!(formatted.format, MessageFormat::Html).then_some(formatted.body.as_str())
 }
 
+/// Whether a message is media, as far as editing is concerned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MediaInput {
+    /// Not a media message.
+    NotMedia,
+    /// Media with a caption.
+    Captioned,
+    /// Media without a caption: there is nothing to edit.
+    Bare,
+}
+
 /// What the user may do with a message. Redacting is offered on own and on
 /// remote events (the server decides about other people's), reacting on
-/// remote events and local echoes.
+/// remote events and local echoes. Media can be edited only through its
+/// caption.
 pub(crate) fn item_actions(
     can_reply: bool,
     can_edit: bool,
     is_own: bool,
     is_remote: bool,
     is_local: bool,
+    media: MediaInput,
 ) -> ItemActions {
     ItemActions {
         can_reply,
-        can_edit,
+        can_edit: can_edit && media != MediaInput::Bare,
         can_redact: is_own || is_remote,
         can_react: is_remote || is_local,
         can_copy: true,
@@ -496,9 +573,120 @@ pub(crate) fn item_actions(
 
 #[cfg(test)]
 mod tests {
-    use matrix_sdk::ruma::event_id;
+    use matrix_sdk::ruma::{event_id, user_id};
 
     use super::*;
+
+    #[test]
+    fn thread_summary_table() {
+        let carol = user_id!("@carol:x");
+        let latest = |name: Option<&str>, body: Option<&'static str>| {
+            Some(LatestReply {
+                sender: carol,
+                sender_name: name.map(str::to_owned),
+                body,
+            })
+        };
+        let long = "x".repeat(300);
+        let cases: Vec<(u32, Option<LatestReply<'_>>, ThreadSummaryView)> = vec![
+            // Unknown latest reply: only the count.
+            (
+                3,
+                None,
+                ThreadSummaryView {
+                    replies: 3,
+                    latest_sender: None,
+                    latest_sender_name: None,
+                    latest_preview: None,
+                },
+            ),
+            // Known sender, name and text.
+            (
+                1,
+                latest(Some("Carol"), Some("hello")),
+                ThreadSummaryView {
+                    replies: 1,
+                    latest_sender: Some(UserId::from("@carol:x")),
+                    latest_sender_name: Some("Carol".into()),
+                    latest_preview: Some("hello".into()),
+                },
+            ),
+            // No profile yet: the ID is still there.
+            (
+                2,
+                latest(None, Some("hi")),
+                ThreadSummaryView {
+                    replies: 2,
+                    latest_sender: Some(UserId::from("@carol:x")),
+                    latest_sender_name: None,
+                    latest_preview: Some("hi".into()),
+                },
+            ),
+            // Not a message (a redaction, say): no preview.
+            (
+                0,
+                latest(Some("Carol"), None),
+                ThreadSummaryView {
+                    replies: 0,
+                    latest_sender: Some(UserId::from("@carol:x")),
+                    latest_sender_name: Some("Carol".into()),
+                    latest_preview: None,
+                },
+            ),
+            // Only the first line, cut like a reply quote.
+            (
+                4,
+                latest(None, Some("first\nsecond")),
+                ThreadSummaryView {
+                    replies: 4,
+                    latest_sender: Some(UserId::from("@carol:x")),
+                    latest_sender_name: None,
+                    latest_preview: Some("first".into()),
+                },
+            ),
+            (
+                5,
+                Some(LatestReply {
+                    sender: carol,
+                    sender_name: None,
+                    body: Some(long.as_str()),
+                }),
+                ThreadSummaryView {
+                    replies: 5,
+                    latest_sender: Some(UserId::from("@carol:x")),
+                    latest_sender_name: None,
+                    latest_preview: Some("x".repeat(REPLY_BODY_CHARS)),
+                },
+            ),
+            // An empty body gives no preview.
+            (
+                6,
+                latest(None, Some("")),
+                ThreadSummaryView {
+                    replies: 6,
+                    latest_sender: Some(UserId::from("@carol:x")),
+                    latest_sender_name: None,
+                    latest_preview: None,
+                },
+            ),
+        ];
+        for (replies, latest, expected) in cases {
+            assert_eq!(thread_view(replies, latest), expected);
+        }
+    }
+
+    #[test]
+    fn unloaded_latest_reply_keeps_the_count() {
+        for details in [TimelineDetails::Unavailable, TimelineDetails::Pending] {
+            let summary = ThreadSummary {
+                latest_event: details,
+                num_replies: 7,
+            };
+            let view = map_thread_summary(&summary);
+            assert_eq!(view.replies, 7);
+            assert!(view.latest_sender.is_none() && view.latest_preview.is_none());
+        }
+    }
 
     #[test]
     fn shield_mapping_table() {
@@ -579,6 +767,43 @@ mod tests {
         assert_eq!(map_send_state(&not_yet), SendStatus::Sending);
         assert_eq!(map_send_state(&failed), SendStatus::Failed);
         assert_eq!(map_send_state(&sent), SendStatus::Sent);
+    }
+
+    #[test]
+    fn upload_progress_mapping_table() {
+        use matrix_sdk::send_queue::AbstractProgress;
+        use matrix_sdk_ui::timeline::MediaUploadProgress;
+        let progress = |current, total| EventSendState::NotSentYet {
+            progress: Some(MediaUploadProgress {
+                index: 0,
+                progress: AbstractProgress { current, total },
+            }),
+        };
+        let failed = EventSendState::SendingFailed {
+            error: std::sync::Arc::new(matrix_sdk::Error::AuthenticationRequired),
+            is_recoverable: true,
+        };
+        let sent = EventSendState::Sent {
+            event_id: event_id!("$e:localhost").to_owned(),
+        };
+        assert_eq!(
+            map_upload_progress(Some(&progress(5, 20))),
+            Some(UploadProgress { sent: 5, total: 20 })
+        );
+        assert_eq!(
+            map_upload_progress(Some(&progress(0, 0))),
+            Some(UploadProgress { sent: 0, total: 0 })
+        );
+        for other in [
+            None,
+            Some(&EventSendState::NotSentYet { progress: None }),
+            Some(&failed),
+            Some(&sent),
+        ] {
+            assert_eq!(map_upload_progress(other), None);
+        }
+        // A progress state is still "sending".
+        assert_eq!(map_send_state(&progress(1, 2)), SendStatus::Sending);
     }
 
     fn uid(s: &str) -> matrix_sdk::ruma::OwnedUserId {
@@ -832,15 +1057,32 @@ mod tests {
     #[test]
     fn actions_table() {
         // (replyable, editable, own, remote, local)
-        let a = item_actions(true, true, true, true, false);
+        let a = item_actions(true, true, true, true, false, MediaInput::NotMedia);
         assert!(a.can_reply && a.can_edit && a.can_redact && a.can_react && a.can_copy);
-        let remote_other = item_actions(true, false, false, true, false);
+        let remote_other = item_actions(true, false, false, true, false, MediaInput::NotMedia);
         assert!(!remote_other.can_edit && remote_other.can_redact && remote_other.can_react);
-        let local = item_actions(false, true, true, false, true);
+        let local = item_actions(false, true, true, false, true, MediaInput::NotMedia);
         assert!(!local.can_reply && local.can_redact && local.can_react);
-        let neither = item_actions(false, false, false, false, false);
+        let neither = item_actions(false, false, false, false, false, MediaInput::NotMedia);
         assert!(!neither.can_redact && !neither.can_react);
         assert!(neither.can_copy);
+    }
+
+    #[test]
+    fn media_is_editable_only_with_a_caption() {
+        // (media, editable by the SDK, expected can_edit)
+        let table = [
+            (MediaInput::NotMedia, true, true),
+            (MediaInput::Captioned, true, true),
+            (MediaInput::Bare, true, false),
+            (MediaInput::Captioned, false, false),
+        ];
+        for (media, editable, expected) in table {
+            let a = item_actions(true, editable, true, true, false, media);
+            assert_eq!(a.can_edit, expected, "{media:?} editable={editable}");
+            // Reply, react, redact and copy do not depend on the caption.
+            assert!(a.can_reply && a.can_redact && a.can_react && a.can_copy);
+        }
     }
 
     #[test]

@@ -7,6 +7,7 @@
 
 use iced::theme::{Mode, Palette};
 use iced::{Color, Theme, color};
+use tessera_core::api::ThemeChoice;
 
 /// Palette of the light theme.
 pub const LIGHT: Palette = Palette {
@@ -86,6 +87,21 @@ pub fn theme_for(mode: Mode) -> Theme {
     }
 }
 
+/// The mode the window uses: the user's override, else the system's.
+pub fn resolve_mode(system: Mode, choice: ThemeChoice) -> Mode {
+    match choice {
+        ThemeChoice::System => system,
+        ThemeChoice::Light => Mode::Light,
+        ThemeChoice::Dark => Mode::Dark,
+    }
+}
+
+/// The theme for the system mode and the user's choice (plan Q17): an
+/// override wins over the system, `System` follows it.
+pub fn theme_for_choice(system: Mode, choice: ThemeChoice) -> Theme {
+    theme_for(resolve_mode(system, choice))
+}
+
 /// The semantic colours that go with `theme`.
 pub fn semantic(theme: &Theme) -> Semantic {
     if theme.extended_palette().is_dark {
@@ -145,6 +161,24 @@ fn luminance(color: Color) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_override_wins_over_the_system_mode() {
+        let modes = [Mode::Dark, Mode::Light, Mode::None];
+        for system in modes {
+            assert_eq!(
+                theme_for_choice(system, ThemeChoice::System).to_string(),
+                theme_for(system).to_string(),
+                "System follows the system ({system:?})"
+            );
+            let light = theme_for_choice(system, ThemeChoice::Light);
+            assert_eq!(light.to_string(), LIGHT_NAME, "{system:?}");
+            assert!(!light.extended_palette().is_dark);
+            let dark = theme_for_choice(system, ThemeChoice::Dark);
+            assert_eq!(dark.to_string(), DARK_NAME, "{system:?}");
+            assert!(dark.extended_palette().is_dark);
+        }
+    }
 
     #[test]
     fn theme_for_names_and_darkness() {

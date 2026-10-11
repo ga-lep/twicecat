@@ -10,15 +10,16 @@ use std::time::Duration;
 use futures_util::{Stream, StreamExt as _, pin_mut};
 use matrix_sdk::event_cache::PaginationStatus;
 use matrix_sdk::room::edit::EditedContent;
-use matrix_sdk::ruma::OwnedUserId;
 use matrix_sdk::ruma::api::client::receipt::create_receipt::v3::ReceiptType;
-use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
+use matrix_sdk::ruma::events::room::message::{MessageType, RoomMessageEventContent};
+use matrix_sdk::ruma::{OwnedEventId, OwnedUserId};
 use matrix_sdk::send_queue::SendHandle;
-use matrix_sdk::{Client, RoomMemberships, SessionChange};
+use matrix_sdk::{Client, Room, RoomMemberships, RoomState, SessionChange};
 use matrix_sdk_ui::eyeball_im::{Vector, VectorDiff};
 use matrix_sdk_ui::sync_service::SyncService;
 use matrix_sdk_ui::timeline::{
-    EventSendState, RoomExt as _, Timeline, TimelineItem as SdkTimelineItem,
+    EventSendState, MsgLikeKind, RoomExt as _, Timeline, TimelineFocus,
+    TimelineItem as SdkTimelineItem, TimelineItemContent,
 };
 use tokio::sync::{Notify, OnceCell, broadcast, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
@@ -27,9 +28,9 @@ use zeroize::Zeroizing;
 
 use crate::api::{
     ActionKind, AudioBackend, AudioDevice, AudioDeviceId, AudioDevices, AudioSettings,
-    CallEndReason, CallState, Command, CoreError, CoreEvent, DeviceId, Draft, ListDiff, Member,
-    MessageText, OutgoingMessage, PaginationState, Password, RoomId, RoomListQuery, TypingUser,
-    UserId,
+    CallEndReason, CallState, Command, CoreError, CoreEvent, DeviceId, Draft, ListDiff, MediaSize,
+    Member, MessageText, OutgoingAttachment, OutgoingMessage, PaginationState, Password, RoomId,
+    RoomListQuery, RoomNotificationModeView, TimelineItem, TypingUser, UserId,
 };
 use crate::audio_session::{AudioSession, Mode};
 use crate::avatars::{Avatars, SdkFetcher, answer_unavailable};
@@ -41,21 +42,27 @@ use crate::client::{
     ensure_homeserver_after_login, map_login_error, same_origin,
 };
 use crate::drafts;
+use crate::media::{self, MediaTasks};
+use crate::notifications::{self, NotificationTasks};
 use crate::oauth::authorize;
 use crate::outgoing::outgoing_content;
 use crate::paths::DataPaths;
-use crate::room_list::{Registered, build_filter, loaded_event, map_batch, map_diff};
+use crate::room_list::{Registered, filter_for, loaded_event, map_batch, map_diff};
+use crate::rooms::{self, RoomTasks};
 use crate::secrets::{SecretError, SecretStore};
 use crate::security::{self, SecurityTasks};
 use crate::session::{
     RECORD_VERSION, SessionAuth, SessionRecord, generate_session_id, generate_store_passphrase,
 };
+use crate::spaces::SpaceChildren;
 use crate::sync::{CancelTrigger, SdkTarget, SyncControl, SyncPause, cancel_pair, run_supervised};
+use crate::threads::{self, OpenThread, Route, route_item};
 use crate::timeline::{map_item, normalize_reaction_key, parse_room_id, rank_members};
+use crate::upload;
 use crate::verification::Target;
 
 /// Events loaded by one back-pagination.
-const PAGINATION_BATCH: u16 = 20;
+pub(crate) const PAGINATION_BATCH: u16 = 20;
 
 /// Most typing users reported at once (a hostile room could list thousands).
 const MAX_TYPING_USERS: usize = 16;
@@ -76,6 +83,9 @@ pub struct CoreConfig {
     pub homeserver_override: Option<String>,
     /// Page size of the room list (`DEFAULT_ROOM_LIST_PAGE_SIZE` is 500).
     pub room_list_page_size: usize,
+    /// Replaces the upload limit the server reports (tests). `None` uses the
+    /// server's.
+    pub max_upload_bytes_override: Option<u64>,
     /// Audio devices for calls and the mic test (`AudioBackend::System`
     /// unless testing).
     pub audio: AudioBackend,
@@ -157,22 +167,50 @@ struct Selected {
     members_synced: Arc<OnceCell<()>>,
     /// Set while a back-pagination of this room runs.
     paginating: Arc<AtomicBool>,
+    /// The open thread of this room, if any. It ends with the selection.
+    thread: Option<OpenThread>,
 }
 
 impl Selected {
     /// Ends the forwarder and the action tasks; the timeline is dropped with
     /// `self`, after the tasks that hold clones of it.
     async fn stop(mut self) {
+        if let Some(thread) = self.thread.take() {
+            thread.stop().await;
+        }
         self.task.abort();
         // An aborted task ends with a cancellation error; that is expected.
         let _ = self.task.await;
         self.tasks.shutdown().await;
     }
 
-    /// Runs `work` on the timeline in the action tasks. Its error, if any,
-    /// is reported as `ActionFailed`.
+    /// The timeline `target` names, or why there is none.
+    fn timeline_for(&self, target: TimelineTarget<'_>) -> Result<Arc<Timeline>, CoreError> {
+        match target {
+            TimelineTarget::Main => Ok(self.timeline.clone()),
+            TimelineTarget::Item(item_id) => match route_item(item_id) {
+                Route::Main => Ok(self.timeline.clone()),
+                // The ID names its thread: one of another (or a closed)
+                // thread is not found, never an item of the open one.
+                Route::Thread => self
+                    .thread
+                    .as_ref()
+                    .filter(|t| threads::item_in_thread(item_id, &t.root))
+                    .map(|t| t.timeline.clone())
+                    .ok_or(CoreError::ItemNotFound),
+            },
+            TimelineTarget::Thread(root) => match &self.thread {
+                Some(t) if t.root == *root => Ok(t.timeline.clone()),
+                _ => Err(CoreError::NotAllowed),
+            },
+        }
+    }
+
+    /// Runs `work` on `timeline` in the action tasks. Its error, if any, is
+    /// reported as `ActionFailed`.
     fn spawn_action<F, Fut>(
         &mut self,
+        timeline: Arc<Timeline>,
         action: ActionKind,
         events: &mpsc::Sender<CoreEvent>,
         work: F,
@@ -182,7 +220,7 @@ impl Selected {
     {
         // Forget finished tasks, so the set does not grow with every action.
         while self.tasks.try_join_next().is_some() {}
-        let fut = work(self.timeline.clone());
+        let fut = work(timeline);
         let events = events.clone();
         let room_id = self.room_id.clone();
         self.tasks.spawn(async move {
@@ -199,6 +237,17 @@ impl Selected {
     }
 }
 
+/// Which of the selected room's timelines a command acts on.
+#[derive(Clone, Copy)]
+enum TimelineTarget<'a> {
+    /// The room's live timeline.
+    Main,
+    /// The timeline the item ID belongs to (see `route_item`).
+    Item(&'a str),
+    /// The open thread, which must be the one rooted at this event.
+    Thread(&'a matrix_sdk::ruma::EventId),
+}
+
 struct Active {
     client: Client,
     record: SessionRecord,
@@ -210,6 +259,13 @@ struct Active {
     fetcher: Arc<SdkFetcher>,
     /// The status forwarder and the network actions of the encryption API.
     security: SecurityTasks,
+    /// Media fetches and saves, and the upload limit request.
+    media: MediaTasks,
+    /// The notification handler, settings and unread totals; `None` until
+    /// the session has started them.
+    notifications: Option<NotificationTasks>,
+    /// Room, member and profile requests, and the session's spaces.
+    rooms: RoomTasks,
 }
 
 impl Active {
@@ -223,7 +279,12 @@ impl Active {
         }
         // The security tasks hold clones of the client too, and go first.
         self.security.stop().await;
+        if let Some(mut notifications) = self.notifications.take() {
+            notifications.stop().await;
+        }
+        self.rooms.stop().await;
         // Fetch tasks hold clones of the client, so they go next.
+        self.media.stop().await;
         self.avatars.stop().await;
         if let Some(selected) = self.selected.take() {
             selected.stop().await;
@@ -318,6 +379,7 @@ async fn forward_room_list(
     service: Arc<SyncService>,
     page_size: usize,
     mut query: watch::Receiver<RoomListQuery>,
+    mut spaces: watch::Receiver<SpaceChildren>,
     mut more: mpsc::Receiver<()>,
     events: mpsc::Sender<CoreEvent>,
 ) {
@@ -333,9 +395,10 @@ async fn forward_room_list(
     let (stream, controller) = room_list.entries_with_dynamic_adapters(page_size.max(1));
     // The stream yields nothing until a filter is set. `borrow_and_update`
     // marks this value seen, so only later queries wake the loop below.
-    let first = build_filter(&query.borrow_and_update());
+    let first = filter_for(&query.borrow_and_update(), &spaces.borrow_and_update());
     controller.set_filter(first);
     let mut query_open = true;
+    let mut spaces_open = true;
     let mut more_open = true;
     pin_mut!(stream);
     // Rooms registered for latest events live and die with this task, so the
@@ -353,9 +416,20 @@ async fn forward_room_list(
                     query_open = false;
                     continue;
                 }
-                let filter = build_filter(&query.borrow_and_update());
+                let filter = filter_for(&query.borrow_and_update(), &spaces.borrow());
                 controller.set_filter(filter);
                 controller.reset_to_one_page();
+                continue;
+            }
+            // A space gained or lost rooms: only a query inside a space is
+            // affected, and it keeps its pages.
+            changed = spaces.changed(), if spaces_open => {
+                if changed.is_err() {
+                    spaces_open = false;
+                } else if query.borrow().space.is_some() {
+                    let filter = filter_for(&query.borrow(), &spaces.borrow_and_update());
+                    controller.set_filter(filter);
+                }
                 continue;
             }
             request = more.recv(), if more_open => {
@@ -386,30 +460,25 @@ async fn forward_room_list(
 /// Forwards the initial timeline items as one `Reset`, then the room's stored
 /// draft (after the items, so a reply draft can find its message), then every
 /// diff batch.
-async fn forward_timeline(
-    room_id: RoomId,
+///
+/// `wrap` makes the event for a batch of diffs (the room's `TimelineDiff` or
+/// the open thread's `ThreadDiff`); `after_first` follows the first batch.
+pub(crate) async fn forward_timeline(
     items: Vector<Arc<SdkTimelineItem>>,
     stream: impl Stream<Item = Vec<VectorDiff<Arc<SdkTimelineItem>>>>,
     events: mpsc::Sender<CoreEvent>,
     own: Option<OwnedUserId>,
-    draft: Option<Draft>,
+    wrap: impl Fn(Vec<ListDiff<TimelineItem>>) -> CoreEvent,
+    after_first: Vec<CoreEvent>,
 ) {
     let initial = ListDiff::Reset {
         values: items.iter().map(|i| map_item(i, own.as_deref())).collect(),
     };
-    let first = CoreEvent::TimelineDiff {
-        room_id: room_id.clone(),
-        diffs: vec![initial],
-    };
-    if events.send(first).await.is_err() {
+    if events.send(wrap(vec![initial])).await.is_err() {
         return;
     }
-    if let Some(draft) = draft {
-        let loaded = CoreEvent::DraftLoaded {
-            room_id: room_id.clone(),
-            draft,
-        };
-        if events.send(loaded).await.is_err() {
+    for event in after_first {
+        if events.send(event).await.is_err() {
             return;
         }
     }
@@ -419,11 +488,7 @@ async fn forward_timeline(
             .into_iter()
             .map(|d| map_diff(d, |item| map_item(&item, own.as_deref())))
             .collect();
-        let event = CoreEvent::TimelineDiff {
-            room_id: room_id.clone(),
-            diffs,
-        };
-        if events.send(event).await.is_err() {
+        if events.send(wrap(diffs)).await.is_err() {
             return;
         }
     }
@@ -729,11 +794,11 @@ async fn discard_task(timeline: Arc<Timeline>, item_id: String) -> Result<(), Co
 
 /// Marks a back-pagination as running; at most one runs per selection.
 /// Dropping the permit frees the slot.
-struct PaginationPermit(Arc<AtomicBool>);
+pub(crate) struct PaginationPermit(Arc<AtomicBool>);
 
 impl PaginationPermit {
     /// Takes the slot, or `None` while another pagination holds it.
-    fn try_acquire(flag: &Arc<AtomicBool>) -> Option<Self> {
+    pub(crate) fn try_acquire(flag: &Arc<AtomicBool>) -> Option<Self> {
         flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .ok()
             .map(|_| Self(flag.clone()))
@@ -872,6 +937,40 @@ async fn forward_typing(room_id: RoomId, timeline: Arc<Timeline>, events: mpsc::
     }
 }
 
+/// Parses an event ID; a malformed one is refused.
+fn parse_event_id(id: &crate::api::EventId) -> Result<OwnedEventId, CoreError> {
+    OwnedEventId::try_from(id.as_str()).map_err(|_| CoreError::NotAllowed)
+}
+
+/// Parses a user ID; a malformed one is refused.
+fn parse_user_id(id: &str) -> Result<OwnedUserId, CoreError> {
+    OwnedUserId::try_from(id).map_err(|_| CoreError::NotAllowed)
+}
+
+/// A room the account knows, in one of `states`; `NotAllowed` in any other.
+fn room_in(client: &Client, id: &RoomId, states: &[RoomState]) -> Result<Room, CoreError> {
+    let room = client
+        .get_room(&parse_room_id(id)?)
+        .ok_or_else(|| CoreError::UnknownRoom(id.clone()))?;
+    if states.contains(&room.state()) {
+        Ok(room)
+    } else {
+        Err(CoreError::NotAllowed)
+    }
+}
+
+fn joined_room(client: &Client, id: &RoomId) -> Result<Room, CoreError> {
+    room_in(client, id, &[RoomState::Joined])
+}
+
+fn invited_room(client: &Client, id: &RoomId) -> Result<Room, CoreError> {
+    room_in(client, id, &[RoomState::Invited])
+}
+
+fn leavable_room(client: &Client, id: &RoomId) -> Result<Room, CoreError> {
+    room_in(client, id, &[RoomState::Joined, RoomState::Invited])
+}
+
 impl Engine {
     async fn run(mut self, mut commands: mpsc::Receiver<Command>) {
         let mut watch_changes = true;
@@ -925,7 +1024,7 @@ impl Engine {
                 match self.login_password(&username, &password, server).await {
                     Ok(event) => {
                         self.emit(event).await;
-                        self.start_security();
+                        self.start_security().await;
                         self.start_sync().await;
                     }
                     Err(e) => self.emit(CoreEvent::LoginFailed(e)).await,
@@ -985,27 +1084,43 @@ impl Engine {
             },
             Command::Send(message) => {
                 let room_id = message.room_id.clone();
-                self.run_action(room_id, ActionKind::Send, |timeline| {
+                // A threaded message goes through the thread's timeline,
+                // which adds the relation.
+                let root = match message.thread_root.as_ref().map(parse_event_id) {
+                    None => None,
+                    Some(Ok(root)) => Some(root),
+                    Some(Err(error)) => {
+                        self.fail(room_id, ActionKind::Send, error).await;
+                        return;
+                    }
+                };
+                let target = root
+                    .as_deref()
+                    .map_or(TimelineTarget::Main, TimelineTarget::Thread);
+                self.run_action_on(room_id, ActionKind::Send, target, |timeline| {
                     send_task(timeline, message)
                 })
                 .await;
             }
             Command::RetrySend { room_id, item_id } => {
-                self.run_action(room_id, ActionKind::Retry, |timeline| {
-                    retry_task(timeline, item_id)
+                let target = TimelineTarget::Item(&item_id);
+                self.run_action_on(room_id, ActionKind::Retry, target, |timeline| {
+                    retry_task(timeline, item_id.clone())
                 })
                 .await;
             }
             Command::DiscardSend { room_id, item_id } => {
-                self.run_action(room_id, ActionKind::Discard, |timeline| {
-                    discard_task(timeline, item_id)
+                let target = TimelineTarget::Item(&item_id);
+                self.run_action_on(room_id, ActionKind::Discard, target, |timeline| {
+                    discard_task(timeline, item_id.clone())
                 })
                 .await;
             }
             Command::Edit { item_id, message } => {
                 let room_id = message.room_id.clone();
-                self.run_action(room_id, ActionKind::Edit, |timeline| {
-                    edit_task(timeline, item_id, message)
+                let target = TimelineTarget::Item(&item_id);
+                self.run_action_on(room_id, ActionKind::Edit, target, |timeline| {
+                    edit_task(timeline, item_id.clone(), message)
                 })
                 .await;
             }
@@ -1014,8 +1129,9 @@ impl Engine {
                 item_id,
                 reason,
             } => {
-                self.run_action(room_id, ActionKind::Redact, |timeline| {
-                    redact_task(timeline, item_id, reason)
+                let target = TimelineTarget::Item(&item_id);
+                self.run_action_on(room_id, ActionKind::Redact, target, |timeline| {
+                    redact_task(timeline, item_id.clone(), reason)
                 })
                 .await;
             }
@@ -1024,8 +1140,9 @@ impl Engine {
                 item_id,
                 key,
             } => {
-                self.run_action(room_id, ActionKind::React, |timeline| {
-                    react_task(timeline, item_id, key)
+                let target = TimelineTarget::Item(&item_id);
+                self.run_action_on(room_id, ActionKind::React, target, |timeline| {
+                    react_task(timeline, item_id.clone(), key)
                 })
                 .await;
             }
@@ -1278,8 +1395,237 @@ impl Engine {
                     session.push_to_talk(pressed);
                 }
             }
+            Command::FetchMedia {
+                room_id,
+                item_id,
+                size,
+            } => self.fetch_media(room_id, item_id, size).await,
+            Command::SaveMedia {
+                room_id,
+                item_id,
+                path,
+            } => self.save_media(room_id, item_id, path).await,
+            Command::SendAttachment(attachment) => self.send_attachment(attachment).await,
+            Command::SetRoomNotificationMode { room_id, mode } => {
+                self.set_room_notification_mode(room_id, mode).await;
+            }
+            Command::SetDefaultNotificationMode { one_to_one, mode } => {
+                self.notification_job(
+                    RoomId::from(""),
+                    Ok(notifications::Job::DefaultMode { one_to_one, mode }),
+                )
+                .await;
+            }
+            Command::AddKeyword { keyword } => {
+                self.notification_job(
+                    RoomId::from(""),
+                    Ok(notifications::Job::AddKeyword(keyword)),
+                )
+                .await;
+            }
+            Command::RemoveKeyword { keyword } => {
+                self.notification_job(
+                    RoomId::from(""),
+                    Ok(notifications::Job::RemoveKeyword(keyword)),
+                )
+                .await;
+            }
             // Handled in `run`.
             Command::Shutdown => {}
+            Command::CreateRoom(request) => {
+                self.room_job(RoomId::from(""), ActionKind::Rooms, |_| {
+                    let request = rooms::create_room_request(&request)?;
+                    Ok(rooms::Job::Create(Box::new(request)))
+                })
+                .await;
+            }
+            Command::CreateDm { user_id } => {
+                self.room_job(RoomId::from(""), ActionKind::Rooms, |client| {
+                    let user = parse_user_id(user_id.as_str())?;
+                    // A chat with oneself is not a DM.
+                    if client.user_id() == Some(&user) {
+                        return Err(CoreError::NotAllowed);
+                    }
+                    Ok(rooms::Job::Dm(user))
+                })
+                .await;
+            }
+            Command::JoinRoom { target, via } => {
+                self.room_job(RoomId::from(""), ActionKind::Rooms, |_| {
+                    let mut target =
+                        rooms::parse_room_target(&target).ok_or(CoreError::NotAllowed)?;
+                    target.via = rooms::merge_via(std::mem::take(&mut target.via), &via);
+                    Ok(rooms::Job::Join(target))
+                })
+                .await;
+            }
+            Command::AcceptInvite { room_id } => {
+                self.room_job(room_id.clone(), ActionKind::Rooms, |client| {
+                    Ok(rooms::Job::Accept(invited_room(client, &room_id)?))
+                })
+                .await;
+            }
+            Command::DeclineInvite { room_id } => {
+                self.room_job(room_id.clone(), ActionKind::Rooms, |client| {
+                    Ok(rooms::Job::Decline(invited_room(client, &room_id)?))
+                })
+                .await;
+            }
+            Command::InviteUser { room_id, user_id } => {
+                self.room_job(room_id.clone(), ActionKind::Rooms, |client| {
+                    let user = parse_user_id(user_id.as_str())?;
+                    Ok(rooms::Job::Invite(joined_room(client, &room_id)?, user))
+                })
+                .await;
+            }
+            Command::LeaveRoom { room_id } => self.leave_room(room_id).await,
+            Command::OpenRoomDetails { room_id } => self.open_room_details(room_id).await,
+            Command::SetRoomName { room_id, name } => {
+                self.room_job(room_id.clone(), ActionKind::Rooms, |client| {
+                    let name = rooms::clean_name(&name)?;
+                    Ok(rooms::Job::Name(joined_room(client, &room_id)?, name))
+                })
+                .await;
+            }
+            Command::SetRoomTopic { room_id, topic } => {
+                self.room_job(room_id.clone(), ActionKind::Rooms, |client| {
+                    let topic = match topic {
+                        Some(topic) => rooms::clean_topic(&topic)?,
+                        None => None,
+                    };
+                    Ok(rooms::Job::Topic(
+                        joined_room(client, &room_id)?,
+                        topic.unwrap_or_default(),
+                    ))
+                })
+                .await;
+            }
+            Command::SetRoomAvatar {
+                room_id,
+                data,
+                mimetype,
+            } => {
+                self.room_job(room_id.clone(), ActionKind::Rooms, |client| {
+                    let mime = rooms::check_image(data.as_bytes(), &mimetype)?;
+                    Ok(rooms::Job::RoomAvatar(
+                        joined_room(client, &room_id)?,
+                        mime,
+                        data.as_bytes().to_vec(),
+                    ))
+                })
+                .await;
+            }
+            Command::EnableRoomEncryption { room_id } => {
+                self.room_job(room_id.clone(), ActionKind::Rooms, |client| {
+                    Ok(rooms::Job::Encrypt(joined_room(client, &room_id)?))
+                })
+                .await;
+            }
+            Command::ListRoomMembers { room_id } => {
+                self.room_job(room_id.clone(), ActionKind::Rooms, |client| {
+                    Ok(rooms::Job::Members(joined_room(client, &room_id)?))
+                })
+                .await;
+            }
+            Command::SetDisplayName { name } => {
+                self.room_job(RoomId::from(""), ActionKind::Profile, |_| {
+                    Ok(rooms::Job::DisplayName(rooms::clean_name(&name)?))
+                })
+                .await;
+            }
+            Command::SetAvatar { data, mimetype } => {
+                self.room_job(RoomId::from(""), ActionKind::Profile, |_| {
+                    let mime = rooms::check_image(data.as_bytes(), &mimetype)?;
+                    Ok(rooms::Job::OwnAvatar(mime, data.as_bytes().to_vec()))
+                })
+                .await;
+            }
+            Command::RemoveAvatar => {
+                self.room_job(RoomId::from(""), ActionKind::Profile, |_| {
+                    Ok(rooms::Job::RemoveOwnAvatar)
+                })
+                .await;
+            }
+            Command::OpenThread { room_id, root } => self.open_thread(room_id, root).await,
+            Command::CloseThread => self.close_thread().await,
+            Command::PaginateThread { room_id, root } => {
+                self.paginate_thread(room_id, root).await;
+            }
+        }
+    }
+
+    /// Runs a room or profile request in the background, or answers why it
+    /// can't be. `make` checks the input and finds the rooms, in that order.
+    /// Says whether the job was queued.
+    async fn room_job(
+        &mut self,
+        room_id: RoomId,
+        action: ActionKind,
+        make: impl FnOnce(&Client) -> Result<rooms::Job, CoreError>,
+    ) -> bool {
+        let result = match self.active.as_mut() {
+            None => Err(CoreError::NotLoggedIn),
+            Some(active) => make(&active.client).and_then(|job| {
+                active
+                    .rooms
+                    .submit(&active.client, &self.events, room_id.clone(), action, job)
+            }),
+        };
+        match result {
+            Ok(()) => true,
+            Err(error) => {
+                self.emit(CoreEvent::ActionFailed {
+                    room_id,
+                    action,
+                    error,
+                })
+                .await;
+                false
+            }
+        }
+    }
+
+    /// Leaves a room, closing its timeline when it is the open one. A leave
+    /// that is refused keeps the timeline open.
+    async fn leave_room(&mut self, room_id: RoomId) {
+        let queued = self
+            .room_job(room_id.clone(), ActionKind::Rooms, |client| {
+                Ok(rooms::Job::Leave(leavable_room(client, &room_id)?))
+            })
+            .await;
+        if queued
+            && let Some(active) = self.active.as_mut()
+            && active
+                .selected
+                .as_ref()
+                .is_some_and(|s| s.room_id == room_id)
+            && let Some(selected) = active.selected.take()
+        {
+            selected.stop().await;
+        }
+    }
+
+    /// Starts reporting a room's settings, in place of the last room's.
+    async fn open_room_details(&mut self, room_id: RoomId) {
+        let result = match self.active.as_mut() {
+            None => Err(CoreError::NotLoggedIn),
+            Some(active) => joined_room(&active.client, &room_id).and_then(|room| {
+                let own = active
+                    .client
+                    .user_id()
+                    .map(ToOwned::to_owned)
+                    .ok_or(CoreError::NotLoggedIn)?;
+                active.rooms.open_details(room, own, &self.events);
+                Ok(())
+            }),
+        };
+        if let Err(error) = result {
+            self.emit(CoreEvent::ActionFailed {
+                room_id,
+                action: ActionKind::Rooms,
+                error,
+            })
+            .await;
         }
     }
 
@@ -1612,6 +1958,26 @@ impl Engine {
         }
     }
 
+    /// Queues a notification settings change, or answers why it can't be.
+    async fn notification_job(&self, room_id: RoomId, job: Result<notifications::Job, CoreError>) {
+        let result = match (&self.active, job) {
+            (None, _) => Err(CoreError::NotLoggedIn),
+            (_, Err(e)) => Err(e),
+            (Some(active), Ok(job)) => match &active.notifications {
+                Some(tasks) => tasks.submit(job),
+                None => Err(CoreError::Internal("notifications have not started".into())),
+            },
+        };
+        if let Err(error) = result {
+            self.emit(CoreEvent::ActionFailed {
+                room_id,
+                action: ActionKind::Notifications,
+                error,
+            })
+            .await;
+        }
+    }
+
     /// Opens the microphone (and, with `loopback`, the speakers) and starts
     /// reporting levels; replaces a running mic test.
     async fn start_mic_test(&mut self, loopback: bool) {
@@ -1633,6 +1999,25 @@ impl Engine {
         }
     }
 
+    async fn set_room_notification_mode(
+        &self,
+        room_id: RoomId,
+        mode: Option<RoomNotificationModeView>,
+    ) {
+        let job = parse_room_id(&room_id).and_then(|room| {
+            let known = self
+                .active
+                .as_ref()
+                .is_none_or(|active| active.client.get_room(&room).is_some());
+            if known {
+                Ok(notifications::Job::RoomMode { room, mode })
+            } else {
+                Err(CoreError::UnknownRoom(room_id.clone()))
+            }
+        });
+        self.notification_job(room_id, job).await;
+    }
+
     /// Answers a Phase 4 action sent without a session. These actions belong
     /// to no room, so `room_id` is empty.
     async fn not_logged_in(&self, action: ActionKind) {
@@ -1645,10 +2030,188 @@ impl Engine {
     }
 
     /// Starts the security status forwarder of the new session.
-    fn start_security(&mut self) {
+    async fn start_security(&mut self) {
         if let Some(active) = self.active.as_mut() {
+            // Before the sync starts, so that no notification is missed.
+            active.notifications =
+                Some(NotificationTasks::start(&active.client, &self.events).await);
             active.security.start(&active.client, &self.events);
+            active.rooms.start(&active.client, &self.events);
+            active.media.send_limits(&active.client, &self.events);
+            // Local echoes of uploads carry progress.
+            active.client.send_queue().enable_upload_progress(true);
         }
+    }
+
+    /// The message type of a media item of the selected room, and whether the
+    /// item is a local echo.
+    async fn media_item(
+        &self,
+        room_id: &RoomId,
+        item_id: &str,
+    ) -> Result<(MessageType, bool), CoreError> {
+        let active = self.active.as_ref().ok_or(CoreError::NotLoggedIn)?;
+        let selected = active
+            .selected
+            .as_ref()
+            .filter(|s| s.room_id == *room_id)
+            .ok_or(CoreError::NoRoomSelected)?;
+        let timeline = selected.timeline_for(TimelineTarget::Item(item_id))?;
+        let item = find_item(&timeline, item_id).await?;
+        let event = item.as_event().ok_or(CoreError::NotAllowed)?;
+        match event.content() {
+            TimelineItemContent::MsgLike(content) => match &content.kind {
+                MsgLikeKind::Message(message) if media::map_media(message.msgtype()).is_some() => {
+                    Ok((message.msgtype().clone(), event.is_local_echo()))
+                }
+                _ => Err(CoreError::NotAllowed),
+            },
+            _ => Err(CoreError::NotAllowed),
+        }
+    }
+
+    /// Answers `FetchMedia` with `Media`. Network work runs in the media
+    /// tasks, so `handle` never waits on it.
+    async fn fetch_media(&mut self, room_id: RoomId, item_id: String, size: MediaSize) {
+        let found = self.media_item(&room_id, &item_id).await;
+        let events = self.events.clone();
+        let result = match (found, self.active.as_mut()) {
+            (Ok((msgtype, local_echo)), Some(active)) => {
+                let fetcher = media::SdkContentFetcher(active.client.clone());
+                let permits = active.media.permits.clone();
+                let deadline = match size {
+                    MediaSize::Thumbnail => media::THUMBNAIL_DEADLINE,
+                    MediaSize::Full => media::FULL_DEADLINE,
+                };
+                let (room, item) = (room_id.clone(), item_id.clone());
+                let out = events.clone();
+                let queued = active.media.spawn(async move {
+                    let result = media::fetch_media(
+                        &fetcher, &msgtype, size, local_echo, &permits, deadline,
+                    )
+                    .await;
+                    let _ = out
+                        .send(CoreEvent::Media {
+                            room_id: room,
+                            item_id: item,
+                            size,
+                            result,
+                        })
+                        .await;
+                });
+                if queued {
+                    return;
+                }
+                Err(CoreError::Busy)
+            }
+            (Err(e), _) => Err(e),
+            (Ok(_), None) => Err(CoreError::NotLoggedIn),
+        };
+        self.emit(CoreEvent::Media {
+            room_id,
+            item_id,
+            size,
+            result,
+        })
+        .await;
+    }
+
+    /// Queues a file as a media message. Anything refused here sends nothing
+    /// (no request, no local echo); later failures arrive as `ActionFailed`.
+    async fn send_attachment(&mut self, attachment: OutgoingAttachment) {
+        let room_id = attachment.room_id.clone();
+        let result = self.try_queue_attachment(attachment);
+        if let Err(error) = result {
+            self.emit(CoreEvent::ActionFailed {
+                room_id,
+                action: ActionKind::Upload,
+                error,
+            })
+            .await;
+        }
+    }
+
+    fn try_queue_attachment(&mut self, attachment: OutgoingAttachment) -> Result<(), CoreError> {
+        let limit = self.config.max_upload_bytes_override;
+        let active = self.active.as_mut().ok_or(CoreError::NotLoggedIn)?;
+        let mime = upload::validate(&attachment)?;
+        // Only a joined room takes a file.
+        let joined = parse_room_id(&attachment.room_id)
+            .ok()
+            .and_then(|id| active.client.get_room(&id))
+            .is_some_and(|room| room.state() == RoomState::Joined);
+        if !joined {
+            return Err(CoreError::NotAllowed);
+        }
+        // The local echo appears in the selected room's timeline, or in the
+        // open thread's when the attachment names a thread root (the thread
+        // timeline adds the relation).
+        let selected = active
+            .selected
+            .as_ref()
+            .filter(|s| s.room_id == attachment.room_id)
+            .ok_or(CoreError::NoRoomSelected)?;
+        let timeline = match attachment.thread_root.as_ref().map(parse_event_id) {
+            None => selected.timeline_for(TimelineTarget::Main)?,
+            Some(root) => selected.timeline_for(TimelineTarget::Thread(&root?))?,
+        };
+        let job = upload::Job {
+            timeline,
+            attachment,
+            mime,
+        };
+        active
+            .media
+            .queue_upload(&active.client, &self.events, limit, job)
+    }
+
+    /// Answers `SaveMedia` with `MediaSaved` or `ActionFailed { Media, .. }`.
+    async fn save_media(&mut self, room_id: RoomId, item_id: String, path: std::path::PathBuf) {
+        let error = match self.media_item(&room_id, &item_id).await {
+            Ok((msgtype, local_echo)) => match self.active.as_mut() {
+                Some(active) => {
+                    let fetcher = media::SdkContentFetcher(active.client.clone());
+                    let permits = active.media.permits.clone();
+                    let out = self.events.clone();
+                    let (room, item) = (room_id.clone(), item_id.clone());
+                    let queued = active.media.spawn(async move {
+                        let saved = media::save_media(
+                            &fetcher,
+                            &msgtype,
+                            local_echo,
+                            &permits,
+                            media::FULL_DEADLINE,
+                            path,
+                        )
+                        .await;
+                        let event = match saved {
+                            Ok(()) => CoreEvent::MediaSaved {
+                                room_id: room,
+                                item_id: item,
+                            },
+                            Err(error) => CoreEvent::ActionFailed {
+                                room_id: room,
+                                action: ActionKind::Media,
+                                error,
+                            },
+                        };
+                        let _ = out.send(event).await;
+                    });
+                    if queued {
+                        return;
+                    }
+                    CoreError::Busy
+                }
+                None => CoreError::NotLoggedIn,
+            },
+            Err(e) => e,
+        };
+        self.emit(CoreEvent::ActionFailed {
+            room_id,
+            action: ActionKind::Media,
+            error,
+        })
+        .await;
     }
 
     /// Why a new login cannot start now, if so.
@@ -1741,7 +2304,7 @@ impl Engine {
             Ok((active, event)) => {
                 self.active = Some(active);
                 self.emit(event).await;
-                self.start_security();
+                self.start_security().await;
                 self.start_sync().await;
             }
             Err(e) => {
@@ -1826,8 +2389,14 @@ impl Engine {
         if let Some(previous) = active.selected.take() {
             previous.stop().await;
         }
+        // Threaded replies belong to their thread's timeline (Q16); the
+        // builder from `RoomExt` keeps the read receipt tracking.
         let timeline = room
-            .timeline()
+            .timeline_builder()
+            .with_focus(TimelineFocus::Live {
+                hide_threaded_events: true,
+            })
+            .build()
             .await
             .map_err(|_| CoreError::Internal("could not open the room timeline".into()))?;
         // Typing and receipts of the open room arrive through sliding sync
@@ -1846,13 +2415,25 @@ impl Engine {
             .flatten()
             .and_then(drafts::from_sdk);
         let (items, stream) = timeline.subscribe().await;
+        let wrap_room = room_id.clone();
         let task = tokio::spawn(forward_timeline(
-            room_id.clone(),
             items,
             stream,
             self.events.clone(),
             active.client.user_id().map(ToOwned::to_owned),
-            draft,
+            move |diffs| CoreEvent::TimelineDiff {
+                room_id: wrap_room.clone(),
+                diffs,
+            },
+            // The draft follows the items, so a reply draft can find its
+            // message.
+            draft
+                .map(|draft| CoreEvent::DraftLoaded {
+                    room_id: room_id.clone(),
+                    draft,
+                })
+                .into_iter()
+                .collect(),
         ));
         let timeline = Arc::new(timeline);
         // Both forwarders live in the action set, so they end with the
@@ -1875,6 +2456,7 @@ impl Engine {
             tasks,
             members_synced: Arc::new(OnceCell::new()),
             paginating: Arc::new(AtomicBool::new(false)),
+            thread: None,
         });
         // A DM with exactly one other user shows that user's trust (Q10).
         if let Some(peer) = security::dm_peer_of(&room, active.client.user_id()) {
@@ -1895,23 +2477,121 @@ impl Engine {
         F: FnOnce(Arc<Timeline>) -> Fut,
         Fut: std::future::Future<Output = Result<(), CoreError>> + Send + 'static,
     {
+        self.run_action_on(room_id, action, TimelineTarget::Main, work)
+            .await;
+    }
+
+    /// Like [`Self::run_action`] on the timeline `target` names: the room's,
+    /// or the open thread's. A target that is not there (no open thread, or
+    /// another one) fails the action.
+    async fn run_action_on<F, Fut>(
+        &mut self,
+        room_id: RoomId,
+        action: ActionKind,
+        target: TimelineTarget<'_>,
+        work: F,
+    ) where
+        F: FnOnce(Arc<Timeline>) -> Fut,
+        Fut: std::future::Future<Output = Result<(), CoreError>> + Send + 'static,
+    {
         let events = self.events.clone();
         let error = match self.active.as_mut() {
             None => CoreError::NotLoggedIn,
             Some(active) => match active.selected.as_mut().filter(|s| s.room_id == room_id) {
-                Some(selected) => {
-                    selected.spawn_action(action, &events, work);
-                    return;
-                }
+                Some(selected) => match selected.timeline_for(target) {
+                    Ok(timeline) => {
+                        selected.spawn_action(timeline, action, &events, work);
+                        return;
+                    }
+                    Err(error) => error,
+                },
                 None => CoreError::NoRoomSelected,
             },
         };
+        self.fail(room_id, action, error).await;
+    }
+
+    /// Answers a command with `ActionFailed`.
+    async fn fail(&self, room_id: RoomId, action: ActionKind, error: CoreError) {
         self.emit(CoreEvent::ActionFailed {
             room_id,
             action,
             error,
         })
         .await;
+    }
+
+    /// Opens the thread rooted at `root` in the selected room, closing the
+    /// open one. The thread's items arrive as `ThreadDiff`s.
+    async fn open_thread(&mut self, room_id: RoomId, root: crate::api::EventId) {
+        let result = match self.active.as_mut() {
+            None => Err(CoreError::NotLoggedIn),
+            Some(active) => {
+                let own = active.client.user_id().map(ToOwned::to_owned);
+                match active.selected.as_mut().filter(|s| s.room_id == room_id) {
+                    None => Err(CoreError::NoRoomSelected),
+                    Some(selected) => match parse_event_id(&root) {
+                        Err(error) => Err(error),
+                        Ok(id) => {
+                            if let Some(old) = selected.thread.take() {
+                                old.stop().await;
+                            }
+                            let room = selected.timeline.room().clone();
+                            threads::open(&room, &room_id, id, own, &self.events)
+                                .await
+                                .map(|thread| selected.thread = Some(thread))
+                        }
+                    },
+                }
+            }
+        };
+        match result {
+            // A new thread timeline is empty until it paginates once: the
+            // root and the replies the sync did not bring come from there.
+            Ok(()) => self.paginate_thread(room_id, root).await,
+            Err(error) => self.fail(room_id, ActionKind::Thread, error).await,
+        }
+    }
+
+    /// Closes the open thread, if any.
+    async fn close_thread(&mut self) {
+        let Some(active) = self.active.as_mut() else {
+            return self
+                .fail(RoomId::from(""), ActionKind::Thread, CoreError::NotLoggedIn)
+                .await;
+        };
+        if let Some(thread) = active.selected.as_mut().and_then(|s| s.thread.take()) {
+            thread.stop().await;
+        }
+    }
+
+    /// Loads older events of the open thread.
+    async fn paginate_thread(&mut self, room_id: RoomId, root: crate::api::EventId) {
+        let parsed = parse_event_id(&root);
+        let events = self.events.clone();
+        let (room, event) = (room_id.clone(), root.clone());
+        let (flag, cancelled) = self
+            .active
+            .as_ref()
+            .and_then(|a| a.selected.as_ref())
+            .and_then(|s| s.thread.as_ref())
+            .map(|t| (t.paginating.clone(), t.cancelled()))
+            .unwrap_or_else(|| (Arc::default(), tokio::sync::watch::channel(false).1));
+        // Without an open thread the action below fails before it runs.
+        match parsed {
+            Ok(id) => {
+                self.run_action_on(
+                    room_id,
+                    ActionKind::Thread,
+                    TimelineTarget::Thread(&id),
+                    |timeline| {
+                        threads::paginate_task(timeline, flag, events, room, event, cancelled)
+                    },
+                )
+                .await;
+            }
+            Err(error) => self.fail(room_id, ActionKind::Thread, error).await,
+        }
     }
 
     /// Sends a text message to the selected room.
@@ -2050,6 +2730,9 @@ impl Engine {
                         selected: None,
                         avatars: Avatars::new(),
                         security: SecurityTasks::new(),
+                        media: MediaTasks::new(),
+                        notifications: None,
+                        rooms: RoomTasks::new(),
                     },
                     event,
                 ))
@@ -2160,7 +2843,7 @@ impl Engine {
             Ok(Some((active, event))) => {
                 self.active = Some(active);
                 self.emit(event).await;
-                self.start_security();
+                self.start_security().await;
                 self.start_sync().await;
             }
             Ok(None) => self.emit(CoreEvent::NoSession).await,
@@ -2228,6 +2911,9 @@ impl Engine {
                 selected: None,
                 avatars: Avatars::new(),
                 security: SecurityTasks::new(),
+                media: MediaTasks::new(),
+                notifications: None,
+                rooms: RoomTasks::new(),
             },
             event,
         )))
@@ -2264,6 +2950,7 @@ impl Engine {
             service.clone(),
             self.config.room_list_page_size,
             self.room_list_query.subscribe(),
+            active.rooms.subscribe_children(),
             more_rx,
             self.events.clone(),
         ));
@@ -2368,6 +3055,7 @@ mod tests {
                 data: DataPaths::at(std::env::temp_dir().join("tessera-unused")),
                 homeserver_override: None,
                 room_list_page_size: DEFAULT_ROOM_LIST_PAGE_SIZE,
+                max_upload_bytes_override: None,
                 audio: AudioBackend::default(),
                 call_service_override: None,
             },
@@ -2462,6 +3150,7 @@ mod tests {
                 data: DataPaths::at(dir),
                 homeserver_override: None,
                 room_list_page_size: DEFAULT_ROOM_LIST_PAGE_SIZE,
+                max_upload_bytes_override: None,
                 audio: AudioBackend::default(),
                 call_service_override: None,
             },
@@ -2558,6 +3247,7 @@ mod tests {
         let mut watcher = engine.room_list_query.subscribe();
         assert_eq!(*watcher.borrow_and_update(), RoomListQuery::default());
         let query = RoomListQuery {
+            space: None,
             tab: RoomListTab::Spaces,
             search: "x".into(),
         };
@@ -2610,6 +3300,7 @@ mod tests {
             reply_to: None,
             kind: MessageKind::Text,
             format: TextFormat::Markdown,
+            thread_root: None,
         };
         let item_id = || "i".to_owned();
         vec![
@@ -2855,6 +3546,9 @@ mod tests {
             selected: None,
             avatars: Avatars::new(),
             security: SecurityTasks::new(),
+            media: MediaTasks::new(),
+            notifications: None,
+            rooms: RoomTasks::new(),
         });
         engine
             .handle(Command::RenameDevice {
@@ -2899,6 +3593,9 @@ mod tests {
             selected: None,
             avatars: Avatars::new(),
             security: SecurityTasks::new(),
+            media: MediaTasks::new(),
+            notifications: None,
+            rooms: RoomTasks::new(),
         });
         engine
             .handle(Command::SignOutDevices {
@@ -2943,6 +3640,9 @@ mod tests {
             selected: None,
             avatars: Avatars::new(),
             security: SecurityTasks::new(),
+            media: MediaTasks::new(),
+            notifications: None,
+            rooms: RoomTasks::new(),
         });
         engine
             .handle(Command::BootstrapCrossSigning { password: None })
@@ -2992,6 +3692,9 @@ mod tests {
             selected: None,
             avatars: Avatars::new(),
             security: SecurityTasks::new(),
+            media: MediaTasks::new(),
+            notifications: None,
+            rooms: RoomTasks::new(),
         });
         for cmd in [
             Command::EnableRecovery,
@@ -3045,6 +3748,9 @@ mod tests {
             selected: None,
             avatars: Avatars::new(),
             security,
+            media: MediaTasks::new(),
+            notifications: None,
+            rooms: RoomTasks::new(),
         });
         // Twice: the failed first request must not leave a reservation behind
         // (that would answer `Busy`).
@@ -3101,6 +3807,602 @@ mod tests {
         }
     }
 
+    /// One of every Phase 5 command, with the action kind and room it fails
+    /// under while the core has no handler for it.
+    fn phase5_commands() -> Vec<(Command, ActionKind, RoomId)> {
+        use crate::api::{
+            AttachmentData, CreateRoomRequest, EventId, MediaBytes, MediaKind, OutgoingAttachment,
+            RoomNotificationModeView, RoomVisibility,
+        };
+        let room = || rid("p5");
+        let none = || RoomId::from("");
+        let user = || crate::api::UserId::from("@bob:x");
+        let event = || EventId::from("$root");
+        vec![
+            (
+                Command::SendAttachment(OutgoingAttachment {
+                    room_id: room(),
+                    filename: "a.png".into(),
+                    mimetype: "image/png".into(),
+                    data: AttachmentData::Bytes(MediaBytes::from(vec![1])),
+                    kind: MediaKind::Image,
+                    width: None,
+                    height: None,
+                    thumbnail: None,
+                    reply_to: None,
+                    thread_root: None,
+                }),
+                ActionKind::Upload,
+                room(),
+            ),
+            (
+                Command::SetRoomNotificationMode {
+                    room_id: room(),
+                    mode: Some(RoomNotificationModeView::Mute),
+                },
+                ActionKind::Notifications,
+                room(),
+            ),
+            (
+                Command::SetDefaultNotificationMode {
+                    one_to_one: true,
+                    mode: RoomNotificationModeView::AllMessages,
+                },
+                ActionKind::Notifications,
+                none(),
+            ),
+            (
+                Command::AddKeyword {
+                    keyword: "k".into(),
+                },
+                ActionKind::Notifications,
+                none(),
+            ),
+            (
+                Command::RemoveKeyword {
+                    keyword: "k".into(),
+                },
+                ActionKind::Notifications,
+                none(),
+            ),
+            (
+                Command::CreateRoom(CreateRoomRequest {
+                    name: "n".into(),
+                    topic: None,
+                    encrypted: true,
+                    visibility: RoomVisibility::Private,
+                    invitees: Vec::new(),
+                }),
+                ActionKind::Rooms,
+                none(),
+            ),
+            (
+                Command::CreateDm { user_id: user() },
+                ActionKind::Rooms,
+                none(),
+            ),
+            (
+                Command::JoinRoom {
+                    target: "#a:x".into(),
+                    via: Vec::new(),
+                },
+                ActionKind::Rooms,
+                none(),
+            ),
+            (
+                Command::AcceptInvite { room_id: room() },
+                ActionKind::Rooms,
+                room(),
+            ),
+            (
+                Command::DeclineInvite { room_id: room() },
+                ActionKind::Rooms,
+                room(),
+            ),
+            (
+                Command::InviteUser {
+                    room_id: room(),
+                    user_id: user(),
+                },
+                ActionKind::Rooms,
+                room(),
+            ),
+            (
+                Command::LeaveRoom { room_id: room() },
+                ActionKind::Rooms,
+                room(),
+            ),
+            (
+                Command::OpenRoomDetails { room_id: room() },
+                ActionKind::Rooms,
+                room(),
+            ),
+            (
+                Command::SetRoomName {
+                    room_id: room(),
+                    name: "n".into(),
+                },
+                ActionKind::Rooms,
+                room(),
+            ),
+            (
+                Command::SetRoomTopic {
+                    room_id: room(),
+                    topic: None,
+                },
+                ActionKind::Rooms,
+                room(),
+            ),
+            (
+                Command::SetRoomAvatar {
+                    room_id: room(),
+                    data: MediaBytes::from(vec![1]),
+                    mimetype: "image/png".into(),
+                },
+                ActionKind::Rooms,
+                room(),
+            ),
+            (
+                Command::EnableRoomEncryption { room_id: room() },
+                ActionKind::Rooms,
+                room(),
+            ),
+            (
+                Command::ListRoomMembers { room_id: room() },
+                ActionKind::Rooms,
+                room(),
+            ),
+            (
+                Command::SetDisplayName { name: "n".into() },
+                ActionKind::Profile,
+                none(),
+            ),
+            (
+                Command::SetAvatar {
+                    data: MediaBytes::from(vec![1]),
+                    mimetype: "image/png".into(),
+                },
+                ActionKind::Profile,
+                none(),
+            ),
+            (Command::RemoveAvatar, ActionKind::Profile, none()),
+            (
+                Command::OpenThread {
+                    room_id: room(),
+                    root: event(),
+                },
+                ActionKind::Thread,
+                room(),
+            ),
+            (Command::CloseThread, ActionKind::Thread, none()),
+            (
+                Command::PaginateThread {
+                    room_id: room(),
+                    root: event(),
+                },
+                ActionKind::Thread,
+                room(),
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn phase5_commands_without_a_session_fail_with_not_logged_in() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut engine, mut rx) = oauth_engine(tmp.path());
+        for (cmd, kind, room) in phase5_commands() {
+            engine.handle(cmd).await;
+            let got = drain(&mut rx).await;
+            assert!(
+                matches!(
+                    got.as_slice(),
+                    [CoreEvent::ActionFailed { room_id, action, error: CoreError::NotLoggedIn }]
+                        if *room_id == room && *action == kind
+                ),
+                "{kind:?}: {got:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn thread_commands_without_a_selected_room_fail_or_do_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut engine, mut rx) = oauth_engine(tmp.path());
+        let client = Client::builder()
+            .homeserver_url("http://127.0.0.1:1")
+            .build()
+            .await
+            .unwrap();
+        engine.active = Some(Active {
+            fetcher: Arc::new(SdkFetcher(client.clone())),
+            client,
+            record: record("@alice:x", "http://127.0.0.1:1", "s1"),
+            changes: broadcast::channel(1).1,
+            sync: None,
+            selected: None,
+            avatars: Avatars::new(),
+            security: SecurityTasks::new(),
+            media: MediaTasks::new(),
+            notifications: None,
+            rooms: RoomTasks::new(),
+        });
+        let room = rid("a");
+        let root = crate::api::EventId::from("$root:x");
+        for cmd in [
+            Command::OpenThread {
+                room_id: room.clone(),
+                root: root.clone(),
+            },
+            Command::PaginateThread {
+                room_id: room.clone(),
+                root: root.clone(),
+            },
+        ] {
+            engine.handle(cmd).await;
+            let got = drain(&mut rx).await;
+            assert!(
+                matches!(
+                    got.as_slice(),
+                    [CoreEvent::ActionFailed { room_id, action: ActionKind::Thread, error: CoreError::NoRoomSelected }]
+                        if *room_id == room
+                ),
+                "{got:?}"
+            );
+        }
+        // Nothing to close: no answer.
+        engine.handle(Command::CloseThread).await;
+        assert!(drain(&mut rx).await.is_empty());
+        // A threaded send and an action on a thread item need the thread.
+        let Some((Command::Send(mut message), _)) = action_commands(&room).into_iter().next()
+        else {
+            unreachable!("the first action command is a send")
+        };
+        message.thread_root = Some(root);
+        engine.handle(Command::Send(message)).await;
+        let got = drain(&mut rx).await;
+        assert!(
+            matches!(
+                got.as_slice(),
+                [CoreEvent::ActionFailed {
+                    action: ActionKind::Send,
+                    error: CoreError::NoRoomSelected,
+                    ..
+                }]
+            ),
+            "{got:?}"
+        );
+        if let Some(mut active) = engine.active.take() {
+            active.stop_tasks().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn notification_commands_name_the_room_and_the_reason_they_fail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut engine, mut rx) = oauth_engine(tmp.path());
+        let client = Client::builder()
+            .homeserver_url("http://127.0.0.1:1")
+            .build()
+            .await
+            .unwrap();
+        engine.active = Some(Active {
+            fetcher: Arc::new(SdkFetcher(client.clone())),
+            client,
+            record: record("@alice:x", "http://127.0.0.1:1", "s1"),
+            changes: broadcast::channel(1).1,
+            sync: None,
+            selected: None,
+            avatars: Avatars::new(),
+            security: SecurityTasks::new(),
+            media: MediaTasks::new(),
+            notifications: None,
+            rooms: RoomTasks::new(),
+        });
+        // A room the account does not know is refused before anything is
+        // queued; a malformed ID is too.
+        for bad in [rid("nowhere"), RoomId::from("not a room id")] {
+            engine
+                .handle(Command::SetRoomNotificationMode {
+                    room_id: bad.clone(),
+                    mode: None,
+                })
+                .await;
+            let got = drain(&mut rx).await;
+            assert!(
+                matches!(
+                    got.as_slice(),
+                    [CoreEvent::ActionFailed {
+                        room_id,
+                        action: ActionKind::Notifications,
+                        error: CoreError::UnknownRoom(named),
+                    }] if *room_id == bad && *named == bad
+                ),
+                "{got:?}"
+            );
+        }
+        // The other commands go to the worker, which a session without
+        // started notifications doesn't have.
+        for cmd in [
+            Command::AddKeyword {
+                keyword: "k".into(),
+            },
+            Command::RemoveKeyword {
+                keyword: "k".into(),
+            },
+        ] {
+            engine.handle(cmd).await;
+            let got = drain(&mut rx).await;
+            assert!(
+                matches!(
+                    got.as_slice(),
+                    [CoreEvent::ActionFailed {
+                        action: ActionKind::Notifications,
+                        error: CoreError::Internal(_),
+                        ..
+                    }]
+                ),
+                "{got:?}"
+            );
+        }
+        if let Some(mut active) = engine.active.take() {
+            active.stop_tasks().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn room_and_profile_commands_refuse_bad_input_before_any_request() {
+        use crate::api::{CreateRoomRequest, MediaBytes, RoomVisibility};
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut engine, mut rx) = oauth_engine(tmp.path());
+        let client = Client::builder()
+            .homeserver_url("http://127.0.0.1:1")
+            .build()
+            .await
+            .unwrap();
+        engine.active = Some(Active {
+            fetcher: Arc::new(SdkFetcher(client.clone())),
+            client,
+            record: record("@alice:x", "http://127.0.0.1:1", "s1"),
+            changes: broadcast::channel(1).1,
+            sync: None,
+            selected: None,
+            avatars: Avatars::new(),
+            security: SecurityTasks::new(),
+            media: MediaTasks::new(),
+            notifications: None,
+            rooms: RoomTasks::new(),
+        });
+        let none = || RoomId::from("");
+        let user = |id: &str| crate::api::UserId::from(id);
+        let png = MediaBytes::from(include_bytes!("../../tests/fixtures/small-64x48.png").to_vec());
+        let create = |name: &str, alias: Option<&str>| {
+            Command::CreateRoom(CreateRoomRequest {
+                name: name.into(),
+                topic: None,
+                encrypted: true,
+                visibility: alias.map_or(RoomVisibility::Private, |a| RoomVisibility::Public {
+                    alias: a.into(),
+                }),
+                invitees: Vec::new(),
+            })
+        };
+        let cases: Vec<(Command, ActionKind, RoomId, CoreError)> = vec![
+            (
+                create("", None),
+                ActionKind::Rooms,
+                none(),
+                CoreError::NotAllowed,
+            ),
+            (
+                create("n", Some("Bad Alias")),
+                ActionKind::Rooms,
+                none(),
+                CoreError::NotAllowed,
+            ),
+            (
+                Command::CreateDm {
+                    user_id: user("nope"),
+                },
+                ActionKind::Rooms,
+                none(),
+                CoreError::NotAllowed,
+            ),
+            (
+                Command::JoinRoom {
+                    target: "junk".into(),
+                    via: Vec::new(),
+                },
+                ActionKind::Rooms,
+                none(),
+                CoreError::NotAllowed,
+            ),
+            (
+                Command::InviteUser {
+                    room_id: rid("a"),
+                    user_id: user("nope"),
+                },
+                ActionKind::Rooms,
+                rid("a"),
+                CoreError::NotAllowed,
+            ),
+            (
+                Command::SetRoomName {
+                    room_id: rid("a"),
+                    name: "  ".into(),
+                },
+                ActionKind::Rooms,
+                rid("a"),
+                CoreError::NotAllowed,
+            ),
+            (
+                Command::SetRoomTopic {
+                    room_id: rid("a"),
+                    topic: Some("x\u{7}".into()),
+                },
+                ActionKind::Rooms,
+                rid("a"),
+                CoreError::NotAllowed,
+            ),
+            (
+                Command::SetRoomAvatar {
+                    room_id: rid("a"),
+                    data: png.clone(),
+                    mimetype: "image/jpeg".into(),
+                },
+                ActionKind::Rooms,
+                rid("a"),
+                CoreError::NotAllowed,
+            ),
+            (
+                Command::SetDisplayName { name: "\n".into() },
+                ActionKind::Profile,
+                none(),
+                CoreError::NotAllowed,
+            ),
+            (
+                Command::SetAvatar {
+                    data: png.clone(),
+                    mimetype: "text/html".into(),
+                },
+                ActionKind::Profile,
+                none(),
+                CoreError::NotAllowed,
+            ),
+            (
+                Command::SetAvatar {
+                    data: MediaBytes::from(b"<html>".to_vec()),
+                    mimetype: "image/png".into(),
+                },
+                ActionKind::Profile,
+                none(),
+                CoreError::NotAllowed,
+            ),
+        ];
+        // Valid input for a room the account does not know.
+        let unknown: Vec<(Command, RoomId)> = vec![
+            (Command::AcceptInvite { room_id: rid("a") }, rid("a")),
+            (Command::DeclineInvite { room_id: rid("a") }, rid("a")),
+            (Command::LeaveRoom { room_id: rid("a") }, rid("a")),
+            (Command::OpenRoomDetails { room_id: rid("a") }, rid("a")),
+            (
+                Command::EnableRoomEncryption { room_id: rid("a") },
+                rid("a"),
+            ),
+            (Command::ListRoomMembers { room_id: rid("a") }, rid("a")),
+            (
+                Command::InviteUser {
+                    room_id: rid("a"),
+                    user_id: user("@bob:x"),
+                },
+                rid("a"),
+            ),
+            (
+                Command::SetRoomName {
+                    room_id: rid("a"),
+                    name: "Name".into(),
+                },
+                rid("a"),
+            ),
+            (
+                Command::SetRoomTopic {
+                    room_id: rid("a"),
+                    topic: None,
+                },
+                rid("a"),
+            ),
+            (
+                Command::SetRoomAvatar {
+                    room_id: RoomId::from("not a room id"),
+                    data: png,
+                    mimetype: "image/png".into(),
+                },
+                RoomId::from("not a room id"),
+            ),
+        ];
+        let mut cases = cases;
+        cases.extend(unknown.into_iter().map(|(cmd, room)| {
+            let error = CoreError::UnknownRoom(room.clone());
+            (cmd, ActionKind::Rooms, room, error)
+        }));
+        for (cmd, kind, room, error) in cases {
+            let label = format!("{cmd:?}");
+            engine.handle(cmd).await;
+            let got = drain(&mut rx).await;
+            assert!(
+                matches!(
+                    got.as_slice(),
+                    [CoreEvent::ActionFailed { room_id, action, error: e }]
+                        if *room_id == room && *action == kind && *e == error
+                ),
+                "{label}: {got:?}"
+            );
+        }
+        if let Some(mut active) = engine.active.take() {
+            active.stop_tasks().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn an_attachment_for_an_unjoined_room_or_a_bad_mime_is_refused() {
+        use crate::api::{AttachmentData, MediaBytes, MediaKind, OutgoingAttachment};
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut engine, mut rx) = oauth_engine(tmp.path());
+        let client = Client::builder()
+            .homeserver_url("http://127.0.0.1:1")
+            .build()
+            .await
+            .unwrap();
+        engine.active = Some(Active {
+            fetcher: Arc::new(SdkFetcher(client.clone())),
+            client,
+            record: record("@alice:x", "http://127.0.0.1:1", "s1"),
+            changes: broadcast::channel(1).1,
+            sync: None,
+            selected: None,
+            avatars: Avatars::new(),
+            security: SecurityTasks::new(),
+            media: MediaTasks::new(),
+            notifications: None,
+            rooms: RoomTasks::new(),
+        });
+        let attachment = |room: &str, mimetype: &str| OutgoingAttachment {
+            room_id: rid(room),
+            filename: "a.png".into(),
+            mimetype: mimetype.into(),
+            data: AttachmentData::Bytes(MediaBytes::from(vec![1])),
+            kind: MediaKind::Image,
+            width: None,
+            height: None,
+            thumbnail: None,
+            reply_to: None,
+            thread_root: None,
+        };
+        for (room, mimetype) in [
+            ("!unknown:x", "image/png"),
+            ("!unknown:x", "bad"),
+            ("", "x/y"),
+        ] {
+            engine
+                .handle(Command::SendAttachment(attachment(room, mimetype)))
+                .await;
+            let got = drain(&mut rx).await;
+            assert!(
+                matches!(
+                    got.as_slice(),
+                    [CoreEvent::ActionFailed {
+                        action: ActionKind::Upload,
+                        error: CoreError::NotAllowed,
+                        ..
+                    }]
+                ),
+                "{room:?} {mimetype:?}: {got:?}"
+            );
+        }
+        if let Some(mut active) = engine.active.take() {
+            active.stop_tasks().await;
+        }
+    }
+
     /// The next event that is not the status forwarder's.
     async fn next_event(rx: &mut mpsc::Receiver<CoreEvent>) -> CoreEvent {
         loop {
@@ -3151,6 +4453,9 @@ mod tests {
             selected: None,
             avatars: Avatars::new(),
             security: SecurityTasks::new(),
+            media: MediaTasks::new(),
+            notifications: None,
+            rooms: RoomTasks::new(),
         });
         let room = rid("a");
         for (cmd, kind) in action_commands(&room) {
@@ -3164,6 +4469,104 @@ mod tests {
                 ),
                 "{kind:?}: {got:?}"
             );
+        }
+    }
+
+    /// The media commands answer on their own channels: `Media` for a fetch,
+    /// `ActionFailed { Media, .. }` for a save.
+    async fn media_answers(
+        engine: &mut Engine,
+        rx: &mut mpsc::Receiver<CoreEvent>,
+    ) -> [CoreEvent; 2] {
+        let room = rid("a");
+        engine
+            .handle(Command::FetchMedia {
+                room_id: room.clone(),
+                item_id: "i".into(),
+                size: crate::api::MediaSize::Thumbnail,
+            })
+            .await;
+        let fetch = next_event(rx).await;
+        engine
+            .handle(Command::SaveMedia {
+                room_id: room,
+                item_id: "i".into(),
+                path: "/nonexistent/x".into(),
+            })
+            .await;
+        let save = next_event(rx).await;
+        [fetch, save]
+    }
+
+    #[tokio::test]
+    async fn media_commands_without_a_session_fail_with_not_logged_in() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut engine, mut rx) = oauth_engine(tmp.path());
+        let [fetch, save] = media_answers(&mut engine, &mut rx).await;
+        assert!(
+            matches!(&fetch, CoreEvent::Media { room_id, item_id, result: Err(CoreError::NotLoggedIn), .. }
+                if *room_id == rid("a") && item_id == "i"),
+            "{fetch:?}"
+        );
+        assert!(
+            matches!(
+                &save,
+                CoreEvent::ActionFailed {
+                    action: ActionKind::Media,
+                    error: CoreError::NotLoggedIn,
+                    ..
+                }
+            ),
+            "{save:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn media_commands_without_a_selected_room_fail_with_no_room_selected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut engine, mut rx) = oauth_engine(tmp.path());
+        let client = Client::builder()
+            .homeserver_url("http://127.0.0.1:1")
+            .build()
+            .await
+            .unwrap();
+        engine.active = Some(Active {
+            fetcher: Arc::new(SdkFetcher(client.clone())),
+            client,
+            record: record("@alice:x", "http://127.0.0.1:1", "s1"),
+            changes: broadcast::channel(1).1,
+            sync: None,
+            selected: None,
+            avatars: Avatars::new(),
+            security: SecurityTasks::new(),
+            media: MediaTasks::new(),
+            notifications: None,
+            rooms: RoomTasks::new(),
+        });
+        let [fetch, save] = media_answers(&mut engine, &mut rx).await;
+        assert!(
+            matches!(
+                &fetch,
+                CoreEvent::Media {
+                    result: Err(CoreError::NoRoomSelected),
+                    ..
+                }
+            ),
+            "{fetch:?}"
+        );
+        assert!(
+            matches!(
+                &save,
+                CoreEvent::ActionFailed {
+                    action: ActionKind::Media,
+                    error: CoreError::NoRoomSelected,
+                    ..
+                }
+            ),
+            "{save:?}"
+        );
+        if let Some(mut active) = engine.active.take() {
+            active.stop_tasks().await;
         }
     }
 }

@@ -93,11 +93,14 @@ impl Fetcher for SdkFetcher {
         };
         // The SDK builds the request URL from the parsed URI. Its error text
         // is dropped: it can quote server data.
-        self.0
-            .media()
-            .get_media_content(&request, true)
-            .await
-            .map_err(|_| ())
+        // A server that sends more than an avatar can be is not read to the
+        // end: the capped fetcher of the client stops at the limit.
+        crate::media_fetch::with_cap(
+            u64::try_from(MAX_AVATAR_BYTES).unwrap_or(u64::MAX),
+            self.0.media().get_media_content(&request, true),
+        )
+        .await
+        .map_err(|_| ())
     }
 }
 

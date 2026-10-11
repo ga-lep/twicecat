@@ -152,9 +152,298 @@ pub fn open_link(url: &CheckedUrl) -> bool {
     open::that_detached(url.as_str()).is_ok()
 }
 
+/// Longest room target text, in bytes (the core's limit too).
+pub const MAX_TARGET_BYTES: usize = 512;
+/// Most `via` servers kept from a link (the core's limit too).
+pub const MAX_VIA: usize = 8;
+
+/// A room to join: the room ID or alias, and servers that can route a join.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RoomTarget {
+    /// `!id:server`, `!id` (room version 12) or `#alias:server`.
+    pub id: String,
+    /// Servers from a `matrix.to` link.
+    pub via: Vec<String>,
+}
+
+// Manual impl: aliases and IDs are user content.
+impl fmt::Debug for RoomTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "RoomTarget(<redacted>, {} via)", self.via.len())
+    }
+}
+
+/// Whether `name` is a Matrix server name: a DNS name, an IPv4 address or a
+/// bracketed IPv6 address, with an optional port.
+pub fn valid_server_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 255 {
+        return false;
+    }
+    let (host, port) = if let Some(rest) = name.strip_prefix('[') {
+        let Some((inner, after)) = rest.split_once(']') else {
+            return false;
+        };
+        if inner.parse::<std::net::Ipv6Addr>().is_err() {
+            return false;
+        }
+        (None, after)
+    } else {
+        match name.find(':') {
+            Some(at) => (Some(&name[..at]), &name[at..]),
+            None => (Some(name), ""),
+        }
+    };
+    let port_ok = match port {
+        "" => true,
+        p => p.strip_prefix(':').is_some_and(|digits| {
+            (1..=5).contains(&digits.len())
+                && digits.bytes().all(|b| b.is_ascii_digit())
+                && digits.parse::<u16>().is_ok_and(|n| n > 0)
+        }),
+    };
+    let host_ok = match host {
+        // A bracketed IPv6 address was checked above.
+        None => true,
+        Some(host) if host.bytes().all(|b| b.is_ascii_digit() || b == b'.') => {
+            host.parse::<std::net::Ipv4Addr>().is_ok()
+        }
+        Some(host) => {
+            !host.is_empty()
+                && host
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+        }
+    };
+    port_ok && host_ok
+}
+
+/// Parses a user ID, `@localpart:server`, as the core does.
+pub fn parse_user_id(text: &str) -> Option<tessera_core::api::UserId> {
+    let text = text.trim();
+    let rest = text.strip_prefix('@')?;
+    if text.len() > MAX_USER_ID_BYTES {
+        return None;
+    }
+    let (local, server) = rest.split_once(':')?;
+    // Historical user IDs allow any visible ASCII; spaces, controls and
+    // look-alike or bidirectional characters never.
+    let local_ok = !local.is_empty() && local.bytes().all(|b| (0x21..=0x7E).contains(&b));
+    (local_ok && valid_server_name(server)).then(|| tessera_core::api::UserId::from(text))
+}
+
+/// Parses `#alias:server`, `!id:server` or a `https://matrix.to/#/...` link
+/// to a room or alias, with the same table as the core's `parse_room_target`
+/// (the app checks before it sends; the core checks again). Nothing is
+/// fetched. Anything else (users, events, other hosts, schemes or
+/// arguments) is refused.
+pub fn parse_room_target(text: &str) -> Option<RoomTarget> {
+    let text = text.trim();
+    if text.is_empty() || text.len() > MAX_TARGET_BYTES || text.chars().any(char::is_whitespace) {
+        return None;
+    }
+    if let Some(rest) = text.strip_prefix(MATRIX_TO_PREFIX) {
+        let (id_part, query) = match rest.split_once('?') {
+            Some((id, query)) => (id, query),
+            None => (rest, ""),
+        };
+        let id = percent_decode(id_part)?;
+        if !valid_room_id_or_alias(&id) {
+            return None;
+        }
+        let mut via = Vec::new();
+        for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+            let value = percent_decode(pair.strip_prefix("via=")?)?;
+            if !valid_server_name(&value) {
+                return None;
+            }
+            if via.len() < MAX_VIA && !via.contains(&value) {
+                via.push(value);
+            }
+        }
+        return Some(RoomTarget { id, via });
+    }
+    if text.contains("//") || !valid_room_id_or_alias(text) {
+        return None;
+    }
+    Some(RoomTarget {
+        id: text.to_owned(),
+        via: Vec::new(),
+    })
+}
+
+const MATRIX_TO_PREFIX: &str = "https://matrix.to/#/";
+/// Longest user ID, in bytes (the Matrix limit).
+const MAX_USER_ID_BYTES: usize = 255;
+
+/// `!id:server`, `!id` or `#alias:server`: a sigil, something after it, and
+/// for an alias a valid server name; a colon in a room ID starts a server
+/// name too.
+fn valid_room_id_or_alias(id: &str) -> bool {
+    if id.len() > MAX_TARGET_BYTES || id.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return false;
+    }
+    let (sigil, rest) = match id.split_at_checked(1) {
+        Some((sigil @ ("!" | "#"), rest)) => (sigil, rest),
+        _ => return false,
+    };
+    if rest.is_empty() || rest.contains('/') {
+        return false;
+    }
+    match rest.split_once(':') {
+        Some((local, server)) => !local.is_empty() && valid_server_name(server),
+        // A room ID of room version 12 has no server part; an alias needs one.
+        None => sigil == "!",
+    }
+}
+
+/// Decodes `%XX` escapes; `None` for a broken escape or non-UTF-8 bytes.
+fn percent_decode(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = text.get(i + 1..i + 3)?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn room_targets_are_aliases_ids_and_matrix_to_links_only() {
+        let ok = |text: &str| parse_room_target(text).unwrap_or_else(|| panic!("{text:?}"));
+        assert_eq!(ok("#lounge:localhost").id, "#lounge:localhost");
+        assert_eq!(ok("  !abc:localhost ").id, "!abc:localhost");
+        assert!(ok("#lounge:localhost").via.is_empty());
+        // Room versions 12 and later have IDs without a server part.
+        assert_eq!(ok("!abc").id, "!abc");
+        assert_eq!(ok("#a:[::1]:8448").id, "#a:[::1]:8448");
+
+        let link = ok("https://matrix.to/#/!abc:localhost?via=a.example&via=b.example");
+        assert_eq!(link.id, "!abc:localhost");
+        assert_eq!(link.via, ["a.example", "b.example"]);
+        assert_eq!(
+            ok("https://matrix.to/#/%23lounge:localhost").id,
+            "#lounge:localhost"
+        );
+        assert_eq!(
+            ok("https://matrix.to/#/#lounge:localhost").id,
+            "#lounge:localhost"
+        );
+        let many: String = (0..20).map(|i| format!("&via=s{i}.example")).collect();
+        let long = ok(&format!(
+            "https://matrix.to/#/!abc:localhost?{}",
+            &many[1..]
+        ));
+        assert_eq!(long.via.len(), MAX_VIA);
+    }
+
+    #[test]
+    fn junk_is_not_a_room_target() {
+        for bad in [
+            "",
+            "   ",
+            "lounge",
+            "lounge:localhost",
+            "#lounge",
+            "!",
+            "#",
+            "@bob:localhost",
+            "$event:localhost",
+            "#a b:localhost",
+            "#a:localhost extra",
+            "#a:bad host",
+            "#a:",
+            "#a:host:99999",
+            "http://matrix.to/#/!abc:localhost",
+            "https://evil.example/#/!abc:localhost",
+            "https://matrix.to.evil.example/#/!abc:localhost",
+            "https://matrix.to/#/@bob:localhost",
+            "https://matrix.to/#/!abc:localhost/$event:localhost",
+            "https://matrix.to/#/!abc:localhost?via=not a server",
+            "https://matrix.to/#/!abc:localhost?other=1",
+            "matrix:roomid/abc:localhost",
+            "https://example.com/room",
+            &format!("#{}:localhost", "a".repeat(600)),
+        ] {
+            assert_eq!(parse_room_target(bad), None, "{bad:?}");
+        }
+        // Surrounding whitespace, a trailing newline included, is trimmed.
+        assert!(parse_room_target("#a:localhost\n").is_some());
+    }
+
+    #[test]
+    fn user_ids_need_a_local_part_and_a_server() {
+        for good in [
+            "@bob:localhost",
+            " @bob:example.org ",
+            "@a.b_c=d-e:host:8448",
+        ] {
+            assert!(parse_user_id(good).is_some(), "{good:?}");
+        }
+        assert_eq!(
+            parse_user_id(" @bob:localhost ").map(|u| u.as_str().to_owned()),
+            Some("@bob:localhost".to_owned())
+        );
+        for bad in [
+            "",
+            "@",
+            "@:localhost",
+            "@bob",
+            "@bob:",
+            "bob:localhost",
+            "@bob:local host",
+            "@bo b:localhost",
+            "@bob:localhost\n@eve:localhost",
+            "@bob\u{202E}:localhost",
+            "!room:localhost",
+            "@bob:host:99999",
+            &format!("@{}:localhost", "a".repeat(300)),
+        ] {
+            assert!(parse_user_id(bad).is_none(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn server_names_are_dns_names_or_addresses_with_a_port() {
+        for good in [
+            "localhost",
+            "example.org",
+            "example.org:8448",
+            "127.0.0.1",
+            "127.0.0.1:8008",
+            "[::1]",
+            "[2001:db8::1]:8448",
+            "a-b.example",
+        ] {
+            assert!(valid_server_name(good), "{good:?}");
+        }
+        for bad in [
+            "",
+            ":8448",
+            "example.org:",
+            "example.org:0x10",
+            "example.org:70000",
+            "a b",
+            "[::1",
+            "[zz]",
+            "999.1.1.1",
+            "exa_mple.org",
+            "example.org/",
+            &"a".repeat(300),
+        ] {
+            assert!(!valid_server_name(bad), "{bad:?}");
+        }
+    }
 
     fn ok(url: &str) -> CheckedUrl {
         check_link_url(url).unwrap_or_else(|e| panic!("{url:?} refused: {e:?}"))

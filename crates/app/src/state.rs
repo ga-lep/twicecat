@@ -4,6 +4,7 @@
 //! [`Task`]s. It never awaits, never touches the network and never sees an SDK
 //! type.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -11,31 +12,47 @@ use iced::theme;
 use iced::widget::{operation, scrollable};
 use iced::{Element, Subscription, Task, Theme, clipboard, system, window};
 use tessera_core::api::{
-    ActionKind, Command, CoreError, CoreEvent, Draft, EventId, ListDiff, MessageDetails,
-    MessageText, OutgoingMessage, Password, ReauthAction, RoomId, RoomListQuery, RoomListTab,
-    RoomSummary, SyncState, TimelineItem, TimelineItemKind, TypingUser, UserId, UserTrust,
+    ActionKind, Command, CoreError, CoreEvent, Draft, EventId, ListDiff, MediaBytes, MediaKind,
+    MediaSize, MessageDetails, MessageText, NotificationKind, NotificationSettingsView,
+    NotificationView, OutgoingMessage, Password, ReauthAction, RoomId, RoomListQuery, RoomListTab,
+    RoomNotificationModeView, RoomSummary, SyncState, TimelineItem, TimelineItemKind, TypingUser,
+    UiSettings, UserId, UserTrust,
 };
 use tokio::sync::mpsc;
 
 use crate::actions::{self, ActionButtons, ActionState, NOTICE_DURATION, Notice, Picker};
 use crate::avatars::Avatars;
+use crate::blocking;
 use crate::bridge::{self, Bridge, EventsSlot};
 use crate::composer::{self, Composer, ComposerKey, EditorAction, SearchStep};
+use crate::dialogs::{self, Clipboard, ClipboardContent, Dialogs, SystemClipboard, SystemDialogs};
 use crate::emoji;
+use crate::keys;
 use crate::links::{self, LinkBar};
+use crate::media::{self, Decoded, MediaModel, SavePath};
+use crate::notifications::{self, Folding, ModeChoice, NoNotifier, Notifier};
 use crate::rich_text::{LinkTarget, MAX_REVEALED, Revealed};
 use crate::room_list;
+use crate::rooms::{RoomsMessage, RoomsModel};
 use crate::screens::login::{self, BrowserUrl, LoginForm};
 use crate::screens::{self, loading, main_view};
 use crate::security::{Busy, SecurityMessage, SecurityModel};
 use crate::sessions::{SessionsMessage, SessionsModel, logout_needs_warning};
+use crate::settings::{NoSettingsStore, SettingsMessage, SettingsModel, SettingsStore};
+use crate::spaces::{SpacesMessage, SpacesModel};
 use crate::text_safety;
+use crate::threads::{ThreadsMessage, ThreadsModel};
 use crate::timeline::{self, Effects, TimelineView};
+use crate::tray::{self, NoTrayFactory, SystemTrayFactory, TrayAction, TrayFactory, TrayModel};
+use crate::upload::{self, Outcome, UploadModel, UploadPaths};
 use crate::verification::{VerificationMessage, VerificationModel};
 
 /// How many users' trust the app keeps: the selected peer, and a stale one or
 /// two from watchers the core replaced.
 pub const MAX_TRUST_KEPT: usize = 8;
+
+/// How many room mode choices the app keeps until the list shows them.
+pub const MAX_LOCAL_MODES: usize = 64;
 
 /// How long to wait for the core to close after `Shutdown` (plan Q18).
 pub const SHUTDOWN_WAIT: Duration = Duration::from_secs(10);
@@ -59,6 +76,20 @@ pub const JUMP_FAILED_TEXT: &str =
     "Could not find the original message (searched about 1,000 earlier messages)";
 
 /// Starts the system handler for a checked link, away from `update`.
+/// Brings the window to the front: un-minimises it and takes the focus.
+fn focus_window() -> Task<Message> {
+    window::oldest()
+        .and_then(|id| Task::batch([window::minimize(id, false), window::gain_focus(id)]))
+}
+
+/// Asks the window system to flag the window (taskbar, dock) without taking
+/// the focus.
+fn attention() -> Task<Message> {
+    window::oldest().and_then(|id| {
+        window::request_user_attention(id, Some(window::UserAttention::Informational))
+    })
+}
+
 fn open_link_task(url: links::CheckedUrl) -> Task<Message> {
     Task::perform(async move { links::open_link(&url) }, |ok| {
         Message::LinkOpened { ok }
@@ -270,6 +301,107 @@ pub enum Message {
     Verification(VerificationMessage),
     /// A button of the Sessions screen or the logout warning.
     Sessions(SessionsMessage),
+    /// An inline image was clicked: open the full-size viewer.
+    MediaClicked(String),
+    /// The viewer was closed (**Close**, Esc).
+    ViewerClosed,
+    /// **Save...** on a media message.
+    SaveRequested(String),
+    /// The save dialog answered; `None` when the user cancelled. The path is
+    /// redacted in `Debug`.
+    SavePicked {
+        /// Room of the item.
+        room_id: RoomId,
+        /// The media message.
+        item_id: String,
+        /// The path the user chose.
+        path: Option<SavePath>,
+    },
+    /// **Open** on a saved file (asks first).
+    OpenRequested(String),
+    /// The user confirmed opening the saved file.
+    OpenConfirmed,
+    /// The user backed out of opening the saved file.
+    OpenDismissed,
+    /// The system handler was started (or failed to start) for a saved file.
+    MediaOpened {
+        /// Whether the handler started without error.
+        ok: bool,
+    },
+    /// **Attach** or Ctrl+U: choose files to send.
+    AttachRequested,
+    /// The file picker answered; the paths are redacted in `Debug`.
+    FilesChosen(UploadPaths),
+    /// Files are being dragged over the window.
+    FileHovered,
+    /// The files left the window without being dropped.
+    FilesHoveredLeft,
+    /// A file was dropped on the window.
+    FileDropped(UploadPaths),
+    /// The pause after the last dropped file ended; the number says which
+    /// drop started it, so only the last one opens the confirmation.
+    DropsDue(u64),
+    /// A file of the confirmation was read and checked.
+    UploadPrepared {
+        /// The line of the confirmation.
+        entry: u64,
+        /// What was found.
+        outcome: Box<Outcome>,
+    },
+    /// Ctrl+V in the composer.
+    PasteRequested,
+    /// What the clipboard held; redacted in `Debug`.
+    Pasted(ClipboardContent),
+    /// The window system's text paste, after the clipboard could not be read.
+    PasteFallback(Option<MessageText>),
+    /// **Send** in the confirmation.
+    UploadConfirmed,
+    /// **Cancel** in the confirmation (or Esc).
+    UploadCancelled,
+    /// A window opened (the first one creates the tray).
+    WindowOpened(window::Id),
+    /// The desktop gave the room's notification this ID.
+    NotificationShown {
+        /// The room.
+        room_id: RoomId,
+        /// The desktop's ID, used to update the notification.
+        id: u32,
+    },
+    /// The user clicked a desktop notification.
+    OpenRoomFromNotification(RoomId),
+    /// A choice in the room header's notification menu.
+    RoomModeChosen(ModeChoice),
+    /// **Show Tessera** or **Quit** in the tray, or a click on the icon.
+    Tray(TrayAction),
+    /// A message of the room dialogs, panels, user card and join bar.
+    Rooms(RoomsMessage),
+    /// A control of the Settings screen, or Ctrl+,.
+    Settings(SettingsMessage),
+    /// A button of the spaces sidebar.
+    Spaces(SpacesMessage),
+    /// A thread summary row or a control of the thread panel.
+    Threads(ThreadsMessage),
+    /// A keyboard shortcut (see `keys`); `captured` says a widget used the
+    /// key already.
+    Shortcut {
+        /// What the keys stand for.
+        shortcut: crate::keys::Shortcut,
+        /// A widget used the key.
+        captured: bool,
+    },
+    /// The room switcher's field, list and rows.
+    Switcher(crate::switcher::SwitcherMessage),
+    /// The task that decoded fetched image bytes finished.
+    MediaDecoded {
+        /// Room of the item.
+        room_id: RoomId,
+        /// The media message.
+        item_id: String,
+        /// Thumbnail or full image.
+        size: MediaSize,
+        /// The pixels, or `None` when the bytes were refused.
+        decoded: Option<Decoded>,
+    },
 }
 
 /// What `main` hands to Iced's boot function.
@@ -312,6 +444,40 @@ pub struct App {
     /// new one, so the header looks up the selected peer by ID
     /// ([`App::dm_peer_trust`]). Capped at [`MAX_TRUST_KEPT`].
     pub user_trust: Vec<(UserId, UserTrust)>,
+    /// Thumbnails, the viewer and saves (plan Q7, Q8).
+    pub media: MediaModel,
+    /// Files being sent: the confirmation, drops and the server's limit.
+    pub uploads: UploadModel,
+    /// Notification, tray and theme settings kept on this device. Until the
+    /// local settings storage exists these are the defaults.
+    pub ui_settings: UiSettings,
+    /// The account's notification defaults and keywords, as the core last
+    /// reported them.
+    pub notification_settings: Option<NotificationSettingsView>,
+    /// Notification modes the user picked that the room list has not shown
+    /// yet (`None` is "use default"). The SDK does not refresh a room's
+    /// summary right after a mode change, so the menu reads these first.
+    pub room_modes: HashMap<RoomId, Option<RoomNotificationModeView>>,
+    /// The tray icon and the unread count it shows.
+    pub tray: TrayModel,
+    /// Room dialogs, settings, members, the user card and the join bar.
+    pub rooms_ui: RoomsModel,
+    /// The Settings screen.
+    pub settings_ui: SettingsModel,
+    pub(crate) settings_store: Box<dyn SettingsStore>,
+    /// The spaces the user is in (the sidebar).
+    pub spaces: SpacesModel,
+    /// The thread panel.
+    pub threads: ThreadsModel,
+    /// The room switcher (Ctrl+K).
+    pub switcher: crate::switcher::SwitcherModel,
+    /// The composer's own Esc just did something; the window listener's
+    /// copy of the same key press must not close another layer.
+    pub(crate) escape_spent: bool,
+    notifier: Box<dyn Notifier>,
+    folding: Folding,
+    pub(crate) dialogs: Box<dyn Dialogs>,
+    pub(crate) clipboard: Box<dyn Clipboard>,
     /// The signed-in account.
     pub user_id: Option<UserId>,
     /// The last sync state.
@@ -379,6 +545,14 @@ impl std::fmt::Debug for App {
             .field("rooms", &self.rooms.len())
             .field("timeline", &self.timeline)
             .field("selected", &self.selected)
+            .field("media", &self.media)
+            .field("uploads", &self.uploads)
+            .field("rooms_ui", &self.rooms_ui)
+            .field("spaces", &self.spaces)
+            .field("threads", &self.threads)
+            .field("settings_ui", &self.settings_ui)
+            .field("switcher", &self.switcher)
+            .field("notification_settings", &self.notification_settings)
             .field("login", &self.login)
             .field("login_in_flight", &self.login_in_flight)
             .field("composer", &self.composer)
@@ -415,6 +589,25 @@ impl App {
             selected: None,
             timeline: TimelineView::default(),
             user_trust: Vec::new(),
+            media: MediaModel::default(),
+            uploads: UploadModel::default(),
+            ui_settings: UiSettings::default(),
+            notification_settings: None,
+            room_modes: HashMap::new(),
+            // Inert until `booter` installs the real ones, so tests never
+            // touch the desktop.
+            tray: TrayModel::new(Box::new(NoTrayFactory)),
+            rooms_ui: RoomsModel::default(),
+            settings_ui: SettingsModel::default(),
+            settings_store: Box::new(NoSettingsStore),
+            spaces: SpacesModel::default(),
+            threads: ThreadsModel::default(),
+            switcher: crate::switcher::SwitcherModel::default(),
+            escape_spent: false,
+            notifier: Box::new(NoNotifier),
+            folding: Folding::default(),
+            dialogs: Box::new(SystemDialogs),
+            clipboard: Box::new(SystemClipboard),
             user_id: None,
             sync_state: SyncState::Idle,
             login: LoginForm::new(),
@@ -447,7 +640,15 @@ impl App {
     }
 
     /// A boot function for `iced::application`; Iced calls it once.
-    pub fn booter(startup: Startup) -> impl Fn() -> (App, Task<Message>) {
+    ///
+    /// `ui_settings` are the local settings read from disk before the core
+    /// started; they decide the theme, notifications, previews and the tray
+    /// badge from the first frame. `store` writes them back on each change.
+    pub fn booter(
+        startup: Startup,
+        ui_settings: UiSettings,
+        store: impl SettingsStore + Clone + 'static,
+    ) -> impl Fn() -> (App, Task<Message>) {
         let startup = Mutex::new(Some(startup));
         move || {
             let startup = startup
@@ -455,8 +656,138 @@ impl App {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .take()
                 .expect("iced boots the application exactly once");
-            App::new(startup)
+            let (mut app, task) = App::new(startup);
+            app.set_ui_settings(ui_settings);
+            app.set_settings_store(Box::new(store.clone()));
+            app.set_notifier(Box::new(notifications::SystemNotifier));
+            app.set_tray_factory(Box::new(SystemTrayFactory));
+            (app, task)
         }
+    }
+
+    /// Replaces the local settings (read from the settings file at boot).
+    pub fn set_ui_settings(&mut self, settings: UiSettings) {
+        self.ui_settings = settings;
+    }
+
+    /// Replaces where the local settings are written (tests use a fake).
+    pub fn set_settings_store(&mut self, store: Box<dyn SettingsStore>) {
+        self.settings_store = store;
+    }
+
+    /// The theme the window uses: the user's override, else the system's.
+    pub fn current_theme(&self) -> Theme {
+        crate::theme::theme_for_choice(self.theme_mode, self.ui_settings.theme)
+    }
+
+    /// Replaces the desktop notification service (tests use a fake).
+    pub fn set_notifier(&mut self, notifier: Box<dyn Notifier>) {
+        self.notifier = notifier;
+    }
+
+    /// Replaces the tray factory (tests use a fake). Only before the tray is
+    /// created.
+    pub fn set_tray_factory(&mut self, factory: Box<dyn TrayFactory>) {
+        self.tray = TrayModel::new(factory);
+    }
+
+    /// The choice the room header's menu shows for `room`: what the user
+    /// picked and the list has not caught up with, else the list's mode.
+    pub fn room_mode_choice(&self, room: &RoomId) -> ModeChoice {
+        ModeChoice::from_mode(self.effective_room_mode(room))
+    }
+
+    /// The mode of `room` for the list and the menu.
+    pub fn effective_room_mode(&self, room: &RoomId) -> Option<RoomNotificationModeView> {
+        match self.room_modes.get(room) {
+            Some(mode) => *mode,
+            None => self
+                .rooms
+                .iter()
+                .find(|r| r.id == *room)
+                .and_then(|r| r.notification_mode),
+        }
+    }
+
+    /// Forgets local mode choices that the room list now agrees with.
+    fn reconcile_room_modes(&mut self) {
+        let rooms = &self.rooms;
+        self.room_modes.retain(|id, mode| {
+            rooms
+                .iter()
+                .find(|r| r.id == *id)
+                .is_none_or(|r| r.notification_mode != *mode)
+        });
+    }
+
+    fn choose_room_mode(&mut self, choice: ModeChoice) -> Task<Message> {
+        let Some(room) = self.selected.clone() else {
+            return Task::none();
+        };
+        if self.room_mode_choice(&room) == choice {
+            return Task::none();
+        }
+        if self.room_modes.len() >= MAX_LOCAL_MODES && !self.room_modes.contains_key(&room) {
+            self.room_modes.clear();
+        }
+        self.room_modes.insert(room.clone(), choice.mode());
+        self.send(Command::SetRoomNotificationMode {
+            room_id: room,
+            mode: choice.mode(),
+        })
+    }
+
+    /// Creates the tray once, on the main thread.
+    fn ensure_tray(&mut self) {
+        if self.tray.ensure(self.ui_settings.tray_badge) {
+            eprintln!("tessera: the tray icon is not available");
+        }
+    }
+
+    fn on_notification(&mut self, mut view: NotificationView) -> Task<Message> {
+        if !notifications::should_show(self.window_focused, &self.ui_settings) {
+            return Task::none();
+        }
+        let show_content = self.ui_settings.show_message_content;
+        if !show_content {
+            // The core always sends a preview; it stops here.
+            view.preview = None;
+        }
+        let (folded, replace) = match self.folding.admit(&view.room_id, Instant::now()) {
+            notifications::Delivery::New => (None, None),
+            notifications::Delivery::Fold { count, replace } => (Some(count), replace),
+        };
+        let toast = notifications::build_toast(&view, show_content, folded);
+        let show = self.notifier.show(notifications::Request {
+            room_id: view.room_id,
+            toast,
+            replace,
+        });
+        if view.kind == NotificationKind::Mention {
+            Task::batch([show, attention()])
+        } else {
+            show
+        }
+    }
+
+    fn open_room_from_notification(&mut self, room: RoomId) -> Task<Message> {
+        let select =
+            if self.selected.as_ref() != Some(&room) && room_list::contains(&self.rooms, &room) {
+                self.update_inner(Message::SelectRoom(room))
+            } else {
+                Task::none()
+            };
+        Task::batch([select, focus_window()])
+    }
+
+    /// Replaces the system dialogs (tests use a fake).
+    pub fn set_dialogs(&mut self, dialogs: Box<dyn Dialogs>) {
+        self.dialogs = dialogs;
+    }
+
+    /// Replaces the system clipboard (tests use a fake).
+    pub fn set_clipboard(&mut self, clipboard: Box<dyn Clipboard>) {
+        self.clipboard = clipboard;
     }
 
     /// The selected direct message's other person and the core's latest word
@@ -508,6 +839,8 @@ impl App {
                 | Message::ReplyRequested(_)
                 | Message::EditRequested(_)
                 | Message::ModeCancelled
+                | Message::Pasted(_)
+                | Message::PasteFallback(_)
         );
         let task = self.update_inner(message);
         if touches_composer && self.selected.is_some() {
@@ -629,8 +962,23 @@ impl App {
                 }
                 Task::none()
             }
+            Message::WindowOpened(_) => {
+                self.ensure_tray();
+                Task::none()
+            }
+            Message::NotificationShown { room_id, id } => {
+                self.folding.shown(&room_id, id);
+                Task::none()
+            }
+            Message::OpenRoomFromNotification(room) => self.open_room_from_notification(room),
+            Message::RoomModeChosen(choice) => self.choose_room_mode(choice),
+            Message::Tray(TrayAction::Show) => focus_window(),
+            Message::Tray(TrayAction::Quit) => self.update_inner(Message::CloseRequested),
             Message::WindowFocus(focused) => {
                 self.window_focused = focused;
+                // A second chance to create the tray, should the first
+                // window event not have reached the app.
+                self.ensure_tray();
                 self.read_receipt(Instant::now())
             }
             Message::ReadDue(room_id) => {
@@ -740,6 +1088,98 @@ impl App {
             Message::Security(message) => self.on_security(message),
             Message::Verification(message) => self.on_verification(message),
             Message::Sessions(message) => self.on_sessions(message),
+            Message::Rooms(message) => self.on_rooms(message),
+            Message::Settings(message) => self.on_settings(message),
+            Message::Spaces(SpacesMessage::Select(space)) => self.select_space(space),
+            Message::Threads(message) => self.on_threads(message),
+            Message::Shortcut { shortcut, captured } => self.on_shortcut(shortcut, captured),
+            Message::Switcher(message) => self.on_switcher(message),
+            Message::AttachRequested => {
+                self.uploads_for_room();
+                self.attach_requested()
+            }
+            Message::FilesChosen(paths) => self.files_added(paths.0),
+            Message::FileHovered => {
+                self.uploads.hovering = self.upload_room().is_some();
+                Task::none()
+            }
+            Message::FilesHoveredLeft => {
+                self.uploads.hovering = false;
+                Task::none()
+            }
+            Message::FileDropped(paths) => {
+                self.uploads_for_room();
+                self.files_dropped(paths.0)
+            }
+            Message::DropsDue(seq) => self.drops_due(seq),
+            Message::UploadPrepared { entry, outcome } => {
+                self.upload_prepared(entry, *outcome);
+                Task::none()
+            }
+            Message::PasteRequested => {
+                self.uploads_for_room();
+                self.paste_requested()
+            }
+            Message::Pasted(content) => self.pasted(content),
+            Message::PasteFallback(text) => self.paste_fallback(text),
+            Message::UploadConfirmed => self.upload_confirmed(),
+            Message::UploadCancelled => {
+                self.uploads.dialog = None;
+                Task::none()
+            }
+            Message::MediaClicked(item_id) => self.open_viewer(item_id),
+            Message::ViewerClosed => {
+                self.media.close_viewer();
+                Task::none()
+            }
+            Message::SaveRequested(item_id) => self.request_save(&item_id),
+            Message::SavePicked {
+                room_id,
+                item_id,
+                path,
+            } => self.save_picked(room_id, item_id, path),
+            Message::OpenRequested(item_id) => {
+                if let (Some(room_id), Some(name)) =
+                    (self.selected.clone(), self.media_filename(&item_id))
+                {
+                    let name = name.to_owned();
+                    self.media.ask_open(&(room_id, item_id), &name);
+                }
+                Task::none()
+            }
+            Message::OpenConfirmed => match self.media.open_bar.take() {
+                Some(bar) => {
+                    let path = bar.path().to_path_buf();
+                    Task::perform(async move { dialogs::open_file(&path) }, |ok| {
+                        Message::MediaOpened { ok }
+                    })
+                }
+                None => Task::none(),
+            },
+            Message::OpenDismissed => {
+                self.media.open_bar = None;
+                Task::none()
+            }
+            Message::MediaOpened { ok } => {
+                if ok {
+                    Task::none()
+                } else {
+                    self.show_notice_text("The file could not be opened.".to_owned())
+                }
+            }
+            Message::MediaDecoded {
+                room_id,
+                item_id,
+                size,
+                decoded,
+            } => {
+                let key = (room_id, item_id);
+                match size {
+                    MediaSize::Thumbnail => self.media.thumb_decoded(&key, decoded),
+                    MediaSize::Full => self.media.viewer_decoded(&key, decoded),
+                }
+                Task::none()
+            }
             Message::SelectRoom(id) => {
                 if !room_list::contains(&self.rooms, &id) {
                     return Task::none();
@@ -750,17 +1190,24 @@ impl App {
                 let save = self.save_draft();
                 self.draft_dirty = false;
                 self.draft_seq = self.draft_seq.wrapping_add(1);
+                // The core closes the thread with the old room; this is for
+                // picking the open room again.
+                let close_thread = self.close_thread_panel();
                 self.selected = Some(id.clone());
                 self.timeline.reset();
+                self.media.reset_view();
+                self.uploads.reset_view();
                 self.user_trust.clear();
                 self.typing.clear();
                 self.actions.reset();
                 self.clear_draft();
                 self.reset_link_state();
+                self.rooms_ui.reset_room();
                 Task::batch([
                     stop_typing,
                     marker,
                     save,
+                    close_thread,
                     self.send(Command::SelectRoom(id)),
                 ])
             }
@@ -768,6 +1215,7 @@ impl App {
                 let query = RoomListQuery {
                     tab,
                     search: self.query.search.clone(),
+                    space: self.query.space.clone(),
                 };
                 self.set_query(query)
             }
@@ -775,6 +1223,7 @@ impl App {
                 let query = RoomListQuery {
                     tab: self.query.tab,
                     search: search.trim().to_owned(),
+                    space: self.query.space.clone(),
                 };
                 self.search_input = search;
                 self.set_query(query)
@@ -850,6 +1299,8 @@ impl App {
                 task = self.drop_secrets();
                 self.security = SecurityModel::default();
                 self.security.fresh_login = !restored;
+                self.room_modes.clear();
+                self.folding.clear();
                 self.user_id = Some(user_id);
                 self.notice = None;
                 self.end_login_attempt();
@@ -881,6 +1332,7 @@ impl App {
             CoreEvent::SyncState(state) => self.sync_state = state,
             CoreEvent::RoomListChanged(diffs) => {
                 room_list::apply_room_diffs(&mut self.rooms, &diffs);
+                self.reconcile_room_modes();
                 // A search or tab filters the list, so an open room missing
                 // from it is only hidden: keep it and its draft. Without a
                 // filter, a missing room has really gone.
@@ -900,7 +1352,7 @@ impl App {
                 if self.screen == Screen::Loading && !self.rooms.is_empty() {
                     self.screen = Screen::Main;
                 }
-                task = self.after_list_change();
+                task = Task::batch([self.after_list_change(), self.rooms_after_list_change()]);
             }
             CoreEvent::RoomListLoaded { total_rooms } => {
                 self.total_rooms = total_rooms;
@@ -967,6 +1419,68 @@ impl App {
                     task = self.show_notice(action, &error);
                 }
             }
+            CoreEvent::ActionFailed {
+                room_id,
+                action: ActionKind::Thread,
+                ..
+            } => {
+                if self.selected.as_ref() == Some(&room_id) {
+                    task = self.show_notice_text("The thread could not be loaded.".to_owned());
+                }
+            }
+            CoreEvent::ActionFailed {
+                room_id,
+                action: ActionKind::Media,
+                ..
+            } => {
+                self.media.fail_saves(&room_id);
+                if self.selected.as_ref() == Some(&room_id) {
+                    task = self.show_notice_text("The file could not be saved.".to_owned());
+                }
+            }
+            CoreEvent::ActionFailed {
+                room_id,
+                action: ActionKind::Notifications,
+                ..
+            } => {
+                // The change did not happen: show what the list says again.
+                self.room_modes.remove(&room_id);
+                if room_id.as_str().is_empty() {
+                    self.on_account_notification_failed();
+                }
+                if self.selected.as_ref() == Some(&room_id) {
+                    task = self.show_notice_text(
+                        "The notification setting could not be changed.".to_owned(),
+                    );
+                }
+            }
+            CoreEvent::ActionFailed {
+                action: ActionKind::Profile,
+                ..
+            } => self.on_profile_failed(),
+            CoreEvent::ActionFailed {
+                room_id,
+                action: ActionKind::Rooms,
+                error,
+            } => task = self.on_rooms_failed(&room_id, &error),
+            CoreEvent::ActionFailed {
+                room_id,
+                action: ActionKind::Discard,
+                ..
+            } => {
+                if self.selected.as_ref() == Some(&room_id) {
+                    task = self.show_notice_text(upload::CANCEL_REFUSED.to_owned());
+                }
+            }
+            CoreEvent::ActionFailed {
+                room_id,
+                action: ActionKind::Upload,
+                error,
+            } => {
+                if self.selected.as_ref() == Some(&room_id) {
+                    task = self.show_notice_text(upload::failure_text(&error).to_owned());
+                }
+            }
             CoreEvent::Typing { room_id, mut users } => {
                 if self.selected.as_ref() == Some(&room_id) {
                     users.truncate(timeline::MAX_TYPING_KEPT);
@@ -1018,6 +1532,39 @@ impl App {
             }
             CoreEvent::UserTrust { user_id, trust } => self.remember_trust(user_id, trust),
             CoreEvent::Devices(list) => self.on_devices_event(list),
+            // Phase 5 events: the app screens that show them arrive with the
+            // UI tasks of the Phase 5 plan; until then they are ignored.
+            CoreEvent::Media {
+                room_id,
+                item_id,
+                size,
+                result,
+            } => task = self.on_media(room_id, item_id, size, result),
+            CoreEvent::MediaSaved { room_id, item_id } => {
+                self.media.finish_save(&(room_id, item_id));
+            }
+            CoreEvent::MediaLimits { max_upload_bytes } => {
+                self.uploads.max_upload_bytes = max_upload_bytes;
+            }
+            CoreEvent::Notification(view) => task = self.on_notification(view),
+            CoreEvent::NotificationSettings(settings) => self.on_notification_settings(settings),
+            CoreEvent::UnreadTotals { notifications, .. } => {
+                self.tray
+                    .set_unread(notifications, self.ui_settings.tray_badge);
+            }
+            CoreEvent::RoomCreated { room_id } => task = self.on_room_created(room_id),
+            CoreEvent::RoomJoined { room_id } => task = self.on_room_joined(room_id),
+            CoreEvent::RoomDetails(details) => task = self.on_room_details(details),
+            CoreEvent::RoomMembers {
+                room_id,
+                members,
+                truncated,
+            } => task = self.on_room_members(room_id, members, truncated),
+            CoreEvent::Spaces(spaces) => task = self.on_spaces(spaces),
+            event @ (CoreEvent::ThreadDiff { .. } | CoreEvent::ThreadPagination { .. }) => {
+                task = self.thread_event(event);
+            }
+            CoreEvent::OwnProfile(view) => self.on_own_profile(&view),
             // Calls and audio have no UI yet (Phase 6 UI tasks).
             CoreEvent::CallState(_)
             | CoreEvent::CallParticipants { .. }
@@ -1135,7 +1682,7 @@ impl App {
 
     /// Keeps `query` and asks the core for it, unless it is the query the core
     /// already has. The list comes back as a `Reset`, so paging may ask again.
-    fn set_query(&mut self, query: RoomListQuery) -> Task<Message> {
+    pub(crate) fn set_query(&mut self, query: RoomListQuery) -> Task<Message> {
         if query == self.query {
             return Task::none();
         }
@@ -1198,7 +1745,7 @@ impl App {
 
     /// Applies an editor action to the composer of the open room and sends
     /// what that asks for: typing notices and member searches.
-    fn composer_action_at(
+    pub(crate) fn composer_action_at(
         &mut self,
         action: iced::widget::text_editor::Action,
         now: Instant,
@@ -1259,6 +1806,7 @@ impl App {
                 Task::none()
             }
             ComposerKey::Escape => {
+                self.escape_spent = self.composer_has_escape_work();
                 let was_edit = matches!(self.composer.mode, composer::Mode::Edit(_));
                 self.composer.escape();
                 self.after_edit_left(was_edit)
@@ -1269,9 +1817,13 @@ impl App {
     /// The message `id` of the open timeline: its plain body, whether it is
     /// the user's own, and its details. `None` for other kinds of item.
     fn find_message(&self, id: &str) -> Option<(&str, bool, &MessageDetails)> {
+        // Thread item IDs carry their root and never equal a room item's,
+        // so one search over both lists finds the right item.
+        let thread = self.threads.panel.iter().flat_map(|p| &p.timeline.items);
         self.timeline
             .items
             .iter()
+            .chain(thread)
             .find(|item| item.id == id)
             .and_then(|item| match &item.kind {
                 TimelineItemKind::Message {
@@ -1282,6 +1834,14 @@ impl App {
                 } => Some((body.as_str(), *is_own, details.as_ref())),
                 _ => None,
             })
+    }
+
+    /// Whether `id` is an item of the thread panel.
+    fn is_thread_item(&self, id: &str) -> bool {
+        self.threads
+            .panel
+            .as_ref()
+            .is_some_and(|p| p.timeline.items.iter().any(|item| item.id == id))
     }
 
     /// The buttons message `id` offers right now, or `None` when it is gone.
@@ -1314,7 +1874,11 @@ impl App {
 
     /// **Reply**: quote message `id` in the next send.
     fn request_reply(&mut self, id: String) -> Task<Message> {
-        if self.selected.is_none() || !self.buttons_for(&id).is_some_and(|b| b.reply) {
+        // The room's composer cannot quote a thread item.
+        if self.selected.is_none()
+            || self.is_thread_item(&id)
+            || !self.buttons_for(&id).is_some_and(|b| b.reply)
+        {
             return Task::none();
         }
         let was_edit = matches!(self.composer.mode, composer::Mode::Edit(_));
@@ -1330,7 +1894,10 @@ impl App {
 
     /// **Edit**: load the plain body of the user's own message `id`.
     fn request_edit(&mut self, id: String) -> Task<Message> {
-        if self.selected.is_none() || !self.buttons_for(&id).is_some_and(|b| b.edit) {
+        if self.selected.is_none()
+            || self.is_thread_item(&id)
+            || !self.buttons_for(&id).is_some_and(|b| b.edit)
+        {
             return Task::none();
         }
         let Some(body) = self.find_message(&id).map(|(body, ..)| body.to_owned()) else {
@@ -1419,7 +1986,7 @@ impl App {
     }
 
     /// Shows a failure line for 5 seconds.
-    fn show_notice_text(&mut self, text: String) -> Task<Message> {
+    pub(crate) fn show_notice_text(&mut self, text: String) -> Task<Message> {
         let seq = self.actions.notice_seq.saturating_add(1);
         self.actions.notice_seq = seq;
         self.actions.notice = Some(Notice { seq, text });
@@ -1504,6 +2071,8 @@ impl App {
         self.total_rooms = None;
         self.load_more_at = None;
         self.avatars.clear();
+        self.media.clear();
+        self.uploads.clear();
         self.list_offset_y = 0.0;
         self.deselect();
         self.sync_state = SyncState::Idle;
@@ -1511,20 +2080,29 @@ impl App {
         self.security = SecurityModel::default();
         self.verification = None;
         self.sessions = SessionsModel::default();
+        self.rooms_ui = RoomsModel::default();
+        self.settings_ui = SettingsModel::default();
+        self.notification_settings = None;
+        self.spaces.clear();
+        self.reset_threads();
         self.notice = Some(notice.to_owned());
         self.end_login_attempt();
         self.screen = Screen::Login;
         flush
     }
 
-    fn deselect(&mut self) {
+    pub(crate) fn deselect(&mut self) {
         self.selected = None;
+        self.reset_threads();
         self.timeline.reset();
+        self.media.reset_view();
+        self.uploads.reset_view();
         self.user_trust.clear();
         self.typing.clear();
         self.actions.reset();
         self.clear_draft();
         self.reset_link_state();
+        self.rooms_ui.reset_room();
     }
 
     /// Forgets revealed spoilers, the link bar and the unknown-command bar
@@ -1548,15 +2126,14 @@ impl App {
                 Task::none()
             }
             LinkTarget::Room(room) => {
-                let id = RoomId::from(room);
+                let id = RoomId::from(room.as_str());
                 if room_list::contains(&self.rooms, &id) {
                     self.update(Message::SelectRoom(id))
                 } else {
-                    Task::none()
+                    self.room_pill_clicked(&room)
                 }
             }
-            // Profiles are Phase 5.
-            LinkTarget::User(_) => Task::none(),
+            LinkTarget::User(user) => self.user_pill_clicked(user),
             LinkTarget::Spoiler { item, index } => {
                 let key = (item, index);
                 if !self.revealed.remove(&key) && self.revealed.len() < MAX_REVEALED {
@@ -1577,7 +2154,8 @@ impl App {
             return Task::none();
         }
         let effects = self.timeline.apply_diffs(diffs);
-        self.timeline_effects(effects)
+        let members = self.members_for_pills();
+        Task::batch([self.timeline_effects(effects), members])
     }
 
     /// The timeline scrolled to `offset_from_bottom` pixels from the bottom
@@ -1621,8 +2199,186 @@ impl App {
         if effects.jump_failed {
             tasks.push(self.show_notice_text(JUMP_FAILED_TEXT.to_owned()));
         }
+        tasks.push(self.fetch_visible_media());
         tasks.push(self.read_receipt(Instant::now()));
         Task::batch(tasks)
+    }
+
+    /// Asks for the thumbnail of every image within one screen of the
+    /// viewport that is neither cached nor on its way (plan Q7). Rows far
+    /// away ask for nothing, and an answer already in the cache is never
+    /// asked for again.
+    fn fetch_visible_media(&mut self) -> Task<Message> {
+        let Some(room_id) = self.selected.clone() else {
+            return Task::none();
+        };
+        let wanted = visible_images(&self.timeline);
+        self.fetch_thumbnails(&room_id, wanted)
+    }
+
+    /// The same for the thread panel's timeline, whose item IDs
+    /// (`thread:{root}:{n}`) share the media cache with the room's.
+    pub(crate) fn fetch_visible_thread_media(&mut self) -> Task<Message> {
+        let Some(panel) = &self.threads.panel else {
+            return Task::none();
+        };
+        let room_id = panel.room_id.clone();
+        let wanted = visible_images(&panel.timeline);
+        self.fetch_thumbnails(&room_id, wanted)
+    }
+
+    fn fetch_thumbnails(&mut self, room_id: &RoomId, wanted: Vec<String>) -> Task<Message> {
+        let mut tasks = Vec::new();
+        for item_id in wanted {
+            if self.media.needs_fetch(&(room_id.clone(), item_id.clone())) {
+                tasks.push(self.send(Command::FetchMedia {
+                    room_id: room_id.clone(),
+                    item_id,
+                    size: MediaSize::Thumbnail,
+                }));
+            }
+        }
+        Task::batch(tasks)
+    }
+
+    /// The core answered a `FetchMedia`. The bytes are untrusted: they are
+    /// decoded in a task, never here, and only if somebody still waits.
+    fn on_media(
+        &mut self,
+        room_id: RoomId,
+        item_id: String,
+        size: MediaSize,
+        result: Result<MediaBytes, CoreError>,
+    ) -> Task<Message> {
+        let key = (room_id.clone(), item_id.clone());
+        let wanted = match size {
+            MediaSize::Thumbnail => self.media.is_pending(&key),
+            MediaSize::Full => self.media.viewer_wants(&key),
+        };
+        if !wanted {
+            return Task::none();
+        }
+        let Ok(bytes) = result else {
+            match size {
+                MediaSize::Thumbnail => self.media.thumb_failed(&key),
+                MediaSize::Full => self.media.viewer_decoded(&key, None),
+            }
+            return Task::none();
+        };
+        // Decoding untrusted bytes is CPU work: off the executor, and only
+        // a couple at a time.
+        Task::perform(
+            async move {
+                blocking::run(move || match size {
+                    MediaSize::Thumbnail => media::decode_thumbnail(bytes.as_bytes()),
+                    MediaSize::Full => media::decode_full(bytes.as_bytes()),
+                })
+                .await
+                .flatten()
+            },
+            move |decoded| Message::MediaDecoded {
+                room_id: room_id.clone(),
+                item_id: item_id.clone(),
+                size,
+                decoded,
+            },
+        )
+    }
+
+    /// The sender-given file name of media message `item_id` in the open
+    /// room.
+    fn media_filename(&self, item_id: &str) -> Option<&str> {
+        let (_, _, details) = self.find_message(item_id)?;
+        details.media.as_deref().map(|m| m.filename.as_str())
+    }
+
+    /// When the message `item_id` of the room or the thread panel was sent.
+    fn message_timestamp_ms(&self, item_id: &str) -> Option<u64> {
+        let thread = self.threads.panel.iter().flat_map(|p| &p.timeline.items);
+        self.timeline
+            .items
+            .iter()
+            .chain(thread)
+            .find(|item| item.id == item_id)
+            .and_then(|item| match &item.kind {
+                TimelineItemKind::Message { timestamp_ms, .. } => Some(*timestamp_ms),
+                _ => None,
+            })
+    }
+
+    /// Opens the viewer on an image of the open room and asks for the file.
+    fn open_viewer(&mut self, item_id: String) -> Task<Message> {
+        let Some(room_id) = self.selected.clone() else {
+            return Task::none();
+        };
+        let is_image = self
+            .find_message(&item_id)
+            .and_then(|(_, _, details)| details.media.as_deref())
+            .is_some_and(|m| m.kind == MediaKind::Image);
+        if !is_image {
+            return Task::none();
+        }
+        self.media.open_viewer((room_id.clone(), item_id.clone()));
+        self.send(Command::FetchMedia {
+            room_id,
+            item_id,
+            size: MediaSize::Full,
+        })
+    }
+
+    /// **Save...**: the dialog proposes a name made from the sender's and
+    /// the sent time by [`media::save_name`]; the answer comes back as
+    /// `SavePicked`.
+    fn request_save(&mut self, item_id: &str) -> Task<Message> {
+        let Some(room_id) = self.selected.clone() else {
+            return Task::none();
+        };
+        let Some(filename) = self.media_filename(item_id) else {
+            return Task::none();
+        };
+        let sent = self
+            .message_timestamp_ms(item_id)
+            .and_then(|ms| i64::try_from(ms).ok())
+            .and_then(|ms| chrono::TimeZone::timestamp_millis_opt(&chrono::Local, ms).single());
+        let suggested = match sent {
+            Some(sent) => media::save_name(filename, &sent),
+            None => media::suggested_file_name(filename),
+        };
+        let item_id = item_id.to_owned();
+        self.dialogs
+            .save_file(&suggested)
+            .map(move |path| Message::SavePicked {
+                room_id: room_id.clone(),
+                item_id: item_id.clone(),
+                path: path.map(SavePath::from),
+            })
+    }
+
+    /// The user picked a path: send it to the core as it is. The path is
+    /// never built from the sender's file name.
+    fn save_picked(
+        &mut self,
+        room_id: RoomId,
+        item_id: String,
+        path: Option<SavePath>,
+    ) -> Task<Message> {
+        let Some(path) = path else {
+            return Task::none();
+        };
+        let path = path.as_path();
+        if self.selected.as_ref() != Some(&room_id) || self.media_filename(&item_id).is_none() {
+            return Task::none();
+        }
+        if !media::save_path_usable(path) {
+            return self.show_notice_text("The file could not be saved there.".to_owned());
+        }
+        self.media
+            .begin_save((room_id.clone(), item_id.clone()), path.to_path_buf());
+        self.send(Command::SaveMedia {
+            room_id,
+            item_id,
+            path: path.to_path_buf(),
+        })
     }
 
     /// Sends the read receipt when one is due, or starts the timer that
@@ -1655,10 +2411,17 @@ impl App {
     /// **Retry** or **Discard** for item `id`, only while it is a failed
     /// local echo.
     fn echo_command(&mut self, item_id: String, discard: bool) -> Task<Message> {
-        let failed = self
-            .find_message(&item_id)
-            .is_some_and(|(_, _, details)| details.send_failure.is_some());
-        let Some(room_id) = self.selected.clone().filter(|_| failed) else {
+        // A failed echo can be retried or discarded; an upload that is on
+        // its way can be cancelled, which is a discard.
+        let allowed = self.find_message(&item_id).is_some_and(|(_, _, details)| {
+            details.send_failure.is_some()
+                || (discard
+                    && details
+                        .media
+                        .as_deref()
+                        .is_some_and(|media| media.upload.is_some()))
+        });
+        let Some(room_id) = self.selected.clone().filter(|_| allowed) else {
             return Task::none();
         };
         self.send(if discard {
@@ -1681,7 +2444,22 @@ impl App {
                 );
                 screens::verification::layer(base, self)
             }
-            Screen::Main => screens::verification::layer(main_view::view(self), self),
+            Screen::Main => screens::verification::layer(
+                screens::switcher::layer(
+                    screens::upload_dialog::layer(
+                        screens::media_viewer::layer(
+                            screens::settings::layer(
+                                screens::room_dialogs::layer(main_view::view(self), self),
+                                self,
+                            ),
+                            self,
+                        ),
+                        self,
+                    ),
+                    self,
+                ),
+                self,
+            ),
             Screen::ShuttingDown => screens::centered_text("Closing\u{2026}"),
             Screen::Disconnected => screens::centered_text("The core stopped"),
         }
@@ -1692,19 +2470,46 @@ impl App {
         Subscription::batch([
             bridge::events_subscription(self.events.clone()),
             window::close_requests().map(|_| Message::CloseRequested),
-            iced::event::listen_with(|event, _status, _id| match event {
+            iced::event::listen_with(|event, status, _id| match event {
                 iced::Event::Window(window::Event::Focused) => Some(Message::WindowFocus(true)),
                 iced::Event::Window(window::Event::Unfocused) => Some(Message::WindowFocus(false)),
-                _ => None,
+                other => upload::event_message(&other).or_else(|| {
+                    keys::event_message(&other, status == iced::event::Status::Captured)
+                }),
             }),
             system::theme_changes().map(Message::ThemeMode),
+            window::open_events().map(Message::WindowOpened),
+            tray::subscription(),
         ])
     }
 
     /// The theme for the current system mode (plan Q13).
     pub fn theme(&self) -> Option<Theme> {
-        Some(crate::theme::theme_for(self.theme_mode))
+        Some(self.current_theme())
     }
+}
+
+/// The IDs of the image messages within one screen of `view`'s viewport.
+fn visible_images(view: &TimelineView) -> Vec<String> {
+    let range = timeline::visible_window(
+        &view.prefix,
+        view.offset_from_bottom,
+        view.viewport_h,
+        view.viewport_h,
+    );
+    view.items
+        .get(range)
+        .unwrap_or_default()
+        .iter()
+        .filter(|item| {
+            matches!(
+                &item.kind,
+                TimelineItemKind::Message { details, .. }
+                    if details.media.as_ref().is_some_and(|m| m.kind == MediaKind::Image)
+            )
+        })
+        .map(|item| item.id.clone())
+        .collect()
 }
 
 #[cfg(test)]
@@ -6008,5 +6813,4394 @@ mod tests {
         key_ready(&mut app, KEY_S);
         assert_eq!(laid_out_size(&app), window, "the new key");
         assert_no_sentinel("new key screen", &format!("{app:?}"), &ALL_S);
+    }
+
+    // ---- Phase 5 Task 9: media in the timeline ----
+
+    use std::path::PathBuf;
+
+    use tessera_core::api::{MediaBytes, MediaContent, MediaKind, MediaSize};
+
+    use crate::dialogs::RecordingDialogs;
+    use crate::media::{self, Decoded, SavePath, Thumb};
+
+    const FILE_SENTINEL: &str = "sentinel-file-name-x";
+
+    fn media_item(id: &str, kind: MediaKind, filename: &str, w: u32, h: u32) -> TimelineItem {
+        let mut content = MediaContent::new(kind, filename.to_owned());
+        content.width = Some(w);
+        content.height = Some(h);
+        content.size = Some(2048);
+        TimelineItem::new(
+            id.to_owned(),
+            TimelineItemKind::Message {
+                sender: UserId::from("@them:x"),
+                body: filename.to_owned(),
+                is_own: false,
+                timestamp_ms: 1,
+                sent: SendStatus::Sent,
+                details: Box::new(MessageDetails {
+                    media: Some(Box::new(content)),
+                    ..MessageDetails::default()
+                }),
+            },
+        )
+    }
+
+    fn room_a() -> RoomId {
+        RoomId::from("!a:x")
+    }
+
+    fn key_of(id: &str) -> media::Key {
+        (room_a(), id.to_owned())
+    }
+
+    /// `main_app` with `count` images `img0` ... in room `a`, and the fake
+    /// dialogs installed.
+    fn media_app(count: usize) -> (App, mpsc::Receiver<Command>, RecordingDialogs) {
+        let (mut app, mut rx) = main_app();
+        let dialogs = RecordingDialogs::default();
+        app.set_dialogs(Box::new(dialogs.clone()));
+        let values = (0..count)
+            .map(|n| media_item(&format!("img{n}"), MediaKind::Image, "pic.png", 640, 480))
+            .collect();
+        let _ = app.update(core(CoreEvent::TimelineDiff {
+            room_id: room_a(),
+            diffs: vec![ListDiff::Append { values }],
+        }));
+        let _ = drain(&mut rx);
+        (app, rx, dialogs)
+    }
+
+    fn fetches(commands: &[Command], wanted: MediaSize) -> Vec<String> {
+        commands
+            .iter()
+            .filter_map(|c| match c {
+                Command::FetchMedia { item_id, size, .. } if *size == wanted => {
+                    Some(item_id.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn png(width: u32, height: u32) -> MediaBytes {
+        let img = image::RgbaImage::from_pixel(width, height, image::Rgba([1, 2, 3, 255]));
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, image::ImageFormat::Png)
+            .expect("encode");
+        MediaBytes::from(out.into_inner())
+    }
+
+    fn media_event(id: &str, size: MediaSize, result: Result<MediaBytes, CoreError>) -> Message {
+        core(CoreEvent::Media {
+            room_id: room_a(),
+            item_id: id.to_owned(),
+            size,
+            result,
+        })
+    }
+
+    fn decoded(width: u32, height: u32) -> Decoded {
+        let (handle, w, h) =
+            media::decode_media(png(width, height).as_bytes(), media::decode_limits())
+                .expect("decodes");
+        Decoded {
+            handle,
+            width: w,
+            height: h,
+        }
+    }
+
+    fn arrive(app: &mut App, id: &str, d: Option<Decoded>) {
+        let _ = app.update(Message::MediaDecoded {
+            room_id: room_a(),
+            item_id: id.to_owned(),
+            size: MediaSize::Thumbnail,
+            decoded: d,
+        });
+    }
+
+    #[test]
+    fn only_rows_in_the_window_plus_one_screen_ask_for_a_thumbnail() {
+        let (mut app, mut rx) = main_app();
+        let values = (0..60)
+            .map(|n| media_item(&format!("img{n}"), MediaKind::Image, "pic.png", 640, 480))
+            .collect();
+        let _ = app.update(core(CoreEvent::TimelineDiff {
+            room_id: room_a(),
+            diffs: vec![ListDiff::Append { values }],
+        }));
+        let asked = fetches(&drain(&mut rx), MediaSize::Thumbnail);
+        assert!(asked.contains(&"img59".to_owned()), "{asked:?}");
+        assert!(!asked.contains(&"img0".to_owned()), "{asked:?}");
+        assert!(asked.len() < 20, "{} requests", asked.len());
+        let unique: std::collections::HashSet<_> = asked.iter().collect();
+        assert_eq!(unique.len(), asked.len(), "each at most once");
+    }
+
+    #[test]
+    fn a_thumbnail_is_requested_once_while_it_is_pending_or_cached() {
+        let (mut app, mut rx, _) = media_app(3);
+        // The diff already asked once. Anything that runs the effects again
+        // (a measured row, a scroll) must not ask again.
+        let _ = app.update(Message::RowMeasured {
+            id: "img2".into(),
+            height: 230.0,
+        });
+        let _ = app.on_timeline_scrolled(0.0, 600.0, 800.0);
+        assert!(fetches(&drain(&mut rx), MediaSize::Thumbnail).is_empty());
+        arrive(&mut app, "img2", Some(decoded(4, 3)));
+        let _ = app.on_timeline_scrolled(0.0, 600.0, 800.0);
+        assert!(fetches(&drain(&mut rx), MediaSize::Thumbnail).is_empty());
+        assert!(matches!(
+            app.media.thumb(&key_of("img2")),
+            Some(Thumb::Ready(_))
+        ));
+    }
+
+    #[test]
+    fn scrolling_up_asks_for_the_rows_that_come_into_range() {
+        let (mut app, mut rx) = main_app();
+        let values = (0..60)
+            .map(|n| media_item(&format!("img{n}"), MediaKind::Image, "pic.png", 640, 480))
+            .collect();
+        let _ = app.update(core(CoreEvent::TimelineDiff {
+            room_id: room_a(),
+            diffs: vec![ListDiff::Append { values }],
+        }));
+        let _ = drain(&mut rx);
+        let _ = app.on_timeline_scrolled(5000.0, 600.0, 800.0);
+        let asked = fetches(&drain(&mut rx), MediaSize::Thumbnail);
+        assert!(!asked.is_empty(), "new rows came into range");
+        assert!(!asked.contains(&"img59".to_owned()), "{asked:?}");
+    }
+
+    #[test]
+    fn a_non_image_and_a_text_message_never_ask_for_a_thumbnail() {
+        let (mut app, mut rx) = main_app();
+        let _ = app.update(core(CoreEvent::TimelineDiff {
+            room_id: room_a(),
+            diffs: vec![ListDiff::Append {
+                values: vec![
+                    media_item("f", MediaKind::File, "a.zip", 0, 0),
+                    media_item("v", MediaKind::Video, "a.mp4", 10, 10),
+                    media_item("a", MediaKind::Audio, "a.ogg", 0, 0),
+                    message_item("t", "hello", false, ALL_ACTIONS),
+                ],
+            }],
+        }));
+        assert!(fetches(&drain(&mut rx), MediaSize::Thumbnail).is_empty());
+    }
+
+    #[test]
+    fn an_arriving_thumbnail_changes_no_row_height() {
+        let (mut app, _rx, _) = media_app(4);
+        for n in 0..4 {
+            let _ = app.update(Message::RowMeasured {
+                id: format!("img{n}"),
+                height: 233.0,
+            });
+        }
+        let before = (app.timeline.prefix.clone(), app.timeline.measured.clone());
+        let _ = app.update(media_event("img3", MediaSize::Thumbnail, Ok(png(8, 6))));
+        arrive(&mut app, "img3", Some(decoded(8, 6)));
+        arrive(&mut app, "img2", None);
+        assert_eq!(app.timeline.prefix, before.0);
+        assert_eq!(app.timeline.measured, before.1);
+        // The estimate of an unmeasured row does not read the cache either.
+        let item = app.timeline.items[3].clone();
+        let est = timeline::estimate_height(&item, false, 800.0);
+        arrive(&mut app, "img3", Some(decoded(8, 6)));
+        assert_eq!(timeline::estimate_height(&item, false, 800.0), est);
+    }
+
+    #[test]
+    fn the_bytes_are_decoded_in_a_task_not_in_update() {
+        let (mut app, _rx, _) = media_app(1);
+        let _ = app.update(media_event("img0", MediaSize::Thumbnail, Ok(png(8, 6))));
+        assert!(
+            app.media.thumb(&key_of("img0")).is_none(),
+            "nothing is cached until the decode task answers"
+        );
+        arrive(&mut app, "img0", Some(decoded(8, 6)));
+        assert!(app.media.thumb(&key_of("img0")).is_some());
+    }
+
+    #[test]
+    fn a_failed_or_undecodable_thumbnail_is_unavailable_and_not_retried() {
+        let (mut app, mut rx, _) = media_app(2);
+        let _ = app.update(media_event(
+            "img0",
+            MediaSize::Thumbnail,
+            Err(CoreError::Internal("no".into())),
+        ));
+        arrive(&mut app, "img1", None);
+        assert!(matches!(
+            app.media.thumb(&key_of("img0")),
+            Some(Thumb::Unavailable)
+        ));
+        assert!(matches!(
+            app.media.thumb(&key_of("img1")),
+            Some(Thumb::Unavailable)
+        ));
+        let _ = app.on_timeline_scrolled(0.0, 600.0, 800.0);
+        assert!(fetches(&drain(&mut rx), MediaSize::Thumbnail).is_empty());
+    }
+
+    #[test]
+    fn an_answer_nobody_asked_for_is_dropped() {
+        let (mut app, _rx, _) = media_app(1);
+        arrive(&mut app, "stranger", Some(decoded(2, 2)));
+        assert!(app.media.thumb(&key_of("stranger")).is_none());
+        let task = app.update(media_event("stranger", MediaSize::Thumbnail, Ok(png(2, 2))));
+        drop(task);
+        assert!(app.media.thumb(&key_of("stranger")).is_none());
+        // A full-size answer with no viewer open is dropped too.
+        let _ = app.update(media_event("img0", MediaSize::Full, Ok(png(2, 2))));
+        assert!(app.media.viewer.is_none());
+    }
+
+    #[test]
+    fn clicking_an_image_opens_the_viewer_and_asks_for_the_full_file() {
+        let (mut app, mut rx, _) = media_app(1);
+        let _ = app.update(Message::MediaClicked("img0".into()));
+        assert!(app.media.viewer.is_some());
+        let commands = drain(&mut rx);
+        assert_eq!(fetches(&commands, MediaSize::Full), vec!["img0".to_owned()]);
+        // The full image arrives, is decoded, and is shown.
+        let _ = app.update(media_event("img0", MediaSize::Full, Ok(png(9, 7))));
+        let _ = app.update(Message::MediaDecoded {
+            room_id: room_a(),
+            item_id: "img0".into(),
+            size: MediaSize::Full,
+            decoded: Some(decoded(9, 7)),
+        });
+        let viewer = app.media.viewer.as_ref().expect("viewer");
+        assert!(viewer.decoded().is_some());
+        // Close drops the full image; a late answer does not bring it back.
+        let _ = app.update(Message::ViewerClosed);
+        assert!(app.media.viewer.is_none());
+        let _ = app.update(Message::MediaDecoded {
+            room_id: room_a(),
+            item_id: "img0".into(),
+            size: MediaSize::Full,
+            decoded: Some(decoded(9, 7)),
+        });
+        assert!(app.media.viewer.is_none());
+    }
+
+    #[test]
+    fn only_an_image_opens_the_viewer() {
+        let (mut app, mut rx, _) = media_app(0);
+        let _ = app.update(core(CoreEvent::TimelineDiff {
+            room_id: room_a(),
+            diffs: vec![ListDiff::Append {
+                values: vec![
+                    media_item("f", MediaKind::File, "a.zip", 0, 0),
+                    message_item("t", "hello", false, ALL_ACTIONS),
+                ],
+            }],
+        }));
+        for id in ["f", "t", "missing"] {
+            let _ = app.update(Message::MediaClicked(id.into()));
+            assert!(app.media.viewer.is_none(), "{id}");
+        }
+        assert!(fetches(&drain(&mut rx), MediaSize::Full).is_empty());
+    }
+
+    #[test]
+    fn a_failed_full_fetch_shows_the_failure_in_the_viewer() {
+        let (mut app, _rx, _) = media_app(1);
+        let _ = app.update(Message::MediaClicked("img0".into()));
+        let _ = app.update(media_event(
+            "img0",
+            MediaSize::Full,
+            Err(CoreError::Internal("too big".into())),
+        ));
+        let viewer = app.media.viewer.as_ref().expect("viewer");
+        assert!(viewer.failed());
+        assert!(viewer.decoded().is_none());
+    }
+
+    #[test]
+    fn leaving_the_room_closes_the_viewer() {
+        let (mut app, _rx, _) = media_app(1);
+        let _ = app.update(Message::MediaClicked("img0".into()));
+        let _ = app.update(Message::SelectRoom(RoomId::from("!b:x")));
+        assert!(app.media.viewer.is_none());
+    }
+
+    fn file_app() -> (App, mpsc::Receiver<Command>, RecordingDialogs) {
+        let (mut app, mut rx, dialogs) = media_app(0);
+        let _ = app.update(core(CoreEvent::TimelineDiff {
+            room_id: room_a(),
+            diffs: vec![ListDiff::Append {
+                values: vec![
+                    media_item("doc", MediaKind::File, "../../report.pdf", 0, 0),
+                    media_item("prog", MediaKind::File, "setup.exe", 0, 0),
+                    media_item("bare", MediaKind::File, "README", 0, 0),
+                ],
+            }],
+        }));
+        let _ = drain(&mut rx);
+        (app, rx, dialogs)
+    }
+
+    fn picked(id: &str, path: Option<&str>) -> Message {
+        Message::SavePicked {
+            room_id: room_a(),
+            item_id: id.to_owned(),
+            path: path.map(|p| SavePath::from(PathBuf::from(p))),
+        }
+    }
+
+    #[test]
+    fn save_proposes_a_sanitised_name_and_sends_the_path_the_user_picked() {
+        let (mut app, mut rx, dialogs) = file_app();
+        let _ = app.update(Message::SaveRequested("doc".into()));
+        assert_eq!(
+            *dialogs.asked.lock().expect("mutex"),
+            vec!["report.pdf".to_owned()]
+        );
+        assert!(
+            drain(&mut rx).is_empty(),
+            "nothing is saved before the pick"
+        );
+        let _ = app.update(picked("doc", Some("/home/u/Documents/mine.pdf")));
+        let commands = drain(&mut rx);
+        assert_eq!(commands.len(), 1, "{commands:?}");
+        match &commands[0] {
+            Command::SaveMedia {
+                room_id,
+                item_id,
+                path,
+            } => {
+                assert_eq!(room_id, &room_a());
+                assert_eq!(item_id, "doc");
+                assert_eq!(path, &PathBuf::from("/home/u/Documents/mine.pdf"));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn save_adds_the_sent_time_to_a_generic_name() {
+        let (mut app, mut rx, dialogs) = media_app(0);
+        let _ = app.update(core(CoreEvent::TimelineDiff {
+            room_id: room_a(),
+            diffs: vec![ListDiff::Append {
+                values: vec![media_item("pasted", MediaKind::Image, "image.png", 4, 4)],
+            }],
+        }));
+        let _ = drain(&mut rx);
+        let _ = app.update(Message::SaveRequested("pasted".into()));
+        // `media_item` sends at 1 ms after the epoch, shown in local time.
+        let sent = chrono::TimeZone::timestamp_millis_opt(&chrono::Local, 1).unwrap();
+        assert_eq!(
+            *dialogs.asked.lock().expect("mutex"),
+            vec![format!("image-{}.png", sent.format("%Y%m%d-%H%M%S"))]
+        );
+    }
+
+    #[test]
+    fn a_cancelled_or_unusable_pick_saves_nothing() {
+        let (mut app, mut rx, _) = file_app();
+        for path in [
+            None,
+            Some("relative/file.pdf"),
+            Some("file.pdf"),
+            Some("/"),
+            Some(""),
+            Some("/home/u/.."),
+        ] {
+            let _ = app.update(picked("doc", path));
+            assert!(drain(&mut rx).is_empty(), "{path:?}");
+        }
+    }
+
+    #[test]
+    fn a_pick_for_an_item_that_is_not_media_or_in_another_room_saves_nothing() {
+        let (mut app, mut rx, dialogs) = file_app();
+        let _ = app.update(Message::SaveRequested("missing".into()));
+        assert!(dialogs.asked.lock().expect("mutex").is_empty());
+        let _ = app.update(picked("missing", Some("/tmp/x.bin")));
+        let _ = app.update(Message::SavePicked {
+            room_id: RoomId::from("!b:x"),
+            item_id: "doc".into(),
+            path: Some(SavePath::from(PathBuf::from("/tmp/x.bin"))),
+        });
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn open_is_offered_for_any_file_once_it_is_saved() {
+        let (mut app, mut rx, _) = file_app();
+        let doc = key_of("doc");
+        assert!(!app.media.open_allowed(&doc));
+        let _ = app.update(picked("doc", Some("/home/u/mine.pdf")));
+        assert!(!app.media.open_allowed(&doc), "not saved yet");
+        let _ = app.update(core(CoreEvent::MediaSaved {
+            room_id: room_a(),
+            item_id: "doc".into(),
+        }));
+        assert!(app.media.open_allowed(&doc));
+        // Programs and names without an extension too: the bar asks first.
+        for (id, path) in [("prog", "/home/u/setup.exe"), ("bare", "/home/u/README")] {
+            let _ = app.update(picked(id, Some(path)));
+            let _ = app.update(core(CoreEvent::MediaSaved {
+                room_id: room_a(),
+                item_id: id.into(),
+            }));
+            assert!(app.media.open_allowed(&key_of(id)), "{id}");
+        }
+        let _ = drain(&mut rx);
+    }
+
+    fn saved_and_asked(app: &mut App, id: &str, path: &str) -> Option<(String, Option<String>)> {
+        let _ = app.update(picked(id, Some(path)));
+        let _ = app.update(core(CoreEvent::MediaSaved {
+            room_id: room_a(),
+            item_id: id.into(),
+        }));
+        let _ = app.update(Message::OpenRequested(id.into()));
+        let bar = app.media.open_bar.as_ref()?;
+        Some((bar.question(), bar.warning().map(str::to_owned)))
+    }
+
+    #[test]
+    fn open_asks_first_and_warns_before_a_program() {
+        let (mut app, _rx, _) = file_app();
+        let (question, warning) =
+            saved_and_asked(&mut app, "doc", "/home/u/mine.pdf").expect("bar");
+        assert_eq!(question, "Open mine.pdf?");
+        assert_eq!(warning, None, "a document gets the plain question");
+        let _ = app.update(Message::OpenDismissed);
+        assert!(app.media.open_bar.is_none());
+        // The sender named it a program.
+        let (question, warning) =
+            saved_and_asked(&mut app, "prog", "/home/u/setup.exe").expect("bar");
+        assert_eq!(question, "Open setup.exe?");
+        assert_eq!(
+            warning.as_deref(),
+            Some(
+                "This file can run a program on your computer. Open it only if you trust the sender."
+            )
+        );
+        // A document saved under a program's name warns too.
+        let (_, warning) = saved_and_asked(&mut app, "doc", "/home/u/innocent.sh").expect("bar");
+        assert!(warning.is_some(), "the saved name decides as well");
+        // Never saved: no bar.
+        let _ = app.update(Message::OpenDismissed);
+        let _ = app.update(Message::OpenRequested("bare".into()));
+        assert!(app.media.open_bar.is_none());
+    }
+
+    #[test]
+    fn a_failed_save_shows_a_notice_and_forgets_the_pending_path() {
+        let (mut app, _rx, _) = file_app();
+        let _ = app.update(picked("doc", Some("/home/u/mine.pdf")));
+        let _ = app.update(core(CoreEvent::ActionFailed {
+            room_id: room_a(),
+            action: ActionKind::Media,
+            error: CoreError::Internal("disk full".into()),
+        }));
+        assert!(app.actions.notice.is_some());
+        let _ = app.update(core(CoreEvent::MediaSaved {
+            room_id: room_a(),
+            item_id: "doc".into(),
+        }));
+        assert!(
+            !app.media.open_allowed(&key_of("doc")),
+            "a late success for a save that was reported failed opens nothing"
+        );
+    }
+
+    #[test]
+    fn debug_of_the_app_and_its_media_messages_shows_no_bytes_or_names() {
+        let (mut app, mut rx, _) = media_app(0);
+        let _ = app.update(core(CoreEvent::TimelineDiff {
+            room_id: room_a(),
+            diffs: vec![ListDiff::Append {
+                values: vec![
+                    media_item("pic", MediaKind::Image, FILE_SENTINEL, 640, 480),
+                    media_item("doc", MediaKind::File, FILE_SENTINEL, 0, 0),
+                ],
+            }],
+        }));
+        let _ = drain(&mut rx);
+        arrive(&mut app, "pic", Some(decoded(8, 6)));
+        let _ = app.update(Message::MediaClicked("pic".into()));
+        let _ = app.update(media_event("pic", MediaSize::Full, Ok(png(9, 7))));
+        let _ = app.update(Message::MediaDecoded {
+            room_id: room_a(),
+            item_id: "pic".into(),
+            size: MediaSize::Full,
+            decoded: Some(decoded(9, 7)),
+        });
+        let _ = app.update(picked("doc", Some("/home/u/sentinel-file-name-x")));
+        let _ = app.update(core(CoreEvent::MediaSaved {
+            room_id: room_a(),
+            item_id: "doc".into(),
+        }));
+        let _ = app.update(Message::OpenRequested("doc".into()));
+        assert!(app.media.viewer.is_some());
+        let dbg = format!("{app:?}");
+        assert!(!dbg.contains(FILE_SENTINEL), "{dbg}");
+        assert!(!dbg.contains("/home/u"), "{dbg}");
+        assert!(dbg.contains("media"), "the app Debug still reports media");
+        let message = Message::MediaDecoded {
+            room_id: room_a(),
+            item_id: "x".into(),
+            size: MediaSize::Full,
+            decoded: Some(decoded(9, 7)),
+        };
+        let dbg = format!(
+            "{message:?} {:?}",
+            picked("doc", Some("/home/u/sentinel-file-name-x"))
+        );
+        assert!(
+            !dbg.contains(FILE_SENTINEL) && !dbg.contains("/home/u"),
+            "{dbg}"
+        );
+        assert!(!dbg.contains("pixels"), "{dbg}");
+    }
+
+    /// The tags of the first-child chain of a laid-out tree.
+    fn tag_path(app: &App) -> Vec<iced::advanced::widget::tree::Tag> {
+        use iced::advanced::widget::Tree;
+        let element = app.view();
+        let tree = Tree::new(element.as_widget());
+        let mut tags = vec![tree.tag];
+        let mut node = &tree;
+        while let Some(child) = node.children.first() {
+            tags.push(child.tag);
+            node = child;
+        }
+        tags
+    }
+
+    #[test]
+    fn opening_the_viewer_keeps_the_widget_tree_under_it() {
+        let (mut app, _rx, _) = media_app(2);
+        let closed = tag_path(&app);
+        let _ = app.update(Message::MediaClicked("img0".into()));
+        assert_eq!(tag_path(&app), closed, "the base keeps its place");
+        let _ = app.update(Message::ViewerClosed);
+        assert_eq!(tag_path(&app), closed);
+    }
+
+    #[test]
+    fn logging_out_forgets_the_media() {
+        let (mut app, _rx, _) = media_app(2);
+        arrive(&mut app, "img1", Some(decoded(8, 6)));
+        let _ = app.update(Message::MediaClicked("img0".into()));
+        let _ = app.update(core(CoreEvent::LoggedOut));
+        assert!(app.media.viewer.is_none());
+        assert!(app.media.thumb(&key_of("img1")).is_none());
+    }
+
+    // ---- Task 10: uploads ----
+
+    mod uploads {
+        use std::path::PathBuf;
+        use std::sync::Arc;
+
+        use tessera_core::api::{
+            ActionKind, AttachmentData, MediaContent, MediaKind, MessageText, UploadProgress,
+        };
+
+        use super::*;
+        use crate::dialogs::{ClipboardContent, RecordingClipboard, RecordingDialogs};
+        use crate::upload::{self, EntryState, Outcome, Refusal, TooLarge, UploadPaths};
+
+        fn rig() -> (
+            App,
+            mpsc::Receiver<Command>,
+            RecordingDialogs,
+            RecordingClipboard,
+        ) {
+            let (mut app, rx) = main_app();
+            let dialogs = RecordingDialogs::default();
+            let clipboard = RecordingClipboard::default();
+            app.set_dialogs(Box::new(dialogs.clone()));
+            app.set_clipboard(Box::new(clipboard.clone()));
+            (app, rx, dialogs, clipboard)
+        }
+
+        fn paths(names: &[&str]) -> UploadPaths {
+            UploadPaths(
+                names
+                    .iter()
+                    .map(|n| PathBuf::from(format!("/x/{n}")))
+                    .collect(),
+            )
+        }
+
+        fn outcome_for(name: &str, bytes: Vec<u8>, limit: Option<u64>) -> Outcome {
+            upload::prepare_bytes(name.to_owned(), bytes, limit)
+        }
+
+        fn prepared(entry: u64, name: &str, bytes: Vec<u8>) -> Message {
+            Message::UploadPrepared {
+                entry,
+                outcome: Box::new(outcome_for(name, bytes, None)),
+            }
+        }
+
+        fn attachments(commands: &[Command]) -> Vec<&tessera_core::api::OutgoingAttachment> {
+            commands
+                .iter()
+                .filter_map(|c| match c {
+                    Command::SendAttachment(a) => Some(a),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        #[test]
+        fn attach_opens_the_picker_only_with_a_room() {
+            let (mut app, _rx, dialogs, _) = rig();
+            let _ = app.update(Message::AttachRequested);
+            assert_eq!(*dialogs.picked.lock().expect("mutex"), 1);
+            let _ = app.update(Message::SelectRoom(RoomId::from("!a:x")));
+            app.deselect();
+            let _ = app.update(Message::AttachRequested);
+            assert_eq!(
+                *dialogs.picked.lock().expect("mutex"),
+                1,
+                "no room, no dialog"
+            );
+        }
+
+        #[test]
+        fn chosen_files_open_one_confirmation_in_order() {
+            let (mut app, _rx, _, _) = rig();
+            let task = app.update(Message::FilesChosen(paths(&["b.txt", "a.txt"])));
+            assert!(task.units() >= 2, "one read per file, in tasks");
+            let dialog = app.uploads.dialog.as_ref().expect("a confirmation");
+            assert_eq!(dialog.room_id, room_a());
+            let names: Vec<_> = dialog.entries.iter().map(|e| e.name.as_str()).collect();
+            assert_eq!(names, ["b.txt", "a.txt"]);
+            assert!(dialog.loading());
+            assert!(!dialog.can_send());
+        }
+
+        #[test]
+        fn an_empty_answer_opens_nothing() {
+            let (mut app, _rx, _, _) = rig();
+            let _ = app.update(Message::FilesChosen(UploadPaths(Vec::new())));
+            assert!(app.uploads.dialog.is_none());
+        }
+
+        #[test]
+        fn at_most_twenty_files_are_taken() {
+            let (mut app, _rx, _, _) = rig();
+            let many: Vec<String> = (0..30).map(|n| format!("f{n}.txt")).collect();
+            let many: Vec<&str> = many.iter().map(String::as_str).collect();
+            let _ = app.update(Message::FilesChosen(paths(&many)));
+            let dialog = app.uploads.dialog.as_ref().expect("dialog");
+            assert_eq!(dialog.entries.len(), upload::MAX_FILES);
+            let _ = app.update(Message::FilesChosen(paths(&["more.txt"])));
+            let dialog = app.uploads.dialog.as_ref().expect("dialog");
+            assert_eq!(dialog.entries.len(), upload::MAX_FILES, "the cap holds");
+        }
+
+        #[test]
+        fn names_are_base_names_without_separators_or_controls() {
+            let (mut app, _rx, _, _) = rig();
+            let evil = UploadPaths(vec![PathBuf::from("/tmp/dir/sub/na\u{202E}me\n.txt")]);
+            let _ = app.update(Message::FilesChosen(evil));
+            let dialog = app.uploads.dialog.as_ref().expect("dialog");
+            assert_eq!(dialog.entries[0].name, "name.txt");
+        }
+
+        #[test]
+        fn prepared_files_fill_their_lines_and_unlock_send() {
+            let (mut app, _rx, _, _) = rig();
+            let _ = app.update(Message::FilesChosen(paths(&["a.txt", "b.txt"])));
+            let ids: Vec<u64> = app
+                .uploads
+                .dialog
+                .as_ref()
+                .expect("dialog")
+                .entries
+                .iter()
+                .map(|e| e.id)
+                .collect();
+            let _ = app.update(prepared(ids[1], "b.txt", b"bee".to_vec()));
+            assert!(
+                !app.uploads.dialog.as_ref().expect("dialog").can_send(),
+                "a.txt still loads"
+            );
+            let _ = app.update(prepared(ids[0], "a.txt", b"ay".to_vec()));
+            let dialog = app.uploads.dialog.as_ref().expect("dialog");
+            assert!(dialog.can_send());
+            assert_eq!(dialog.sendable(), 2);
+        }
+
+        #[test]
+        fn a_late_answer_for_a_closed_confirmation_is_ignored() {
+            let (mut app, _rx, _, _) = rig();
+            let _ = app.update(Message::FilesChosen(paths(&["a.txt"])));
+            let id = app.uploads.dialog.as_ref().expect("dialog").entries[0].id;
+            let _ = app.update(Message::UploadCancelled);
+            let _ = app.update(prepared(id, "a.txt", b"x".to_vec()));
+            assert!(app.uploads.dialog.is_none());
+        }
+
+        #[test]
+        fn over_limit_files_are_refused_with_the_limit_shown() {
+            let (mut app, _rx, _, _) = rig();
+            let _ = app.update(core(CoreEvent::MediaLimits {
+                max_upload_bytes: Some(10),
+            }));
+            assert_eq!(app.uploads.max_upload_bytes, Some(10));
+            let refused = outcome_for("big.bin", vec![0; 11], Some(10));
+            assert!(matches!(
+                refused,
+                Outcome::Refused(Refusal::TooLarge(TooLarge { limit: 10 }))
+            ));
+            let _ = app.update(Message::FilesChosen(paths(&["big.bin"])));
+            let id = app.uploads.dialog.as_ref().expect("dialog").entries[0].id;
+            let _ = app.update(Message::UploadPrepared {
+                entry: id,
+                outcome: Box::new(refused),
+            });
+            let dialog = app.uploads.dialog.as_ref().expect("dialog");
+            assert!(matches!(
+                dialog.entries[0].state,
+                EntryState::Refused(Refusal::TooLarge(_))
+            ));
+            assert!(!dialog.can_send());
+            assert!(
+                Refusal::TooLarge(TooLarge { limit: 10_000_000 })
+                    .text()
+                    .contains("10.0 MB")
+            );
+        }
+
+        #[test]
+        fn hovering_shows_the_drop_layer_and_leaving_hides_it() {
+            let (mut app, _rx, _, _) = rig();
+            let _ = app.update(Message::FileHovered);
+            assert!(app.uploads.hovering);
+            let _ = app.update(Message::FilesHoveredLeft);
+            assert!(!app.uploads.hovering);
+        }
+
+        #[test]
+        fn dropped_files_gather_into_one_confirmation_after_the_pause() {
+            let (mut app, _rx, _, _) = rig();
+            let _ = app.update(Message::FileHovered);
+            let _ = app.update(Message::FileDropped(paths(&["one.txt"])));
+            let first_seq = app.uploads.drop_seq;
+            let _ = app.update(Message::FileDropped(paths(&["two.txt"])));
+            assert!(!app.uploads.hovering, "a drop ends the hover");
+            assert!(
+                app.uploads.dialog.is_none(),
+                "nothing opens before the pause"
+            );
+            // The timer of the first drop is stale.
+            let _ = app.update(Message::DropsDue(first_seq));
+            assert!(app.uploads.dialog.is_none());
+            let _ = app.update(Message::DropsDue(app.uploads.drop_seq));
+            let dialog = app.uploads.dialog.as_ref().expect("a confirmation");
+            let names: Vec<_> = dialog.entries.iter().map(|e| e.name.as_str()).collect();
+            assert_eq!(names, ["one.txt", "two.txt"]);
+            assert!(app.uploads.dropped.is_empty());
+        }
+
+        #[test]
+        fn drops_without_a_room_are_ignored() {
+            let (mut app, _rx, _, _) = rig();
+            app.deselect();
+            let _ = app.update(Message::FileHovered);
+            assert!(!app.uploads.hovering);
+            let _ = app.update(Message::FileDropped(paths(&["a.txt"])));
+            assert!(app.uploads.dropped.is_empty());
+        }
+
+        #[test]
+        fn paste_reads_the_clipboard_in_a_task() {
+            let (mut app, _rx, _, clipboard) = rig();
+            let _ = app.update(Message::PasteRequested);
+            assert_eq!(*clipboard.reads.lock().expect("mutex"), 1);
+        }
+
+        #[test]
+        fn pasted_text_goes_into_the_composer() {
+            let (mut app, _rx, _, _) = rig();
+            type_in(&mut app, "ab");
+            let _ = app.update(Message::Pasted(ClipboardContent::Text(MessageText::from(
+                "XY",
+            ))));
+            assert_eq!(app.composer.text(), "abXY");
+            assert!(app.uploads.dialog.is_none());
+        }
+
+        #[test]
+        fn a_pasted_picture_opens_the_confirmation_with_a_png() {
+            let (mut app, _rx, _, _) = rig();
+            let task = app.update(Message::Pasted(ClipboardContent::Image {
+                width: 2,
+                height: 2,
+                rgba: Arc::new(vec![255; 16]),
+            }));
+            assert!(task.units() >= 1, "the PNG is made in a task");
+            let dialog = app.uploads.dialog.as_ref().expect("a confirmation");
+            assert_eq!(dialog.entries.len(), 1);
+            assert!(dialog.loading());
+            assert_eq!(composer_text(&app), "");
+        }
+
+        #[test]
+        fn pixels_become_a_png_file() {
+            let rgba = vec![200u8; 4 * 3 * 4];
+            let Outcome::Ready(p) = upload::prepare_pixels("p.png".into(), 4, 3, &rgba, None)
+            else {
+                panic!("ready");
+            };
+            assert_eq!(p.mime, "image/png");
+            assert_eq!(p.kind, MediaKind::Image);
+            assert_eq!((p.width, p.height), (Some(4), Some(3)));
+            assert!(
+                matches!(&p.source, upload::Source::Bytes(b) if b.starts_with(&[0x89, b'P', b'N', b'G']))
+            );
+            // A size that does not match the pixels is refused.
+            assert!(matches!(
+                upload::prepare_pixels("p.png".into(), 4, 3, &rgba[..10], None),
+                Outcome::Refused(Refusal::BadPicture)
+            ));
+        }
+
+        #[test]
+        fn an_unreadable_clipboard_falls_back_to_the_window_systems_text_paste() {
+            let (mut app, _rx, _, _) = rig();
+            let task = app.update(Message::Pasted(ClipboardContent::Unavailable));
+            assert!(task.units() >= 1, "iced::clipboard::read");
+            assert!(app.uploads.dialog.is_none());
+            type_in(&mut app, "a");
+            let _ = app.update(Message::PasteFallback(Some(MessageText::from("bc"))));
+            assert_eq!(app.composer.text(), "abc");
+            let _ = app.update(Message::PasteFallback(None));
+            assert_eq!(app.composer.text(), "abc");
+        }
+
+        fn composer_text(app: &App) -> String {
+            app.composer.text()
+        }
+
+        /// Confirms two ready files with a reply and a thread root set.
+        fn two_ready(app: &mut App) {
+            let _ = app.update(Message::FilesChosen(paths(&["a.txt", "b.png"])));
+            let ids: Vec<u64> = app
+                .uploads
+                .dialog
+                .as_ref()
+                .expect("dialog")
+                .entries
+                .iter()
+                .map(|e| e.id)
+                .collect();
+            let _ = app.update(prepared(ids[0], "a.txt", b"ay".to_vec()));
+            let _ = app.update(prepared(ids[1], "b.txt", b"bee".to_vec()));
+        }
+
+        #[test]
+        fn send_queues_one_attachment_per_file_in_order() {
+            let (mut app, mut rx, _, _) = rig();
+            two_ready(&mut app);
+            let _ = drain(&mut rx);
+            let _ = app.update(Message::UploadConfirmed);
+            let commands = drain(&mut rx);
+            let sent = attachments(&commands);
+            assert_eq!(sent.len(), 2);
+            assert_eq!(sent[0].filename, "a.txt");
+            assert_eq!(sent[1].filename, "b.txt");
+            assert!(sent.iter().all(|a| a.room_id == room_a()));
+            assert!(
+                sent.iter()
+                    .all(|a| a.reply_to.is_none() && a.thread_root.is_none())
+            );
+            assert_eq!(sent[0].mimetype, "text/plain");
+            assert!(matches!(&sent[0].data, AttachmentData::Bytes(b) if b.as_bytes() == b"ay"));
+            assert!(app.uploads.dialog.is_none());
+        }
+
+        #[test]
+        fn path_files_go_to_the_core_as_paths_with_the_base_name_only() {
+            let (mut app, mut rx, _, _) = rig();
+            let _ = app.update(Message::FilesChosen(paths(&["a.txt"])));
+            let id = app.uploads.dialog.as_ref().expect("dialog").entries[0].id;
+            let outcome = Outcome::Ready(Box::new(upload::Prepared {
+                name: "a.txt".into(),
+                size: 3,
+                source: upload::Source::Path(PathBuf::from("/x/a.txt")),
+                mime: "text/plain",
+                kind: MediaKind::File,
+                width: None,
+                height: None,
+                thumbnail: None,
+                preview: None,
+            }));
+            let _ = app.update(Message::UploadPrepared {
+                entry: id,
+                outcome: Box::new(outcome),
+            });
+            let _ = drain(&mut rx);
+            let _ = app.update(Message::UploadConfirmed);
+            let commands = drain(&mut rx);
+            let sent = attachments(&commands);
+            assert_eq!(sent.len(), 1);
+            assert_eq!(sent[0].filename, "a.txt");
+            assert!(
+                matches!(&sent[0].data, AttachmentData::Path(p) if p == &PathBuf::from("/x/a.txt"))
+            );
+        }
+
+        #[test]
+        fn send_carries_the_reply_target_and_the_thread_root() {
+            let (mut app, mut rx, _, _) = rig();
+            let mut target = media_item("m1", MediaKind::File, "f.bin", 1, 1);
+            target.event_id = Some(EventId::from("$target:x"));
+            let _ = app.update(core(CoreEvent::TimelineDiff {
+                room_id: room_a(),
+                diffs: vec![ListDiff::Append {
+                    values: vec![target],
+                }],
+            }));
+            app.composer.mode = composer::Mode::Reply("m1".into());
+            app.uploads.thread_root = Some(EventId::from("$root:x"));
+            two_ready(&mut app);
+            let _ = drain(&mut rx);
+            let _ = app.update(Message::UploadConfirmed);
+            let commands = drain(&mut rx);
+            let sent = attachments(&commands);
+            assert_eq!(sent.len(), 2);
+            for a in &sent {
+                assert_eq!(a.reply_to.as_ref().map(EventId::as_str), Some("$target:x"));
+                assert_eq!(a.thread_root.as_ref().map(EventId::as_str), Some("$root:x"));
+            }
+            assert_eq!(
+                app.composer.mode,
+                composer::Mode::Normal,
+                "the reply is used up"
+            );
+        }
+
+        #[test]
+        fn send_skips_refused_files_and_waits_for_loading_ones() {
+            let (mut app, mut rx, _, _) = rig();
+            let _ = app.update(Message::FilesChosen(paths(&["a.txt", "b.txt"])));
+            let ids: Vec<u64> = app
+                .uploads
+                .dialog
+                .as_ref()
+                .expect("dialog")
+                .entries
+                .iter()
+                .map(|e| e.id)
+                .collect();
+            let _ = app.update(prepared(ids[0], "a.txt", b"x".to_vec()));
+            let _ = drain(&mut rx);
+            let _ = app.update(Message::UploadConfirmed);
+            assert!(attachments(&drain(&mut rx)).is_empty(), "b.txt still loads");
+            assert!(app.uploads.dialog.is_some());
+            let _ = app.update(Message::UploadPrepared {
+                entry: ids[1],
+                outcome: Box::new(Outcome::Refused(Refusal::Unreadable)),
+            });
+            let _ = app.update(Message::UploadConfirmed);
+            let commands = drain(&mut rx);
+            assert_eq!(attachments(&commands).len(), 1);
+        }
+
+        #[test]
+        fn cancel_and_changing_rooms_close_the_confirmation() {
+            let (mut app, mut rx, _, _) = rig();
+            two_ready(&mut app);
+            let _ = app.update(Message::UploadCancelled);
+            assert!(app.uploads.dialog.is_none());
+            assert!(attachments(&drain(&mut rx)).is_empty());
+            two_ready(&mut app);
+            let _ = app.update(Message::SelectRoom(RoomId::from("!b:x")));
+            assert!(app.uploads.dialog.is_none());
+        }
+
+        #[test]
+        fn logging_out_forgets_uploads() {
+            let (mut app, _rx, _, _) = rig();
+            two_ready(&mut app);
+            app.uploads.max_upload_bytes = Some(5);
+            let _ = app.update(core(CoreEvent::LoggedOut));
+            assert!(app.uploads.dialog.is_none());
+            assert_eq!(app.uploads.max_upload_bytes, None);
+        }
+
+        #[test]
+        fn messages_and_state_never_print_paths_names_or_pixels() {
+            let (mut app, _rx, _, _) = rig();
+            let secret = UploadPaths(vec![PathBuf::from("/home/u/secret-sentinel.txt")]);
+            let shown = format!("{:?}", Message::FilesChosen(secret.clone()));
+            assert!(!shown.contains("secret-sentinel"), "{shown}");
+            let shown = format!("{:?}", Message::FileDropped(secret.clone()));
+            assert!(!shown.contains("secret-sentinel"), "{shown}");
+            let _ = app.update(Message::FilesChosen(secret));
+            let id = app.uploads.dialog.as_ref().expect("dialog").entries[0].id;
+            let _ = app.update(prepared(
+                id,
+                "secret-sentinel.txt",
+                b"body-sentinel".to_vec(),
+            ));
+            let shown = format!("{app:?}");
+            assert!(!shown.contains("secret-sentinel"), "{shown}");
+            assert!(!shown.contains("body-sentinel"), "{shown}");
+            let message = prepared(id, "secret-sentinel.txt", b"body-sentinel".to_vec());
+            let shown = format!("{message:?}");
+            assert!(
+                !shown.contains("secret-sentinel") && !shown.contains("body-sentinel"),
+                "{shown}"
+            );
+            let clip = format!(
+                "{:?}",
+                Message::Pasted(ClipboardContent::Text(MessageText::from("clip-sentinel")))
+            );
+            assert!(!clip.contains("clip-sentinel"), "{clip}");
+        }
+
+        // ---- progress and cancel ----
+
+        fn upload_echo(
+            id: &str,
+            sent: SendStatus,
+            progress: Option<UploadProgress>,
+        ) -> TimelineItem {
+            let mut content = MediaContent::new(MediaKind::File, "f.bin".to_owned());
+            content.upload = progress;
+            TimelineItem::new(
+                id.to_owned(),
+                TimelineItemKind::Message {
+                    sender: UserId::from("@a:x"),
+                    body: "f.bin".to_owned(),
+                    is_own: true,
+                    timestamp_ms: 1,
+                    sent,
+                    details: Box::new(MessageDetails {
+                        media: Some(Box::new(content)),
+                        ..MessageDetails::default()
+                    }),
+                },
+            )
+        }
+
+        fn show(app: &mut App, item: TimelineItem) {
+            let _ = app.update(core(CoreEvent::TimelineDiff {
+                room_id: room_a(),
+                diffs: vec![ListDiff::Append { values: vec![item] }],
+            }));
+        }
+
+        #[test]
+        fn cancel_discards_an_upload_that_is_in_progress() {
+            let (mut app, mut rx, _, _) = rig();
+            show(
+                &mut app,
+                upload_echo(
+                    "up",
+                    SendStatus::Sending,
+                    Some(UploadProgress { sent: 1, total: 4 }),
+                ),
+            );
+            let _ = drain(&mut rx);
+            let _ = app.update(Message::DiscardRequested("up".into()));
+            assert!(matches!(
+                drain(&mut rx).as_slice(),
+                [Command::DiscardSend { item_id, .. }] if item_id == "up"
+            ));
+        }
+
+        #[test]
+        fn a_plain_message_that_is_sending_cannot_be_discarded() {
+            let (mut app, mut rx, _, _) = rig();
+            show(&mut app, upload_echo("up", SendStatus::Sending, None));
+            let _ = drain(&mut rx);
+            let _ = app.update(Message::DiscardRequested("up".into()));
+            assert!(drain(&mut rx).is_empty());
+        }
+
+        #[test]
+        fn failures_of_cancel_and_upload_show_a_notice_in_the_open_room() {
+            let (mut app, _rx, _, _) = rig();
+            let _ = app.update(core(CoreEvent::ActionFailed {
+                room_id: room_a(),
+                action: ActionKind::Discard,
+                error: CoreError::Internal("x".into()),
+            }));
+            let notice = app.actions.notice.as_ref().expect("a notice").text.clone();
+            assert!(notice.contains("cancel"), "{notice}");
+            let _ = app.update(core(CoreEvent::ActionFailed {
+                room_id: room_a(),
+                action: ActionKind::Upload,
+                error: CoreError::NotAllowed,
+            }));
+            let notice = app.actions.notice.as_ref().expect("a notice").text.clone();
+            assert!(notice.contains("not sent"), "{notice}");
+            // Another room's failure is not shown here.
+            app.actions.notice = None;
+            let _ = app.update(core(CoreEvent::ActionFailed {
+                room_id: RoomId::from("!b:x"),
+                action: ActionKind::Upload,
+                error: CoreError::NotAllowed,
+            }));
+            assert!(app.actions.notice.is_none());
+        }
+
+        #[test]
+        fn opening_the_confirmation_keeps_the_widget_tree_under_it() {
+            let (mut app, _rx, _, _) = rig();
+            let closed = tag_path(&app);
+            let _ = app.update(Message::FileHovered);
+            assert_eq!(tag_path(&app), closed);
+            let _ = app.update(Message::FilesHoveredLeft);
+            two_ready(&mut app);
+            assert_eq!(tag_path(&app), closed, "the base keeps its place");
+            let _ = app.update(Message::UploadCancelled);
+            assert_eq!(tag_path(&app), closed);
+        }
+    }
+
+    mod notification_flow {
+        use tessera_core::api::{
+            EventId, NotificationKind, NotificationView, RoomNotificationModeView,
+        };
+
+        use super::*;
+        use crate::notifications::{ModeChoice, RecordingNotifier, Request};
+        use crate::tray::{FakeTray, FakeTrayFactory, TrayAction};
+
+        struct Rig {
+            app: App,
+            rx: mpsc::Receiver<Command>,
+            shown: Arc<std::sync::Mutex<Vec<Request>>>,
+            tray: FakeTray,
+        }
+
+        fn rig_with(tray_fails: bool) -> Rig {
+            let (mut app, rx) = main_app();
+            let notifier = RecordingNotifier::default();
+            let shown = notifier.shown.clone();
+            app.set_notifier(Box::new(notifier));
+            let factory = FakeTrayFactory {
+                fail: tray_fails,
+                ..FakeTrayFactory::default()
+            };
+            let tray = factory.tray.clone();
+            app.set_tray_factory(Box::new(factory));
+            Rig {
+                app,
+                rx,
+                shown,
+                tray,
+            }
+        }
+
+        fn rig() -> Rig {
+            rig_with(false)
+        }
+
+        fn unfocus(app: &mut App) {
+            let _ = app.update(Message::WindowFocus(false));
+        }
+
+        fn view(room: &str, kind: NotificationKind, is_dm: bool) -> NotificationView {
+            NotificationView {
+                room_id: RoomId::from(format!("!{room}:x")),
+                event_id: EventId::from("$e"),
+                room_name: room.to_owned(),
+                sender: UserId::from("@bob:x"),
+                sender_name: Some("Bob".into()),
+                is_dm,
+                kind,
+                preview: Some(MessageText::from("secret preview text")),
+            }
+        }
+
+        fn notify(app: &mut App, v: NotificationView) -> Task<Message> {
+            app.update(core(CoreEvent::Notification(v)))
+        }
+
+        fn requests(rig: &Rig) -> Vec<Request> {
+            rig.shown.lock().expect("test mutex").clone()
+        }
+
+        #[test]
+        fn an_unfocused_window_shows_a_dm_and_a_focused_one_does_not() {
+            let mut rig = rig();
+            let _ = notify(&mut rig.app, view("b", NotificationKind::Message, true));
+            assert!(requests(&rig).is_empty(), "the window has focus");
+            unfocus(&mut rig.app);
+            let _ = notify(&mut rig.app, view("b", NotificationKind::Message, true));
+            let shown = requests(&rig);
+            assert_eq!(shown.len(), 1);
+            assert_eq!(shown[0].room_id, RoomId::from("!b:x"));
+            assert_eq!(shown[0].toast.title, "Bob");
+            assert_eq!(shown[0].toast.body, "secret preview text");
+        }
+
+        #[test]
+        fn the_selected_room_notifies_only_while_unfocused() {
+            let mut rig = rig();
+            assert_eq!(rig.app.selected, Some(RoomId::from("!a:x")));
+            let _ = notify(&mut rig.app, view("a", NotificationKind::Message, false));
+            assert!(requests(&rig).is_empty());
+            unfocus(&mut rig.app);
+            let _ = notify(&mut rig.app, view("a", NotificationKind::Message, false));
+            assert_eq!(requests(&rig).len(), 1);
+        }
+
+        #[test]
+        fn desktop_notifications_off_shows_nothing() {
+            let mut rig = rig();
+            rig.app.ui_settings.desktop_notifications = false;
+            unfocus(&mut rig.app);
+            let task = notify(&mut rig.app, view("b", NotificationKind::Mention, false));
+            assert!(requests(&rig).is_empty());
+            assert_eq!(task.units(), 0, "no attention request either");
+        }
+
+        #[test]
+        fn settings_stored_on_disk_reach_the_notification_path() {
+            let mut rig = rig();
+            rig.app.set_ui_settings(UiSettings {
+                show_message_content: false,
+                ..UiSettings::default()
+            });
+            unfocus(&mut rig.app);
+            let _ = notify(&mut rig.app, view("b", NotificationKind::Message, false));
+            let shown = requests(&rig);
+            assert_eq!(shown.len(), 1);
+            assert_eq!(shown[0].toast.body, "New message");
+            rig.app.set_ui_settings(UiSettings {
+                desktop_notifications: false,
+                ..UiSettings::default()
+            });
+            let _ = notify(&mut rig.app, view("c", NotificationKind::Message, false));
+            assert_eq!(requests(&rig).len(), 1, "notifications off shows nothing");
+        }
+
+        #[test]
+        fn with_content_off_the_preview_never_reaches_the_notifier() {
+            let mut rig = rig();
+            rig.app.ui_settings.show_message_content = false;
+            unfocus(&mut rig.app);
+            for (kind, is_dm) in [
+                (NotificationKind::Message, false),
+                (NotificationKind::Message, true),
+                (NotificationKind::Mention, false),
+                (NotificationKind::Encrypted, false),
+                (NotificationKind::Invite, false),
+            ] {
+                let _ = notify(
+                    &mut rig.app,
+                    view(&format!("r{is_dm}{kind:?}"), kind, is_dm),
+                );
+            }
+            let shown = requests(&rig);
+            assert_eq!(shown.len(), 5);
+            let bodies: Vec<&str> = shown.iter().map(|r| r.toast.body.as_str()).collect();
+            assert_eq!(
+                bodies,
+                [
+                    "New message",
+                    "New message",
+                    "Mentioned you",
+                    "New message",
+                    "Invited you"
+                ]
+            );
+            for request in &shown {
+                let text = format!("{} {}", request.toast.title, request.toast.body);
+                assert!(!text.contains("secret"), "{text}");
+                assert!(!text.contains("Bob"), "{text}");
+            }
+        }
+
+        #[test]
+        fn a_burst_in_one_room_folds_into_the_shown_notification() {
+            let mut rig = rig();
+            unfocus(&mut rig.app);
+            let _ = notify(&mut rig.app, view("b", NotificationKind::Message, false));
+            let _ = rig.app.update(Message::NotificationShown {
+                room_id: RoomId::from("!b:x"),
+                id: 7,
+            });
+            let _ = notify(&mut rig.app, view("b", NotificationKind::Message, false));
+            let _ = notify(&mut rig.app, view("b", NotificationKind::Message, false));
+            let shown = requests(&rig);
+            assert_eq!(shown.len(), 3);
+            assert_eq!(shown[0].replace, None);
+            assert_eq!(shown[1].replace, Some(7));
+            assert_eq!(shown[1].toast.body, "2 new messages");
+            assert_eq!(shown[2].toast.body, "3 new messages");
+            // Another room is not folded in.
+            let _ = notify(&mut rig.app, view("a", NotificationKind::Message, false));
+            assert_eq!(requests(&rig)[3].replace, None);
+        }
+
+        #[test]
+        fn a_mention_asks_for_attention_and_a_plain_message_does_not() {
+            let mut rig = rig();
+            unfocus(&mut rig.app);
+            let plain = notify(&mut rig.app, view("b", NotificationKind::Message, false));
+            assert_eq!(plain.units(), 0);
+            let mention = notify(&mut rig.app, view("a", NotificationKind::Mention, false));
+            assert!(mention.units() > 0);
+        }
+
+        #[test]
+        fn clicking_a_notification_selects_the_room_and_focuses_the_window() {
+            let mut rig = rig();
+            let task = rig
+                .app
+                .update(Message::OpenRoomFromNotification(RoomId::from("!b:x")));
+            assert!(task.units() > 0);
+            assert_eq!(rig.app.selected, Some(RoomId::from("!b:x")));
+            let commands = drain(&mut rig.rx);
+            assert!(
+                commands
+                    .iter()
+                    .any(|c| matches!(c, Command::SelectRoom(id) if *id == RoomId::from("!b:x")))
+            );
+            // The same room again: only the focus.
+            let task = rig
+                .app
+                .update(Message::OpenRoomFromNotification(RoomId::from("!b:x")));
+            assert!(task.units() > 0);
+            assert!(drain(&mut rig.rx).is_empty());
+            // A room that is not listed is not selected.
+            let _ = rig
+                .app
+                .update(Message::OpenRoomFromNotification(RoomId::from("!zz:x")));
+            assert_eq!(rig.app.selected, Some(RoomId::from("!b:x")));
+        }
+
+        fn mode_commands(rig: &mut Rig) -> Vec<Command> {
+            drain(&mut rig.rx)
+                .into_iter()
+                .filter(|c| matches!(c, Command::SetRoomNotificationMode { .. }))
+                .collect()
+        }
+
+        #[test]
+        fn each_menu_choice_sends_its_command_once() {
+            let mut rig = rig();
+            let room = RoomId::from("!a:x");
+            for (choice, mode) in [
+                (
+                    ModeChoice::AllMessages,
+                    Some(RoomNotificationModeView::AllMessages),
+                ),
+                (
+                    ModeChoice::MentionsAndKeywords,
+                    Some(RoomNotificationModeView::MentionsAndKeywords),
+                ),
+                (ModeChoice::Mute, Some(RoomNotificationModeView::Mute)),
+                (ModeChoice::Default, None),
+            ] {
+                let _ = rig.app.update(Message::RoomModeChosen(choice));
+                let commands = mode_commands(&mut rig);
+                assert_eq!(commands.len(), 1, "{choice:?}");
+                assert!(
+                    matches!(&commands[0], Command::SetRoomNotificationMode { room_id, mode: m }
+                        if *room_id == room && *m == mode),
+                    "{choice:?}: {commands:?}"
+                );
+                // The menu shows the choice at once, before the list catches up.
+                assert_eq!(rig.app.room_mode_choice(&room), choice);
+                // Choosing it again changes nothing.
+                let _ = rig.app.update(Message::RoomModeChosen(choice));
+                assert!(mode_commands(&mut rig).is_empty(), "{choice:?} twice");
+            }
+        }
+
+        #[test]
+        fn choosing_a_mode_without_a_room_sends_nothing() {
+            let mut rig = rig();
+            let _ = rig
+                .app
+                .update(core(CoreEvent::RoomListChanged(vec![ListDiff::Clear])));
+            let _ = drain(&mut rig.rx);
+            let _ = rig.app.update(Message::RoomModeChosen(ModeChoice::Mute));
+            assert!(mode_commands(&mut rig).is_empty());
+        }
+
+        #[test]
+        fn a_failed_change_goes_back_to_what_the_list_says() {
+            let mut rig = rig();
+            let room = RoomId::from("!a:x");
+            let _ = rig.app.update(Message::RoomModeChosen(ModeChoice::Mute));
+            assert_eq!(rig.app.room_mode_choice(&room), ModeChoice::Mute);
+            let _ = rig.app.update(core(CoreEvent::ActionFailed {
+                room_id: room.clone(),
+                action: ActionKind::Notifications,
+                error: CoreError::NotAllowed,
+            }));
+            assert_eq!(rig.app.room_mode_choice(&room), ModeChoice::Default);
+        }
+
+        #[test]
+        fn the_list_taking_over_drops_the_local_choice() {
+            let mut rig = rig();
+            let room = RoomId::from("!a:x");
+            let _ = rig.app.update(Message::RoomModeChosen(ModeChoice::Mute));
+            let mut changed = RoomSummary::new(room.clone(), "a".into());
+            changed.notification_mode = Some(RoomNotificationModeView::Mute);
+            let _ = rig
+                .app
+                .update(core(CoreEvent::RoomListChanged(vec![ListDiff::Set {
+                    index: 0,
+                    value: changed,
+                }])));
+            assert!(rig.app.room_modes.is_empty());
+            assert_eq!(rig.app.room_mode_choice(&room), ModeChoice::Mute);
+        }
+
+        #[test]
+        fn the_tray_appears_on_the_first_window_and_only_once() {
+            let mut rig = rig();
+            assert!(rig.tray.created.lock().expect("test mutex").is_empty());
+            let id = iced::window::Id::unique();
+            let _ = rig.app.update(Message::WindowOpened(id));
+            let _ = rig.app.update(Message::WindowOpened(id));
+            assert_eq!(rig.tray.created.lock().expect("test mutex").len(), 1);
+        }
+
+        #[test]
+        fn a_tray_failure_leaves_the_app_working() {
+            let mut rig = rig_with(true);
+            let _ = rig
+                .app
+                .update(Message::WindowOpened(iced::window::Id::unique()));
+            let _ = rig.app.update(core(CoreEvent::UnreadTotals {
+                notifications: 3,
+                highlights: 0,
+            }));
+            assert!(rig.tray.badges.lock().expect("test mutex").is_empty());
+            assert_eq!(rig.app.screen, Screen::Main);
+        }
+
+        #[test]
+        fn unread_totals_update_the_tray_only_when_the_look_changes() {
+            let mut rig = rig();
+            let _ = rig
+                .app
+                .update(Message::WindowOpened(iced::window::Id::unique()));
+            let totals = |n| {
+                core(CoreEvent::UnreadTotals {
+                    notifications: n,
+                    highlights: 0,
+                })
+            };
+            let _ = rig.app.update(totals(3));
+            let _ = rig.app.update(totals(3));
+            assert_eq!(*rig.tray.badges.lock().expect("test mutex"), [true]);
+            assert_eq!(rig.tray.tooltips.lock().expect("test mutex").len(), 1);
+            let _ = rig.app.update(totals(0));
+            assert_eq!(*rig.tray.badges.lock().expect("test mutex"), [true, false]);
+        }
+
+        #[test]
+        fn totals_that_arrive_before_the_tray_are_used_at_creation() {
+            let mut rig = rig();
+            let _ = rig.app.update(core(CoreEvent::UnreadTotals {
+                notifications: 5,
+                highlights: 1,
+            }));
+            let _ = rig
+                .app
+                .update(Message::WindowOpened(iced::window::Id::unique()));
+            let created = rig.tray.created.lock().expect("test mutex");
+            assert_eq!(created.len(), 1);
+            assert!(created[0].badge);
+        }
+
+        #[test]
+        fn the_badge_setting_off_keeps_the_tray_plain() {
+            let mut rig = rig();
+            rig.app.ui_settings.tray_badge = false;
+            let _ = rig
+                .app
+                .update(Message::WindowOpened(iced::window::Id::unique()));
+            let _ = rig.app.update(core(CoreEvent::UnreadTotals {
+                notifications: 5,
+                highlights: 0,
+            }));
+            assert!(rig.tray.badges.lock().expect("test mutex").is_empty());
+        }
+
+        #[test]
+        fn tray_show_focuses_the_window_and_quit_takes_the_close_path() {
+            let mut rig = rig();
+            let show = rig.app.update(Message::Tray(TrayAction::Show));
+            assert!(show.units() > 0);
+            assert_ne!(rig.app.screen, Screen::ShuttingDown);
+            let _ = drain(&mut rig.rx);
+            let _ = rig.app.update(Message::Tray(TrayAction::Quit));
+            assert_eq!(rig.app.screen, Screen::ShuttingDown);
+            assert!(
+                drain(&mut rig.rx)
+                    .iter()
+                    .any(|c| matches!(c, Command::Shutdown))
+            );
+        }
+
+        #[test]
+        fn the_notification_settings_event_is_kept() {
+            let mut rig = rig();
+            let settings = tessera_core::api::NotificationSettingsView {
+                group_default: RoomNotificationModeView::AllMessages,
+                dm_default: RoomNotificationModeView::Mute,
+                keywords: vec!["kw".into()],
+            };
+            let _ = rig
+                .app
+                .update(core(CoreEvent::NotificationSettings(settings.clone())));
+            assert_eq!(rig.app.notification_settings.as_ref(), Some(&settings));
+        }
+    }
+
+    // ---- Phase 5 Task 12: room dialogs, settings, members and pills ----
+
+    mod rooms_ui {
+        use std::path::PathBuf;
+
+        use tessera_core::api::{
+            Block, Inline, MediaBytes, MembershipView, MentionTarget, MessageDetails,
+            PowerLevelView, RichText, Role, RoomDetailsView, RoomMemberView, RoomPermissions,
+            SendStatus, TimelineItemKind,
+        };
+
+        use super::*;
+        use crate::dialogs::RecordingDialogs;
+        use crate::links::RoomTarget;
+        use crate::rooms::{AvatarRefusal, AvatarUpload, Dialog, MEMBERS_PAGE, RoomsMessage as R};
+
+        fn rig() -> (App, mpsc::Receiver<Command>, RecordingDialogs) {
+            let (mut app, rx) = main_app();
+            let dialogs = RecordingDialogs::default();
+            app.set_dialogs(Box::new(dialogs.clone()));
+            (app, rx, dialogs)
+        }
+
+        fn rooms(app: &mut App, message: R) {
+            let _ = app.update(Message::Rooms(message));
+        }
+
+        fn t(text: &str) -> MessageText {
+            MessageText::from(text)
+        }
+
+        fn id(room: &str) -> RoomId {
+            RoomId::from(room)
+        }
+
+        fn all(can: bool) -> RoomPermissions {
+            RoomPermissions {
+                can_set_name: can,
+                can_set_topic: can,
+                can_set_avatar: can,
+                can_enable_encryption: can,
+                can_invite: can,
+            }
+        }
+
+        fn details(room: &str, encrypted: bool, permissions: RoomPermissions) -> RoomDetailsView {
+            RoomDetailsView {
+                room_id: id(room),
+                name: "Lounge".into(),
+                topic: Some("Chat".into()),
+                avatar: None,
+                is_encrypted: encrypted,
+                alias: None,
+                permissions,
+            }
+        }
+
+        fn member(user: &str, name: Option<&str>, role: Role) -> RoomMemberView {
+            RoomMemberView {
+                user_id: UserId::from(user),
+                display_name: name.map(str::to_owned),
+                avatar: None,
+                power: PowerLevelView::Level(0),
+                role,
+                membership: MembershipView::Joined,
+            }
+        }
+
+        fn open_settings(app: &mut App, rx: &mut mpsc::Receiver<Command>, perms: RoomPermissions) {
+            rooms(app, R::OpenSettings);
+            let _ = drain(rx);
+            let _ = app.update(core(CoreEvent::RoomDetails(details("!a:x", false, perms))));
+        }
+
+        #[test]
+        fn new_room_opens_with_encryption_on_and_a_bad_form_sends_nothing() {
+            let (mut app, mut rx, _) = rig();
+            rooms(&mut app, R::OpenCreate);
+            let Some(Dialog::Create(dialog)) = &app.rooms_ui.dialog else {
+                panic!("the create dialog is open");
+            };
+            assert!(dialog.form.encrypted);
+            rooms(&mut app, R::CreateSubmit);
+            assert!(drain(&mut rx).is_empty(), "an empty name sends nothing");
+            let Some(Dialog::Create(dialog)) = &app.rooms_ui.dialog else {
+                panic!("still open");
+            };
+            assert!(dialog.error.is_some());
+            assert!(!dialog.busy);
+        }
+
+        #[test]
+        fn create_sends_one_command_even_when_pressed_twice() {
+            let (mut app, mut rx, _) = rig();
+            rooms(&mut app, R::OpenCreate);
+            rooms(&mut app, R::CreateName(t(" Lounge ")));
+            rooms(&mut app, R::CreateTopic(t("Chat")));
+            rooms(&mut app, R::CreateInvitees(t("@bob:x")));
+            rooms(&mut app, R::CreateSubmit);
+            rooms(&mut app, R::CreateSubmit);
+            let sent = drain(&mut rx);
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            let Command::CreateRoom(request) = &sent[0] else {
+                panic!("{sent:?}");
+            };
+            assert_eq!(request.name, "Lounge");
+            assert!(request.encrypted);
+            assert_eq!(request.invitees, [UserId::from("@bob:x")]);
+        }
+
+        #[test]
+        fn an_unencrypted_public_room_is_asked_for_as_typed() {
+            let (mut app, mut rx, _) = rig();
+            rooms(&mut app, R::OpenCreate);
+            rooms(&mut app, R::CreateName(t("Open")));
+            rooms(&mut app, R::CreateEncrypted(false));
+            rooms(&mut app, R::CreatePublic(true));
+            rooms(&mut app, R::CreateAlias(t("open-room")));
+            rooms(&mut app, R::CreateSubmit);
+            let sent = drain(&mut rx);
+            let Command::CreateRoom(request) = &sent[0] else {
+                panic!("{sent:?}");
+            };
+            assert!(!request.encrypted);
+            assert_eq!(
+                request.visibility,
+                tessera_core::api::RoomVisibility::Public {
+                    alias: "open-room".into()
+                }
+            );
+        }
+
+        #[test]
+        fn a_created_room_is_selected_when_it_appears_in_the_list() {
+            let (mut app, mut rx, _) = rig();
+            rooms(&mut app, R::OpenCreate);
+            rooms(&mut app, R::CreateName(t("Lounge")));
+            rooms(&mut app, R::CreateSubmit);
+            let _ = drain(&mut rx);
+            let _ = app.update(core(CoreEvent::RoomCreated {
+                room_id: id("!new:x"),
+            }));
+            assert!(app.rooms_ui.dialog.is_none(), "the dialog closes");
+            assert!(drain(&mut rx).is_empty(), "the room is not listed yet");
+            assert_eq!(app.selected, Some(id("!a:x")));
+            let _ = app.update(core(CoreEvent::RoomListChanged(vec![ListDiff::PushBack {
+                value: RoomSummary::new(id("!new:x"), "Lounge".into()),
+            }])));
+            let sent = drain(&mut rx);
+            assert!(
+                sent.iter()
+                    .any(|c| matches!(c, Command::SelectRoom(r) if *r == id("!new:x"))),
+                "{sent:?}"
+            );
+            assert_eq!(app.selected, Some(id("!new:x")));
+            assert_eq!(app.rooms_ui.select_when_listed, None);
+            // A later list change does not select it again.
+            let _ = app.update(core(CoreEvent::RoomListChanged(vec![ListDiff::Clear])));
+            assert!(
+                !drain(&mut rx)
+                    .iter()
+                    .any(|c| matches!(c, Command::SelectRoom(_)))
+            );
+        }
+
+        #[test]
+        fn a_room_that_is_already_listed_is_selected_at_once() {
+            let (mut app, mut rx, _) = rig();
+            let _ = app.update(core(CoreEvent::RoomCreated {
+                room_id: id("!b:x"),
+            }));
+            assert_eq!(app.selected, Some(id("!b:x")));
+            assert!(
+                drain(&mut rx)
+                    .iter()
+                    .any(|c| matches!(c, Command::SelectRoom(r) if *r == id("!b:x")))
+            );
+        }
+
+        #[test]
+        fn a_failed_create_shows_a_fixed_line_and_allows_another_try() {
+            let (mut app, mut rx, _) = rig();
+            rooms(&mut app, R::OpenCreate);
+            rooms(&mut app, R::CreateName(t("Lounge")));
+            rooms(&mut app, R::CreateSubmit);
+            let _ = drain(&mut rx);
+            let _ = app.update(core(CoreEvent::ActionFailed {
+                room_id: id(""),
+                action: ActionKind::Rooms,
+                error: CoreError::Internal("sentinel-secret-text".into()),
+            }));
+            let Some(Dialog::Create(dialog)) = &app.rooms_ui.dialog else {
+                panic!("the dialog stays open");
+            };
+            assert!(!dialog.busy);
+            let line = dialog.error.expect("an error line");
+            assert!(!line.contains("sentinel"));
+            rooms(&mut app, R::CreateSubmit);
+            assert_eq!(drain(&mut rx).len(), 1);
+        }
+
+        #[test]
+        fn a_dm_needs_a_user_id_and_is_sent_once() {
+            let (mut app, mut rx, _) = rig();
+            rooms(&mut app, R::OpenDm);
+            rooms(&mut app, R::DmInput(t("bob")));
+            rooms(&mut app, R::DmSubmit);
+            assert!(drain(&mut rx).is_empty());
+            rooms(&mut app, R::DmInput(t(" @bob:x ")));
+            rooms(&mut app, R::DmSubmit);
+            rooms(&mut app, R::DmSubmit);
+            let sent = drain(&mut rx);
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            assert!(
+                matches!(&sent[0], Command::CreateDm { user_id } if user_id.as_str() == "@bob:x")
+            );
+        }
+
+        #[test]
+        fn join_takes_an_alias_an_id_or_a_link_and_sends_once() {
+            for (typed, target, via) in [
+                ("#lounge:x", "#lounge:x", vec![]),
+                ("!abc:x", "!abc:x", vec![]),
+                (
+                    "https://matrix.to/#/!abc:x?via=h.example",
+                    "!abc:x",
+                    vec!["h.example".to_owned()],
+                ),
+            ] {
+                let (mut app, mut rx, _) = rig();
+                rooms(&mut app, R::OpenJoin);
+                rooms(&mut app, R::JoinInput(t(typed)));
+                rooms(&mut app, R::JoinSubmit);
+                rooms(&mut app, R::JoinSubmit);
+                let sent = drain(&mut rx);
+                assert_eq!(sent.len(), 1, "{typed}: {sent:?}");
+                match &sent[0] {
+                    Command::JoinRoom { target: t, via: v } => {
+                        assert_eq!(t, target);
+                        assert_eq!(*v, via);
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+        }
+
+        #[test]
+        fn join_refuses_junk_without_sending() {
+            let (mut app, mut rx, _) = rig();
+            rooms(&mut app, R::OpenJoin);
+            for bad in ["", "lounge", "@bob:x", "https://evil.example/#/!a:x"] {
+                rooms(&mut app, R::JoinInput(t(bad)));
+                rooms(&mut app, R::JoinSubmit);
+            }
+            assert!(drain(&mut rx).is_empty());
+            let Some(Dialog::Join(dialog)) = &app.rooms_ui.dialog else {
+                panic!("still open");
+            };
+            assert!(dialog.error.is_some() && !dialog.busy);
+        }
+
+        #[test]
+        fn a_joined_room_is_selected_and_the_dialog_closes() {
+            let (mut app, mut rx, _) = rig();
+            rooms(&mut app, R::OpenJoin);
+            rooms(&mut app, R::JoinInput(t("!j:x")));
+            rooms(&mut app, R::JoinSubmit);
+            let _ = drain(&mut rx);
+            let _ = app.update(core(CoreEvent::RoomJoined {
+                room_id: id("!j:x"),
+            }));
+            assert!(app.rooms_ui.dialog.is_none());
+            let _ = app.update(core(CoreEvent::RoomListChanged(vec![ListDiff::PushBack {
+                value: RoomSummary::new(id("!j:x"), "J".into()),
+            }])));
+            assert_eq!(app.selected, Some(id("!j:x")));
+        }
+
+        fn with_invite(app: &mut App) {
+            let mut invite = RoomSummary::new(id("!inv:x"), "Invited".into());
+            invite.is_invite = true;
+            let _ = app.update(core(CoreEvent::RoomListChanged(vec![ListDiff::PushBack {
+                value: invite,
+            }])));
+        }
+
+        #[test]
+        fn accept_and_decline_send_their_command_once_each() {
+            let (mut app, mut rx, _) = rig();
+            with_invite(&mut app);
+            rooms(&mut app, R::Accept(id("!inv:x")));
+            rooms(&mut app, R::Accept(id("!inv:x")));
+            rooms(&mut app, R::Decline(id("!inv:x")));
+            let sent = drain(&mut rx);
+            assert_eq!(sent.len(), 1, "one answer per invitation: {sent:?}");
+            assert!(
+                matches!(&sent[0], Command::AcceptInvite { room_id } if *room_id == id("!inv:x"))
+            );
+
+            let (mut app, mut rx, _) = rig();
+            with_invite(&mut app);
+            rooms(&mut app, R::Decline(id("!inv:x")));
+            rooms(&mut app, R::Decline(id("!inv:x")));
+            let sent = drain(&mut rx);
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            assert!(
+                matches!(&sent[0], Command::DeclineInvite { room_id } if *room_id == id("!inv:x"))
+            );
+        }
+
+        #[test]
+        fn only_invitations_can_be_accepted_or_declined() {
+            let (mut app, mut rx, _) = rig();
+            rooms(&mut app, R::Accept(id("!b:x")));
+            rooms(&mut app, R::Decline(id("!b:x")));
+            rooms(&mut app, R::Accept(id("!unknown:x")));
+            assert!(drain(&mut rx).is_empty());
+        }
+
+        #[test]
+        fn a_failed_answer_can_be_tried_again() {
+            let (mut app, mut rx, _) = rig();
+            with_invite(&mut app);
+            rooms(&mut app, R::Accept(id("!inv:x")));
+            let _ = drain(&mut rx);
+            let _ = app.update(core(CoreEvent::ActionFailed {
+                room_id: id("!inv:x"),
+                action: ActionKind::Rooms,
+                error: CoreError::Network("x".into()),
+            }));
+            assert!(app.actions.notice.is_some(), "the failure is shown");
+            rooms(&mut app, R::Accept(id("!inv:x")));
+            assert_eq!(drain(&mut rx).len(), 1);
+        }
+
+        #[test]
+        fn settings_ask_for_details_and_members() {
+            let (mut app, mut rx, _) = rig();
+            rooms(&mut app, R::OpenSettings);
+            let sent = drain(&mut rx);
+            assert!(sent.iter().any(
+                |c| matches!(c, Command::OpenRoomDetails { room_id } if *room_id == id("!a:x"))
+            ));
+            assert!(sent.iter().any(
+                |c| matches!(c, Command::ListRoomMembers { room_id } if *room_id == id("!a:x"))
+            ));
+            let panel = app.rooms_ui.settings.as_ref().expect("open");
+            assert_eq!(panel.room, id("!a:x"));
+        }
+
+        #[test]
+        fn settings_without_a_selected_room_do_not_open() {
+            let (mut app, mut rx) = login_app();
+            logged_in(&mut app);
+            rooms(&mut app, R::OpenSettings);
+            rooms(&mut app, R::OpenMembers);
+            assert!(app.rooms_ui.settings.is_none() && app.rooms_ui.members_panel.is_none());
+            assert!(drain(&mut rx).is_empty());
+        }
+
+        #[test]
+        fn details_fill_the_fields_until_the_user_edits_them() {
+            let (mut app, mut rx, _) = rig();
+            open_settings(&mut app, &mut rx, all(true));
+            let panel = app.rooms_ui.settings.as_ref().expect("open");
+            assert_eq!(
+                (panel.name.as_str(), panel.topic.as_str()),
+                ("Lounge", "Chat")
+            );
+            rooms(&mut app, R::NameInput(t("Typed")));
+            let mut newer = details("!a:x", false, all(true));
+            newer.name = "From server".into();
+            newer.topic = Some("Server topic".into());
+            let _ = app.update(core(CoreEvent::RoomDetails(newer)));
+            let panel = app.rooms_ui.settings.as_ref().expect("open");
+            assert_eq!(panel.name, "Typed", "an edited field is kept");
+            assert_eq!(panel.topic, "Server topic");
+        }
+
+        #[test]
+        fn details_of_another_room_are_ignored() {
+            let (mut app, mut rx, _) = rig();
+            rooms(&mut app, R::OpenSettings);
+            let _ = drain(&mut rx);
+            let _ = app.update(core(CoreEvent::RoomDetails(details(
+                "!b:x",
+                false,
+                all(true),
+            ))));
+            assert!(app.rooms_ui.details.is_none());
+        }
+
+        #[test]
+        fn name_and_topic_are_saved_only_with_permission() {
+            let (mut app, mut rx, _) = rig();
+            open_settings(&mut app, &mut rx, all(false));
+            rooms(&mut app, R::NameInput(t("New")));
+            rooms(&mut app, R::TopicInput(t("Topic")));
+            rooms(&mut app, R::SaveName);
+            rooms(&mut app, R::SaveTopic);
+            assert!(drain(&mut rx).is_empty(), "no permission, no command");
+
+            let (mut app, mut rx, _) = rig();
+            open_settings(&mut app, &mut rx, all(true));
+            rooms(&mut app, R::NameInput(t("  New name ")));
+            rooms(&mut app, R::TopicInput(t("  ")));
+            rooms(&mut app, R::SaveName);
+            rooms(&mut app, R::SaveTopic);
+            let sent = drain(&mut rx);
+            assert_eq!(sent.len(), 2, "{sent:?}");
+            assert!(matches!(&sent[0], Command::SetRoomName { name, .. } if name == "New name"));
+            assert!(matches!(
+                &sent[1],
+                Command::SetRoomTopic { topic: None, .. }
+            ));
+        }
+
+        #[test]
+        fn a_bad_name_is_not_sent() {
+            let (mut app, mut rx, _) = rig();
+            open_settings(&mut app, &mut rx, all(true));
+            rooms(&mut app, R::NameInput(t("   ")));
+            rooms(&mut app, R::SaveName);
+            rooms(&mut app, R::NameInput(t("a\u{202E}b")));
+            rooms(&mut app, R::SaveName);
+            assert!(drain(&mut rx).is_empty());
+            assert!(
+                app.rooms_ui
+                    .settings
+                    .as_ref()
+                    .expect("open")
+                    .error
+                    .is_some()
+            );
+        }
+
+        #[test]
+        fn the_picture_goes_through_the_picker_and_is_sent_once() {
+            let (mut app, mut rx, dialogs) = rig();
+            open_settings(&mut app, &mut rx, all(true));
+            rooms(&mut app, R::ChooseAvatar);
+            assert_eq!(*dialogs.images.lock().expect("mutex"), 1);
+            rooms(&mut app, R::AvatarPicked(None));
+            assert!(!app.rooms_ui.settings.as_ref().expect("open").avatar_busy);
+            // A path starts the read; the scaled picture arrives as a message.
+            rooms(
+                &mut app,
+                R::AvatarPicked(Some(PathBuf::from("/nonexistent/p.png").into())),
+            );
+            assert!(app.rooms_ui.settings.as_ref().expect("open").avatar_busy);
+            let upload = AvatarUpload {
+                data: vec![1, 2, 3],
+                mimetype: "image/png",
+                width: 2,
+                height: 2,
+            };
+            let ready = R::AvatarReady {
+                room: id("!a:x"),
+                result: Ok(Box::new(upload)),
+            };
+            rooms(&mut app, ready.clone());
+            rooms(&mut app, ready);
+            let sent = drain(&mut rx);
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            match &sent[0] {
+                Command::SetRoomAvatar {
+                    room_id,
+                    data,
+                    mimetype,
+                } => {
+                    assert_eq!(*room_id, id("!a:x"));
+                    assert_eq!(data, &MediaBytes::from(vec![1, 2, 3]));
+                    assert_eq!(mimetype, "image/png");
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+
+        #[test]
+        fn a_refused_picture_shows_a_line_and_sends_nothing() {
+            let (mut app, mut rx, _) = rig();
+            open_settings(&mut app, &mut rx, all(true));
+            rooms(
+                &mut app,
+                R::AvatarPicked(Some(PathBuf::from("/nonexistent/p.png").into())),
+            );
+            rooms(
+                &mut app,
+                R::AvatarReady {
+                    room: id("!a:x"),
+                    result: Err(AvatarRefusal::NotAPicture),
+                },
+            );
+            let panel = app.rooms_ui.settings.as_ref().expect("open");
+            assert!(!panel.avatar_busy);
+            assert_eq!(panel.error, Some(AvatarRefusal::NotAPicture.text()));
+            assert!(drain(&mut rx).is_empty());
+        }
+
+        #[test]
+        fn a_picture_for_another_room_or_a_closed_panel_is_dropped() {
+            let (mut app, mut rx, _) = rig();
+            open_settings(&mut app, &mut rx, all(true));
+            let upload = || AvatarUpload {
+                data: vec![1],
+                mimetype: "image/png",
+                width: 1,
+                height: 1,
+            };
+            rooms(
+                &mut app,
+                R::AvatarReady {
+                    room: id("!b:x"),
+                    result: Ok(Box::new(upload())),
+                },
+            );
+            rooms(&mut app, R::CloseSettings);
+            rooms(
+                &mut app,
+                R::AvatarReady {
+                    room: id("!a:x"),
+                    result: Ok(Box::new(upload())),
+                },
+            );
+            assert!(drain(&mut rx).is_empty());
+        }
+
+        #[test]
+        fn enabling_encryption_needs_the_warning_card_and_permission() {
+            let (mut app, mut rx, _) = rig();
+            open_settings(&mut app, &mut rx, all(true));
+            rooms(&mut app, R::EncryptConfirm);
+            assert!(drain(&mut rx).is_empty(), "no confirm without the card");
+            rooms(&mut app, R::EncryptAsk);
+            assert!(app.rooms_ui.settings.as_ref().expect("open").encrypt_ask);
+            rooms(&mut app, R::EncryptCancel);
+            rooms(&mut app, R::EncryptConfirm);
+            assert!(drain(&mut rx).is_empty(), "cancel withdraws the card");
+            rooms(&mut app, R::EncryptAsk);
+            rooms(&mut app, R::EncryptConfirm);
+            rooms(&mut app, R::EncryptConfirm);
+            let sent = drain(&mut rx);
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            assert!(
+                matches!(&sent[0], Command::EnableRoomEncryption { room_id } if *room_id == id("!a:x"))
+            );
+
+            let (mut app, mut rx, _) = rig();
+            open_settings(&mut app, &mut rx, all(false));
+            rooms(&mut app, R::EncryptAsk);
+            rooms(&mut app, R::EncryptConfirm);
+            assert!(drain(&mut rx).is_empty(), "no permission");
+
+            let (mut app, mut rx, _) = rig();
+            rooms(&mut app, R::OpenSettings);
+            let _ = drain(&mut rx);
+            let _ = app.update(core(CoreEvent::RoomDetails(details(
+                "!a:x",
+                true,
+                all(true),
+            ))));
+            rooms(&mut app, R::EncryptAsk);
+            rooms(&mut app, R::EncryptConfirm);
+            assert!(drain(&mut rx).is_empty(), "already encrypted");
+        }
+
+        #[test]
+        fn leaving_asks_first_then_sends_once_and_closes_the_room() {
+            let (mut app, mut rx, _) = rig();
+            open_settings(&mut app, &mut rx, all(true));
+            rooms(&mut app, R::LeaveConfirm);
+            assert!(drain(&mut rx).is_empty(), "no confirm without the question");
+            rooms(&mut app, R::LeaveAsk);
+            rooms(&mut app, R::LeaveCancel);
+            rooms(&mut app, R::LeaveConfirm);
+            assert!(drain(&mut rx).is_empty());
+            rooms(&mut app, R::LeaveAsk);
+            rooms(&mut app, R::LeaveConfirm);
+            rooms(&mut app, R::LeaveConfirm);
+            let sent = drain(&mut rx);
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            assert!(matches!(&sent[0], Command::LeaveRoom { room_id } if *room_id == id("!a:x")));
+            assert!(app.rooms_ui.settings.is_none());
+            assert_eq!(app.selected, None, "the timeline is closed");
+            // The list still shows the room until the next sync says more.
+            assert!(room_list::contains(&app.rooms, &id("!a:x")));
+        }
+
+        #[test]
+        fn a_refused_leave_is_reported() {
+            let (mut app, mut rx, _) = rig();
+            open_settings(&mut app, &mut rx, all(true));
+            rooms(&mut app, R::LeaveAsk);
+            rooms(&mut app, R::LeaveConfirm);
+            let _ = drain(&mut rx);
+            let _ = app.update(core(CoreEvent::ActionFailed {
+                room_id: id("!a:x"),
+                action: ActionKind::Rooms,
+                error: CoreError::NotAllowed,
+            }));
+            assert!(app.actions.notice.is_some());
+        }
+
+        #[test]
+        fn the_leave_warning_follows_what_is_known() {
+            let (mut app, mut rx, _) = rig();
+            open_settings(&mut app, &mut rx, all(true));
+            assert!(app.leave_warning_now().unknown, "members not listed yet");
+            let _ = app.update(core(CoreEvent::RoomDetails(details(
+                "!a:x",
+                true,
+                all(true),
+            ))));
+            let _ = app.update(core(CoreEvent::RoomMembers {
+                room_id: id("!a:x"),
+                members: vec![
+                    member("@a:x", None, Role::Admin),
+                    member("@b:x", None, Role::User),
+                ],
+                truncated: false,
+            }));
+            let w = app.leave_warning_now();
+            assert!(w.encrypted && w.last_admin && !w.unknown, "{w:?}");
+        }
+
+        #[test]
+        fn members_open_with_details_and_a_list_sorted_by_role_then_name() {
+            let (mut app, mut rx, _) = rig();
+            rooms(&mut app, R::OpenMembers);
+            let sent = drain(&mut rx);
+            assert!(
+                sent.iter()
+                    .any(|c| matches!(c, Command::ListRoomMembers { .. }))
+            );
+            assert!(
+                sent.iter()
+                    .any(|c| matches!(c, Command::OpenRoomDetails { .. }))
+            );
+            let _ = app.update(core(CoreEvent::RoomMembers {
+                room_id: id("!a:x"),
+                members: vec![
+                    member("@z:x", Some("Zed"), Role::User),
+                    member("@m:x", Some("Mod"), Role::Moderator),
+                    member("@c:x", Some("Boss"), Role::Creator),
+                    member("@a:x", Some("alice"), Role::User),
+                ],
+                truncated: true,
+            }));
+            let known = app.rooms_ui.known.as_ref().expect("listed");
+            let ids: Vec<&str> = known.members.iter().map(|m| m.user_id.as_str()).collect();
+            assert_eq!(ids, ["@c:x", "@m:x", "@a:x", "@z:x"]);
+            assert!(known.truncated);
+        }
+
+        #[test]
+        fn a_member_list_for_another_room_is_ignored() {
+            let (mut app, _rx, _) = rig();
+            let _ = app.update(core(CoreEvent::RoomMembers {
+                room_id: id("!b:x"),
+                members: vec![member("@z:x", Some("Zed"), Role::User)],
+                truncated: false,
+            }));
+            assert!(app.rooms_ui.known.is_none());
+        }
+
+        #[test]
+        fn invites_are_validated_in_the_app_and_need_permission() {
+            let (mut app, mut rx, _) = rig();
+            rooms(&mut app, R::OpenMembers);
+            let _ = drain(&mut rx);
+            let _ = app.update(core(CoreEvent::RoomDetails(details(
+                "!a:x",
+                false,
+                all(true),
+            ))));
+            rooms(&mut app, R::InviteInput(t("bob")));
+            rooms(&mut app, R::InviteSubmit);
+            assert!(drain(&mut rx).is_empty(), "not a user ID");
+            rooms(&mut app, R::InviteInput(t(" @bob:x ")));
+            rooms(&mut app, R::InviteSubmit);
+            let sent = drain(&mut rx);
+            assert!(
+                matches!(&sent[0], Command::InviteUser { room_id, user_id }
+                    if *room_id == id("!a:x") && user_id.as_str() == "@bob:x"),
+                "{sent:?}"
+            );
+            assert_eq!(
+                sent.iter()
+                    .filter(|c| matches!(c, Command::InviteUser { .. }))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                app.rooms_ui.members_panel.as_ref().expect("open").invite,
+                "",
+                "the field is emptied"
+            );
+
+            let (mut app, mut rx, _) = rig();
+            rooms(&mut app, R::OpenMembers);
+            let _ = drain(&mut rx);
+            let _ = app.update(core(CoreEvent::RoomDetails(details(
+                "!a:x",
+                false,
+                all(false),
+            ))));
+            rooms(&mut app, R::InviteInput(t("@bob:x")));
+            rooms(&mut app, R::InviteSubmit);
+            assert!(drain(&mut rx).is_empty(), "no permission");
+        }
+
+        #[test]
+        fn the_member_list_grows_page_by_page() {
+            let (mut app, mut rx, _) = rig();
+            rooms(&mut app, R::OpenMembers);
+            let _ = drain(&mut rx);
+            let many: Vec<RoomMemberView> = (0..MEMBERS_PAGE + 50)
+                .map(|i| member(&format!("@u{i:04}:x"), None, Role::User))
+                .collect();
+            let _ = app.update(core(CoreEvent::RoomMembers {
+                room_id: id("!a:x"),
+                members: many,
+                truncated: false,
+            }));
+            let panel = app.rooms_ui.members_panel.as_ref().expect("open");
+            assert_eq!(panel.shown, MEMBERS_PAGE);
+            rooms(&mut app, R::ShowMoreMembers);
+            let panel = app.rooms_ui.members_panel.as_ref().expect("open");
+            assert!(panel.shown > MEMBERS_PAGE);
+        }
+
+        fn user_pill_item(label: &str, user: &str) -> TimelineItem {
+            let details = MessageDetails {
+                content: RichText {
+                    blocks: vec![Block::Paragraph(vec![Inline::Mention {
+                        target: MentionTarget::User(UserId::from(user)),
+                        label: label.to_owned(),
+                    }])],
+                },
+                ..MessageDetails::default()
+            };
+            TimelineItem::new(
+                format!("m-{user}"),
+                TimelineItemKind::Message {
+                    sender: UserId::from("@s:x"),
+                    body: label.to_owned(),
+                    is_own: false,
+                    timestamp_ms: 1,
+                    sent: SendStatus::Sent,
+                    details: Box::new(details),
+                },
+            )
+        }
+
+        #[test]
+        fn the_members_are_asked_for_once_when_a_user_pill_shows() {
+            let (mut app, mut rx, _) = rig();
+            let plain = TimelineItem::new("x".into(), TimelineItemKind::ReadMarker);
+            let _ = app.update(core(CoreEvent::TimelineDiff {
+                room_id: id("!a:x"),
+                diffs: vec![ListDiff::Append {
+                    values: vec![plain],
+                }],
+            }));
+            assert!(
+                !drain(&mut rx)
+                    .iter()
+                    .any(|c| matches!(c, Command::ListRoomMembers { .. })),
+                "no pill, no request"
+            );
+            let diff = |label: &str| CoreEvent::TimelineDiff {
+                room_id: id("!a:x"),
+                diffs: vec![ListDiff::PushBack {
+                    value: user_pill_item(label, "@bob:x"),
+                }],
+            };
+            let _ = app.update(core(diff("Not Bob")));
+            let _ = app.update(core(diff("Again")));
+            let sent = drain(&mut rx);
+            let asked = sent
+                .iter()
+                .filter(
+                    |c| matches!(c, Command::ListRoomMembers { room_id } if *room_id == id("!a:x")),
+                )
+                .count();
+            assert_eq!(asked, 1, "{sent:?}");
+        }
+
+        #[test]
+        fn a_user_pill_opens_the_card_for_its_target_and_message_starts_a_dm() {
+            let (mut app, mut rx, _) = rig();
+            let _ = app.update(Message::LinkClicked(LinkTarget::User(UserId::from(
+                "@bob:x",
+            ))));
+            let card = app.rooms_ui.card.clone().expect("the card");
+            assert_eq!(card.user, UserId::from("@bob:x"));
+            assert!(drain(&mut rx).is_empty(), "opening the card sends nothing");
+            rooms(&mut app, R::CardMessage);
+            rooms(&mut app, R::CardMessage);
+            let sent = drain(&mut rx);
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            assert!(
+                matches!(&sent[0], Command::CreateDm { user_id } if user_id.as_str() == "@bob:x")
+            );
+            let _ = app.update(core(CoreEvent::RoomCreated {
+                room_id: id("!dm:x"),
+            }));
+            assert!(app.rooms_ui.card.is_none(), "the card closes");
+        }
+
+        #[test]
+        fn the_card_of_your_own_pill_does_not_open() {
+            let (mut app, mut rx, _) = rig();
+            let _ = app.update(Message::LinkClicked(LinkTarget::User(UserId::from("@a:x"))));
+            assert!(app.rooms_ui.card.is_none());
+            assert!(drain(&mut rx).is_empty());
+        }
+
+        #[test]
+        fn a_failed_message_from_the_card_can_be_pressed_again() {
+            let (mut app, mut rx, _) = rig();
+            let _ = app.update(Message::LinkClicked(LinkTarget::User(UserId::from(
+                "@bob:x",
+            ))));
+            rooms(&mut app, R::CardMessage);
+            let _ = drain(&mut rx);
+            let _ = app.update(core(CoreEvent::ActionFailed {
+                room_id: id(""),
+                action: ActionKind::Rooms,
+                error: CoreError::Busy,
+            }));
+            assert!(app.rooms_ui.card.is_some());
+            rooms(&mut app, R::CardMessage);
+            assert_eq!(drain(&mut rx).len(), 1);
+        }
+
+        #[test]
+        fn a_listed_room_pill_selects_the_room() {
+            let (mut app, mut rx, _) = rig();
+            let _ = app.update(Message::LinkClicked(LinkTarget::Room("!b:x".into())));
+            assert_eq!(app.selected, Some(id("!b:x")));
+            assert!(app.rooms_ui.join_bar.is_none());
+            let _ = drain(&mut rx);
+        }
+
+        #[test]
+        fn an_unjoined_room_pill_asks_before_joining_and_join_sends_once() {
+            let (mut app, mut rx, _) = rig();
+            let _ = app.update(Message::LinkClicked(LinkTarget::Room("#new:x".into())));
+            assert!(drain(&mut rx).is_empty(), "clicking joins nothing");
+            let bar = app.rooms_ui.join_bar.clone().expect("the bar");
+            assert_eq!(bar.id, "#new:x");
+            rooms(&mut app, R::JoinBarJoin);
+            rooms(&mut app, R::JoinBarJoin);
+            let sent = drain(&mut rx);
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            assert!(matches!(&sent[0], Command::JoinRoom { target, via }
+                if target == "#new:x" && via.is_empty()));
+            let _ = app.update(core(CoreEvent::RoomJoined {
+                room_id: id("!new:x"),
+            }));
+            assert!(app.rooms_ui.join_bar.is_none());
+        }
+
+        #[test]
+        fn cancel_closes_the_join_bar_and_junk_pill_targets_open_nothing() {
+            let (mut app, mut rx, _) = rig();
+            let _ = app.update(Message::LinkClicked(LinkTarget::Room("#new:x".into())));
+            rooms(&mut app, R::JoinBarCancel);
+            assert!(app.rooms_ui.join_bar.is_none());
+            rooms(&mut app, R::JoinBarJoin);
+            let _ = app.update(Message::LinkClicked(LinkTarget::Room("junk".into())));
+            assert!(app.rooms_ui.join_bar.is_none());
+            assert!(drain(&mut rx).is_empty());
+            let target: Option<RoomTarget> = crate::links::parse_room_target("junk");
+            assert!(target.is_none());
+        }
+
+        #[test]
+        fn leaving_the_room_view_closes_everything_of_that_room() {
+            let (mut app, mut rx, _) = rig();
+            open_settings(&mut app, &mut rx, all(true));
+            rooms(&mut app, R::OpenMembers);
+            let _ = app.update(Message::LinkClicked(LinkTarget::User(UserId::from(
+                "@bob:x",
+            ))));
+            let _ = app.update(Message::LinkClicked(LinkTarget::Room("#new:x".into())));
+            let _ = app.update(Message::SelectRoom(id("!b:x")));
+            assert!(app.rooms_ui.settings.is_none());
+            assert!(app.rooms_ui.members_panel.is_none());
+            assert!(app.rooms_ui.card.is_none());
+            assert!(app.rooms_ui.join_bar.is_none());
+            assert!(app.rooms_ui.known.is_none());
+            let _ = drain(&mut rx);
+        }
+
+        #[test]
+        fn logging_out_forgets_the_room_screens() {
+            let (mut app, _rx, _) = rig();
+            rooms(&mut app, R::OpenCreate);
+            rooms(&mut app, R::OpenSettings);
+            let _ = app.update(core(CoreEvent::LoggedOut));
+            assert!(app.rooms_ui.dialog.is_none());
+            assert!(app.rooms_ui.settings.is_none());
+        }
+
+        #[test]
+        fn escape_closes_the_topmost_screen_first() {
+            let (mut app, _rx, _) = rig();
+            rooms(&mut app, R::OpenSettings);
+            rooms(&mut app, R::OpenCreate);
+            rooms(&mut app, R::Escape);
+            assert!(app.rooms_ui.dialog.is_none());
+            assert!(app.rooms_ui.settings.is_some());
+            rooms(&mut app, R::Escape);
+            assert!(app.rooms_ui.settings.is_none());
+        }
+
+        #[test]
+        fn debug_output_shows_no_names_topics_or_ids_typed() {
+            let (mut app, mut rx, _) = rig();
+            rooms(&mut app, R::OpenCreate);
+            rooms(&mut app, R::CreateName(t("sentinel-name")));
+            rooms(&mut app, R::CreateTopic(t("sentinel-topic")));
+            rooms(&mut app, R::CreateAlias(t("sentinel-alias")));
+            rooms(&mut app, R::CreateInvitees(t("@sentinel-invitee:x")));
+            let shown = format!("{:?}", app.rooms_ui);
+            assert!(!shown.contains("sentinel"), "{shown}");
+            rooms(&mut app, R::CloseDialog);
+            rooms(&mut app, R::OpenDm);
+            rooms(&mut app, R::DmInput(t("@sentinel-dm:x")));
+            rooms(&mut app, R::CloseDialog);
+            rooms(&mut app, R::OpenJoin);
+            rooms(&mut app, R::JoinInput(t("#sentinel-join:x")));
+            let shown = format!("{:?}", app.rooms_ui);
+            assert!(!shown.contains("sentinel"), "{shown}");
+            rooms(&mut app, R::CloseDialog);
+            open_settings(&mut app, &mut rx, all(true));
+            rooms(&mut app, R::NameInput(t("sentinel-room-name")));
+            rooms(&mut app, R::TopicInput(t("sentinel-room-topic")));
+            let mut with_sentinels = details("!a:x", false, all(true));
+            with_sentinels.name = "sentinel-details-name".into();
+            with_sentinels.topic = Some("sentinel-details-topic".into());
+            let _ = app.update(core(CoreEvent::RoomDetails(with_sentinels)));
+            rooms(&mut app, R::OpenMembers);
+            rooms(&mut app, R::InviteInput(t("@sentinel-inv:x")));
+            let _ = app.update(core(CoreEvent::RoomMembers {
+                room_id: id("!a:x"),
+                members: vec![member(
+                    "@sentinel-member:x",
+                    Some("sentinel-person"),
+                    Role::User,
+                )],
+                truncated: false,
+            }));
+            let _ = app.update(Message::LinkClicked(LinkTarget::Room(
+                "#sentinel-pill:x".into(),
+            )));
+            let shown = format!("{:?} {:?}", app.rooms_ui, app);
+            assert!(
+                !shown.contains("sentinel-room")
+                    && !shown.contains("sentinel-details")
+                    && !shown.contains("sentinel-person")
+                    && !shown.contains("sentinel-inv")
+                    && !shown.contains("sentinel-pill"),
+                "{shown}"
+            );
+            for message in [
+                R::NameInput(t("sentinel-msg")),
+                R::CreateInvitees(t("sentinel-msg")),
+                R::InviteInput(t("sentinel-msg")),
+                R::AvatarPicked(Some(PathBuf::from("/sentinel-msg/p.png").into())),
+            ] {
+                assert!(!format!("{message:?}").contains("sentinel"));
+            }
+            let _ = drain(&mut rx);
+        }
+    }
+    // ---- Task 13: spaces and threads ----
+
+    mod spaces_and_threads {
+        use iced::advanced::widget::{Tree, tree::Tag};
+        use tessera_core::api::{
+            ActionKind, MediaKind, PaginationState, RoomListQuery, RoomListTab, SpaceView,
+        };
+
+        use super::*;
+        use crate::dialogs::RecordingDialogs;
+        use crate::spaces::SpacesMessage;
+        use crate::threads::ThreadsMessage;
+
+        fn room() -> RoomId {
+            RoomId::from("!a:x")
+        }
+
+        fn root(n: &str) -> EventId {
+            EventId::from(format!("${n}:x"))
+        }
+
+        fn space(id: &str, level: u32) -> SpaceView {
+            SpaceView {
+                id: RoomId::from(id),
+                name: id.to_owned(),
+                avatar: None,
+                level,
+                children: 0,
+            }
+        }
+
+        fn queries(commands: &[Command]) -> Vec<&RoomListQuery> {
+            commands
+                .iter()
+                .filter_map(|c| match c {
+                    Command::SetRoomListQuery(q) => Some(q),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn thread_item(root: &EventId, n: u32, body: &str) -> TimelineItem {
+            message_item(
+                &format!("thread:{}:{n}", root.as_str()),
+                body,
+                false,
+                ALL_ACTIONS,
+            )
+        }
+
+        fn thread_diff(root: &EventId, items: Vec<TimelineItem>) -> Message {
+            core(CoreEvent::ThreadDiff {
+                room_id: room(),
+                root: root.clone(),
+                diffs: vec![ListDiff::Append { values: items }],
+            })
+        }
+
+        /// `main_app` with a space list and room `a` selected.
+        fn spaces_app() -> (App, mpsc::Receiver<Command>) {
+            let (mut app, mut rx) = main_app();
+            let _ = app.update(core(CoreEvent::Spaces(vec![
+                space("!s1:x", 0),
+                space("!s1c:x", 1),
+                space("!s2:x", 0),
+            ])));
+            let _ = drain(&mut rx);
+            (app, rx)
+        }
+
+        /// `main_app` with the thread `$r:x` open.
+        fn thread_app() -> (App, mpsc::Receiver<Command>) {
+            let (mut app, mut rx) = main_app();
+            let _ = app.update(Message::Threads(ThreadsMessage::Open(root("r"))));
+            let _ = drain(&mut rx);
+            (app, rx)
+        }
+
+        fn open_panel(app: &App) -> &crate::threads::ThreadPanel {
+            app.threads.panel.as_ref().expect("an open thread")
+        }
+
+        // ---- spaces ----
+
+        #[test]
+        fn selecting_a_space_filters_the_list_and_keeps_tab_and_search() {
+            let (mut app, mut rx) = spaces_app();
+            let _ = app.update(Message::TabSelected(RoomListTab::People));
+            let _ = app.update(Message::SearchChanged("  lo ".into()));
+            let _ = drain(&mut rx);
+            let _ = app.update(Message::Spaces(SpacesMessage::Select(Some(RoomId::from(
+                "!s1:x",
+            )))));
+            let sent = drain(&mut rx);
+            let [q] = queries(&sent)[..] else {
+                panic!("one query expected: {sent:?}")
+            };
+            assert_eq!(q.space, Some(RoomId::from("!s1:x")));
+            assert_eq!(q.tab, RoomListTab::People);
+            assert_eq!(q.search, "lo");
+            // Back to Home: the tab and the search stay.
+            let _ = app.update(Message::Spaces(SpacesMessage::Select(None)));
+            let sent = drain(&mut rx);
+            let [q] = queries(&sent)[..] else {
+                panic!("one query expected: {sent:?}")
+            };
+            assert_eq!(q.space, None);
+            assert_eq!((q.tab, q.search.as_str()), (RoomListTab::People, "lo"));
+        }
+
+        #[test]
+        fn selecting_the_same_space_again_or_an_unknown_one_sends_nothing() {
+            let (mut app, mut rx) = spaces_app();
+            let s1 = Some(RoomId::from("!s1:x"));
+            let _ = app.update(Message::Spaces(SpacesMessage::Select(s1.clone())));
+            let _ = drain(&mut rx);
+            let _ = app.update(Message::Spaces(SpacesMessage::Select(s1)));
+            let _ = app.update(Message::Spaces(SpacesMessage::Select(Some(RoomId::from(
+                "!nope:x",
+            )))));
+            assert!(drain(&mut rx).is_empty());
+            assert_eq!(app.query.space, Some(RoomId::from("!s1:x")));
+        }
+
+        #[test]
+        fn a_space_that_vanishes_resets_the_filter_to_home() {
+            let (mut app, mut rx) = spaces_app();
+            let _ = app.update(Message::TabSelected(RoomListTab::Rooms));
+            let _ = app.update(Message::Spaces(SpacesMessage::Select(Some(RoomId::from(
+                "!s2:x",
+            )))));
+            let _ = drain(&mut rx);
+            // Still there: nothing happens.
+            let _ = app.update(core(CoreEvent::Spaces(vec![space("!s2:x", 0)])));
+            assert!(queries(&drain(&mut rx)).is_empty());
+            // Gone: Home, with the tab kept.
+            let _ = app.update(core(CoreEvent::Spaces(vec![space("!s1:x", 0)])));
+            let sent = drain(&mut rx);
+            let [q] = queries(&sent)[..] else {
+                panic!("one query expected: {sent:?}")
+            };
+            assert_eq!((q.space.clone(), q.tab), (None, RoomListTab::Rooms));
+            assert_eq!(app.query.space, None);
+        }
+
+        #[test]
+        fn space_avatars_are_requested_once() {
+            let (mut app, mut rx) = main_app();
+            let mut s = space("!s1:x", 0);
+            s.avatar = Some(tessera_core::api::AvatarId::from("mxc://x/a"));
+            let _ = app.update(core(CoreEvent::Spaces(vec![s.clone()])));
+            let first = drain(&mut rx);
+            assert!(matches!(first.as_slice(), [Command::FetchAvatars(ids)] if ids.len() == 1));
+            let _ = app.update(core(CoreEvent::Spaces(vec![s])));
+            assert!(drain(&mut rx).is_empty());
+        }
+
+        #[test]
+        fn logging_out_forgets_the_spaces_and_the_thread() {
+            let (mut app, _rx) = spaces_app();
+            let _ = app.update(Message::Threads(ThreadsMessage::Open(root("r"))));
+            let _ = app.update(core(CoreEvent::LoggedOut));
+            assert!(app.spaces.is_empty());
+            assert!(app.threads.panel.is_none());
+        }
+
+        // ---- the thread panel ----
+
+        #[test]
+        fn opening_a_thread_sends_open_thread_once() {
+            let (mut app, mut rx) = main_app();
+            let _ = app.update(Message::Threads(ThreadsMessage::Open(root("r"))));
+            let sent = drain(&mut rx);
+            assert!(
+                matches!(
+                    sent.as_slice(),
+                    [Command::OpenThread { room_id, root: r }] if *room_id == room() && r.as_str() == "$r:x"
+                ),
+                "{sent:?}"
+            );
+            assert!(open_panel(&app).is(&room(), &root("r")));
+            // Clicking the summary again does not reopen it.
+            let _ = app.update(Message::Threads(ThreadsMessage::Open(root("r"))));
+            assert!(drain(&mut rx).is_empty());
+        }
+
+        #[test]
+        fn without_a_room_nothing_opens() {
+            let (mut app, mut rx) = login_app();
+            logged_in(&mut app);
+            let _ = drain(&mut rx);
+            let _ = app.update(Message::Threads(ThreadsMessage::Open(root("r"))));
+            assert!(drain(&mut rx).is_empty() && app.threads.panel.is_none());
+        }
+
+        #[test]
+        fn thread_diffs_go_to_the_panel_and_not_to_the_room_timeline() {
+            let (mut app, _rx) = thread_app();
+            let r = root("r");
+            let before = app.timeline.items.len();
+            let _ = app.update(thread_diff(
+                &r,
+                vec![thread_item(&r, 0, "root"), thread_item(&r, 1, "reply")],
+            ));
+            assert_eq!(open_panel(&app).timeline.items.len(), 2);
+            assert_eq!(app.timeline.items.len(), before);
+            // A second batch applies in order.
+            let _ = app.update(thread_diff(&r, vec![thread_item(&r, 2, "more")]));
+            assert_eq!(open_panel(&app).timeline.items.len(), 3);
+        }
+
+        #[test]
+        fn an_image_in_the_thread_panel_asks_for_its_thumbnail() {
+            let (mut app, mut rx) = thread_app();
+            let r = root("r");
+            let image = media_item(
+                &format!("thread:{}:0", r.as_str()),
+                MediaKind::Image,
+                "pic.png",
+                640,
+                480,
+            );
+            let _ = app.update(thread_diff(&r, vec![image]));
+            let asked = fetches(&drain(&mut rx), MediaSize::Thumbnail);
+            assert_eq!(asked, vec!["thread:$r:x:0".to_owned()]);
+        }
+
+        #[test]
+        fn events_of_another_thread_or_room_are_ignored() {
+            let (mut app, mut rx) = thread_app();
+            let other = root("other");
+            let _ = app.update(thread_diff(&other, vec![thread_item(&other, 0, "x")]));
+            let _ = app.update(core(CoreEvent::ThreadDiff {
+                room_id: RoomId::from("!b:x"),
+                root: root("r"),
+                diffs: vec![ListDiff::Append {
+                    values: vec![thread_item(&root("r"), 0, "x")],
+                }],
+            }));
+            let _ = app.update(core(CoreEvent::ThreadPagination {
+                room_id: room(),
+                root: other,
+                state: PaginationState::ReachedStart,
+            }));
+            assert!(open_panel(&app).timeline.items.is_empty());
+            assert_eq!(open_panel(&app).timeline.pagination, PaginationState::Idle);
+            assert!(drain(&mut rx).is_empty());
+            // Nothing open: nothing happens either.
+            let _ = app.update(Message::Threads(ThreadsMessage::Close));
+            let _ = drain(&mut rx);
+            let r = root("r");
+            let _ = app.update(thread_diff(&r, vec![thread_item(&r, 0, "late")]));
+            assert!(app.threads.panel.is_none());
+        }
+
+        #[test]
+        fn pagination_state_applies_to_the_open_thread() {
+            let (mut app, _rx) = thread_app();
+            let _ = app.update(core(CoreEvent::ThreadPagination {
+                room_id: room(),
+                root: root("r"),
+                state: PaginationState::ReachedStart,
+            }));
+            assert_eq!(
+                open_panel(&app).timeline.pagination,
+                PaginationState::ReachedStart
+            );
+        }
+
+        #[test]
+        fn a_new_root_starts_with_a_fresh_model_and_one_open_thread() {
+            let (mut app, mut rx) = thread_app();
+            let r = root("r");
+            let _ = app.update(thread_diff(&r, vec![thread_item(&r, 0, "old")]));
+            let _ = app.update(Message::Threads(ThreadsMessage::Draft(MessageText::from(
+                "half typed",
+            ))));
+            // A short thread asks for older events by itself.
+            assert!(
+                drain(&mut rx)
+                    .iter()
+                    .any(|c| matches!(c, Command::PaginateThread { .. }))
+            );
+            let _ = app.update(Message::Threads(ThreadsMessage::Open(root("s"))));
+            let sent = drain(&mut rx);
+            assert!(
+                matches!(sent.as_slice(), [Command::OpenThread { root: n, .. }] if n.as_str() == "$s:x"),
+                "{sent:?}"
+            );
+            let panel = open_panel(&app);
+            assert!(panel.is(&room(), &root("s")));
+            assert!(panel.timeline.items.is_empty() && panel.draft.is_empty());
+            // A straggler of the old thread cannot get in.
+            let _ = app.update(thread_diff(&r, vec![thread_item(&r, 1, "late")]));
+            assert!(open_panel(&app).timeline.items.is_empty());
+        }
+
+        #[test]
+        fn closing_sends_close_thread_and_drops_the_model() {
+            let (mut app, mut rx) = thread_app();
+            let _ = app.update(Message::Threads(ThreadsMessage::Close));
+            assert!(matches!(drain(&mut rx).as_slice(), [Command::CloseThread]));
+            assert!(app.threads.panel.is_none());
+            // A second close has nothing to close.
+            let _ = app.update(Message::Threads(ThreadsMessage::Close));
+            assert!(drain(&mut rx).is_empty());
+        }
+
+        #[test]
+        fn selecting_another_room_closes_the_panel() {
+            let (mut app, mut rx) = thread_app();
+            let _ = app.update(Message::SelectRoom(RoomId::from("!b:x")));
+            let sent = drain(&mut rx);
+            let close = sent
+                .iter()
+                .position(|c| matches!(c, Command::CloseThread))
+                .expect("CloseThread");
+            let select = sent
+                .iter()
+                .position(|c| matches!(c, Command::SelectRoom(_)))
+                .expect("SelectRoom");
+            assert!(close < select, "the thread closes before the room changes");
+            assert!(app.threads.panel.is_none());
+        }
+
+        #[test]
+        fn the_panel_composer_sends_into_the_thread() {
+            let (mut app, mut rx) = thread_app();
+            let _ = app.update(Message::Threads(ThreadsMessage::Draft(MessageText::from(
+                "in the thread",
+            ))));
+            let _ = app.update(Message::Threads(ThreadsMessage::Submit));
+            let sent = drain(&mut rx);
+            let [Command::Send(m)] = sent.as_slice() else {
+                panic!("{sent:?}")
+            };
+            assert_eq!(m.text.expose(), "in the thread");
+            assert_eq!(m.thread_root.as_ref().map(EventId::as_str), Some("$r:x"));
+            assert_eq!(m.room_id, room());
+            assert!(open_panel(&app).draft.is_empty());
+            // Blank text sends nothing.
+            let _ = app.update(Message::Threads(ThreadsMessage::Submit));
+            assert!(drain(&mut rx).is_empty());
+        }
+
+        #[test]
+        fn actions_on_panel_items_carry_their_thread_ids() {
+            let (mut app, mut rx) = thread_app();
+            let r = root("r");
+            let _ = app.update(thread_diff(&r, vec![thread_item(&r, 4, "reply")]));
+            let id = "thread:$r:x:4".to_owned();
+            let _ = drain(&mut rx);
+            let _ = app.update(Message::ReactionToggled {
+                item: id.clone(),
+                key: MessageText::from("\u{1F44D}"),
+            });
+            let _ = app.update(Message::DeleteRequested(id.clone()));
+            let _ = app.update(Message::DeleteConfirmed);
+            let sent = drain(&mut rx);
+            assert!(
+                matches!(&sent[0], Command::ToggleReaction { room_id, item_id, .. } if *room_id == room() && *item_id == id),
+                "{sent:?}"
+            );
+            assert!(
+                matches!(&sent[1], Command::Redact { room_id, item_id, .. } if *room_id == room() && *item_id == id),
+                "{sent:?}"
+            );
+        }
+
+        #[test]
+        fn reply_and_edit_stay_with_the_room_composer() {
+            let (mut app, _rx) = thread_app();
+            let r = root("r");
+            let _ = app.update(thread_diff(&r, vec![thread_item(&r, 0, "reply")]));
+            let _ = app.update(Message::ReplyRequested("thread:$r:x:0".into()));
+            let _ = app.update(Message::EditRequested("thread:$r:x:0".into()));
+            assert!(matches!(app.composer.mode, composer::Mode::Normal));
+        }
+
+        #[test]
+        fn thread_media_opens_with_its_thread_id() {
+            let (mut app, mut rx) = thread_app();
+            let r = root("r");
+            let mut image = media_item("thread:$r:x:0", MediaKind::Image, "pic.png", 64, 48);
+            // The same counter in the room's own timeline is another key.
+            let mut main = media_item("0", MediaKind::Image, "pic.png", 64, 48);
+            std::mem::swap(&mut image, &mut main);
+            let _ = app.update(core(CoreEvent::TimelineDiff {
+                room_id: room(),
+                diffs: vec![ListDiff::Append {
+                    values: vec![image],
+                }],
+            }));
+            let _ = app.update(thread_diff(&r, vec![main]));
+            let _ = drain(&mut rx);
+            let _ = app.update(Message::MediaClicked("thread:$r:x:0".into()));
+            let viewer = app.media.viewer.as_ref().expect("viewer");
+            assert_eq!(viewer.key, (room(), "thread:$r:x:0".to_owned()));
+            assert!(matches!(
+                drain(&mut rx).as_slice(),
+                [Command::FetchMedia { item_id, .. }] if item_id == "thread:$r:x:0"
+            ));
+        }
+
+        #[test]
+        fn a_failed_thread_action_says_so_and_keeps_the_panel() {
+            let (mut app, _rx) = thread_app();
+            let _ = app.update(core(CoreEvent::ActionFailed {
+                room_id: room(),
+                action: ActionKind::Thread,
+                error: CoreError::Internal("x".into()),
+            }));
+            assert!(app.actions.notice.is_some());
+            assert!(app.threads.panel.is_some());
+        }
+
+        // ---- uploads from the panel ----
+
+        #[test]
+        fn attach_in_the_panel_targets_the_thread_and_the_room_attach_does_not() {
+            let (mut app, mut rx) = thread_app();
+            app.set_dialogs(Box::new(RecordingDialogs::default()));
+            let _ = app.update(Message::Threads(ThreadsMessage::Attach));
+            assert_eq!(
+                app.uploads.thread_root.as_ref().map(EventId::as_str),
+                Some("$r:x")
+            );
+            // The room's own Attach (no confirmation open) goes to the room.
+            let _ = app.update(Message::AttachRequested);
+            assert_eq!(app.uploads.thread_root, None);
+            let _ = drain(&mut rx);
+        }
+
+        #[test]
+        fn closing_the_panel_drops_its_upload_confirmation() {
+            let (mut app, _rx) = thread_app();
+            app.set_dialogs(Box::new(RecordingDialogs::default()));
+            let _ = app.update(Message::Threads(ThreadsMessage::Attach));
+            app.uploads.dialog = Some(crate::upload::UploadDialog {
+                room_id: room(),
+                entries: Vec::new(),
+            });
+            let _ = app.update(Message::Threads(ThreadsMessage::Close));
+            assert!(app.uploads.dialog.is_none() && app.uploads.thread_root.is_none());
+        }
+
+        // ---- the room pane is not disturbed ----
+
+        #[test]
+        fn opening_and_closing_the_panel_keeps_the_room_scroll_and_draft() {
+            let (mut app, mut rx) = main_app();
+            type_in(&mut app, "half a message");
+            let _ = app.on_timeline_scrolled(120.0, 600.0, 800.0);
+            let _ = drain(&mut rx);
+            let before = (
+                app.timeline.offset_from_bottom,
+                app.timeline.anchor.clone(),
+                app.timeline.last_scroll_request,
+                app.timeline.items.len(),
+                app.composer.text(),
+            );
+            let _ = app.update(Message::Threads(ThreadsMessage::Open(root("r"))));
+            let r = root("r");
+            let _ = app.update(thread_diff(&r, vec![thread_item(&r, 0, "x")]));
+            let _ = app.update(Message::Threads(ThreadsMessage::Close));
+            let after = (
+                app.timeline.offset_from_bottom,
+                app.timeline.anchor.clone(),
+                app.timeline.last_scroll_request,
+                app.timeline.items.len(),
+                app.composer.text(),
+            );
+            assert_eq!(before, after);
+            assert!(
+                !drain(&mut rx).iter().any(|c| matches!(
+                    c,
+                    Command::SaveDraft { .. } | Command::PaginateBackwards { .. }
+                )),
+                "the panel sends no room commands"
+            );
+        }
+
+        /// Every widget tag of a tree, depth first.
+        fn tags(tree: &Tree, out: &mut Vec<Tag>) {
+            out.push(tree.tag);
+            for child in &tree.children {
+                tags(child, out);
+            }
+        }
+
+        #[test]
+        fn the_panes_row_keeps_four_slots_and_the_room_pane_its_tree() {
+            let (mut app, _rx) = main_app();
+            let slots = |app: &App| {
+                let element = crate::screens::main_view::main_row(app);
+                let tree = Tree::new(element.as_widget());
+                let mut room_tags = Vec::new();
+                tags(&tree.children[2], &mut room_tags);
+                (tree.children.len(), room_tags)
+            };
+            let (n_closed, room_closed) = slots(&app);
+            assert_eq!(n_closed, 4);
+            let _ = app.update(Message::Threads(ThreadsMessage::Open(root("r"))));
+            let (n_open, room_open) = slots(&app);
+            assert_eq!(n_open, 4);
+            assert_eq!(room_open, room_closed, "the room pane keeps its widgets");
+            let _ = app.update(core(CoreEvent::Spaces(vec![space("!s1:x", 0)])));
+            let (n_spaces, room_spaces) = slots(&app);
+            assert_eq!(n_spaces, 4);
+            assert_eq!(room_spaces, room_closed);
+        }
+
+        /// The widths of the panes row and of its four slots, laid out in a
+        /// 1000 x 700 window.
+        fn pane_widths(app: &App) -> (f32, Vec<f32>) {
+            use iced::advanced::layout::Limits;
+            use iced::advanced::renderer::Headless;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("a current-thread runtime");
+            let renderer = runtime
+                .block_on(iced::Renderer::new(
+                    iced::Font::DEFAULT,
+                    iced::Pixels(16.0),
+                    Some("tiny-skia"),
+                ))
+                .expect("the headless tiny-skia renderer is not available");
+            let mut element = crate::screens::main_view::main_row(app);
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &Limits::new(iced::Size::ZERO, iced::Size::new(1000.0, 700.0)),
+            );
+            let slots = node.children().iter().map(|c| c.size().width).collect();
+            (node.size().width, slots)
+        }
+
+        /// The panes row was built with `Row::from_vec`, which does not look
+        /// at its children, and only told to fill the height: it shrank to its
+        /// content and the room pane lost the free width.
+        #[test]
+        fn the_panes_fill_the_window_with_and_without_a_thread() {
+            let (mut app, _rx) = spaces_app();
+            let (row, slots) = pane_widths(&app);
+            assert_eq!(row, 1000.0, "the row fills the window: {slots:?}");
+            let room_alone = slots[2];
+            assert_eq!(slots[3], 0.0, "no thread, no panel");
+            let r = root("r");
+            let _ = app.update(Message::Threads(ThreadsMessage::Open(r.clone())));
+            let _ = app.update(thread_diff(&r, vec![thread_item(&r, 0, "x")]));
+            let (row, slots) = pane_widths(&app);
+            assert_eq!(row, 1000.0, "the row fills the window: {slots:?}");
+            assert!(slots[3] > 0.0, "the panel has its width: {slots:?}");
+            assert_eq!(
+                slots[2],
+                room_alone - slots[3],
+                "the panel takes its width from the room pane only: {slots:?}"
+            );
+        }
+
+        #[test]
+        fn the_whole_window_builds_with_spaces_and_a_thread() {
+            let (mut app, _rx) = spaces_app();
+            let r = root("r");
+            let _ = app.update(Message::Threads(ThreadsMessage::Open(r.clone())));
+            let _ = app.update(thread_diff(&r, vec![thread_item(&r, 0, "x")]));
+            let _ = app.view();
+        }
+    }
+
+    // ---- Phase 5 Task 15: the Settings screen ----
+
+    mod settings_ui {
+        use std::path::PathBuf;
+
+        use tessera_core::api::{
+            AvatarId, EventId, MediaBytes, NotificationKind, NotificationSettingsView,
+            OwnProfileView, RoomNotificationModeView as Mode, ThemeChoice,
+        };
+
+        use super::*;
+        use crate::dialogs::RecordingDialogs;
+        use crate::notifications::RecordingNotifier;
+        use crate::rooms::{AvatarRefusal, AvatarUpload};
+        use crate::settings::{
+            RecordingSettings, SettingsError, SettingsMessage as S, check_keyword,
+        };
+        use crate::tray::{FakeTray, FakeTrayFactory};
+
+        struct Rig {
+            app: App,
+            rx: mpsc::Receiver<Command>,
+            dialogs: RecordingDialogs,
+            saved: Arc<std::sync::Mutex<Vec<UiSettings>>>,
+            shown: Arc<std::sync::Mutex<Vec<crate::notifications::Request>>>,
+            tray: FakeTray,
+        }
+
+        fn rig() -> Rig {
+            let (mut app, rx) = main_app();
+            let dialogs = RecordingDialogs::default();
+            app.set_dialogs(Box::new(dialogs.clone()));
+            let store = RecordingSettings::default();
+            let saved = store.saved.clone();
+            app.set_settings_store(Box::new(store));
+            let notifier = RecordingNotifier::default();
+            let shown = notifier.shown.clone();
+            app.set_notifier(Box::new(notifier));
+            let factory = FakeTrayFactory::default();
+            let tray = factory.tray.clone();
+            app.set_tray_factory(Box::new(factory));
+            Rig {
+                app,
+                rx,
+                dialogs,
+                saved,
+                shown,
+                tray,
+            }
+        }
+
+        fn open(rig: &mut Rig) {
+            let _ = rig.app.update(Message::Settings(S::Open));
+            assert!(rig.app.settings_ui.open);
+        }
+
+        fn st(rig: &mut Rig, message: S) {
+            let _ = rig.app.update(Message::Settings(message));
+        }
+
+        fn profile(name: Option<&str>, avatar: bool) -> CoreEvent {
+            CoreEvent::OwnProfile(OwnProfileView {
+                display_name: name.map(str::to_owned),
+                avatar: avatar.then(|| AvatarId::from("mxc://x/a")),
+            })
+        }
+
+        fn settings_event(group: Mode, dm: Mode, keywords: &[&str]) -> CoreEvent {
+            CoreEvent::NotificationSettings(NotificationSettingsView {
+                group_default: group,
+                dm_default: dm,
+                keywords: keywords.iter().map(|k| (*k).to_owned()).collect(),
+            })
+        }
+
+        fn text(s: &str) -> MessageText {
+            MessageText::from(s)
+        }
+
+        fn writes(rig: &Rig) -> Vec<UiSettings> {
+            rig.saved.lock().expect("test mutex").clone()
+        }
+
+        #[test]
+        fn settings_open_from_the_button_and_close_again() {
+            let mut rig = rig();
+            assert!(!rig.app.settings_open());
+            open(&mut rig);
+            st(&mut rig, S::Close);
+            assert!(!rig.app.settings_open());
+            assert!(drain(&mut rig.rx).is_empty(), "opening sends nothing");
+        }
+
+        #[test]
+        fn settings_do_not_open_on_the_login_screen_or_over_another_modal() {
+            let (mut app, _rx) = login_app();
+            let _ = app.update(Message::Settings(S::Open));
+            assert!(!app.settings_open());
+
+            let mut rig = rig();
+            let _ = rig.app.update(Message::Sessions(SessionsMessage::Open));
+            let _ = rig.app.update(Message::Settings(S::Open));
+            assert!(!rig.app.settings_open(), "Sessions is open");
+        }
+
+        #[test]
+        fn the_profile_fills_the_name_field_until_the_user_edits_it() {
+            let mut rig = rig();
+            let _ = rig.app.update(core(profile(Some("Alice"), false)));
+            assert_eq!(rig.app.settings_ui.name.expose(), "Alice");
+            st(&mut rig, S::NameInput(text("Alicia")));
+            let _ = rig.app.update(core(profile(Some("Alice B"), false)));
+            assert_eq!(rig.app.settings_ui.name.expose(), "Alicia");
+        }
+
+        #[test]
+        fn saving_the_name_sends_one_command() {
+            let mut rig = rig();
+            let _ = rig.app.update(core(profile(Some("Alice"), false)));
+            st(&mut rig, S::NameInput(text("  Alicia  ")));
+            st(&mut rig, S::SaveName);
+            st(&mut rig, S::SaveName);
+            let sent = drain(&mut rig.rx);
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            assert!(matches!(&sent[0], Command::SetDisplayName { name } if name == "Alicia"));
+        }
+
+        #[test]
+        fn an_unchanged_name_sends_nothing_and_a_bad_one_is_refused() {
+            let mut rig = rig();
+            let _ = rig.app.update(core(profile(Some("Alice"), false)));
+            st(&mut rig, S::NameInput(text("Alice")));
+            st(&mut rig, S::SaveName);
+            assert!(drain(&mut rig.rx).is_empty());
+            for (bad, error) in [
+                ("   ", SettingsError::NameEmpty),
+                (&"a".repeat(256), SettingsError::NameTooLong),
+                ("a\u{7}b", SettingsError::NameUnsafe),
+                ("a\u{202E}b", SettingsError::NameUnsafe),
+            ] {
+                st(&mut rig, S::NameInput(text(bad)));
+                st(&mut rig, S::SaveName);
+                assert_eq!(rig.app.settings_ui.error, Some(error), "{bad:?}");
+            }
+            assert!(drain(&mut rig.rx).is_empty());
+        }
+
+        #[test]
+        fn the_picture_goes_through_the_picker_and_is_sent_once() {
+            let mut rig = rig();
+            st(&mut rig, S::ChooseAvatar);
+            st(&mut rig, S::ChooseAvatar);
+            assert_eq!(*rig.dialogs.images.lock().expect("mutex"), 1);
+            st(&mut rig, S::AvatarPicked(None));
+            assert!(!rig.app.settings_ui.avatar_busy);
+            st(&mut rig, S::ChooseAvatar);
+            st(
+                &mut rig,
+                S::AvatarPicked(Some(PathBuf::from("/nonexistent/p.png").into())),
+            );
+            let ready = S::AvatarReady(Ok(Box::new(AvatarUpload {
+                data: vec![1, 2, 3],
+                mimetype: "image/png",
+                width: 2,
+                height: 2,
+            })));
+            st(&mut rig, ready.clone());
+            st(&mut rig, ready);
+            let sent = drain(&mut rig.rx);
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            match &sent[0] {
+                Command::SetAvatar { data, mimetype } => {
+                    assert_eq!(data, &MediaBytes::from(vec![1, 2, 3]));
+                    assert_eq!(mimetype, "image/png");
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+
+        #[test]
+        fn a_refused_picture_shows_a_line_and_sends_nothing() {
+            let mut rig = rig();
+            st(&mut rig, S::ChooseAvatar);
+            st(&mut rig, S::AvatarReady(Err(AvatarRefusal::NotAPicture)));
+            assert_eq!(
+                rig.app.settings_ui.error,
+                Some(SettingsError::Picture(AvatarRefusal::NotAPicture))
+            );
+            assert!(!rig.app.settings_ui.avatar_busy);
+            assert!(drain(&mut rig.rx).is_empty());
+        }
+
+        #[test]
+        fn remove_picture_needs_a_picture_and_sends_once() {
+            let mut rig = rig();
+            let _ = rig.app.update(core(profile(Some("A"), false)));
+            st(&mut rig, S::RemoveAvatar);
+            assert!(drain(&mut rig.rx).is_empty(), "there is no picture");
+            let _ = rig.app.update(core(profile(Some("A"), true)));
+            st(&mut rig, S::RemoveAvatar);
+            st(&mut rig, S::RemoveAvatar);
+            let sent = drain(&mut rig.rx);
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            assert!(matches!(sent[0], Command::RemoveAvatar));
+        }
+
+        #[test]
+        fn a_failed_profile_change_shows_a_line_and_frees_the_buttons() {
+            let mut rig = rig();
+            let _ = rig.app.update(core(profile(Some("A"), true)));
+            st(&mut rig, S::RemoveAvatar);
+            assert!(rig.app.settings_ui.profile_pending);
+            let _ = rig.app.update(core(CoreEvent::ActionFailed {
+                room_id: RoomId::from(""),
+                action: ActionKind::Profile,
+                error: CoreError::Internal("x".into()),
+            }));
+            assert_eq!(
+                rig.app.settings_ui.error,
+                Some(SettingsError::ProfileFailed)
+            );
+            assert!(!rig.app.settings_ui.profile_pending);
+        }
+
+        #[test]
+        fn a_default_mode_sends_once_and_the_same_mode_sends_nothing() {
+            let mut rig = rig();
+            let _ = rig.app.update(core(settings_event(
+                Mode::AllMessages,
+                Mode::AllMessages,
+                &[],
+            )));
+            let pick = S::DefaultMode {
+                one_to_one: false,
+                mode: Mode::Mute,
+            };
+            st(&mut rig, pick.clone());
+            st(&mut rig, pick);
+            st(
+                &mut rig,
+                S::DefaultMode {
+                    one_to_one: true,
+                    mode: Mode::AllMessages,
+                },
+            );
+            let sent = drain(&mut rig.rx);
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            assert!(matches!(
+                sent[0],
+                Command::SetDefaultNotificationMode {
+                    one_to_one: false,
+                    mode: Mode::Mute
+                }
+            ));
+        }
+
+        #[test]
+        fn a_late_echo_of_the_old_mode_does_not_undo_the_pick() {
+            let mut rig = rig();
+            let shown = |rig: &Rig| {
+                rig.app
+                    .settings_ui
+                    .shown_default(rig.app.notification_settings.as_ref(), false)
+            };
+            let event = |mode| core(settings_event(mode, Mode::AllMessages, &[]));
+            let _ = rig.app.update(event(Mode::AllMessages));
+            st(
+                &mut rig,
+                S::DefaultMode {
+                    one_to_one: false,
+                    mode: Mode::MentionsAndKeywords,
+                },
+            );
+            // The first events after the change still carry the old value.
+            let _ = rig.app.update(event(Mode::AllMessages));
+            assert_eq!(shown(&rig), Some(Mode::MentionsAndKeywords));
+            let _ = rig.app.update(event(Mode::AllMessages));
+            assert_eq!(shown(&rig), Some(Mode::MentionsAndKeywords));
+            // The event that agrees settles it.
+            let _ = rig.app.update(event(Mode::MentionsAndKeywords));
+            assert!(rig.app.settings_ui.pending_group.is_none());
+            assert_eq!(shown(&rig), Some(Mode::MentionsAndKeywords));
+        }
+
+        #[test]
+        fn a_change_the_core_never_confirms_is_not_shown_for_ever() {
+            let mut rig = rig();
+            let event = || core(settings_event(Mode::AllMessages, Mode::AllMessages, &[]));
+            let _ = rig.app.update(event());
+            st(
+                &mut rig,
+                S::DefaultMode {
+                    one_to_one: false,
+                    mode: Mode::Mute,
+                },
+            );
+            for _ in 0..crate::settings::MAX_STALE_EVENTS {
+                let _ = rig.app.update(event());
+            }
+            assert_eq!(
+                rig.app
+                    .settings_ui
+                    .shown_default(rig.app.notification_settings.as_ref(), false),
+                Some(Mode::AllMessages)
+            );
+        }
+
+        #[test]
+        fn a_failed_default_mode_shows_what_the_core_reports_again() {
+            let mut rig = rig();
+            let _ = rig.app.update(core(settings_event(
+                Mode::AllMessages,
+                Mode::AllMessages,
+                &[],
+            )));
+            st(
+                &mut rig,
+                S::DefaultMode {
+                    one_to_one: true,
+                    mode: Mode::Mute,
+                },
+            );
+            let _ = rig.app.update(core(CoreEvent::ActionFailed {
+                room_id: RoomId::from(""),
+                action: ActionKind::Notifications,
+                error: CoreError::Internal("x".into()),
+            }));
+            assert_eq!(
+                rig.app
+                    .settings_ui
+                    .shown_default(rig.app.notification_settings.as_ref(), true),
+                Some(Mode::AllMessages)
+            );
+            assert_eq!(
+                rig.app.settings_ui.error,
+                Some(SettingsError::NotificationFailed)
+            );
+        }
+
+        #[test]
+        fn a_keyword_is_validated_sent_once_and_the_field_cleared() {
+            let mut rig = rig();
+            st(&mut rig, S::KeywordInput(text("  lunch  ")));
+            st(&mut rig, S::AddKeyword);
+            st(&mut rig, S::AddKeyword);
+            let sent = drain(&mut rig.rx);
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            assert!(matches!(&sent[0], Command::AddKeyword { keyword } if keyword == "lunch"));
+            assert_eq!(rig.app.settings_ui.keyword_input.expose(), "");
+        }
+
+        #[test]
+        fn a_keyword_over_64_characters_is_refused() {
+            let mut rig = rig();
+            st(&mut rig, S::KeywordInput(text(&"k".repeat(65))));
+            st(&mut rig, S::AddKeyword);
+            assert!(drain(&mut rig.rx).is_empty());
+            assert_eq!(
+                rig.app.settings_ui.error,
+                Some(SettingsError::KeywordTooLong)
+            );
+            // The field keeps the text so it can be shortened.
+            assert_eq!(rig.app.settings_ui.keyword_input.expose().len(), 65);
+            st(&mut rig, S::KeywordInput(text(&"k".repeat(64))));
+            st(&mut rig, S::AddKeyword);
+            assert_eq!(drain(&mut rig.rx).len(), 1, "64 characters are fine");
+        }
+
+        #[test]
+        fn keyword_checks_cover_blank_control_limit_and_duplicates() {
+            assert_eq!(check_keyword("  ", 0, false), Ok(None));
+            assert_eq!(
+                check_keyword("a\nb", 0, false),
+                Err(SettingsError::KeywordUnsafe)
+            );
+            assert_eq!(
+                check_keyword("é".repeat(64).as_str(), 0, false).map(|k| k.is_some()),
+                Ok(true)
+            );
+            assert_eq!(
+                check_keyword("x", 50, false),
+                Err(SettingsError::TooManyKeywords)
+            );
+            assert_eq!(check_keyword("x", 50, true), Ok(Some("x".to_owned())));
+        }
+
+        #[test]
+        fn a_known_keyword_is_not_sent_again_and_remove_sends_only_known_ones() {
+            let mut rig = rig();
+            let _ = rig.app.update(core(settings_event(
+                Mode::AllMessages,
+                Mode::AllMessages,
+                &["lunch"],
+            )));
+            st(&mut rig, S::KeywordInput(text("lunch")));
+            st(&mut rig, S::AddKeyword);
+            st(&mut rig, S::RemoveKeyword(text("dinner")));
+            assert!(drain(&mut rig.rx).is_empty());
+            st(&mut rig, S::RemoveKeyword(text("lunch")));
+            let sent = drain(&mut rig.rx);
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            assert!(matches!(&sent[0], Command::RemoveKeyword { keyword } if keyword == "lunch"));
+        }
+
+        #[test]
+        fn each_local_toggle_writes_the_settings_once() {
+            let mut rig = rig();
+            st(&mut rig, S::DesktopNotifications(false));
+            st(&mut rig, S::DesktopNotifications(false));
+            st(&mut rig, S::ShowMessageContent(false));
+            st(&mut rig, S::TrayBadge(false));
+            st(&mut rig, S::Theme(ThemeChoice::Dark));
+            st(&mut rig, S::Theme(ThemeChoice::Dark));
+            let saved = writes(&rig);
+            assert_eq!(saved.len(), 4, "{saved:?}");
+            assert_eq!(
+                saved[3],
+                UiSettings {
+                    theme: ThemeChoice::Dark,
+                    desktop_notifications: false,
+                    show_message_content: false,
+                    tray_badge: false,
+                }
+            );
+            assert!(
+                drain(&mut rig.rx).is_empty(),
+                "local settings are not commands"
+            );
+        }
+
+        #[test]
+        fn a_failed_write_shows_a_line() {
+            let mut rig = rig();
+            st(&mut rig, S::Saved(true));
+            assert!(rig.app.settings_ui.error.is_none());
+            st(&mut rig, S::Saved(false));
+            assert_eq!(rig.app.settings_ui.error, Some(SettingsError::SaveFailed));
+        }
+
+        fn notification(kind: NotificationKind) -> NotificationView {
+            NotificationView {
+                room_id: RoomId::from("!b:x"),
+                event_id: EventId::from("$e"),
+                room_name: "b".into(),
+                sender: UserId::from("@bob:x"),
+                sender_name: Some("Bob".into()),
+                is_dm: false,
+                kind,
+                preview: Some(MessageText::from("secret preview text")),
+            }
+        }
+
+        #[test]
+        fn turning_desktop_notifications_off_stops_notifier_calls_at_once() {
+            let mut rig = rig();
+            let _ = rig.app.update(Message::WindowFocus(false));
+            let _ = rig.app.update(core(CoreEvent::Notification(notification(
+                NotificationKind::Message,
+            ))));
+            assert_eq!(rig.shown.lock().expect("mutex").len(), 1);
+            st(&mut rig, S::DesktopNotifications(false));
+            let _ = rig.app.update(core(CoreEvent::Notification(notification(
+                NotificationKind::Mention,
+            ))));
+            assert_eq!(rig.shown.lock().expect("mutex").len(), 1);
+            st(&mut rig, S::DesktopNotifications(true));
+            let _ = rig.app.update(core(CoreEvent::Notification(notification(
+                NotificationKind::Message,
+            ))));
+            assert_eq!(rig.shown.lock().expect("mutex").len(), 2);
+        }
+
+        #[test]
+        fn turning_content_off_drops_the_preview_and_the_sender_at_once() {
+            let mut rig = rig();
+            let _ = rig.app.update(Message::WindowFocus(false));
+            st(&mut rig, S::ShowMessageContent(false));
+            let _ = rig.app.update(core(CoreEvent::Notification(notification(
+                NotificationKind::Message,
+            ))));
+            let shown = rig.shown.lock().expect("mutex").clone();
+            assert_eq!(shown.len(), 1);
+            let all = format!("{} {}", shown[0].toast.title, shown[0].toast.body);
+            assert!(!all.contains("secret") && !all.contains("Bob"), "{all}");
+            assert_eq!(shown[0].toast.body, "New message");
+        }
+
+        #[test]
+        fn the_tray_badge_toggle_redraws_the_icon_without_a_new_count() {
+            let mut rig = rig();
+            let _ = rig
+                .app
+                .update(Message::WindowOpened(iced::window::Id::unique()));
+            let _ = rig.app.update(core(CoreEvent::UnreadTotals {
+                notifications: 5,
+                highlights: 0,
+            }));
+            assert_eq!(*rig.tray.badges.lock().expect("mutex"), [true]);
+            st(&mut rig, S::TrayBadge(false));
+            assert_eq!(*rig.tray.badges.lock().expect("mutex"), [true, false]);
+            st(&mut rig, S::TrayBadge(true));
+            assert_eq!(*rig.tray.badges.lock().expect("mutex"), [true, false, true]);
+        }
+
+        #[test]
+        fn the_theme_choice_overrides_the_system_mode_live() {
+            let mut rig = rig();
+            let _ = rig.app.update(Message::ThemeMode(theme::Mode::Dark));
+            let dark = |app: &App| app.theme().expect("a theme").extended_palette().is_dark;
+            assert!(dark(&rig.app));
+            st(&mut rig, S::Theme(ThemeChoice::Light));
+            assert!(!dark(&rig.app));
+            st(&mut rig, S::Theme(ThemeChoice::System));
+            assert!(dark(&rig.app));
+        }
+
+        #[test]
+        fn the_sessions_link_closes_settings_and_opens_the_sessions_page() {
+            let mut rig = rig();
+            open(&mut rig);
+            st(&mut rig, S::OpenSessions);
+            assert!(!rig.app.settings_open());
+            assert!(rig.app.sessions.open);
+            assert!(
+                drain(&mut rig.rx)
+                    .iter()
+                    .any(|c| matches!(c, Command::ListDevices))
+            );
+        }
+
+        #[test]
+        fn opening_settings_keeps_the_widget_tree_under_it() {
+            let mut rig = rig();
+            let closed = tag_path(&rig.app);
+            open(&mut rig);
+            assert_eq!(tag_path(&rig.app), closed, "the base keeps its place");
+            st(&mut rig, S::Close);
+            assert_eq!(tag_path(&rig.app), closed);
+        }
+
+        #[test]
+        fn the_screen_builds_with_every_section() {
+            let mut rig = rig();
+            let _ = rig.app.update(core(profile(Some("Alice"), true)));
+            let _ = rig.app.update(core(settings_event(
+                Mode::Mute,
+                Mode::AllMessages,
+                &["lunch"],
+            )));
+            open(&mut rig);
+            let _ = rig.app.view();
+        }
+
+        #[test]
+        fn names_and_keywords_stay_out_of_debug_output() {
+            let mut rig = rig();
+            let _ = rig
+                .app
+                .update(core(profile(Some("sentinel-name-x"), false)));
+            let _ = rig.app.update(core(settings_event(
+                Mode::AllMessages,
+                Mode::AllMessages,
+                &["sentinel-kw-x"],
+            )));
+            st(&mut rig, S::KeywordInput(text("sentinel-typed-x")));
+            let dbg = format!(
+                "{:?} {:?} {:?} {:?}",
+                rig.app,
+                rig.app.settings_ui,
+                S::NameInput(text("sentinel-name-x")),
+                S::RemoveKeyword(text("sentinel-kw-x")),
+            );
+            assert!(!dbg.contains("sentinel"), "{dbg}");
+        }
+
+        #[test]
+        fn logging_out_closes_settings_and_forgets_the_profile() {
+            let mut rig = rig();
+            let _ = rig.app.update(core(profile(Some("Alice"), true)));
+            open(&mut rig);
+            let _ = rig.app.update(core(CoreEvent::LoggedOut));
+            assert!(!rig.app.settings_open());
+            assert!(rig.app.settings_ui.profile.is_none());
+            assert!(rig.app.notification_settings.is_none());
+        }
+    }
+
+    mod keyboard {
+        use tessera_core::api::{ListDiff, RoomListQuery, RoomListTab};
+
+        use super::*;
+        use crate::dialogs::RecordingDialogs;
+        use crate::keys::Shortcut;
+        use crate::rooms::RoomsMessage as R;
+        use crate::settings::SettingsMessage as S;
+        use crate::switcher::SwitcherMessage as W;
+        use crate::threads::ThreadsMessage;
+
+        fn key(app: &mut App, shortcut: Shortcut) -> Task<Message> {
+            app.update(Message::Shortcut {
+                shortcut,
+                captured: false,
+            })
+        }
+
+        fn sw(app: &mut App, message: W) {
+            let _ = app.update(Message::Switcher(message));
+        }
+
+        fn id(n: &str) -> RoomId {
+            RoomId::from(format!("!{n}:x"))
+        }
+
+        fn list(app: &mut App, rooms: Vec<RoomSummary>) {
+            let _ = app.update(core(CoreEvent::RoomListChanged(vec![ListDiff::Reset {
+                values: rooms,
+            }])));
+        }
+
+        fn named(n: &str) -> RoomSummary {
+            RoomSummary::new(id(n), n.to_owned())
+        }
+
+        fn unread(n: &str) -> RoomSummary {
+            let mut room = named(n);
+            room.unread_messages = 2;
+            room
+        }
+
+        /// Rooms `alpha`, `beta`, `gamma`, `delta`, with `alpha` open.
+        fn app4() -> (App, mpsc::Receiver<Command>) {
+            let (mut app, mut rx) = main_app();
+            list(
+                &mut app,
+                vec![
+                    named("alpha"),
+                    named("beta"),
+                    named("gamma"),
+                    named("delta"),
+                ],
+            );
+            let _ = app.update(Message::SelectRoom(id("alpha")));
+            let _ = drain(&mut rx);
+            (app, rx)
+        }
+
+        fn queries(commands: &[Command]) -> Vec<&RoomListQuery> {
+            commands
+                .iter()
+                .filter_map(|c| match c {
+                    Command::SetRoomListQuery(q) => Some(q),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        // ---- the switcher ----
+
+        #[test]
+        fn ctrl_k_opens_the_switcher_with_the_field_focused() {
+            let (mut app, _rx) = app4();
+            let task = key(&mut app, Shortcut::Switcher);
+            assert!(app.switcher.open);
+            assert_eq!(task.units(), 1, "one operation: focus the field");
+        }
+
+        #[test]
+        fn the_switcher_does_not_open_over_another_overlay_or_off_the_main_screen() {
+            let (mut app, _rx) = app4();
+            let _ = app.update(Message::Settings(S::Open));
+            let _ = key(&mut app, Shortcut::Switcher);
+            assert!(!app.switcher.open);
+            let (mut login, _rx) = login_app();
+            let _ = key(&mut login, Shortcut::Switcher);
+            assert!(!login.switcher.open);
+        }
+
+        #[test]
+        fn typing_ranks_rooms_and_the_arrows_move_the_highlight() {
+            let (mut app, _rx) = app4();
+            let _ = key(&mut app, Shortcut::Switcher);
+            // Blank query: every room, in list order.
+            let all = app.switcher.results(&app.rooms);
+            assert_eq!(all, [id("alpha"), id("beta"), id("gamma"), id("delta")]);
+            sw(&mut app, W::Input("DE".into()));
+            assert_eq!(app.switcher.results(&app.rooms), [id("delta")]);
+            sw(&mut app, W::Input("".into()));
+            assert_eq!(app.switcher.selected, 0);
+            let _ = key(&mut app, Shortcut::SwitcherNext);
+            let _ = key(&mut app, Shortcut::SwitcherNext);
+            assert_eq!(app.switcher.selected, 2);
+            let _ = key(&mut app, Shortcut::SwitcherPrevious);
+            assert_eq!(app.switcher.selected, 1);
+            // Wraps at both ends.
+            let _ = key(&mut app, Shortcut::SwitcherPrevious);
+            let _ = key(&mut app, Shortcut::SwitcherPrevious);
+            assert_eq!(app.switcher.selected, 3);
+            let _ = key(&mut app, Shortcut::SwitcherNext);
+            assert_eq!(app.switcher.selected, 0);
+        }
+
+        #[test]
+        fn the_arrows_are_the_composers_while_the_switcher_is_closed() {
+            let (mut app, _rx) = app4();
+            let task = key(&mut app, Shortcut::SwitcherNext);
+            assert_eq!(task.units(), 0);
+            assert_eq!(app.switcher.selected, 0);
+        }
+
+        #[test]
+        fn enter_opens_the_highlighted_room_and_closes_the_switcher() {
+            let (mut app, mut rx) = app4();
+            let _ = key(&mut app, Shortcut::Switcher);
+            sw(&mut app, W::Input("ga".into()));
+            let _ = drain(&mut rx);
+            let task = app.update(Message::Switcher(W::Submit));
+            assert!(!app.switcher.open);
+            assert_eq!(app.selected, Some(id("gamma")));
+            assert!(task.units() >= 1, "the composer gets the focus back");
+            assert!(drain(&mut rx).iter().any(|c| matches!(
+                c,
+                Command::SelectRoom(r) if *r == id("gamma")
+            )));
+        }
+
+        #[test]
+        fn enter_with_no_match_keeps_the_switcher_open() {
+            let (mut app, _rx) = app4();
+            let _ = key(&mut app, Shortcut::Switcher);
+            sw(&mut app, W::Input("nothing like it".into()));
+            sw(&mut app, W::Submit);
+            assert!(app.switcher.open);
+            assert_eq!(app.selected, Some(id("alpha")));
+        }
+
+        #[test]
+        fn clicking_a_row_selects_it_too() {
+            let (mut app, _rx) = app4();
+            let _ = key(&mut app, Shortcut::Switcher);
+            sw(&mut app, W::Pick(id("delta")));
+            assert!(!app.switcher.open);
+            assert_eq!(app.selected, Some(id("delta")));
+        }
+
+        #[test]
+        fn esc_closes_the_switcher_and_focuses_the_composer() {
+            let (mut app, _rx) = app4();
+            let _ = key(&mut app, Shortcut::Switcher);
+            let task = key(&mut app, Shortcut::Escape);
+            assert!(!app.switcher.open);
+            assert_eq!(task.units(), 1, "focus the composer");
+            assert_eq!(app.selected, Some(id("alpha")));
+        }
+
+        #[test]
+        fn few_local_matches_also_search_in_the_core_and_closing_restores_the_list() {
+            let (mut app, mut rx) = app4();
+            let before = app.query.clone();
+            let _ = key(&mut app, Shortcut::Switcher);
+            // Four local matches: no core search.
+            sw(&mut app, W::Input("a".into()));
+            assert!(queries(&drain(&mut rx)).is_empty());
+            // One local match: the core searches too.
+            sw(&mut app, W::Input("delta".into()));
+            let commands = drain(&mut rx);
+            assert_eq!(
+                queries(&commands),
+                [&RoomListQuery {
+                    tab: RoomListTab::All,
+                    search: "delta".into(),
+                    space: None,
+                }]
+            );
+            // The core's answer replaces the sidebar list; the rooms from
+            // before stay among the switcher's candidates.
+            list(&mut app, vec![named("delta"), named("delta two")]);
+            assert_eq!(
+                app.switcher.results(&app.rooms),
+                [id("delta"), id("delta two")]
+            );
+            sw(&mut app, W::Input("gam".into()));
+            let _ = drain(&mut rx);
+            assert_eq!(app.switcher.results(&app.rooms), [id("gamma")]);
+            // Choosing a room only the opening list knew selects it, and the
+            // list query is put back.
+            sw(&mut app, W::Submit);
+            assert_eq!(app.selected, Some(id("gamma")));
+            let commands = drain(&mut rx);
+            assert_eq!(queries(&commands).last().copied(), Some(&before));
+            assert!(!app.switcher.open);
+        }
+
+        #[test]
+        fn a_long_query_is_cut_and_a_closed_switcher_ignores_messages() {
+            let (mut app, _rx) = app4();
+            sw(&mut app, W::Input("x".into()));
+            assert!(app.switcher.query.is_empty());
+            let _ = key(&mut app, Shortcut::Switcher);
+            sw(&mut app, W::Input("y".repeat(500)));
+            assert_eq!(
+                app.switcher.query.chars().count(),
+                crate::switcher::MAX_QUERY_CHARS
+            );
+        }
+
+        #[test]
+        fn opening_the_switcher_keeps_the_widget_tree_under_it() {
+            let (mut app, _rx) = app4();
+            let closed = tag_path(&app);
+            let _ = key(&mut app, Shortcut::Switcher);
+            sw(&mut app, W::Input("al".into()));
+            assert_eq!(tag_path(&app), closed, "the base keeps its place");
+            let _ = key(&mut app, Shortcut::Escape);
+            assert_eq!(tag_path(&app), closed);
+        }
+
+        // ---- stepping through rooms ----
+
+        #[test]
+        fn alt_down_and_up_step_through_the_list_and_wrap() {
+            let (mut app, _rx) = app4();
+            let _ = key(&mut app, Shortcut::NextRoom);
+            assert_eq!(app.selected, Some(id("beta")));
+            let _ = key(&mut app, Shortcut::PreviousRoom);
+            let _ = key(&mut app, Shortcut::PreviousRoom);
+            assert_eq!(app.selected, Some(id("delta")), "wraps to the end");
+            let _ = key(&mut app, Shortcut::NextRoom);
+            assert_eq!(app.selected, Some(id("alpha")), "and back");
+        }
+
+        #[test]
+        fn ctrl_shift_arrows_find_the_next_room_with_unread_messages() {
+            let (mut app, _rx) = main_app();
+            list(
+                &mut app,
+                vec![named("a"), named("b"), unread("c"), named("d"), unread("e")],
+            );
+            let _ = app.update(Message::SelectRoom(id("a")));
+            let _ = key(&mut app, Shortcut::NextUnread);
+            assert_eq!(app.selected, Some(id("c")));
+            let _ = key(&mut app, Shortcut::NextUnread);
+            assert_eq!(app.selected, Some(id("e")));
+            let _ = key(&mut app, Shortcut::NextUnread);
+            assert_eq!(app.selected, Some(id("c")), "wraps");
+            let _ = key(&mut app, Shortcut::PreviousUnread);
+            assert_eq!(app.selected, Some(id("e")));
+        }
+
+        #[test]
+        fn nothing_unread_means_no_move_and_spaces_and_invites_are_skipped() {
+            let (mut app, mut rx) = main_app();
+            let mut space = named("s");
+            space.is_space = true;
+            let mut invite = named("i");
+            invite.is_invite = true;
+            list(&mut app, vec![named("a"), space, invite, named("b")]);
+            let _ = app.update(Message::SelectRoom(id("a")));
+            let _ = drain(&mut rx);
+            let _ = key(&mut app, Shortcut::NextUnread);
+            assert_eq!(app.selected, Some(id("a")));
+            assert!(drain(&mut rx).is_empty());
+            let _ = key(&mut app, Shortcut::NextRoom);
+            assert_eq!(app.selected, Some(id("b")));
+        }
+
+        #[test]
+        fn room_shortcuts_wait_while_an_overlay_is_open() {
+            let (mut app, _rx) = app4();
+            let _ = app.update(Message::Settings(S::Open));
+            let _ = key(&mut app, Shortcut::NextRoom);
+            assert_eq!(app.selected, Some(id("alpha")));
+        }
+
+        #[test]
+        fn a_key_a_widget_used_is_not_taken_twice() {
+            let (mut app, _rx) = app4();
+            let _ = app.update(Message::Shortcut {
+                shortcut: Shortcut::NextRoom,
+                captured: true,
+            });
+            assert_eq!(app.selected, Some(id("alpha")));
+            let _ = app.update(Message::Shortcut {
+                shortcut: Shortcut::Switcher,
+                captured: true,
+            });
+            assert!(!app.switcher.open);
+        }
+
+        #[test]
+        fn ctrl_comma_opens_settings_and_ctrl_u_asks_for_files() {
+            let (mut app, _rx) = app4();
+            let dialogs = RecordingDialogs::default();
+            app.set_dialogs(Box::new(dialogs.clone()));
+            let _ = key(&mut app, Shortcut::Attach);
+            assert_eq!(*dialogs.picked.lock().expect("test mutex"), 1);
+            let _ = key(&mut app, Shortcut::Settings);
+            assert!(app.settings_ui.open);
+        }
+
+        // ---- focus order ----
+
+        #[test]
+        fn tab_and_shift_tab_move_the_focus_unless_a_widget_used_the_key() {
+            let (mut app, _rx) = app4();
+            assert_eq!(key(&mut app, Shortcut::FocusNext).units(), 1);
+            assert_eq!(key(&mut app, Shortcut::FocusPrevious).units(), 1);
+            let used = app.update(Message::Shortcut {
+                shortcut: Shortcut::FocusNext,
+                captured: true,
+            });
+            assert_eq!(used.units(), 0, "the editor's Tab is not stolen");
+        }
+
+        // ---- Esc closes every overlay ----
+
+        #[test]
+        fn esc_closes_the_upload_confirmation() {
+            let (mut app, _rx) = app4();
+            app.uploads.dialog = Some(crate::upload::UploadDialog {
+                room_id: id("alpha"),
+                entries: Vec::new(),
+            });
+            let _ = key(&mut app, Shortcut::Escape);
+            assert!(app.uploads.dialog.is_none());
+        }
+
+        #[test]
+        fn esc_closes_the_viewer() {
+            let (mut app, _rx, _) = media_app(1);
+            let _ = app.update(Message::MediaClicked("img0".into()));
+            assert!(app.media.viewer.is_some());
+            let _ = key(&mut app, Shortcut::Escape);
+            assert!(app.media.viewer.is_none());
+        }
+
+        #[test]
+        fn esc_closes_settings() {
+            let (mut app, _rx) = app4();
+            let _ = app.update(Message::Settings(S::Open));
+            let _ = key(&mut app, Shortcut::Escape);
+            assert!(!app.settings_ui.open);
+        }
+
+        #[test]
+        fn esc_closes_a_room_dialog() {
+            let (mut app, _rx) = app4();
+            let _ = app.update(Message::Rooms(R::OpenCreate));
+            assert!(app.rooms_ui.overlay_open());
+            let _ = key(&mut app, Shortcut::Escape);
+            assert!(!app.rooms_ui.overlay_open());
+        }
+
+        #[test]
+        fn esc_closes_the_thread_panel() {
+            let (mut app, _rx) = app4();
+            let _ = app.update(Message::Threads(ThreadsMessage::Open(EventId::from(
+                "$r:x",
+            ))));
+            assert!(app.threads.panel.is_some());
+            let _ = key(&mut app, Shortcut::Escape);
+            assert!(app.threads.panel.is_none());
+        }
+
+        #[test]
+        fn esc_with_nothing_open_does_nothing() {
+            let (mut app, mut rx) = app4();
+            assert_eq!(key(&mut app, Shortcut::Escape).units(), 0);
+            assert!(drain(&mut rx).is_empty());
+        }
+
+        #[test]
+        fn esc_closes_one_layer_per_press_topmost_first() {
+            let (mut app, _rx) = app4();
+            let _ = app.update(Message::Threads(ThreadsMessage::Open(EventId::from(
+                "$r:x",
+            ))));
+            let _ = app.update(Message::Settings(S::Open));
+            let _ = key(&mut app, Shortcut::Escape);
+            assert!(!app.settings_ui.open);
+            assert!(app.threads.panel.is_some(), "the panel waits its turn");
+            let _ = key(&mut app, Shortcut::Escape);
+            assert!(app.threads.panel.is_none());
+        }
+
+        #[test]
+        fn esc_cancels_a_reply_before_it_closes_the_panel() {
+            let (mut app, _rx) = app4();
+            let _ = app.update(Message::Threads(ThreadsMessage::Open(EventId::from(
+                "$r:x",
+            ))));
+            app.composer.mode = composer::Mode::Reply("x".into());
+            let _ = key(&mut app, Shortcut::Escape);
+            assert!(matches!(app.composer.mode, composer::Mode::Normal));
+            assert!(app.threads.panel.is_some());
+        }
+
+        #[test]
+        fn the_composers_own_esc_is_not_taken_twice_with_the_apps() {
+            let (mut app, _rx) = app4();
+            let _ = app.update(Message::Threads(ThreadsMessage::Open(EventId::from(
+                "$r:x",
+            ))));
+            app.composer.mode = composer::Mode::Reply("x".into());
+            // One key press, two messages: the composer's binding, and the
+            // window listener, which saw the editor take the key.
+            let _ = app.update(Message::ComposerKey(ComposerKey::Escape));
+            let _ = app.update(Message::Shortcut {
+                shortcut: Shortcut::Escape,
+                captured: true,
+            });
+            assert!(matches!(app.composer.mode, composer::Mode::Normal));
+            assert!(app.threads.panel.is_some(), "one layer per press");
+            let _ = key(&mut app, Shortcut::Escape);
+            assert!(app.threads.panel.is_none());
+        }
+
+        #[test]
+        fn a_text_fields_esc_closes_the_panel_behind_it() {
+            let (mut app, _rx) = app4();
+            let _ = app.update(Message::Threads(ThreadsMessage::Open(EventId::from(
+                "$r:x",
+            ))));
+            // The composer has nothing to cancel; the key was taken by a
+            // field that dropped its focus.
+            let _ = app.update(Message::Shortcut {
+                shortcut: Shortcut::Escape,
+                captured: true,
+            });
+            assert!(app.threads.panel.is_none());
+        }
+    }
+
+    // ---- Task 17: Phase 5 redaction sweep ----
+
+    /// One sentinel per kind of Phase 5 text. Each is built into the state
+    /// or message that carries it, and none may come back out in a `Debug`
+    /// string of the app or of any message.
+    mod redaction_sweep {
+        use std::path::PathBuf;
+
+        use tessera_core::api::{
+            AvatarId, EventId, MediaKind, MembershipView, NotificationKind,
+            NotificationSettingsView, NotificationView, OwnProfileView, PowerLevelView, Role,
+            RoomDetailsView, RoomMemberView, RoomNotificationModeView as Mode, RoomPermissions,
+        };
+
+        use super::*;
+        use crate::dialogs::{ClipboardContent, RecordingDialogs};
+        use crate::notifications::RecordingNotifier;
+        use crate::rooms::RoomsMessage as R;
+        use crate::settings::SettingsMessage as S;
+        use crate::switcher::SwitcherMessage as W;
+        use crate::threads::ThreadsMessage as T;
+        use crate::upload::UploadPaths;
+
+        const SENTINELS: [&str; 12] = [
+            "sweep-file-name",
+            "sweep-save-path",
+            "sweep-upload-name",
+            "sweep-upload-body",
+            "sweep-preview",
+            "sweep-room-name",
+            "sweep-sender-name",
+            "sweep-topic",
+            "sweep-member",
+            "sweep-draft",
+            "sweep-keyword",
+            "sweep-query",
+        ];
+
+        fn text(s: &str) -> MessageText {
+            MessageText::from(s)
+        }
+
+        /// Fails if a sentinel is in the app's `Debug` or in the `Debug` of
+        /// any of `messages`.
+        fn sweep(context: &str, app: &App, messages: &[Message]) {
+            assert_no_sentinel(context, &format!("{app:?}"), &SENTINELS);
+            for message in messages {
+                assert_no_sentinel(context, &format!("{message:?}"), &SENTINELS);
+            }
+        }
+
+        #[test]
+        fn the_media_viewer_and_cache_hold_no_names_or_paths_in_debug() {
+            let (mut app, mut rx, _) = media_app(0);
+            let item = media_item("pic", MediaKind::Image, "sweep-file-name.png", 640, 480);
+            let _ = app.update(core(CoreEvent::TimelineDiff {
+                room_id: room_a(),
+                diffs: vec![ListDiff::Append { values: vec![item] }],
+            }));
+            let _ = drain(&mut rx);
+            arrive(&mut app, "pic", Some(decoded(8, 6)));
+            let _ = app.update(Message::MediaClicked("pic".into()));
+            let _ = app.update(media_event("pic", MediaSize::Full, Ok(png(9, 7))));
+            let decoded_full = Message::MediaDecoded {
+                room_id: room_a(),
+                item_id: "pic".into(),
+                size: MediaSize::Full,
+                decoded: Some(decoded(9, 7)),
+            };
+            let _ = app.update(decoded_full.clone());
+            let chosen = Message::SavePicked {
+                room_id: room_a(),
+                item_id: "pic".into(),
+                path: Some(media::SavePath::from(PathBuf::from(
+                    "/home/u/sweep-save-path",
+                ))),
+            };
+            let _ = app.update(chosen.clone());
+            assert!(app.media.viewer.is_some(), "the viewer is open");
+            sweep(
+                "media viewer and cache",
+                &app,
+                &[
+                    decoded_full,
+                    chosen,
+                    media_event("pic", MediaSize::Full, Ok(png(2, 2))),
+                ],
+            );
+        }
+
+        #[test]
+        fn the_upload_confirmation_with_a_pasted_image_holds_no_names_or_bytes_in_debug() {
+            let (mut app, _rx) = main_app();
+            let dialogs = RecordingDialogs::default();
+            app.set_dialogs(Box::new(dialogs));
+            let pasted = Message::Pasted(ClipboardContent::Image {
+                width: 2,
+                height: 2,
+                rgba: Arc::new(vec![171; 16]),
+            });
+            let _ = app.update(pasted.clone());
+            // A drop waits for its debounce with the path in the model.
+            let dropped = Message::FileDropped(UploadPaths(vec![PathBuf::from(
+                "/home/u/sweep-upload-name-dropped.txt",
+            )]));
+            let _ = app.update(dropped.clone());
+            assert!(!app.uploads.dropped.is_empty(), "the drop is waiting");
+            sweep("dropped file in its debounce", &app, &[dropped]);
+            app.uploads.dropped.clear();
+            let chosen = Message::FilesChosen(UploadPaths(vec![PathBuf::from(
+                "/home/u/sweep-upload-name.txt",
+            )]));
+            let _ = app.update(chosen.clone());
+            let dialog = app.uploads.dialog.as_ref().expect("a confirmation");
+            assert_eq!(dialog.entries.len(), 2, "the picture and the file");
+            let ids: Vec<u64> = dialog.entries.iter().map(|e| e.id).collect();
+            let prepared = Message::UploadPrepared {
+                entry: ids[1],
+                outcome: Box::new(crate::upload::prepare_bytes(
+                    "sweep-upload-name.txt".to_owned(),
+                    b"sweep-upload-body".to_vec(),
+                    None,
+                )),
+            };
+            let _ = app.update(prepared.clone());
+            sweep("upload confirmation", &app, &[pasted, chosen, prepared]);
+            assert!(!format!("{app:?}").contains("171, 171"), "no pixels");
+        }
+
+        #[test]
+        fn a_pending_notification_holds_no_text_in_debug() {
+            let (mut app, _rx) = main_app();
+            let notifier = RecordingNotifier::default();
+            let shown = notifier.shown.clone();
+            app.set_notifier(Box::new(notifier));
+            let _ = app.update(Message::WindowFocus(false));
+            let view = NotificationView {
+                room_id: RoomId::from("!b:x"),
+                event_id: EventId::from("$e"),
+                room_name: "sweep-room-name".into(),
+                sender: UserId::from("@bob:x"),
+                sender_name: Some("sweep-sender-name".into()),
+                is_dm: false,
+                kind: NotificationKind::Message,
+                preview: Some(text("sweep-preview")),
+            };
+            let event = core(CoreEvent::Notification(view));
+            let _ = app.update(event.clone());
+            let requests = shown.lock().expect("test mutex").clone();
+            assert_eq!(requests.len(), 1, "the notification reached the desktop");
+            assert_no_sentinel("notification request", &format!("{requests:?}"), &SENTINELS);
+            sweep("pending notification", &app, &[event]);
+        }
+
+        #[test]
+        fn room_settings_with_a_topic_and_the_member_list_hold_no_text_in_debug() {
+            let (mut app, mut rx) = main_app();
+            let rooms = |app: &mut App, m: R| {
+                let _ = app.update(Message::Rooms(m));
+            };
+            rooms(&mut app, R::OpenSettings);
+            let _ = drain(&mut rx);
+            let details = core(CoreEvent::RoomDetails(RoomDetailsView {
+                room_id: room_a(),
+                name: "sweep-room-name".into(),
+                topic: Some("sweep-topic".into()),
+                avatar: None,
+                is_encrypted: false,
+                alias: None,
+                permissions: RoomPermissions {
+                    can_set_name: true,
+                    can_set_topic: true,
+                    can_set_avatar: true,
+                    can_enable_encryption: true,
+                    can_invite: true,
+                },
+            }));
+            let _ = app.update(details.clone());
+            let typed = Message::Rooms(R::TopicInput(text("sweep-topic")));
+            let _ = app.update(typed.clone());
+            rooms(&mut app, R::OpenMembers);
+            let members = core(CoreEvent::RoomMembers {
+                room_id: room_a(),
+                members: vec![RoomMemberView {
+                    user_id: UserId::from("@bob:x"),
+                    display_name: Some("sweep-member".into()),
+                    avatar: None,
+                    power: PowerLevelView::Level(0),
+                    role: Role::User,
+                    membership: MembershipView::Joined,
+                }],
+                truncated: false,
+            });
+            let _ = app.update(members.clone());
+            sweep(
+                "room settings and members",
+                &app,
+                &[details, typed, members],
+            );
+        }
+
+        #[test]
+        fn the_thread_panel_with_a_draft_holds_no_text_in_debug() {
+            let (mut app, _rx) = main_app();
+            let root = EventId::from("$r:x");
+            let _ = app.update(Message::Threads(T::Open(root)));
+            let draft = Message::Threads(T::Draft(text("sweep-draft")));
+            let _ = app.update(draft.clone());
+            let panel = app.threads.panel.as_ref().expect("an open thread");
+            assert_eq!(panel.draft, "sweep-draft", "the draft is kept");
+            sweep("thread panel", &app, &[draft]);
+        }
+
+        #[test]
+        fn the_settings_screen_with_keywords_holds_no_text_in_debug() {
+            let (mut app, _rx) = main_app();
+            let _ = app.update(Message::Settings(S::Open));
+            let _ = app.update(core(CoreEvent::OwnProfile(OwnProfileView {
+                display_name: Some("sweep-member".into()),
+                avatar: Some(AvatarId::from("mxc://x/a")),
+            })));
+            let settings = core(CoreEvent::NotificationSettings(NotificationSettingsView {
+                group_default: Mode::AllMessages,
+                dm_default: Mode::AllMessages,
+                keywords: vec!["sweep-keyword".into()],
+            }));
+            let _ = app.update(settings.clone());
+            let typed = Message::Settings(S::KeywordInput(text("sweep-keyword")));
+            let _ = app.update(typed.clone());
+            let removal = Message::Settings(S::RemoveKeyword(text("sweep-keyword")));
+            assert!(app.settings_ui.open, "the screen is open");
+            sweep("settings screen", &app, &[settings, typed, removal]);
+        }
+
+        #[test]
+        fn the_switcher_with_a_query_holds_no_text_in_debug() {
+            let (mut app, _rx) = main_app();
+            let _ = app.open_switcher();
+            let typed = Message::Switcher(W::Input("sweep-query".into()));
+            let _ = app.update(typed.clone());
+            assert_eq!(app.switcher.query, "sweep-query", "the query is kept");
+            sweep("switcher", &app, &[typed]);
+        }
+
+        #[test]
+        fn the_app_debug_reports_the_settings_screen_and_the_switcher() {
+            let (app, _rx) = main_app();
+            let shown = format!("{app:?}");
+            assert!(shown.contains("settings_ui"), "{shown}");
+            assert!(shown.contains("switcher"), "{shown}");
+        }
     }
 }

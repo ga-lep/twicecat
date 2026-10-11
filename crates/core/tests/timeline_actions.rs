@@ -116,6 +116,7 @@ fn outgoing(room: &str, text: &str) -> OutgoingMessage {
         reply_to: None,
         kind: MessageKind::Text,
         format: TextFormat::Markdown,
+        thread_root: None,
     }
 }
 

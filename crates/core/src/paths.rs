@@ -1,6 +1,12 @@
-//! On-disk locations for per-session stores and the last-account marker.
+//! On-disk locations for per-session stores, the last-account marker and the
+//! local settings file.
 
 use std::path::{Path, PathBuf};
+
+use crate::api::{ThemeChoice, UiSettings};
+
+/// Largest settings file read (64 KiB); anything bigger is treated as corrupt.
+const MAX_SETTINGS_BYTES: u64 = 64 * 1024;
 
 /// Errors from building paths.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -48,6 +54,22 @@ fn create_private_dir_all(dir: &Path) -> std::io::Result<()> {
         builder.mode(0o700);
     }
     builder.create(dir)
+}
+
+/// Reads a regular file of at most [`MAX_SETTINGS_BYTES`]. `None` for anything
+/// else (missing, a directory or device, too big, unreadable).
+fn read_capped_regular_file(path: &Path) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+
+    let file = std::fs::File::open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_SETTINGS_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() as u64 <= MAX_SETTINGS_BYTES).then_some(bytes)
 }
 
 /// Root of all Tessera data on disk.
@@ -142,6 +164,82 @@ impl DataPaths {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(PathsError::Io),
             _ => Ok(()),
         }
+    }
+
+    /// `<root>/settings.json`: the typed [`UiSettings`], no secrets, no content.
+    pub fn settings_file(&self) -> PathBuf {
+        self.root.join("settings.json")
+    }
+
+    /// Reads the local settings. A missing file gives the defaults. A file that
+    /// cannot be read or parsed also gives the defaults, and a corrupt one is
+    /// renamed `settings.json.bad` so the next write does not hide it. Unknown
+    /// fields are ignored and missing ones take their default.
+    pub fn read_settings(&self) -> UiSettings {
+        let path = self.settings_file();
+        let Some(bytes) = read_capped_regular_file(&path) else {
+            return UiSettings::default();
+        };
+        match serde_json::from_slice(&bytes) {
+            Ok(settings) => settings,
+            Err(_) => {
+                // Best effort: if the rename fails the defaults still apply.
+                let _ = std::fs::rename(&path, self.root.join("settings.json.bad"));
+                UiSettings::default()
+            }
+        }
+    }
+
+    /// Writes the local settings atomically: a temporary file in the data root
+    /// (mode 0o600 on Unix), then a rename over `settings.json`.
+    pub fn write_settings(&self, settings: &UiSettings) -> std::io::Result<()> {
+        use std::io::Write as _;
+
+        create_private_dir_all(&self.root)?;
+        // Built by hand: the serializer guard in `session::tests` allows no
+        // serializing outside `session.rs`.
+        let theme = match settings.theme {
+            ThemeChoice::System => "System",
+            ThemeChoice::Light => "Light",
+            ThemeChoice::Dark => "Dark",
+        };
+        let json = serde_json::json!({
+            "theme": theme,
+            "desktop_notifications": settings.desktop_notifications,
+            "show_message_content": settings.show_message_content,
+            "tray_badge": settings.tray_badge,
+        })
+        .to_string();
+        let tmp = self.root.join("settings.json.tmp");
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let result = (|| {
+            // Never write through a leftover file or symlink at the temp path.
+            match std::fs::remove_file(&tmp) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+                _ => {}
+            }
+            let mut file = options.open(&tmp)?;
+            // `mode` applies only when the file is created; fix a stale one.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
+            file.write_all(json.as_bytes())?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&tmp, self.settings_file())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        result
     }
 
     /// `<root>/last_account`: holds only a user ID, never a secret.
@@ -291,12 +389,13 @@ mod tests {
         let p = DataPaths::at(tmp.path().join("root"));
         p.create_session_store_dir("abc").unwrap();
         p.write_last_account("@a:x").unwrap();
+        p.write_settings(&UiSettings::default()).unwrap();
         let mut names: Vec<String> = std::fs::read_dir(p.root())
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         names.sort();
-        assert_eq!(names, ["last_account", "sessions"]);
+        assert_eq!(names, ["last_account", "sessions", "settings.json"]);
         let sessions: Vec<String> = std::fs::read_dir(p.root().join("sessions"))
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -314,10 +413,104 @@ mod tests {
     }
 
     #[test]
+    fn settings_default_when_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = DataPaths::at(tmp.path().join("root"));
+        assert_eq!(p.settings_file(), tmp.path().join("root/settings.json"));
+        assert_eq!(p.read_settings(), UiSettings::default());
+    }
+
+    #[test]
+    fn settings_round_trip_atomically() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = DataPaths::at(tmp.path().join("root"));
+        let s = UiSettings {
+            theme: ThemeChoice::Dark,
+            desktop_notifications: false,
+            show_message_content: false,
+            tray_badge: false,
+        };
+        p.write_settings(&s).unwrap();
+        assert_eq!(p.read_settings(), s);
+        // Overwriting works and leaves no temp file behind.
+        p.write_settings(&UiSettings::default()).unwrap();
+        assert_eq!(p.read_settings(), UiSettings::default());
+        let names: Vec<_> = std::fs::read_dir(p.root())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["settings.json"]);
+    }
+
+    #[test]
+    fn corrupt_settings_give_defaults_and_are_set_aside() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = DataPaths::at(tmp.path().join("root"));
+        std::fs::create_dir_all(p.root()).unwrap();
+        std::fs::write(p.settings_file(), b"{ not json").unwrap();
+        assert_eq!(p.read_settings(), UiSettings::default());
+        assert!(!p.settings_file().exists());
+        assert_eq!(
+            std::fs::read(p.root().join("settings.json.bad")).unwrap(),
+            b"{ not json"
+        );
+    }
+
+    #[test]
+    fn settings_ignore_unknown_fields_and_fill_missing_ones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = DataPaths::at(tmp.path().join("root"));
+        std::fs::create_dir_all(p.root()).unwrap();
+        std::fs::write(
+            p.settings_file(),
+            br#"{"theme":"Light","tray_badge":false,"from_the_future":{"x":1}}"#,
+        )
+        .unwrap();
+        let s = p.read_settings();
+        assert_eq!(s.theme, ThemeChoice::Light);
+        assert!(!s.tray_badge);
+        assert!(s.desktop_notifications && s.show_message_content);
+        assert!(p.settings_file().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn settings_file_is_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let p = DataPaths::at(tmp.path().join("root"));
+        p.write_settings(&UiSettings::default()).unwrap();
+        let mode = std::fs::metadata(p.settings_file())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
     fn from_os_returns_some() {
         let p = DataPaths::from_os().expect("OS data dir available on the test machine");
         assert!(p.root().is_absolute());
         assert!(p.last_account_file().starts_with(p.root()));
+    }
+
+    #[test]
+    fn every_theme_and_bool_round_trips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = DataPaths::at(tmp.path().join("root"));
+        for theme in [ThemeChoice::System, ThemeChoice::Light, ThemeChoice::Dark] {
+            for bits in 0..8u8 {
+                let s = UiSettings {
+                    theme,
+                    desktop_notifications: bits & 1 != 0,
+                    show_message_content: bits & 2 != 0,
+                    tray_badge: bits & 4 != 0,
+                };
+                p.write_settings(&s).unwrap();
+                assert_eq!(p.read_settings(), s);
+            }
+        }
     }
 
     #[test]
@@ -333,6 +526,46 @@ mod tests {
         );
         assert!(!dir.path().join("root/call_settings.json.tmp").exists());
         assert!(paths.call_settings_file().starts_with(paths.root()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stale_loose_temp_file_is_tightened_before_the_write() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let p = DataPaths::at(tmp.path().join("root"));
+        std::fs::create_dir_all(p.root()).unwrap();
+        let stale = p.root().join("settings.json.tmp");
+        std::fs::write(&stale, b"old").unwrap();
+        std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o666)).unwrap();
+        p.write_settings(&UiSettings::default()).unwrap();
+        let mode = std::fs::metadata(p.settings_file())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn an_oversized_settings_file_gives_defaults() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = DataPaths::at(tmp.path().join("root"));
+        std::fs::create_dir_all(p.root()).unwrap();
+        let mut big = br#"{"theme":"Dark","pad":""#.to_vec();
+        big.resize(MAX_SETTINGS_BYTES as usize + 10, b'a');
+        big.extend_from_slice(b"\"}");
+        std::fs::write(p.settings_file(), &big).unwrap();
+        assert_eq!(p.read_settings(), UiSettings::default());
+    }
+
+    #[test]
+    fn a_settings_path_that_is_not_a_regular_file_gives_defaults() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = DataPaths::at(tmp.path().join("root"));
+        std::fs::create_dir_all(p.settings_file()).unwrap();
+        assert_eq!(p.read_settings(), UiSettings::default());
+        assert!(p.settings_file().is_dir());
     }
 
     #[cfg(unix)]

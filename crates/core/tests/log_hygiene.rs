@@ -22,12 +22,12 @@ use std::time::Duration;
 
 use common::{
     DEFAULT_TIMEOUT, EncryptedPair, TestEnv, e2ee_serial, expect_event, hex, login_and_run,
-    message_with, outgoing, pump, pump_with, start_core,
+    message_with, outgoing, pump, pump_with, raw_login, start_core,
 };
 use tessera_core::CoreHandle;
 use tessera_core::api::{
-    Command, CoreError, CoreEvent, CrossSigning, DeviceVerification, Password, RecoveryKey,
-    RecoveryStatus, SendStatus, TimelineItemKind, VerificationPhase,
+    Command, CoreError, CoreEvent, CrossSigning, DeviceVerification, MediaSize, Password,
+    RecoveryKey, RecoveryStatus, SendStatus, TimelineItemKind, VerificationPhase,
 };
 use tessera_core::logging::DEFAULT_FILTER;
 use tessera_core::secrets::{InMemorySecretStore, SecretStore as _};
@@ -36,6 +36,11 @@ use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 use tracing_subscriber::{EnvFilter, Layer as _};
 use zeroize::Zeroizing;
+
+/// An image with a plain-text sentinel in its bytes (`tEXt` chunk).
+const IMAGE: &[u8] = include_bytes!("fixtures/photo-1200x900.png");
+/// The text in [`IMAGE`]'s `tEXt` chunk.
+const IMAGE_SENTINEL: &str = "tessera-png-sentinel-x";
 
 /// An in-memory log sink.
 #[derive(Clone, Default)]
@@ -363,6 +368,63 @@ async fn no_secret_reaches_the_logs_or_the_disk() {
     )
     .await;
 
+    // An encrypted image whose bytes carry a sentinel (the fixture's `tEXt`
+    // chunk), sent by a raw client and fetched by both cores: the decrypted
+    // bytes and the file name must reach neither the logs nor the disk in
+    // clear (Phase 5 Q20).
+    println!("log hygiene: step media");
+    let image_name = format!("secret-name-{}.png", hex());
+    let image_event = common::send_attachment_with(
+        &raw_login(1).await,
+        &p.room_id,
+        &image_name,
+        "image/png",
+        IMAGE.to_vec(),
+    )
+    .await;
+    let has_image = |items: &[tessera_core::api::TimelineItem]| {
+        items.iter().any(|i| {
+            i.event_id.as_ref().map(|e| e.as_str()) == Some(image_event.as_str())
+                && matches!(&i.kind, TimelineItemKind::Message { details, .. }
+                    if details.media.is_some())
+        })
+    };
+    for (core, rooms, items) in [
+        (&mut p.alice, &mut p.alice_rooms, &mut p.alice_items),
+        (&mut p.carol, &mut p.carol_rooms, &mut p.carol_items),
+    ] {
+        pump(core, &room, rooms, items, |_, i| has_image(i)).await;
+        let item_id = items
+            .iter()
+            .find(|i| i.event_id.as_ref().map(|e| e.as_str()) == Some(image_event.as_str()))
+            .expect("the image arrived")
+            .id
+            .clone();
+        for size in [MediaSize::Full, MediaSize::Thumbnail] {
+            send(
+                core,
+                Command::FetchMedia {
+                    room_id: tessera_core::api::RoomId::from(room.as_str()),
+                    item_id: item_id.clone(),
+                    size,
+                },
+            )
+            .await;
+            match expect_event(
+                core,
+                |e| matches!(e, CoreEvent::Media { size: s, .. } if *s == size),
+            )
+            .await
+            {
+                CoreEvent::Media { result, .. } => {
+                    let bytes = result.expect("the image is fetched");
+                    assert_eq!(bytes.as_bytes(), IMAGE, "decrypted bytes are identical");
+                }
+                _ => unreachable!("the predicate only accepts Media"),
+            }
+        }
+    }
+
     // Alice's core 1 becomes the account's first device (password reset).
     // The reset runs through a pump so the open room's diffs are not lost.
     println!("log hygiene: step reset");
@@ -514,6 +576,8 @@ async fn no_secret_reaches_the_logs_or_the_disk() {
     sentinels.push(Sentinel::new("recovery key", &compact));
     sentinels.push(Sentinel::new("message body", &from_alice));
     sentinels.push(Sentinel::new("message body", &from_carol));
+    sentinels.push(Sentinel::new("image file name", &image_name));
+    sentinels.push(Sentinel::new("image bytes", IMAGE_SENTINEL));
     println!("log hygiene: {} sentinel values", sentinels.len());
 
     // (b) Data at rest, while the sessions are live (the SQLite -wal and -shm

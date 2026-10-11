@@ -128,10 +128,39 @@ impl Decision {
     }
 }
 
+/// Ctrl+V (paste, which may be a picture the editor cannot take) and the
+/// chords of the `keys::SHORTCUTS` table (Ctrl+K, Ctrl+U, Alt+Up, ...), which
+/// the editor must neither type nor use to move the cursor. Enter, Up, Down,
+/// Tab and Esc are not chords: `bind` decides those.
+fn shortcut(press: &KeyPress) -> Option<Message> {
+    if let Some(found) = crate::keys::shortcut_for(
+        &press.modified_key,
+        press.modifiers,
+        crate::keys::Platform::current(),
+    ) && crate::keys::composer_takes(found)
+    {
+        return Some(Message::Shortcut {
+            shortcut: found,
+            captured: false,
+        });
+    }
+    if !press.modifiers.command() || press.modifiers.alt() {
+        return None;
+    }
+    let keyboard::Key::Character(ch) = press.modified_key.as_ref() else {
+        return None;
+    };
+    ch.eq_ignore_ascii_case("v")
+        .then_some(Message::PasteRequested)
+}
+
 /// The adapter for `text_editor::key_binding`.
 pub fn binding(press: KeyPress, suggestions_open: bool) -> Option<Binding<Message>> {
     if !matches!(press.status, Status::Focused { .. }) {
         return None;
+    }
+    if let Some(message) = shortcut(&press) {
+        return Some(Binding::Custom(message));
     }
     let key = match press.modified_key.as_ref() {
         keyboard::Key::Named(key::Named::Enter) => Key::Enter,
@@ -1013,6 +1042,7 @@ fn build(
         reply_to,
         kind,
         format,
+        thread_root: None,
     })
 }
 
@@ -1116,6 +1146,135 @@ mod tests {
                 false
             ),
             Some(Binding::Insert('a'))
+        ));
+    }
+
+    /// A focused composer's key press.
+    fn focused(key: keyboard::Key, modifiers: keyboard::Modifiers) -> KeyPress {
+        KeyPress {
+            key: key.clone(),
+            modified_key: key,
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            modifiers,
+            text: None,
+            status: Status::Focused { is_hovered: false },
+        }
+    }
+
+    #[test]
+    fn shortcuts_typed_in_the_composer_do_not_steal_its_own_keys() {
+        use crate::keys::Shortcut;
+        use keyboard::Modifiers as M;
+        let named = |n: key::Named| keyboard::Key::Named(n);
+        let chord = |c: &str, m: M| Some(focused(keyboard::Key::Character(c.into()), m));
+        let shortcut_of = |press: KeyPress| match binding(press, false) {
+            Some(Binding::Custom(Message::Shortcut { shortcut, captured })) => {
+                assert!(!captured);
+                Some(shortcut)
+            }
+            _ => None,
+        };
+        // The chords are the app's.
+        for (press, want) in [
+            (chord("k", M::COMMAND), Shortcut::Switcher),
+            (chord(",", M::COMMAND), Shortcut::Settings),
+            (chord("u", M::COMMAND), Shortcut::Attach),
+            (
+                Some(focused(named(key::Named::ArrowDown), M::ALT)),
+                Shortcut::NextRoom,
+            ),
+            (
+                Some(focused(named(key::Named::ArrowUp), M::ALT)),
+                Shortcut::PreviousRoom,
+            ),
+            (
+                Some(focused(named(key::Named::ArrowDown), M::COMMAND | M::SHIFT)),
+                Shortcut::NextUnread,
+            ),
+            (
+                Some(focused(named(key::Named::ArrowUp), M::COMMAND | M::SHIFT)),
+                Shortcut::PreviousUnread,
+            ),
+        ] {
+            assert_eq!(shortcut_of(press.expect("press")), Some(want));
+        }
+        // Enter sends, Shift+Enter breaks the line, Up edits the last
+        // message, Tab picks a suggestion: none of them is a shortcut.
+        let enter = || focused(named(key::Named::Enter), M::empty());
+        assert!(matches!(
+            binding(enter(), false),
+            Some(Binding::Custom(Message::ComposerKey(ComposerKey::Send)))
+        ));
+        assert!(matches!(
+            binding(focused(named(key::Named::Enter), M::SHIFT), false),
+            Some(Binding::Enter)
+        ));
+        assert!(matches!(
+            binding(focused(named(key::Named::ArrowUp), M::empty()), false),
+            Some(Binding::Move(_))
+        ));
+        assert!(matches!(
+            binding(focused(named(key::Named::ArrowUp), M::empty()), true),
+            Some(Binding::Custom(Message::ComposerKey(ComposerKey::Previous)))
+        ));
+        assert!(matches!(
+            binding(focused(named(key::Named::Tab), M::empty()), true),
+            Some(Binding::Custom(Message::ComposerKey(ComposerKey::Pick)))
+        ));
+        // Esc and a bare Tab stay with the composer's own handling.
+        assert!(matches!(
+            binding(focused(named(key::Named::Escape), M::empty()), false),
+            Some(Binding::Custom(Message::ComposerKey(ComposerKey::Escape)))
+        ));
+        assert!(shortcut_of(focused(named(key::Named::Tab), M::empty())).is_none());
+        // Paste is not in the table: it stays the composer's.
+        assert!(matches!(
+            binding(
+                focused(keyboard::Key::Character("v".into()), M::COMMAND),
+                false
+            ),
+            Some(Binding::Custom(Message::PasteRequested))
+        ));
+    }
+
+    #[test]
+    fn ctrl_v_and_ctrl_u_are_the_apps_paste_and_attach() {
+        let press = |ch: &str, modifiers: keyboard::Modifiers| KeyPress {
+            key: keyboard::Key::Character(ch.into()),
+            modified_key: keyboard::Key::Character(ch.into()),
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            modifiers,
+            text: None,
+            status: Status::Focused { is_hovered: false },
+        };
+        let ctrl = keyboard::Modifiers::COMMAND;
+        assert!(matches!(
+            binding(press("v", ctrl), false),
+            Some(Binding::Custom(Message::PasteRequested))
+        ));
+        assert!(matches!(
+            binding(press("V", ctrl | keyboard::Modifiers::SHIFT), false),
+            Some(Binding::Custom(Message::PasteRequested))
+        ));
+        assert!(matches!(
+            binding(press("u", ctrl), false),
+            Some(Binding::Custom(Message::Shortcut {
+                shortcut: crate::keys::Shortcut::Attach,
+                captured: false
+            }))
+        ));
+        // Without the modifier, and with Alt, the keys are ordinary.
+        assert!(!matches!(
+            binding(press("v", keyboard::Modifiers::empty()), false),
+            Some(Binding::Custom(_))
+        ));
+        assert!(!matches!(
+            binding(press("v", ctrl | keyboard::Modifiers::ALT), false),
+            Some(Binding::Custom(_))
         ));
     }
 

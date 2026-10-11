@@ -2,20 +2,26 @@
 //! (timeline pane and composer) on the right.
 
 use iced::widget::{
-    Column, Row, button, column, container, opaque, row, space, stack, text, text_editor,
-    text_input,
+    Column, Row, button, column, container, opaque, pick_list, row, space, stack, text,
+    text_editor, text_input,
 };
 use iced::{Element, Fill};
-use tessera_core::api::{MessageText, UserId, UserTrust};
+use tessera_core::api::{MessageText, RoomId, UserId, UserTrust};
 
 use crate::actions::{self, Picker};
 use crate::composer::{self, EditorAction, Mode, Suggestions};
 use crate::emoji;
 use crate::links::{CheckedUrl, LinkBar, LinkKind};
+use crate::notifications::ModeChoice;
+use crate::rooms::RoomsMessage;
 use crate::screens::loading::sync_label;
 use crate::screens::timeline_pane::RichEnv;
-use crate::screens::{room_list_pane, security, sessions, timeline_pane};
+use crate::screens::{
+    media_viewer, room_dialogs, room_list_pane, security, sessions, spaces_sidebar, thread_panel,
+    timeline_pane,
+};
 use crate::sessions::SessionsMessage;
+use crate::settings::SettingsMessage;
 use crate::state::{App, Message};
 use crate::text_safety::{MAX_NAME_CHARS, name_or_placeholder, one_line_capped};
 use crate::theme;
@@ -86,6 +92,13 @@ fn header<'a>(app: &'a App, title: String) -> Element<'a, Message> {
     if let Some(lock) = selected.and_then(room_list_pane::encrypted_mark) {
         line = line.push(text(lock).size(16));
     }
+    if let Some(room) = selected.filter(|room| !room.is_invite) {
+        line = line.push(notification_menu(app, &room.id));
+        line = line.push(room_buttons());
+    }
+    if let Some(room) = selected.filter(|room| room.is_invite) {
+        line = line.push(invite_buttons(app, &room.id));
+    }
     if let Some((peer, badge)) = app
         .dm_peer_trust()
         .and_then(|(peer, trust)| trust_badge(trust).map(|badge| (peer, badge)))
@@ -122,19 +135,104 @@ fn header<'a>(app: &'a App, title: String) -> Element<'a, Message> {
     line.into()
 }
 
+/// **Members** and **Settings**, in the header of a joined room.
+fn room_buttons<'a>() -> Element<'a, Message> {
+    row![
+        button(text("Members").size(13))
+            .padding([2, 8])
+            .style(button::secondary)
+            .on_press(Message::Rooms(RoomsMessage::OpenMembers)),
+        button(text("Settings").size(13))
+            .padding([2, 8])
+            .style(button::secondary)
+            .on_press(Message::Rooms(RoomsMessage::OpenSettings)),
+    ]
+    .spacing(6)
+    .into()
+}
+
+/// **Accept** and **Decline**, in the header of an invitation. They are off
+/// while the answer is on its way.
+fn invite_buttons<'a>(app: &App, room: &RoomId) -> Element<'a, Message> {
+    let idle = !app.rooms_ui.invite_busy.contains(room);
+    row![
+        text("You were invited").size(13),
+        button(text("Accept").size(13))
+            .padding([2, 8])
+            .on_press_maybe(idle.then(|| Message::Rooms(RoomsMessage::Accept(room.clone())))),
+        button(text("Decline").size(13))
+            .padding([2, 8])
+            .style(button::secondary)
+            .on_press_maybe(idle.then(|| Message::Rooms(RoomsMessage::Decline(room.clone())))),
+    ]
+    .spacing(6)
+    .align_y(iced::Center)
+    .into()
+}
+
+/// The room's notification menu: a drop-down with the four choices of plan
+/// Q11. It shows what the user picked at once, since the room list lags
+/// behind a change.
+fn notification_menu<'a>(app: &'a App, room: &RoomId) -> Element<'a, Message> {
+    let label = text("Notifications")
+        .size(13)
+        .style(|theme: &iced::Theme| text::Style {
+            color: Some(theme::semantic(theme).muted),
+        });
+    let menu = pick_list(
+        ModeChoice::ALL,
+        Some(app.room_mode_choice(room)),
+        Message::RoomModeChosen,
+    )
+    .text_size(13)
+    .padding([2, 8]);
+    row![label, menu].spacing(6).align_y(iced::Center).into()
+}
+
 /// The main screen: panes above a status bar.
 pub fn view(app: &App) -> Element<'_, Message> {
     let content = main_column(
         security::banner_slot(&app.security),
-        row![room_list_pane::view(app), room_pane(app)]
-            .height(Fill)
-            .into(),
+        main_row(app),
         status_bar(app),
     );
     security::layer(
         content,
         security::top_layer(app).or_else(|| sessions::layer(app)),
     )
+}
+
+/// The panes, always `[spaces sidebar, room list, room pane, thread panel]`:
+/// the sidebar and the panel are empty spaces when they have nothing to show,
+/// so the room pane (timeline scroll, editor focus) keeps its place in the
+/// widget tree when a thread opens or closes. `from_vec` does not look at its
+/// children, so the row is told to fill the window both ways: left at its
+/// default width it shrinks to its content and the room pane loses the free
+/// width.
+pub(crate) fn main_row(app: &App) -> Element<'_, Message> {
+    Row::from_vec(vec![
+        spaces_sidebar::view(app),
+        room_list_pane::view(app),
+        room_pane(app),
+        thread_panel::slot(app),
+    ])
+    .width(Fill)
+    .height(Fill)
+    .into()
+}
+
+/// What the timeline pane needs besides the timeline, for the open room.
+pub fn rich_env<'a>(app: &'a App, theme: &'a iced::Theme) -> RichEnv<'a> {
+    RichEnv {
+        theme,
+        own_user: app.user_id.as_ref(),
+        revealed: &app.revealed,
+        actions: &app.actions,
+        rooms: &app.rooms,
+        members: app.known_members(),
+        media: &app.media,
+        room: app.selected.as_ref(),
+    }
 }
 
 /// The main column, always `[banner slot, panes, status bar]`: the slot is
@@ -165,14 +263,8 @@ fn room_pane(app: &App) -> Element<'_, Message> {
         |room| display_name(&room.name),
     );
 
-    let theme = theme::theme_for(app.theme_mode);
-    let env = RichEnv {
-        theme: &theme,
-        own_user: app.user_id.as_ref(),
-        revealed: &app.revealed,
-        actions: &app.actions,
-        rooms: &app.rooms,
-    };
+    let theme = app.current_theme();
+    let env = rich_env(app, &theme);
     let timeline = container(timeline_pane::view(&app.timeline, env)).height(Fill);
     // The picker floats over the timeline's bottom right corner.
     let picker = app.actions.picker.as_ref().map(|picker| {
@@ -187,6 +279,12 @@ fn room_pane(app: &App) -> Element<'_, Message> {
     let mut bars: Vec<Element<'_, Message>> = Vec::new();
     if let Some(bar) = &app.link_bar {
         bars.push(link_bar(bar));
+    }
+    if let Some(bar) = &app.rooms_ui.join_bar {
+        bars.push(room_dialogs::join_bar(bar));
+    }
+    if let Some(bar) = &app.media.open_bar {
+        bars.push(media_viewer::open_bar(bar));
     }
     if let Some(name) = &app.command_bar {
         bars.push(command_bar(name));
@@ -267,7 +365,15 @@ fn editor(app: &App, enabled: bool) -> Element<'_, Message> {
     if enabled {
         editor = editor.on_action(|action| Message::Composer(EditorAction(action)));
     }
-    editor.into()
+    // The button is always there, so the editor keeps its place in the tree;
+    // without a room it does nothing.
+    let attach = button(text("Attach\u{2026}"))
+        .on_press_maybe(enabled.then_some(Message::AttachRequested))
+        .style(button::secondary);
+    row![attach, editor]
+        .spacing(8)
+        .align_y(iced::Alignment::End)
+        .into()
 }
 
 /// The text of the bar above the editor: the quote of the message being
@@ -487,6 +593,9 @@ fn status_bar(app: &App) -> Element<'_, Message> {
             }),
             space().width(Fill),
             text(account),
+            button(text("Settings"))
+                .on_press(Message::Settings(SettingsMessage::Open))
+                .style(button::secondary),
             button(text("Sessions"))
                 .on_press(Message::Sessions(SessionsMessage::Open))
                 .style(button::secondary),

@@ -29,6 +29,8 @@ url = "2"
 rand = "0.10"
 rpassword = "7"
 zeroize = { version = "1.9", features = ["serde"] }
+# Names the `Mime` that `Room::send_attachment` takes; already in the lock (matrix-sdk dependency).
+mime = "0.3"
 # Build with LK_CUSTOM_WEBRTC from scripts/fetch-libwebrtc.sh (pinned SHA-256);
 # without it webrtc-sys downloads libwebrtc unverified.
 tessera-audio = { path = "../audio" }
@@ -41,3 +43,5 @@ gpu-enhancement = ["tessera-audio/onnxruntime"]
 
 [dev-dependencies]
 tempfile = "3"
+# Paused time for the unread-totals throttle test; a feature of the pinned-in-lock tokio, no new packages.
+tokio = { version = "1", features = ["test-util"] }

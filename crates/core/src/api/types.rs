@@ -5,7 +5,7 @@ use std::fmt;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-use super::{Shield, UtdReason};
+use super::{MediaContent, RoomNotificationModeView, Shield, ThreadSummaryView, UtdReason};
 
 /// Declares a `String` newtype with `as_str`, `From`, `Display` and
 /// transparent serde (the bare string).
@@ -157,6 +157,9 @@ pub struct RoomListQuery {
     pub tab: RoomListTab,
     /// Case- and diacritic-insensitive name filter; blank means no filter.
     pub search: String,
+    /// Show only the rooms inside this space (and its sub-spaces); `None`
+    /// shows every room. An unknown space shows an empty list.
+    pub space: Option<RoomId>,
 }
 
 /// A password. `Debug` never shows the value, and the memory is zeroized on
@@ -332,6 +335,9 @@ pub struct RoomSummary {
     /// whose trust it reports); `None` for other rooms and for DMs with no or
     /// several other users.
     pub dm_peer: Option<UserId>,
+    /// The user's own notification mode for this room; `None` when the room
+    /// follows the account default.
+    pub notification_mode: Option<RoomNotificationModeView>,
 }
 
 impl RoomSummary {
@@ -360,6 +366,7 @@ impl RoomSummary {
             last_message: None,
             is_encrypted: false,
             dm_peer: None,
+            notification_mode: None,
         }
     }
 }
@@ -722,6 +729,11 @@ pub struct MessageDetails {
     /// The authenticity shield, for encrypted messages the SDK vouches for
     /// (or warns about); `None` when there is nothing to show.
     pub shield: Option<Shield>,
+    /// The media of a picture, video, audio or file message. The message
+    /// `body` is then the caption, or the file name when there is none.
+    pub media: Option<Box<MediaContent>>,
+    /// The summary of the thread this message starts.
+    pub thread: Option<ThreadSummaryView>,
 }
 
 /// A state change shown as a muted line. Targets carry an optional display
@@ -911,6 +923,8 @@ pub struct OutgoingMessage {
     pub kind: MessageKind,
     /// How `text` becomes the event's body.
     pub format: TextFormat,
+    /// Send into the thread rooted at this event.
+    pub thread_root: Option<EventId>,
 }
 
 // Manual impl: the text and labels are user content.
@@ -923,6 +937,7 @@ impl fmt::Debug for OutgoingMessage {
             .field("reply_to", &self.reply_to.is_some())
             .field("kind", &self.kind)
             .field("format", &self.format)
+            .field("thread_root", &self.thread_root)
             .finish()
     }
 }
@@ -961,6 +976,18 @@ pub enum ActionKind {
     /// Sign devices out: every failure of that command, so that a caller
     /// can tell it from the other device actions.
     SignOutDevices,
+    /// Fetch or save media.
+    Media,
+    /// Send a file.
+    Upload,
+    /// Change notification settings.
+    Notifications,
+    /// Create, join, leave or manage a room, or list its members.
+    Rooms,
+    /// Change the user's own profile.
+    Profile,
+    /// Open or page a thread.
+    Thread,
 }
 
 /// What a timeline item is.

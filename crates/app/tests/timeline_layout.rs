@@ -67,6 +67,20 @@ fn timeline(n: usize) -> TimelineView {
 /// The layout of the pane: the content column inside the scrollable, which
 /// is the first layer of the pane's stack.
 fn content_node(view: &TimelineView, renderer: &Renderer) -> Node {
+    content_node_with(
+        view,
+        renderer,
+        &tessera_app::media::MediaModel::default(),
+        None,
+    )
+}
+
+fn content_node_with(
+    view: &TimelineView,
+    renderer: &Renderer,
+    media: &tessera_app::media::MediaModel,
+    room: Option<&tessera_core::api::RoomId>,
+) -> Node {
     let theme = tessera_app::theme::theme_for(iced::theme::Mode::Light);
     let revealed = Revealed::new();
     let actions = tessera_app::actions::ActionState::default();
@@ -76,6 +90,9 @@ fn content_node(view: &TimelineView, renderer: &Renderer) -> Node {
         revealed: &revealed,
         actions: &actions,
         rooms: &[],
+        members: &[],
+        media,
+        room,
     };
     let mut element = view_in(view, NOW, &Utc, env);
     let mut tree = Tree::new(element.as_widget());
@@ -182,4 +199,136 @@ fn an_empty_timeline_has_only_two_empty_spacers() {
     let node = content_node(&view, &renderer);
     assert_eq!(node.children().len(), 2);
     assert!(node.bounds().height < 1.0);
+}
+
+fn media_message(id: &str, kind: tessera_core::api::MediaKind, w: u32, h: u32) -> TimelineItem {
+    let mut media = tessera_core::api::MediaContent::new(kind, "pic.png".to_owned());
+    media.width = Some(w);
+    media.height = Some(h);
+    TimelineItem::new(
+        id.to_owned(),
+        TimelineItemKind::Message {
+            sender: UserId::from("@a:x"),
+            body: "pic.png".to_owned(),
+            is_own: false,
+            timestamp_ms: NOW,
+            sent: SendStatus::Sent,
+            details: Box::new(MessageDetails {
+                media: Some(Box::new(media)),
+                ..MessageDetails::default()
+            }),
+        },
+    )
+}
+
+/// The heights of the built rows, from the layout.
+fn row_heights(node: &Node) -> Vec<f32> {
+    let kids = node.children();
+    kids[1..kids.len() - 1]
+        .iter()
+        .map(|row| row.bounds().height)
+        .collect()
+}
+
+#[test]
+fn a_thumbnail_arriving_changes_no_laid_out_row_height() {
+    use tessera_core::api::{MediaKind, RoomId};
+    let renderer = renderer();
+    let room = RoomId::from("!r:x");
+    let mut view = TimelineView::default();
+    view.apply_diffs(vec![ListDiff::Reset {
+        values: vec![
+            media_message("a", MediaKind::Image, 1600, 900),
+            media_message("b", MediaKind::Image, 30, 20),
+            media_message("c", MediaKind::Image, 0, 0),
+            media_message("d", MediaKind::File, 0, 0),
+        ],
+    }]);
+    view.scrolled(0.0, HEIGHT, WIDTH);
+
+    let mut media = tessera_app::media::MediaModel::default();
+    let before = row_heights(&content_node_with(&view, &renderer, &media, Some(&room)));
+    assert_eq!(before.len(), 4);
+
+    // The estimate matches what the box lays out to, so the first measure
+    // moves nothing either.
+    for (i, height) in before.iter().enumerate() {
+        let estimate = tessera_app::timeline::estimate_height(
+            &view.items[i],
+            tessera_app::timeline::is_continuation(&view.items, i),
+            WIDTH,
+        );
+        assert!(
+            (estimate - height).abs() <= 8.0,
+            "row {i}: estimated {estimate}, laid out {height}"
+        );
+    }
+
+    // Thumbnails arrive for the images, one of them undecodable.
+    for (id, ok) in [("a", true), ("b", true), ("c", false)] {
+        let key = (room.clone(), id.to_owned());
+        assert!(media.needs_fetch(&key));
+        let decoded = ok
+            .then(|| {
+                tessera_app::media::decode_thumbnail(&{
+                    let img = image::RgbaImage::new(64, 36);
+                    let mut out = std::io::Cursor::new(Vec::new());
+                    img.write_to(&mut out, image::ImageFormat::Png)
+                        .expect("encode");
+                    out.into_inner()
+                })
+            })
+            .flatten();
+        media.thumb_decoded(&key, decoded);
+    }
+    let after = row_heights(&content_node_with(&view, &renderer, &media, Some(&room)));
+    assert_eq!(after, before);
+}
+
+/// A file being uploaded: a local echo with progress.
+fn uploading(id: &str, sent: u64) -> TimelineItem {
+    let mut media =
+        tessera_core::api::MediaContent::new(tessera_core::api::MediaKind::File, "f.bin".into());
+    media.upload = Some(tessera_core::api::UploadProgress { sent, total: 100 });
+    TimelineItem::new(
+        id.to_owned(),
+        TimelineItemKind::Message {
+            sender: UserId::from("@a:x"),
+            body: "f.bin".to_owned(),
+            is_own: true,
+            timestamp_ms: NOW,
+            sent: SendStatus::Sending,
+            details: Box::new(MessageDetails {
+                media: Some(Box::new(media)),
+                ..MessageDetails::default()
+            }),
+        },
+    )
+}
+
+#[test]
+fn upload_progress_changes_no_laid_out_row_height() {
+    let renderer = renderer();
+    let heights = |sent| {
+        let mut view = TimelineView::default();
+        view.apply_diffs(vec![ListDiff::Reset {
+            values: vec![uploading("u", sent)],
+        }]);
+        view.scrolled(0.0, HEIGHT, WIDTH);
+        row_heights(&content_node(&view, &renderer))
+    };
+    let (start, middle, end) = (heights(0), heights(50), heights(100));
+    assert_eq!(start.len(), 1);
+    assert_eq!(start, middle);
+    assert_eq!(middle, end);
+    // The bar and **Cancel** add a line under the card.
+    let plain = {
+        let mut view = TimelineView::default();
+        view.apply_diffs(vec![ListDiff::Reset {
+            values: vec![media_message("p", tessera_core::api::MediaKind::File, 0, 0)],
+        }]);
+        view.scrolled(0.0, HEIGHT, WIDTH);
+        row_heights(&content_node(&view, &renderer))
+    };
+    assert!(start[0] > plain[0], "{start:?} vs {plain:?}");
 }
