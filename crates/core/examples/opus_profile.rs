@@ -8,7 +8,9 @@
 //! it, and with denormals flushed (x86: FTZ/DAZ). Decoding is per remote
 //! voice.
 //!
-//! Run: `cargo run --release -p twicecat-core --example opus_profile [seconds]`
+//! Run: `cargo run --release -p twicecat-core --example opus_profile -- [--tsv] [seconds]`
+//! (`--tsv`: one tab-separated line per encode and per decode row, for
+//! `scripts/profile-call-path.sh`)
 //!
 //! On a hybrid CPU (Intel P- and E-cores) run it on an E-core too
 //! (`taskset -c <cpu>`): WebRTC's encoder thread runs there, and Opus on
@@ -197,12 +199,35 @@ impl Signal {
     }
 }
 
-/// Mean time per 10 ms of audio (two per packet) and the share of packets
-/// sent (not DTX).
+/// Time per packet of each encode and decode (after the first second), and
+/// the share of packets sent (not DTX).
 struct Cost {
-    encode: Duration,
-    decode: Duration,
+    encode: Vec<Duration>,
+    decode: Vec<Duration>,
     sent: f32,
+}
+
+/// Mean per 10 ms of audio (two per packet).
+fn mean_per_10_ms(times: &[Duration]) -> Duration {
+    times.iter().sum::<Duration>() / (2 * times.len() as u32)
+}
+
+/// One tab-separated line (`--tsv`): name, then mean, median, p99 and worst
+/// in µs per 10 ms of audio (half a packet's time), then the share of
+/// packets sent in percent.
+fn tsv_line(name: &str, times: &[Duration], sent: f32) -> String {
+    let mut times = times.to_vec();
+    times.sort();
+    let n = times.len();
+    let us = |d: Duration| d.as_secs_f64() * 1e6 / 2.0;
+    format!(
+        "{name}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\t{:.0}",
+        us(times.iter().sum::<Duration>() / n as u32),
+        us(times[n / 2]),
+        us(times[n * 99 / 100]),
+        us(times[n - 1]),
+        sent * 100.0,
+    )
 }
 
 fn measure(signal: &[i16], bitrate: i32, complexity: i32) -> Cost {
@@ -210,7 +235,7 @@ fn measure(signal: &[i16], bitrate: i32, complexity: i32) -> Cost {
     let mut decoder = Decoder::new();
     let mut out = [0_u8; 1500];
     let mut pcm = [0_i16; PACKET];
-    let (mut encode, mut decode, mut sent) = (Duration::ZERO, Duration::ZERO, 0_usize);
+    let (mut encode, mut decode, mut sent) = (Vec::new(), Vec::new(), 0_usize);
     let packets = signal.chunks_exact(PACKET);
     let count = packets.len();
     // One second first, so the encoder's state (and its denormals) settles.
@@ -223,23 +248,27 @@ fn measure(signal: &[i16], bitrate: i32, complexity: i32) -> Cost {
         decoder.decode(if len > 2 { &out[..len] } else { &[] }, &mut pcm);
         let decoded = start.elapsed();
         if i >= 50 {
-            encode += encoded;
-            decode += decoded;
+            encode.push(encoded);
+            decode.push(decoded);
             sent += usize::from(len > 2);
         }
     }
-    let tens = 2 * (count - 50) as u32;
     Cost {
-        encode: encode / tens,
-        decode: decode / tens,
+        encode,
+        decode,
         sent: sent as f32 / (count - 50) as f32,
     }
 }
 
 fn main() {
-    let seconds: usize = std::env::args()
-        .nth(1)
-        .map_or(10, |s| s.parse().expect("seconds"));
+    let mut tsv = false;
+    let mut seconds = 10;
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--tsv" => tsv = true,
+            n => seconds = n.parse().expect("seconds"),
+        }
+    }
     let len = (seconds + 1) * RATE as usize / PACKET * PACKET;
     let signals = [
         Signal::VoiceInNoise,
@@ -247,31 +276,67 @@ fn main() {
         Signal::DigitalSilence,
     ];
     let audio: Vec<Vec<i16>> = signals.iter().map(|s| s.samples(len)).collect();
-    println!("Opus in libwebrtc, per 10 ms of audio, mean over {seconds} s (after 1 s)");
+    if !tsv {
+        println!("Opus in libwebrtc, per 10 ms of audio, mean over {seconds} s (after 1 s)");
+    }
     for flushed in [false, true] {
         if flushed {
             twicecat_audio::flush_denormals_on_this_thread();
         }
-        println!(
-            "\n-- denormals {}",
-            if flushed {
-                "flushed (FTZ/DAZ)"
-            } else {
-                "as on WebRTC's encoder thread"
-            }
-        );
+        if !tsv {
+            println!(
+                "\n-- denormals {}",
+                if flushed {
+                    "flushed (FTZ/DAZ)"
+                } else {
+                    "as on WebRTC's encoder thread"
+                }
+            );
+        }
         for (bitrate, complexity) in [(64_000, 9), (32_000, 9), (32_000, 5), (12_000, 10)] {
             for (signal, samples) in signals.iter().zip(&audio) {
                 let cost = measure(samples, bitrate, complexity);
+                if tsv {
+                    let row = format!(
+                        "{} kb/s c{complexity} {} {}",
+                        bitrate / 1000,
+                        signal.name(),
+                        if flushed { "flushed" } else { "unflushed" },
+                    );
+                    println!(
+                        "{}",
+                        tsv_line(&format!("encode {row}"), &cost.encode, cost.sent)
+                    );
+                    println!(
+                        "{}",
+                        tsv_line(&format!("decode {row}"), &cost.decode, cost.sent)
+                    );
+                    continue;
+                }
                 println!(
                     "{:>3} kb/s complexity {complexity:>2}, {:<15}: encode {:>6.1} µs, decode {:>5.1} µs, {:>3.0} % of packets sent",
                     bitrate / 1000,
                     signal.name(),
-                    cost.encode.as_secs_f64() * 1e6,
-                    cost.decode.as_secs_f64() * 1e6,
+                    mean_per_10_ms(&cost.encode).as_secs_f64() * 1e6,
+                    mean_per_10_ms(&cost.decode).as_secs_f64() * 1e6,
                     cost.sent * 100.0,
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_row_is_one_tab_separated_line_per_10_ms() {
+        // 100 packets of 1..=100 µs: per 10 ms (half a packet) 0.5..=50.
+        let times: Vec<Duration> = (1..=100).map(Duration::from_micros).collect();
+        assert_eq!(
+            tsv_line("encode 64 kb/s c9 voice in noise", &times, 0.5),
+            "encode 64 kb/s c9 voice in noise\t25.2\t25.5\t50.0\t50.0\t50"
+        );
     }
 }
