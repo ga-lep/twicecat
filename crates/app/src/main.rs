@@ -1,4 +1,4 @@
-//! Tessera desktop app entry point: parses the command line, starts the core
+//! Twicecat desktop app entry point: parses the command line, starts the core
 //! on its own runtime and runs the Iced application.
 
 use std::collections::hash_map::RandomState;
@@ -7,29 +7,29 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use tessera_app::settings::DiskSettings;
-use tessera_app::state::App;
-use tessera_app::{Bridge, Startup, TITLE};
-use tessera_core::api::AudioBackend;
-use tessera_core::logging;
-use tessera_core::paths::DataPaths;
-use tessera_core::secrets::{
+use twicecat_app::settings::DiskSettings;
+use twicecat_app::state::App;
+use twicecat_app::{Bridge, Startup, TITLE};
+use twicecat_core::api::AudioBackend;
+use twicecat_core::logging;
+use twicecat_core::paths::DataPaths;
+use twicecat_core::secrets::{
     InMemorySecretStore, KEYCHAIN_SERVICE, KeyringSecretStore, SecretStore,
 };
-use tessera_core::{CoreConfig, DEFAULT_ROOM_LIST_PAGE_SIZE};
+use twicecat_core::{CoreConfig, DEFAULT_ROOM_LIST_PAGE_SIZE};
 
 /// Log filter of the app (plan Q19): the app never logs messages or secrets.
-const LOG_FILTER: &str = "warn,tessera_core=info,tessera_app=info";
+const LOG_FILTER: &str = "warn,twicecat_core=info,twicecat_app=info";
 
 const HELP: &str = "\
-tessera: desktop Matrix client
+twicecat: desktop Matrix client
 
 USAGE:
-    tessera [--data-dir <path> | --ephemeral] [--homeserver <url>]
+    twicecat [--data-dir <path> | --ephemeral] [--homeserver <url>]
 
 OPTIONS:
     --data-dir <path>     Store session data here (default: the OS data directory;
-                          on Linux ~/.local/share/tessera)
+                          on Linux ~/.local/share/twicecat)
     --homeserver <url>    Use this homeserver (URL or server name) instead of
                           discovering it from the user ID
     --ephemeral           Keep the secret store in memory and use a temporary
@@ -38,7 +38,7 @@ OPTIONS:
                           account settings.
     --help                Show this help
 
-The app and tessera-cli share the same data directory and keychain entry, so a
+The app and twicecat-cli share the same data directory and keychain entry, so a
 session made in one is restored in the other. Do not run both at the same time
 on one data directory: the session store is locked by SQLite.
 ";
@@ -90,7 +90,7 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
 fn ephemeral_dir() -> PathBuf {
     let seed = |_| RandomState::new().build_hasher().finish();
     let suffix: String = (0..2).map(|i| format!("{:016x}", seed(i))).collect();
-    std::env::temp_dir().join(format!("tessera-{suffix}"))
+    std::env::temp_dir().join(format!("twicecat-{suffix}"))
 }
 
 fn run(options: Options) -> Result<(), String> {
@@ -151,7 +151,7 @@ fn run(options: Options) -> Result<(), String> {
 }
 
 fn main() -> ExitCode {
-    tessera_core::require_cpu_level();
+    twicecat_core::require_cpu_level();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let options = match parse_args(&args) {
         Ok(Parsed::Run(options)) => options,
@@ -160,17 +160,17 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Err(message) => {
-            eprintln!("tessera: {message}\nTry --help.");
+            eprintln!("twicecat: {message}\nTry --help.");
             return ExitCode::from(2);
         }
     };
     if let Err(error) = logging::init(LOG_FILTER) {
-        eprintln!("tessera: logging not started: {error}");
+        eprintln!("twicecat: logging not started: {error}");
     }
     match run(options) {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
-            eprintln!("tessera: {message}");
+            eprintln!("twicecat: {message}");
             ExitCode::FAILURE
         }
     }
@@ -185,8 +185,8 @@ mod tests {
     }
 
     #[test]
-    fn window_title_is_tessera() {
-        assert_eq!(TITLE, "Tessera");
+    fn window_title_is_twicecat() {
+        assert_eq!(TITLE, "Twicecat");
     }
 
     #[test]
@@ -221,7 +221,7 @@ mod tests {
 
     #[test]
     fn help_carries_the_shared_data_dir_note() {
-        assert!(HELP.contains("tessera-cli"));
+        assert!(HELP.contains("twicecat-cli"));
         assert!(HELP.contains("at the same time"));
     }
 

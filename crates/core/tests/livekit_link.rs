@@ -41,10 +41,10 @@ fn libwebrtc_apm_processes_ten_ms_frames() {
 #[test]
 #[ignore = "needs an audio output device; plays 300 ms of silence"]
 fn hardware_audio_output_opens_in_a_binary_linking_libwebrtc() {
-    let io = tessera_audio::AudioIo::start(
-        tessera_audio::IoConfig {
+    let io = twicecat_audio::AudioIo::start(
+        twicecat_audio::IoConfig {
             playback: true,
-            ..tessera_audio::IoConfig::default()
+            ..twicecat_audio::IoConfig::default()
         },
         |_: &_, _: &mut _| {},
     )

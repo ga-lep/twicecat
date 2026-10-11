@@ -166,7 +166,7 @@ impl DeviceWatcher {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
         let thread = std::thread::Builder::new()
-            .name("tessera-audio-devices".into())
+            .name("twicecat-audio-devices".into())
             .spawn(move || {
                 // Registered on this thread, which owns its COM objects;
                 // the callback only wakes it.

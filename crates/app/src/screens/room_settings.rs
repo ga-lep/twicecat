@@ -4,7 +4,7 @@
 
 use iced::widget::{Column, button, column, container, row, scrollable, space, text, text_input};
 use iced::{Element, Fill};
-use tessera_core::api::MessageText;
+use twicecat_core::api::MessageText;
 
 use crate::rooms::{RoomsMessage, SettingsPanel};
 use crate::screens::room_dialogs::{error_line, modal, msg, muted};

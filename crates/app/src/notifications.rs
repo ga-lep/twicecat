@@ -19,10 +19,10 @@ use std::time::{Duration, Instant};
 
 use iced::Task;
 use iced::futures::stream;
-use tessera_core::api::{
+use tokio::sync::mpsc;
+use twicecat_core::api::{
     NotificationKind, NotificationView, RoomId, RoomNotificationModeView, UiSettings,
 };
-use tokio::sync::mpsc;
 
 use crate::state::Message;
 use crate::text_safety::one_line_capped;
@@ -298,7 +298,7 @@ fn deliver(request: Request, tx: &mpsc::UnboundedSender<Message>) {
     } = request;
     let mut notification = notify_rust::Notification::new();
     notification
-        .appname("Tessera")
+        .appname("Twicecat")
         .summary(&toast.title)
         .body(&toast.body)
         .action("default", "Open");
@@ -331,7 +331,7 @@ fn deliver(request: Request, tx: &mpsc::UnboundedSender<Message>) {
 fn deliver(request: Request, _tx: &mpsc::UnboundedSender<Message>) {
     let mut notification = notify_rust::Notification::new();
     notification
-        .appname("Tessera")
+        .appname("Twicecat")
         .summary(&request.toast.title)
         .body(&request.toast.body);
     let _ = notification.show();
@@ -425,7 +425,7 @@ mod fake {
 
 #[cfg(test)]
 mod tests {
-    use tessera_core::api::{EventId, MessageText, UserId};
+    use twicecat_core::api::{EventId, MessageText, UserId};
 
     use super::*;
 

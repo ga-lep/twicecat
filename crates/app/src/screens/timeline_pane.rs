@@ -19,7 +19,7 @@ use iced::widget::{
 use iced::{
     Background, Color, ContentFit, Element, Fill, Font, Length, Padding, Shrink, Theme, mouse,
 };
-use tessera_core::api::{
+use twicecat_core::api::{
     Block, EventId, Inline, MediaContent, MediaKind, MessageDetails, MessageKind, MessageText,
     PaginationState, PlaceholderKind, ReactionGroup, ReplyPreview, ReplyState, RichText, RoomId,
     RoomMemberView, RoomSummary, SendStatus, Shield, ShieldCode, StateChange, TextStyle,
@@ -983,7 +983,7 @@ pub fn placeholder_text(what: PlaceholderKind) -> &'static str {
         PlaceholderKind::Sticker => "sent a sticker (not shown yet)",
         PlaceholderKind::Poll => "started a poll (not shown yet)",
         PlaceholderKind::Location => "shared a location (not shown yet)",
-        PlaceholderKind::Unsupported => "sent something Tessera cannot show yet",
+        PlaceholderKind::Unsupported => "sent something Twicecat cannot show yet",
     }
 }
 
@@ -1246,7 +1246,7 @@ mod tests {
         assert_eq!(upload_percent(-1.0), "0 %");
     }
 
-    use tessera_core::api::EventId;
+    use twicecat_core::api::EventId;
 
     use super::*;
 
@@ -1833,7 +1833,7 @@ mod tests {
 
     use ::image as image_crate;
     use chrono::Utc;
-    use tessera_core::api::{ListDiff, SendFailure};
+    use twicecat_core::api::{ListDiff, SendFailure};
 
     use crate::timeline::MAX_BUILT_ROWS;
 
@@ -1937,7 +1937,7 @@ mod tests {
 
     #[test]
     fn formatted_messages_build_in_both_themes_with_every_item_kind() {
-        use tessera_core::api::{Block, Inline, MentionTarget, RichText, TextStyle};
+        use twicecat_core::api::{Block, Inline, MentionTarget, RichText, TextStyle};
         let rich = RichText {
             blocks: vec![
                 Block::Paragraph(vec![
@@ -2040,7 +2040,7 @@ mod tests {
 
     #[test]
     fn rows_with_actions_and_reactions_build_without_changing_the_window() {
-        use tessera_core::api::ItemActions;
+        use twicecat_core::api::ItemActions;
         let details = MessageDetails {
             actions: ItemActions {
                 can_reply: true,

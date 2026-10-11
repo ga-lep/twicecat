@@ -107,7 +107,7 @@ pub(crate) struct CallSession {
 /// The audio side handed to a call.
 pub(crate) struct CallAudio {
     pub voice: Option<crate::audio_session::Voice>,
-    pub outgoing: Option<tessera_audio::Outgoing>,
+    pub outgoing: Option<twicecat_audio::Outgoing>,
     pub bitrate_kbps: u16,
     /// Cleaning other people's voices, and the per-user choices.
     pub cleaning: (RemoteCleaning, BTreeMap<UserId, VoiceCleaning>),

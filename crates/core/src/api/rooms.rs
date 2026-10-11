@@ -363,7 +363,7 @@ pub enum ThemeChoice {
 /// Settings kept on this device only. No secrets, no content.
 ///
 /// ```
-/// use tessera_core::api::{ThemeChoice, UiSettings};
+/// use twicecat_core::api::{ThemeChoice, UiSettings};
 /// let s = UiSettings::default();
 /// assert_eq!(s.theme, ThemeChoice::System);
 /// assert!(s.desktop_notifications && s.show_message_content && s.tray_badge);

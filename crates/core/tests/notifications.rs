@@ -22,12 +22,12 @@ use matrix_sdk::ruma::api::client::membership::joined_rooms;
 use matrix_sdk::ruma::events::Mentions;
 use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
 use matrix_sdk::ruma::{OwnedRoomId, OwnedUserId};
-use tessera_core::CoreHandle;
-use tessera_core::api::{
+use twicecat_core::CoreHandle;
+use twicecat_core::api::{
     ActionKind, Command, CoreEvent, ListDiff, NotificationKind, NotificationSettingsView,
     NotificationView, RoomId, RoomNotificationModeView, RoomSummary,
 };
-use tessera_core::secrets::InMemorySecretStore;
+use twicecat_core::secrets::InMemorySecretStore;
 
 /// All tests in this binary share two accounts' push rules.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -216,7 +216,7 @@ impl Fixture {
     async fn create_group(&mut self) -> OwnedRoomId {
         let room = create_room(
             &self.alice,
-            &format!("tessera-test-{}", hex()),
+            &format!("twicecat-test-{}", hex()),
             Some(&self.carol_id),
         )
         .await;
@@ -324,7 +324,7 @@ async fn a_mention_in_a_muted_room_is_silent_until_the_mode_is_reset() {
 async fn a_keyword_notifies_in_a_mentions_only_room() {
     let mut f = Fixture::new().await;
     let group = f.create_group().await;
-    let keyword = format!("tessera-kw-{}", hex());
+    let keyword = format!("twicecat-kw-{}", hex());
 
     f.change_settings(Command::AddKeyword {
         keyword: format!("  {keyword}  "),
@@ -447,7 +447,7 @@ async fn an_invite_notifies() {
     let mut f = Fixture::new().await;
     let room = create_room(
         &f.alice,
-        &format!("tessera-test-{}", hex()),
+        &format!("twicecat-test-{}", hex()),
         Some(&f.carol_id),
     )
     .await;

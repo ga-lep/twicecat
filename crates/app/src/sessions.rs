@@ -11,7 +11,7 @@ use std::fmt;
 
 use chrono::TimeZone;
 use iced::Task;
-use tessera_core::api::{
+use twicecat_core::api::{
     AuthUrl, Command, CoreError, DeviceId, DeviceSummary, DeviceTrust, Password, ReauthAction,
     RecoveryStatus, SecurityStatus,
 };
@@ -666,7 +666,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use chrono::FixedOffset;
-    use tessera_core::api::{CrossSigning, DeviceVerification, ReauthAction};
+    use twicecat_core::api::{CrossSigning, DeviceVerification, ReauthAction};
 
     use super::*;
 

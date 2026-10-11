@@ -90,7 +90,7 @@ impl Default for RemoteCleaning {
 }
 
 /// Which voices [`RemoteCleaning`] leaves alone because their sender's
-/// device says it cleans them already: Tessera announces its suppressor
+/// device says it cleans them already: Twicecat announces its suppressor
 /// ([`CleaningAnnouncement`]), and LiveKit's web and mobile clients flag
 /// their tracks (the browser's noise suppression, Krisp). Your per-person
 /// choice wins over this.
@@ -110,7 +110,7 @@ pub enum SkipCleaned {
 }
 
 /// What others in a call learn about your microphone's cleaning, so their
-/// Tessera need not clean your voice again ([`SkipCleaned`]). Sent as a
+/// Twicecat need not clean your voice again ([`SkipCleaned`]). Sent as a
 /// LiveKit participant attribute, seen by everyone in the call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -118,7 +118,7 @@ pub struct CleaningAnnouncement {
     /// Tell others which suppressor runs on your microphone (default on).
     /// Off, others may clean your voice a second time.
     pub enabled: bool,
-    /// Your microphone is cleaned before Tessera (NVIDIA Broadcast, a
+    /// Your microphone is cleaned before Twicecat (NVIDIA Broadcast, a
     /// Krisp app, a headset's own processing): announced as cleaned by a
     /// neural suppressor, whatever [`AudioProcessing::noise_suppression`]
     /// says.
@@ -267,7 +267,7 @@ pub struct GpuEnhancement {
 ///   RNNoise and DeepFilterNet3 never run on top of each other.
 /// - `cancel_system_audio` extends echo cancellation and does nothing
 ///   without it.
-/// - Processing done outside Tessera (NVIDIA Broadcast, a virtual
+/// - Processing done outside Twicecat (NVIDIA Broadcast, a virtual
 ///   PipeWire source, Krisp) is the user's choice: it is not detected, and
 ///   ours runs on top of it unless turned off here.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -318,7 +318,7 @@ pub enum InputMode {
     },
 }
 
-/// What push-to-talk listens to. The strings are parsed by `tessera-ptt`
+/// What push-to-talk listens to. The strings are parsed by `twicecat-ptt`
 /// (the core only stores them); kept when the input mode changes.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -426,7 +426,7 @@ impl AudioSettings {
     /// [`limits`]). NaN values fall back to the default.
     ///
     /// ```
-    /// use tessera_core::api::AudioSettings;
+    /// use twicecat_core::api::AudioSettings;
     /// let s = AudioSettings { input_gain_db: 99.0, ..AudioSettings::default() };
     /// assert_eq!(s.validated().input_gain_db, 20.0);
     /// ```

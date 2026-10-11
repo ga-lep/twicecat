@@ -1,5 +1,5 @@
 [package]
-name = "tessera-ptt"
+name = "twicecat-ptt"
 version = "0.1.0"
 edition.workspace = true
 repository.workspace = true

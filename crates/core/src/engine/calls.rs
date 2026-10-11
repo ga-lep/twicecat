@@ -29,7 +29,7 @@ pub(super) async fn next_media_notice(call: &mut Option<CallSession>) -> MediaNo
 /// How often the device watcher re-lists audio devices.
 const DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
-fn audio_device(info: tessera_audio::DeviceInfo) -> AudioDevice {
+fn audio_device(info: twicecat_audio::DeviceInfo) -> AudioDevice {
     AudioDevice {
         id: AudioDeviceId::from(info.id),
         name: info.name,
@@ -37,7 +37,7 @@ fn audio_device(info: tessera_audio::DeviceInfo) -> AudioDevice {
     }
 }
 
-fn audio_devices(list: tessera_audio::DeviceList) -> AudioDevices {
+fn audio_devices(list: twicecat_audio::DeviceList) -> AudioDevices {
     AudioDevices {
         inputs: list.inputs.into_iter().map(audio_device).collect(),
         outputs: list.outputs.into_iter().map(audio_device).collect(),
@@ -55,7 +55,7 @@ impl Engine {
         let events = self.events.clone();
         tokio::spawn(async move {
             let available = tokio::task::spawn_blocking(|| {
-                tessera_audio::default_model_dir()
+                twicecat_audio::default_model_dir()
                     .map(|dir| crate::gpu_enhancement::probe(&dir))
                     .unwrap_or_default()
             })
@@ -70,7 +70,7 @@ impl Engine {
     /// the first time, starts the hot-plug watcher, which sends
     /// `AudioDevices` again whenever the list changes.
     pub(super) async fn list_audio_devices(&mut self) {
-        match blocking(tessera_audio::list_devices).await {
+        match blocking(twicecat_audio::list_devices).await {
             Ok(Ok(list)) => {
                 self.emit(CoreEvent::AudioDevices(audio_devices(list)))
                     .await
@@ -84,7 +84,7 @@ impl Engine {
         }
         if self.device_watcher.is_none() {
             let events = self.events.clone();
-            let watcher = tessera_audio::DeviceWatcher::spawn(DEVICE_POLL_INTERVAL, move |list| {
+            let watcher = twicecat_audio::DeviceWatcher::spawn(DEVICE_POLL_INTERVAL, move |list| {
                 // A plain thread, not a runtime one, so blocking is fine; a
                 // closed channel means the engine is gone.
                 let _ = events.blocking_send(CoreEvent::AudioDevices(audio_devices(list)));

@@ -42,14 +42,14 @@ load_stack_env() {
     [ -f "$root/.env.test" ] || { echo "error: $root/.env.test missing" >&2; return 1; }
     load_env_file "$root/.env.local"
     load_env_file "$root/.env.test"
-    local host=$TESSERA_ADDRESS
+    local host=$TWICECAT_ADDRESS
     # An IPv6 address goes in brackets in URLs and in published ports.
     [[ "$host" == *:* ]] && host="[$host]"
-    export TESSERA_PUBLISH_ADDRESS="$host"
-    : "${HOMESERVER_URL:=http://$host:$TESSERA_SYNAPSE_PORT}"
-    : "${LK_JWT_URL:=http://$host:$TESSERA_LK_JWT_PORT}"
-    : "${LIVEKIT_URL:=ws://$host:$TESSERA_LIVEKIT_PORT}"
-    : "${LK_JWT_URL_B:=http://$host:$TESSERA_LK_JWT_PORT_B}"
-    : "${LIVEKIT_URL_B:=ws://$host:$TESSERA_LIVEKIT_PORT_B}"
+    export TWICECAT_PUBLISH_ADDRESS="$host"
+    : "${HOMESERVER_URL:=http://$host:$TWICECAT_SYNAPSE_PORT}"
+    : "${LK_JWT_URL:=http://$host:$TWICECAT_LK_JWT_PORT}"
+    : "${LIVEKIT_URL:=ws://$host:$TWICECAT_LIVEKIT_PORT}"
+    : "${LK_JWT_URL_B:=http://$host:$TWICECAT_LK_JWT_PORT_B}"
+    : "${LIVEKIT_URL_B:=ws://$host:$TWICECAT_LIVEKIT_PORT_B}"
     export HOMESERVER_URL LK_JWT_URL LIVEKIT_URL LK_JWT_URL_B LIVEKIT_URL_B
 }

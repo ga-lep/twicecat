@@ -6,7 +6,7 @@
 
 use std::ops::Range;
 
-use tessera_core::api::{ListDiff, RoomId, RoomListTab, RoomSummary};
+use twicecat_core::api::{ListDiff, RoomId, RoomListTab, RoomSummary};
 
 use crate::text_safety::{MAX_NAME_CHARS, name_or_placeholder, one_line_capped};
 
@@ -51,7 +51,7 @@ pub fn contains(rooms: &[RoomSummary], id: &RoomId) -> bool {
 /// `0..len`.
 ///
 /// ```
-/// use tessera_app::room_list::visible_range;
+/// use twicecat_app::room_list::visible_range;
 /// assert_eq!(visible_range(0.0, 100.0, 10.0, 1000, 2), 0..12);
 /// assert_eq!(visible_range(0.0, 100.0, 10.0, 0, 2), 0..0);
 /// ```
@@ -164,11 +164,11 @@ pub fn empty_label(tab: RoomListTab, search: &str) -> &'static str {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use tessera_core::api::{
+    use tokio::sync::mpsc;
+    use twicecat_core::api::{
         AvatarId, Command, CoreEvent, ListDiff, MessagePreview, RoomId, RoomSummary, SendStatus,
         TimelineItem, TimelineItemKind, UserId,
     };
-    use tokio::sync::mpsc;
 
     use crate::bridge::EventsSlot;
     use crate::state::{App, Message, Startup};
@@ -483,7 +483,7 @@ mod tests {
 
     // ---- Query, scrolling and paging (Task 10) ----------------------------
 
-    use tessera_core::api::{RoomListQuery, RoomListTab};
+    use twicecat_core::api::{RoomListQuery, RoomListTab};
 
     use super::ROW_HEIGHT;
 
@@ -680,7 +680,7 @@ mod tests {
 
     use std::collections::HashMap;
 
-    use tessera_core::api::AvatarImage;
+    use twicecat_core::api::AvatarImage;
 
     use crate::avatars::AvatarState;
 
@@ -1056,7 +1056,7 @@ mod tests {
 
 #[cfg(test)]
 mod pure_tests {
-    use tessera_core::api::{MessagePreview, RoomId, RoomListTab, RoomSummary, UserId};
+    use twicecat_core::api::{MessagePreview, RoomId, RoomListTab, RoomSummary, UserId};
 
     use super::*;
 

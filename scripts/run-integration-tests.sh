@@ -11,5 +11,5 @@ script_dir=$(cd "$(dirname "$0")" && pwd)
 cd "$script_dir/.."
 
 "$script_dir/prune-test-rooms.sh"
-exec cargo test -p tessera-core -p tessera-app --locked -- \
+exec cargo test -p twicecat-core -p twicecat-app --locked -- \
     --ignored --skip keyring --skip hardware_ "$@"

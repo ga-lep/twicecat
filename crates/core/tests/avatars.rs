@@ -11,8 +11,10 @@ use common::{
     TestEnv, create_room, expect_event, expect_event_within, raw_login, start_core,
     unique_room_name,
 };
-use tessera_core::api::{AvatarId, Command, CoreEvent, ListDiff, Password, RoomSummary, SyncState};
-use tessera_core::secrets::InMemorySecretStore;
+use twicecat_core::api::{
+    AvatarId, Command, CoreEvent, ListDiff, Password, RoomSummary, SyncState,
+};
+use twicecat_core::secrets::InMemorySecretStore;
 
 const FIXTURE: &[u8] = include_bytes!("fixtures/avatar.png");
 

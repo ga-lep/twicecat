@@ -12,11 +12,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{expect_event, expect_event_within, start_core_with_audio};
-use tessera_core::api::{
+use twicecat_core::api::{
     AUDIO_FRAME_LEN, AudioBackend, AudioProcessing, AudioSettings, Command, CoreEvent,
     EnhancerBackend, GpuBackend, NoiseSuppression, VirtualAudio,
 };
-use tessera_core::secrets::InMemorySecretStore;
+use twicecat_core::secrets::InMemorySecretStore;
 
 /// A quiet hiss on the microphone; playback is ignored.
 struct Hiss(std::sync::Mutex<u32>);

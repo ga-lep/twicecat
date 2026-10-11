@@ -55,7 +55,7 @@ struct Run {
 /// flag (subdivision flags), at most [`MAX_TAG_CHARS`] of them.
 ///
 /// ```
-/// assert_eq!(tessera_app::text_safety::one_line("a\nb"), "a\u{23CE}b");
+/// assert_eq!(twicecat_app::text_safety::one_line("a\nb"), "a\u{23CE}b");
 /// ```
 pub fn one_line(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -231,7 +231,7 @@ fn split_line(text: &str) -> (&str, Option<&str>) {
 /// [`ELLIPSIS`], and always falls on a character boundary.
 ///
 /// ```
-/// use tessera_app::text_safety::multi_line_capped;
+/// use twicecat_app::text_safety::multi_line_capped;
 /// assert_eq!(multi_line_capped("a\r\nb\u{2028}c", 100, 2), "a\nb\u{2026}");
 /// ```
 pub fn multi_line_capped(text: &str, max_chars: usize, max_lines: usize) -> String {

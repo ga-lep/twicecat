@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! docker compose up -d --wait && scripts/create-test-users.sh
-//! cargo run -p tessera-core --example seed_big_room -- 10000
+//! cargo run -p twicecat-core --example seed_big_room -- 10000
 //! ```
 //!
 //! It reads `.env.test` (variables of the same name win), logs in as test
@@ -94,12 +94,12 @@ async fn main() -> Result<(), String> {
     client
         .matrix_auth()
         .login_username(get("TEST_USER_1")?, get("TEST_PASSWORD_1")?)
-        .initial_device_display_name("tessera-seed-big-room")
+        .initial_device_display_name("twicecat-seed-big-room")
         .await
         .map_err(fail("login failed"))?;
 
     let mut request = CreateRequest::new();
-    request.name = Some(format!("tessera-big-room-{count}"));
+    request.name = Some(format!("twicecat-big-room-{count}"));
     let invitee = format!("@{}:{}", get("TEST_USER_3")?, get("HOMESERVER_DOMAIN")?);
     request
         .invite

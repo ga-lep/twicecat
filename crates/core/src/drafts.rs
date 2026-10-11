@@ -35,7 +35,7 @@ pub(crate) fn to_sdk(draft: &Draft) -> Option<ComposerDraft> {
     })
 }
 
-/// The draft stored by [`to_sdk`]. An edit draft (Tessera never stores one)
+/// The draft stored by [`to_sdk`]. An edit draft (Twicecat never stores one)
 /// and blank text give `None`, so an edit cannot come back as a new message.
 pub(crate) fn from_sdk(draft: ComposerDraft) -> Option<Draft> {
     let reply_to = match draft.draft_type {

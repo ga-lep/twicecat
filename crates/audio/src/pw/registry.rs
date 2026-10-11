@@ -221,7 +221,7 @@ impl Watcher {
         let (stop, stopped) = pw::channel::channel::<()>();
         let (ready_tx, ready) = mpsc::sync_channel(1);
         let thread = std::thread::Builder::new()
-            .name("tessera-pw-devices".into())
+            .name("twicecat-pw-devices".into())
             .spawn(move || {
                 let session = match Session::connect() {
                     Ok(session) => session,

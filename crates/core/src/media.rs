@@ -38,7 +38,7 @@ pub(crate) const MAX_THUMBNAIL_BYTES: u64 = 10 * 1024 * 1024;
 /// Largest file the core fetches: the SDK holds the whole body in memory.
 pub(crate) const MAX_FULL_BYTES: u64 = 512 * 1024 * 1024;
 /// Suffix of the file a save is written to before it is renamed.
-const PART_SUFFIX: &str = ".tessera-part";
+const PART_SUFFIX: &str = ".twicecat-part";
 /// Deadline of the server limits request.
 const LIMITS_DEADLINE: Duration = Duration::from_secs(15);
 
@@ -358,7 +358,7 @@ pub(crate) async fn save_media<F: ContentFetcher>(
         .map_err(|_| CoreError::Storage("could not write the file".into()))
 }
 
-/// Writes `bytes` to `<path>.tessera-part`, syncs it and renames it to
+/// Writes `bytes` to `<path>.twicecat-part`, syncs it and renames it to
 /// `path`. On any failure the part file is removed.
 pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;

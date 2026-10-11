@@ -4,7 +4,7 @@
 use iced::widget::image::{self, FilterMethod};
 use iced::widget::{Row, column, container, space, stack, text};
 use iced::{Center, Element, Fill, Length};
-use tessera_core::api::CancelReason;
+use twicecat_core::api::CancelReason;
 
 use crate::screens::security::{card, secondary, wide};
 use crate::state::{App, Message};
@@ -64,7 +64,7 @@ fn cancel_button() -> Element<'static, Message> {
     secondary("Cancel", Some(msg(VerificationMessage::Cancel)))
 }
 
-fn emoji_grid(set: &[tessera_core::api::SasEmoji; 7]) -> Element<'_, Message> {
+fn emoji_grid(set: &[twicecat_core::api::SasEmoji; 7]) -> Element<'_, Message> {
     let cells = set.iter().map(|e| {
         column![
             text(e.symbol.as_str()).size(36),
@@ -157,7 +157,7 @@ fn content(model: &VerificationModel) -> Element<'_, Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tessera_core::api::{
+    use twicecat_core::api::{
         DeviceId, QrImage, SasEmoji, UserId, VerificationId, VerificationPeer,
         VerificationPhase as P,
     };

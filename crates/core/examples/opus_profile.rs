@@ -8,7 +8,7 @@
 //! it, and with denormals flushed (x86: FTZ/DAZ). Decoding is per remote
 //! voice.
 //!
-//! Run: `cargo run --release -p tessera-core --example opus_profile [seconds]`
+//! Run: `cargo run --release -p twicecat-core --example opus_profile [seconds]`
 //!
 //! On a hybrid CPU (Intel P- and E-cores) run it on an E-core too
 //! (`taskset -c <cpu>`): WebRTC's encoder thread runs there, and Opus on
@@ -250,7 +250,7 @@ fn main() {
     println!("Opus in libwebrtc, per 10 ms of audio, mean over {seconds} s (after 1 s)");
     for flushed in [false, true] {
         if flushed {
-            tessera_audio::flush_denormals_on_this_thread();
+            twicecat_audio::flush_denormals_on_this_thread();
         }
         println!(
             "\n-- denormals {}",

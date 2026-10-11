@@ -2,18 +2,18 @@
 //! `.env.test` (the committed defaults), overridden by `.env.local` (this
 //! machine's, not committed), overridden by the environment. The URLs the
 //! clients use are derived from the address and ports unless set. Shared by
-//! tessera-core's and tessera-app's tests (`#[path]`).
+//! twicecat-core's and twicecat-app's tests (`#[path]`).
 
 use std::collections::HashMap;
 use std::path::Path;
 
 /// The derived URLs: key, scheme, and the port setting they use.
 const URLS: [(&str, &str, &str); 5] = [
-    ("HOMESERVER_URL", "http", "TESSERA_SYNAPSE_PORT"),
-    ("LK_JWT_URL", "http", "TESSERA_LK_JWT_PORT"),
-    ("LIVEKIT_URL", "ws", "TESSERA_LIVEKIT_PORT"),
-    ("LK_JWT_URL_B", "http", "TESSERA_LK_JWT_PORT_B"),
-    ("LIVEKIT_URL_B", "ws", "TESSERA_LIVEKIT_PORT_B"),
+    ("HOMESERVER_URL", "http", "TWICECAT_SYNAPSE_PORT"),
+    ("LK_JWT_URL", "http", "TWICECAT_LK_JWT_PORT"),
+    ("LIVEKIT_URL", "ws", "TWICECAT_LIVEKIT_PORT"),
+    ("LK_JWT_URL_B", "http", "TWICECAT_LK_JWT_PORT_B"),
+    ("LIVEKIT_URL_B", "ws", "TWICECAT_LIVEKIT_PORT_B"),
 ];
 
 /// Loads the settings from the workspace root.
@@ -43,7 +43,7 @@ pub fn resolve(
             values.insert(key, value);
         }
     }
-    let address = values.get("TESSERA_ADDRESS").cloned().unwrap_or_default();
+    let address = values.get("TWICECAT_ADDRESS").cloned().unwrap_or_default();
     // An IPv6 address goes in brackets.
     let host = if address.contains(':') {
         format!("[{address}]")

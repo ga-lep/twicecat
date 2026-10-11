@@ -72,7 +72,7 @@ string_newtype!(
 /// The bytes of an encoded avatar image. `Debug` shows only the length.
 ///
 /// ```
-/// use tessera_core::api::AvatarImage;
+/// use twicecat_core::api::AvatarImage;
 /// let img = AvatarImage::from(vec![1, 2, 3]);
 /// assert_eq!(format!("{img:?}"), "AvatarImage(<3 bytes>)");
 /// assert_eq!(img.as_bytes(), &[1, 2, 3]);
@@ -166,7 +166,7 @@ pub struct RoomListQuery {
 /// drop (each clone separately).
 ///
 /// ```
-/// use tessera_core::api::Password;
+/// use twicecat_core::api::Password;
 /// let p = Password::from("hunter2");
 /// assert!(!format!("{p:?}").contains("hunter2"));
 /// assert_eq!(p.expose(), "hunter2");
@@ -203,7 +203,7 @@ impl fmt::Debug for Password {
 /// memory is zeroized on drop (each clone separately).
 ///
 /// ```
-/// use tessera_core::api::MessageText;
+/// use twicecat_core::api::MessageText;
 /// let t = MessageText::from("hello");
 /// assert!(!format!("{t:?}").contains("hello"));
 /// assert_eq!(t.expose(), "hello");
@@ -240,7 +240,7 @@ impl fmt::Debug for MessageText {
 /// its query, so `Debug` shows only scheme and host.
 ///
 /// ```
-/// use tessera_core::api::AuthUrl;
+/// use twicecat_core::api::AuthUrl;
 /// let u = AuthUrl::from("https://auth.example.org/a?state=s");
 /// assert!(!format!("{u:?}").contains("state"));
 /// assert_eq!(u.expose(), "https://auth.example.org/a?state=s");
@@ -344,7 +344,7 @@ impl RoomSummary {
     /// A summary with zero counts, `false` flags and no avatar or preview.
     ///
     /// ```
-    /// use tessera_core::api::{RoomId, RoomSummary};
+    /// use twicecat_core::api::{RoomId, RoomSummary};
     /// let r = RoomSummary::new(RoomId::from("!r:x"), "Lounge".into());
     /// assert_eq!(r.unread_messages, 0);
     /// assert!(r.last_message.is_none());
@@ -536,7 +536,7 @@ impl fmt::Debug for Block {
 /// Formatted message text, free of HTML. `Debug` shows only counts.
 ///
 /// ```
-/// use tessera_core::api::RichText;
+/// use twicecat_core::api::RichText;
 /// assert!(RichText::default().blocks.is_empty());
 /// assert_eq!(format!("{:?}", RichText::default()), "RichText(<0 blocks, 0 inlines>)");
 /// ```
@@ -1127,7 +1127,7 @@ impl TimelineItem {
     /// An item that no one has read yet.
     ///
     /// ```
-    /// use tessera_core::api::{TimelineItem, TimelineItemKind};
+    /// use twicecat_core::api::{TimelineItem, TimelineItemKind};
     /// let item = TimelineItem::new("i".into(), TimelineItemKind::ReadMarker);
     /// assert!(item.read_by.is_empty());
     /// ```

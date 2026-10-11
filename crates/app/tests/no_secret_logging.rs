@@ -399,7 +399,7 @@ fn the_scanner_flags_every_macro_and_ignores_test_code_and_comments() {
     }
     assert!(missed.is_empty(), "not flagged:\n{}", missed.join("\n--\n"));
     let fine = r#"
-fn f(message: &str) { eprintln!("tessera: {message}"); }
+fn f(message: &str) { eprintln!("twicecat: {message}"); }
 fn g(x: Option<u8>) { x.expect("a fixed message"); assert!(x.is_some(), "fine"); panic!("fine ) text"); }
 // println!("{}", s.password);
 /* println!("{}", s.password); /* nested */ eprintln!("{}", s.password); */

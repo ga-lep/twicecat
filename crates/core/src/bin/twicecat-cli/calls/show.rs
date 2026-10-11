@@ -1,7 +1,7 @@
-//! What `tessera-cli` prints about calls and audio. Every text that comes
+//! What `twicecat-cli` prints about calls and audio. Every text that comes
 //! from the network or the system goes through `sanitize`.
 
-use tessera_core::api::{
+use twicecat_core::api::{
     AudioDeviceId, AudioDevices, AudioSettings, CleaningStatus, EnhancerBackend, GpuBackend,
     GpuEnhancement, InputLevel, InputMode, NoiseSuppression, Participant, RoomId, RoomSummary,
     SkipCleaned, SkipReason,
@@ -200,7 +200,7 @@ pub(super) fn describe(s: &AudioSettings, devices: &AudioDevices) -> Vec<String>
     ) {
         (false, _) => "Your cleaning is not announced.",
         (true, false) => "Your suppressor is announced to the call.",
-        (true, true) => "Your voice is announced as cleaned before Tessera.",
+        (true, true) => "Your voice is announced as cleaned before Twicecat.",
     };
     vec![
         format!(
@@ -245,7 +245,7 @@ pub(super) fn level_line(level: InputLevel) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tessera_core::api::{AudioDevice, DeviceId, ParticipantId, UserId};
+    use twicecat_core::api::{AudioDevice, DeviceId, ParticipantId, UserId};
 
     #[test]
     fn gpu_enhancement_is_reported_in_one_line() {

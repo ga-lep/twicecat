@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Downloads Microsoft's prebuilt ONNX Runtime at the pinned version for the
-# opt-in GPU speech enhancement (plan Task 13b; tessera-audio feature
+# opt-in GPU speech enhancement (plan Task 13b; twicecat-audio feature
 # `onnxruntime`), checks the SHA-256 in scripts/checksums/onnxruntime.sha256 (GitHub
 # release digests), unpacks it into a cache dir, and prints the directory
-# holding the shared library. Tessera loads it from there at run time (or
-# from TESSERA_ONNXRUNTIME_DIR); nothing is linked at build time. The
+# holding the shared library. Twicecat loads it from there at run time (or
+# from TWICECAT_ONNXRUNTIME_DIR); nothing is linked at build time. The
 # DirectML flavour (Windows x64) is not published for this version:
 # scripts/build-onnxruntime-directml.sh builds it.
 #
@@ -14,7 +14,7 @@
 #             cuDNN runtime libraries installed)
 #   platform: linux-x64 | linux-aarch64 | osx-arm64 | win-x64 | win-arm64
 #             (default: the host)
-# Env: TESSERA_ONNXRUNTIME_CACHE overrides the cache root.
+# Env: TWICECAT_ONNXRUNTIME_CACHE overrides the cache root.
 # Progress goes to stderr; stdout carries only the path.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -75,7 +75,7 @@ expected=$(awk -v f="$archive" '$2 == f {print $1}' "$sums")
 [ -n "$expected" ] || die "no pinned SHA-256 for $archive in $sums"
 [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || die "malformed SHA-256 for $archive in $sums"
 
-cache_root="${TESSERA_ONNXRUNTIME_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/tessera/onnxruntime}"
+cache_root="${TWICECAT_ONNXRUNTIME_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/twicecat/onnxruntime}"
 dest="$cache_root/$version/${platform}${flavour}"
 marker="$dest/.verified"
 

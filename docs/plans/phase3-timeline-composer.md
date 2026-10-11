@@ -397,7 +397,7 @@ Two probes were compiled in a scratch copy of the workspace in the session scrat
 ### Conventions for every task
 - **Gate (rule 4)**, required before each commit:
   - `cargo fmt --all --check && cargo clippy --workspace --all-targets --all-features --locked -- -D warnings && cargo test --workspace --locked`, plus `scripts/check-app-deps.sh`, `scripts/check-core-api.sh` and `cargo deny check`.
-  - Tasks that touch the core or the bridge also run `docker compose up -d --wait && scripts/create-test-users.sh && cargo test -p tessera-core -p tessera-app --locked -- --ignored --skip keyring`, then `docker compose stop`.
+  - Tasks that touch the core or the bridge also run `docker compose up -d --wait && scripts/create-test-users.sh && cargo test -p twicecat-core -p twicecat-app --locked -- --ignored --skip keyring`, then `docker compose stop`.
   - The agent never runs the real-keychain test.
 - **One commit per task**, message `phase3.<task number>: <summary>`, with the attribution trailer as instructed by the session. ROADMAP.md is never committed.
 - **PROGRESS.md (rule 5).**
@@ -409,7 +409,7 @@ Two probes were compiled in a scratch copy of the workspace in the session scrat
     - open issues and new human items.
   - Rendering, scrolling feel, IME, link opening and OS behaviour go on the human list, never ticked by the agent (rule 9).
 - **Boundary (rule 7).**
-  - `crates/app` depends only on `tessera-core`, iced, image, tokio, open, emojis and chrono. It imports only `tessera_core::{api, Core, CoreConfig, CoreHandle, DEFAULT_ROOM_LIST_PAGE_SIZE, paths, secrets, logging}`.
+  - `crates/app` depends only on `twicecat-core`, iced, image, tokio, open, emojis and chrono. It imports only `twicecat_core::{api, Core, CoreConfig, CoreHandle, DEFAULT_ROOM_LIST_PAGE_SIZE, paths, secrets, logging}`.
   - `crates/core/src/api/` stays SDK-free (`check-core-api.sh`). `rich_text.rs`, `outgoing.rs` and the timeline mapping stay private core modules.
 - **No network or blocking in `update`.** `update` only mutates state, calls `try_send`, and returns `Task`s, including scroll operations, link opening and debounce timers. Unit tests drive `update` with a plain `mpsc` sink and no runtime.
 - **Secrets and content hygiene (rule 6).**
@@ -436,7 +436,7 @@ Acceptance criteria:
 - `crates/core/Cargo.toml` changes only by adding `"markdown"` to matrix-sdk's features; the pin `=0.19.1` is unchanged.
 - `crates/app/Cargo.toml` gains exactly the Q2 entries: `emojis`, `chrono`, and the dev-only `iced` entry with `advanced`.
 - The `Cargo.lock` diff adds exactly pulldown-cmark 0.13.4, pulldown-cmark-escape 0.11.0 and unicase 2.9.0, plus dependency edges. No existing version changes (checked with a sorted name/version comparison recorded in PROGRESS.md).
-- `cargo tree -p tessera-app --depth 1 -e normal` lists emojis v0.9.0 and chrono v0.4.45. `cargo tree -p tessera-app -e features -i iced` shows `advanced` only under dev.
+- `cargo tree -p twicecat-app --depth 1 -e normal` lists emojis v0.9.0 and chrono v0.4.45. `cargo tree -p twicecat-app -e features -i iced` shows `advanced` only under dev.
 - `deny.toml` gains only the Q3 ignore entry. `cargo deny check` passes, and PROGRESS.md records that the advisory failure was pre-existing on `main`.
 - `scripts/check-app-deps.sh` exits 0.
 - PROGRESS.md gains the Phase 3 steps list, the pinned-versions lines, and a "Phase 3 human checkpoint" list seeded with:
@@ -446,7 +446,7 @@ Acceptance criteria:
 
 ### Task 2: Additive core API for Phase 3
 Language: rust
-Files: crates/core/src/api/mod.rs, crates/core/src/api/types.rs, crates/core/src/timeline.rs, crates/core/src/engine.rs, crates/core/src/bin/tessera-cli.rs, crates/core/tests/timeline.rs, crates/app/src/screens/main_view.rs, crates/app/src/room_list.rs, PROGRESS.md
+Files: crates/core/src/api/mod.rs, crates/core/src/api/types.rs, crates/core/src/timeline.rs, crates/core/src/engine.rs, crates/core/src/bin/twicecat-cli.rs, crates/core/tests/timeline.rs, crates/app/src/screens/main_view.rs, crates/app/src/room_list.rs, PROGRESS.md
 Depends on: Task 1
 Acceptance criteria:
 - The API has exactly the Q7 additions, all `Clone + Debug + PartialEq`, SDK-free and documented. `scripts/check-core-api.sh` exits 0.

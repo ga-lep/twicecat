@@ -6,7 +6,7 @@ use iced::widget::{
     text_editor, text_input,
 };
 use iced::{Element, Fill};
-use tessera_core::api::{MessageText, RoomId, UserId, UserTrust};
+use twicecat_core::api::{MessageText, RoomId, UserId, UserTrust};
 
 use crate::actions::{self, Picker};
 use crate::composer::{self, EditorAction, Mode, Suggestions};
@@ -492,7 +492,7 @@ fn suggestion_list(suggestions: &Suggestions) -> Option<Element<'_, Message>> {
 }
 
 /// One member row: the display name and the user ID, sanitised and capped.
-pub fn member_row_label(member: &tessera_core::api::Member) -> String {
+pub fn member_row_label(member: &twicecat_core::api::Member) -> String {
     let id = one_line_capped(member.user_id.as_str(), MAX_NAME_CHARS);
     match member.display_name.as_deref() {
         Some(name) if !name.trim().is_empty() => {
@@ -687,7 +687,7 @@ mod tests {
     fn the_panes_keep_their_place_when_the_banner_and_security_screens_come_and_go() {
         use crate::security::{Banner, Overlay, RecoverySetup, SecurityModel};
         use iced::advanced::widget::Tree;
-        use tessera_core::api::{DeviceVerification, RecoveryKey, RecoveryStatus};
+        use twicecat_core::api::{DeviceVerification, RecoveryKey, RecoveryStatus};
 
         let content = text_editor::Content::new();
         fn build<'a>(
@@ -796,7 +796,7 @@ mod tests {
     #[test]
     fn the_mode_bar_quotes_the_replied_message() {
         use crate::state::Startup;
-        use tessera_core::api::{
+        use twicecat_core::api::{
             ListDiff, MessageDetails, SendStatus, TimelineItem, TimelineItemKind,
         };
         let (tx, _rx) = tokio::sync::mpsc::channel(4);

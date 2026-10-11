@@ -12,12 +12,12 @@ use common::{
     TestEnv, create_room, expect_event, login_and_run, raw_login, start_core, unique_room_name,
     wait_for_room,
 };
-use tessera_core::CoreHandle;
-use tessera_core::api::{
+use twicecat_core::CoreHandle;
+use twicecat_core::api::{
     Command, CoreError, CoreEvent, ListDiff, MessageText, RoomId, SendStatus, TimelineItem,
     TimelineItemKind,
 };
-use tessera_core::secrets::InMemorySecretStore;
+use twicecat_core::secrets::InMemorySecretStore;
 
 /// Applies timeline diffs of `room_id` to `items` until `done` holds.
 async fn apply_until(
@@ -67,7 +67,7 @@ fn unique_marker() -> String {
     let mut bytes = [0u8; 8];
     rand::fill(&mut bytes);
     let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    format!("tessera-marker-{hex}")
+    format!("twicecat-marker-{hex}")
 }
 
 #[tokio::test]

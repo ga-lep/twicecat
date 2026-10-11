@@ -17,8 +17,8 @@
 # Installed as scripts/fetch-onnxruntime.sh lays a release out (the printed
 # lib directory: onnxruntime.dll, its shared-provider library and
 # DirectML.dll, with the licences), as the `win-x64-directml` flavour that
-# Tessera loads after the CUDA builds and before the CPU one (or from
-# TESSERA_ONNXRUNTIME_DIR).
+# Twicecat loads after the CUDA builds and before the CPU one (or from
+# TWICECAT_ONNXRUNTIME_DIR).
 #
 # Needs: Windows x64, Visual Studio 2022 or its Build Tools (C++ workload,
 # a Windows 10/11 SDK), CMake 3.28 or later, Python 3, git. About 30 GB of
@@ -27,8 +27,8 @@
 # minutes.
 #
 # Usage: scripts/build-onnxruntime-directml.sh
-# Env: TESSERA_ONNXRUNTIME_CACHE overrides the cache root (as
-# fetch-onnxruntime.sh); TESSERA_ORT_BUILD_DIR the build tree (default
+# Env: TWICECAT_ONNXRUNTIME_CACHE overrides the cache root (as
+# fetch-onnxruntime.sh); TWICECAT_ORT_BUILD_DIR the build tree (default
 # <cache root>/b: keep it short, Windows paths stop at 260 characters
 # unless long paths are enabled); CMAKE the cmake to use.
 # Progress goes to stderr; stdout carries only the path.
@@ -60,7 +60,7 @@ package="microsoft.ai.directml.${dml_version}.nupkg"
 dml_expected=$(awk -v f="$package" '$2 == f {print $1}' "$sums")
 [[ "$dml_expected" =~ ^[0-9a-f]{64}$ ]] || die "no pinned SHA-256 for $package in $sums"
 
-cache_root="${TESSERA_ONNXRUNTIME_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/tessera/onnxruntime}"
+cache_root="${TWICECAT_ONNXRUNTIME_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/twicecat/onnxruntime}"
 dest="$cache_root/$version/win-x64-directml"
 marker="$dest/.verified"
 pinned="$commit $dml_expected"
@@ -77,7 +77,7 @@ if [ -z "$cmake" ] && [ -x "/c/Program Files/CMake/bin/cmake.exe" ]; then
 fi
 [ -n "$cmake" ] || die "need CMake 3.28 or later (or set CMAKE)"
 
-build="${TESSERA_ORT_BUILD_DIR:-$cache_root/b}"
+build="${TWICECAT_ORT_BUILD_DIR:-$cache_root/b}"
 src="$build/ort-src-$version"
 out="$build/ort-b"
 mkdir -p "$build"

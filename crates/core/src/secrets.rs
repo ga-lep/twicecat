@@ -11,11 +11,11 @@ use thiserror::Error;
 use zeroize::Zeroizing;
 
 /// Keychain service name used in production (plan Decision 5).
-pub const KEYCHAIN_SERVICE: &str = "io.github.ga_lep.Tessera";
+pub const KEYCHAIN_SERVICE: &str = "io.github.ga_lep.Twicecat";
 
 /// Keychain service name used only by the ignored real-keychain test, so it
 /// can never collide with a production entry (plan Decision 7).
-pub const TEST_KEYCHAIN_SERVICE: &str = "io.github.ga_lep.Tessera.test";
+pub const TEST_KEYCHAIN_SERVICE: &str = "io.github.ga_lep.Twicecat.test";
 
 /// A failure of the secret store. Messages never contain secret values.
 #[derive(Debug, Error)]

@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use tessera_core::api::{ActionKind, MessageDetails, TimelineItem, TimelineItemKind};
+use twicecat_core::api::{ActionKind, MessageDetails, TimelineItem, TimelineItemKind};
 
 use crate::screens::timeline_pane::sender_label;
 use crate::text_safety::one_line_capped;
@@ -171,7 +171,7 @@ pub fn notice_text(action: ActionKind, detail: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tessera_core::api::ItemActions;
+    use twicecat_core::api::ItemActions;
 
     fn details(actions: ItemActions) -> MessageDetails {
         MessageDetails {
@@ -271,11 +271,11 @@ mod tests {
             TimelineItem::new(
                 id.to_owned(),
                 TimelineItemKind::Message {
-                    sender: tessera_core::api::UserId::from("@a:x"),
+                    sender: twicecat_core::api::UserId::from("@a:x"),
                     body: body.to_owned(),
                     is_own: false,
                     timestamp_ms: 1,
-                    sent: tessera_core::api::SendStatus::Sent,
+                    sent: twicecat_core::api::SendStatus::Sent,
                     details: Box::new(MessageDetails {
                         sender_name: name.map(str::to_owned),
                         ..MessageDetails::default()

@@ -13,12 +13,12 @@ use common::{
     unique_room_name,
 };
 use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
-use tessera_core::CoreHandle;
-use tessera_core::api::{
+use twicecat_core::CoreHandle;
+use twicecat_core::api::{
     Block, Command, CoreEvent, Inline, ListDiff, MentionTarget, MessageKind, Password, RoomId,
     RoomSummary, StateChange, SyncState, TimelineItem, TimelineItemKind,
 };
-use tessera_core::secrets::InMemorySecretStore;
+use twicecat_core::secrets::InMemorySecretStore;
 
 /// Carol's display name is account-wide: Synapse copies a change into the
 /// member event of every room she is in, asynchronously and with the latest

@@ -13,11 +13,11 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use iced::Task;
-use tessera_core::api::{
+use twicecat_core::api::{
     Command, MediaBytes, MessageText, NotificationSettingsView, OwnProfileView,
     RoomNotificationModeView, ThemeChoice, UiSettings,
 };
-use tessera_core::paths::DataPaths;
+use twicecat_core::paths::DataPaths;
 
 use crate::blocking;
 use crate::media::SavePath;

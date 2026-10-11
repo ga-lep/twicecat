@@ -17,7 +17,7 @@ use iced::font::{Style as FontStyle, Weight};
 use iced::widget::text::{Span, Wrapping};
 use iced::widget::{Column, container, rich_text, row, rule, text};
 use iced::{Background, Border, Color, Element, Fill, Font, Length, Pixels, Shrink, Theme};
-use tessera_core::api::{
+use twicecat_core::api::{
     Block, Inline, MentionTarget, RichText, RoomMemberView, RoomSummary, TextStyle, UserId,
 };
 
@@ -566,7 +566,7 @@ mod tests {
 
     #[test]
     fn a_room_pill_is_labelled_from_its_target_never_from_the_senders_label() {
-        use tessera_core::api::RoomId;
+        use twicecat_core::api::RoomId;
         let rooms = [RoomSummary::new(
             RoomId::from("!r:x"),
             "Lobby\u{202E}".into(),
@@ -600,7 +600,7 @@ mod tests {
 
     #[test]
     fn a_user_pill_is_labelled_from_its_target_never_from_the_senders_label() {
-        use tessera_core::api::{MembershipView, PowerLevelView, Role, RoomMemberView};
+        use twicecat_core::api::{MembershipView, PowerLevelView, Role, RoomMemberView};
         let members = [RoomMemberView {
             user_id: UserId::from("@bob:x"),
             display_name: Some("Bob".into()),

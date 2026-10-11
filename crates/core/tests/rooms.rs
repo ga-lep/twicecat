@@ -19,13 +19,13 @@ use common::{
 use matrix_sdk::ruma::api::client::state::get_state_events;
 use matrix_sdk::ruma::{OwnedRoomId, RoomId as SdkRoomId};
 use serde_json::Value;
-use tessera_core::CoreHandle;
-use tessera_core::api::{
+use twicecat_core::CoreHandle;
+use twicecat_core::api::{
     ActionKind, Command, CoreError, CoreEvent, CreateRoomRequest, ListDiff, MediaBytes,
     MembershipView, OwnProfileView, Password, Role, RoomDetailsView, RoomId, RoomListQuery,
     RoomMemberView, RoomPermissions, RoomSummary, RoomVisibility, SpaceView, SyncState, UserId,
 };
-use tessera_core::secrets::InMemorySecretStore;
+use twicecat_core::secrets::InMemorySecretStore;
 
 /// All state events of `room` as seen by `client`, as JSON.
 async fn state_events(client: &matrix_sdk::Client, room: &SdkRoomId) -> Vec<Value> {
@@ -97,7 +97,7 @@ async fn create_space_raw_has_the_space_type_and_one_child() {
 async fn reset_notification_baseline_leaves_no_test_keyword() {
     let alice = raw_login(1).await;
     let settings = alice.notification_settings().await;
-    let keyword = format!("tessera-kw-{}", common::hex());
+    let keyword = format!("twicecat-kw-{}", common::hex());
     settings
         .add_keyword(keyword.clone())
         .await
@@ -111,7 +111,7 @@ async fn reset_notification_baseline_leaves_no_test_keyword() {
         .enabled_keywords()
         .await
         .into_iter()
-        .filter(|k| k.starts_with("tessera-kw-"))
+        .filter(|k| k.starts_with("twicecat-kw-"))
         .collect();
     assert!(left.is_empty(), "{} test keywords left", left.len());
 }
@@ -440,7 +440,7 @@ async fn an_encrypted_room_is_created_invited_and_accepted() {
 #[ignore = "needs local homeserver: docker compose up -d --wait"]
 async fn a_public_room_is_joined_by_alias() {
     let mut p = Pair::new().await;
-    let local = format!("tessera-{}", hex());
+    let local = format!("twicecat-{}", hex());
     let room = p
         .alice
         .create(CreateRoomRequest {

@@ -26,9 +26,9 @@ const CLEAR: [u8; 4] = [0, 0, 0, 0];
 /// The tooltip for `unread` unread notifications.
 pub fn tray_tooltip(unread: u64) -> String {
     match unread {
-        0 => "Tessera".to_owned(),
-        1..=99 => format!("Tessera \u{2013} {unread} unread"),
-        _ => "Tessera \u{2013} 99+ unread".to_owned(),
+        0 => "Twicecat".to_owned(),
+        1..=99 => format!("Twicecat \u{2013} {unread} unread"),
+        _ => "Twicecat \u{2013} 99+ unread".to_owned(),
     }
 }
 
@@ -223,14 +223,14 @@ impl TrayModel {
 /// What a click in the tray asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrayAction {
-    /// **Show Tessera**, or a click on the icon.
+    /// **Show Twicecat**, or a click on the icon.
     Show,
     /// **Quit**.
     Quit,
 }
 
-const SHOW_ID: &str = "tessera-show";
-const QUIT_ID: &str = "tessera-quit";
+const SHOW_ID: &str = "twicecat-show";
+const QUIT_ID: &str = "twicecat-quit";
 
 /// A factory that never makes a tray: the default until the real one is
 /// installed.
@@ -258,14 +258,14 @@ fn icon(badge: bool) -> Result<Icon, TrayError> {
 impl TrayFactory for SystemTrayFactory {
     fn create(&self, look: &Look) -> Result<Box<dyn TrayHandle>, TrayError> {
         let menu = Menu::new();
-        let show = MenuItem::with_id(SHOW_ID, "Show Tessera", true, None);
+        let show = MenuItem::with_id(SHOW_ID, "Show Twicecat", true, None);
         let quit = MenuItem::with_id(QUIT_ID, "Quit", true, None);
         menu.append_items(&[&show, &quit]).map_err(|_| TrayError)?;
         let icon = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_icon(icon(look.badge)?)
             .with_tooltip(&look.tooltip)
-            .with_title("Tessera")
+            .with_title("Twicecat")
             .build()
             .map_err(|_| TrayError)?;
         Ok(Box::new(SystemTray { icon }))
@@ -416,12 +416,12 @@ mod tests {
 
     #[test]
     fn tooltips() {
-        assert_eq!(tray_tooltip(0), "Tessera");
-        assert_eq!(tray_tooltip(1), "Tessera \u{2013} 1 unread");
-        assert_eq!(tray_tooltip(3), "Tessera \u{2013} 3 unread");
-        assert_eq!(tray_tooltip(99), "Tessera \u{2013} 99 unread");
-        assert_eq!(tray_tooltip(100), "Tessera \u{2013} 99+ unread");
-        assert_eq!(tray_tooltip(u64::MAX), "Tessera \u{2013} 99+ unread");
+        assert_eq!(tray_tooltip(0), "Twicecat");
+        assert_eq!(tray_tooltip(1), "Twicecat \u{2013} 1 unread");
+        assert_eq!(tray_tooltip(3), "Twicecat \u{2013} 3 unread");
+        assert_eq!(tray_tooltip(99), "Twicecat \u{2013} 99 unread");
+        assert_eq!(tray_tooltip(100), "Twicecat \u{2013} 99+ unread");
+        assert_eq!(tray_tooltip(u64::MAX), "Twicecat \u{2013} 99+ unread");
     }
 
     #[test]
@@ -450,10 +450,10 @@ mod tests {
     fn the_badge_setting_off_keeps_the_tray_plain() {
         let look = Look::for_unread(5, false);
         assert!(!look.badge);
-        assert_eq!(look.tooltip, "Tessera");
+        assert_eq!(look.tooltip, "Twicecat");
         let look = Look::for_unread(5, true);
         assert!(look.badge);
-        assert_eq!(look.tooltip, "Tessera \u{2013} 5 unread");
+        assert_eq!(look.tooltip, "Twicecat \u{2013} 5 unread");
     }
 
     fn model(fail: bool) -> (TrayModel, FakeTray) {
@@ -520,7 +520,7 @@ mod tests {
                 .expect("test mutex")
                 .last()
                 .map(String::as_str),
-            Some("Tessera")
+            Some("Twicecat")
         );
     }
 

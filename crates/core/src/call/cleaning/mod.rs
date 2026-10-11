@@ -14,7 +14,7 @@
 //! gives up.
 //!
 //! Voices their sender's device already cleans are left alone
-//! ([`SkipCleaned`]): Tessera announces its microphone's suppressor as a
+//! ([`SkipCleaned`]): Twicecat announces its microphone's suppressor as a
 //! LiveKit participant attribute ([`ANNOUNCE_KEY`]), and LiveKit's web and
 //! mobile clients flag their tracks (the browser's noise suppression, Krisp).
 
@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
-use tessera_audio::{
+use twicecat_audio::{
     CleaningFlag, DeepFilter, DeepFilterBackend, DeepFilterModel, DeepFilterStatus, SourceCleaning,
     SourceId,
 };
@@ -378,7 +378,7 @@ impl Cleaning {
         let weak = Arc::downgrade(&self.0);
         tokio::spawn(async move {
             let model = tokio::task::spawn_blocking(|| {
-                let dir = tessera_audio::default_model_dir()?;
+                let dir = twicecat_audio::default_model_dir()?;
                 DeepFilterModel::load(&dir).ok()
             })
             .await
@@ -401,7 +401,7 @@ impl Cleaning {
         let weak = Arc::downgrade(&self.0);
         tokio::spawn(async move {
             let loaded = tokio::task::spawn_blocking(move || {
-                let dir = tessera_audio::default_model_dir().ok_or("no model directory")?;
+                let dir = twicecat_audio::default_model_dir().ok_or("no model directory")?;
                 gpu_enhancement::load_bank(&dir, limits::CLEANING_FILTERS, limit)
             })
             .await

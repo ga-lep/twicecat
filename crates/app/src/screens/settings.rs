@@ -11,7 +11,7 @@ use iced::widget::{
     text, text_input,
 };
 use iced::{Element, Fill};
-use tessera_core::api::ThemeChoice;
+use twicecat_core::api::ThemeChoice;
 
 use crate::screens::room_dialogs::{modal, muted};
 use crate::settings::{

@@ -2,7 +2,7 @@
 //! the portal and gamepads on a real desktop (human checkpoint):
 //!
 //! ```text
-//! cargo run -p tessera-ptt --example ptt_probe -- --key ctrl+shift+KeyT --button left_thumb
+//! cargo run -p twicecat-ptt --example ptt_probe -- --key ctrl+shift+KeyT --button left_thumb
 //! ```
 //!
 //! `--keyboard portal|hotkey|window` overrides the detected mechanism. Stop
@@ -12,7 +12,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use tessera_ptt::{KeyboardBackend, PttConfig, PttService};
+use twicecat_ptt::{KeyboardBackend, PttConfig, PttService};
 
 fn main() -> Result<(), String> {
     let mut config = PttConfig::default();

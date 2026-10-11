@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
-use tessera_core::api::{
+use twicecat_core::api::{
     Block, EventId, Inline, ListDiff, MediaContent, MediaKind, PaginationState, RichText,
     SendStatus, TimelineItem, TimelineItemKind,
 };
@@ -936,12 +936,12 @@ mod tests {
     use std::collections::HashMap;
     use std::time::{Duration, Instant};
 
-    use tessera_core::api::{
+    use tokio::sync::mpsc;
+    use twicecat_core::api::{
         Block, Command, CoreEvent, EventId, Inline, ListDiff, MessageDetails, PaginationState,
         PlaceholderKind, ReactionGroup, RichText, RoomId, RoomSummary, SendStatus, Shield,
         ShieldCode, StateChange, TextStyle, TimelineItem, TimelineItemKind, UserId, UtdReason,
     };
-    use tokio::sync::mpsc;
 
     use super::*;
     use crate::bridge::EventsSlot;

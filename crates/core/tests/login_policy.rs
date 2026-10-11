@@ -5,10 +5,10 @@ mod common;
 use std::sync::Arc;
 
 use common::expect_event;
-use tessera_core::api::{Command, CoreError, CoreEvent, Password};
-use tessera_core::paths::DataPaths;
-use tessera_core::secrets::{InMemorySecretStore, SecretStore as _};
-use tessera_core::{Core, CoreConfig};
+use twicecat_core::api::{Command, CoreError, CoreEvent, Password};
+use twicecat_core::paths::DataPaths;
+use twicecat_core::secrets::{InMemorySecretStore, SecretStore as _};
+use twicecat_core::{Core, CoreConfig};
 
 /// Needs no homeserver: the policy check must reject the URL before any
 /// request is made (the host cannot resolve, so a network attempt would
@@ -21,7 +21,7 @@ async fn http_non_loopback_homeserver_is_refused_before_login() {
         CoreConfig {
             data: DataPaths::at(dir.path()),
             homeserver_override: Some("http://matrix.example.invalid".to_owned()),
-            room_list_page_size: tessera_core::DEFAULT_ROOM_LIST_PAGE_SIZE,
+            room_list_page_size: twicecat_core::DEFAULT_ROOM_LIST_PAGE_SIZE,
             max_upload_bytes_override: None,
             audio: Default::default(),
             call_service_override: None,
@@ -86,12 +86,12 @@ fn only_loopback_http_urls_count_as_local() {
 
 const STACK_DEFAULTS: &str = "\
 # comment
-TESSERA_ADDRESS=127.0.0.1
-TESSERA_SYNAPSE_PORT=8008
-TESSERA_LK_JWT_PORT=8080
-TESSERA_LIVEKIT_PORT=7880
-TESSERA_LK_JWT_PORT_B=8081
-TESSERA_LIVEKIT_PORT_B=7890
+TWICECAT_ADDRESS=127.0.0.1
+TWICECAT_SYNAPSE_PORT=8008
+TWICECAT_LK_JWT_PORT=8080
+TWICECAT_LIVEKIT_PORT=7880
+TWICECAT_LK_JWT_PORT_B=8081
+TWICECAT_LIVEKIT_PORT_B=7890
 TEST_USER_1=alice
 ";
 
@@ -108,8 +108,8 @@ fn stack_urls_are_derived_from_the_address_and_ports() {
 
 #[test]
 fn the_environment_wins_over_local_settings_which_win_over_the_defaults() {
-    let local = "TESSERA_LK_JWT_PORT=8090\nTESSERA_SYNAPSE_PORT=8018\n";
-    let env = |key: &str| (key == "TESSERA_SYNAPSE_PORT").then(|| "8028".to_owned());
+    let local = "TWICECAT_LK_JWT_PORT=8090\nTWICECAT_SYNAPSE_PORT=8018\n";
+    let env = |key: &str| (key == "TWICECAT_SYNAPSE_PORT").then(|| "8028".to_owned());
     let v = common::stack_env::resolve(STACK_DEFAULTS, Some(local), env);
     assert_eq!(v["LK_JWT_URL"], "http://127.0.0.1:8090", "from .env.local");
     assert_eq!(
@@ -122,7 +122,7 @@ fn the_environment_wins_over_local_settings_which_win_over_the_defaults() {
 #[test]
 fn a_url_set_in_the_environment_is_kept_and_ipv6_is_bracketed() {
     let env = |key: &str| match key {
-        "TESSERA_ADDRESS" => Some("::1".to_owned()),
+        "TWICECAT_ADDRESS" => Some("::1".to_owned()),
         "LIVEKIT_URL" => Some("ws://localhost:7999".to_owned()),
         _ => None,
     };

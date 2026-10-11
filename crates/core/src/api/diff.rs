@@ -62,7 +62,7 @@ impl<T: Clone> ListDiff<T> {
     /// a malformed stream cannot crash a consumer.
     ///
     /// ```
-    /// use tessera_core::api::ListDiff;
+    /// use twicecat_core::api::ListDiff;
     /// let mut v = vec![1, 2];
     /// ListDiff::PushBack { value: 3 }.apply(&mut v);
     /// assert_eq!(v, [1, 2, 3]);

@@ -29,9 +29,9 @@ use livekit::webrtc::audio_frame::AudioFrame;
 use livekit::webrtc::audio_source::native::NativeAudioSource;
 use livekit::webrtc::audio_source::{AudioSourceOptions, RtcAudioSource};
 use livekit::webrtc::audio_stream::native::NativeAudioStream;
-use tessera_audio::{FRAME_LEN, Outgoing, SAMPLE_RATE, SILENCE, SourceId};
 use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinHandle;
+use twicecat_audio::{FRAME_LEN, Outgoing, SAMPLE_RATE, SILENCE, SourceId};
 
 use super::cleaning::{ANNOUNCE_KEY, Claim, Cleaning};
 use super::jwt::SfuAccess;
@@ -122,7 +122,7 @@ pub(crate) fn user_of(identity: &str) -> &str {
 }
 
 /// `frame` as 16-bit samples, clipped, into `out`.
-fn to_i16(frame: &tessera_audio::Frame, out: &mut [i16; FRAME_LEN]) {
+fn to_i16(frame: &twicecat_audio::Frame, out: &mut [i16; FRAME_LEN]) {
     for (o, s) in out.iter_mut().zip(frame) {
         *o = (s.clamp(-1.0, 1.0) * f32::from(i16::MAX)) as i16;
     }
@@ -459,7 +459,7 @@ fn spawn_audio_task(task: impl Future<Output = ()> + Send + 'static) -> JoinHand
             .ok()?;
         let handle = runtime.handle().clone();
         std::thread::Builder::new()
-            .name("tessera-call-audio".into())
+            .name("twicecat-call-audio".into())
             .spawn(move || runtime.block_on(std::future::pending::<()>()))
             .ok()?;
         Some(handle)
@@ -474,7 +474,7 @@ fn spawn_audio_task(task: impl Future<Output = ()> + Send + 'static) -> JoinHand
 }
 
 /// Reads one remote track into its mixer source.
-async fn read_track(mut stream: NativeAudioStream, mut input: tessera_audio::SourceInput) {
+async fn read_track(mut stream: NativeAudioStream, mut input: twicecat_audio::SourceInput) {
     let mut samples = Vec::with_capacity(FRAME_LEN);
     while let Some(frame) = stream.next().await {
         let channels = frame.num_channels.max(1) as usize;

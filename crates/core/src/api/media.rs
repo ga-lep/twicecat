@@ -15,7 +15,7 @@ use super::{EventId, RoomId};
 /// are equal when their contents are. `Debug` shows only the length.
 ///
 /// ```
-/// use tessera_core::api::MediaBytes;
+/// use twicecat_core::api::MediaBytes;
 /// let a = MediaBytes::from(vec![1, 2, 3]);
 /// assert_eq!(a, MediaBytes::from(vec![1, 2, 3]));
 /// assert_eq!(format!("{a:?}"), "MediaBytes(<3 bytes>)");
@@ -113,7 +113,7 @@ impl MediaContent {
     /// unknown.
     ///
     /// ```
-    /// use tessera_core::api::{MediaContent, MediaKind};
+    /// use twicecat_core::api::{MediaContent, MediaKind};
     /// let m = MediaContent::new(MediaKind::File, "a.txt".into());
     /// assert!(m.size.is_none() && !m.has_thumbnail && m.upload.is_none());
     /// ```

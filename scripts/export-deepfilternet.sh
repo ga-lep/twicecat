@@ -12,8 +12,8 @@
 #      reproducible) and installed; its directory is printed.
 #
 # Usage: scripts/export-deepfilternet.sh
-# Env: TESSERA_MODEL_CACHE overrides the model cache root (as fetch-models.sh);
-#      TESSERA_EXPORT_CACHE where the venv and sources go (default: the cache
+# Env: TWICECAT_MODEL_CACHE overrides the model cache root (as fetch-models.sh);
+#      TWICECAT_EXPORT_CACHE where the venv and sources go (default: the cache
 #      root's export/, about 1 GB); PYTHON the interpreter for the venv.
 # Progress goes to stderr; stdout carries only the path.
 set -euo pipefail
@@ -43,14 +43,14 @@ pinned() {
 
 expected=$(pinned "$model")
 upstream=$(scripts/fetch-models.sh)
-cache_root="${TESSERA_MODEL_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/tessera/models}"
+cache_root="${TWICECAT_MODEL_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/twicecat/models}"
 dest="$cache_root/deepfilternet3-stateful"
 if [ -f "$dest/.verified" ] && [ "$(cat "$dest/.verified")" = "$expected" ]; then
     printf '%s\n' "$dest"
     exit 0
 fi
 
-work_root="${TESSERA_EXPORT_CACHE:-$(dirname "$cache_root")/export}"
+work_root="${TWICECAT_EXPORT_CACHE:-$(dirname "$cache_root")/export}"
 mkdir -p "$work_root"
 venv="$work_root/venv-torch-$torch_version"
 # The venv's interpreter: bin/python, or Scripts/python.exe on Windows.
@@ -95,7 +95,7 @@ actual=$(sha256_of "$work/out/$model")
 [ "$actual" = "$expected" ] || die "the export differs from the pinned one: expected $expected, got $actual"
 cp "$upstream/config.ini" "$work/out/config.ini"
 cat >"$work/out/SOURCE" <<SRC
-DeepFilterNet3 as one stateful graph, exported by Tessera's
+DeepFilterNet3 as one stateful graph, exported by Twicecat's
 scripts/export-deepfilternet-stateful.py from the pretrained checkpoint in
 https://github.com/Rikorose/DeepFilterNet commit $commit (tag v0.5.6),
 models/DeepFilterNet3.zip. SHA-256 $expected.

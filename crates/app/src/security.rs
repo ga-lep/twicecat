@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use iced::widget::operation;
 use iced::{Task, clipboard};
-use tessera_core::api::{
+use twicecat_core::api::{
     ActionKind, AuthUrl, Command, CoreError, CoreEvent, DeviceVerification, Password, ReauthAction,
     RecoveryKey, RecoveryProgress, RecoveryStatus, SecurityStatus,
 };
@@ -860,7 +860,7 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use tessera_core::api::{
+    use twicecat_core::api::{
         CrossSigning, DeviceVerification, RecoveryKey, RecoveryStatus, SecurityStatus,
     };
 
@@ -961,7 +961,7 @@ mod tests {
         m.overlay = Some(Overlay::ConfirmIdentity);
         assert_eq!(m.visible(), Visible::Overlay(Overlay::ConfirmIdentity));
         m.reauth = Some(ReauthPrompt::new(
-            tessera_core::api::ReauthAction::ResetIdentity,
+            twicecat_core::api::ReauthAction::ResetIdentity,
         ));
         assert_eq!(m.visible(), Visible::Reauth);
         m.setup = Some(RecoverySetup::new(RecoveryKey::from("secret-key-x"), false));
@@ -975,8 +975,8 @@ mod tests {
         m.setup = Some(RecoverySetup::new(RecoveryKey::from("secret-key-x"), false));
         m.restore_input = RecoveryKey::from("secret-input-x");
         m.copied = Some(RecoveryKey::from("secret-copied-x"));
-        let mut prompt = ReauthPrompt::new(tessera_core::api::ReauthAction::ResetIdentity);
-        prompt.password = tessera_core::api::Password::from("secret-pw-x");
+        let mut prompt = ReauthPrompt::new(twicecat_core::api::ReauthAction::ResetIdentity);
+        prompt.password = twicecat_core::api::Password::from("secret-pw-x");
         m.reauth = Some(prompt);
         let dbg = format!("{m:?}");
         for secret in [
@@ -997,7 +997,7 @@ mod tests {
         m.restore_input = RecoveryKey::from("secret-input-x");
         m.copied = Some(RecoveryKey::from("secret-copied-x"));
         m.reauth = Some(ReauthPrompt::new(
-            tessera_core::api::ReauthAction::ResetIdentity,
+            twicecat_core::api::ReauthAction::ResetIdentity,
         ));
         m.clear_secrets();
         assert!(m.setup.is_none() && m.reauth.is_none() && m.copied.is_none());

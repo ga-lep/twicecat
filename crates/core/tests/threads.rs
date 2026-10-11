@@ -19,13 +19,13 @@ use common::{
 use matrix_sdk::ruma::events::relation::Thread;
 use matrix_sdk::ruma::events::room::message::{Relation, RoomMessageEventContent};
 use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId};
-use tessera_core::CoreHandle;
-use tessera_core::api::{
+use twicecat_core::CoreHandle;
+use twicecat_core::api::{
     ActionKind, AttachmentData, Command, CoreError, CoreEvent, EventId, ListDiff, MediaBytes,
     MediaKind, MessageDetails, OutgoingAttachment, PaginationState, RoomId, RoomSummary,
     TimelineItem, TimelineItemKind,
 };
-use tessera_core::secrets::InMemorySecretStore;
+use twicecat_core::secrets::InMemorySecretStore;
 
 /// One user's core with the room's main timeline and the open thread's.
 struct Side {
@@ -129,7 +129,7 @@ fn message<'a>(
 }
 
 fn marker() -> String {
-    format!("tessera-marker-{}", common::hex())
+    format!("twicecat-marker-{}", common::hex())
 }
 
 /// Alice and carol in a fresh plain room, both with it open.
@@ -220,7 +220,7 @@ impl Rig {
 fn summary_of<'a>(
     side: &'a Side,
     root_text: &str,
-) -> Option<&'a tessera_core::api::ThreadSummaryView> {
+) -> Option<&'a twicecat_core::api::ThreadSummaryView> {
     message(&side.main, root_text).and_then(|(_, d)| d.thread.as_ref())
 }
 

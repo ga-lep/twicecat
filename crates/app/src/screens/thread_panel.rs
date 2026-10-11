@@ -9,7 +9,7 @@
 use chrono::Local;
 use iced::widget::{Column, button, column, container, row, rule, space, text, text_input};
 use iced::{Element, Fill};
-use tessera_core::api::MessageText;
+use twicecat_core::api::MessageText;
 
 use crate::screens::main_view::rich_env;
 use crate::screens::timeline_pane::{self, Pane};

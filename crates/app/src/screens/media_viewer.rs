@@ -32,7 +32,7 @@ fn title(app: &App, viewer: &Viewer) -> String {
         .iter()
         .find(|item| item.id == *item_id)
         .and_then(|item| match &item.kind {
-            tessera_core::api::TimelineItemKind::Message { details, .. } => details
+            twicecat_core::api::TimelineItemKind::Message { details, .. } => details
                 .media
                 .as_deref()
                 .map(|media| card_name(&media.filename)),

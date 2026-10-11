@@ -4,7 +4,7 @@
 //! same release with DirectML is built by
 //! `scripts/build-onnxruntime-directml.sh`: Microsoft no longer publishes
 //! it), and loaded at run time from that directory (or
-//! `TESSERA_ONNXRUNTIME_DIR`); nothing is downloaded or linked at build
+//! `TWICECAT_ONNXRUNTIME_DIR`); nothing is downloaded or linked at build
 //! time.
 //!
 //! Sessions try the requested accelerators in order (TensorRT, CUDA,
@@ -162,11 +162,11 @@ fn library_name() -> &'static str {
     }
 }
 
-/// Where the runtime's library is: `TESSERA_ONNXRUNTIME_DIR`, else the
+/// Where the runtime's library is: `TWICECAT_ONNXRUNTIME_DIR`, else the
 /// fetched GPU build (CUDA 13, then 12) if present, else the DirectML build
 /// (Windows, `scripts/build-onnxruntime-directml.sh`), else the CPU build.
 pub fn default_runtime_dir() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("TESSERA_ONNXRUNTIME_DIR") {
+    if let Some(dir) = std::env::var_os("TWICECAT_ONNXRUNTIME_DIR") {
         return Some(PathBuf::from(dir));
     }
     let base = crate::paths::cache_dir()?
@@ -193,7 +193,7 @@ impl OnnxRuntime {
         let loaded = RUNTIME.get_or_init(|| {
             nvidia::preload(dir);
             let builder = ort::init_from(dir.join(library_name())).map_err(|e| e.to_string())?;
-            if !builder.with_name("tessera").commit() {
+            if !builder.with_name("twicecat").commit() {
                 tracing::debug!("ONNX Runtime environment was already set up");
             }
             // Registered to see whether WebGPU finds a GPU, then released
@@ -297,7 +297,7 @@ pub(crate) fn open_session(
     // ONNX Runtime's profiler, for profiling a backend: a trace of every run
     // and node, with the provider each ran on, written to
     // `<prefix>_<date>.json` when the session ends.
-    if let Some(prefix) = std::env::var_os("TESSERA_ONNX_PROFILE") {
+    if let Some(prefix) = std::env::var_os("TWICECAT_ONNX_PROFILE") {
         builder = builder.with_profiling(prefix).map_err(text)?;
     }
     for (name, size) in config.dimensions {

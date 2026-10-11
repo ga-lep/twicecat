@@ -74,7 +74,7 @@ pub struct IoInfo {
 /// Whether the processing thread runs with real-time priority, which keeps
 /// it on time when the CPU is busy (a game). Asked for through PipeWire on
 /// Linux, through the system's audio scheduling on Windows (MMCSS) and macOS
-/// (the time-constraint policy); `TESSERA_AUDIO_REALTIME=0` turns the
+/// (the time-constraint policy); `TWICECAT_AUDIO_REALTIME=0` turns the
 /// request off.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum Realtime {
@@ -161,7 +161,7 @@ impl AudioIo {
             let stop = stop.clone();
             let counters = counters.clone();
             std::thread::Builder::new()
-                .name("tessera-audio-io".into())
+                .name("twicecat-audio-io".into())
                 .spawn(move || cpal::run(config, processor, stop, counters, events_tx, ready_tx))
                 .map_err(|_| AudioError::Internal)?
         };
@@ -207,7 +207,7 @@ impl AudioIo {
             let (capture, playback, reference) =
                 (opened.capture, opened.playback, opened.reference);
             let utils = opened.thread_utils;
-            crate::pw::spawn_thread(utils, "tessera-voice", move || {
+            crate::pw::spawn_thread(utils, "twicecat-voice", move || {
                 crate::denormals::flush_denormals_on_this_thread();
                 counters.set_processing_thread();
                 let realtime = if realtime_wanted() {
@@ -245,7 +245,7 @@ impl AudioIo {
             let stop = stop.clone();
             let counters = counters.clone();
             std::thread::Builder::new()
-                .name("tessera-audio-virtual".into())
+                .name("twicecat-audio-virtual".into())
                 .spawn(move || {
                     crate::denormals::flush_denormals_on_this_thread();
                     let tick = Duration::from_millis(10);
@@ -346,10 +346,10 @@ impl Worker {
     }
 }
 
-/// Whether to ask for real-time priority (`TESSERA_AUDIO_REALTIME=0` says
+/// Whether to ask for real-time priority (`TWICECAT_AUDIO_REALTIME=0` says
 /// no).
 pub(super) fn realtime_wanted() -> bool {
-    std::env::var_os("TESSERA_AUDIO_REALTIME").is_none_or(|v| v != "0")
+    std::env::var_os("TWICECAT_AUDIO_REALTIME").is_none_or(|v| v != "0")
 }
 
 /// Runs the pipeline until `stop`: paced by the capture stream (its

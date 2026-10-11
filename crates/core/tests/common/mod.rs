@@ -12,13 +12,13 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tessera_core::api::{
+use twicecat_core::api::{
     Command, CoreEvent, ListDiff, MessageKind, MessageText, OutgoingMessage, Password, RoomId,
     RoomSummary, SecurityStatus, SyncState, TextFormat, TimelineItem, TimelineItemKind,
 };
-use tessera_core::paths::DataPaths;
-use tessera_core::secrets::InMemorySecretStore;
-use tessera_core::{Core, CoreConfig, CoreHandle};
+use twicecat_core::paths::DataPaths;
+use twicecat_core::secrets::InMemorySecretStore;
+use twicecat_core::{Core, CoreConfig, CoreHandle};
 
 /// Default wait for an expected event.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -92,7 +92,7 @@ pub fn assert_local_homeserver(url: &str) {
 pub fn start_core_with_audio(
     dir: &Path,
     secrets: Arc<InMemorySecretStore>,
-    audio: tessera_core::api::AudioBackend,
+    audio: twicecat_core::api::AudioBackend,
 ) -> CoreHandle {
     start_core_with_call_service(dir, secrets, audio, None)
 }
@@ -102,7 +102,7 @@ pub fn start_core_with_audio(
 pub fn start_core_with_call_service(
     dir: &Path,
     secrets: Arc<InMemorySecretStore>,
-    audio: tessera_core::api::AudioBackend,
+    audio: twicecat_core::api::AudioBackend,
     call_service: Option<String>,
 ) -> CoreHandle {
     let env = TestEnv::load();
@@ -110,7 +110,7 @@ pub fn start_core_with_call_service(
         CoreConfig {
             data: DataPaths::at(dir),
             homeserver_override: Some(env.homeserver_url().to_owned()),
-            room_list_page_size: tessera_core::DEFAULT_ROOM_LIST_PAGE_SIZE,
+            room_list_page_size: twicecat_core::DEFAULT_ROOM_LIST_PAGE_SIZE,
             max_upload_bytes_override: None,
             audio,
             call_service_override: call_service,
@@ -124,21 +124,21 @@ pub fn start_core_with_call_service(
 /// the human-run `hardware_*` tests ask for `AudioBackend::System`.
 struct Silence;
 
-impl tessera_core::api::VirtualAudio for Silence {
-    fn capture(&self, frame: &mut [f32; tessera_core::api::AUDIO_FRAME_LEN]) {
+impl twicecat_core::api::VirtualAudio for Silence {
+    fn capture(&self, frame: &mut [f32; twicecat_core::api::AUDIO_FRAME_LEN]) {
         frame.fill(0.0);
     }
-    fn playback(&self, _: &[f32; tessera_core::api::AUDIO_FRAME_LEN]) {}
+    fn playback(&self, _: &[f32; twicecat_core::api::AUDIO_FRAME_LEN]) {}
 }
 
-fn silence() -> tessera_core::api::AudioBackend {
-    tessera_core::api::AudioBackend::Virtual(Arc::new(Silence))
+fn silence() -> twicecat_core::api::AudioBackend {
+    twicecat_core::api::AudioBackend::Virtual(Arc::new(Silence))
 }
 
 /// Starts a core on `dir` against the local homeserver, with silent
 /// virtual audio devices.
 pub fn start_core(dir: &Path, secrets: Arc<InMemorySecretStore>) -> CoreHandle {
-    start_core_with_page_size(dir, secrets, tessera_core::DEFAULT_ROOM_LIST_PAGE_SIZE)
+    start_core_with_page_size(dir, secrets, twicecat_core::DEFAULT_ROOM_LIST_PAGE_SIZE)
 }
 
 /// Like [`start_core`] with an explicit room list page size.
@@ -159,7 +159,7 @@ pub fn start_core_with_upload_limit(
     start_core_with(
         dir,
         secrets,
-        tessera_core::DEFAULT_ROOM_LIST_PAGE_SIZE,
+        twicecat_core::DEFAULT_ROOM_LIST_PAGE_SIZE,
         Some(max_upload_bytes),
     )
 }
@@ -223,7 +223,7 @@ pub async fn raw_login(n: u8) -> matrix_sdk::Client {
     client
         .matrix_auth()
         .login_username(env.user(n), env.password(n))
-        .initial_device_display_name("tessera-test-setup")
+        .initial_device_display_name("twicecat-test-setup")
         .await
         .expect("raw login");
     client
@@ -234,7 +234,7 @@ pub fn unique_room_name() -> String {
     let mut bytes = [0u8; 8];
     rand::fill(&mut bytes);
     let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    format!("tessera-test-{hex}")
+    format!("twicecat-test-{hex}")
 }
 
 /// Creates a plain (unencrypted) room as `creator` and invites `invitee`
@@ -441,7 +441,7 @@ async fn reset_to_b0(n: u8) -> (matrix_sdk::Client, usize) {
     use matrix_sdk::encryption::CrossSigningResetAuthType;
     let env = TestEnv::load();
     assert_local_homeserver(env.homeserver_url());
-    let client = raw_login_named(n, "tessera-e2ee-reset").await;
+    let client = raw_login_named(n, "twicecat-e2ee-reset").await;
     client
         .encryption()
         .wait_for_e2ee_initialization_tasks()
@@ -740,8 +740,8 @@ impl EncryptedPair {
         reset_e2ee_account(1).await;
         reset_e2ee_account(3).await;
         let env = TestEnv::load();
-        let alice_raw = raw_login_named(1, "tessera-e2ee-setup").await;
-        let carol_raw = raw_login_named(3, "tessera-e2ee-setup").await;
+        let alice_raw = raw_login_named(1, "twicecat-e2ee-setup").await;
+        let carol_raw = raw_login_named(3, "twicecat-e2ee-setup").await;
         let room_id =
             create_encrypted_room(&alice_raw, &unique_room_name(), Some(&env.user_id(3))).await;
         carol_raw
@@ -842,7 +842,7 @@ pub async fn expect_security(
 /// device, the device is verified, and recovery is off. The reset deletes
 /// every backup and the SDK creates a fresh one (Q4 settings).
 pub async fn reset_identity_on(core: &mut CoreHandle, n: u8) {
-    use tessera_core::api::{CrossSigning, DeviceVerification, RecoveryStatus};
+    use twicecat_core::api::{CrossSigning, DeviceVerification, RecoveryStatus};
     let env = TestEnv::load();
     core.commands
         .send(Command::ResetIdentity {
@@ -861,7 +861,7 @@ pub async fn reset_identity_on(core: &mut CoreHandle, n: u8) {
 /// Watches `core` for `window` and fails if the status shows an incomplete
 /// cross-signing identity (a sync-driven keys query dropped the private keys).
 pub async fn assert_identity_stays_complete(core: &mut CoreHandle, window: Duration) {
-    use tessera_core::api::CrossSigning;
+    use twicecat_core::api::CrossSigning;
     let watch = async {
         loop {
             match core.events.recv().await {
@@ -1012,7 +1012,7 @@ pub async fn leave_all_created(n: u8, ids: &[matrix_sdk::ruma::OwnedRoomId]) {
 }
 
 /// Puts test user `n`'s notification settings in a known state (Phase 5 Q19):
-/// removes every `tessera-kw-` keyword, sets the four default room modes back
+/// removes every `twicecat-kw-` keyword, sets the four default room modes back
 /// to the Synapse default (all messages) and deletes every user-defined room
 /// rule. Prints the user number and counts.
 pub async fn reset_notification_baseline(n: u8) {
@@ -1022,7 +1022,7 @@ pub async fn reset_notification_baseline(n: u8) {
     let settings = client.notification_settings().await;
     let mut keywords = 0usize;
     for keyword in settings.enabled_keywords().await {
-        if keyword.starts_with("tessera-kw-") {
+        if keyword.starts_with("twicecat-kw-") {
             settings
                 .remove_keyword(&keyword)
                 .await

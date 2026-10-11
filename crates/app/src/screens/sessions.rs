@@ -10,7 +10,7 @@ use iced::widget::{
     Column, button, column, container, opaque, row, scrollable, space, stack, text, text_input,
 };
 use iced::{Element, Fill, Theme};
-use tessera_core::api::{DeviceSummary, DeviceTrust, Password};
+use twicecat_core::api::{DeviceSummary, DeviceTrust, Password};
 
 use crate::screens::security::{card, secondary, wide};
 use crate::security::SecurityModel;

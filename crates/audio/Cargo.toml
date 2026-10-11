@@ -1,5 +1,5 @@
 [package]
-name = "tessera-audio"
+name = "twicecat-audio"
 version = "0.1.0"
 edition.workspace = true
 repository.workspace = true

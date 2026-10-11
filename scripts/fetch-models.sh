@@ -2,11 +2,11 @@
 # Downloads the DeepFilterNet3 ONNX models (Rikorose/DeepFilterNet v0.5.6,
 # MIT OR Apache-2.0) at a pinned commit, checks the SHA-256 in
 # scripts/checksums/models.sha256, unpacks them into a cache dir, and prints that
-# directory. tessera-audio looks for the models there (or in
-# TESSERA_MODEL_DIR); without them DeepFilterNet falls back to RNNoise.
+# directory. twicecat-audio looks for the models there (or in
+# TWICECAT_MODEL_DIR); without them DeepFilterNet falls back to RNNoise.
 #
 # Usage: scripts/fetch-models.sh
-# Env: TESSERA_MODEL_CACHE overrides the cache root.
+# Env: TWICECAT_MODEL_CACHE overrides the cache root.
 # Progress goes to stderr; stdout carries only the path.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -32,7 +32,7 @@ expected=$(awk -v f="$archive" '$2 == f {print $1}' "$sums")
 [ -n "$expected" ] || die "no pinned SHA-256 for $archive in $sums"
 [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || die "malformed SHA-256 for $archive in $sums"
 
-cache_root="${TESSERA_MODEL_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/tessera/models}"
+cache_root="${TWICECAT_MODEL_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/twicecat/models}"
 dest="$cache_root/deepfilternet3"
 marker="$dest/.verified"
 

@@ -2,7 +2,7 @@
 # used by both SFUs. A template: the container's entrypoint replaces the
 # @...@ values from the stack settings (scripts/stack.sh, .env.test).
 # Runs in the synapse container's network namespace; the compose file
-# publishes its ports on TESSERA_ADDRESS only. Keys come from .env.test.
+# publishes its ports on TWICECAT_ADDRESS only. Keys come from .env.test.
 port: @PORT@
 rtc:
   tcp_port: @TCP_PORT@

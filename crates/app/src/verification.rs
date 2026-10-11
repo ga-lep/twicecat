@@ -6,7 +6,7 @@ use std::fmt;
 
 use iced::Task;
 use iced::widget::image::Handle;
-use tessera_core::api::{
+use twicecat_core::api::{
     CancelReason, Command, CoreError, QrImage, SasEmoji, VerificationId, VerificationPeer,
     VerificationPhase,
 };
@@ -364,7 +364,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tessera_core::api::{
+    use twicecat_core::api::{
         CancelReason, DeviceId, QrImage, SasEmoji, UserId, VerificationId, VerificationPeer,
         VerificationPhase as P,
     };

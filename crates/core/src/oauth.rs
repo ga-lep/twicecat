@@ -28,7 +28,7 @@ const REDIRECT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// a native client use any port on these (RFC 8252 section 7.3).
 const REDIRECT_URIS: [&str; 2] = ["http://127.0.0.1/", "http://[::1]/"];
 
-/// The metadata Tessera registers itself with: a native client using the
+/// The metadata Twicecat registers itself with: a native client using the
 /// authorization code grant with loopback redirects.
 pub(crate) fn client_metadata() -> Raw<ClientMetadata> {
     let client_uri = url::Url::parse(env!("CARGO_PKG_REPOSITORY"))
@@ -42,7 +42,7 @@ pub(crate) fn client_metadata() -> Raw<ClientMetadata> {
         vec![OAuthGrantType::AuthorizationCode { redirect_uris }],
         Localized::new(client_uri, []),
     );
-    metadata.client_name = Some(Localized::new("Tessera".to_owned(), []));
+    metadata.client_name = Some(Localized::new("Twicecat".to_owned(), []));
     Raw::new(&metadata).expect("client metadata serializes")
 }
 
@@ -195,8 +195,8 @@ mod tests {
     fn client_metadata_has_the_required_fields() {
         let json: serde_json::Value = serde_json::from_str(client_metadata().json().get()).unwrap();
         assert_eq!(json["application_type"], "native");
-        assert_eq!(json["client_name"], "Tessera");
-        assert_eq!(json["client_uri"], "https://github.com/ga-lep/tessera");
+        assert_eq!(json["client_name"], "Twicecat");
+        assert_eq!(json["client_uri"], "https://github.com/ga-lep/twicecat");
         let grants: Vec<&str> = json["grant_types"]
             .as_array()
             .unwrap()

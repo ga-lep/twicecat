@@ -14,8 +14,8 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use tessera_audio::onnx::{Accelerator, OnnxRuntime, default_runtime_dir};
-use tessera_audio::{
+use twicecat_audio::onnx::{Accelerator, OnnxRuntime, default_runtime_dir};
+use twicecat_audio::{
     BatchCleaner, DeepFilter, DeepFilterBackend, DeepFilterBank, FRAME_LEN, Frame,
     default_model_dir, default_stateful_model, flush_denormals_on_this_thread,
 };
@@ -400,7 +400,7 @@ fn a_bank_loads_while_a_gpu_filter_runs() {
 #[ignore = "needs scripts/fetch-onnxruntime.sh cuda13, export-deepfilternet.sh and a GPU"]
 fn the_gpu_loops_match_the_host_loop_frame_by_frame() {
     let _gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
-    use tessera_audio::onnx::LoopSpec;
+    use twicecat_audio::onnx::LoopSpec;
     let runtime = OnnxRuntime::load(&default_runtime_dir().expect("ONNX Runtime")).unwrap();
     let model = default_stateful_model().unwrap();
     let spec = LoopSpec {

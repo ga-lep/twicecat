@@ -11,13 +11,13 @@ use std::sync::Arc;
 
 use common::{TestEnv, create_room, expect_event, raw_login, send_text, start_core};
 use common::{set_display_name, unique_room_name};
-use tessera_core::CoreHandle;
-use tessera_core::api::{
+use twicecat_core::CoreHandle;
+use twicecat_core::api::{
     ActionKind, Block, Command, CoreError, CoreEvent, Inline, ListDiff, MentionRef, MentionTarget,
     MessageKind, MessageText, OutgoingMessage, Password, PlaceholderKind, RoomId, RoomSummary,
     SendStatus, SyncState, TextFormat, TimelineItem, TimelineItemKind, UserId,
 };
-use tessera_core::secrets::InMemorySecretStore;
+use twicecat_core::secrets::InMemorySecretStore;
 
 async fn login_and_run(core: &mut CoreHandle, env: &TestEnv, n: u8) {
     core.commands
@@ -105,7 +105,7 @@ fn unique_marker() -> String {
     let mut bytes = [0u8; 8];
     rand::fill(&mut bytes);
     let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    format!("tessera-marker-{hex}")
+    format!("twicecat-marker-{hex}")
 }
 
 fn outgoing(room: &str, text: &str) -> OutgoingMessage {
@@ -190,7 +190,7 @@ fn paragraph_inlines(blocks: &[Block]) -> Vec<&Inline> {
 fn received<'a>(
     items: &'a [TimelineItem],
     body: &str,
-) -> Option<(&'a TimelineItem, &'a tessera_core::api::MessageDetails)> {
+) -> Option<(&'a TimelineItem, &'a twicecat_core::api::MessageDetails)> {
     items.iter().find_map(|i| match &i.kind {
         TimelineItemKind::Message {
             body: b,
@@ -490,7 +490,7 @@ async fn reply_to_an_unknown_item_or_action_in_another_room_fails() {
 fn message_by_id<'a>(
     items: &'a [TimelineItem],
     id: &str,
-) -> Option<&'a tessera_core::api::MessageDetails> {
+) -> Option<&'a twicecat_core::api::MessageDetails> {
     items
         .iter()
         .find(|i| i.id == id)
@@ -644,7 +644,7 @@ async fn reaction_toggles_on_and_off_for_both_sides() {
     };
 
     p.carol.commands.send(toggle()).await.unwrap();
-    let thumbs = |own: bool| move |d: &tessera_core::api::MessageDetails| matches!(d.reactions.as_slice(), [g] if g.key == "👍" && g.count == 1 && g.own == own);
+    let thumbs = |own: bool| move |d: &twicecat_core::api::MessageDetails| matches!(d.reactions.as_slice(), [g] if g.key == "👍" && g.count == 1 && g.own == own);
     apply_until(&mut p.alice, &p.room, &mut p.alice_items, |items| {
         message_by_id(items, &alice_item).is_some_and(thumbs(false))
     })

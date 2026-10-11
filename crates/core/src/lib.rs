@@ -1,4 +1,4 @@
-//! Tessera core: a headless Matrix client engine.
+//! Twicecat core: a headless Matrix client engine.
 
 // The SDK's timeline types nest deeply; without this rustc fails with
 // "queries overflow the depth limit" (same as the SDK's `examples/timeline`).

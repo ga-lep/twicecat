@@ -150,23 +150,23 @@ pub(crate) fn stream_properties(
     pid: u32,
 ) -> Vec<(&'static str, String)> {
     let (category, node, description) = match kind {
-        StreamKind::Capture => ("Capture", "tessera-capture", "Tessera microphone"),
-        StreamKind::Playback => ("Playback", "tessera-playback", "Tessera call"),
+        StreamKind::Capture => ("Capture", "twicecat-capture", "Twicecat microphone"),
+        StreamKind::Playback => ("Playback", "twicecat-playback", "Twicecat call"),
         StreamKind::SinkMonitor => (
             "Capture",
-            "tessera-echo-reference",
-            "Tessera echo reference",
+            "twicecat-echo-reference",
+            "Twicecat echo reference",
         ),
     };
     let mut props = vec![
         ("media.type", "Audio".to_owned()),
         ("media.category", category.to_owned()),
-        ("application.name", "Tessera".to_owned()),
+        ("application.name", "Twicecat".to_owned()),
         ("node.name", node.to_owned()),
         ("node.description", description.to_owned()),
         ("node.latency", LATENCY.to_owned()),
         ("node.rate", "1/48000".to_owned()),
-        ("node.group", format!("tessera-{pid}")),
+        ("node.group", format!("twicecat-{pid}")),
     ];
     match kind {
         StreamKind::Capture | StreamKind::Playback => {
@@ -301,7 +301,7 @@ mod tests {
         assert_eq!(get(&mic, "media.category").as_deref(), Some("Capture"));
         assert_eq!(get(&mic, "node.latency").as_deref(), Some("480/48000"));
         assert_eq!(get(&mic, "node.rate").as_deref(), Some("1/48000"));
-        assert_eq!(get(&mic, "node.group").as_deref(), Some("tessera-7"));
+        assert_eq!(get(&mic, "node.group").as_deref(), Some("twicecat-7"));
         assert_eq!(
             get(&mic, "target.object").as_deref(),
             Some("alsa_input.usb")

@@ -11,7 +11,7 @@ use iced::widget::{
     Column, button, checkbox, column, container, image, opaque, row, space, stack, text, text_input,
 };
 use iced::{Background, Color, Element, Fill, Length, Theme, border};
-use tessera_core::api::{AvatarId, MessageText, RoomId, UserId};
+use twicecat_core::api::{AvatarId, MessageText, RoomId, UserId};
 
 use crate::avatars::{AvatarState, Avatars, NEUTRAL_INITIALS, initials, placeholder_color};
 use crate::rooms::{
@@ -355,7 +355,7 @@ pub fn join_bar(bar: &JoinBar) -> Element<'_, Message> {
 mod tests {
     use iced::advanced::widget::Tree;
     use iced::widget::text_editor;
-    use tessera_core::api::{
+    use twicecat_core::api::{
         MembershipView, PowerLevelView, Role, RoomDetailsView, RoomMemberView, RoomPermissions,
     };
 
