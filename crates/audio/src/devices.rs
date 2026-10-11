@@ -1,10 +1,12 @@
 //! Device enumeration and hot-plug watching.
 //!
 //! On Linux with a PipeWire daemon the list comes from its registry and
-//! changes arrive as events (`crate::pw`). Elsewhere cpal has no
-//! device-change notification, so [`DeviceWatcher`] polls the list. Default
-//! devices need no watching: streams on the default device follow the
-//! system default by themselves.
+//! changes arrive as events (`crate::pw`). On Windows the list is cpal's and
+//! the MMDevice API's notifications say when to read it again
+//! (`crate::wasapi`); the default devices are the *communications* ones.
+//! Elsewhere cpal has no device-change notification, so [`DeviceWatcher`]
+//! polls the list. Streams that follow the default are moved by the audio
+//! I/O itself when it changes (`crate::io`).
 
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
@@ -25,7 +27,8 @@ pub struct DeviceInfo {
     pub id: String,
     /// Human-readable name.
     pub name: String,
-    /// The system default device.
+    /// The system default device (on Windows the default communications
+    /// device, the one calls use).
     pub is_default: bool,
 }
 
@@ -51,6 +54,21 @@ fn info(device: &cpal::Device, default_id: Option<&str>) -> Option<DeviceInfo> {
     })
 }
 
+/// The default device's ID for capture (`input`) or playback: the
+/// communications one on Windows when there is one, else cpal's.
+pub(crate) fn default_id(host: &cpal::Host, input: bool) -> Option<String> {
+    #[cfg(target_os = "windows")]
+    if let Some(id) = crate::wasapi::communications_default(input) {
+        return Some(id);
+    }
+    let device = if input {
+        host.default_input_device()
+    } else {
+        host.default_output_device()
+    };
+    device.and_then(|d| d.id().ok()).map(|id| id.to_string())
+}
+
 /// Lists the devices: from PipeWire's registry on Linux when its daemon
 /// runs, else from the platform's default cpal host (ALSA, CoreAudio,
 /// WASAPI). Blocking.
@@ -60,14 +78,8 @@ pub fn list_devices() -> Result<DeviceList, AudioError> {
         return crate::pw::list();
     }
     let host = cpal::default_host();
-    let default_in = host
-        .default_input_device()
-        .and_then(|d| d.id().ok())
-        .map(|id| id.to_string());
-    let default_out = host
-        .default_output_device()
-        .and_then(|d| d.id().ok())
-        .map(|id| id.to_string());
+    let default_in = default_id(&host, true);
+    let default_out = default_id(&host, false);
     let inputs: Vec<DeviceInfo> = host
         .input_devices()
         .map_err(|_| AudioError::Enumerate)?
@@ -92,8 +104,10 @@ pub struct DeviceWatcher {
 
 impl DeviceWatcher {
     /// Calls `on_change` with the new list whenever it differs from the
-    /// last one (not for the first): at once with PipeWire, else polling
-    /// [`list_devices`] every `interval`.
+    /// last one (not for the first): at once with PipeWire; on Windows when
+    /// the MMDevice API reports a change (polling every 30 s as well, or
+    /// every `interval` if its notifications cannot be had); elsewhere
+    /// polling [`list_devices`] every `interval`.
     pub fn spawn(
         interval: Duration,
         on_change: impl FnMut(DeviceList) + Send + 'static,
@@ -123,21 +137,56 @@ impl DeviceWatcher {
                 }
             }
         }
-        Self::spawn_with(interval, list_devices, on_change)
+        Self::spawn_polling(
+            interval,
+            list_devices,
+            on_change,
+            cfg!(target_os = "windows"),
+        )
     }
 
     /// Polls `enumerate` every `interval` (tests, and systems without
     /// PipeWire).
     pub fn spawn_with(
         interval: Duration,
+        enumerate: impl FnMut() -> Result<DeviceList, AudioError> + Send + 'static,
+        on_change: impl FnMut(DeviceList) + Send + 'static,
+    ) -> std::io::Result<Self> {
+        Self::spawn_polling(interval, enumerate, on_change, false)
+    }
+
+    /// Polls `enumerate`; with `endpoint_events` (Windows) the MMDevice API's
+    /// notifications wake the thread too, and the poll is only a fallback.
+    fn spawn_polling(
+        interval: Duration,
         mut enumerate: impl FnMut() -> Result<DeviceList, AudioError> + Send + 'static,
         mut on_change: impl FnMut(DeviceList) + Send + 'static,
+        endpoint_events: bool,
     ) -> std::io::Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
         let thread = std::thread::Builder::new()
             .name("tessera-audio-devices".into())
             .spawn(move || {
+                // Registered on this thread, which owns its COM objects;
+                // the callback only wakes it.
+                #[cfg(target_os = "windows")]
+                let (_watch, interval) = {
+                    let watch = endpoint_events
+                        .then(|| {
+                            let me = std::thread::current();
+                            crate::wasapi::EndpointWatch::register(move |_| me.unpark())
+                        })
+                        .flatten();
+                    let interval = if watch.is_some() {
+                        interval.max(WINDOWS_FALLBACK_POLL)
+                    } else {
+                        interval
+                    };
+                    (watch, interval)
+                };
+                #[cfg(not(target_os = "windows"))]
+                let _ = endpoint_events;
                 let mut last = enumerate().ok();
                 while !flag.load(Ordering::Acquire) {
                     std::thread::park_timeout(interval);
@@ -161,6 +210,11 @@ impl DeviceWatcher {
         })
     }
 }
+
+/// On Windows, how often the device list is read when no notification came
+/// (a missed one, or a change the API does not report).
+#[cfg(target_os = "windows")]
+const WINDOWS_FALLBACK_POLL: Duration = Duration::from_secs(30);
 
 impl Drop for DeviceWatcher {
     fn drop(&mut self) {

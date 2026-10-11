@@ -13,10 +13,10 @@
 set -euo pipefail
 script_dir=$(cd "$(dirname "$0")" && pwd)
 cd "$script_dir/.."
-set -a
-# shellcheck disable=SC1091
-source .env.test
-set +a
+# The stack settings and test accounts: environment, .env.local, .env.test.
+# shellcheck source=scripts/stack-env.sh
+source "$script_dir/stack-env.sh"
+load_stack_env
 # shellcheck source=scripts/require-local-homeserver.sh
 source "$script_dir/require-local-homeserver.sh"
 require_local_homeserver

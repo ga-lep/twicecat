@@ -220,6 +220,10 @@ impl PlaybackSide {
     }
 }
 
+/// The most echo reference left queued after a frame, in frames (30 ms):
+/// a loopback stream's bursts fit, drift beyond it is dropped.
+const REFERENCE_BACKLOG_FRAMES: usize = 3;
+
 pub(crate) struct Pipeline<P> {
     capture: Option<CaptureSide>,
     reference: Option<CaptureSide>,
@@ -255,9 +259,8 @@ impl<P: FrameProcessor> Pipeline<P> {
         }
     }
 
-    /// Adds the echo reference stream (what the output device plays; only
-    /// our PipeWire client has one).
-    #[cfg(target_os = "linux")]
+    /// Adds the echo reference stream (what the output device plays): our
+    /// PipeWire client's sink monitor, or WASAPI's loopback on Windows.
     pub(crate) fn set_echo_reference(&mut self, reference: Option<CaptureSide>) {
         if let Some(r) = &reference {
             let need = r.converter.input_frames_max();
@@ -266,6 +269,25 @@ impl<P: FrameProcessor> Pipeline<P> {
             }
         }
         self.reference = reference;
+    }
+
+    /// Swaps the capture side (a stream reopened on another device), or
+    /// removes it (no microphone left: [`tick`](Self::tick) paces then).
+    /// What the old ring still held is dropped.
+    pub(crate) fn replace_capture(&mut self, capture: Option<CaptureSide>) {
+        if let Some(c) = &capture {
+            let need = c.converter.input_frames_max();
+            if need > self.scratch.len() {
+                self.scratch.resize(need, 0.0);
+            }
+        }
+        self.capture = capture;
+    }
+
+    /// Swaps the playback side (a stream reopened on another device), or
+    /// removes it.
+    pub(crate) fn replace_playback(&mut self, playback: Option<PlaybackSide>) {
+        self.playback = playback;
     }
 
     pub(crate) fn has_capture(&self) -> bool {
@@ -303,7 +325,12 @@ impl<P: FrameProcessor> Pipeline<P> {
     }
 
     /// Hands the processor one frame of the echo reference, silence when the
-    /// stream has none yet (it runs on the same graph clock as capture).
+    /// stream has none yet. On PipeWire it runs on the same graph clock as
+    /// capture; WASAPI's loopback runs on the output device's clock, which
+    /// drifts from the microphone's, so a backlog beyond
+    /// [`REFERENCE_BACKLOG_FRAMES`] is dropped: the reference stays within
+    /// echo cancellation's delay range instead of falling ever further
+    /// behind.
     fn pull_reference(&mut self) -> Result<(), AudioError> {
         let Some(reference) = self.reference.as_mut() else {
             return Ok(());
@@ -316,6 +343,13 @@ impl<P: FrameProcessor> Pipeline<P> {
                 .pop_entire_slice(input)
                 .map_err(|_| AudioError::Internal)?;
             reference.converter.process(input, &mut self.frame_ref)?;
+            let backlog = reference.ring.slots();
+            if backlog > need * REFERENCE_BACKLOG_FRAMES {
+                // Keep one frame's worth: the next frame's.
+                if let Ok(chunk) = reference.ring.read_chunk(backlog - need) {
+                    chunk.commit_all();
+                }
+            }
         } else {
             self.frame_ref = SILENCE;
         }
@@ -324,9 +358,10 @@ impl<P: FrameProcessor> Pipeline<P> {
     }
 
     /// Runs one frame of silence through the processor (no microphone; the
-    /// caller paces this every 10 ms).
+    /// caller paces this every 10 ms), with the echo reference if one runs.
     pub(crate) fn tick(&mut self) -> Result<(), AudioError> {
         self.frame_in = SILENCE;
+        self.pull_reference()?;
         self.run_frame()
     }
 
@@ -449,6 +484,92 @@ mod tests {
             (stats.wakes, stats.late_wakes, stats.max_wake_us),
             (3, 1, 3_000)
         );
+    }
+
+    /// Records the echo reference frames it is given.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    struct References(Vec<f32>);
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    impl FrameProcessor for References {
+        fn process(&mut self, _: &Frame, _: &mut Frame) {}
+        fn echo_reference(&mut self, played: &Frame) {
+            self.0.extend_from_slice(played);
+        }
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn an_echo_reference_ahead_of_capture_is_trimmed_not_queued() {
+        let counters = Arc::new(IoCounters::default());
+        let (mut mic, capture, _, _) = rings(SAMPLE_RATE);
+        let (mut loopback, reference_rx) = rtrb::RingBuffer::new(capture_ring_len(SAMPLE_RATE));
+        let mut pipeline = Pipeline::new(Some(capture), None, References(Vec::new()), counters);
+        pipeline.set_echo_reference(Some(CaptureSide::new(reference_rx, SAMPLE_RATE).unwrap()));
+        // The output device's clock runs ahead: 8 frames of reference
+        // (numbered by their value) before one frame of microphone.
+        for n in 0..8 {
+            loopback.push_entire_slice(&[n as f32; FRAME_LEN]).unwrap();
+        }
+        mic.push_entire_slice(&SILENCE).unwrap();
+        assert_eq!(pipeline.pump().unwrap(), 1);
+        // Within the bound: frames 1 to 3 would wait. Beyond it, all but the
+        // newest frame are dropped.
+        let left = pipeline.reference.as_ref().unwrap().ring.slots();
+        assert_eq!(left, FRAME_LEN, "one frame kept");
+        mic.push_entire_slice(&SILENCE).unwrap();
+        mic.push_entire_slice(&SILENCE).unwrap();
+        assert_eq!(pipeline.pump().unwrap(), 2);
+        let seen = &pipeline.processor.0;
+        assert_eq!(seen.len(), FRAME_LEN * 3);
+        assert!(seen[..FRAME_LEN].iter().all(|s| *s == 0.0), "frame 0 first");
+        assert!(
+            seen[FRAME_LEN..FRAME_LEN * 2].iter().all(|s| *s == 7.0),
+            "then the newest, frame 7"
+        );
+        assert!(
+            seen[FRAME_LEN * 2..].iter().all(|s| *s == 0.0),
+            "then silence: nothing more came"
+        );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn an_echo_reference_within_the_bound_is_kept() {
+        let counters = Arc::new(IoCounters::default());
+        let (mut mic, capture, _, _) = rings(SAMPLE_RATE);
+        let (mut loopback, reference_rx) = rtrb::RingBuffer::new(capture_ring_len(SAMPLE_RATE));
+        let mut pipeline = Pipeline::new(Some(capture), None, References(Vec::new()), counters);
+        pipeline.set_echo_reference(Some(CaptureSide::new(reference_rx, SAMPLE_RATE).unwrap()));
+        // A burst of four frames (one used now, three queued: the bound).
+        for n in 0..4 {
+            loopback.push_entire_slice(&[n as f32; FRAME_LEN]).unwrap();
+        }
+        for _ in 0..4 {
+            mic.push_entire_slice(&SILENCE).unwrap();
+        }
+        assert_eq!(pipeline.pump().unwrap(), 4);
+        let seen = &pipeline.processor.0;
+        for n in 0..4 {
+            let frame = &seen[n * FRAME_LEN..(n + 1) * FRAME_LEN];
+            assert!(frame.iter().all(|s| *s == n as f32), "frame {n} in order");
+        }
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn without_a_microphone_tick_hands_over_the_echo_reference() {
+        let counters = Arc::new(IoCounters::default());
+        let (mut loopback, reference_rx) = rtrb::RingBuffer::new(capture_ring_len(SAMPLE_RATE));
+        let mut pipeline = Pipeline::new(None, None, References(Vec::new()), counters);
+        pipeline.set_echo_reference(Some(CaptureSide::new(reference_rx, SAMPLE_RATE).unwrap()));
+        loopback.push_entire_slice(&[0.5; FRAME_LEN]).unwrap();
+        pipeline.tick().unwrap();
+        pipeline.tick().unwrap();
+        let seen = &pipeline.processor.0;
+        assert_eq!(seen.len(), FRAME_LEN * 2);
+        assert!(seen[..FRAME_LEN].iter().all(|s| *s == 0.5));
+        assert!(seen[FRAME_LEN..].iter().all(|s| *s == 0.0), "then silence");
     }
 
     #[test]

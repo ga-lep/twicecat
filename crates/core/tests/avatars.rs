@@ -1,5 +1,5 @@
 //! Avatar fetching against the local homeserver
-//! (`docker compose up -d --wait && scripts/create-test-users.sh`).
+//! (`scripts/stack.sh up -d --wait && scripts/create-test-users.sh`).
 
 mod common;
 
@@ -38,7 +38,7 @@ fn files_containing(dir: &Path, needle: &[u8]) -> Vec<std::path::PathBuf> {
 }
 
 #[tokio::test]
-#[ignore = "needs local homeserver: docker compose up -d --wait"]
+#[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
 async fn avatar_is_fetched_once_through_the_sdk_media_cache() {
     let env = TestEnv::load();
     let dir = tempfile::tempdir().unwrap();

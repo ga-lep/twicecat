@@ -50,17 +50,21 @@ platform=${1:-$(host_platform)}
 read -r expected url < <(awk -v p="$platform" '!/^#/ && $2 == p {print $1, $3}' "$sums")
 [[ "${expected:-}" =~ ^[0-9a-f]{64}$ ]] || die "no pinned SHA-256 for $platform in $sums"
 [[ "$url" == https://files.pythonhosted.org/* ]] || die "unexpected URL in $sums: $url"
+# The plugin, and on Windows the DirectX shader compiler that Dawn's
+# Direct3D 12 backend loads next to it (in the same wheel).
 case "$platform" in
-    win-*) library=onnxruntime_providers_webgpu.dll ;;
-    osx-*) library=libonnxruntime_providers_webgpu.dylib ;;
-    *) library=libonnxruntime_providers_webgpu.so ;;
+    win-*) libraries=(onnxruntime_providers_webgpu.dll dxcompiler.dll dxil.dll) ;;
+    osx-*) libraries=(libonnxruntime_providers_webgpu.dylib) ;;
+    *) libraries=(libonnxruntime_providers_webgpu.so) ;;
 esac
+# What was unpacked is part of the marker, so an older cache is redone.
+pinned="$expected ${libraries[*]}"
 
 cache_root="${TESSERA_ONNXRUNTIME_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/tessera/onnxruntime}"
 dest="$cache_root/webgpu-ep-$version"
 marker="$dest/.verified"
 
-if [ ! -f "$marker" ] || [ "$(cat "$marker")" != "$expected" ]; then
+if [ ! -f "$marker" ] || [ "$(cat "$marker")" != "$pinned" ]; then
     mkdir -p "$cache_root"
     work=$(mktemp -d "$cache_root/.fetch.XXXXXX")
     trap 'rm -rf "$work"' EXIT
@@ -70,24 +74,25 @@ if [ ! -f "$marker" ] || [ "$(cat "$marker")" != "$expected" ]; then
     actual=$(sha256_of "$work/$wheel")
     [ "$actual" = "$expected" ] || die "SHA-256 mismatch for $wheel: expected $expected, got $actual"
     mkdir -p "$work/out/licenses"
-    python3 - "$work/$wheel" "$work/out" "$library" <<'PY'
+    python3 - "$work/$wheel" "$work/out" "${libraries[@]}" <<'PY'
 import sys, zipfile
-wheel, out, library = sys.argv[1:]
+wheel, out, *libraries = sys.argv[1:]
 z = zipfile.ZipFile(wheel)
 names = z.namelist()
-member = f"onnxruntime_ep_webgpu/{library}"
-if member not in names:
-    sys.exit(f"error: {member} not in the wheel")
-with z.open(member) as src, open(f"{out}/{library}", "wb") as dst:
-    while chunk := src.read(1 << 24):
-        dst.write(chunk)
+for library in libraries:
+    member = f"onnxruntime_ep_webgpu/{library}"
+    if member not in names:
+        sys.exit(f"error: {member} not in the wheel")
+    with z.open(member) as src, open(f"{out}/{library}", "wb") as dst:
+        while chunk := src.read(1 << 24):
+            dst.write(chunk)
 for name in names:
     for kept in ("LICENSE", "ThirdPartyNotices.txt"):
         if name.endswith(f"dist-info/licenses/{kept}"):
             with open(f"{out}/licenses/{kept}", "wb") as dst:
                 dst.write(z.read(name))
 PY
-    printf '%s' "$expected" >"$work/out/.verified"
+    printf '%s' "$pinned" >"$work/out/.verified"
     rm -rf "$dest"
     mv "$work/out" "$dest"
     echo "verified and unpacked into $dest" >&2

@@ -158,9 +158,11 @@ impl DataPaths {
     }
 
     /// Removes a session store directory. A missing directory is `Ok`.
+    /// Blocking: on Windows it waits (at most [`STORE_RELEASE_WAIT`]) for
+    /// files still in use, see [`remove_dir_all_when_released`].
     pub fn remove_session_store_dir(&self, session_id: &str) -> Result<(), PathsError> {
         let dir = self.session_store_dir(session_id)?;
-        match std::fs::remove_dir_all(dir) {
+        match remove_dir_all_when_released(&dir, STORE_RELEASE_WAIT) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(PathsError::Io),
             _ => Ok(()),
         }
@@ -287,9 +289,90 @@ impl DataPaths {
     }
 }
 
+/// How long removing a store waits for its files to be released.
+const STORE_RELEASE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// `remove_dir_all`, retried while a file in `dir` is still open. Windows
+/// cannot delete an open file: the SDK's SQLite stores close their
+/// connections shortly after the client is dropped (25 to 50 ms measured),
+/// so a removal right after a failed login or a logout found them in use
+/// and left the session's store behind. Elsewhere open files are unlinked
+/// and the first attempt is the only one.
+fn remove_dir_all_when_released(dir: &Path, wait: std::time::Duration) -> std::io::Result<()> {
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match std::fs::remove_dir_all(dir) {
+            Err(e) if in_use(&e) && std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            result => return result,
+        }
+    }
+}
+
+/// Whether `e` says a file is open elsewhere: Windows' sharing violation,
+/// or access denied for a file already marked for deletion.
+fn in_use(e: &std::io::Error) -> bool {
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    cfg!(windows)
+        && matches!(
+            e.raw_os_error(),
+            Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION)
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A file opened as SQLite opens its database on Windows: shared for
+    /// reading and writing, not for deletion (std's `File` allows deletion).
+    #[cfg(windows)]
+    fn open_like_sqlite(path: &Path) -> std::fs::File {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_SHARE_READ: u32 = 1;
+        const FILE_SHARE_WRITE: u32 = 2;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(path)
+            .unwrap()
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn a_store_still_open_is_removed_once_released() {
+        let root = tempfile::tempdir().unwrap();
+        let p = DataPaths::at(root.path().to_path_buf());
+        let dir = p.create_session_store_dir("abc").unwrap();
+        let file = open_like_sqlite(&dir.join("store.sqlite3"));
+        // Closed 100 ms from now, as the SDK's stores are after a drop.
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(file);
+        });
+        p.remove_session_store_dir("abc").unwrap();
+        closer.join().unwrap();
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn a_store_never_released_is_an_error_after_the_wait() {
+        let root = tempfile::tempdir().unwrap();
+        let p = DataPaths::at(root.path().to_path_buf());
+        let dir = p.create_session_store_dir("abc").unwrap();
+        let file = open_like_sqlite(&dir.join("store.sqlite3"));
+        let started = std::time::Instant::now();
+        let result = remove_dir_all_when_released(&dir, std::time::Duration::from_millis(200));
+        assert!(result.is_err());
+        assert!(started.elapsed() >= std::time::Duration::from_millis(200));
+        drop(file);
+    }
 
     #[test]
     fn paths_are_under_root() {

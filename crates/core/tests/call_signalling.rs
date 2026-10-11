@@ -1,4 +1,4 @@
-//! MatrixRTC signalling against the local stack (`docker compose up -d
+//! MatrixRTC signalling against the local stack (`scripts/stack.sh up -d
 //! --wait && scripts/create-test-users.sh`): our membership event in
 //! Element Call's format, the delayed leave kept alive, a lost membership
 //! restored, leave, and two devices seeing each other. No media yet.
@@ -150,7 +150,7 @@ async fn participants_until(
 }
 
 #[tokio::test]
-#[ignore = "needs local homeserver: docker compose up -d --wait"]
+#[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
 async fn membership_is_element_compatible_survives_the_delay_and_leaves() {
     let env = TestEnv::load();
     let dir = tempfile::tempdir().unwrap();
@@ -218,7 +218,7 @@ async fn membership_is_element_compatible_survives_the_delay_and_leaves() {
 /// leave after a stall longer than its delay), we join again, and stay:
 /// the old delayed leave is cancelled, not left to fire later.
 #[tokio::test]
-#[ignore = "needs local homeserver: docker compose up -d --wait"]
+#[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
 async fn a_removed_membership_is_restored_and_stays() {
     use matrix_sdk::ruma::api::client::state::send_state_event;
     let env = TestEnv::load();
@@ -273,7 +273,7 @@ async fn a_removed_membership_is_restored_and_stays() {
 }
 
 #[tokio::test]
-#[ignore = "needs local homeserver: docker compose up -d --wait"]
+#[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
 async fn two_devices_in_one_call_see_each_other() {
     let env = TestEnv::load();
     let alice_raw = raw_login(1).await;

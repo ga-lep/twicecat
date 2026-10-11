@@ -63,6 +63,10 @@ matrix_rtc:
 max_event_delay_duration: 24h
 YAML
 fi
+# The call service as clients reach it (TESSERA_LK_JWT_URL, from the stack
+# settings): set on every start, so a changed port applies to an existing
+# volume too.
+sed -i "s|^      livekit_service_url:.*|      livekit_service_url: ${TESSERA_LK_JWT_URL:?}|" /data/homeserver.yaml
 # The tests share three accounts and create rooms, invites and messages from
 # the same user in bursts. Synapse's defaults (e.g. 10 room creations, then
 # one per minute) answer with 429 and the SDK sleeps out `retry_after`, which

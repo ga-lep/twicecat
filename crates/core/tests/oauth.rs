@@ -12,7 +12,7 @@ use tessera_core::api::{Command, CoreError, CoreEvent};
 use tessera_core::secrets::{InMemorySecretStore, SecretStore as _};
 
 #[tokio::test]
-#[ignore = "needs local homeserver: docker compose up -d --wait"]
+#[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
 async fn oauth_against_a_server_without_mas_is_not_supported() {
     let env = TestEnv::load();
     let dir = tempfile::tempdir().unwrap();

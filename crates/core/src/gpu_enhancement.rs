@@ -45,8 +45,11 @@ mod imp {
     /// RTX 5090 it runs a frame in 0.13 ms for 16 µs of CPU, against 0.36 ms
     /// and 76 µs with CUDA. Its first use on a machine builds an engine for
     /// the GPU (about 20 s, cached after); without its libraries it fails
-    /// at once and CUDA runs. WebGPU (any vendor; on the RTX 5090 0.59 ms
-    /// for 0.42 ms of CPU) is for the GPUs those do not reach.
+    /// at once and CUDA runs. On Windows without CUDA, DirectML (the
+    /// DirectML build of the runtime; on the RTX 5090 0.30 ms for 0.11 ms
+    /// of CPU), then WebGPU (any vendor; 0.59 ms for 0.42 ms of CPU on
+    /// Vulkan, 0.93 ms for 0.85 ms on Direct3D 12) for the GPUs those do
+    /// not reach.
     const PREFER: [Accelerator; 5] = Accelerator::ALL;
 
     fn backend(accelerator: Accelerator) -> GpuBackend {

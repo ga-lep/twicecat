@@ -53,14 +53,19 @@ fi
 work_root="${TESSERA_EXPORT_CACHE:-$(dirname "$cache_root")/export}"
 mkdir -p "$work_root"
 venv="$work_root/venv-torch-$torch_version"
-if [ ! -x "$venv/bin/python" ]; then
+# The venv's interpreter: bin/python, or Scripts/python.exe on Windows.
+case "$(uname -s)" in
+    MINGW* | MSYS* | CYGWIN*) py="$venv/Scripts/python.exe" ;;
+    *) py="$venv/bin/python" ;;
+esac
+if [ ! -x "$py" ]; then
     echo "creating $venv" >&2
     if command -v uv >/dev/null; then
         uv venv -q --python "${PYTHON:-3.13}" "$venv"
-        install() { uv pip install -q --python "$venv/bin/python" "$@"; }
+        install() { uv pip install -q --python "$py" "$@"; }
     else
         "${PYTHON:-python3}" -m venv "$venv"
-        install() { "$venv/bin/pip" install -q "$@"; }
+        install() { "$py" -m pip install -q "$@"; }
     fi
     install --index-url https://download.pytorch.org/whl/cpu "torch==$torch_version+cpu"
     install -r scripts/export-requirements.txt
@@ -80,10 +85,10 @@ zip="$src/models/DeepFilterNet3.zip"
 [ "$(sha256_of "$zip")" = "$(pinned DeepFilterNet3.zip)" ] || die "SHA-256 mismatch for DeepFilterNet3.zip"
 work=$(mktemp -d "$work_root/.export.XXXXXX")
 trap 'rm -rf "$work"' EXIT
-"$venv/bin/python" -m zipfile -e "$zip" "$work/ckpt"
+"$py" -m zipfile -e "$zip" "$work/ckpt"
 
 echo "exporting" >&2
-"$venv/bin/python" scripts/export-deepfilternet-stateful.py \
+"$py" scripts/export-deepfilternet-stateful.py \
     --df-src "$src" --checkpoint "$work/ckpt/DeepFilterNet3" \
     --out "$work/out/$model" --check "$upstream" >&2
 actual=$(sha256_of "$work/out/$model")

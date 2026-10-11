@@ -3,9 +3,11 @@
 //! [`AudioIo::start`] opens the capture and playback streams, then runs the
 //! [`Pipeline`] on a dedicated thread. On Linux with a PipeWire daemon the
 //! streams are our own PipeWire client's (`crate::pw`), on their own thread;
-//! elsewhere they are cpal's, opened on the processing thread (cpal streams
-//! are not `Send` on every platform, so they live and die there). The device
-//! callbacks only convert samples and move them through lock-free rings.
+//! on Windows our own WASAPI client's (`crate::wasapi`), each on its own
+//! thread, with cpal's as the fallback; elsewhere cpal's. Both kinds are
+//! opened on the processing thread (cpal streams are not `Send` on every
+//! platform, so they live and die there). The device callbacks only convert
+//! samples and move them through lock-free rings.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,6 +16,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 mod cpal;
+mod reroute;
 
 use crate::AudioError;
 use crate::frame::{Frame, SAMPLE_RATE, SILENCE};
@@ -33,8 +36,9 @@ pub struct IoConfig {
     pub output_device: Option<String>,
     /// Also capture what the output device plays (every application's
     /// sound, a game's included) and hand it to the processor as the echo
-    /// reference ([`FrameProcessor::echo_reference`]). PipeWire only;
-    /// ignored elsewhere.
+    /// reference ([`FrameProcessor::echo_reference`]). Our PipeWire client
+    /// (the sink's monitor) and Windows (WASAPI loopback); ignored
+    /// elsewhere. Needs `playback`: it is the playback device's sound.
     pub echo_reference: bool,
 }
 
@@ -45,9 +49,12 @@ pub struct StreamInfo {
     pub device_id: String,
     /// Device name.
     pub device_name: String,
-    /// The device's rate (the pipeline resamples to 48 kHz when it differs).
+    /// The stream's rate: the device's (the pipeline resamples to 48 kHz
+    /// when it differs), or 48 kHz where the system converts (our WASAPI
+    /// and PipeWire streams).
     pub sample_rate: u32,
-    /// The device's channel count (mixed down or copied to mono).
+    /// The stream's channel count (mixed down or copied to mono): the
+    /// device's, or 1 where the system converts.
     pub channels: u16,
 }
 
@@ -101,6 +108,14 @@ pub enum IoEvent {
         input: bool,
         /// The backend's description (device names, no user data).
         message: String,
+    },
+    /// The device in use went away or the default changed, and the stream
+    /// was reopened on this device; the call goes on.
+    Switched {
+        /// Capture (true) or playback.
+        input: bool,
+        /// The device now used.
+        device: StreamInfo,
     },
     /// The processing thread stopped on an internal error.
     Stopped(AudioError),
@@ -340,14 +355,34 @@ pub(super) fn realtime_wanted() -> bool {
 /// Runs the pipeline until `stop`: paced by the capture stream (its
 /// callback wakes this thread when audio comes), or by a 10 ms timer
 /// without one.
+#[cfg(target_os = "linux")]
 fn process<P: FrameProcessor>(
-    mut pipeline: Pipeline<P>,
+    pipeline: Pipeline<P>,
     stop: &AtomicBool,
     events: &mpsc::Sender<IoEvent>,
 ) {
+    process_with(pipeline, stop, events, |_| {});
+}
+
+/// [`process`], calling `maintain` between frames (it may swap the
+/// pipeline's streams: cpal's reopened devices).
+fn process_with<P: FrameProcessor>(
+    mut pipeline: Pipeline<P>,
+    stop: &AtomicBool,
+    events: &mpsc::Sender<IoEvent>,
+    mut maintain: impl FnMut(&mut Pipeline<P>),
+) {
     let tick = Duration::from_millis(10);
     let mut next_tick = Instant::now() + tick;
+    let mut had_capture = pipeline.has_capture();
     while !stop.load(Ordering::Acquire) {
+        maintain(&mut pipeline);
+        // The timer starts from now when the microphone goes, rather than
+        // catching up on every tick missed while it ran.
+        if had_capture && !pipeline.has_capture() {
+            next_tick = Instant::now() + tick;
+        }
+        had_capture = pipeline.has_capture();
         let ran = if pipeline.has_capture() {
             pipeline.pump()
         } else if Instant::now() >= next_tick {

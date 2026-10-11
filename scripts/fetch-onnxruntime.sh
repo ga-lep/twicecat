@@ -4,7 +4,9 @@
 # `onnxruntime`), checks the SHA-256 in scripts/checksums/onnxruntime.sha256 (GitHub
 # release digests), unpacks it into a cache dir, and prints the directory
 # holding the shared library. Tessera loads it from there at run time (or
-# from TESSERA_ONNXRUNTIME_DIR); nothing is linked at build time.
+# from TESSERA_ONNXRUNTIME_DIR); nothing is linked at build time. The
+# DirectML flavour (Windows x64) is not published for this version:
+# scripts/build-onnxruntime-directml.sh builds it.
 #
 # Usage: scripts/fetch-onnxruntime.sh [variant] [platform]
 #   variant:  cpu (default) | cuda12 | cuda13   (CUDA: linux-x64, win-x64;

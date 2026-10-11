@@ -1,5 +1,5 @@
 //! Password login, session persistence, restore, and logout against the local
-//! homeserver (`docker compose up -d --wait && scripts/create-test-users.sh`).
+//! homeserver (`scripts/stack.sh up -d --wait && scripts/create-test-users.sh`).
 
 mod common;
 
@@ -46,7 +46,7 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 #[tokio::test]
-#[ignore = "needs local homeserver: docker compose up -d --wait"]
+#[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
 async fn password_login_and_wrong_password() {
     let env = TestEnv::load();
     let dir = tempfile::tempdir().unwrap();
@@ -94,7 +94,7 @@ async fn password_login_and_wrong_password() {
 }
 
 #[tokio::test]
-#[ignore = "needs local homeserver: docker compose up -d --wait"]
+#[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
 async fn restore_without_logging_in_again() {
     let env = TestEnv::load();
     // Bob is used only by this test, so the device count is stable.
@@ -144,7 +144,7 @@ async fn restore_without_logging_in_again() {
 }
 
 #[tokio::test]
-#[ignore = "needs local homeserver: docker compose up -d --wait"]
+#[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
 async fn no_token_on_disk() {
     let env = TestEnv::load();
     let dir = tempfile::tempdir().unwrap();
@@ -189,7 +189,7 @@ async fn no_token_on_disk() {
 }
 
 #[tokio::test]
-#[ignore = "needs local homeserver: docker compose up -d --wait"]
+#[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
 async fn logout_removes_everything() {
     let env = TestEnv::load();
     let dir = tempfile::tempdir().unwrap();

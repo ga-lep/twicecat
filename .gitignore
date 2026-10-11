@@ -1,2 +1,4 @@
 /target
 __pycache__/
+# This machine's stack settings (see .env.test).
+/.env.local

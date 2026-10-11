@@ -1,5 +1,5 @@
 //! End-to-end run of `tessera-cli` against the local homeserver
-//! (`docker compose up -d --wait && scripts/create-test-users.sh`).
+//! (`scripts/stack.sh up -d --wait && scripts/create-test-users.sh`).
 
 mod common;
 
@@ -42,7 +42,7 @@ fn cli_source_names_no_sdk_crate() {
 }
 
 #[test]
-#[ignore = "needs local homeserver: docker compose up -d --wait"]
+#[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
 fn ephemeral_password_login_and_quit() {
     let env = TestEnv::load();
     let mut child = Command::new(env!("CARGO_BIN_EXE_tessera-cli"))
@@ -143,7 +143,7 @@ impl Session {
 /// Joins a call from the CLI, mutes, leaves and quits; the membership is
 /// gone afterwards. Audio is silent and virtual (`--silent-audio`).
 #[test]
-#[ignore = "needs local homeserver: docker compose up -d --wait"]
+#[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
 fn cli_joins_mutes_and_leaves_a_call() {
     use matrix_sdk::ruma::api::client::state::get_state_events;
 

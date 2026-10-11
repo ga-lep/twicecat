@@ -1,11 +1,14 @@
 //! ONNX Runtime for the opt-in GPU speech enhancement (plan Task 13b;
 //! feature `onnxruntime`). The library is Microsoft's prebuilt release,
-//! fetched and checked by `scripts/fetch-onnxruntime.sh` and loaded at run
-//! time from that directory (or `TESSERA_ONNXRUNTIME_DIR`); nothing is
-//! downloaded or linked at build time.
+//! fetched and checked by `scripts/fetch-onnxruntime.sh` (on Windows, the
+//! same release with DirectML is built by
+//! `scripts/build-onnxruntime-directml.sh`: Microsoft no longer publishes
+//! it), and loaded at run time from that directory (or
+//! `TESSERA_ONNXRUNTIME_DIR`); nothing is downloaded or linked at build
+//! time.
 //!
 //! Sessions try the requested accelerators in order (TensorRT, CUDA,
-//! WebGPU, DirectML, CoreML) and fall back to the CPU, reporting what runs:
+//! DirectML, WebGPU, CoreML) and fall back to the CPU, reporting what runs:
 //! an accelerator can be compiled in and still fail at run time (missing
 //! CUDA or cuDNN libraries, an unsupported operator).
 //!
@@ -58,12 +61,17 @@ pub enum Accelerator {
 }
 
 impl Accelerator {
-    /// Every accelerator, preferred first.
+    /// Every accelerator, preferred first: the fastest for the least CPU
+    /// first, as measured (their outputs are all far closer to the CPU's
+    /// than anything audible). DirectML before WebGPU: on an RTX 5090 it
+    /// ran a frame in 0.30 ms for 0.11 ms of CPU, against 0.93 ms and
+    /// 0.85 ms (Direct3D 12); a 16-row bank costs the same on both. One
+    /// runtime has either CUDA or DirectML, never both.
     pub const ALL: [Self; 5] = [
         Self::TensorRt,
         Self::Cuda,
-        Self::WebGpu,
         Self::DirectMl,
+        Self::WebGpu,
         Self::CoreMl,
     ];
 
@@ -155,7 +163,8 @@ fn library_name() -> &'static str {
 }
 
 /// Where the runtime's library is: `TESSERA_ONNXRUNTIME_DIR`, else the
-/// fetched GPU build (CUDA 13, then 12) if present, else the CPU build.
+/// fetched GPU build (CUDA 13, then 12) if present, else the DirectML build
+/// (Windows, `scripts/build-onnxruntime-directml.sh`), else the CPU build.
 pub fn default_runtime_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("TESSERA_ONNXRUNTIME_DIR") {
         return Some(PathBuf::from(dir));
@@ -164,7 +173,7 @@ pub fn default_runtime_dir() -> Option<PathBuf> {
         .join("onnxruntime")
         .join(ONNXRUNTIME_VERSION);
     let platform = platform()?;
-    ["-gpu_cuda13", "-gpu_cuda12", ""]
+    ["-gpu_cuda13", "-gpu_cuda12", "-directml", ""]
         .iter()
         .map(|flavour| base.join(format!("{platform}{flavour}")).join("lib"))
         .find(|dir| dir.join(library_name()).exists())

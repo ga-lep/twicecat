@@ -354,11 +354,7 @@ fn gpu_bank() -> Option<(Box<dyn tessera_audio::BatchCleaner>, String)> {
         16,
         100.0,
         &runtime,
-        &[
-            Accelerator::TensorRt,
-            Accelerator::Cuda,
-            Accelerator::WebGpu,
-        ],
+        &Accelerator::ALL,
     )
     .ok()??;
     let on = format!("{:?}", bank.accelerator());

@@ -1,4 +1,4 @@
-//! Ringing and voice rooms against the local stack (`docker compose up -d
+//! Ringing and voice rooms against the local stack (`scripts/stack.sh up -d
 //! --wait && scripts/create-test-users.sh`): MSC4075 notifications as
 //! Element Call sends them, MSC4310 declines, call counts for the room list
 //! and MSC3417 call rooms.
@@ -113,7 +113,7 @@ fn is_count(e: &CoreEvent, room_id: &str, n: u32) -> bool {
 /// A DM call (encrypted, as the SDK creates DMs) rings the other member;
 /// answering stops it, and the room list counts the devices in the call.
 #[tokio::test]
-#[ignore = "needs local homeserver: docker compose up -d --wait"]
+#[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
 async fn a_dm_call_rings_and_answering_stops_it() {
     let env = TestEnv::load();
     let alice_raw = raw_login(1).await;
@@ -177,7 +177,7 @@ async fn a_dm_call_rings_and_answering_stops_it() {
 
 /// Declining stops the ring here and tells the caller who declined.
 #[tokio::test]
-#[ignore = "needs local homeserver: docker compose up -d --wait"]
+#[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
 async fn declining_stops_the_ring_and_tells_the_caller() {
     let env = TestEnv::load();
     let alice_raw = raw_login(1).await;
@@ -234,7 +234,7 @@ async fn declining_stops_the_ring_and_tells_the_caller() {
 /// In a group room the first member's notification is quiet (`ring:
 /// false`), and it stops when the call ends.
 #[tokio::test]
-#[ignore = "needs local homeserver: docker compose up -d --wait"]
+#[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
 async fn a_group_call_notifies_quietly_until_it_ends() {
     let env = TestEnv::load();
     let alice_raw = raw_login(1).await;
@@ -273,7 +273,7 @@ async fn a_group_call_notifies_quietly_until_it_ends() {
 
 /// An MSC3417 call room is marked in the room list, a voice room.
 #[tokio::test]
-#[ignore = "needs local homeserver: docker compose up -d --wait"]
+#[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
 async fn call_rooms_are_marked_in_the_room_list() {
     use matrix_sdk::ruma::api::client::room::create_room::v3::{CreationContent, Request};
     use matrix_sdk::ruma::room::RoomType;

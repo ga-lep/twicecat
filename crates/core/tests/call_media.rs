@@ -1,4 +1,4 @@
-//! Call media end to end on the local stack (`docker compose up -d --wait
+//! Call media end to end on the local stack (`scripts/stack.sh up -d --wait
 //! && scripts/create-test-users.sh`): alice's (virtual) microphone plays a
 //! 1 kHz tone, and it must come out of carol's (virtual) speakers through
 //! the LiveKit SFU, Opus and both voice pipelines. Muting alice stops it.
@@ -266,7 +266,7 @@ async fn allow_calls(admin: &matrix_sdk::Client, room_id: &str) {
 }
 
 #[tokio::test]
-#[ignore = "needs local homeserver: docker compose up -d --wait"]
+#[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
 async fn alices_tone_reaches_carols_speakers_and_mute_stops_it() {
     let env = TestEnv::load();
     let alice_raw = raw_login(1).await;
@@ -348,7 +348,7 @@ async fn alices_tone_reaches_carols_speakers_and_mute_stops_it() {
 /// Element Call's multi-SFU mode), alice on the first. Each subscribes on
 /// the other's SFU: alice hears carol's 600 Hz tone, carol alice's 1 kHz.
 #[tokio::test]
-#[ignore = "needs local homeserver: docker compose up -d --wait"]
+#[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
 async fn members_on_different_sfus_hear_each_other() {
     const ALICE_HZ: f32 = 1000.0;
     const CAROL_HZ: f32 = 600.0;
@@ -519,7 +519,7 @@ async fn intrude(client: &matrix_sdk::Client, room_id: &str, hz: f32) -> livekit
 /// participant on the SFU without a call membership is not played; a real
 /// member next to it is.
 #[tokio::test]
-#[ignore = "needs local homeserver: docker compose up -d --wait"]
+#[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
 async fn a_participant_without_a_membership_is_not_played() {
     const CAROL_HZ: f32 = 600.0;
     const INTRUDER_HZ: f32 = 800.0;
@@ -660,7 +660,7 @@ async fn eavesdrop(
 /// and after carol leaves (alice rotates her key) and rejoins, both hear
 /// each other again.
 #[tokio::test]
-#[ignore = "needs local homeserver: docker compose up -d --wait"]
+#[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
 async fn encrypted_room_calls_are_end_to_end_encrypted() {
     const ALICE_HZ: f32 = 1000.0;
     const CAROL_HZ: f32 = 600.0;

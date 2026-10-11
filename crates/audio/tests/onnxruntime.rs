@@ -187,13 +187,13 @@ fn deepfilternet_on_the_gpu_sounds_like_on_the_cpu() {
         );
         // Measured: CUDA 91 dB from the CPU's output, TensorRT 86 to 88 dB
         // (it times kernels when it builds an engine, so builds differ a
-        // little), WebGPU 133 dB. The bar for them sits well above the 26 to
-        // 40 dB that a race between our copies and TensorRT's replay gave;
-        // providers not measured yet get a looser one, still far below
-        // anything audible.
+        // little), WebGPU 133 dB, DirectML 132 dB. The bar for them sits well
+        // above the 26 to 40 dB that a race between our copies and TensorRT's
+        // replay gave; providers not measured yet get a looser one, still far
+        // below anything audible.
         let bar = if matches!(
             candidate,
-            Accelerator::Cuda | Accelerator::TensorRt | Accelerator::WebGpu
+            Accelerator::Cuda | Accelerator::TensorRt | Accelerator::WebGpu | Accelerator::DirectMl
         ) {
             60.0
         } else {
@@ -254,6 +254,7 @@ fn a_bank_cleans_each_voice_as_its_own_filter_would() {
         Accelerator::Cuda,
         Accelerator::TensorRt,
         Accelerator::WebGpu,
+        Accelerator::DirectMl,
     ] {
         if !runtime.accelerators().contains(&candidate) {
             continue;
@@ -343,6 +344,7 @@ fn a_bank_loads_while_a_gpu_filter_runs() {
         Accelerator::Cuda,
         Accelerator::TensorRt,
         Accelerator::WebGpu,
+        Accelerator::DirectMl,
     ] {
         if !runtime.accelerators().contains(&candidate) {
             continue;
@@ -413,6 +415,7 @@ fn the_gpu_loops_match_the_host_loop_frame_by_frame() {
         Accelerator::Cuda,
         Accelerator::TensorRt,
         Accelerator::WebGpu,
+        Accelerator::DirectMl,
     ] {
         if !runtime.accelerators().contains(&candidate) {
             continue;

@@ -1,5 +1,5 @@
 //! Sync state and room list events against the local homeserver
-//! (`docker compose up -d --wait && scripts/create-test-users.sh`).
+//! (`scripts/stack.sh up -d --wait && scripts/create-test-users.sh`).
 
 mod common;
 
@@ -57,7 +57,7 @@ async fn apply_until(
 }
 
 #[tokio::test]
-#[ignore = "needs local homeserver: docker compose up -d --wait"]
+#[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
 async fn room_appears_in_room_list() {
     let env = TestEnv::load();
     let dir = tempfile::tempdir().unwrap();
@@ -78,7 +78,7 @@ async fn room_appears_in_room_list() {
 }
 
 #[tokio::test]
-#[ignore = "needs local homeserver: docker compose up -d --wait"]
+#[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
 async fn unread_count_reaches_two() {
     let env = TestEnv::load();
     let dir = tempfile::tempdir().unwrap();
@@ -115,7 +115,7 @@ async fn unread_count_reaches_two() {
 }
 
 #[tokio::test]
-#[ignore = "needs local homeserver: docker compose up -d --wait"]
+#[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
 async fn last_message_preview_shows_own_message() {
     let env = TestEnv::load();
     let dir = tempfile::tempdir().unwrap();
@@ -151,7 +151,7 @@ async fn last_message_preview_shows_own_message() {
 }
 
 #[tokio::test]
-#[ignore = "needs local homeserver: docker compose up -d --wait"]
+#[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
 async fn dm_and_space_flags() {
     let env = TestEnv::load();
     let dir = tempfile::tempdir().unwrap();
@@ -180,7 +180,7 @@ async fn dm_and_space_flags() {
 }
 
 #[tokio::test]
-#[ignore = "needs local homeserver: docker compose up -d --wait"]
+#[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
 async fn room_list_loaded_is_signalled() {
     let env = TestEnv::load();
     let dir = tempfile::tempdir().unwrap();
@@ -213,7 +213,7 @@ fn has(rooms: &[RoomSummary], id: &matrix_sdk::ruma::OwnedRoomId) -> bool {
 }
 
 #[tokio::test]
-#[ignore = "needs local homeserver: docker compose up -d --wait"]
+#[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
 async fn search_query_filters_the_list() {
     let env = TestEnv::load();
     let dir = tempfile::tempdir().unwrap();
@@ -253,7 +253,7 @@ async fn search_query_filters_the_list() {
 }
 
 #[tokio::test]
-#[ignore = "needs local homeserver: docker compose up -d --wait"]
+#[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
 async fn tab_queries_split_dms_rooms_and_spaces() {
     let env = TestEnv::load();
     let dir = tempfile::tempdir().unwrap();
@@ -312,7 +312,7 @@ async fn tab_queries_split_dms_rooms_and_spaces() {
 }
 
 #[tokio::test]
-#[ignore = "needs local homeserver: docker compose up -d --wait"]
+#[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
 async fn load_more_rooms_adds_a_page() {
     let env = TestEnv::load();
     let dir = tempfile::tempdir().unwrap();
