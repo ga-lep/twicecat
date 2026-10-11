@@ -7147,6 +7147,16 @@ mod tests {
         (app, rx, dialogs)
     }
 
+    /// An absolute path on every platform: a bare `/home/..` has no drive
+    /// letter, so it is relative on Windows.
+    fn abs(path: &str) -> String {
+        if cfg!(windows) {
+            format!("C:{path}")
+        } else {
+            path.to_owned()
+        }
+    }
+
     fn picked(id: &str, path: Option<&str>) -> Message {
         Message::SavePicked {
             room_id: room_a(),
@@ -7167,7 +7177,7 @@ mod tests {
             drain(&mut rx).is_empty(),
             "nothing is saved before the pick"
         );
-        let _ = app.update(picked("doc", Some("/home/u/Documents/mine.pdf")));
+        let _ = app.update(picked("doc", Some(&abs("/home/u/Documents/mine.pdf"))));
         let commands = drain(&mut rx);
         assert_eq!(commands.len(), 1, "{commands:?}");
         match &commands[0] {
@@ -7178,7 +7188,7 @@ mod tests {
             } => {
                 assert_eq!(room_id, &room_a());
                 assert_eq!(item_id, "doc");
-                assert_eq!(path, &PathBuf::from("/home/u/Documents/mine.pdf"));
+                assert_eq!(path, &PathBuf::from(abs("/home/u/Documents/mine.pdf")));
             }
             other => panic!("{other:?}"),
         }
@@ -7238,7 +7248,7 @@ mod tests {
         let (mut app, mut rx, _) = file_app();
         let doc = key_of("doc");
         assert!(!app.media.open_allowed(&doc));
-        let _ = app.update(picked("doc", Some("/home/u/mine.pdf")));
+        let _ = app.update(picked("doc", Some(&abs("/home/u/mine.pdf"))));
         assert!(!app.media.open_allowed(&doc), "not saved yet");
         let _ = app.update(core(CoreEvent::MediaSaved {
             room_id: room_a(),
@@ -7247,7 +7257,7 @@ mod tests {
         assert!(app.media.open_allowed(&doc));
         // Programs and names without an extension too: the bar asks first.
         for (id, path) in [("prog", "/home/u/setup.exe"), ("bare", "/home/u/README")] {
-            let _ = app.update(picked(id, Some(path)));
+            let _ = app.update(picked(id, Some(&abs(path))));
             let _ = app.update(core(CoreEvent::MediaSaved {
                 room_id: room_a(),
                 item_id: id.into(),
@@ -7258,7 +7268,7 @@ mod tests {
     }
 
     fn saved_and_asked(app: &mut App, id: &str, path: &str) -> Option<(String, Option<String>)> {
-        let _ = app.update(picked(id, Some(path)));
+        let _ = app.update(picked(id, Some(&abs(path))));
         let _ = app.update(core(CoreEvent::MediaSaved {
             room_id: room_a(),
             item_id: id.into(),
@@ -7299,7 +7309,7 @@ mod tests {
     #[test]
     fn a_failed_save_shows_a_notice_and_forgets_the_pending_path() {
         let (mut app, _rx, _) = file_app();
-        let _ = app.update(picked("doc", Some("/home/u/mine.pdf")));
+        let _ = app.update(picked("doc", Some(&abs("/home/u/mine.pdf"))));
         let _ = app.update(core(CoreEvent::ActionFailed {
             room_id: room_a(),
             action: ActionKind::Media,
