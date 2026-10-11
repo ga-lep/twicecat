@@ -91,7 +91,7 @@ jobs:
 
   integration:
     runs-on: ubuntu-26.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
         with:
@@ -116,7 +116,7 @@ jobs:
       # The real-keychain test needs a desktop session, and hardware_ tests a
       # microphone or speakers; both are human-run.
       - name: Run homeserver integration tests
-        run: cargo test -p tessera-core -p tessera-app --locked -- --ignored --skip keyring --skip hardware_
+        run: scripts/run-integration-tests.sh
       - run: scripts/check-no-webrtc-download.sh
       - name: Stop local Synapse
         if: always()
