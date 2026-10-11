@@ -6,7 +6,10 @@
 //! noise (the gate open, nobody talking) and on digital silence (muted, push
 //! to talk released, the gate closed); encoding on the thread as WebRTC runs
 //! it, and with denormals flushed (x86: FTZ/DAZ). Decoding is per remote
-//! voice.
+//! voice. The silence options of step 15 are rows too: digital silence, a
+//! seeded dither at -110 and -90 dBFS RMS, and "no frames" (the encoder is
+//! not called; WebRTC's audio source does not allow that, see PROGRESS.md),
+//! each with the share of packets sent (DTX) and the payload in kb/s.
 //!
 //! Run: `cargo run --release -p twicecat-core --example opus_profile -- [--tsv] [seconds]`
 //! (`--tsv`: one tab-separated line per encode and per decode row, for
@@ -160,6 +163,9 @@ enum Signal {
     RoomNoise,
     /// Zeros: muted, push to talk released, the gate closed.
     DigitalSilence,
+    /// Zeros with a seeded dither of this RMS level in dBFS (see
+    /// [`dither`]): one option for keeping the encoder off denormals.
+    Dither(f64),
 }
 
 impl Signal {
@@ -168,10 +174,15 @@ impl Signal {
             Self::VoiceInNoise => "voice in noise",
             Self::RoomNoise => "room noise",
             Self::DigitalSilence => "digital silence",
+            Self::Dither(level) if level <= -100.0 => "dither -110 dBFS",
+            Self::Dither(_) => "dither -90 dBFS",
         }
     }
 
     fn samples(self, len: usize) -> Vec<i16> {
+        if let Self::Dither(level) = self {
+            return dither(len, level);
+        }
         let mut seed = 0x9e37_79b9_u32;
         (0..len)
             .map(|n| {
@@ -191,12 +202,37 @@ impl Signal {
                         0.1 * syllable * voice + 0.03 * noise
                     }
                     Self::RoomNoise => 0.003 * noise,
-                    Self::DigitalSilence => 0.0,
+                    Self::DigitalSilence | Self::Dither(_) => 0.0,
                 };
                 (x * 32767.0) as i16
             })
             .collect()
     }
+}
+
+/// Seeded dither of `rms_dbfs` (RMS, re full scale 32768) in whole LSB: a
+/// sample is `+k` or `-k` LSB with the probability that gives the RMS, and
+/// zero otherwise, with `k` the RMS in LSB rounded up (so -110 dBFS, 0.10
+/// LSB, is sparse ±1 LSB, and -90 dBFS, 1.04 LSB, is ±2 LSB at one sample in
+/// four). The peak is `k` LSB.
+fn dither(len: usize, rms_dbfs: f64) -> Vec<i16> {
+    let rms_lsb = 10.0_f64.powf(rms_dbfs / 20.0) * 32768.0;
+    let k = rms_lsb.ceil().max(1.0);
+    let probability = (rms_lsb / k).powi(2);
+    let mut seed = 0x2545_f491_u32;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed
+    };
+    (0..len)
+        .map(|_| {
+            let hit = f64::from(next()) / f64::from(u32::MAX) < probability;
+            let sign = if next() & 1 == 0 { 1 } else { -1 };
+            if hit { sign * k as i16 } else { 0 }
+        })
+        .collect()
 }
 
 /// Time per packet of each encode and decode (after the first second), and
@@ -205,23 +241,41 @@ struct Cost {
     encode: Vec<Duration>,
     decode: Vec<Duration>,
     sent: f32,
+    /// Payload of the packets sent, in kb/s (RTP and SRTP headers extra).
+    kbps: f64,
 }
 
-/// Mean per 10 ms of audio (two per packet).
+/// Mean per 10 ms of audio (two per packet); zero for no samples.
 fn mean_per_10_ms(times: &[Duration]) -> Duration {
+    if times.is_empty() {
+        return Duration::ZERO;
+    }
     times.iter().sum::<Duration>() / (2 * times.len() as u32)
+}
+
+/// Label of the row where the encoder is not called. LiveKit's audio source
+/// cannot do that (it feeds zeros every 10 ms; see PROGRESS.md), so the row
+/// is a by-construction zero, not something a call can reach.
+const NO_FRAMES: &str = "no frames (not possible with LiveKit's source)";
+
+/// The `--tsv` encode line of the "no frames" row: zeros, 7 columns.
+fn no_frames_tsv(setting: &str, flushed: &str) -> String {
+    format!("encode {setting} {NO_FRAMES} {flushed}\t0.0\t0.0\t0.0\t0.0\t0\t0.0")
 }
 
 /// One tab-separated line (`--tsv`): name, then mean, median, p99 and worst
 /// in µs per 10 ms of audio (half a packet's time), then the share of
-/// packets sent in percent.
-fn tsv_line(name: &str, times: &[Duration], sent: f32) -> String {
+/// packets sent in percent, then the payload in kb/s.
+fn tsv_line(name: &str, times: &[Duration], sent: f32, kbps: f64) -> String {
+    if times.is_empty() {
+        return format!("{name}\t0.0\t0.0\t0.0\t0.0\t0\t0.0");
+    }
     let mut times = times.to_vec();
     times.sort();
     let n = times.len();
     let us = |d: Duration| d.as_secs_f64() * 1e6 / 2.0;
     format!(
-        "{name}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\t{:.0}",
+        "{name}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\t{:.0}\t{kbps:.1}",
         us(times.iter().sum::<Duration>() / n as u32),
         us(times[n / 2]),
         us(times[n * 99 / 100]),
@@ -236,6 +290,7 @@ fn measure(signal: &[i16], bitrate: i32, complexity: i32) -> Cost {
     let mut out = [0_u8; 1500];
     let mut pcm = [0_i16; PACKET];
     let (mut encode, mut decode, mut sent) = (Vec::new(), Vec::new(), 0_usize);
+    let mut bytes = 0_usize;
     let packets = signal.chunks_exact(PACKET);
     let count = packets.len();
     // One second first, so the encoder's state (and its denormals) settles.
@@ -251,12 +306,24 @@ fn measure(signal: &[i16], bitrate: i32, complexity: i32) -> Cost {
             encode.push(encoded);
             decode.push(decoded);
             sent += usize::from(len > 2);
+            bytes += if len > 2 { len } else { 0 };
         }
+    }
+    // Nothing was timed (under 51 packets): no shares to give.
+    let timed = count.saturating_sub(50);
+    if timed == 0 {
+        return Cost {
+            encode,
+            decode,
+            sent: 0.0,
+            kbps: 0.0,
+        };
     }
     Cost {
         encode,
         decode,
-        sent: sent as f32 / (count - 50) as f32,
+        sent: sent as f32 / timed as f32,
+        kbps: bytes as f64 * 8.0 / (timed as f64 * 0.02) / 1000.0,
     }
 }
 
@@ -274,6 +341,8 @@ fn main() {
         Signal::VoiceInNoise,
         Signal::RoomNoise,
         Signal::DigitalSilence,
+        Signal::Dither(-110.0),
+        Signal::Dither(-90.0),
     ];
     let audio: Vec<Vec<i16>> = signals.iter().map(|s| s.samples(len)).collect();
     if !tsv {
@@ -305,21 +374,43 @@ fn main() {
                     );
                     println!(
                         "{}",
-                        tsv_line(&format!("encode {row}"), &cost.encode, cost.sent)
+                        tsv_line(&format!("encode {row}"), &cost.encode, cost.sent, cost.kbps)
                     );
                     println!(
                         "{}",
-                        tsv_line(&format!("decode {row}"), &cost.decode, cost.sent)
+                        tsv_line(&format!("decode {row}"), &cost.decode, cost.sent, cost.kbps)
                     );
                     continue;
                 }
                 println!(
-                    "{:>3} kb/s complexity {complexity:>2}, {:<15}: encode {:>6.1} µs, decode {:>5.1} µs, {:>3.0} % of packets sent",
+                    "{:>3} kb/s complexity {complexity:>2}, {:<15}: encode {:>6.1} µs, decode {:>5.1} µs, {:>3.0} % of packets sent, {:>5.1} kb/s",
                     bitrate / 1000,
                     signal.name(),
                     mean_per_10_ms(&cost.encode).as_secs_f64() * 1e6,
                     mean_per_10_ms(&cost.decode).as_secs_f64() * 1e6,
                     cost.sent * 100.0,
+                    cost.kbps,
+                );
+            }
+            // "No frames": the encoder is not called (nothing is sent, so
+            // nothing is encoded or decoded). LiveKit's source cannot do it.
+            let flushed_label = if flushed { "flushed" } else { "unflushed" };
+            if tsv {
+                println!(
+                    "{}",
+                    no_frames_tsv(
+                        &format!("{} kb/s c{complexity}", bitrate / 1000),
+                        flushed_label
+                    )
+                );
+            } else {
+                println!(
+                    "{:>3} kb/s complexity {complexity:>2}, {NO_FRAMES}: encode {:>6.1} µs, decode {:>5.1} µs, {:>3.0} % of packets sent, {:>5.1} kb/s",
+                    bitrate / 1000,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
                 );
             }
         }
@@ -335,8 +426,71 @@ mod tests {
         // 100 packets of 1..=100 µs: per 10 ms (half a packet) 0.5..=50.
         let times: Vec<Duration> = (1..=100).map(Duration::from_micros).collect();
         assert_eq!(
-            tsv_line("encode 64 kb/s c9 voice in noise", &times, 0.5),
-            "encode 64 kb/s c9 voice in noise\t25.2\t25.5\t50.0\t50.0\t50"
+            tsv_line("encode 64 kb/s c9 voice in noise", &times, 0.5, 12.5),
+            "encode 64 kb/s c9 voice in noise\t25.2\t25.5\t50.0\t50.0\t50\t12.5"
         );
+    }
+
+    #[test]
+    fn an_empty_sample_set_is_a_row_of_zeros_not_a_panic() {
+        assert_eq!(
+            tsv_line("encode x", &[], 0.0, 0.0),
+            "encode x\t0.0\t0.0\t0.0\t0.0\t0\t0.0"
+        );
+        assert_eq!(mean_per_10_ms(&[]), Duration::ZERO);
+    }
+
+    #[test]
+    fn zero_seconds_measure_nothing_without_panicking() {
+        let cost = measure(&[], 64_000, 9);
+        assert!(cost.encode.is_empty() && cost.sent == 0.0 && cost.kbps == 0.0);
+    }
+
+    #[test]
+    fn the_no_frames_row_says_livekit_cannot_do_it() {
+        assert_eq!(NO_FRAMES, "no frames (not possible with LiveKit's source)");
+        assert!(no_frames_tsv("64 kb/s c9", "unflushed").starts_with(
+            "encode 64 kb/s c9 no frames (not possible with LiveKit's source) unflushed\t"
+        ));
+        assert_eq!(
+            no_frames_tsv("64 kb/s c9", "unflushed").split('\t').count(),
+            7
+        );
+    }
+
+    /// Peak and RMS of `samples` in dBFS (full scale: 32768).
+    fn levels(samples: &[i16]) -> (f64, f64) {
+        let peak = samples
+            .iter()
+            .map(|s| f64::from(s.unsigned_abs()))
+            .fold(0.0, f64::max);
+        let mean_square =
+            samples.iter().map(|&s| f64::from(s).powi(2)).sum::<f64>() / samples.len() as f64;
+        (
+            20.0 * (peak / 32768.0).log10(),
+            10.0 * (mean_square / 32768.0_f64.powi(2)).log10(),
+        )
+    }
+
+    #[test]
+    fn dither_stays_within_its_stated_level() {
+        for rms_dbfs in [-110.0, -90.0] {
+            let samples = dither(RATE as usize * 20, rms_dbfs);
+            let (peak, rms) = levels(&samples);
+            assert!(
+                (rms - rms_dbfs).abs() < 0.5,
+                "{rms_dbfs} dBFS: RMS {rms:.2} dBFS"
+            );
+            // A whole number of LSB, at most the next one up from the RMS.
+            let limit =
+                20.0 * ((10.0_f64.powf(rms_dbfs / 20.0) * 32768.0).ceil() / 32768.0).log10();
+            assert!(peak <= limit + 1e-9, "{rms_dbfs} dBFS: peak {peak:.2} dBFS");
+            assert!(peak > rms, "{rms_dbfs} dBFS: not constant");
+        }
+    }
+
+    #[test]
+    fn dither_is_the_same_every_time() {
+        assert_eq!(dither(5000, -90.0), dither(5000, -90.0));
     }
 }
