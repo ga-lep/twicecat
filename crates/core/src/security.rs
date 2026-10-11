@@ -24,7 +24,7 @@ use matrix_sdk::ruma::api::client::uiaa::{
 };
 use matrix_sdk::ruma::{DeviceId as SdkDeviceId, OwnedDeviceId, OwnedUserId, UserId};
 use matrix_sdk::{AuthApi, Client};
-use tokio::sync::{Mutex, Notify, mpsc};
+use tokio::sync::{Mutex, MutexGuard, Notify, mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::api::{
@@ -370,28 +370,8 @@ async fn forward_status(
     let mut changes_open = true;
     let mut last: Option<SecurityStatus> = None;
     loop {
-        // While an identity operation has the sync paused, no status goes
-        // out: a front end that reacts to it (a message sent right after the
-        // reset's status) would run against a stopped sync and send queue.
-        // The lock is only waited for, never held, and never nested with
-        // `keys_gate` here.
-        drop(op.paused.lock().await);
-        let status = {
-            let _gate = op.keys_gate.lock().await;
-            read_status(&client, &op).await
-        };
-        // After an operation that paused the sync the status goes out even
-        // when it equals the last one sent: the paused changes were held
-        // back, and the front end waits for the result (a second reset in a
-        // row ends in the same status as the first).
-        if op.announce.swap(false, Ordering::AcqRel) {
-            last = None;
-        }
-        if last != Some(status) {
-            last = Some(status);
-            if events.send(CoreEvent::Security(status)).await.is_err() {
-                return;
-            }
+        if !forward_round(&op, &mut last, &events, read_status(&client, &op)).await {
+            return;
         }
         tokio::select! {
             item = changes.next(), if changes_open => {
@@ -402,6 +382,45 @@ async fn forward_status(
             () = refresh.notified() => {}
         }
     }
+}
+
+/// One round of the status forwarder: reads the status and sends it when it
+/// changed (or when an operation announced its end). Returns `false` when the
+/// receiver is gone.
+///
+/// While an identity operation has the sync paused, no status goes out: a
+/// front end that reacts to it (a message sent right after the reset's
+/// status) would run against a stopped sync and send queue. The `paused` lock
+/// is held from before the read until the status is sent, so an operation
+/// cannot start in between and have its half-done state read (a new account's
+/// reset makes its keys before it ends). The counter `op.rounds` is bumped
+/// before the lock is released, which is what `announce_end` waits for.
+async fn forward_round(
+    op: &IdentityOp,
+    last: &mut Option<SecurityStatus>,
+    events: &mpsc::Sender<CoreEvent>,
+    read: impl Future<Output = SecurityStatus>,
+) -> bool {
+    let paused = op.paused.lock().await;
+    let status = {
+        let _gate = op.lock_keys(&paused).await;
+        read.await
+    };
+    // After an operation that paused the sync the status goes out even when
+    // it equals the last one sent: the paused changes were held back, and the
+    // front end waits for the result (a second reset in a row ends in the
+    // same status as the first).
+    if op.announce.swap(false, Ordering::AcqRel) {
+        *last = None;
+    }
+    let mut open = true;
+    if *last != Some(status) {
+        *last = Some(status);
+        open = events.send(CoreEvent::Security(status)).await.is_ok();
+    }
+    op.rounds.send_modify(|rounds| *rounds += 1);
+    drop(paused);
+    open
 }
 
 /// Why a security task stopped before it finished.
@@ -417,6 +436,52 @@ impl From<CoreError> for Stop {
     fn from(error: CoreError) -> Self {
         Self::Failed(error)
     }
+}
+
+/// The longest `announce_end` waits for the status forwarder after a stop for
+/// the password (it reads the status, which may ask the server).
+const FORWARDER_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Ends the hold on the paused sync of `bootstrap` or `reset` and wakes the
+/// status forwarder.
+///
+/// An attempt that stopped for the password changed nothing and goes on once
+/// the password is in, so it announces nothing. Its stop is reported only
+/// after the forwarder has run one round: the status that waited for the
+/// `paused` lock goes out first. A status that came after the front end had
+/// sent the password would look like the end of the second attempt when the
+/// device is already verified and has no backup (a new account).
+///
+/// The order does not rest on the fairness of the lock. The round counter
+/// `op.rounds` is read while `paused` is still held, and the forwarder bumps
+/// it only while holding `paused` after it sent. So a bump seen after the
+/// guard is dropped belongs to a round that read after this operation's work,
+/// and the wait ends then. `refresh` makes sure such a round happens. If the
+/// forwarder is gone (its receiver closed), the wait ends after
+/// `FORWARDER_WAIT` instead of never; a status read that takes longer than
+/// that is not waited for.
+async fn announce_end(
+    op: &IdentityOp,
+    refresh: &Notify,
+    result: &Result<(), Stop>,
+    paused: MutexGuard<'_, ()>,
+) {
+    if announces_end(result) {
+        drop(paused);
+        op.announce.store(true, Ordering::Release);
+        refresh.notify_one();
+    } else {
+        let mut rounds = op.rounds.subscribe();
+        drop(paused);
+        refresh.notify_one();
+        // An error only means that the counter is gone; nothing to wait for.
+        let _ = tokio::time::timeout(FORWARDER_WAIT, rounds.changed()).await;
+    }
+}
+
+/// Whether an operation that ended with `result` announces its end.
+fn announces_end(result: &Result<(), Stop>) -> bool {
+    !matches!(result, Err(Stop::Reauth(_)))
 }
 
 /// Marks an identity operation as running; at most one runs at a time.
@@ -455,9 +520,18 @@ struct IdentityOp {
     announce: AtomicBool,
     /// The server was seen to hold an identity for the account (it stays).
     server_identity_seen: AtomicBool,
+    /// Counts the rounds of the status forwarder; bumped while it still holds
+    /// `paused`. `announce_end` waits for it to move.
+    rounds: watch::Sender<u64>,
 }
 
 impl IdentityOp {
+    /// Takes `keys_gate`. Asking for the `paused` guard makes the order
+    /// `paused`, then `keys_gate` the only one that compiles.
+    async fn lock_keys(&self, _paused: &MutexGuard<'_, ()>) -> MutexGuard<'_, ()> {
+        self.keys_gate.lock().await
+    }
+
     fn try_start(self: &Arc<Self>) -> Option<IdentityPermit> {
         self.busy
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -586,10 +660,10 @@ impl SecurityTasks {
         let refresh = self.refresh.clone();
         let op = self.identity.clone();
         self.spawn_identity(events, ActionKind::CrossSigning, move || async move {
-            let _paused = op.paused.lock().await;
+            let paused = op.paused.lock().await;
             let result = with_sync_paused(&client, pause.as_ref(), async {
                 let result = {
-                    let _gate = op.keys_gate.lock().await;
+                    let _gate = op.lock_keys(&paused).await;
                     bootstrap_task(&client, password.as_ref()).await
                 };
                 // Also after a failure: a keys query drops local keys when
@@ -599,8 +673,7 @@ impl SecurityTasks {
                 result
             })
             .await;
-            op.announce.store(true, Ordering::Release);
-            refresh.notify_one();
+            announce_end(&op, &refresh, &result, paused).await;
             result.map(|()| None)
         });
     }
@@ -618,10 +691,10 @@ impl SecurityTasks {
         let op = self.identity.clone();
         let events_for_task = events.clone();
         self.spawn_identity(events, ActionKind::CrossSigning, move || async move {
-            let _paused = op.paused.lock().await;
+            let paused = op.paused.lock().await;
             let result = with_sync_paused(&client, pause.as_ref(), async {
                 let result = {
-                    let _gate = op.keys_gate.lock().await;
+                    let _gate = op.lock_keys(&paused).await;
                     reset_task(&client, &op, password.as_ref(), &events_for_task).await
                 };
                 // Also after a failure: after a reset that made new private
@@ -634,8 +707,7 @@ impl SecurityTasks {
                 }
             })
             .await;
-            op.announce.store(true, Ordering::Release);
-            refresh.notify_one();
+            announce_end(&op, &refresh, &result, paused).await;
             result.map(|()| None)
         });
     }
@@ -1577,6 +1649,86 @@ mod tests {
 
     use super::*;
     use crate::api::{CrossSigning, DeviceVerification, RecoveryStatus};
+
+    #[test]
+    fn a_stop_for_the_password_announces_nothing() {
+        assert!(announces_end(&Ok(())));
+        assert!(announces_end(&Err(Stop::Failed(CoreError::Busy))));
+        assert!(!announces_end(&Err(Stop::Reauth(
+            ReauthAction::ResetIdentity
+        ))));
+    }
+
+    /// A stand-in for `forward_status`: one `forward_round` per wake-up of
+    /// `refresh`, after a first one at once when `queued` is set (so that it is
+    /// already waiting for `paused` when the operation ends).
+    fn fake_forwarder(
+        op: &Arc<IdentityOp>,
+        refresh: &Arc<Notify>,
+        events: &mpsc::Sender<CoreEvent>,
+        queued: bool,
+    ) -> JoinHandle<()> {
+        let (op, refresh, events) = (op.clone(), refresh.clone(), events.clone());
+        tokio::spawn(async move {
+            let mut last = None;
+            if !queued {
+                refresh.notified().await;
+            }
+            loop {
+                let read = std::future::ready(SecurityStatus::default());
+                if !forward_round(&op, &mut last, &events, read).await {
+                    return;
+                }
+                refresh.notified().await;
+            }
+        })
+    }
+
+    /// Ends an operation that stops for the password and returns whether the
+    /// forwarder's status was already sent when that returned, that is, before
+    /// the stop would be reported.
+    async fn status_is_out_when_the_stop_returns(queued: bool) -> bool {
+        let op = Arc::new(IdentityOp::default());
+        let refresh = Arc::new(Notify::new());
+        let (tx, mut rx) = unlimited_events();
+        let paused = op.paused.lock().await;
+        let forwarder = fake_forwarder(&op, &refresh, &tx, queued);
+        // Let the forwarder run up to the point where it waits.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        let stop = Err(Stop::Reauth(ReauthAction::ResetIdentity));
+        announce_end(&op, &refresh, &stop, paused).await;
+        let out = matches!(rx.try_recv(), Ok(CoreEvent::Security(_)));
+        assert!(
+            !op.announce.load(Ordering::Acquire),
+            "a stop for the password announces nothing"
+        );
+        forwarder.abort();
+        out
+    }
+
+    #[tokio::test]
+    async fn a_status_waiting_for_the_lock_goes_out_before_the_stop() {
+        assert!(status_is_out_when_the_stop_returns(true).await);
+    }
+
+    #[tokio::test]
+    async fn a_forwarder_not_yet_waiting_sends_before_the_stop_too() {
+        assert!(status_is_out_when_the_stop_returns(false).await);
+    }
+
+    #[tokio::test]
+    async fn a_success_announces_its_end_and_wakes_the_forwarder() {
+        let op = Arc::new(IdentityOp::default());
+        let refresh = Notify::new();
+        let paused = op.paused.lock().await;
+        announce_end(&op, &refresh, &Ok(()), paused).await;
+        assert!(op.announce.load(Ordering::Acquire));
+        tokio::time::timeout(std::time::Duration::from_secs(1), refresh.notified())
+            .await
+            .expect("the forwarder is woken");
+    }
 
     #[test]
     fn user_trust_follows_the_identity_facts() {
