@@ -185,31 +185,63 @@ fn start_core_with(
 }
 
 /// Waits for the first event matching `predicate`, ignoring others.
-pub async fn expect_event(
-    handle: &mut CoreHandle,
-    predicate: impl Fn(&CoreEvent) -> bool,
-) -> CoreEvent {
-    expect_event_within(handle, DEFAULT_TIMEOUT, predicate).await
+///
+/// A timeout panics at the calling line and names the last events seen.
+#[track_caller]
+pub fn expect_event<'a>(
+    handle: &'a mut CoreHandle,
+    predicate: impl Fn(&CoreEvent) -> bool + 'a,
+) -> impl std::future::Future<Output = CoreEvent> + 'a {
+    expect_event_within(handle, DEFAULT_TIMEOUT, predicate)
 }
 
 /// Like [`expect_event`] with an explicit timeout.
-pub async fn expect_event_within(
-    handle: &mut CoreHandle,
+#[track_caller]
+pub fn expect_event_within<'a>(
+    handle: &'a mut CoreHandle,
     timeout: Duration,
-    predicate: impl Fn(&CoreEvent) -> bool,
-) -> CoreEvent {
-    let wait = async {
-        loop {
-            match handle.events.recv().await {
-                Some(event) if predicate(&event) => return event,
-                Some(_) => {}
-                None => panic!("event channel closed while waiting for an event"),
+    predicate: impl Fn(&CoreEvent) -> bool + 'a,
+) -> impl std::future::Future<Output = CoreEvent> + 'a {
+    let at = std::panic::Location::caller();
+    async move {
+        let mut seen = std::collections::VecDeque::new();
+        let wait = async {
+            loop {
+                match handle.events.recv().await {
+                    Some(event) if predicate(&event) => return event,
+                    Some(event) => {
+                        if seen.len() == LAST_EVENTS_SHOWN {
+                            seen.pop_front();
+                        }
+                        seen.push_back(variant_name(&event));
+                    }
+                    None => panic!(
+                        "event channel closed while waiting for an event at {at}; \
+                         last events seen: {seen:?}"
+                    ),
+                }
             }
+        };
+        match tokio::time::timeout(timeout, wait).await {
+            Ok(event) => event,
+            Err(_) => panic!(
+                "timed out after {timeout:?} waiting for an event at {at}; \
+                 last events seen (oldest first, names only): {seen:?}"
+            ),
         }
-    };
-    tokio::time::timeout(timeout, wait)
-        .await
-        .expect("timed out waiting for an event")
+    }
+}
+
+/// How many of the ignored events a timeout names.
+const LAST_EVENTS_SHOWN: usize = 8;
+
+/// The variant name of an event, without its fields (which may hold message
+/// text or other private data).
+fn variant_name(event: &CoreEvent) -> String {
+    format!("{event:?}")
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect()
 }
 
 /// A plain SDK client logged in as test user `n`, for test setup only.
