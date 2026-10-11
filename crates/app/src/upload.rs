@@ -451,6 +451,11 @@ fn finish(
 /// [`crate::blocking::run`].
 pub fn prepare_path(path: PathBuf, limit: Option<u64>) -> Outcome {
     let Ok(mut file) = std::fs::File::open(&path) else {
+        // Windows cannot open a directory as a file (access denied), so a
+        // dropped folder would look unreadable instead of "not a file".
+        if std::fs::metadata(&path).is_ok_and(|meta| !meta.is_file()) {
+            return Outcome::Refused(Refusal::NotAFile);
+        }
         return Outcome::Refused(Refusal::Unreadable);
     };
     // The size and the type come from the open handle, not from the path.
