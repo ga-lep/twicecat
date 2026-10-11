@@ -19,10 +19,14 @@
 //! mobile clients flag their tracks (the browser's noise suppression, Krisp).
 
 mod policy;
+#[cfg(test)]
+mod tests;
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use tokio::time::Instant;
 
 use twicecat_audio::{
     CleaningFlag, DeepFilter, DeepFilterBackend, DeepFilterModel, DeepFilterStatus, SourceCleaning,
@@ -119,6 +123,35 @@ struct Inner {
     gpu: Gpu,
     /// Where the cleaning runs, for `AudioStats`.
     backend: Option<CleaningBackend>,
+    loaders: Loaders,
+}
+
+type BankLoader = Arc<dyn Fn(f32) -> Result<Option<gpu_enhancement::Bank>, String> + Send + Sync>;
+type ModelLoader = Arc<dyn Fn() -> Option<DeepFilterModel> + Send + Sync>;
+
+/// How the call gets its GPU bank and its CPU model (blocking): the real
+/// ones, or fakes in unit tests.
+#[derive(Clone)]
+struct Loaders {
+    /// A bank of `limits::CLEANING_FILTERS` rows with the attenuation limit;
+    /// `Ok(None)`: no GPU keeps up.
+    bank: BankLoader,
+    model: ModelLoader,
+}
+
+impl Loaders {
+    fn real() -> Self {
+        Self {
+            bank: Arc::new(|limit| {
+                let dir = twicecat_audio::default_model_dir().ok_or("no model directory")?;
+                gpu_enhancement::load_bank(&dir, limits::CLEANING_FILTERS, limit)
+            }),
+            model: Arc::new(|| {
+                let dir = twicecat_audio::default_model_dir()?;
+                DeepFilterModel::load(&dir).ok()
+            }),
+        }
+    }
 }
 
 /// See the module docs. Cheap to clone.
@@ -132,6 +165,19 @@ impl Cleaning {
         choices: BTreeMap<UserId, VoiceCleaning>,
         flags: SharedFlags,
         backend: Option<CleaningBackend>,
+    ) -> Self {
+        Self::with_loaders(voice, settings, choices, flags, backend, Loaders::real())
+    }
+
+    /// As [`new`](Self::new), with the loaders of the GPU bank and the CPU
+    /// model given (unit tests plug in fakes).
+    fn with_loaders(
+        voice: Option<Voice>,
+        settings: RemoteCleaning,
+        choices: BTreeMap<UserId, VoiceCleaning>,
+        flags: SharedFlags,
+        backend: Option<CleaningBackend>,
+        loaders: Loaders,
     ) -> Self {
         if let Some(voice) = &voice {
             let _ = voice_control(voice).set_cleaning_slots(limits::CLEANED_VOICES);
@@ -148,6 +194,7 @@ impl Cleaning {
             watching: false,
             gpu: Gpu::Absent,
             backend,
+            loaders,
         })))
     }
 
@@ -358,11 +405,11 @@ impl Cleaning {
         }
         if load_model && matches!(inner.model, Model::Absent) {
             inner.model = Model::Loading;
-            self.load_model();
+            self.load_model(inner.loaders.model.clone());
         }
         if load_bank && matches!(inner.gpu, Gpu::Absent) {
             inner.gpu = Gpu::Loading;
-            self.load_bank(limit);
+            self.load_bank(limit, inner.loaders.bank.clone());
         }
         for (identity, source, model) in create {
             self.create_filter(identity, source, model, limit);
@@ -374,16 +421,13 @@ impl Cleaning {
         publish(&inner, &decisions);
     }
 
-    fn load_model(&self) {
+    fn load_model(&self, load: ModelLoader) {
         let weak = Arc::downgrade(&self.0);
         tokio::spawn(async move {
-            let model = tokio::task::spawn_blocking(|| {
-                let dir = twicecat_audio::default_model_dir()?;
-                DeepFilterModel::load(&dir).ok()
-            })
-            .await
-            .ok()
-            .flatten();
+            let model = tokio::task::spawn_blocking(move || load())
+                .await
+                .ok()
+                .flatten();
             let Some(this) = upgrade(&weak) else {
                 return;
             };
@@ -397,15 +441,12 @@ impl Cleaning {
         });
     }
 
-    fn load_bank(&self, limit: f32) {
+    fn load_bank(&self, limit: f32, load: BankLoader) {
         let weak = Arc::downgrade(&self.0);
         tokio::spawn(async move {
-            let loaded = tokio::task::spawn_blocking(move || {
-                let dir = twicecat_audio::default_model_dir().ok_or("no model directory")?;
-                gpu_enhancement::load_bank(&dir, limits::CLEANING_FILTERS, limit)
-            })
-            .await
-            .unwrap_or_else(|_| Err("the GPU load stopped".to_owned()));
+            let loaded = tokio::task::spawn_blocking(move || load(limit))
+                .await
+                .unwrap_or_else(|_| Err("the GPU load stopped".to_owned()));
             let unused = match upgrade(&weak) {
                 Some(this) => {
                     let unused = this.hand_over_bank(loaded);

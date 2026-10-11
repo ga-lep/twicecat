@@ -109,6 +109,10 @@ jobs:
         shell: bash
         run: echo "LK_CUSTOM_WEBRTC=$(scripts/fetch-libwebrtc.sh)" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
+      # The ignored cleaning tests (core lib and call_media) need DeepFilterNet3;
+      # the script (pinned SHA-256) fills the default cache dir core reads.
+      - name: Fetch models
+        run: scripts/fetch-models.sh
       - name: Start local Synapse
         run: scripts/stack.sh up -d --wait
       - name: Register test users

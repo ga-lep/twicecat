@@ -77,13 +77,15 @@ pub enum DeepFilterBackend {
 pub struct DeepFilterStatus(Arc<AtomicU8>);
 
 impl DeepFilterStatus {
-    fn new(backend: DeepFilterBackend) -> Self {
+    /// A status reading `backend`.
+    pub(crate) fn new_internal(backend: DeepFilterBackend) -> Self {
         let status = Self(Arc::new(AtomicU8::new(0)));
-        status.set(backend);
+        status.set_internal(backend);
         status
     }
 
-    fn set(&self, backend: DeepFilterBackend) {
+    /// Sets what [`get`](Self::get) reads (the filter itself does this).
+    pub(crate) fn set_internal(&self, backend: DeepFilterBackend) {
         let code = match backend {
             DeepFilterBackend::Cpu => 0,
             DeepFilterBackend::Gpu => 1,
@@ -91,6 +93,21 @@ impl DeepFilterStatus {
             DeepFilterBackend::CpuAfterGpuTooSlow => 3,
         };
         self.0.store(code, Ordering::Relaxed);
+    }
+
+    /// A status reading `backend`. Only with the `test-fakes` feature, for
+    /// tests that fake a bank; not part of the audio crate's API.
+    #[cfg(feature = "test-fakes")]
+    pub fn new(backend: DeepFilterBackend) -> Self {
+        Self::new_internal(backend)
+    }
+
+    /// Sets what [`get`](Self::get) reads, so a fake bank can report "too
+    /// slow". Only with the `test-fakes` feature; not part of the audio
+    /// crate's API.
+    #[cfg(feature = "test-fakes")]
+    pub fn set(&self, backend: DeepFilterBackend) {
+        self.set_internal(backend);
     }
 
     /// The backend now.
@@ -110,7 +127,7 @@ mod tests {
 
     #[test]
     fn the_status_reads_back_what_was_set() {
-        let status = DeepFilterStatus::new(DeepFilterBackend::Gpu);
+        let status = DeepFilterStatus::new_internal(DeepFilterBackend::Gpu);
         let reader = status.clone();
         for backend in [
             DeepFilterBackend::Cpu,
@@ -118,7 +135,7 @@ mod tests {
             DeepFilterBackend::CpuAfterGpuTooSlow,
             DeepFilterBackend::Gpu,
         ] {
-            status.set(backend);
+            status.set_internal(backend);
             assert_eq!(reader.get(), backend);
         }
     }

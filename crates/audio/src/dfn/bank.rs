@@ -74,7 +74,7 @@ impl DeepFilterBank {
             deadline: Deadline::default(),
             accelerator,
             call: warm.median,
-            status: DeepFilterStatus::new(DeepFilterBackend::Gpu),
+            status: DeepFilterStatus::new_internal(DeepFilterBackend::Gpu),
         }))
     }
 
@@ -124,7 +124,8 @@ impl crate::BatchCleaner for DeepFilterBank {
             Ok(true) => {}
             Ok(false) => return Ok(()),
             Err(e) => {
-                self.status.set(DeepFilterBackend::CpuAfterGpuError);
+                self.status
+                    .set_internal(DeepFilterBackend::CpuAfterGpuError);
                 return Err(e);
             }
         }
@@ -140,7 +141,8 @@ impl crate::BatchCleaner for DeepFilterBank {
             Err(AudioError::GpuBusy) => return Ok(()),
             Err(e) => {
                 tracing::warn!("cleaning other voices on the GPU failed");
-                self.status.set(DeepFilterBackend::CpuAfterGpuError);
+                self.status
+                    .set_internal(DeepFilterBackend::CpuAfterGpuError);
                 return Err(e);
             }
         };
@@ -150,7 +152,8 @@ impl crate::BatchCleaner for DeepFilterBank {
                 "cleaning other voices on the GPU missed {GPU_MISSES} deadlines in a row \
                  (last call {took:?})"
             );
-            self.status.set(DeepFilterBackend::CpuAfterGpuTooSlow);
+            self.status
+                .set_internal(DeepFilterBackend::CpuAfterGpuTooSlow);
             return Err(AudioError::Internal);
         }
         let per_row = outputs.len() / self.rows.len();
@@ -158,7 +161,8 @@ impl crate::BatchCleaner for DeepFilterBank {
             let dsp = &mut self.rows[row];
             let out = &outputs[row * per_row..(row + 1) * per_row];
             if let Err(e) = read_output(&self.cfg, out, &mut dsp.net) {
-                self.status.set(DeepFilterBackend::CpuAfterGpuError);
+                self.status
+                    .set_internal(DeepFilterBackend::CpuAfterGpuError);
                 return Err(e);
             }
             dsp.synthesise(&self.cfg, frame);
