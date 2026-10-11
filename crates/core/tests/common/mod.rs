@@ -202,6 +202,18 @@ pub fn expect_event_within<'a>(
     timeout: Duration,
     predicate: impl Fn(&CoreEvent) -> bool + 'a,
 ) -> impl std::future::Future<Output = CoreEvent> + 'a {
+    expect_event_labeled(handle, timeout, "an event", predicate)
+}
+
+/// Like [`expect_event_within`], and a timeout also names `label` (a short
+/// description of what is awaited, for example a verification phase).
+#[track_caller]
+pub fn expect_event_labeled<'a>(
+    handle: &'a mut CoreHandle,
+    timeout: Duration,
+    label: &'static str,
+    predicate: impl Fn(&CoreEvent) -> bool + 'a,
+) -> impl std::future::Future<Output = CoreEvent> + 'a {
     let at = std::panic::Location::caller();
     async move {
         let mut seen = std::collections::VecDeque::new();
@@ -216,7 +228,7 @@ pub fn expect_event_within<'a>(
                         seen.push_back(variant_name(&event));
                     }
                     None => panic!(
-                        "event channel closed while waiting for an event at {at}; \
+                        "event channel closed while waiting for {label} at {at}; \
                          last events seen: {seen:?}"
                     ),
                 }
@@ -225,7 +237,7 @@ pub fn expect_event_within<'a>(
         match tokio::time::timeout(timeout, wait).await {
             Ok(event) => event,
             Err(_) => panic!(
-                "timed out after {timeout:?} waiting for an event at {at}; \
+                "timed out after {timeout:?} waiting for {label} at {at}; \
                  last events seen (oldest first, names only): {seen:?}"
             ),
         }

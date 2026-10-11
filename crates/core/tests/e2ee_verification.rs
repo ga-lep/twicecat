@@ -7,14 +7,15 @@
 
 mod common;
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
 use common::{
     DEFAULT_TIMEOUT, EncryptedPair, TestEnv, create_dm, e2ee_serial, expect_event,
-    expect_event_within, expect_security, hex, login_and_run, message_with, outgoing, pump,
-    pump_recording, pump_with, raw_login_named, reset_e2ee_account, reset_identity_on, start_core,
-    try_pump_with,
+    expect_event_labeled, expect_event_within, expect_security, hex, login_and_run, message_with,
+    outgoing, pump, pump_recording, pump_with, raw_login_named, reset_e2ee_account,
+    reset_identity_on, start_core, try_pump_with,
 };
 use twicecat_core::CoreHandle;
 use twicecat_core::api::{
@@ -30,13 +31,29 @@ use twicecat_core::secrets::InMemorySecretStore;
 static QR_EXPECTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Waits for the first `Verification` event of flow `id` whose phase `want`
-/// accepts, ignoring everything else, and returns that phase.
-async fn phase(
-    core: &mut CoreHandle,
-    id: &VerificationId,
-    want: impl Fn(&VerificationPhase) -> bool,
-) -> VerificationPhase {
-    let event = expect_event(core, |e| {
+/// accepts, ignoring everything else, and returns that phase. `label` names
+/// the awaited phase in a timeout message. A timeout names the line of the
+/// test that called this.
+#[track_caller]
+fn phase<'a>(
+    core: &'a mut CoreHandle,
+    id: &'a VerificationId,
+    label: &'static str,
+    want: impl Fn(&VerificationPhase) -> bool + 'a,
+) -> impl Future<Output = VerificationPhase> + 'a {
+    phase_within(core, id, DEFAULT_TIMEOUT, label, want)
+}
+
+/// Like [`phase`] with an explicit timeout.
+#[track_caller]
+fn phase_within<'a>(
+    core: &'a mut CoreHandle,
+    id: &'a VerificationId,
+    within: Duration,
+    label: &'static str,
+    want: impl Fn(&VerificationPhase) -> bool + 'a,
+) -> impl Future<Output = VerificationPhase> + 'a {
+    let event = expect_event_labeled(core, within, label, move |e| {
         // Two Twicecat cores never offer a QR code to each other (neither
         // advertises scanning); tests that expect one use `qr_phase`.
         if let CoreEvent::Verification {
@@ -48,54 +65,123 @@ async fn phase(
             panic!("a QR code was shown between two Twicecat cores");
         }
         matches!(e, CoreEvent::Verification { id: i, phase } if i == id && want(phase))
-    })
-    .await;
-    match event {
-        CoreEvent::Verification { phase, .. } => phase,
-        _ => unreachable!("the predicate only accepts Verification events"),
+    });
+    async move {
+        match event.await {
+            CoreEvent::Verification { phase, .. } => phase,
+            _ => unreachable!("the predicate only accepts Verification events"),
+        }
     }
 }
 
 /// Waits for the next `VerificationRequested`.
-async fn requested(core: &mut CoreHandle) -> (VerificationId, VerificationPeer) {
-    match expect_event(core, |e| {
+#[track_caller]
+fn requested(core: &mut CoreHandle) -> impl Future<Output = (VerificationId, VerificationPeer)> {
+    requested_within(core, DEFAULT_TIMEOUT)
+}
+
+/// Like [`requested`] with an explicit timeout.
+#[track_caller]
+fn requested_within(
+    core: &mut CoreHandle,
+    within: Duration,
+) -> impl Future<Output = (VerificationId, VerificationPeer)> {
+    let event = expect_event_labeled(core, within, "VerificationRequested", |e| {
         matches!(e, CoreEvent::VerificationRequested { .. })
-    })
-    .await
-    {
-        CoreEvent::VerificationRequested { id, peer } => (id, peer),
-        _ => unreachable!("the predicate only accepts VerificationRequested"),
+    });
+    async move {
+        match event.await {
+            CoreEvent::VerificationRequested { id, peer } => (id, peer),
+            _ => unreachable!("the predicate only accepts VerificationRequested"),
+        }
     }
 }
 
 /// Waits for the emoji of flow `id`.
-async fn emojis(core: &mut CoreHandle, id: &VerificationId) -> Vec<SasEmoji> {
-    match phase(core, id, |p| matches!(p, VerificationPhase::Emojis(_))).await {
-        VerificationPhase::Emojis(e) => e.to_vec(),
-        _ => unreachable!("the predicate only accepts Emojis"),
+#[track_caller]
+fn emojis<'a>(
+    core: &'a mut CoreHandle,
+    id: &'a VerificationId,
+) -> impl Future<Output = Vec<SasEmoji>> + 'a {
+    emojis_within(core, id, DEFAULT_TIMEOUT)
+}
+
+/// Like [`emojis`] with an explicit timeout.
+#[track_caller]
+fn emojis_within<'a>(
+    core: &'a mut CoreHandle,
+    id: &'a VerificationId,
+    within: Duration,
+) -> impl Future<Output = Vec<SasEmoji>> + 'a {
+    let waiting = phase_within(core, id, within, "Emojis phase", |p| {
+        matches!(p, VerificationPhase::Emojis(_))
+    });
+    async move {
+        match waiting.await {
+            VerificationPhase::Emojis(e) => e.to_vec(),
+            _ => unreachable!("the predicate only accepts Emojis"),
+        }
     }
 }
 
 /// Both sides reach the emoji of flow `id`; the seven symbols are identical.
-async fn both_see_same_emoji(a: &mut CoreHandle, b: &mut CoreHandle, id: &VerificationId) {
-    let (ea, eb) = tokio::join!(emojis(a, id), emojis(b, id));
-    assert_eq!(ea.len(), 7);
-    let sa: Vec<&str> = ea.iter().map(|e| e.symbol.as_str()).collect();
-    let sb: Vec<&str> = eb.iter().map(|e| e.symbol.as_str()).collect();
-    assert_eq!(sa, sb, "the two sides show different emoji");
-    assert!(ea.iter().all(|e| !e.description.is_empty()));
+#[track_caller]
+fn both_see_same_emoji<'a>(
+    a: &'a mut CoreHandle,
+    b: &'a mut CoreHandle,
+    id: &'a VerificationId,
+) -> impl Future<Output = ()> + 'a {
+    both_see_same_emoji_within(a, b, id, DEFAULT_TIMEOUT)
+}
+
+/// Like [`both_see_same_emoji`] with an explicit timeout for each side.
+#[track_caller]
+fn both_see_same_emoji_within<'a>(
+    a: &'a mut CoreHandle,
+    b: &'a mut CoreHandle,
+    id: &'a VerificationId,
+    within: Duration,
+) -> impl Future<Output = ()> + 'a {
+    let (wa, wb) = (emojis_within(a, id, within), emojis_within(b, id, within));
+    async move {
+        let (ea, eb) = tokio::join!(wa, wb);
+        assert_eq!(ea.len(), 7);
+        let sa: Vec<&str> = ea.iter().map(|e| e.symbol.as_str()).collect();
+        let sb: Vec<&str> = eb.iter().map(|e| e.symbol.as_str()).collect();
+        assert_eq!(sa, sb, "the two sides show different emoji");
+        assert!(ea.iter().all(|e| !e.description.is_empty()));
+    }
 }
 
 async fn send(core: &mut CoreHandle, command: Command) {
     core.commands.send(command).await.unwrap();
 }
 
-/// Both sides confirm and both reach `Done`.
-async fn confirm_both(a: &mut CoreHandle, b: &mut CoreHandle, id: &VerificationId) {
-    send(a, Command::ConfirmSas { id: id.clone() }).await;
-    send(b, Command::ConfirmSas { id: id.clone() }).await;
+/// Both sides confirm and both reach `Done`, each within `within`.
+#[track_caller]
+fn confirm_both_within<'a>(
+    a: &'a mut CoreHandle,
+    b: &'a mut CoreHandle,
+    id: &'a VerificationId,
+    within: Duration,
+) -> impl Future<Output = ()> + 'a {
+    // Build the waits here, not in the async block, so that a timeout names
+    // the line that called this function.
+    let (to_a, to_b) = (a.commands.clone(), b.commands.clone());
     let done = |p: &VerificationPhase| matches!(p, VerificationPhase::Done);
-    tokio::join!(phase(a, id, done), phase(b, id, done));
+    let (wa, wb) = (
+        phase_within(a, id, within, "Done phase", done),
+        phase_within(b, id, within, "Done phase", done),
+    );
+    async move {
+        to_a.send(Command::ConfirmSas { id: id.clone() })
+            .await
+            .unwrap();
+        to_b.send(Command::ConfirmSas { id: id.clone() })
+            .await
+            .unwrap();
+        tokio::join!(wa, wb);
+    }
 }
 
 async fn logout(mut core: CoreHandle) {
@@ -344,7 +430,10 @@ async fn self_verification_verifies_the_device_and_decrypts_history() {
     let verified = std::cell::Cell::new(false);
     let mut diffs: Vec<ListDiff<TimelineItem>> = Vec::new();
     let (_, ()) = tokio::join!(
-        phase(&mut p.alice, &id, |p| matches!(p, VerificationPhase::Done)),
+        phase(&mut p.alice, &id, "Done phase", |p| matches!(
+            p,
+            VerificationPhase::Done
+        )),
         pump_recording(
             &mut second,
             &room,
@@ -437,12 +526,19 @@ async fn user_verification_in_a_dm_verifies_both_users() {
         },
     )
     .await;
-    let (id, peer) = requested(&mut carol).await;
+    // Every wait from here to the end of the flow is for a to-device message
+    // of the other side. The SDK sends such a message with its next sync
+    // request, which can sit behind a running long poll (30 s), and the
+    // receiver sees it after that; one wait can thus reach the 30 s default.
+    // Allow the same 75 s as the trust wait below. This is a hypothesis from
+    // CI timeouts, not a measured cause.
+    let slow = Duration::from_secs(75);
+    let (id, peer) = requested_within(&mut carol, slow).await;
     assert!(!peer.own_account, "{peer:?}");
     assert_eq!(peer.user_id, alice_id);
     send(&mut carol, Command::AcceptVerification { id: id.clone() }).await;
-    both_see_same_emoji(&mut alice, &mut carol, &id).await;
-    confirm_both(&mut alice, &mut carol, &id).await;
+    both_see_same_emoji_within(&mut alice, &mut carol, &id, slow).await;
+    confirm_both_within(&mut alice, &mut carol, &id, slow).await;
 
     // Each side now trusts the other user.
     send(
@@ -468,7 +564,6 @@ async fn user_verification_in_a_dm_verifies_both_users() {
     // The SDK uploads the signature on the other's identity with its next
     // sync request, which can wait for the end of a long poll (30 s); the
     // other side sees it after that.
-    let slow = Duration::from_secs(75);
     let (a, c) = tokio::join!(
         expect_event_within(&mut alice, slow, trust(carol_id.clone())),
         expect_event_within(&mut carol, slow, trust(alice_id.clone())),
@@ -498,8 +593,8 @@ async fn mismatch_cancels_both_sides_and_trust_is_unchanged() {
         )
     };
     tokio::join!(
-        phase(&mut first, &id, cancelled),
-        phase(&mut second, &id, cancelled),
+        phase(&mut first, &id, "Cancelled(Mismatch) phase", cancelled),
+        phase(&mut second, &id, "Cancelled(Mismatch) phase", cancelled),
     );
 
     // Core 2 never turns verified.
@@ -529,7 +624,7 @@ async fn only_one_verification_is_open_at_a_time() {
     let (mut first, mut second, _dirs) = alice_with_second_device().await;
     send(&mut second, Command::RequestSelfVerification).await;
     let (id, _peer) = requested(&mut first).await;
-    phase(&mut second, &id, |p| {
+    phase(&mut second, &id, "Requested(outgoing) phase", |p| {
         matches!(p, VerificationPhase::Requested { incoming: false })
     })
     .await;
@@ -547,8 +642,8 @@ async fn only_one_verification_is_open_at_a_time() {
     // Declining the first request ends it on both sides.
     send(&mut first, Command::CancelVerification { id: id.clone() }).await;
     let ended = |p: &VerificationPhase| matches!(p, VerificationPhase::Cancelled { .. });
-    let a = phase(&mut first, &id, ended).await;
-    let b = phase(&mut second, &id, ended).await;
+    let a = phase(&mut first, &id, "Cancelled phase", ended).await;
+    let b = phase(&mut second, &id, "Cancelled phase", ended).await;
     assert_eq!(
         a,
         VerificationPhase::Cancelled {
@@ -660,11 +755,17 @@ async fn a_second_incoming_request_from_another_user_is_cancelled() {
 }
 
 /// Waits for the end of flow `id`.
-async fn phase_cancelled(core: &mut CoreHandle, id: &VerificationId) {
-    phase(core, id, |p| {
+#[track_caller]
+fn phase_cancelled<'a>(
+    core: &'a mut CoreHandle,
+    id: &'a VerificationId,
+) -> impl Future<Output = ()> + 'a {
+    let waiting = phase(core, id, "Cancelled phase", |p| {
         matches!(p, VerificationPhase::Cancelled { .. })
-    })
-    .await;
+    });
+    async move {
+        waiting.await;
+    }
 }
 
 // ---- QR code display (plan Q3) ----
@@ -783,7 +884,7 @@ async fn core_showing_qr() -> (
     assert!(who.own_account, "{who:?}");
     send(&mut core, Command::AcceptVerification { id: id.clone() }).await;
     QR_EXPECTED.store(true, std::sync::atomic::Ordering::SeqCst);
-    let shown = phase(&mut core, &id, |p| {
+    let shown = phase(&mut core, &id, "ShowQr phase", |p| {
         matches!(p, VerificationPhase::ShowQr(_))
     })
     .await;
@@ -859,7 +960,10 @@ async fn compare_emoji_instead_of_the_qr_code_verifies_the_peer() {
 
     sas.confirm().await.expect("the peer confirms");
     send(&mut core, Command::ConfirmSas { id: id.clone() }).await;
-    phase(&mut core, &id, |p| matches!(p, VerificationPhase::Done)).await;
+    phase(&mut core, &id, "Done phase", |p| {
+        matches!(p, VerificationPhase::Done)
+    })
+    .await;
 
     // The core signed the peer's device (the peer sees it after its next
     // keys query).
@@ -891,7 +995,7 @@ async fn cancelling_while_the_qr_code_shows_cancels_the_peer_request() {
     let (mut core, _dir, peer, request, id, _image) = core_showing_qr().await;
     QR_EXPECTED.store(false, std::sync::atomic::Ordering::SeqCst);
     send(&mut core, Command::CancelVerification { id: id.clone() }).await;
-    let ended = phase(&mut core, &id, |p| {
+    let ended = phase(&mut core, &id, "Cancelled phase", |p| {
         matches!(p, VerificationPhase::Cancelled { .. })
     })
     .await;
