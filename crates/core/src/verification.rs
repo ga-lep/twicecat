@@ -354,7 +354,7 @@ impl Flow {
         }
         match state {
             // The request is ready: show a QR code when the other side can
-            // scan one, else Tessera starts SAS for a request it made.
+            // scan one, else Twicecat starts SAS for a request it made.
             VerificationRequestState::Ready { .. } if !self.qr_tried => {
                 self.qr_tried = true;
                 match self.request.generate_qr_code().await {
@@ -398,7 +398,7 @@ impl Flow {
         }
     }
 
-    /// Tessera starts the SAS flow of a request it made.
+    /// Twicecat starts the SAS flow of a request it made.
     async fn start_own_sas(&mut self) {
         if self.request.we_started() && !self.sas_started {
             self.sas_started = true;

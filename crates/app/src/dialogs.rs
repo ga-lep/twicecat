@@ -14,7 +14,7 @@ use std::sync::Arc;
 use iced::Task;
 use iced::window;
 use rfd::AsyncFileDialog;
-use tessera_core::api::MessageText;
+use twicecat_core::api::MessageText;
 
 use crate::blocking;
 

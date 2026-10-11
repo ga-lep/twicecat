@@ -1,25 +1,26 @@
 //! NVIDIA's libraries for the CUDA and TensorRT providers on Linux and
 //! Windows: from the system, or from `scripts/fetch-cuda-runtime.sh` and
-//! `scripts/fetch-tensorrt.sh` (or `TESSERA_CUDA_DIR`,
-//! `TESSERA_TENSORRT_DIR`), preloaded before the runtime starts so its
+//! `scripts/fetch-tensorrt.sh` (or `TWICECAT_CUDA_DIR`,
+//! `TWICECAT_TENSORRT_DIR`), preloaded before the runtime starts so its
 //! providers find them without `LD_LIBRARY_PATH` or `PATH`. Also where TensorRT keeps
 //! the engines it builds for this machine.
 
 use std::path::{Path, PathBuf};
 
 /// Where `scripts/fetch-cuda-runtime.sh` put NVIDIA's libraries, or
-/// `TESSERA_CUDA_DIR`; `None` when neither exists (a system install is then
+/// `TWICECAT_CUDA_DIR`; `None` when neither exists (a system install is then
 /// used, if any).
 pub fn default_cuda_dir() -> Option<PathBuf> {
-    let dir = crate::paths::from_env_or_cache("TESSERA_CUDA_DIR", "cuda/13.0/lib")?;
+    let dir = crate::paths::from_env_or_cache("TWICECAT_CUDA_DIR", "cuda/13.0/lib")?;
     dir.is_dir().then_some(dir)
 }
 
 /// Where `scripts/fetch-tensorrt.sh` put TensorRT, or
-/// `TESSERA_TENSORRT_DIR`; `None` when neither exists (a system install is
+/// `TWICECAT_TENSORRT_DIR`; `None` when neither exists (a system install is
 /// then used, if any).
 pub fn default_tensorrt_dir() -> Option<PathBuf> {
-    let dir = crate::paths::from_env_or_cache("TESSERA_TENSORRT_DIR", "cuda/tensorrt-10.16.1/lib")?;
+    let dir =
+        crate::paths::from_env_or_cache("TWICECAT_TENSORRT_DIR", "cuda/tensorrt-10.16.1/lib")?;
     dir.is_dir().then_some(dir)
 }
 
@@ -189,7 +190,7 @@ mod tests {
 
     #[test]
     fn tensorrt_resources_load_between_the_runtime_and_its_plugins() {
-        let dir = std::env::temp_dir().join(format!("tessera-trt-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("twicecat-trt-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         for name in [
             "libnvinfer_builder_resource_sm90.so.10",
@@ -219,7 +220,7 @@ mod windows_tests {
 
     #[test]
     fn every_dll_in_the_directory_is_preloaded_in_a_stable_order() {
-        let dir = std::env::temp_dir().join(format!("tessera-cuda-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("twicecat-cuda-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         for name in [
             "cudnn64_9.dll",

@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use iced::keyboard::{self, key};
 use iced::widget::text_editor::{self, Action, Binding, Cursor, Edit, KeyPress, Position, Status};
-use tessera_core::api::{
+use twicecat_core::api::{
     Member, MentionRef, MessageKind, MessageText, OutgoingMessage, RoomId, TextFormat,
 };
 
@@ -876,7 +876,7 @@ impl Composer {
 pub enum Outgoing {
     /// Send this message.
     Send(OutgoingMessage),
-    /// `/name` is no command Tessera knows: ask before sending the text as
+    /// `/name` is no command Twicecat knows: ask before sending the text as
     /// a message (Element's "Unknown Command" question).
     UnknownCommand(String),
     /// A known command, named here, without its text, such as `/me` alone
@@ -1070,7 +1070,7 @@ fn mention_label(member: &Member) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tessera_core::api::UserId;
+    use twicecat_core::api::UserId;
 
     fn input(key: Key, shift: bool) -> KeyInput {
         KeyInput { key, shift }

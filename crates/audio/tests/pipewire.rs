@@ -14,12 +14,12 @@ use std::process::{Child, Command};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use tessera_audio::{
+use twicecat_audio::{
     AudioIo, DeviceList, DeviceWatcher, FRAME_LEN, Frame, IoConfig, SAMPLE_RATE, list_devices,
 };
 
 /// Set in the child: run the test body.
-const CHILD: &str = "TESSERA_PW_TEST_CHILD";
+const CHILD: &str = "TWICECAT_PW_TEST_CHILD";
 
 const CONFIG: &str = r#"
 context.properties = {
@@ -65,7 +65,7 @@ context.objects = [
     { factory = adapter
         args = {
             factory.name     = support.null-audio-sink
-            node.name        = tessera-test-sink
+            node.name        = twicecat-test-sink
             node.description = "Test Speakers"
             media.class      = Audio/Sink
             audio.position   = [ MONO ]
@@ -77,7 +77,7 @@ context.objects = [
     { factory = adapter
         args = {
             factory.name     = support.null-audio-sink
-            node.name        = tessera-test-mic
+            node.name        = twicecat-test-mic
             node.description = "Test Microphone"
             media.class      = Audio/Source/Virtual
             audio.position   = [ MONO ]
@@ -130,7 +130,7 @@ impl Daemon {
         // Unix socket path must fit in 108 bytes.
         static STARTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let n = STARTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("tessera-pw-{}-{n}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("twicecat-pw-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let config = dir.join("test.conf");
         std::fs::write(&config, CONFIG).unwrap();
@@ -202,8 +202,8 @@ fn tool(program: &str, args: &[&str]) -> String {
 
 fn set_defaults() {
     for (key, node) in [
-        ("default.audio.sink", "tessera-test-sink"),
-        ("default.audio.source", "tessera-test-mic"),
+        ("default.audio.sink", "twicecat-test-sink"),
+        ("default.audio.source", "twicecat-test-mic"),
     ] {
         tool(
             "pw-metadata",
@@ -246,14 +246,14 @@ fn lists_devices_and_their_defaults_but_not_streams() {
     assert_eq!(
         ids(&list),
         (
-            vec!["pipewire:tessera-test-mic".to_owned()],
-            vec!["pipewire:tessera-test-sink".to_owned()]
+            vec!["pipewire:twicecat-test-mic".to_owned()],
+            vec!["pipewire:twicecat-test-sink".to_owned()]
         )
     );
     assert_eq!(list.inputs[0].name, "Test Microphone");
     assert!(list.inputs[0].is_default && list.outputs[0].is_default);
     let info = io.info().output.clone().unwrap();
-    assert_eq!(info.device_id, "pipewire:tessera-test-sink", "the default");
+    assert_eq!(info.device_id, "pipewire:twicecat-test-sink", "the default");
     assert_eq!((info.sample_rate, info.channels), (SAMPLE_RATE, 1));
 }
 
@@ -382,9 +382,9 @@ fn a_tone_goes_out_and_comes_back_through_the_graph() {
     let io = AudioIo::start(
         IoConfig {
             capture: true,
-            input_device: Some("pipewire:tessera-test-mic".into()),
+            input_device: Some("pipewire:twicecat-test-mic".into()),
             playback: true,
-            output_device: Some("pipewire:tessera-test-mic".into()),
+            output_device: Some("pipewire:twicecat-test-mic".into()),
             echo_reference: false,
         },
         move |capture: &Frame, playback: &mut Frame| {
@@ -401,8 +401,8 @@ fn a_tone_goes_out_and_comes_back_through_the_graph() {
     // A virtual source plays back what is written to it: our playback goes
     // in, our capture comes out. No session manager runs, so we link.
     let io = io.unwrap();
-    link("tessera-playback", "tessera-test-mic");
-    link("tessera-test-mic", "tessera-capture");
+    link("twicecat-playback", "twicecat-test-mic");
+    link("twicecat-test-mic", "twicecat-capture");
     std::thread::sleep(Duration::from_millis(1500));
     let stats = io.stats();
     drop(io);
@@ -494,10 +494,10 @@ fn rms_db(samples: &[f32]) -> f32 {
 }
 
 /// What our microphone sends while a game plays on the same speakers it
-/// hears (`tessera-test-sink`'s monitor feeds the test microphone): RMS of
+/// hears (`twicecat-test-sink`'s monitor feeds the test microphone): RMS of
 /// the last two seconds sent, dBFS, and the microphone's level.
 fn sent_while_a_game_plays(echo_reference: bool) -> (f32, f32) {
-    use tessera_audio::{ChainSettings, GateMode, NoiseMode, VoiceEngine};
+    use twicecat_audio::{ChainSettings, GateMode, NoiseMode, VoiceEngine};
     let settings = ChainSettings {
         echo_cancellation: true,
         high_pass: true,
@@ -514,9 +514,9 @@ fn sent_while_a_game_plays(echo_reference: bool) -> (f32, f32) {
     let io = AudioIo::start(
         IoConfig {
             capture: true,
-            input_device: Some("pipewire:tessera-test-mic".into()),
+            input_device: Some("pipewire:twicecat-test-mic".into()),
             playback: true,
-            output_device: Some("pipewire:tessera-test-sink".into()),
+            output_device: Some("pipewire:twicecat-test-sink".into()),
             echo_reference,
         },
         engine,
@@ -524,12 +524,12 @@ fn sent_while_a_game_plays(echo_reference: bool) -> (f32, f32) {
     .unwrap();
     assert_eq!(io.info().echo_reference.is_some(), echo_reference);
     let game = Game::start();
-    link("test-game", "tessera-test-sink");
-    link("tessera-test-sink", "tessera-test-mic");
-    link("tessera-test-mic", "tessera-capture");
-    link("tessera-playback", "tessera-test-sink");
+    link("test-game", "twicecat-test-sink");
+    link("twicecat-test-sink", "twicecat-test-mic");
+    link("twicecat-test-mic", "twicecat-capture");
+    link("twicecat-playback", "twicecat-test-sink");
     if echo_reference {
-        link("tessera-test-sink", "tessera-echo-reference");
+        link("twicecat-test-sink", "twicecat-echo-reference");
     }
     let mut sent = Vec::new();
     let mut mic_levels = Vec::new();
@@ -583,14 +583,14 @@ fn the_system_mix_reference_cancels_a_games_sound() {
 fn on_time_under_load() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use tessera_audio::Realtime;
+    use twicecat_audio::Realtime;
 
     let io = AudioIo::start(
         IoConfig {
             capture: true,
-            input_device: Some("pipewire:tessera-test-mic".into()),
+            input_device: Some("pipewire:twicecat-test-mic".into()),
             playback: true,
-            output_device: Some("pipewire:tessera-test-mic".into()),
+            output_device: Some("pipewire:twicecat-test-mic".into()),
             echo_reference: false,
         },
         move |capture: &Frame, playback: &mut Frame| {
@@ -603,8 +603,8 @@ fn on_time_under_load() {
         },
     )
     .unwrap();
-    link("tessera-playback", "tessera-test-mic");
-    link("tessera-test-mic", "tessera-capture");
+    link("twicecat-playback", "twicecat-test-mic");
+    link("twicecat-test-mic", "twicecat-capture");
     std::thread::sleep(Duration::from_millis(1000));
 
     let busy = Arc::new(AtomicBool::new(true));
@@ -666,7 +666,7 @@ fn processing_stays_on_time_under_load_with_real_time_priority() {
 fn processing_under_load_at_normal_priority_for_comparison() {
     if outer_with(
         "processing_under_load_at_normal_priority_for_comparison",
-        &[("TESSERA_AUDIO_REALTIME", "0")],
+        &[("TWICECAT_AUDIO_REALTIME", "0")],
     ) {
         return;
     }

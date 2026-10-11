@@ -16,13 +16,13 @@ use common::{
     TestEnv, create_dm, e2ee_serial, expect_event, expect_event_within, expect_security,
     first_device, login_and_run, pump, raw_login_named, reset_e2ee_account, start_core,
 };
-use tessera_core::CoreHandle;
-use tessera_core::api::{
+use twicecat_core::CoreHandle;
+use twicecat_core::api::{
     ActionKind, Command, CoreError, CoreEvent, DeviceId, DeviceSummary, DeviceTrust,
     DeviceVerification, Password, ReauthAction, RoomId, UserId, UserTrust, VerificationId,
     VerificationPhase,
 };
-use tessera_core::secrets::InMemorySecretStore;
+use twicecat_core::secrets::InMemorySecretStore;
 
 async fn send(core: &mut CoreHandle, command: Command) {
     core.commands.send(command).await.unwrap();
@@ -347,8 +347,8 @@ async fn selecting_a_dm_reports_the_trust_in_its_peer() {
     reset_e2ee_account(1).await;
     reset_e2ee_account(3).await;
     let env = TestEnv::load();
-    let alice_raw = raw_login_named(1, "tessera-e2ee-setup").await;
-    let carol_raw = raw_login_named(3, "tessera-e2ee-setup").await;
+    let alice_raw = raw_login_named(1, "twicecat-e2ee-setup").await;
+    let carol_raw = raw_login_named(3, "twicecat-e2ee-setup").await;
     let room_id = create_dm(&alice_raw, &env.user_id(3)).await;
     carol_raw
         .join_room_by_id(&room_id)

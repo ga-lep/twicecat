@@ -1,4 +1,4 @@
-//! End-to-end run of `tessera-cli` against the local homeserver
+//! End-to-end run of `twicecat-cli` against the local homeserver
 //! (`scripts/stack.sh up -d --wait && scripts/create-test-users.sh`).
 
 mod common;
@@ -45,14 +45,14 @@ fn cli_source_names_no_sdk_crate() {
 #[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
 fn ephemeral_password_login_and_quit() {
     let env = TestEnv::load();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_tessera-cli"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_twicecat-cli"))
         .args(["--ephemeral", "--homeserver", env.homeserver_url()])
         .arg("--password-stdin")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn tessera-cli");
+        .expect("spawn twicecat-cli");
     let input = format!("{}\n{}\n/rooms\n/quit\n", env.user(1), env.password(1));
     child
         .stdin
@@ -67,8 +67,8 @@ fn ephemeral_password_login_and_quit() {
     });
     let output = rx
         .recv_timeout(Duration::from_secs(60))
-        .expect("tessera-cli did not exit within 60 s")
-        .expect("wait for tessera-cli");
+        .expect("twicecat-cli did not exit within 60 s")
+        .expect("wait for twicecat-cli");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -90,13 +90,13 @@ struct Session {
 
 impl Session {
     fn start(args: &[&str]) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_tessera-cli"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_twicecat-cli"))
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .expect("spawn tessera-cli");
+            .expect("spawn twicecat-cli");
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
         let (tx, lines) = mpsc::channel();
@@ -190,7 +190,7 @@ fn cli_joins_mutes_and_leaves_a_call() {
     cli.write("/leave");
     cli.expect("Left the call in");
     cli.write("/quit");
-    let status = cli.child.wait().expect("wait for tessera-cli");
+    let status = cli.child.wait().expect("wait for twicecat-cli");
     assert!(status.success(), "exit status {status:?}");
 
     // Our membership was emptied on leave.

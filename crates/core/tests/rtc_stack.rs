@@ -113,7 +113,7 @@ async fn openid_token_buys_a_livekit_jwt_that_connects() {
 async fn delayed_state_event_is_sent_by_the_server() {
     let alice = raw_login(1).await;
     let room_id = create_room(&alice, &unique_room_name(), None).await;
-    let event_type = StateEventType::from("io.github.ga_lep.tessera.test");
+    let event_type = StateEventType::from("io.github.ga_lep.twicecat.test");
     let content = Raw::new(&json!({ "sent": "by the server" }))
         .expect("serialise content")
         .cast_unchecked();

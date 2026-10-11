@@ -21,7 +21,7 @@ use image::codecs::jpeg::JpegEncoder;
 use image::codecs::png::PngEncoder;
 use image::metadata::Orientation;
 use image::{DynamicImage, ExtendedColorType, ImageEncoder as _};
-use tessera_core::api::{
+use twicecat_core::api::{
     AttachmentData, Command, CoreError, EventId, MediaBytes, MediaKind, MessageText,
     OutgoingAttachment, RoomId, UploadProgress, UploadThumbnail,
 };
@@ -124,7 +124,7 @@ pub const OCTET_STREAM: &str = "application/octet-stream";
 /// not. An unknown extension is `application/octet-stream`.
 ///
 /// ```
-/// use tessera_app::upload::mime_for;
+/// use twicecat_app::upload::mime_for;
 /// assert_eq!(mime_for("notes.txt", b"hello"), "text/plain");
 /// // A PNG that calls itself a JPEG is a plain file.
 /// let png = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
@@ -226,7 +226,7 @@ pub fn make_thumbnail(bytes: &[u8]) -> Option<UploadThumbnail> {
 ///
 /// ```
 /// use chrono::{TimeZone, Utc};
-/// use tessera_app::upload::pasted_image_name;
+/// use twicecat_app::upload::pasted_image_name;
 /// let now = Utc.with_ymd_and_hms(2026, 10, 8, 9, 5, 3).unwrap();
 /// assert_eq!(pasted_image_name(&now), "pasted-image-20261008-090503.png");
 /// ```
@@ -251,7 +251,7 @@ pub const DEFAULT_LIMIT: u64 = 100 * 1024 * 1024;
 /// has not said).
 ///
 /// ```
-/// use tessera_app::upload::{check_size, TooLarge};
+/// use twicecat_app::upload::{check_size, TooLarge};
 /// assert_eq!(check_size(10, Some(10)), Ok(()));
 /// assert_eq!(check_size(11, Some(10)), Err(TooLarge { limit: 10 }));
 /// ```
@@ -1168,7 +1168,7 @@ mod tests {
         fn new() -> Self {
             static N: AtomicU32 = AtomicU32::new(0);
             let dir = std::env::temp_dir().join(format!(
-                "tessera-upload-test-{}-{}",
+                "twicecat-upload-test-{}-{}",
                 std::process::id(),
                 N.fetch_add(1, Ordering::SeqCst)
             ));

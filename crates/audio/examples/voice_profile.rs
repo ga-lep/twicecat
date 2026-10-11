@@ -5,7 +5,7 @@
 //! worst) and heap allocations per frame, and can run one configuration
 //! alone for `perf`.
 //!
-//! `cargo run --release -p tessera-audio --example voice_profile -- [name]
+//! `cargo run --release -p twicecat-audio --example voice_profile -- [name]
 //! [frames]` (no name: every configuration). DeepFilterNet rows need
 //! `scripts/fetch-models.sh`. On a hybrid CPU, run it on an efficiency core
 //! too (`taskset -c <cpu>`): the processing thread often runs there. With
@@ -17,7 +17,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use tessera_audio::{
+use twicecat_audio::{
     CaptureChain, ChainSettings, DeepFilter, DeepFilterModel, FRAME_LEN, Frame, FrameProcessor,
     GateMode, NoiseMode, NsLevel, SILENCE, VoiceEngine, default_model_dir,
     flush_denormals_on_this_thread,
@@ -68,7 +68,7 @@ fn trace_allocation() {
             "sonora",
             "nnnoiseless",
             "tract",
-            "tessera_audio",
+            "twicecat_audio",
             "realfft",
             "rustfft",
             "ort",
@@ -345,12 +345,12 @@ fn engine(
 
 /// A bank of 16 rows on the first GPU backend that starts, and its name.
 #[cfg(feature = "onnxruntime")]
-fn gpu_bank() -> Option<(Box<dyn tessera_audio::BatchCleaner>, String)> {
-    use tessera_audio::onnx::{Accelerator, OnnxRuntime, default_runtime_dir};
+fn gpu_bank() -> Option<(Box<dyn twicecat_audio::BatchCleaner>, String)> {
+    use twicecat_audio::onnx::{Accelerator, OnnxRuntime, default_runtime_dir};
     let runtime = OnnxRuntime::load(&default_runtime_dir()?).ok()?;
-    let bank = tessera_audio::DeepFilterBank::load(
+    let bank = twicecat_audio::DeepFilterBank::load(
         &default_model_dir()?,
-        &tessera_audio::default_stateful_model()?,
+        &twicecat_audio::default_stateful_model()?,
         16,
         100.0,
         &runtime,
@@ -362,7 +362,7 @@ fn gpu_bank() -> Option<(Box<dyn tessera_audio::BatchCleaner>, String)> {
 }
 
 #[cfg(not(feature = "onnxruntime"))]
-fn gpu_bank() -> Option<(Box<dyn tessera_audio::BatchCleaner>, String)> {
+fn gpu_bank() -> Option<(Box<dyn twicecat_audio::BatchCleaner>, String)> {
     None
 }
 
@@ -371,10 +371,10 @@ fn gpu_bank() -> Option<(Box<dyn tessera_audio::BatchCleaner>, String)> {
 /// graph, to compare with tract (whose row includes the DSP, about 20 µs).
 #[cfg(feature = "onnxruntime")]
 fn onnx_cpu_network(name: &str, frames: usize) {
-    use tessera_audio::onnx::{LoopSpec, OnnxRuntime, default_runtime_dir};
+    use twicecat_audio::onnx::{LoopSpec, OnnxRuntime, default_runtime_dir};
     let (Some(dir), Some(model)) = (
         default_runtime_dir(),
-        tessera_audio::default_stateful_model(),
+        twicecat_audio::default_stateful_model(),
     ) else {
         println!("{name:<34} (no ONNX Runtime or stateful model)");
         return;

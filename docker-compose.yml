@@ -1,8 +1,13 @@
 # Start it with scripts/stack.sh (up -d --wait, down -v, ...), which sets
 # the address and ports below from the environment, .env.local or .env.test;
 # a bare `docker compose` stops at the first one missing.
+# The project name is fixed here, not taken from the folder's name, so the
+# containers (twicecat-synapse-1, ...) and the volume (twicecat_synapse-data)
+# keep their names wherever the repository is cloned.
+name: twicecat
+
 x-stack: &stack
-  TESSERA_ADDRESS: ${TESSERA_ADDRESS:?run through scripts/stack.sh}
+  TWICECAT_ADDRESS: ${TWICECAT_ADDRESS:?run through scripts/stack.sh}
 
 services:
   synapse:
@@ -12,24 +17,24 @@ services:
       SYNAPSE_SERVER_NAME: localhost
       SYNAPSE_REPORT_STATS: "no"
       # The call service as clients reach it (MSC4143 transports).
-      TESSERA_LK_JWT_URL: ${LK_JWT_URL:?run through scripts/stack.sh}
+      TWICECAT_LK_JWT_URL: ${LK_JWT_URL:?run through scripts/stack.sh}
     # livekit and lk-jwt share this network namespace, so their ports are
-    # published here, on TESSERA_ADDRESS only (127.0.0.1 by default).
+    # published here, on TWICECAT_ADDRESS only (127.0.0.1 by default).
     # Synapse and lk-jwt-service listen on fixed ports inside, published on
     # the configured ones. LiveKit listens on the configured ports inside
     # too: lk-jwt-service uses the URL it gives clients itself, and ICE
     # candidates carry the ports.
     ports:
-      - "${TESSERA_PUBLISH_ADDRESS:?run through scripts/stack.sh}:${TESSERA_SYNAPSE_PORT:?}:8008" # Synapse client API
-      - "${TESSERA_PUBLISH_ADDRESS}:${TESSERA_LK_JWT_PORT:?}:8080" # lk-jwt-service
-      - "${TESSERA_PUBLISH_ADDRESS}:${TESSERA_LIVEKIT_PORT:?}:${TESSERA_LIVEKIT_PORT}" # LiveKit signalling (ws)
-      - "${TESSERA_PUBLISH_ADDRESS}:${TESSERA_LIVEKIT_TCP_PORT:?}:${TESSERA_LIVEKIT_TCP_PORT}" # LiveKit ICE over TCP
-      - "${TESSERA_PUBLISH_ADDRESS}:${TESSERA_LIVEKIT_UDP_PORT:?}:${TESSERA_LIVEKIT_UDP_PORT}/udp" # LiveKit ICE over UDP (muxed)
+      - "${TWICECAT_PUBLISH_ADDRESS:?run through scripts/stack.sh}:${TWICECAT_SYNAPSE_PORT:?}:8008" # Synapse client API
+      - "${TWICECAT_PUBLISH_ADDRESS}:${TWICECAT_LK_JWT_PORT:?}:8080" # lk-jwt-service
+      - "${TWICECAT_PUBLISH_ADDRESS}:${TWICECAT_LIVEKIT_PORT:?}:${TWICECAT_LIVEKIT_PORT}" # LiveKit signalling (ws)
+      - "${TWICECAT_PUBLISH_ADDRESS}:${TWICECAT_LIVEKIT_TCP_PORT:?}:${TWICECAT_LIVEKIT_TCP_PORT}" # LiveKit ICE over TCP
+      - "${TWICECAT_PUBLISH_ADDRESS}:${TWICECAT_LIVEKIT_UDP_PORT:?}:${TWICECAT_LIVEKIT_UDP_PORT}/udp" # LiveKit ICE over UDP (muxed)
       # Second SFU and lk-jwt-service (multi-SFU tests: another "homeserver's" call service).
-      - "${TESSERA_PUBLISH_ADDRESS}:${TESSERA_LK_JWT_PORT_B:?}:8081" # lk-jwt-service B
-      - "${TESSERA_PUBLISH_ADDRESS}:${TESSERA_LIVEKIT_PORT_B:?}:${TESSERA_LIVEKIT_PORT_B}" # LiveKit B signalling (ws)
-      - "${TESSERA_PUBLISH_ADDRESS}:${TESSERA_LIVEKIT_TCP_PORT_B:?}:${TESSERA_LIVEKIT_TCP_PORT_B}" # LiveKit B ICE over TCP
-      - "${TESSERA_PUBLISH_ADDRESS}:${TESSERA_LIVEKIT_UDP_PORT_B:?}:${TESSERA_LIVEKIT_UDP_PORT_B}/udp" # LiveKit B ICE over UDP (muxed)
+      - "${TWICECAT_PUBLISH_ADDRESS}:${TWICECAT_LK_JWT_PORT_B:?}:8081" # lk-jwt-service B
+      - "${TWICECAT_PUBLISH_ADDRESS}:${TWICECAT_LIVEKIT_PORT_B:?}:${TWICECAT_LIVEKIT_PORT_B}" # LiveKit B signalling (ws)
+      - "${TWICECAT_PUBLISH_ADDRESS}:${TWICECAT_LIVEKIT_TCP_PORT_B:?}:${TWICECAT_LIVEKIT_TCP_PORT_B}" # LiveKit B ICE over TCP
+      - "${TWICECAT_PUBLISH_ADDRESS}:${TWICECAT_LIVEKIT_UDP_PORT_B:?}:${TWICECAT_LIVEKIT_UDP_PORT_B}/udp" # LiveKit B ICE over UDP (muxed)
     volumes:
       - synapse-data:/data
       - ./dev/synapse/start.sh:/start-dev.sh:ro
@@ -52,21 +57,21 @@ services:
     env_file: .env.test
     environment:
       <<: *stack
-      TESSERA_LIVEKIT_PORT: ${TESSERA_LIVEKIT_PORT:?}
-      TESSERA_LIVEKIT_TCP_PORT: ${TESSERA_LIVEKIT_TCP_PORT:?}
-      TESSERA_LIVEKIT_UDP_PORT: ${TESSERA_LIVEKIT_UDP_PORT:?}
-      TESSERA_WEBHOOK_PORT: "8080"
+      TWICECAT_LIVEKIT_PORT: ${TWICECAT_LIVEKIT_PORT:?}
+      TWICECAT_LIVEKIT_TCP_PORT: ${TWICECAT_LIVEKIT_TCP_PORT:?}
+      TWICECAT_LIVEKIT_UDP_PORT: ${TWICECAT_LIVEKIT_UDP_PORT:?}
+      TWICECAT_WEBHOOK_PORT: "8080"
     entrypoint: ["/bin/sh", "-c"]
     command: &livekit-command
       - >-
-        sed -e "s|@PORT@|$$TESSERA_LIVEKIT_PORT|" -e "s|@TCP_PORT@|$$TESSERA_LIVEKIT_TCP_PORT|"
-        -e "s|@UDP_PORT@|$$TESSERA_LIVEKIT_UDP_PORT|" -e "s|@NODE_IP@|$$TESSERA_ADDRESS|"
-        -e "s|@WEBHOOK_PORT@|$$TESSERA_WEBHOOK_PORT|" /etc/livekit.yaml.in >/tmp/livekit.yaml &&
+        sed -e "s|@PORT@|$$TWICECAT_LIVEKIT_PORT|" -e "s|@TCP_PORT@|$$TWICECAT_LIVEKIT_TCP_PORT|"
+        -e "s|@UDP_PORT@|$$TWICECAT_LIVEKIT_UDP_PORT|" -e "s|@NODE_IP@|$$TWICECAT_ADDRESS|"
+        -e "s|@WEBHOOK_PORT@|$$TWICECAT_WEBHOOK_PORT|" /etc/livekit.yaml.in >/tmp/livekit.yaml &&
         LIVEKIT_KEYS="$$LIVEKIT_KEY: $$LIVEKIT_SECRET" exec /livekit-server --config /tmp/livekit.yaml
     volumes:
       - ./dev/livekit/livekit.yaml:/etc/livekit.yaml.in:ro
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:$$TESSERA_LIVEKIT_PORT >/dev/null"]
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:$$TWICECAT_LIVEKIT_PORT >/dev/null"]
       interval: 2s
       timeout: 5s
       retries: 30
@@ -109,16 +114,16 @@ services:
     env_file: .env.test
     environment:
       <<: *stack
-      TESSERA_LIVEKIT_PORT: ${TESSERA_LIVEKIT_PORT_B:?}
-      TESSERA_LIVEKIT_TCP_PORT: ${TESSERA_LIVEKIT_TCP_PORT_B:?}
-      TESSERA_LIVEKIT_UDP_PORT: ${TESSERA_LIVEKIT_UDP_PORT_B:?}
-      TESSERA_WEBHOOK_PORT: "8081"
+      TWICECAT_LIVEKIT_PORT: ${TWICECAT_LIVEKIT_PORT_B:?}
+      TWICECAT_LIVEKIT_TCP_PORT: ${TWICECAT_LIVEKIT_TCP_PORT_B:?}
+      TWICECAT_LIVEKIT_UDP_PORT: ${TWICECAT_LIVEKIT_UDP_PORT_B:?}
+      TWICECAT_WEBHOOK_PORT: "8081"
     entrypoint: ["/bin/sh", "-c"]
     command: *livekit-command
     volumes:
       - ./dev/livekit/livekit.yaml:/etc/livekit.yaml.in:ro
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:$$TESSERA_LIVEKIT_PORT >/dev/null"]
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:$$TWICECAT_LIVEKIT_PORT >/dev/null"]
       interval: 2s
       timeout: 5s
       retries: 30

@@ -11,13 +11,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use iced::futures::StreamExt as _;
-use tessera_app::bridge::{BridgeEvent, events_stream};
-use tessera_app::{App, Bridge, Message, Screen, Startup};
-use tessera_core::CoreConfig;
-use tessera_core::paths::DataPaths;
-use tessera_core::secrets::InMemorySecretStore;
+use twicecat_app::bridge::{BridgeEvent, events_stream};
+use twicecat_app::{App, Bridge, Message, Screen, Startup};
+use twicecat_core::CoreConfig;
+use twicecat_core::paths::DataPaths;
+use twicecat_core::secrets::InMemorySecretStore;
 
-// The same settings as tessera-core's tests: .env.test, .env.local, the
+// The same settings as twicecat-core's tests: .env.test, .env.local, the
 // environment.
 #[allow(dead_code)]
 #[path = "../../core/tests/common/stack_env.rs"]
@@ -140,7 +140,7 @@ fn scratch_dir() -> PathBuf {
     let id = std::collections::hash_map::RandomState::new()
         .build_hasher()
         .finish();
-    std::env::temp_dir().join(format!("tessera-app-bridge-test-{id:016x}"))
+    std::env::temp_dir().join(format!("twicecat-app-bridge-test-{id:016x}"))
 }
 
 #[test]
@@ -157,7 +157,7 @@ fn login_reaches_main_with_rooms_and_shutdown_closes_the_bridge() {
         CoreConfig {
             data: DataPaths::at(&dir),
             homeserver_override: Some(base),
-            room_list_page_size: tessera_core::DEFAULT_ROOM_LIST_PAGE_SIZE,
+            room_list_page_size: twicecat_core::DEFAULT_ROOM_LIST_PAGE_SIZE,
             max_upload_bytes_override: None,
             audio: Default::default(),
             call_service_override: None,
@@ -201,9 +201,9 @@ fn login_reaches_main_with_rooms_and_shutdown_closes_the_bridge() {
         next(&mut app, Duration::from_secs(5));
     }
     let _ = app.update(Message::UsernameChanged(user));
-    let _ = app.update(Message::PasswordChanged(tessera_core::api::Password::from(
-        password,
-    )));
+    let _ = app.update(Message::PasswordChanged(
+        twicecat_core::api::Password::from(password),
+    ));
     let _ = app.update(Message::LoginSubmitted);
 
     let limit = deadline(60);
@@ -234,7 +234,7 @@ fn login_reaches_main_with_rooms_and_shutdown_closes_the_bridge() {
 /// character, like the text editor widget publishes them.
 fn type_into_composer(app: &mut App, text: &str) {
     use iced::widget::text_editor::{Action, Edit};
-    use tessera_app::composer::EditorAction;
+    use twicecat_app::composer::EditorAction;
     for c in text.chars() {
         let _ = app.update(Message::Composer(EditorAction(Action::Edit(Edit::Insert(
             c,
@@ -245,7 +245,7 @@ fn type_into_composer(app: &mut App, text: &str) {
 /// Whether the applied timeline holds a message whose rich text is exactly
 /// the bold word `word`.
 fn timeline_has_bold_message(app: &App, word: &str) -> bool {
-    use tessera_core::api::{Block, Inline, TimelineItemKind};
+    use twicecat_core::api::{Block, Inline, TimelineItemKind};
     app.timeline.items.iter().any(|item| match &item.kind {
         TimelineItemKind::Message { details, .. } => matches!(
             details.content.blocks.as_slice(),
@@ -261,7 +261,7 @@ fn timeline_has_bold_message(app: &App, word: &str) -> bool {
 #[test]
 #[ignore = "needs local homeserver: docker compose up -d --wait"]
 fn typing_markdown_and_pressing_enter_shows_a_bold_message_in_the_timeline() {
-    use tessera_app::composer::{Key, KeyInput, bind};
+    use twicecat_app::composer::{Key, KeyInput, bind};
     let env = TestEnv::load();
     let base = env.get("HOMESERVER_URL").to_owned();
     let user = env.get("TEST_USER_1").to_owned();
@@ -273,7 +273,7 @@ fn typing_markdown_and_pressing_enter_shows_a_bold_message_in_the_timeline() {
         CoreConfig {
             data: DataPaths::at(&dir),
             homeserver_override: Some(base),
-            room_list_page_size: tessera_core::DEFAULT_ROOM_LIST_PAGE_SIZE,
+            room_list_page_size: twicecat_core::DEFAULT_ROOM_LIST_PAGE_SIZE,
             max_upload_bytes_override: None,
             audio: Default::default(),
             call_service_override: None,
@@ -313,9 +313,9 @@ fn typing_markdown_and_pressing_enter_shows_a_bold_message_in_the_timeline() {
         next(&mut app, Duration::from_secs(5));
     }
     let _ = app.update(Message::UsernameChanged(user));
-    let _ = app.update(Message::PasswordChanged(tessera_core::api::Password::from(
-        password,
-    )));
+    let _ = app.update(Message::PasswordChanged(
+        twicecat_core::api::Password::from(password),
+    ));
     let _ = app.update(Message::LoginSubmitted);
     let limit = deadline(60);
     while !(app.screen == Screen::Main && !app.rooms.is_empty()) {
@@ -364,8 +364,8 @@ fn typing_markdown_and_pressing_enter_shows_a_bold_message_in_the_timeline() {
 #[test]
 #[ignore = "needs local homeserver: docker compose up -d --wait"]
 fn carol_resets_her_identity_sets_up_recovery_and_logs_out() {
-    use tessera_app::security::{Overlay, SecurityMessage, Visible};
-    use tessera_core::api::{DeviceVerification, Password, RecoveryStatus};
+    use twicecat_app::security::{Overlay, SecurityMessage, Visible};
+    use twicecat_core::api::{DeviceVerification, Password, RecoveryStatus};
     let env = TestEnv::load();
     let base = env.get("HOMESERVER_URL").to_owned();
     let user = env.get("TEST_USER_3").to_owned();
@@ -376,7 +376,7 @@ fn carol_resets_her_identity_sets_up_recovery_and_logs_out() {
         CoreConfig {
             data: DataPaths::at(&dir),
             homeserver_override: Some(base),
-            room_list_page_size: tessera_core::DEFAULT_ROOM_LIST_PAGE_SIZE,
+            room_list_page_size: twicecat_core::DEFAULT_ROOM_LIST_PAGE_SIZE,
             max_upload_bytes_override: None,
             audio: Default::default(),
             call_service_override: None,

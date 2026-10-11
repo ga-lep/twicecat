@@ -11,14 +11,14 @@ use std::time::{Duration, Instant};
 use iced::theme;
 use iced::widget::{operation, scrollable};
 use iced::{Element, Subscription, Task, Theme, clipboard, system, window};
-use tessera_core::api::{
+use tokio::sync::mpsc;
+use twicecat_core::api::{
     ActionKind, Command, CoreError, CoreEvent, Draft, EventId, ListDiff, MediaBytes, MediaKind,
     MediaSize, MessageDetails, MessageText, NotificationKind, NotificationSettingsView,
     NotificationView, OutgoingMessage, Password, ReauthAction, RoomId, RoomListQuery, RoomListTab,
     RoomNotificationModeView, RoomSummary, SyncState, TimelineItem, TimelineItemKind, TypingUser,
     UiSettings, UserId, UserTrust,
 };
-use tokio::sync::mpsc;
 
 use crate::actions::{self, ActionButtons, ActionState, NOTICE_DURATION, Notice, Picker};
 use crate::avatars::Avatars;
@@ -371,7 +371,7 @@ pub enum Message {
     OpenRoomFromNotification(RoomId),
     /// A choice in the room header's notification menu.
     RoomModeChosen(ModeChoice),
-    /// **Show Tessera** or **Quit** in the tray, or a click on the icon.
+    /// **Show Twicecat** or **Quit** in the tray, or a click on the icon.
     Tray(TrayAction),
     /// A message of the room dialogs, panels, user card and join bar.
     Rooms(RoomsMessage),
@@ -740,7 +740,7 @@ impl App {
     /// Creates the tray once, on the main thread.
     fn ensure_tray(&mut self) {
         if self.tray.ensure(self.ui_settings.tray_badge) {
-            eprintln!("tessera: the tray icon is not available");
+            eprintln!("twicecat: the tray icon is not available");
         }
     }
 
@@ -2517,7 +2517,7 @@ mod tests {
     use std::sync::Arc;
 
     use iced::widget::text_editor::{Action, Edit};
-    use tessera_core::api::{DeviceId, ListDiff, RoomId};
+    use twicecat_core::api::{DeviceId, ListDiff, RoomId};
 
     use super::*;
 
@@ -2645,7 +2645,7 @@ mod tests {
 
     // ---- Task 9: screens ----
 
-    use tessera_core::api::{AuthUrl, AvatarId, AvatarImage, CoreError};
+    use twicecat_core::api::{AuthUrl, AvatarId, AvatarImage, CoreError};
 
     /// Types into the login form through `update`.
     fn fill(app: &mut App, server: &str, user: &str, password: &str) {
@@ -2939,7 +2939,7 @@ mod tests {
             .filter(|l| !l.trim_start().starts_with("//"))
             .collect();
         assert!(
-            !code.contains("tessera_app::open") && !code.contains("that_detached"),
+            !code.contains("twicecat_app::open") && !code.contains("that_detached"),
             "no direct launcher call"
         );
     }
@@ -3154,8 +3154,8 @@ mod tests {
         let answer = |query: &str| {
             core(CoreEvent::Members {
                 room_id: RoomId::from("!a:x"),
-                query: tessera_core::api::MessageText::from(query),
-                members: vec![tessera_core::api::Member {
+                query: twicecat_core::api::MessageText::from(query),
+                members: vec![twicecat_core::api::Member {
                     user_id: UserId::from("@alice:x"),
                     display_name: Some("Alice".into()),
                 }],
@@ -3183,8 +3183,8 @@ mod tests {
         type_in(&mut app, "@a");
         let _ = app.update(core(CoreEvent::Members {
             room_id: RoomId::from("!b:x"),
-            query: tessera_core::api::MessageText::from("a"),
-            members: vec![tessera_core::api::Member {
+            query: twicecat_core::api::MessageText::from("a"),
+            members: vec![twicecat_core::api::Member {
                 user_id: UserId::from("@alice:x"),
                 display_name: None,
             }],
@@ -3667,7 +3667,7 @@ mod tests {
     // ---- Task 12: message actions ----
 
     use crate::actions::NOTICE_DURATION;
-    use tessera_core::api::{
+    use twicecat_core::api::{
         ItemActions, MessageDetails, MessageText, ReactionGroup, SendStatus, TimelineItemKind,
     };
 
@@ -4027,7 +4027,7 @@ mod tests {
 
     // ---- per-room drafts ----------------------------------------------------
 
-    fn saved_drafts(commands: &[Command]) -> Vec<(String, Option<tessera_core::api::Draft>)> {
+    fn saved_drafts(commands: &[Command]) -> Vec<(String, Option<twicecat_core::api::Draft>)> {
         commands
             .iter()
             .filter_map(|c| match c {
@@ -4039,7 +4039,7 @@ mod tests {
             .collect()
     }
 
-    fn draft_text(draft: &Option<tessera_core::api::Draft>) -> Option<String> {
+    fn draft_text(draft: &Option<twicecat_core::api::Draft>) -> Option<String> {
         draft.as_ref().map(|d| d.text.expose().to_owned())
     }
 
@@ -4112,9 +4112,9 @@ mod tests {
         if let Some(item) = app.timeline.items.iter_mut().find(|i| i.id == "theirs") {
             item.event_id = Some(EventId::from("$theirs"));
         }
-        let draft = tessera_core::api::Draft {
+        let draft = twicecat_core::api::Draft {
             text: MessageText::from("@Bob: back"),
-            mentions: vec![tessera_core::api::MentionRef {
+            mentions: vec![twicecat_core::api::MentionRef {
                 label: "@Bob".into(),
                 user_id: UserId::from("@bob:x"),
             }],
@@ -4140,7 +4140,7 @@ mod tests {
         type_in(&mut app, "typed already");
         let _ = app.update(core(CoreEvent::DraftLoaded {
             room_id: RoomId::from("!a:x"),
-            draft: tessera_core::api::Draft {
+            draft: twicecat_core::api::Draft {
                 text: MessageText::from("old draft"),
                 mentions: Vec::new(),
                 reply_to: None,
@@ -4222,7 +4222,7 @@ mod tests {
         match send_commands(&commands).as_slice() {
             [Command::Send(m)] => {
                 assert_eq!(m.text.expose(), "/foo bar");
-                assert_eq!(m.format, tessera_core::api::TextFormat::Markdown);
+                assert_eq!(m.format, twicecat_core::api::TextFormat::Markdown);
             }
             other => panic!("expected one send, got {other:?}"),
         }
@@ -4278,7 +4278,7 @@ mod tests {
         let commands = drain(&mut rx);
         assert!(matches!(
             send_commands(&commands).as_slice(),
-            [Command::Send(m)] if m.format == tessera_core::api::TextFormat::Html
+            [Command::Send(m)] if m.format == twicecat_core::api::TextFormat::Html
         ));
         type_in(&mut app, "/foo");
         let _ = app.update(Message::ComposerKey(ComposerKey::Send));
@@ -4322,7 +4322,7 @@ mod tests {
         // Let any pagination of the short timeline finish first.
         let _ = app.update(core(CoreEvent::Pagination {
             room_id: RoomId::from("!a:x"),
-            state: tessera_core::api::PaginationState::Idle,
+            state: twicecat_core::api::PaginationState::Idle,
         }));
         let _ = drain(&mut rx);
         let _ = app.update(Message::ReplyQuoteClicked(EventId::from("$old")));
@@ -4345,7 +4345,7 @@ mod tests {
         let _ = app.update(Message::ReplyQuoteClicked(EventId::from("$gone")));
         let _ = app.update(core(CoreEvent::Pagination {
             room_id: RoomId::from("!a:x"),
-            state: tessera_core::api::PaginationState::ReachedStart,
+            state: twicecat_core::api::PaginationState::ReachedStart,
         }));
         let _ = app.update(core(CoreEvent::TimelineDiff {
             room_id: RoomId::from("!a:x"),
@@ -4472,8 +4472,8 @@ mod tests {
         assert_eq!(marks(&drain(&mut rx)), Vec::<bool>::new());
     }
 
-    fn typist(id: &str, name: Option<&str>) -> tessera_core::api::TypingUser {
-        tessera_core::api::TypingUser {
+    fn typist(id: &str, name: Option<&str>) -> twicecat_core::api::TypingUser {
+        twicecat_core::api::TypingUser {
             user_id: UserId::from(id),
             name: name.map(str::to_owned),
         }
@@ -4501,7 +4501,7 @@ mod tests {
         let mut item = message_item(id, "x", true, ALL_ACTIONS);
         if let TimelineItemKind::Message { sent, details, .. } = &mut item.kind {
             *sent = SendStatus::Failed;
-            details.send_failure = Some(tessera_core::api::SendFailure { recoverable });
+            details.send_failure = Some(twicecat_core::api::SendFailure { recoverable });
         }
         item
     }
@@ -4536,7 +4536,7 @@ mod tests {
     // ---- Task 10: security banner and screens ----
 
     use crate::security::{Banner, Busy, Overlay, SecurityMessage, Visible};
-    use tessera_core::api::{
+    use twicecat_core::api::{
         ActionKind as Kind, CrossSigning, DeviceVerification, ReauthAction, RecoveryKey,
         RecoveryStatus, SecurityStatus,
     };
@@ -5129,7 +5129,7 @@ mod tests {
     // ---- Task 11: verification dialog ----
 
     use crate::verification::VerificationMessage as VM;
-    use tessera_core::api::{
+    use twicecat_core::api::{
         CancelReason, QrImage, SasEmoji, VerificationId, VerificationPeer, VerificationPhase as VP,
     };
 
@@ -5254,7 +5254,7 @@ mod tests {
         let _ = app.update(core(CoreEvent::Verification {
             id: flow2,
             phase: VP::Cancelled {
-                reason: tessera_core::api::CancelReason::ByThem,
+                reason: twicecat_core::api::CancelReason::ByThem,
             },
         }));
         let _ = vmsg(&mut app, VM::Close);
@@ -5451,7 +5451,7 @@ mod tests {
                 body: String::new(),
                 is_own: false,
                 timestamp_ms: 0,
-                sent: tessera_core::api::SendStatus::Sent,
+                sent: twicecat_core::api::SendStatus::Sent,
                 details: Box::default(),
             },
         )
@@ -5595,7 +5595,7 @@ mod tests {
     // ---- Task 13: sessions screen and re-authentication ----
 
     use crate::sessions::SessionsMessage;
-    use tessera_core::api::{DeviceSummary, DeviceTrust};
+    use twicecat_core::api::{DeviceSummary, DeviceTrust};
 
     fn ses(app: &mut App, message: SessionsMessage) -> Task<Message> {
         app.update(Message::Sessions(message))
@@ -5614,7 +5614,7 @@ mod tests {
     /// Three devices: this one, a verified laptop and an unverified phone.
     fn device_list() -> Vec<DeviceSummary> {
         vec![
-            summary("THIS", Some("Tessera"), true, DeviceTrust::Verified),
+            summary("THIS", Some("Twicecat"), true, DeviceTrust::Verified),
             summary("LAPTOP", Some("Laptop"), false, DeviceTrust::Verified),
             summary("PHONE", Some("Phone"), false, DeviceTrust::Unverified),
         ]
@@ -6513,7 +6513,7 @@ mod tests {
             Message::Sessions(SessionsMessage::ReauthInput(Password::from(PW_S))),
             core(CoreEvent::Verification {
                 id: vid(),
-                phase: tessera_core::api::VerificationPhase::ShowQr(vqr()),
+                phase: twicecat_core::api::VerificationPhase::ShowQr(vqr()),
             }),
             Message::PasswordChanged(Password::from(LOGIN_PW_S)),
             core(CoreEvent::OAuthUrl(AuthUrl::from(format!(
@@ -6537,7 +6537,7 @@ mod tests {
 
     #[test]
     fn the_redaction_sweep_finds_no_secret_in_any_state_or_message() {
-        use tessera_core::api::VerificationPhase;
+        use twicecat_core::api::VerificationPhase;
 
         // The show-once key screen, with a copy pending.
         let (mut app, _rx) = recovery_app();
@@ -6819,7 +6819,7 @@ mod tests {
 
     use std::path::PathBuf;
 
-    use tessera_core::api::{MediaBytes, MediaContent, MediaKind, MediaSize};
+    use twicecat_core::api::{MediaBytes, MediaContent, MediaKind, MediaSize};
 
     use crate::dialogs::RecordingDialogs;
     use crate::media::{self, Decoded, SavePath, Thumb};
@@ -7406,7 +7406,7 @@ mod tests {
         use std::path::PathBuf;
         use std::sync::Arc;
 
-        use tessera_core::api::{
+        use twicecat_core::api::{
             ActionKind, AttachmentData, MediaContent, MediaKind, MessageText, UploadProgress,
         };
 
@@ -7448,7 +7448,7 @@ mod tests {
             }
         }
 
-        fn attachments(commands: &[Command]) -> Vec<&tessera_core::api::OutgoingAttachment> {
+        fn attachments(commands: &[Command]) -> Vec<&twicecat_core::api::OutgoingAttachment> {
             commands
                 .iter()
                 .filter_map(|c| match c {
@@ -7971,7 +7971,7 @@ mod tests {
     }
 
     mod notification_flow {
-        use tessera_core::api::{
+        use twicecat_core::api::{
             EventId, NotificationKind, NotificationView, RoomNotificationModeView,
         };
 
@@ -8358,7 +8358,7 @@ mod tests {
         #[test]
         fn the_notification_settings_event_is_kept() {
             let mut rig = rig();
-            let settings = tessera_core::api::NotificationSettingsView {
+            let settings = twicecat_core::api::NotificationSettingsView {
                 group_default: RoomNotificationModeView::AllMessages,
                 dm_default: RoomNotificationModeView::Mute,
                 keywords: vec!["kw".into()],
@@ -8375,7 +8375,7 @@ mod tests {
     mod rooms_ui {
         use std::path::PathBuf;
 
-        use tessera_core::api::{
+        use twicecat_core::api::{
             Block, Inline, MediaBytes, MembershipView, MentionTarget, MessageDetails,
             PowerLevelView, RichText, Role, RoomDetailsView, RoomMemberView, RoomPermissions,
             SendStatus, TimelineItemKind,
@@ -8496,7 +8496,7 @@ mod tests {
             assert!(!request.encrypted);
             assert_eq!(
                 request.visibility,
-                tessera_core::api::RoomVisibility::Public {
+                twicecat_core::api::RoomVisibility::Public {
                     alias: "open-room".into()
                 }
             );
@@ -9352,7 +9352,7 @@ mod tests {
 
     mod spaces_and_threads {
         use iced::advanced::widget::{Tree, tree::Tag};
-        use tessera_core::api::{
+        use twicecat_core::api::{
             ActionKind, MediaKind, PaginationState, RoomListQuery, RoomListTab, SpaceView,
         };
 
@@ -9497,7 +9497,7 @@ mod tests {
         fn space_avatars_are_requested_once() {
             let (mut app, mut rx) = main_app();
             let mut s = space("!s1:x", 0);
-            s.avatar = Some(tessera_core::api::AvatarId::from("mxc://x/a"));
+            s.avatar = Some(twicecat_core::api::AvatarId::from("mxc://x/a"));
             let _ = app.update(core(CoreEvent::Spaces(vec![s.clone()])));
             let first = drain(&mut rx);
             assert!(matches!(first.as_slice(), [Command::FetchAvatars(ids)] if ids.len() == 1));
@@ -9924,7 +9924,7 @@ mod tests {
     mod settings_ui {
         use std::path::PathBuf;
 
-        use tessera_core::api::{
+        use twicecat_core::api::{
             AvatarId, EventId, MediaBytes, NotificationKind, NotificationSettingsView,
             OwnProfileView, RoomNotificationModeView as Mode, ThemeChoice,
         };
@@ -10507,7 +10507,7 @@ mod tests {
     }
 
     mod keyboard {
-        use tessera_core::api::{ListDiff, RoomListQuery, RoomListTab};
+        use twicecat_core::api::{ListDiff, RoomListQuery, RoomListTab};
 
         use super::*;
         use crate::dialogs::RecordingDialogs;
@@ -10959,7 +10959,7 @@ mod tests {
     mod redaction_sweep {
         use std::path::PathBuf;
 
-        use tessera_core::api::{
+        use twicecat_core::api::{
             AvatarId, EventId, MediaKind, MembershipView, NotificationKind,
             NotificationSettingsView, NotificationView, OwnProfileView, PowerLevelView, Role,
             RoomDetailsView, RoomMemberView, RoomNotificationModeView as Mode, RoomPermissions,

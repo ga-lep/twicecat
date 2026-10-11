@@ -31,7 +31,7 @@ prune() {
     local user=$1 password=$2 token count=0 failed=0 room
     # The password goes to jq through its environment, not its argv.
     token=$(PRUNE_USER=$user PRUNE_PASSWORD=$password jq -n \
-        '{type:"m.login.password",identifier:{type:"m.id.user",user:env.PRUNE_USER},password:env.PRUNE_PASSWORD,initial_device_display_name:"tessera-prune"}' \
+        '{type:"m.login.password",identifier:{type:"m.id.user",user:env.PRUNE_USER},password:env.PRUNE_PASSWORD,initial_device_display_name:"twicecat-prune"}' \
         | curl -sf -X POST "$api/login" -H 'Content-Type: application/json' -d @- \
         | jq -r .access_token)
     printf 'Authorization: Bearer %s\n' "$token" >"$work/auth"

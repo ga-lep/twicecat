@@ -8,8 +8,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{TestEnv, start_core};
-use tessera_core::api::{Command, CoreError, CoreEvent};
-use tessera_core::secrets::{InMemorySecretStore, SecretStore as _};
+use twicecat_core::api::{Command, CoreError, CoreEvent};
+use twicecat_core::secrets::{InMemorySecretStore, SecretStore as _};
 
 #[tokio::test]
 #[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]

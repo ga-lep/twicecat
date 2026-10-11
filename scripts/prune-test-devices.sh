@@ -31,15 +31,15 @@ prune() {
     local user=$1 password=$2 token session cutoff count failed=0
     # The password goes to jq through its environment, not its argv.
     token=$(PRUNE_USER=$user PRUNE_PASSWORD=$password jq -n \
-        '{type:"m.login.password",identifier:{type:"m.id.user",user:env.PRUNE_USER},password:env.PRUNE_PASSWORD,initial_device_display_name:"tessera-prune"}' \
+        '{type:"m.login.password",identifier:{type:"m.id.user",user:env.PRUNE_USER},password:env.PRUNE_PASSWORD,initial_device_display_name:"twicecat-prune"}' \
         | curl -sf -X POST "$api/login" -H 'Content-Type: application/json' -d @- \
         | jq -r .access_token)
     printf 'Authorization: Bearer %s\n' "$token" >"$work/auth"
     cutoff=$((($(date +%s) - 3600) * 1000))
     curl -sf "$api/devices" -H @"$work/auth" \
         | jq -r --argjson cutoff "$cutoff" '.devices[]
-            | select(.display_name == "Tessera" or .display_name == "tessera-test-setup"
-                     or .display_name == "tessera-prune")
+            | select(.display_name == "Twicecat" or .display_name == "twicecat-test-setup"
+                     or .display_name == "twicecat-prune")
             | select((.last_seen_ts // 0) < $cutoff)
             | .device_id' >"$work/devices"
     count=$(wc -l <"$work/devices")

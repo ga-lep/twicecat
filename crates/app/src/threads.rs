@@ -17,7 +17,7 @@ use std::fmt;
 
 use iced::Task;
 use iced::widget::{operation, scrollable};
-use tessera_core::api::{
+use twicecat_core::api::{
     Command, CoreEvent, EventId, ListDiff, MessageKind, MessageText, OutgoingMessage,
     PaginationState, RoomId, TextFormat, ThreadSummaryView, TimelineItem,
 };
@@ -338,7 +338,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tessera_core::api::UserId;
+    use twicecat_core::api::UserId;
 
     fn summary(replies: u32, name: Option<&str>, preview: Option<&str>) -> ThreadSummaryView {
         ThreadSummaryView {

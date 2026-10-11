@@ -162,7 +162,7 @@ pub(crate) fn open(
     let counters = counters.clone();
     let events = events.clone();
     let thread = std::thread::Builder::new()
-        .name("tessera-pw-streams".into())
+        .name("twicecat-pw-streams".into())
         .spawn(move || {
             let rings = Rings {
                 capture: capture_ring,
@@ -370,7 +370,7 @@ fn run(
                 let Some(ring) = rings.capture.take() else {
                     continue;
                 };
-                (Side::Capture(ring), "tessera-capture", Direction::Input)
+                (Side::Capture(ring), "twicecat-capture", Direction::Input)
             }
             StreamKind::SinkMonitor => {
                 let Some(ring) = rings.reference.take() else {
@@ -378,7 +378,7 @@ fn run(
                 };
                 (
                     Side::Capture(ring),
-                    "tessera-echo-reference",
+                    "twicecat-echo-reference",
                     Direction::Input,
                 )
             }
@@ -386,7 +386,7 @@ fn run(
                 let Some(ring) = rings.playback.take() else {
                     continue;
                 };
-                (Side::Playback(ring), "tessera-playback", Direction::Output)
+                (Side::Playback(ring), "twicecat-playback", Direction::Output)
             }
         };
         let opened = (|| {

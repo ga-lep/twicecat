@@ -26,11 +26,11 @@ mod check {
     //   leaf 0x8000_0001 ECX: LAHF 0, LZCNT 5 = 0x21;
     //   and XCR0 bits 1 and 2: the OS saves the SSE and AVX registers.
     std::arch::global_asm!(
-        ".pushsection .text.tessera_require_x86_64_v3,\"ax\",@progbits",
-        ".globl tessera_require_x86_64_v3",
-        ".hidden tessera_require_x86_64_v3",
-        ".type tessera_require_x86_64_v3,@function",
-        "tessera_require_x86_64_v3:",
+        ".pushsection .text.twicecat_require_x86_64_v3,\"ax\",@progbits",
+        ".globl twicecat_require_x86_64_v3",
+        ".hidden twicecat_require_x86_64_v3",
+        ".type twicecat_require_x86_64_v3,@function",
+        "twicecat_require_x86_64_v3:",
         "    push rbx",
         "    xor eax, eax",
         "    cpuid",
@@ -67,38 +67,38 @@ mod check {
         "2:",
         "    mov eax, 1",
         "    mov edi, 2",
-        "    lea rsi, [rip + .Ltessera_x86_64_v3_message]",
-        "    lea rdx, [rip + .Ltessera_x86_64_v3_message_end]",
+        "    lea rsi, [rip + .Ltwicecat_x86_64_v3_message]",
+        "    lea rdx, [rip + .Ltwicecat_x86_64_v3_message_end]",
         "    sub rdx, rsi",
         "    syscall",
         "    mov eax, 231",
         "    mov edi, 1",
         "    syscall",
         "    ud2",
-        ".size tessera_require_x86_64_v3, . - tessera_require_x86_64_v3",
+        ".size twicecat_require_x86_64_v3, . - twicecat_require_x86_64_v3",
         ".popsection",
-        ".pushsection .rodata.tessera_x86_64_v3_message,\"a\",@progbits",
-        ".Ltessera_x86_64_v3_message:",
-        ".ascii \"tessera: this build needs an x86-64-v3 processor (AVX2, FMA and BMI2: \"",
+        ".pushsection .rodata.twicecat_x86_64_v3_message,\"a\",@progbits",
+        ".Ltwicecat_x86_64_v3_message:",
+        ".ascii \"twicecat: this build needs an x86-64-v3 processor (AVX2, FMA and BMI2: \"",
         ".ascii \"Intel since Haswell, 2013; AMD since Excavator, 2015), \"",
         ".ascii \"and this one lacks part of it.\\n\"",
-        ".Ltessera_x86_64_v3_message_end:",
+        ".Ltwicecat_x86_64_v3_message_end:",
         ".popsection",
         ".pushsection .init_array,\"aw\",@init_array",
         ".balign 8",
-        ".quad tessera_require_x86_64_v3",
+        ".quad twicecat_require_x86_64_v3",
         ".popsection",
     );
 
     unsafe extern "C" {
-        fn tessera_require_x86_64_v3();
+        fn twicecat_require_x86_64_v3();
     }
 
     pub(super) fn require_cpu_level() {
         // SAFETY: the function above takes no arguments, keeps the
         // callee-saved registers (rbx is pushed and popped) and either
         // returns or ends the process.
-        unsafe { tessera_require_x86_64_v3() }
+        unsafe { twicecat_require_x86_64_v3() }
     }
 }
 

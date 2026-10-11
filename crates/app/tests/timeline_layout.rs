@@ -7,10 +7,10 @@ use iced::advanced::layout::{Limits, Node};
 use iced::advanced::renderer::Headless;
 use iced::advanced::widget::Tree;
 use iced::{Font, Pixels, Renderer, Size};
-use tessera_app::rich_text::Revealed;
-use tessera_app::screens::timeline_pane::{RichEnv, view_in};
-use tessera_app::timeline::{MAX_BUILT_ROWS, TimelineView};
-use tessera_core::api::{
+use twicecat_app::rich_text::Revealed;
+use twicecat_app::screens::timeline_pane::{RichEnv, view_in};
+use twicecat_app::timeline::{MAX_BUILT_ROWS, TimelineView};
+use twicecat_core::api::{
     ListDiff, MessageDetails, SendStatus, StateChange, TimelineItem, TimelineItemKind, UserId,
 };
 
@@ -70,7 +70,7 @@ fn content_node(view: &TimelineView, renderer: &Renderer) -> Node {
     content_node_with(
         view,
         renderer,
-        &tessera_app::media::MediaModel::default(),
+        &twicecat_app::media::MediaModel::default(),
         None,
     )
 }
@@ -78,12 +78,12 @@ fn content_node(view: &TimelineView, renderer: &Renderer) -> Node {
 fn content_node_with(
     view: &TimelineView,
     renderer: &Renderer,
-    media: &tessera_app::media::MediaModel,
-    room: Option<&tessera_core::api::RoomId>,
+    media: &twicecat_app::media::MediaModel,
+    room: Option<&twicecat_core::api::RoomId>,
 ) -> Node {
-    let theme = tessera_app::theme::theme_for(iced::theme::Mode::Light);
+    let theme = twicecat_app::theme::theme_for(iced::theme::Mode::Light);
     let revealed = Revealed::new();
-    let actions = tessera_app::actions::ActionState::default();
+    let actions = twicecat_app::actions::ActionState::default();
     let env = RichEnv {
         theme: &theme,
         own_user: None,
@@ -201,8 +201,8 @@ fn an_empty_timeline_has_only_two_empty_spacers() {
     assert!(node.bounds().height < 1.0);
 }
 
-fn media_message(id: &str, kind: tessera_core::api::MediaKind, w: u32, h: u32) -> TimelineItem {
-    let mut media = tessera_core::api::MediaContent::new(kind, "pic.png".to_owned());
+fn media_message(id: &str, kind: twicecat_core::api::MediaKind, w: u32, h: u32) -> TimelineItem {
+    let mut media = twicecat_core::api::MediaContent::new(kind, "pic.png".to_owned());
     media.width = Some(w);
     media.height = Some(h);
     TimelineItem::new(
@@ -232,7 +232,7 @@ fn row_heights(node: &Node) -> Vec<f32> {
 
 #[test]
 fn a_thumbnail_arriving_changes_no_laid_out_row_height() {
-    use tessera_core::api::{MediaKind, RoomId};
+    use twicecat_core::api::{MediaKind, RoomId};
     let renderer = renderer();
     let room = RoomId::from("!r:x");
     let mut view = TimelineView::default();
@@ -246,16 +246,16 @@ fn a_thumbnail_arriving_changes_no_laid_out_row_height() {
     }]);
     view.scrolled(0.0, HEIGHT, WIDTH);
 
-    let mut media = tessera_app::media::MediaModel::default();
+    let mut media = twicecat_app::media::MediaModel::default();
     let before = row_heights(&content_node_with(&view, &renderer, &media, Some(&room)));
     assert_eq!(before.len(), 4);
 
     // The estimate matches what the box lays out to, so the first measure
     // moves nothing either.
     for (i, height) in before.iter().enumerate() {
-        let estimate = tessera_app::timeline::estimate_height(
+        let estimate = twicecat_app::timeline::estimate_height(
             &view.items[i],
-            tessera_app::timeline::is_continuation(&view.items, i),
+            twicecat_app::timeline::is_continuation(&view.items, i),
             WIDTH,
         );
         assert!(
@@ -270,7 +270,7 @@ fn a_thumbnail_arriving_changes_no_laid_out_row_height() {
         assert!(media.needs_fetch(&key));
         let decoded = ok
             .then(|| {
-                tessera_app::media::decode_thumbnail(&{
+                twicecat_app::media::decode_thumbnail(&{
                     let img = image::RgbaImage::new(64, 36);
                     let mut out = std::io::Cursor::new(Vec::new());
                     img.write_to(&mut out, image::ImageFormat::Png)
@@ -288,8 +288,8 @@ fn a_thumbnail_arriving_changes_no_laid_out_row_height() {
 /// A file being uploaded: a local echo with progress.
 fn uploading(id: &str, sent: u64) -> TimelineItem {
     let mut media =
-        tessera_core::api::MediaContent::new(tessera_core::api::MediaKind::File, "f.bin".into());
-    media.upload = Some(tessera_core::api::UploadProgress { sent, total: 100 });
+        twicecat_core::api::MediaContent::new(twicecat_core::api::MediaKind::File, "f.bin".into());
+    media.upload = Some(twicecat_core::api::UploadProgress { sent, total: 100 });
     TimelineItem::new(
         id.to_owned(),
         TimelineItemKind::Message {
@@ -325,7 +325,12 @@ fn upload_progress_changes_no_laid_out_row_height() {
     let plain = {
         let mut view = TimelineView::default();
         view.apply_diffs(vec![ListDiff::Reset {
-            values: vec![media_message("p", tessera_core::api::MediaKind::File, 0, 0)],
+            values: vec![media_message(
+                "p",
+                twicecat_core::api::MediaKind::File,
+                0,
+                0,
+            )],
         }]);
         view.scrolled(0.0, HEIGHT, WIDTH);
         row_heights(&content_node(&view, &renderer))

@@ -1154,8 +1154,8 @@ mod tests {
     #[test]
     fn keywords_are_trimmed_and_bounded() {
         assert_eq!(
-            validate_keyword("  tessera  ", 0, false).as_deref(),
-            Ok("tessera")
+            validate_keyword("  twicecat  ", 0, false).as_deref(),
+            Ok("twicecat")
         );
         assert_eq!(validate_keyword("   ", 0, false), Err(KeywordError::Length));
         assert_eq!(validate_keyword("", 0, false), Err(KeywordError::Length));
@@ -1377,13 +1377,13 @@ mod tests {
     fn keywords_match_whole_words_without_regard_to_case() {
         let kw = |k: &[&str]| k.iter().map(|k| (*k).to_owned()).collect::<Vec<_>>();
         let table: [(&str, &[&str], bool); 9] = [
-            ("hello tessera-kw-ab", &["tessera-kw-ab"], true),
-            ("Hello TESSERA-KW-AB!", &["tessera-kw-ab"], true),
-            ("tessera-kw-ab", &["tessera-kw-ab"], true),
-            ("xtessera-kw-ab", &["tessera-kw-ab"], false),
-            ("tessera-kw-abc", &["tessera-kw-ab"], false),
-            ("a tessera-kw-ab_ b", &["tessera-kw-ab"], false),
-            ("nothing here", &["tessera-kw-ab"], false),
+            ("hello twicecat-kw-ab", &["twicecat-kw-ab"], true),
+            ("Hello TWICECAT-KW-AB!", &["twicecat-kw-ab"], true),
+            ("twicecat-kw-ab", &["twicecat-kw-ab"], true),
+            ("xtwicecat-kw-ab", &["twicecat-kw-ab"], false),
+            ("twicecat-kw-abc", &["twicecat-kw-ab"], false),
+            ("a twicecat-kw-ab_ b", &["twicecat-kw-ab"], false),
+            ("nothing here", &["twicecat-kw-ab"], false),
             ("anything", &[], false),
             ("blank", &[""], false),
         ];
@@ -1394,12 +1394,12 @@ mod tests {
 
     #[test]
     fn a_keyword_in_a_text_message_is_a_highlight() {
-        let json = message("see you at Tessera-KW-1 soon", json!({}));
-        let kw = ["tessera-kw-1".to_owned()];
+        let json = message("see you at Twicecat-KW-1 soon", json!({}));
+        let kw = ["twicecat-kw-1".to_owned()];
         assert!(parse_event(&json, false, ME, &kw).unwrap().highlight);
         assert!(!parse_event(&json, false, ME, &[]).unwrap().highlight);
         // The match is on the whole body, also past the preview.
-        let long = format!("{} tessera-kw-1", "x ".repeat(400));
+        let long = format!("{} twicecat-kw-1", "x ".repeat(400));
         let json = message(&long, json!({}));
         assert!(parse_event(&json, false, ME, &kw).unwrap().highlight);
     }

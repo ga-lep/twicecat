@@ -16,7 +16,7 @@ use iced::Size;
 use iced::widget::image::Handle;
 use image::metadata::Orientation;
 use image::{DynamicImage, ImageDecoder as _, ImageFormat, ImageReader, Limits, RgbaImage};
-use tessera_core::api::{MediaContent, MediaKind, RoomId};
+use twicecat_core::api::{MediaContent, MediaKind, RoomId};
 
 use crate::text_safety;
 
@@ -44,7 +44,7 @@ pub const THUMB_BUDGET: usize = 64 * 1024 * 1024;
 /// image never changes the height of its row.
 ///
 /// ```
-/// use tessera_app::media::media_box;
+/// use twicecat_app::media::media_box;
 /// assert_eq!(media_box(Some(800), Some(300)).width, 400.0);
 /// assert_eq!(media_box(None, None).height, 180.0);
 /// ```
@@ -625,7 +625,7 @@ pub fn type_label(media: &MediaContent) -> String {
 /// A size such as "1.5 MB" (decimal units), or "unknown size".
 ///
 /// ```
-/// use tessera_app::media::size_label;
+/// use twicecat_app::media::size_label;
 /// assert_eq!(size_label(Some(1_500_000)), "1.5 MB");
 /// assert_eq!(size_label(Some(999)), "999 B");
 /// assert_eq!(size_label(None), "unknown size");
@@ -742,7 +742,7 @@ const RUNS_CODE_EXTENSIONS: &[&str] = &[
 /// the confirmation; the bar warns about it.
 ///
 /// ```
-/// use tessera_app::media::may_run_code;
+/// use twicecat_app::media::may_run_code;
 /// assert!(may_run_code("setup.EXE"));
 /// assert!(may_run_code("README"));
 /// assert!(!may_run_code("photo.png"));
@@ -768,7 +768,7 @@ pub fn may_run_code(name: &str) -> bool {
 /// keeps the sender's name from steering it.
 ///
 /// ```
-/// use tessera_app::media::suggested_file_name;
+/// use twicecat_app::media::suggested_file_name;
 /// assert_eq!(suggested_file_name("../../etc/passwd"), "etcpasswd");
 /// assert_eq!(suggested_file_name(""), "download");
 /// ```

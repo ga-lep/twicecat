@@ -18,11 +18,11 @@ use common::{
 use matrix_sdk::ruma::api::client::state::get_state_event_for_key;
 use matrix_sdk::ruma::events::StateEventType;
 use serde_json::Value;
-use tessera_core::CoreHandle;
-use tessera_core::api::{
+use twicecat_core::CoreHandle;
+use twicecat_core::api::{
     CallEndReason, CallIntent, CallState, Command, CoreEvent, ListDiff, Participant, RoomId,
 };
-use tessera_core::secrets::InMemorySecretStore;
+use twicecat_core::secrets::InMemorySecretStore;
 
 const MEMBER_EVENT: &str = "org.matrix.msc3401.call.member";
 
@@ -32,7 +32,7 @@ async fn logged_in_core(dir: &std::path::Path, n: u8) -> (CoreHandle, String) {
     core.commands
         .send(Command::LoginPassword {
             username: env.user(n).to_owned(),
-            password: tessera_core::api::Password::from(env.password(n)),
+            password: twicecat_core::api::Password::from(env.password(n)),
             server: None,
         })
         .await
@@ -44,7 +44,7 @@ async fn logged_in_core(dir: &std::path::Path, n: u8) -> (CoreHandle, String) {
     expect_event(&mut core, |e| {
         matches!(
             e,
-            CoreEvent::SyncState(tessera_core::api::SyncState::Running)
+            CoreEvent::SyncState(twicecat_core::api::SyncState::Running)
         )
     })
     .await;

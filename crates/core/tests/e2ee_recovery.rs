@@ -17,13 +17,13 @@ use common::{
     raw_login_named, reset_e2ee_account, seed_recovery, start_core, try_pump_with,
 };
 use matrix_sdk::ruma::api::client::backup::get_latest_backup_info;
-use tessera_core::CoreHandle;
-use tessera_core::api::{
+use twicecat_core::CoreHandle;
+use twicecat_core::api::{
     ActionKind, Command, CoreError, CoreEvent, CrossSigning, DeviceVerification, ListDiff,
     Password, PlaceholderKind, RecoveryKey, RecoveryStatus, RoomId, SecurityStatus, Shield,
     ShieldCode, TimelineItem, TimelineItemKind, UtdReason,
 };
-use tessera_core::secrets::InMemorySecretStore;
+use twicecat_core::secrets::InMemorySecretStore;
 
 const BACKUP_EXISTS: &str = "a key backup already exists; enter your recovery key";
 const WRONG_KEY: &str = "that recovery key or passphrase is not correct";
@@ -145,7 +145,7 @@ fn restored(s: &SecurityStatus) -> bool {
 /// The version of the backup on the server for test user `n`, and whether
 /// secret storage is on, as a fresh raw client sees them.
 async fn server_backup(n: u8) -> (Option<String>, bool) {
-    let client = raw_login_named(n, "tessera-e2ee-view").await;
+    let client = raw_login_named(n, "twicecat-e2ee-view").await;
     client
         .encryption()
         .wait_for_e2ee_initialization_tasks()
@@ -447,7 +447,7 @@ async fn a_backup_this_device_is_not_connected_to_is_never_replaced() {
     // own check answers, and the core maps it to the same message.
     let _serial = e2ee_serial().await;
     reset_e2ee_account(1).await;
-    let raw = raw_login_named(1, "tessera-e2ee-backup").await;
+    let raw = raw_login_named(1, "twicecat-e2ee-backup").await;
     raw.encryption().wait_for_e2ee_initialization_tasks().await;
     raw.encryption()
         .recovery()

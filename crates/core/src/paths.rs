@@ -72,7 +72,7 @@ fn read_capped_regular_file(path: &Path) -> Option<Vec<u8>> {
     (bytes.len() as u64 <= MAX_SETTINGS_BYTES).then_some(bytes)
 }
 
-/// Root of all Tessera data on disk.
+/// Root of all Twicecat data on disk.
 #[derive(Debug, Clone)]
 pub struct DataPaths {
     root: PathBuf,
@@ -81,7 +81,7 @@ pub struct DataPaths {
 impl DataPaths {
     /// Uses the OS data directory; `None` if it cannot be determined.
     pub fn from_os() -> Option<Self> {
-        let dirs = directories::ProjectDirs::from("io.github", "ga_lep", "Tessera")?;
+        let dirs = directories::ProjectDirs::from("io.github", "ga_lep", "Twicecat")?;
         Some(Self::at(dirs.data_dir()))
     }
 

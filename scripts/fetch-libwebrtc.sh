@@ -9,7 +9,7 @@
 # Usage: scripts/fetch-libwebrtc.sh [triple]
 #   triple: linux-x64 | linux-arm64 | mac-x64 | mac-arm64 | win-x64 | win-arm64
 #           (default: the host)
-# Env: TESSERA_WEBRTC_CACHE overrides the cache root.
+# Env: TWICECAT_WEBRTC_CACHE overrides the cache root.
 # Progress goes to stderr; stdout carries only the path.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -63,7 +63,7 @@ tool() {
 # Linked statically next to libpipewire (cpal's PipeWire backend), they take
 # the place of libpipewire's functions, and pw_init jumps to address 0.
 # Renaming them, and the calls to them inside the archive, to
-# tessera_webrtc_pw_* keeps webrtc's capture working and frees the pw_* names.
+# twicecat_webrtc_pw_* keeps webrtc's capture working and frees the pw_* names.
 # Checked by symbols, not by a pinned SHA-256: the patched bytes depend on the
 # objcopy version, while the input zip is pinned above.
 rename_pw_stubs() {
@@ -72,7 +72,7 @@ rename_pw_stubs() {
     objcopy=$(tool objcopy)
     map=$(mktemp)
     "$nm" -A "$archive" 2>/dev/null |
-        awk '$1 ~ /pipewire_stubs\.o:/ && $(NF-1) == "W" && $NF ~ /^pw_/ { print $NF, "tessera_webrtc_" $NF }' |
+        awk '$1 ~ /pipewire_stubs\.o:/ && $(NF-1) == "W" && $NF ~ /^pw_/ { print $NF, "twicecat_webrtc_" $NF }' |
         sort -u >"$map"
     renamed=$(wc -l <"$map")
     if [ "$renamed" -gt 0 ]; then
@@ -84,7 +84,7 @@ rename_pw_stubs() {
     left=$("$nm" -A "$archive" 2>/dev/null | awk '$(NF-1) ~ /^[A-Z]$/ && $NF ~ /^pw_/' | wc -l)
     [ "$left" -eq 0 ] || die "$left global pw_* symbols left in $archive after renaming"
     stubs=$("$nm" -A "$archive" 2>/dev/null |
-        awk '$1 ~ /pipewire_stubs\.o:/ && $(NF-1) == "W" && $NF ~ /^tessera_webrtc_pw_/' | wc -l)
+        awk '$1 ~ /pipewire_stubs\.o:/ && $(NF-1) == "W" && $NF ~ /^twicecat_webrtc_pw_/' | wc -l)
     [ "$stubs" -gt 0 ] || die "no pw_* stubs found in $archive (unexpected libwebrtc layout)"
     echo "pw_* stubs renamed in $(basename "$archive"): $stubs (this run: $renamed)" >&2
 }
@@ -111,7 +111,7 @@ expected=$(awk -v f="$zip" '$2 == f {print $1}' "$sums")
 [ -n "$expected" ] || die "no pinned SHA-256 for $zip in $sums"
 [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || die "malformed SHA-256 for $zip in $sums"
 
-cache_root="${TESSERA_WEBRTC_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/tessera/libwebrtc}"
+cache_root="${TWICECAT_WEBRTC_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/twicecat/libwebrtc}"
 dest="$cache_root/$tag/$triple"
 lib_dir="$dest/${triple}-release"
 marker="$dest/.verified"

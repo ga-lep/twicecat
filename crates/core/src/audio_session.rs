@@ -5,13 +5,13 @@
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use tessera_audio::{
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
+use twicecat_audio::{
     AudioIo, ChainSettings, DeepFilter, DeepFilterStatus, Frame, GateMode, IoConfig, IoEvent,
     NoiseMode, NsLevel as AudioNsLevel, Outgoing, Realtime, VirtualDevice, VoiceControl,
     VoiceEngine,
 };
-use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinHandle;
 
 use crate::api::{
     AudioBackend, AudioSettings, AudioStats, CoreError, CoreEvent, EnhancerBackend, GpuBackend,
@@ -80,7 +80,7 @@ pub(crate) fn io_config(settings: &AudioSettings, playback: bool) -> IoConfig {
     }
 }
 
-fn audio_error(e: tessera_audio::AudioError) -> CoreError {
+fn audio_error(e: twicecat_audio::AudioError) -> CoreError {
     // The audio crate's messages are fixed text (no user data).
     CoreError::Audio(e.to_string())
 }
@@ -254,7 +254,7 @@ impl AudioSession {
         let events = self.events.clone();
         tokio::spawn(async move {
             let loaded = tokio::task::spawn_blocking(move || {
-                let dir = tessera_audio::default_model_dir().ok_or(None::<String>)?;
+                let dir = twicecat_audio::default_model_dir().ok_or(None::<String>)?;
                 if gpu {
                     match gpu_enhancement::load(&dir, attenuation_limit_db) {
                         Ok((filter, backend)) => return Ok((filter, backend, None)),
@@ -411,7 +411,7 @@ async fn report(
     let mut ticker = tokio::time::interval(LEVEL_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut ticks = 0_u32;
-    let mut scratch = tessera_audio::SILENCE;
+    let mut scratch = twicecat_audio::SILENCE;
     let mut last_io = io.stats();
     loop {
         tokio::select! {

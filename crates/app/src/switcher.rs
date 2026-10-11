@@ -9,7 +9,7 @@
 use std::fmt;
 
 use iced::Task;
-use tessera_core::api::{RoomId, RoomListQuery, RoomListTab, RoomSummary};
+use twicecat_core::api::{RoomId, RoomListQuery, RoomListTab, RoomSummary};
 
 use crate::state::{App, Message, Screen};
 

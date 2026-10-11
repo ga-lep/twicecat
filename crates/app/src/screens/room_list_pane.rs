@@ -8,7 +8,7 @@
 use iced::widget::text::Wrapping;
 use iced::widget::{button, column, container, image, row, scrollable, space, text, text_input};
 use iced::{Background, Color, Element, Fill, Length, border};
-use tessera_core::api::{RoomListTab, RoomNotificationModeView, RoomSummary};
+use twicecat_core::api::{RoomListTab, RoomNotificationModeView, RoomSummary};
 
 use crate::avatars::{AvatarState, Avatars, NEUTRAL_INITIALS, initials, placeholder_color};
 use crate::notifications::muted_mark;
@@ -62,7 +62,7 @@ pub fn tab_label(tab: RoomListTab) -> &'static str {
 /// A badge count as text: `99+` above 99.
 ///
 /// ```
-/// use tessera_app::screens::room_list_pane::count_label;
+/// use twicecat_app::screens::room_list_pane::count_label;
 /// assert_eq!(count_label(7), "7");
 /// assert_eq!(count_label(100), "99+");
 /// ```
@@ -325,7 +325,7 @@ mod tests {
 
     #[test]
     fn only_a_room_known_to_be_encrypted_has_a_lock() {
-        let mut room = RoomSummary::new(tessera_core::api::RoomId::from("!r:x"), "r".to_owned());
+        let mut room = RoomSummary::new(twicecat_core::api::RoomId::from("!r:x"), "r".to_owned());
         assert_eq!(encrypted_mark(&room), None);
         room.is_encrypted = true;
         assert_eq!(encrypted_mark(&room), Some(LOCK_MARK));
@@ -333,7 +333,7 @@ mod tests {
 
     #[test]
     fn rows_build_in_every_notification_mode() {
-        let mut room = RoomSummary::new(tessera_core::api::RoomId::from("!r:x"), "r".to_owned());
+        let mut room = RoomSummary::new(twicecat_core::api::RoomId::from("!r:x"), "r".to_owned());
         room.unread_notifications = 3;
         let avatars = Avatars::default();
         for mode in [
@@ -365,7 +365,7 @@ mod tests {
 
     #[test]
     fn avatar_views_build_for_every_state() {
-        use tessera_core::api::{AvatarId, AvatarImage, RoomId};
+        use twicecat_core::api::{AvatarId, AvatarImage, RoomId};
 
         let mut avatars = Avatars::default();
         let id = AvatarId::from("mxc://x/a");

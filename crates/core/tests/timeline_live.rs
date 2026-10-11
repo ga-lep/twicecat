@@ -11,12 +11,12 @@ use std::time::Duration;
 
 use common::{TestEnv, create_room, expect_event, raw_login, send_text, start_core};
 use common::{set_display_name, unique_room_name};
-use tessera_core::CoreHandle;
-use tessera_core::api::{
+use twicecat_core::CoreHandle;
+use twicecat_core::api::{
     Command, CoreEvent, ListDiff, PaginationState, Password, RoomId, RoomSummary, SyncState,
     TimelineItem, TimelineItemKind,
 };
-use tessera_core::secrets::InMemorySecretStore;
+use twicecat_core::secrets::InMemorySecretStore;
 
 async fn login_and_run(core: &mut CoreHandle, env: &TestEnv, n: u8) {
     core.commands
@@ -347,7 +347,7 @@ async fn typing_notices_reach_the_other_user() {
 #[tokio::test]
 #[ignore = "needs local homeserver: docker compose up -d --wait"]
 async fn a_draft_is_kept_per_room_and_cleared_on_request() {
-    use tessera_core::api::{Draft, MentionRef, UserId};
+    use twicecat_core::api::{Draft, MentionRef, UserId};
 
     let env = TestEnv::load();
     let alice_raw = raw_login(1).await;
@@ -389,7 +389,7 @@ async fn a_draft_is_kept_per_room_and_cleared_on_request() {
         .unwrap();
 
     let draft = Draft {
-        text: tessera_core::api::MessageText::from("half a thought for @Carol"),
+        text: twicecat_core::api::MessageText::from("half a thought for @Carol"),
         mentions: vec![MentionRef {
             label: "@Carol".into(),
             user_id: UserId::from(env.user_id(3)),

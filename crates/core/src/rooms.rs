@@ -803,9 +803,9 @@ mod tests {
             };
             create_room_request(&f)
         };
-        let r = public("tessera-1a.b_c=d").unwrap();
+        let r = public("twicecat-1a.b_c=d").unwrap();
         assert_eq!(r.preset, Some(create_room::v3::RoomPreset::PublicChat));
-        assert_eq!(r.room_alias_name.as_deref(), Some("tessera-1a.b_c=d"));
+        assert_eq!(r.room_alias_name.as_deref(), Some("twicecat-1a.b_c=d"));
         for bad in [
             "",
             "Upper",

@@ -7,7 +7,7 @@
 
 use iced::theme::{Mode, Palette};
 use iced::{Color, Theme, color};
-use tessera_core::api::ThemeChoice;
+use twicecat_core::api::ThemeChoice;
 
 /// Palette of the light theme.
 pub const LIGHT: Palette = Palette {
@@ -30,9 +30,9 @@ pub const DARK: Palette = Palette {
 };
 
 /// Name of the light theme.
-pub const LIGHT_NAME: &str = "Tessera Light";
+pub const LIGHT_NAME: &str = "Twicecat Light";
 /// Name of the dark theme.
-pub const DARK_NAME: &str = "Tessera Dark";
+pub const DARK_NAME: &str = "Twicecat Dark";
 
 /// Colours the screens use beyond the stock palette.
 #[derive(Debug, Clone, Copy, PartialEq)]

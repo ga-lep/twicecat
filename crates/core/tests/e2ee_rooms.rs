@@ -14,7 +14,7 @@ use common::{
 use matrix_sdk::Client;
 use matrix_sdk::ruma::api::client::state::get_state_events;
 use matrix_sdk::ruma::serde::Raw;
-use tessera_core::api::{Block, Command, Inline, Shield, ShieldCode, TimelineItemKind};
+use twicecat_core::api::{Block, Command, Inline, Shield, ShieldCode, TimelineItemKind};
 
 /// What a fresh raw client (no encryption settings) sees for an account.
 struct View {
@@ -28,7 +28,7 @@ struct View {
 /// Logs a fresh raw client in as test user `n` and reads the account's crypto
 /// state. The caller logs the client out.
 async fn fresh_view(n: u8) -> (Client, View) {
-    let client = raw_login_named(n, "tessera-e2ee-view").await;
+    let client = raw_login_named(n, "twicecat-e2ee-view").await;
     client
         .encryption()
         .wait_for_e2ee_initialization_tasks()
@@ -136,8 +136,8 @@ async fn encrypted_room_state_is_readable_by_the_invitee() {
     reset_e2ee_account(1).await;
     reset_e2ee_account(3).await;
     let env = TestEnv::load();
-    let alice = raw_login_named(1, "tessera-e2ee-room").await;
-    let carol = raw_login_named(3, "tessera-e2ee-room").await;
+    let alice = raw_login_named(1, "twicecat-e2ee-room").await;
+    let carol = raw_login_named(3, "twicecat-e2ee-room").await;
     let room_id =
         create_encrypted_room(&alice, &common::unique_room_name(), Some(&env.user_id(3))).await;
     carol
@@ -231,7 +231,7 @@ async fn encrypted_dm_works_both_ways() {
         let r = room_summary.iter().find(|r| r.id.as_str() == room).unwrap();
         assert!(r.is_encrypted, "the room is not reported as encrypted");
     }
-    let checker = raw_login_named(3, "tessera-e2ee-check").await;
+    let checker = raw_login_named(3, "twicecat-e2ee-check").await;
     for id in [carol_event, alice_event] {
         let id: matrix_sdk::ruma::OwnedEventId = id.as_str().try_into().expect("event id");
         assert_eq!(

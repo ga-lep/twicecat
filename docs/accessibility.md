@@ -1,6 +1,6 @@
 # Accessibility
 
-What Tessera does for keyboard use, contrast and assistive technology in
+What Twicecat does for keyboard use, contrast and assistive technology in
 Phase 5, and what it does not do yet. Checked against iced 0.14.0 (pinned).
 
 ## Keyboard map
@@ -42,7 +42,7 @@ Rules the code follows (all in tests):
 
 ## Screen readers: not supported
 
-Tessera cannot be used with a screen reader. iced 0.14 has no accessibility
+Twicecat cannot be used with a screen reader. iced 0.14 has no accessibility
 tree: there is no AccessKit integration in `iced`, `iced_core`, `iced_winit`
 or `iced_widget` (a search of the pinned sources for "accesskit" finds
 nothing), so no widget exposes a role, a name or a state to AT-SPI, and the
@@ -51,7 +51,7 @@ window shows up as one unnamed surface.
 What to watch: the iced project's accessibility work (AccessKit support).
 Re-check at every iced upgrade (search the new sources for `accesskit`, read
 the release notes) and record the result in `PROGRESS.md`. Until it lands the
-keyboard map and the contrast rules below are all Tessera offers.
+keyboard map and the contrast rules below are all Twicecat offers.
 
 ## Drag and drop on Wayland
 

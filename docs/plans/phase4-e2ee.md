@@ -8,7 +8,7 @@ The core (behind the additive command/event API, Phase 2 Q6 convention) gains:
 - **Encrypted rooms:** the client is built with explicit encryption settings (Q4). Rooms report whether they are encrypted. Messages carry an authenticity shield. Undecryptable messages carry a reason, and they turn into normal messages in place (same item ID) once their keys arrive.
 - **Recovery (key backup + secret storage):** the core reports `Recovery::state()`. It can set recovery up (the new recovery key goes to the app once and is never stored), restore with a key or passphrase (`recover()`), and change the key.
 - **Cross-signing:** bootstrapped on login (Q4). If that fails, it can be bootstrapped or reset on request, with re-authentication (password UIA, or the OAuth approval URL).
-- **Interactive verification:** incoming and outgoing requests, for this account's own devices and for other users. SAS with the 7 emoji (decimals as a fallback), confirm, mismatch and cancel. **QR display (Q3):** when the other device can scan, Tessera shows a QR code for it to scan, then asks the user to confirm the scan. Tessera cannot scan codes.
+- **Interactive verification:** incoming and outgoing requests, for this account's own devices and for other users. SAS with the 7 emoji (decimals as a fallback), confirm, mismatch and cancel. **QR display (Q3):** when the other device can scan, Twicecat shows a QR code for it to scan, then asks the user to confirm the scan. Twicecat cannot scan codes.
 - **Trust badges:** a verified/unverified state for devices and for the peer of a DM, updated live.
 - **Session management:** list the account's devices with their trust, rename one, sign out others (re-authentication), verify one.
 - **Security review:** a log-capture test and a data-at-rest scan show that no token, store passphrase, recovery key or message body reaches the logs or the disk in clear. The PROGRESS.md security review records the residual risks.
@@ -21,7 +21,7 @@ The app gains:
 - reason-specific UTD placeholders;
 - a Sessions screen with a re-authentication prompt.
 
-Rendering, the recovery-key wording, scanning Tessera's QR code with a phone, and real-device interop (Element X on a phone, a matrix.org OAuth account) stay on the human checkpoint (rule 9).
+Rendering, the recovery-key wording, scanning Twicecat's QR code with a phone, and real-device interop (Element X on a phone, a matrix.org OAuth account) stay on the human checkpoint (rule 9).
 
 E2EE integration tests use only the `.env.test` accounts (Q2): alice and carol, reset to a known server-side crypto baseline at the start of every test and serialized within each test binary. bob stays untouched by them.
 
@@ -37,14 +37,14 @@ E2EE integration tests use only the `.env.test` accounts (Q2): alice and carol, 
 Registry root: `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/`. Each implementing task re-confirms the APIs it uses (AGENTS.md rule 2) and cites file:line in PROGRESS.md. No code was compiled for this plan except two lock probes (Q3), which ran in scratch copies of the workspace in the session scratchpad, not in the repo.
 
 **Features (matrix-sdk 0.19.1, Cargo.toml `[features]`)**
-- `e2e-encryption` is in `default` and is on for `tessera-core` (`cargo tree -e features -i matrix-sdk` lists `default`, `e2e-encryption`, `automatic-room-key-forwarding`, `sqlite`, `bundled-sqlite`, `local-server`, `markdown`, `rustls-aws-lc-rs`).
+- `e2e-encryption` is in `default` and is on for `twicecat-core` (`cargo tree -e features -i matrix-sdk` lists `default`, `e2e-encryption`, `automatic-room-key-forwarding`, `sqlite`, `bundled-sqlite`, `local-server`, `markdown`, `rustls-aws-lc-rs`).
 - `qrcode` is **off**. It is `["e2e-encryption", "matrix-sdk-base/qrcode"]` (Cargo.toml:121-123) and pulls `matrix-sdk-qrcode` (not in Cargo.lock today).
 - Lock probes (sorted name/version diff of Cargo.lock, before vs after):
   - matrix-sdk `qrcode` **alone** adds exactly 2 packages: matrix-sdk-qrcode 0.19.1 and qrcode 0.14.1. No existing version changes.
   - matrix-sdk `qrcode` **plus** iced `qr_code` adds 9: the two above plus qrcode 0.13.0 (a second version), lyon 1.0.19, lyon_algorithms 1.0.21, lyon_geom 1.0.19, lyon_path 1.0.19, lyon_tessellation 1.0.22, float_next_after 1.0.0 (iced_widget `qr_code = ["canvas", "dep:qrcode"]`, qrcode `0.13`, iced_widget 0.14.2 Cargo.toml:52-55/:84-86).
 
 **QR verification (matrix-sdk `src/encryption/verification/`, matrix-sdk-crypto, matrix-sdk-qrcode)**
-- With `qrcode` on, the SDK's default methods are `SasV1`, `QrCodeShowV1`, `ReciprocateV1` (matrix-sdk-crypto verification/requests.rs:60-65). `QrCodeScanV1` is **not** advertised, which matches "Tessera shows, cannot scan". `accept()` and `request_verification()` use that list (requests.rs:236/:270/:546).
+- With `qrcode` on, the SDK's default methods are `SasV1`, `QrCodeShowV1`, `ReciprocateV1` (matrix-sdk-crypto verification/requests.rs:60-65). `QrCodeScanV1` is **not** advertised, which matches "Twicecat shows, cannot scan". `accept()` and `request_verification()` use that list (requests.rs:236/:270/:546).
 - `VerificationRequest::generate_qr_code() -> Result<Option<QrVerification>>` (matrix-sdk requests.rs:172). It returns `None` unless we advertise `QrCodeShowV1` and the other side advertises `QrCodeScanV1` (crypto requests.rs:1224-1228). Works in `Ready` and `Transitioned` (crypto requests.rs:983-995) and moves the request to `Transitioned`. For the own identity it builds `new_self` when we can sign devices, else `new_self_no_master` (a new, unverified device); for another user, `new_cross` (crypto requests.rs:1230-1290).
 - `VerificationRequest::start_sas()` also works from `Transitioned` (crypto requests.rs:850-877), so "compare emoji instead" is possible while a QR code is shown.
 - `QrVerification` (matrix-sdk verification/qrcode.rs): `to_qr_code() -> Result<QrCode, EncodingError>` :85, `to_bytes` :94, `confirm()` (confirm the other side scanned our code) :99, `cancel` :108, `has_been_scanned` :48, `changes()` :210, `state()` :218, `other_device` :70, `cancel_info` :59. Re-exports (verification/mod.rs:42-48): `QrVerificationState`, `QrVerificationData`, `EncodingError`; `Verification::QrV1` :61.
@@ -78,8 +78,8 @@ Registry root: `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/`. Each i
   - bootstraps cross-signing when `auto_enable_cross_signing` is set, passing the login password as UIA (`AuthData::Password`, :801-813; `None` on restore and for OAuth);
   - calls `backups().setup_and_resume()` and `recovery().setup()`, which auto-creates a backup when `should_auto_enable_backups` holds (recovery/mod.rs:601-632).
 - `bootstrap_cross_signing_if_needed` (mod.rs:1696-1711) bootstraps only when **the server knows no identity** for the user (after the initial key query). An existing identity is never replaced by a login.
-- **Today's `build_client` (crates/core/src/client.rs:189-215) sets no encryption settings.** So no Tessera login has ever bootstrapped cross-signing or created a backup.
-- `ClientBuilder::sqlite_store(path, passphrase)` :301. `build_store_config` (:790-825) opens the state, event cache, media **and crypto** SQLite stores all with that passphrase. Tessera passes its keychain-held 64-hex passphrase (client.rs:209, session.rs:86/:192).
+- **Today's `build_client` (crates/core/src/client.rs:189-215) sets no encryption settings.** So no Twicecat login has ever bootstrapped cross-signing or created a backup.
+- `ClientBuilder::sqlite_store(path, passphrase)` :301. `build_store_config` (:790-825) opens the state, event cache, media **and crypto** SQLite stores all with that passphrase. Twicecat passes its keychain-held 64-hex passphrase (client.rs:209, session.rs:86/:192).
 
 **Cross-signing and identities (encryption/mod.rs, identities/)**
 - `Encryption` methods:
@@ -158,7 +158,7 @@ Registry root: `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/`. Each i
 - `RoomSummary` has no encryption flag.
 - `CoreEvent`/`Command` have no security variants.
 - Tokens and the store passphrase live only in the keychain `SessionRecord` (session.rs:76-110, redacted `Debug`). The `last_account` file (paths.rs:108) holds the user ID in clear.
-- Logging: `DEFAULT_FILTER = "warn,tessera_core=info"` (logging.rs:11).
+- Logging: `DEFAULT_FILTER = "warn,twicecat_core=info"` (logging.rs:11).
 - Engine: `handle` processes commands one at a time (engine.rs:821). Network work belongs in spawned tasks (Phase 3 Q9).
 
 **No rule-8 blocker.** Every API the roadmap names exists in the pinned versions: `recovery().state()`, `recover()`, interactive SAS, QR display (with the `qrcode` feature), cross-signing bootstrap, device listing, rename and delete.
@@ -169,13 +169,13 @@ Registry root: `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/`. Each i
    - **The problem.** Encryption state is per account and lives on the server (cross-signing identity, backup versions, secret storage). An identity can never be deleted. Reused naively, "set up recovery" fails with `BackupExistsOnServer` from the second run on, parallel tests race each other's resets, and leftover devices pile up.
    - **Accounts.** alice is user A (own-account flows, several devices = several cores with their own data directories). carol is user B (the other side of DMs and user verification). bob is not used by any Phase 4 test, so the login device-count test and the room-list test are unaffected. Two accounts cover every planned test, so **no new account and no change to `.env.test` or `create-test-users.sh`**. The app's headless E2EE test uses carol, because the existing bridge tests use alice.
    - **Baseline reset, `reset_e2ee_account(n)`** in `tests/common/mod.rs`, run at the start of every E2EE test for every account the test uses. It uses a raw SDK client built **without** encryption settings (so nothing runs automatically):
-     1. `assert_local_homeserver`, then log in as device "tessera-e2ee-reset" and `wait_for_e2ee_initialization_tasks()`;
+     1. `assert_local_homeserver`, then log in as device "twicecat-e2ee-reset" and `wait_for_e2ee_initialization_tasks()`;
      2. sign out every other device of the account: `delete_devices(others, None)`, then once more with `uiaa::Password` and the UIA session from `as_uiaa_response`. This removes the devices left by `raw_login`, earlier cores and earlier failed runs;
      3. `recovery().reset_identity()` and, on `Uiaa`, `reset(Some(password))`. This deletes every backup version on the server, turns 4S off and replaces the cross-signing identity. With auto backups off on this client, no new backup is created;
      4. assert the postconditions on the same client: `backups().fetch_exists_on_server() == false`, `secret_storage().is_enabled() == false`, exactly one device, an own identity exists;
      5. `logout()`, so the reset device is gone.
 
-     **Baseline B0:** a fresh identity whose private keys nobody holds, no backup, 4S off, no devices. A Tessera core that logs in on B0 is an unverified device (`cross_signing: MissingKeys`, `device: Unverified`, `recovery: Disabled`); with Q4 settings it auto-creates a backup of its own.
+     **Baseline B0:** a fresh identity whose private keys nobody holds, no backup, 4S off, no devices. A Twicecat core that logs in on B0 is an unverified device (`cross_signing: MissingKeys`, `device: Unverified`, `recovery: Disabled`); with Q4 settings it auto-creates a backup of its own.
    - **Seeded recovery, `seed_recovery(n, passphrase: Option<&str>) -> Zeroizing<String>`:** steps 1-4, then, on the same raw client (which now holds the new identity's private keys), `recovery().enable()` (`with_passphrase` when given) and `logout()`. **Baseline B1** (the returning user): identity, 4S on with the returned key, a matching backup, no devices. A core on B1 is `Unverified`/`Incomplete` until `Recover { key }`.
    - **First device, `first_device(core, n)`** (from Task 4): log a core in on B0 and send `ResetIdentity { password: Some(..) }`, then wait for `Security { cross_signing: Complete, device: Verified, recovery: Disabled }`. The reset deletes every backup and, with Q4 settings, the SDK creates a fresh one enabled on this device. This is the closest reachable state to a brand-new account (identities can't be deleted), and it is exactly what the user's own "Reset your identity" does.
    - **No accidental `BackupExistsOnServer`.** Recovery is set up only on a `first_device` core, whose backup is enabled locally, so `enable()` skips the server check (futures.rs:90-97). One test hits the error **on purpose** (a core on B1 sends `EnableRecovery`) to prove the Q5 error mapping.
@@ -190,15 +190,15 @@ Registry root: `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/`. Each i
      - a Synapse admin-API reset (no endpoint deletes a cross-signing identity, and the raw-client reset is enough);
      - using bob as a third E2EE account (not needed; it would couple the E2EE resets to bob's device-count test).
 3. **Q3: QR display and dependencies (rule 3). ANSWERED: add QR display; matrix-sdk `qrcode` and iced `qr_code` approved (pins unchanged).**
-   - **Scope:** Tessera **shows** a QR code for the other device to scan. It never scans (no camera). When the other device doesn't advertise `QrCodeScanV1` (for example another Tessera), the flow is SAS as before.
-   - **matrix-sdk `qrcode`: enabled** in Task 7 (`crates/core/Cargo.toml`, `=0.19.1` unchanged). Lock: exactly matrix-sdk-qrcode 0.19.1 and qrcode 0.14.1 (measured). The SDK's default method list then becomes SAS + show QR + reciprocate (no scan), which is what Tessera wants, so no method list is hand-built.
+   - **Scope:** Twicecat **shows** a QR code for the other device to scan. It never scans (no camera). When the other device doesn't advertise `QrCodeScanV1` (for example another Twicecat), the flow is SAS as before.
+   - **matrix-sdk `qrcode`: enabled** in Task 7 (`crates/core/Cargo.toml`, `=0.19.1` unchanged). Lock: exactly matrix-sdk-qrcode 0.19.1 and qrcode 0.14.1 (measured). The SDK's default method list then becomes SAS + show QR + reciprocate (no scan), which is what Twicecat wants, so no method list is hand-built.
    - **iced `qr_code`: RECOMMENDED not to enable it (needs the human's confirmation).** Its `Data` only takes raw bytes and re-encodes them with qrcode 0.13's automatic segmenting, the form the SDK says mobile scanners have trouble with; it can't take the SDK's ready-made 45 x 45 grid. It would also add 7 more packages (a second qrcode version, lyon and canvas). Instead, the core sends the module grid (`QrImage`), and the app draws it with the already-enabled `image` widget: black modules on white with a 4-module quiet zone, scaled with nearest-neighbour filtering. If the human prefers the iced widget anyway, it would show a different, re-encoded code, and scanning by Element X would have to be proven on the checkpoint before relying on it.
    - **What crosses the API:** only the grid (`QrImage { size, dark }`), never the payload bytes. The grid encodes the flow's one-time shared secret, so its `Debug` prints the size only and it is never logged.
    - **Testing:** a unit test builds a code from spec bytes (`QrVerificationData::from_bytes` → `to_qr_code`) and checks the grid; an integration test proves the code is shown, and that "compare emoji instead" and cancel work, against a raw SDK client advertising `QrCodeScanV1`. The scan itself (camera) and the reciprocate/confirm round trip are proven on the human checkpoint with Element X (rule 9).
    - Rejected: a test-only QR decoder to automate the reciprocate step (a sizeable piece of test code with its own bugs, for a step that starts with a camera anyway); exposing the payload bytes for tests (puts the shared secret in the API).
 4. **Q4: encryption settings. ANSWERED (as recommended).** `build_client` adds `.with_encryption_settings(EncryptionSettings { auto_enable_cross_signing: true, auto_enable_backups: true, backup_download_strategy: AfterDecryptionFailure })`. This is the combination Element X uses: cross-signing on every login, a backup that starts collecting keys at once, and per-event key download for UTDs.
    - Effect on existing accounts:
-     - on its next Tessera login, an account with no identity gets one, using the typed password;
+     - on its next Twicecat login, an account with no identity gets one, using the typed password;
      - an account that already has an identity gets an **unverified** new device, which the Q6 flow handles;
      - alice, bob and carol each get an identity and a backup the first time a core logs them in. bob's device-count test is unaffected; alice's and carol's state is reset by the E2EE tests (Q2).
    - Restored pre-Phase-4 sessions bootstrap with `None` auth. If Synapse demands UIA, the core reports `CrossSigning::NotSetUp` and the app asks for the password (Q13). Task 4 records what Synapse v1.151.0 does (Q2).
@@ -218,7 +218,7 @@ Registry root: `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/`. Each i
      - showing the key again later (the SDK does not keep it, and we never store it);
      - a passphrase on set-up (a weaker secret, and Element X has dropped it).
 6. **Q6: confirming a new device. ANSWERED: Skip allowed.** When a fresh login lands on an account that already has a cross-signing identity and `verification_state` is `Unverified`, the app shows a **Confirm your identity** screen before the main view, offering:
-   - **Use another device** (self-verification request, Q9; the other device may scan Tessera's QR code or compare emoji), shown when `has_devices_to_verify_against`;
+   - **Use another device** (self-verification request, Q9; the other device may scan Twicecat's QR code or compare emoji), shown when `has_devices_to_verify_against`;
    - **Use recovery key** (Q5 restore);
    - **Can't confirm? Reset your identity** (Q14);
    - **Skip for now**.
@@ -291,7 +291,7 @@ Registry root: `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/`. Each i
      - `RequestSelfVerification` uses the own identity's `request_verification()`, sent to every own device;
      - `RequestDeviceVerification` uses `Device::request_verification()`;
      - `RequestUserVerification` uses `UserIdentity::request_verification()` (in a DM);
-     - once the request is `Ready`, the core tries `generate_qr_code()` first: `Some` gives `ShowQr`, `None` makes the core call `start_sas()` (the Phase 4 SAS behaviour, unchanged for Tessera-to-Tessera).
+     - once the request is `Ready`, the core tries `generate_qr_code()` first: `Some` gives `ShowQr`, `None` makes the core call `start_sas()` (the Phase 4 SAS behaviour, unchanged for Twicecat-to-Twicecat).
    - **QR display:** the dialog offers **Compare emoji instead** (`StartSas`, `start_sas()` from `Transitioned`) and **Cancel**. When the peer scans the code, `QrVerificationState::Scanned` becomes `QrScanned`; the user confirms that the other device shows success (`ConfirmQrScanned` → `QrVerification::confirm()`) or cancels. `Confirmed`, `Done` and `Cancelled` map as for SAS; `Reciprocated` (only reached by a scanning side) maps to `Waiting`.
    - **Finishing SAS:** "They match" calls `confirm()`, "They don't match" calls `mismatch()`, and the end is `Done` or `Cancelled { reason }`. The SDK's own timeouts apply, and `CancelInfo`'s code maps to `CancelReason`.
    - **After a self-verification:** the SDK gossips the cross-signing keys and the backup key. With `AfterDecryptionFailure`, history UTDs then resolve. That path is proven in Task 6.
@@ -384,13 +384,13 @@ Registry root: `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/`. Each i
     - The `integration` CI job keeps its 20-minute timeout. Each task records the ignored-run duration and the per-test reset cost. If the run passes 15 minutes, stop and ask (rule 8).
     - A test that fails twice in a row is a rule-8 stop, including the Phase 3 `typing_notices_reach_the_other_user` watch.
     - Rejected: mock-server (`matrix-sdk-test`) E2EE tests. They need the `testing` feature, a new dev-dependency surface, and prove less than the real Synapse.
-19. **Q19: CLI.** RECOMMENDED (stands): `tessera-cli` matches the new events exhaustively and prints one non-secret line each. It prints `Security` as recovery/device/cross-signing states, never `RecoveryKeyReady` (it prints "recovery key received, not shown"). Verification events (including `ShowQr`) are ignored. It gains no new commands. Rejected: CLI verification (the human checkpoint uses the window).
+19. **Q19: CLI.** RECOMMENDED (stands): `twicecat-cli` matches the new events exhaustively and prints one non-secret line each. It prints `Security` as recovery/device/cross-signing states, never `RecoveryKeyReady` (it prints "recovery key received, not shown"). Verification events (including `ShowQr`) are ignored. It gains no new commands. Rejected: CLI verification (the human checkpoint uses the window).
 
 ### Conventions for every task
 - **Gate (rule 4)**, required before each commit:
   - `cargo fmt --all --check && cargo clippy --workspace --all-targets --all-features --locked -- -D warnings && cargo test --workspace --locked`, plus `scripts/check-app-deps.sh`, `scripts/check-core-api.sh` and `cargo deny check`.
-  - Tasks that touch the core or the bridge also run `docker compose up -d --wait && scripts/create-test-users.sh && cargo test -p tessera-core -p tessera-app --locked -- --ignored --skip keyring`, then `docker compose stop`.
-  - Core tasks that add E2EE tests also run their E2EE test binary a second time right after (`cargo test -p tessera-core --locked --test <binary> -- --ignored`), without `create-test-users.sh` in between (Q2 repeat runs).
+  - Tasks that touch the core or the bridge also run `docker compose up -d --wait && scripts/create-test-users.sh && cargo test -p twicecat-core -p twicecat-app --locked -- --ignored --skip keyring`, then `docker compose stop`.
+  - Core tasks that add E2EE tests also run their E2EE test binary a second time right after (`cargo test -p twicecat-core --locked --test <binary> -- --ignored`), without `create-test-users.sh` in between (Q2 repeat runs).
   - The agent never runs the real-keychain test.
 - **One commit per task**, message `phase4.<task number>: <summary>`, with the attribution trailer as instructed by the session. ROADMAP.md is never committed.
 - **PROGRESS.md (rule 5).**
@@ -402,7 +402,7 @@ Registry root: `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/`. Each i
     - open issues and new human items, which also go on the checkpoint list unasked.
   - Rendering, wording, clipboard, browser opening, QR scanning and real-device interop go on the human list, never ticked by the agent (rule 9).
 - **Boundary (rule 7).**
-  - `crates/app` gains no dependency and no feature, and imports only `tessera_core::{api, Core, CoreConfig, CoreHandle, DEFAULT_ROOM_LIST_PAGE_SIZE, paths, secrets, logging}`.
+  - `crates/app` gains no dependency and no feature, and imports only `twicecat_core::{api, Core, CoreConfig, CoreHandle, DEFAULT_ROOM_LIST_PAGE_SIZE, paths, secrets, logging}`.
   - `api/` (including `api/security.rs`) stays SDK-free. `security.rs` and `verification.rs` are private core modules.
 - **No network or blocking in `update`.** `update` only mutates state, calls `try_send`, and returns `Task`s (clipboard, timers, browser). Unit tests drive `update` with a plain `mpsc` sink.
 - **Secrets and content hygiene (rule 6).**
@@ -438,7 +438,7 @@ Acceptance criteria:
 
 ### Task 2: Additive core API for Phase 4
 Language: rust
-Files: crates/core/src/api/security.rs, crates/core/src/api/mod.rs, crates/core/src/api/types.rs, crates/core/src/engine.rs, crates/core/src/timeline.rs, crates/core/src/room_list.rs, crates/core/src/bin/tessera-cli.rs, crates/app/src/screens/timeline_pane.rs, crates/app/src/state.rs, PROGRESS.md
+Files: crates/core/src/api/security.rs, crates/core/src/api/mod.rs, crates/core/src/api/types.rs, crates/core/src/engine.rs, crates/core/src/timeline.rs, crates/core/src/room_list.rs, crates/core/src/bin/twicecat-cli.rs, crates/app/src/screens/timeline_pane.rs, crates/app/src/state.rs, PROGRESS.md
 Depends on: Task 1
 Acceptance criteria:
 - The API has exactly the Q7 additions (including `QrImage`, `ShowQr`, `QrScanned`, `StartSas` and `ConfirmQrScanned`), all `Clone + Debug + PartialEq` (`RecoveryKey` compares by value without printing it), SDK-free and documented. `scripts/check-core-api.sh` exits 0.
@@ -549,7 +549,7 @@ Files: crates/core/Cargo.toml, Cargo.lock, crates/core/src/verification.rs, crat
 Depends on: Task 6
 Acceptance criteria:
 - `crates/core/Cargo.toml`: the matrix-sdk dependency keeps `version = "=0.19.1"` and gains only the `qrcode` feature. `crates/app/Cargo.toml` (iced features) is unchanged unless the human's validation of Q3 says otherwise.
-- `Cargo.lock` adds exactly matrix-sdk-qrcode 0.19.1 and qrcode 0.14.1: a sorted name/version comparison before vs after differs only in those two entries, and no existing version changes. `cargo tree -p tessera-core -e features -i matrix-sdk` lists `qrcode`. `cargo deny check` passes with `deny.toml` unchanged (else stop and ask).
+- `Cargo.lock` adds exactly matrix-sdk-qrcode 0.19.1 and qrcode 0.14.1: a sorted name/version comparison before vs after differs only in those two entries, and no existing version changes. `cargo tree -p twicecat-core -e features -i matrix-sdk` lists `qrcode`. `cargo deny check` passes with `deny.toml` unchanged (else stop and ask).
 - `verification.rs`:
   - once a request is `Ready` (incoming accepted or outgoing ready), calls `generate_qr_code()`. `Some` emits `ShowQr(grid)` and follows `QrVerification::changes()`; `None` keeps the Task 6 behaviour (outgoing: `start_sas()`; incoming: `Waiting`);
   - `StartSas { id }` calls `start_sas()` while a QR code shows, and the flow continues as SAS. If the peer starts SAS while the code shows, the flow follows SAS too;
@@ -559,10 +559,10 @@ Acceptance criteria:
   - `map_qr_state` covers every `QrVerificationState` (`Started` → `ShowQr` already sent, `Scanned` → `QrScanned`, `Confirmed` → `Confirmed`, `Reciprocated` → `Waiting`, `Done` → `Done`, `Cancelled` → `Cancelled { reason }` through `map_cancel_code`).
 - A unit test (no network) builds spec-conformant QR bytes (`MATRIX`, version 0x02, mode 0x02, flow ID, two 32-byte keys, a shared secret), parses them with `QrVerificationData::from_bytes`, calls `to_qr_code()`, and gets a `QrImage` of size 45 whose three 7 x 7 finder patterns are in place.
 - Integration tests added to `e2ee_verification.rs` (verbatim ignore reason; `e2ee_serial`, reset of alice):
-  - **QR shown to a scanning peer:** alice's core is `first_device`. A raw client logged in as alice (`raw_login_named(1, "tessera-test-qr")`) requests verification of the core's device with `request_verification_with_methods([SasV1, QrCodeScanV1, ReciprocateV1])`. The core gets `VerificationRequested { own_account: true }` and accepts, then emits `ShowQr(img)` with `img.size == 45`. The raw client's request reports the core's methods with `QrCodeShowV1` and without `QrCodeScanV1`;
+  - **QR shown to a scanning peer:** alice's core is `first_device`. A raw client logged in as alice (`raw_login_named(1, "twicecat-test-qr")`) requests verification of the core's device with `request_verification_with_methods([SasV1, QrCodeScanV1, ReciprocateV1])`. The core gets `VerificationRequested { own_account: true }` and accepts, then emits `ShowQr(img)` with `img.size == 45`. The raw client's request reports the core's methods with `QrCodeShowV1` and without `QrCodeScanV1`;
   - **compare emoji instead:** in that state the core sends `StartSas`; the raw client accepts the SAS; both sides' emoji are identical; both confirm; the core reaches `Done` and the raw client's own device is verified;
   - **cancel while showing:** in a new flow the core sends `CancelVerification` while `ShowQr` is shown; the raw client sees the request cancelled with code `m.user`;
-  - **Tessera to Tessera stays SAS:** the Task 6 self-verification test still passes and never emits `ShowQr` (neither side advertises scanning).
+  - **Twicecat to Twicecat stays SAS:** the Task 6 self-verification test still passes and never emits `ShowQr` (neither side advertises scanning).
 - The raw client logs out at the end of each test. The scan and reciprocate/confirm round trip is on the human checkpoint (Element X), per Q3.
 - Gate, the ignored run and the repeat run of `e2ee_verification` pass. Commit: `phase4.7: qr code display for verification in the core`.
 
@@ -590,7 +590,7 @@ Acceptance criteria:
 - `log_hygiene.rs` is a separate test binary with exactly one ignored test (verbatim ignore reason) implementing Q16 (a) and (b):
   - it takes `e2ee_serial()` and resets alice and carol first;
   - a global capturing subscriber at `info`;
-  - the full flow from Q16 (its verification is SAS between two Tessera cores, so no QR code is involved);
+  - the full flow from Q16 (its verification is SAS between two Twicecat cores, so no QR code is involved);
   - the sentinel set: access token, refresh token if present, store passphrase (all read from the stored record JSON), alice's and carol's passwords, the recovery key, and every `secret-body-<hex>` sent;
   - it asserts that no sentinel appears in the captured log text, at `info` and again with `DEFAULT_FILTER`;
   - it asserts that no sentinel's bytes (UTF-8 and the JSON-escaped form) appear in any file under the data root, `-wal`/`-shm` included, while the session is still live;
@@ -654,7 +654,7 @@ Acceptance criteria:
 - Human checklist gains:
   - the emoji render (font coverage on each OS) and match Element X and Element Web character for character;
   - the dialog layout in both themes, including the QR code (crisp, black on white, with its quiet zone, in light and dark themes);
-  - **scan Tessera's QR code with Element X on a phone**: (a) a new Tessera device (Confirm your identity → Use another device) shows the code and Element X scans it; Tessera then asks to confirm, **Yes** completes, and Tessera becomes verified; (b) Element X as the new device (Tessera already verified) scans the code Tessera shows; (c) **Compare emoji instead** from the QR screen completes by emoji;
+  - **scan Twicecat's QR code with Element X on a phone**: (a) a new Twicecat device (Confirm your identity → Use another device) shows the code and Element X scans it; Twicecat then asks to confirm, **Yes** completes, and Twicecat becomes verified; (b) Element X as the new device (Twicecat already verified) scans the code Twicecat shows; (c) **Compare emoji instead** from the QR screen completes by emoji;
   - **verify this device against Element X on a phone (roadmap checkpoint)** and against the local Element Web (`docker compose --profile element up -d`, signed in as bob, Q2).
 - Gate passes. Commit: `phase4.11: verification dialog with the sas emoji grid and qr code`.
 
@@ -739,7 +739,7 @@ Acceptance criteria:
   - Rejected: a new settings screen (one button does not justify it); a banner (recovery is fine in this state, nothing needs attention).
 - **Warning first (new `Overlay::ChangeKeyConfirm`).** **Change recovery key** opens a warning card and sends nothing yet. Draft wording (final wording is a human item):
   - title "Change your recovery key?";
-  - "Your current recovery key will stop working. Tessera will show you a new one, once. Other apps and devices that ask for your recovery key will need the new one. Anything another app saved in your secure storage that this device doesn't have will be lost.";
+  - "Your current recovery key will stop working. Twicecat will show you a new one, once. Other apps and devices that ask for your recovery key will need the new one. Anything another app saved in your secure storage that this device doesn't have will be lost.";
   - **Change key** (sends `Command::ChangeRecoveryKey` once and sets `Busy::ChangingKey`) and **Cancel** (closes, sends nothing).
 - **While busy:** the card shows "Changing your recovery key…" and no buttons; a second press, or **Set up recovery**, sends nothing while any `Busy` is set.
 - **Success:** `RecoveryKeyReady` while `Busy::ChangingKey` opens the existing show-once key screen with the title "Your new recovery key" (set-up keeps "Your recovery key"). Everything else is unchanged from Task 10: the "I've saved my recovery key" box gates **Done**, Copy and the 60 s clipboard clear, and the key is dropped on Done, logout and window close.
@@ -751,7 +751,7 @@ Acceptance criteria:
 - **Human checkpoint items** (added to PROGRESS.md and the checklist page unasked):
   - the Recovery line on the Sessions page in each state, in both themes;
   - the warning wording, and the "Your new recovery key" screen;
-  - after changing bob's key in Tessera, the new key restores in Element Web (bob on a new session) and the old one is refused.
+  - after changing bob's key in Twicecat, the new key restores in Element Web (bob on a new session) and the old one is refused.
 - Gate passes (app only, no core or bridge code: no ignored run needed). Commit: `phase4.15: change the recovery key from the sessions page`.
 
 ### Phase 4 human checkpoint (collected in PROGRESS.md)
@@ -759,7 +759,7 @@ Acceptance criteria:
 - [ ] CI green on Linux, Windows and macOS; the `integration` job stays under its 20-minute timeout.
 - [ ] Aware that the ignored suite signs out every alice and carol session on the local Synapse and resets their identities (Q2); local Element Web checks use bob.
 - [ ] **On a fresh install, verify this device against Element X on your phone (emoji match), and confirm encrypted history loads** (roadmap checkpoint).
-- [ ] **Scan Tessera's QR code with Element X:** a new Tessera device shows the code and Element X scans it, Tessera asks for confirmation, **Yes** completes, and Tessera becomes verified; the reverse (Element X as the new device scanning Tessera's code); **Compare emoji instead** from the QR screen works; the code is crisp, black on white with a quiet zone, in both themes.
+- [ ] **Scan Twicecat's QR code with Element X:** a new Twicecat device shows the code and Element X scans it, Twicecat asks for confirmation, **Yes** completes, and Twicecat becomes verified; the reverse (Element X as the new device scanning Twicecat's code); **Compare emoji instead** from the QR screen works; the code is crisp, black on white with a quiet zone, in both themes.
 - [ ] **Review the recovery-key screen wording** (roadmap checkpoint); the key is shown once, Copy works, and the clipboard clears after 60 s.
 - [ ] Recovery restore with a key (and a passphrase, if your account has one) made in Element; history decrypts in place.
 - [ ] Confirm-identity screen after a fresh login: each choice works. **Skip for now** leaves the device unverified and shows the persistent banner; review its wording ("This device isn't verified. Verify it to read your encrypted history and so others can trust it."); it can't be dismissed, it is back after a restart, its Verify button reopens the screen, and it disappears once the device is verified.

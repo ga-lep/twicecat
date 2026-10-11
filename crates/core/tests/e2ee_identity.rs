@@ -15,17 +15,17 @@ use common::{
     message_with, outgoing, pump, raw_login_named, reset_e2ee_account, reset_identity_on,
     seed_recovery, start_core,
 };
-use tessera_core::CoreHandle;
-use tessera_core::api::{
+use twicecat_core::CoreHandle;
+use twicecat_core::api::{
     ActionKind, Command, CoreError, CoreEvent, CrossSigning, DeviceVerification, Password,
     ReauthAction, RecoveryStatus, TimelineItemKind,
 };
-use tessera_core::secrets::InMemorySecretStore;
+use twicecat_core::secrets::InMemorySecretStore;
 
 /// The master key's public part, and whether a backup exists on the server,
 /// as a fresh raw client (no encryption settings) sees them for test user `n`.
 async fn server_view(n: u8) -> (String, bool) {
-    let client = raw_login_named(n, "tessera-e2ee-view").await;
+    let client = raw_login_named(n, "twicecat-e2ee-view").await;
     client
         .encryption()
         .wait_for_e2ee_initialization_tasks()
@@ -359,7 +359,7 @@ async fn a_message_sent_right_after_a_reset_is_sent_promptly() {
         .unwrap();
     // Exactly one item for the message, and it is "Sent": a duplicate or a
     // local echo left at "Sending" fails the test.
-    let sent = |items: &[tessera_core::api::TimelineItem]| {
+    let sent = |items: &[twicecat_core::api::TimelineItem]| {
         let mine: Vec<_> = items
             .iter()
             .filter(|i| {
@@ -370,7 +370,7 @@ async fn a_message_sent_right_after_a_reset_is_sent_promptly() {
             && matches!(
                 &mine[0].kind,
                 TimelineItemKind::Message {
-                    sent: tessera_core::api::SendStatus::Sent,
+                    sent: twicecat_core::api::SendStatus::Sent,
                     ..
                 }
             )

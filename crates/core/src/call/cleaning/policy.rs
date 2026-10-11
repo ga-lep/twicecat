@@ -10,11 +10,11 @@ use crate::api::{
     AudioSettings, NoiseSuppression, RemoteCleaning, SkipCleaned, SkipReason, UserId, VoiceCleaning,
 };
 
-/// The LiveKit participant attribute where Tessera says which suppressor
+/// The LiveKit participant attribute where Twicecat says which suppressor
 /// cleans its microphone (other clients ignore it).
-pub(crate) const ANNOUNCE_KEY: &str = "tessera.voice_cleaning";
+pub(crate) const ANNOUNCE_KEY: &str = "twicecat.voice_cleaning";
 
-// Its values: the wire format other Tessera clients read (approved with
+// Its values: the wire format other Twicecat clients read (approved with
 // Task 16 part 2; a change needs every client to follow).
 /// WebRTC's classic suppressor.
 const WEBRTC: &str = "webrtc";
@@ -22,7 +22,7 @@ const WEBRTC: &str = "webrtc";
 const RNNOISE: &str = "rnnoise";
 /// DeepFilterNet3 (on the CPU or a GPU, whatever its attenuation limit).
 const DEEPFILTERNET3: &str = "deepfilternet3";
-/// Cleaned before Tessera (NVIDIA Broadcast, Krisp), by the user's word.
+/// Cleaned before Twicecat (NVIDIA Broadcast, Krisp), by the user's word.
 const EXTERNAL: &str = "external";
 
 /// What we announce under [`ANNOUNCE_KEY`] (`None`: nothing, the attribute
@@ -57,7 +57,7 @@ pub(crate) enum Claim {
 }
 
 impl Claim {
-    /// From the sender's announcement (Tessera; an unknown value counts
+    /// From the sender's announcement (Twicecat; an unknown value counts
     /// for nothing) and its microphone track's features (LiveKit's clients:
     /// `TF_NOISE_SUPPRESSION` is the browser's suppressor,
     /// `TF_ENHANCED_NOISE_CANCELLATION` Krisp); the strongest wins.

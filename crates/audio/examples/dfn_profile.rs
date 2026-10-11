@@ -1,16 +1,16 @@
 //! Runs DeepFilterNet3 frame by frame for profiling (`samply`, Nsight
 //! Systems) and prints the frame times.
 //!
-//! `cargo run --release -p tessera-audio --features onnxruntime --example
+//! `cargo run --release -p twicecat-audio --features onnxruntime --example
 //! dfn_profile -- <cpu|gpu|trt|webgpu|directml> [frames]`; the models from
 //! `scripts/fetch-models.sh` and, for the GPU modes, `scripts/export-deepfilternet.sh`,
 //! `scripts/fetch-onnxruntime.sh cuda13` (and NVIDIA's libraries), or for
 //! `directml` `scripts/build-onnxruntime-directml.sh` (Windows; with
-//! `TESSERA_ONNXRUNTIME_DIR` when a CUDA build is also fetched).
+//! `TWICECAT_ONNXRUNTIME_DIR` when a CUDA build is also fetched).
 
 use std::time::{Duration, Instant};
 
-use tessera_audio::{
+use twicecat_audio::{
     DeepFilter, FRAME_LEN, Frame, default_model_dir, flush_denormals_on_this_thread,
 };
 
@@ -39,10 +39,10 @@ fn load(mode: &str) -> DeepFilter {
         "cpu" => DeepFilter::load(&dir, 100.0).expect("run scripts/fetch-models.sh"),
         #[cfg(feature = "onnxruntime")]
         "gpu" | "trt" | "webgpu" | "directml" => {
-            use tessera_audio::onnx::{Accelerator, OnnxRuntime, default_runtime_dir};
+            use twicecat_audio::onnx::{Accelerator, OnnxRuntime, default_runtime_dir};
             let runtime = OnnxRuntime::load(&default_runtime_dir().expect("ONNX Runtime"))
                 .expect("load ONNX Runtime");
-            let model = tessera_audio::default_stateful_model().expect("stateful model");
+            let model = twicecat_audio::default_stateful_model().expect("stateful model");
             let prefer = match mode {
                 "trt" => Accelerator::TensorRt,
                 "webgpu" => Accelerator::WebGpu,

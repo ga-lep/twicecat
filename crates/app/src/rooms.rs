@@ -13,7 +13,7 @@ use std::fmt;
 
 use iced::Task;
 use iced::widget::operation;
-use tessera_core::api::{
+use twicecat_core::api::{
     Block, Command, CoreError, CreateRoomRequest, Inline, MediaBytes, MembershipView,
     MentionTarget, MessageText, PowerLevelView, Role, RoomDetailsView, RoomId, RoomMemberView,
     RoomSummary, RoomVisibility, TimelineItemKind, UserId,
@@ -304,7 +304,7 @@ impl LeaveWarning {
         }
         if self.unknown {
             lines.push(
-                "Tessera could not check whether this room is encrypted or whether you \
+                "Twicecat could not check whether this room is encrypted or whether you \
                  are its last admin.",
             );
         }
@@ -1742,7 +1742,7 @@ pub fn read_avatar_file(path: &std::path::Path) -> Result<AvatarUpload, AvatarRe
 
 #[cfg(test)]
 mod tests {
-    use tessera_core::api::{PowerLevelView, RoomId};
+    use twicecat_core::api::{PowerLevelView, RoomId};
 
     use super::*;
 
@@ -1887,7 +1887,7 @@ mod tests {
             avatar: None,
             is_encrypted: encrypted,
             alias: None,
-            permissions: tessera_core::api::RoomPermissions::default(),
+            permissions: twicecat_core::api::RoomPermissions::default(),
         }
     }
 
@@ -2164,7 +2164,7 @@ mod tests {
 
     #[test]
     fn the_avatar_file_must_be_a_regular_file() {
-        let dir = std::env::temp_dir().join(format!("tessera-avatar-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("twicecat-avatar-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("dir");
         let file = dir.join("a.png");
         std::fs::write(&file, png_of(32, 32, false)).expect("write");

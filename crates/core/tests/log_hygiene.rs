@@ -24,23 +24,23 @@ use common::{
     DEFAULT_TIMEOUT, EncryptedPair, TestEnv, e2ee_serial, expect_event, hex, login_and_run,
     message_with, outgoing, pump, pump_with, raw_login, start_core,
 };
-use tessera_core::CoreHandle;
-use tessera_core::api::{
-    Command, CoreError, CoreEvent, CrossSigning, DeviceVerification, MediaSize, Password,
-    RecoveryKey, RecoveryStatus, SendStatus, TimelineItemKind, VerificationPhase,
-};
-use tessera_core::logging::DEFAULT_FILTER;
-use tessera_core::secrets::{InMemorySecretStore, SecretStore as _};
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 use tracing_subscriber::{EnvFilter, Layer as _};
+use twicecat_core::CoreHandle;
+use twicecat_core::api::{
+    Command, CoreError, CoreEvent, CrossSigning, DeviceVerification, MediaSize, Password,
+    RecoveryKey, RecoveryStatus, SendStatus, TimelineItemKind, VerificationPhase,
+};
+use twicecat_core::logging::DEFAULT_FILTER;
+use twicecat_core::secrets::{InMemorySecretStore, SecretStore as _};
 use zeroize::Zeroizing;
 
 /// An image with a plain-text sentinel in its bytes (`tEXt` chunk).
 const IMAGE: &[u8] = include_bytes!("fixtures/photo-1200x900.png");
 /// The text in [`IMAGE`]'s `tEXt` chunk.
-const IMAGE_SENTINEL: &str = "tessera-png-sentinel-x";
+const IMAGE_SENTINEL: &str = "twicecat-png-sentinel-x";
 
 /// An in-memory log sink.
 #[derive(Clone, Default)]
@@ -169,7 +169,7 @@ fn scanner_self_check() {
             .with_filter(EnvFilter::new("info")),
     );
     tracing::subscriber::with_default(subscriber, || {
-        tracing::info!(target: "tessera_core", "self-check: {value}");
+        tracing::info!(target: "twicecat_core", "self-check: {value}");
     });
     let logged = discarded.bytes();
     assert_eq!(
@@ -267,7 +267,7 @@ async fn send(core: &mut CoreHandle, command: Command) {
 }
 
 /// Waits for the emoji (`emoji`) or the end (`!emoji`) of flow `id`.
-async fn phase(core: &mut CoreHandle, id: &tessera_core::api::VerificationId, emoji: bool) {
+async fn phase(core: &mut CoreHandle, id: &twicecat_core::api::VerificationId, emoji: bool) {
     expect_event(core, |e| {
         matches!(e, CoreEvent::Verification { id: i, phase }
         if i == id && if emoji {
@@ -311,7 +311,7 @@ async fn no_secret_reaches_the_logs_or_the_disk() {
             env.user_id(1),
         ),
     ] {
-        let peer = tessera_core::api::UserId::from(peer.as_str());
+        let peer = twicecat_core::api::UserId::from(peer.as_str());
         send(
             core,
             Command::WatchUserTrust {
@@ -342,7 +342,7 @@ async fn no_secret_reaches_the_logs_or_the_disk() {
     let from_carol = format!("secret-body-{}", hex());
     send(&mut p.alice, Command::Send(outgoing(&room, &from_alice))).await;
     send(&mut p.carol, Command::Send(outgoing(&room, &from_carol))).await;
-    let sent = |items: &[tessera_core::api::TimelineItem], body: &str, own: bool| {
+    let sent = |items: &[twicecat_core::api::TimelineItem], body: &str, own: bool| {
         matches!(
             message_with(items, body, own).map(|m| &m.kind),
             Some(TimelineItemKind::Message {
@@ -382,7 +382,7 @@ async fn no_secret_reaches_the_logs_or_the_disk() {
         IMAGE.to_vec(),
     )
     .await;
-    let has_image = |items: &[tessera_core::api::TimelineItem]| {
+    let has_image = |items: &[twicecat_core::api::TimelineItem]| {
         items.iter().any(|i| {
             i.event_id.as_ref().map(|e| e.as_str()) == Some(image_event.as_str())
                 && matches!(&i.kind, TimelineItemKind::Message { details, .. }
@@ -404,7 +404,7 @@ async fn no_secret_reaches_the_logs_or_the_disk() {
             send(
                 core,
                 Command::FetchMedia {
-                    room_id: tessera_core::api::RoomId::from(room.as_str()),
+                    room_id: twicecat_core::api::RoomId::from(room.as_str()),
                     item_id: item_id.clone(),
                     size,
                 },

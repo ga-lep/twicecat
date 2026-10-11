@@ -7774,85 +7774,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tessera-app"
-version = "0.1.0"
-dependencies = [
- "arboard",
- "chrono",
- "emojis",
- "iced",
- "image",
- "notify-rust",
- "open",
- "rfd",
- "tessera-core",
- "tokio",
- "tray-icon",
-]
-
-[[package]]
-name = "tessera-audio"
-version = "0.1.0"
-dependencies = [
- "audio_thread_priority",
- "cpal",
- "libloading 0.9.0",
- "nnnoiseless",
- "ort",
- "pipewire",
- "realfft",
- "rtrb 0.4.0",
- "rubato",
- "serde_json",
- "sonora",
- "thiserror 2.0.21",
- "tracing",
- "tract-onnx",
- "tract-pulse",
- "windows 0.62.2",
- "windows-core 0.62.2",
-]
-
-[[package]]
-name = "tessera-core"
-version = "0.1.0"
-dependencies = [
- "directories",
- "futures-util",
- "keyring",
- "livekit",
- "matrix-sdk",
- "matrix-sdk-crypto",
- "matrix-sdk-ui",
- "mime",
- "rand 0.10.3",
- "rpassword",
- "serde",
- "serde_json",
- "tempfile",
- "tessera-audio",
- "thiserror 2.0.21",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "url",
- "zeroize",
-]
-
-[[package]]
-name = "tessera-ptt"
-version = "0.1.0"
-dependencies = [
- "ashpd",
- "futures-util",
- "gilrs",
- "global-hotkey",
- "thiserror 2.0.21",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "thiserror"
 version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8499,6 +8420,85 @@ dependencies = [
  "sha1",
  "thiserror 2.0.21",
  "url",
+]
+
+[[package]]
+name = "twicecat-app"
+version = "0.1.0"
+dependencies = [
+ "arboard",
+ "chrono",
+ "emojis",
+ "iced",
+ "image",
+ "notify-rust",
+ "open",
+ "rfd",
+ "tokio",
+ "tray-icon",
+ "twicecat-core",
+]
+
+[[package]]
+name = "twicecat-audio"
+version = "0.1.0"
+dependencies = [
+ "audio_thread_priority",
+ "cpal",
+ "libloading 0.9.0",
+ "nnnoiseless",
+ "ort",
+ "pipewire",
+ "realfft",
+ "rtrb 0.4.0",
+ "rubato",
+ "serde_json",
+ "sonora",
+ "thiserror 2.0.21",
+ "tracing",
+ "tract-onnx",
+ "tract-pulse",
+ "windows 0.62.2",
+ "windows-core 0.62.2",
+]
+
+[[package]]
+name = "twicecat-core"
+version = "0.1.0"
+dependencies = [
+ "directories",
+ "futures-util",
+ "keyring",
+ "livekit",
+ "matrix-sdk",
+ "matrix-sdk-crypto",
+ "matrix-sdk-ui",
+ "mime",
+ "rand 0.10.3",
+ "rpassword",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "twicecat-audio",
+ "url",
+ "zeroize",
+]
+
+[[package]]
+name = "twicecat-ptt"
+version = "0.1.0"
+dependencies = [
+ "ashpd",
+ "futures-util",
+ "gilrs",
+ "global-hotkey",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

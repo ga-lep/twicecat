@@ -96,7 +96,7 @@ enum Backend {
 impl OnnxRuntime {
     /// Opens `model` on the first of `prefer` that starts (on CUDA and
     /// WebGPU, with its state on the GPU and a captured graph when
-    /// possible), else the CPU. `TESSERA_ONNX_CUDA_GRAPHS=0` keeps the state
+    /// possible), else the CPU. `TWICECAT_ONNX_CUDA_GRAPHS=0` keeps the state
     /// on the host (a way around a driver problem, and for comparisons).
     pub fn open_loop(
         &self,
@@ -113,7 +113,7 @@ impl OnnxRuntime {
             output: vec![0.0; spec.rows * spec.output.1],
             rows: spec.rows,
         };
-        let graphs = std::env::var_os("TESSERA_ONNX_CUDA_GRAPHS").is_none_or(|v| v != "0");
+        let graphs = std::env::var_os("TWICECAT_ONNX_CUDA_GRAPHS").is_none_or(|v| v != "0");
         for &accelerator in prefer {
             if !self.accelerators().contains(&accelerator) {
                 continue;

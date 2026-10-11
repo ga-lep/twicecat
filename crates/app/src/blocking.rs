@@ -30,7 +30,7 @@ where
     let permit = PERMITS.clone().acquire_owned().await.ok()?;
     let (tx, rx) = oneshot::channel();
     std::thread::Builder::new()
-        .name("tessera-blocking".to_owned())
+        .name("twicecat-blocking".to_owned())
         .spawn(move || {
             let result = work();
             drop(permit);

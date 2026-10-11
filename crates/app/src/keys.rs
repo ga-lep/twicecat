@@ -10,7 +10,7 @@ use iced::keyboard::key::Named;
 use iced::keyboard::{Key, Modifiers};
 
 use iced::Task;
-use tessera_core::api::{RoomId, RoomSummary};
+use twicecat_core::api::{RoomId, RoomSummary};
 
 use crate::settings::SettingsMessage;
 use crate::state::{App, Message, Screen};

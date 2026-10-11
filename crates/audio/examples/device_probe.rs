@@ -2,7 +2,7 @@
 //! checking device following on a real desktop (human checkpoint):
 //!
 //! ```text
-//! cargo run -p tessera-audio --example device_probe -- [--mic] [--seconds N]
+//! cargo run -p twicecat-audio --example device_probe -- [--mic] [--seconds N]
 //! ```
 //!
 //! It plays a faint 440 Hz tone (-40 dBFS) on the default output (on
@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use tessera_audio::{AudioIo, DeviceList, DeviceWatcher, Frame, IoConfig, IoEvent, list_devices};
+use twicecat_audio::{AudioIo, DeviceList, DeviceWatcher, Frame, IoConfig, IoEvent, list_devices};
 
 /// A tone out, and the microphone's peak in.
 struct Probe {
@@ -24,11 +24,11 @@ struct Probe {
     peak: Arc<AtomicU32>,
 }
 
-impl tessera_audio::FrameProcessor for Probe {
+impl twicecat_audio::FrameProcessor for Probe {
     fn process(&mut self, capture: &Frame, playback: &mut Frame) {
         let peak = capture.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
         self.peak.fetch_max(peak.to_bits(), Ordering::Relaxed);
-        let step = 440.0 * std::f32::consts::TAU / tessera_audio::SAMPLE_RATE as f32;
+        let step = 440.0 * std::f32::consts::TAU / twicecat_audio::SAMPLE_RATE as f32;
         for s in playback.iter_mut() {
             *s = 0.01 * self.phase.sin();
             self.phase = (self.phase + step) % std::f32::consts::TAU;

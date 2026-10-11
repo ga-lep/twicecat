@@ -43,10 +43,10 @@ fn library_name() -> &'static str {
 }
 
 /// Where `scripts/fetch-webgpu-ep.sh` put the WebGPU plugin provider, or
-/// `TESSERA_WEBGPU_EP_DIR`; `None` when neither exists.
+/// `TWICECAT_WEBGPU_EP_DIR`; `None` when neither exists.
 pub fn default_webgpu_dir() -> Option<PathBuf> {
     let relative = format!("onnxruntime/webgpu-ep-{WEBGPU_EP_VERSION}");
-    let dir = crate::paths::from_env_or_cache("TESSERA_WEBGPU_EP_DIR", &relative)?;
+    let dir = crate::paths::from_env_or_cache("TWICECAT_WEBGPU_EP_DIR", &relative)?;
     dir.is_dir().then_some(dir)
 }
 
@@ -120,8 +120,8 @@ pub(super) fn add_to_session(
     let capture = if graph_capture { "1" } else { "0" };
     let mut options = vec![(format!("{EP_NAME}.enableGraphCapture"), capture.to_owned())];
     // More provider options, for measuring on other GPUs:
-    // `TESSERA_WEBGPU_EP_OPTIONS="maxNumPendingDispatches=512;..."`.
-    for (key, value) in std::env::var("TESSERA_WEBGPU_EP_OPTIONS")
+    // `TWICECAT_WEBGPU_EP_OPTIONS="maxNumPendingDispatches=512;..."`.
+    for (key, value) in std::env::var("TWICECAT_WEBGPU_EP_OPTIONS")
         .unwrap_or_default()
         .split(';')
         .filter_map(|kv| kv.split_once('='))

@@ -10,7 +10,7 @@ use iced::widget::{
     Column, button, checkbox, column, container, opaque, row, space, stack, text, text_input,
 };
 use iced::{Element, Fill, Font, Theme};
-use tessera_core::api::{Password, RecoveryKey, RecoveryProgress};
+use twicecat_core::api::{Password, RecoveryKey, RecoveryProgress};
 
 use crate::security::{
     Banner, Busy, Overlay, REAUTH_INPUT_ID, RESTORE_INPUT_ID, SecurityMessage, SecurityModel,
@@ -28,7 +28,7 @@ pub const KEY_WARNING: &str = "Store this key somewhere safe, like a password ma
 pub const RESET_WARNING: &str = "Resetting your identity makes your other devices and your contacts see you as a new user, and deletes your key backup: older encrypted messages may become unreadable. Only reset if you can't use another device or your recovery key.";
 
 /// What the warning before changing the recovery key says (plan Task 15).
-pub const CHANGE_KEY_WARNING: &str = "Your current recovery key will stop working. Tessera will show you a new one, once. Other apps and devices that ask for your recovery key will need the new one. Anything another app saved in your secure storage that this device doesn't have will be lost.";
+pub const CHANGE_KEY_WARNING: &str = "Your current recovery key will stop working. Twicecat will show you a new one, once. Other apps and devices that ask for your recovery key will need the new one. Anything another app saved in your secure storage that this device doesn't have will be lost.";
 
 /// Said while the recovery key is being changed.
 pub const CHANGE_KEY_WAIT: &str = "Changing your recovery key\u{2026}";

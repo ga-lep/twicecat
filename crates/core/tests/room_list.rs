@@ -10,11 +10,11 @@ use common::{
     start_core_with_page_size, unique_room_name,
 };
 use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
-use tessera_core::CoreHandle;
-use tessera_core::api::{
+use twicecat_core::CoreHandle;
+use twicecat_core::api::{
     Command, CoreEvent, ListDiff, Password, RoomListQuery, RoomListTab, RoomSummary, SyncState,
 };
-use tessera_core::secrets::InMemorySecretStore;
+use twicecat_core::secrets::InMemorySecretStore;
 
 async fn login_and_run(core: &mut CoreHandle, env: &TestEnv, n: u8) {
     core.commands
@@ -222,8 +222,8 @@ async fn search_query_filters_the_list() {
 
     let alice = raw_login(1).await;
     let suffix = unique_room_name();
-    let name_a = format!("tessera-a-{suffix}");
-    let name_b = format!("tessera-b-{suffix}");
+    let name_a = format!("twicecat-a-{suffix}");
+    let name_b = format!("twicecat-b-{suffix}");
     create_room(&alice, &name_a, None).await;
     create_room(&alice, &name_b, None).await;
 

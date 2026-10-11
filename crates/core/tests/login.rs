@@ -7,8 +7,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use common::{TestEnv, expect_event, raw_login, start_core};
-use tessera_core::api::{Command, CoreEvent, Password};
-use tessera_core::secrets::{InMemorySecretStore, SecretStore as _};
+use twicecat_core::api::{Command, CoreEvent, Password};
+use twicecat_core::secrets::{InMemorySecretStore, SecretStore as _};
 
 fn login_cmd(env: &TestEnv, n: u8, password: &str) -> Command {
     Command::LoginPassword {

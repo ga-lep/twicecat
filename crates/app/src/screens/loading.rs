@@ -2,7 +2,7 @@
 
 use iced::widget::{column, text};
 use iced::{Element, Fill};
-use tessera_core::api::SyncState;
+use twicecat_core::api::SyncState;
 
 use crate::state::{App, Message};
 

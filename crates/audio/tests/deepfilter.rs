@@ -1,14 +1,14 @@
 //! DeepFilterNet3 with the fetched models (`scripts/fetch-models.sh`, or
-//! `TESSERA_MODEL_DIR`): latency, cost per frame, and noise reduction
+//! `TWICECAT_MODEL_DIR`): latency, cost per frame, and noise reduction
 //! against RNNoise on the same input.
 //!
-//! On real speech: set `TESSERA_SPEECH_WAV` and `TESSERA_NOISE_WAV` to
+//! On real speech: set `TWICECAT_SPEECH_WAV` and `TWICECAT_NOISE_WAV` to
 //! 48 kHz mono 16-bit WAV files (not shipped: recordings carry their own
 //! licences).
 
 use std::time::{Duration, Instant};
 
-use tessera_audio::{
+use twicecat_audio::{
     CaptureChain, ChainSettings, DeepFilter, DeepFilterModel, FRAME_LEN, Frame, GateMode,
     LEVEL_FLOOR_DB, NoiseMode, default_model_dir, flush_denormals_on_this_thread,
 };
@@ -149,13 +149,13 @@ fn snr_aligned(clean: &[f32], out: &[f32], skip: usize) -> (f32, usize) {
 }
 
 #[test]
-#[ignore = "needs scripts/fetch-models.sh and TESSERA_SPEECH_WAV / TESSERA_NOISE_WAV"]
+#[ignore = "needs scripts/fetch-models.sh and TWICECAT_SPEECH_WAV / TWICECAT_NOISE_WAV"]
 fn on_real_speech_deep_filter_improves_the_snr_more_than_rnnoise() {
     let (Ok(speech), Ok(noise)) = (
-        std::env::var("TESSERA_SPEECH_WAV"),
-        std::env::var("TESSERA_NOISE_WAV"),
+        std::env::var("TWICECAT_SPEECH_WAV"),
+        std::env::var("TWICECAT_NOISE_WAV"),
     ) else {
-        eprintln!("skipped: set TESSERA_SPEECH_WAV and TESSERA_NOISE_WAV");
+        eprintln!("skipped: set TWICECAT_SPEECH_WAV and TWICECAT_NOISE_WAV");
         return;
     };
     flush_denormals_on_this_thread();

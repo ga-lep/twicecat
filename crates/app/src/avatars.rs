@@ -12,7 +12,7 @@ use std::io::Cursor;
 use iced::Color;
 use iced::widget::image::Handle;
 use image::{ImageFormat, ImageReader, Limits};
-use tessera_core::api::{AvatarId, AvatarImage, RoomId};
+use twicecat_core::api::{AvatarId, AvatarImage, RoomId};
 
 use crate::text_safety;
 
@@ -162,7 +162,7 @@ pub fn decode_avatar(bytes: &[u8]) -> Option<Handle> {
 /// [`NEUTRAL_INITIALS`].
 ///
 /// ```
-/// use tessera_app::avatars::initials;
+/// use twicecat_app::avatars::initials;
 /// assert_eq!(initials("alice smith"), "AS");
 /// assert_eq!(initials("#room:server"), "R");
 /// assert_eq!(initials(""), "?");

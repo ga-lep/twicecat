@@ -2,7 +2,7 @@
 Status: APPROVED
 
 ## Goal
-Turn `tessera-app` into a working desktop shell on top of the approved Phase 1 core API. At startup the app builds a dedicated tokio runtime and starts `Core` on it. Commands go down the core's `mpsc` channel with non-blocking sends from `update`. Core events come back through an Iced `Subscription` that turns each `CoreEvent` into an app `Message`. `update` never awaits network work and never touches an SDK type. The room list and the selected room's timeline are applied diff by diff (`ListDiff`, the SDK-free mirror of all 11 `VectorDiff` variants) to plain `Vec`s in app state. Lists are never rebuilt. The core API grows additively, with no breaking change to the approved contract:
+Turn `twicecat-app` into a working desktop shell on top of the approved Phase 1 core API. At startup the app builds a dedicated tokio runtime and starts `Core` on it. Commands go down the core's `mpsc` channel with non-blocking sends from `update`. Core events come back through an Iced `Subscription` that turns each `CoreEvent` into an app `Message`. `update` never awaits network work and never touches an SDK type. The room list and the selected room's timeline are applied diff by diff (`ListDiff`, the SDK-free mirror of all 11 `VectorDiff` variants) to plain `Vec`s in app state. Lists are never rebuilt. The core API grows additively, with no breaking change to the approved contract:
 - richer `RoomSummary` view models: avatar ID, DM/space/invite flags, highlight count, marked-unread, a redacted last-message preview;
 - a room-list query (tabs DMs / Rooms / Spaces / All plus a search filter, built on the SDK's room-list filters);
 - room-list paging;
@@ -60,10 +60,10 @@ Each implementing task re-confirms the APIs it uses (AGENTS.md rule 2) and cites
   - **the media cache lives in the SQLite media store that `sqlite_store(path, passphrase)` opens with the same path and passphrase as the state store** (client/builder/mod.rs:801-820). It is on disk, encrypted, per session, and removed with the session dir at logout.
 - **Test helpers available:** `Client::create_dm(&UserId)` (client/mod.rs:1964), `Client::create_room(Request)` :1931 (a space via `creation_content` `type: m.space`), `Room::upload_avatar` (room/mod.rs:3040).
 - **Current repo state:**
-  - `crates/app` is a bin-only crate with `iced = "=0.14.0"` and `tessera-core`.
+  - `crates/app` is a bin-only crate with `iced = "=0.14.0"` and `twicecat-core`.
   - `Core::start(CoreConfig, Arc<dyn SecretStore>) -> CoreHandle { commands: mpsc::Sender<Command> (cap 32), events: mpsc::Receiver<CoreEvent> (cap 256) }` must run inside a tokio runtime (engine.rs:72).
   - `forward_room_list` (engine.rs:195) keeps the controller local, so filters and paging can't be changed today.
-  - `RoomSummary` derives `Debug` and is built literally in `room_list.rs:41` and the CLI tests (tessera-cli.rs:807). The CLI matches `CoreEvent` exhaustively (tessera-cli.rs:598).
+  - `RoomSummary` derives `Debug` and is built literally in `room_list.rs:41` and the CLI tests (twicecat-cli.rs:807). The CLI matches `CoreEvent` exhaustively (twicecat-cli.rs:598).
   - `scripts/check-app-deps.sh` already runs in the `lint` CI job.
 - **No rule-8 blocker.** Every API the roadmap names for this phase exists in the pinned versions: the room list's built-in filters, the media API, the `Subscription`, and the `image` widget.
 
@@ -85,7 +85,7 @@ Each implementing task re-confirms the APIs it uses (AGENTS.md rule 2) and cites
      - `tokio-stream` (`futures::stream::unfold` is enough).
 2. **Q2: deny.toml.** RECOMMENDED: no change (`cargo deny check` passes with the new crates). Adopted under the human's standing pre-authorization (2026-10-01; revisit at checkpoint). Rejected: pre-emptive allowlist additions.
 3. **Q3: who owns the core runtime.** RECOMMENDED, adopted under the human's standing pre-authorization (2026-10-01; revisit at checkpoint):
-   - The app's `bridge` module builds a dedicated `tokio::runtime::Builder::new_multi_thread().enable_all().thread_name("tessera-core")` runtime at startup and calls `Core::start` under `rt.enter()`.
+   - The app's `bridge` module builds a dedicated `tokio::runtime::Builder::new_multi_thread().enable_all().thread_name("twicecat-core")` runtime at startup and calls `Core::start` under `rt.enter()`.
    - The app state owns the runtime and shuts it down with `shutdown_timeout(5 s)` after `Shutdown`.
    - Iced keeps its default executor; tokio `mpsc` channels work across executors.
    - Rejected: iced's `tokio` executor shared with the core (couples UI scheduling to SDK load, against the roadmap's "own runtime"), and starting the runtime inside a subscription stream (hidden global; drop-in-async-context hazards).
@@ -141,7 +141,7 @@ Each implementing task re-confirms the APIs it uses (AGENTS.md rule 2) and cites
     - Phase 3's timeline virtualization can reuse the pure function.
     - Rejected: building all 2,000 rows per frame, and iced `lazy` (an extra feature that doesn't cut layout of off-screen rows).
 13. **Q13: theme.** RECOMMENDED, adopted under the human's standing pre-authorization (2026-10-01; revisit at checkpoint):
-    - Two custom palettes, `Theme::custom("Tessera Light", ..)` and `Theme::custom("Tessera Dark", ..)`.
+    - Two custom palettes, `Theme::custom("Twicecat Light", ..)` and `Theme::custom("Twicecat Dark", ..)`.
     - The mode comes from `system::theme()` at boot and from `system::theme_changes()`. `Mode::None` maps to light.
     - Badge and highlight colours derive from the palette.
     - `ICED_THEME` still overrides iced's own default; this is documented, not removed.
@@ -152,7 +152,7 @@ Each implementing task re-confirms the APIs it uses (AGENTS.md rule 2) and cites
     - Formatting, virtualization, pagination and the real composer are Phase 3.
     - Rejected: a placeholder only (the human couldn't check live updates or sending), and a full timeline (Phase 3 scope).
 16. **Q16: app integration tests in CI.** RECOMMENDED, adopted under the human's standing pre-authorization (2026-10-01; revisit at checkpoint):
-    - The `integration` CI job and the agent's ignored-test gate become `cargo test -p tessera-core -p tessera-app --locked -- --ignored --skip keyring`. Same `#[ignore = "needs local homeserver: docker compose up -d --wait"]` convention, verbatim.
+    - The `integration` CI job and the agent's ignored-test gate become `cargo test -p twicecat-core -p twicecat-app --locked -- --ignored --skip keyring`. Same `#[ignore = "needs local homeserver: docker compose up -d --wait"]` convention, verbatim.
     - The headless app test drives the real bridge and `update` without opening a window.
     - Rejected: app tests only on the human list.
 17. **Q17: the 16 ms timing test.** RECOMMENDED, adopted under the human's standing pre-authorization (2026-10-01; revisit at checkpoint):
@@ -166,7 +166,7 @@ Each implementing task re-confirms the APIs it uses (AGENTS.md rule 2) and cites
 19. **Q19: secrets in the UI.** RECOMMENDED, adopted under the human's standing pre-authorization (2026-10-01; revisit at checkpoint):
     - The password field's message and state hold `api::Password` (`on_input(|s| Message::PasswordChanged(Password::from(s)))`; the widget reads `expose()`). The composer holds `api::MessageText`. So a `Debug` of any `Message` or state field never shows a password, a message body or a preview.
     - On submit the password is moved into the command and the field is cleared.
-    - The app never logs `Message`s. It calls `tessera_core::logging::init("warn,tessera_core=info,tessera_app=info")`.
+    - The app never logs `Message`s. It calls `twicecat_core::logging::init("warn,twicecat_core=info,twicecat_app=info")`.
     - Residual: iced's own text-input buffers aren't zeroized. This is documented as an open issue.
     - Rejected: plain `String` fields.
 20. **Q20: app identity and storage.** RECOMMENDED: the app uses the same `DataPaths::from_os()` and `KeyringSecretStore::new(KEYCHAIN_SERVICE)` as the CLI, so a session made in one restores in the other. Running both at once on one data dir is unsupported (SQLite store lock); this is documented in PROGRESS.md and the app's `--help`. Adopted under the human's standing pre-authorization (2026-10-01; revisit at checkpoint). Rejected: a separate app identity (two logins, two devices).
@@ -181,7 +181,7 @@ Each implementing task re-confirms the APIs it uses (AGENTS.md rule 2) and cites
 ### Conventions for every task
 - **Gate (rule 4), required before each commit:**
   - `cargo fmt --all --check && cargo clippy --workspace --all-targets --all-features --locked -- -D warnings && cargo test --workspace --locked`, plus `scripts/check-app-deps.sh`, `scripts/check-core-api.sh` and `cargo deny check`.
-  - Tasks that touch the core or the bridge also run `docker compose up -d --wait && scripts/create-test-users.sh && cargo test -p tessera-core -p tessera-app --locked -- --ignored --skip keyring` (before Task 6, `-p tessera-core` only), then `docker compose stop`.
+  - Tasks that touch the core or the bridge also run `docker compose up -d --wait && scripts/create-test-users.sh && cargo test -p twicecat-core -p twicecat-app --locked -- --ignored --skip keyring` (before Task 6, `-p twicecat-core` only), then `docker compose stop`.
   - The agent never runs the real-keychain test.
 - **One commit per task**, message `phase2.<task number>: <summary>`, attribution trailer as instructed by the session. ROADMAP.md is never committed.
 - **PROGRESS.md (rule 5).**
@@ -193,7 +193,7 @@ Each implementing task re-confirms the APIs it uses (AGENTS.md rule 2) and cites
     - new human items.
   - Rendering, theme following, browser opening, OS behaviour and responsiveness go on the human list, never ticked by the agent (rule 9).
 - **Boundary (rule 7).**
-  - `crates/app` depends only on `tessera-core`, iced, image, tokio and open. It imports only `tessera_core::{api, Core, CoreConfig, CoreHandle, DEFAULT_ROOM_LIST_PAGE_SIZE, paths, secrets, logging}`.
+  - `crates/app` depends only on `twicecat-core`, iced, image, tokio and open. It imports only `twicecat_core::{api, Core, CoreConfig, CoreHandle, DEFAULT_ROOM_LIST_PAGE_SIZE, paths, secrets, logging}`.
   - `crates/core/src/api/` stays SDK-free (`check-core-api.sh`). SDK→API conversions stay private in the core.
 - **No network or blocking in `update`.** `update` only mutates state, calls `try_send`, and returns `Task`s. Blocking or slow work (opening the browser, timers) lives in `Task`s. Unit tests call `update` directly with a plain `tokio::sync::mpsc::channel` as the command sink and no runtime.
 - **Secrets hygiene (rule 6).** No password, token, message body, preview body or full OAuth URL reaches `tracing`, a file, or a `Debug` string. Every new public type that holds one has a redacted `Debug`, unit-tested with a sentinel value.
@@ -205,7 +205,7 @@ Files: crates/app/Cargo.toml, Cargo.lock, scripts/check-app-deps.sh, PROGRESS.md
 Depends on: none
 Acceptance criteria:
 - `crates/app/Cargo.toml` has exactly the Q1 additions. `iced` keeps `=0.14.0` and only gains `features = ["image-without-codecs"]`.
-- `cargo tree -p tessera-app --depth 1 -e normal` lists iced v0.14.0, image v0.25.x, tokio v1.x, open v5.x and tessera-core.
+- `cargo tree -p twicecat-app --depth 1 -e normal` lists iced v0.14.0, image v0.25.x, tokio v1.x, open v5.x and twicecat-core.
 - The `Cargo.lock` diff adds packages only. The 13 image crates plus open, is-wsl and is-docker are listed in PROGRESS.md, and no existing version changes.
 - `cargo deny check` passes with `deny.toml` unchanged.
 - `scripts/check-app-deps.sh` default pattern becomes `(matrix-sdk|matrix_sdk|ruma|eyeball|imbl)`, so the SDK's helper crates are refused too, and the comment says why.
@@ -214,12 +214,12 @@ Acceptance criteria:
   - shellcheck is clean, and the `lint` CI job is unchanged (it already runs the script).
 - PROGRESS.md gains the Phase 2 steps list, the pinned-versions lines, and a "Phase 2 human checkpoint" list seeded with:
   - CI green on Linux, Windows and macOS with the new dependencies;
-  - "Don't run tessera-cli and the app on the same data dir at once" (Q20).
+  - "Don't run twicecat-cli and the app on the same data dir at once" (Q20).
 - Gate passes (the app still builds; unused deps are allowed for this commit). Commit: `phase2.1: app dependencies and stricter app boundary check`.
 
 ### Task 2: Additive core API for Phase 2
 Language: rust
-Files: crates/core/src/api/mod.rs, crates/core/src/api/types.rs, crates/core/src/room_list.rs, crates/core/src/engine.rs, crates/core/src/bin/tessera-cli.rs, PROGRESS.md
+Files: crates/core/src/api/mod.rs, crates/core/src/api/types.rs, crates/core/src/room_list.rs, crates/core/src/engine.rs, crates/core/src/bin/twicecat-cli.rs, PROGRESS.md
 Depends on: Task 1
 Acceptance criteria:
 - The API has exactly the Q6 additions, all `Clone + Debug`, SDK-free and documented. `scripts/check-core-api.sh` exits 0.
@@ -234,7 +234,7 @@ Acceptance criteria:
 
   Each behaviour is unit-tested with the engine's test helper (no network).
 - The CLI handles `RoomListLoaded` and `Avatar` by ignoring them (exhaustive match kept). Its existing tests pass.
-- Gate and the ignored run (`-p tessera-core`) pass. Commit: `phase2.2: additive core api for room list queries, previews and avatars`.
+- Gate and the ignored run (`-p twicecat-core`) pass. Commit: `phase2.2: additive core api for room list queries, previews and avatars`.
 
 ### Task 3: Room view models in the core: flags, highlights, avatar ID, preview, loaded signal (roadmap step 3)
 Language: rust
@@ -267,7 +267,7 @@ Acceptance criteria:
   - `LoadMoreRooms` reaches the forwarder through a small channel and calls `add_one_page()`. With no active sync it's a no-op.
 - `build_filter` is built from a pure `filter_spec(&RoomListQuery) -> Vec<FilterPart>`. Unit tests check the Q7 table for each tab, with and without search, and that whitespace-only search adds no name filter.
 - Integration tests (verbatim ignore reason; unique room names per run):
-  - **search**: two rooms `tessera-a-<rand>` and `tessera-b-<rand>`. After `SetRoomListQuery { search: "tessera-a-<rand>" }` the next applied `Reset` plus diffs contain only the first.
+  - **search**: two rooms `twicecat-a-<rand>` and `twicecat-b-<rand>`. After `SetRoomListQuery { search: "twicecat-a-<rand>" }` the next applied `Reset` plus diffs contain only the first.
   - **tabs**: with a DM and a space from the Task 3 helpers, `People` shows the DM and not the space, `Rooms` shows neither, and `Spaces` shows only the space.
   - **paging**: with `room_list_page_size = 2` in the test `CoreConfig` and at least 3 rooms, the list holds 2 rooms, then 3 or more after `LoadMoreRooms`.
 - Gate and the ignored run pass. Commit: `phase2.4: room list tabs, search and paging via sdk filters`.
@@ -296,10 +296,10 @@ Language: rust
 Files: crates/app/src/lib.rs, crates/app/src/main.rs, crates/app/src/bridge.rs, crates/app/src/state.rs, crates/app/tests/bridge.rs, .github/workflows/ci.yml, PROGRESS.md
 Depends on: Task 5
 Acceptance criteria:
-- The `tessera-app` crate has a lib target plus the `tessera` bin. `main.rs` only:
+- The `twicecat-app` crate has a lib target plus the `twicecat` bin. `main.rs` only:
   - parses `--data-dir`, `--homeserver`, `--ephemeral`, `--help` (same meaning as the CLI; `--help` carries the Q20 note);
   - calls `logging::init` (Q19);
-  - runs `iced::application(App::boot, App::update, App::view)` with `.title("Tessera")`, `.subscription`, `.theme`, `.exit_on_close_request(false)`.
+  - runs `iced::application(App::boot, App::update, App::view)` with `.title("Twicecat")`, `.subscription`, `.theme`, `.exit_on_close_request(false)`.
 
   The existing title test is kept.
 - `bridge.rs` follows Q3/Q4:
@@ -315,7 +315,7 @@ Acceptance criteria:
   - it feeds `Message::LoginSubmitted` with alice's credentials and pumps events from the slot's stream into `update`;
   - the state reaches `Screen::Main` and holds at least one room within 60 s;
   - it sends `Shutdown`, and `CoreClosed` arrives within 10 s.
-- The CI `integration` job command becomes `cargo test -p tessera-core -p tessera-app --locked -- --ignored --skip keyring` (Q16). actionlint is clean.
+- The CI `integration` job command becomes `cargo test -p twicecat-core -p twicecat-app --locked -- --ignored --skip keyring` (Q16). actionlint is clean.
 - Gate and the ignored run (both packages) pass; `scripts/check-app-deps.sh` exits 0. Commit: `phase2.6: app library split and core bridge via subscription`.
 
 ### Task 7: Room list and timeline state from diffs, and the 2,000-room timing test (roadmap step 2)
@@ -343,7 +343,7 @@ Language: rust
 Files: crates/app/src/theme.rs, crates/app/src/lib.rs, PROGRESS.md
 Depends on: Task 7
 Acceptance criteria:
-- `theme.rs` defines `LIGHT` and `DARK` `Palette` constants, `fn theme_for(mode: Mode) -> Theme` (`Dark` gives "Tessera Dark"; `Light` and `None` give "Tessera Light"), and the semantic colours used by later tasks: badge, highlight badge, muted text and selection.
+- `theme.rs` defines `LIGHT` and `DARK` `Palette` constants, `fn theme_for(mode: Mode) -> Theme` (`Dark` gives "Twicecat Dark"; `Light` and `None` give "Twicecat Light"), and the semantic colours used by later tasks: badge, highlight badge, muted text and selection.
 - `App::theme` returns `Some(theme_for(state.mode))`. `Message::ThemeMode(mode)` comes from boot's `system::theme()` and from `system::theme_changes()` in the subscription batch.
 - Unit tests:
   - `theme_for` names and `extended_palette().is_dark` for all 3 modes;

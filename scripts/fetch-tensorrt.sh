@@ -5,15 +5,15 @@
 # in scripts/tensorrt.sha256. Only what ONNX Runtime's TensorRT provider
 # loads is unpacked: the runtime, its ONNX parser and plugins, and the
 # engine builder's resources for this machine's GPU (from nvidia-smi; all of
-# them when it is missing) plus the portable PTX ones. Tessera preloads them
-# from the printed directory (or TESSERA_TENSORRT_DIR).
+# them when it is missing) plus the portable PTX ones. Twicecat preloads them
+# from the printed directory (or TWICECAT_TENSORRT_DIR).
 # Needs scripts/fetch-cuda-runtime.sh (or a system CUDA 13 + cuDNN 9).
 #
 # The libraries are NVIDIA's, under NVIDIA's licence (copied next to them);
 # the wheel is 3.7 GB, about 1.2 GB stays unpacked for one GPU.
 #
 # Usage: scripts/fetch-tensorrt.sh
-# Env: TESSERA_CUDA_CACHE overrides the cache root (as fetch-cuda-runtime.sh).
+# Env: TWICECAT_CUDA_CACHE overrides the cache root (as fetch-cuda-runtime.sh).
 # Progress goes to stderr; stdout carries only the path.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -54,7 +54,7 @@ read -r expected url < <(awk -v a="$arch" '!/^#/ && $2 == a {print $1, $3}' "$su
 archs=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | tr -d '.\r' | sort -u | sed 's/^/sm/' | tr '\n' ' ' || true)
 pinned="$expected ${archs:-all}"
 
-cache_root="${TESSERA_CUDA_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/tessera/cuda}"
+cache_root="${TWICECAT_CUDA_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/twicecat/cuda}"
 dest="$cache_root/tensorrt-$version"
 marker="$dest/.verified"
 

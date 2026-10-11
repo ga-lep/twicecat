@@ -7,13 +7,13 @@ mod common;
 use std::sync::Arc;
 
 use common::{expect_event, start_core, start_core_with_audio};
-use tessera_core::CoreHandle;
-use tessera_core::api::{
+use twicecat_core::CoreHandle;
+use twicecat_core::api::{
     AudioSettings, CallIntent, Command, CoreError, CoreEvent, InputMode, PushToTalkBindings,
     RoomId, UserId,
 };
-use tessera_core::paths::DataPaths;
-use tessera_core::secrets::InMemorySecretStore;
+use twicecat_core::paths::DataPaths;
+use twicecat_core::secrets::InMemorySecretStore;
 
 fn core(dir: &std::path::Path) -> CoreHandle {
     start_core(dir, Arc::new(InMemorySecretStore::new()))
@@ -158,7 +158,7 @@ async fn listing_audio_devices_answers_without_assuming_hardware() {
 }
 
 /// Human-run (AGENTS.md rule 9): opens the real microphone for about a
-/// second. Run with `cargo test -p tessera-core -- --ignored hardware_`.
+/// second. Run with `cargo test -p twicecat-core -- --ignored hardware_`.
 #[tokio::test]
 #[ignore = "needs a microphone; opens it for about a second (human-run)"]
 async fn hardware_mic_test_reports_levels() {
@@ -166,7 +166,7 @@ async fn hardware_mic_test_reports_levels() {
     let mut handle = start_core_with_audio(
         dir.path(),
         Arc::new(InMemorySecretStore::new()),
-        tessera_core::api::AudioBackend::System,
+        twicecat_core::api::AudioBackend::System,
     );
     send(&handle, Command::StartMicTest { loopback: false }).await;
     for _ in 0..10 {

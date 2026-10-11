@@ -7,7 +7,7 @@
 //! graph, one GPU call per frame for all ([`bank`]).
 //!
 //! The models are fetched by `scripts/fetch-models.sh` (pinned SHA-256)
-//! into the cache dir, or found in `TESSERA_MODEL_DIR`. Loading takes a
+//! into the cache dir, or found in `TWICECAT_MODEL_DIR`. Loading takes a
 //! while (the graphs are optimised for this CPU), so it happens off the
 //! audio thread; the loaded filter is then handed over.
 
@@ -42,17 +42,17 @@ pub(crate) const MAX_DB_ERB: f32 = 35.0;
 /// Above this only the ERB gains are applied, not the deep filter.
 pub(crate) const MAX_DB_DF: f32 = 35.0;
 
-/// The model directory: `TESSERA_MODEL_DIR`, else where
+/// The model directory: `TWICECAT_MODEL_DIR`, else where
 /// `scripts/fetch-models.sh` puts it.
 pub fn default_model_dir() -> Option<PathBuf> {
-    crate::paths::from_env_or_cache("TESSERA_MODEL_DIR", "models/deepfilternet3")
+    crate::paths::from_env_or_cache("TWICECAT_MODEL_DIR", "models/deepfilternet3")
 }
 
 /// The stateful graph for the GPU (`scripts/export-deepfilternet.sh`):
-/// `TESSERA_STATEFUL_MODEL`, else where that script installs it.
+/// `TWICECAT_STATEFUL_MODEL`, else where that script installs it.
 pub fn default_stateful_model() -> Option<PathBuf> {
     crate::paths::from_env_or_cache(
-        "TESSERA_STATEFUL_MODEL",
+        "TWICECAT_STATEFUL_MODEL",
         "models/deepfilternet3-stateful/deepfilternet3_stateful.onnx",
     )
 }

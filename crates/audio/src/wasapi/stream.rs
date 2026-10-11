@@ -117,9 +117,9 @@ pub(crate) fn open(
     let endpoint = endpoint.to_owned();
     let thread_stop = stop.clone();
     let name = match side {
-        Side::Capture { .. } => "tessera-wasapi-capture",
-        Side::Render { .. } => "tessera-wasapi-render",
-        Side::Loopback { .. } => "tessera-wasapi-loopback",
+        Side::Capture { .. } => "twicecat-wasapi-capture",
+        Side::Render { .. } => "twicecat-wasapi-render",
+        Side::Loopback { .. } => "twicecat-wasapi-loopback",
     };
     let thread = std::thread::Builder::new()
         .name(name.into())

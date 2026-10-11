@@ -5,14 +5,14 @@
 # Windows, Metal on macOS): Microsoft's wheel at a pinned version, checked
 # against the SHA-256 in scripts/checksums/webgpu-ep.sha256. Only the library (Dawn
 # inside, one file), its licence and its third-party notices are unpacked.
-# Tessera registers it with ONNX Runtime from the printed directory (or
-# TESSERA_WEBGPU_EP_DIR). Needs scripts/fetch-onnxruntime.sh (1.24.4 or
+# Twicecat registers it with ONNX Runtime from the printed directory (or
+# TWICECAT_WEBGPU_EP_DIR). Needs scripts/fetch-onnxruntime.sh (1.24.4 or
 # later) and, on Linux, a Vulkan loader (libvulkan.so.1) and driver.
 #
 # Usage: scripts/fetch-webgpu-ep.sh [platform]
 #   platform: linux-x64 | linux-aarch64 | win-x64 | win-arm64 | osx-arm64
 #             (default: the host)
-# Env: TESSERA_ONNXRUNTIME_CACHE overrides the cache root (as
+# Env: TWICECAT_ONNXRUNTIME_CACHE overrides the cache root (as
 # fetch-onnxruntime.sh). Progress goes to stderr; stdout carries only the path.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -60,7 +60,7 @@ esac
 # What was unpacked is part of the marker, so an older cache is redone.
 pinned="$expected ${libraries[*]}"
 
-cache_root="${TESSERA_ONNXRUNTIME_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/tessera/onnxruntime}"
+cache_root="${TWICECAT_ONNXRUNTIME_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/twicecat/onnxruntime}"
 dest="$cache_root/webgpu-ep-$version"
 marker="$dest/.verified"
 

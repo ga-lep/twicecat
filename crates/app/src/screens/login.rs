@@ -9,7 +9,7 @@ use std::fmt;
 
 use iced::widget::{button, column, container, row, text, text_input};
 use iced::{Element, Fill};
-use tessera_core::api::Password;
+use twicecat_core::api::Password;
 
 use crate::state::{App, Message};
 
@@ -196,7 +196,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
     let submit = (!busy).then_some(Message::LoginSubmitted);
     let browser = (!busy && !form.server.trim().is_empty()).then_some(Message::OAuthRequested);
 
-    let mut fields = column![text("Tessera").size(32)]
+    let mut fields = column![text("Twicecat").size(32)]
         .spacing(12)
         .max_width(FORM_WIDTH);
     if let Some(notice) = &app.notice {

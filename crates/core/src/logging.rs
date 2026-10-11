@@ -8,7 +8,7 @@ use thiserror::Error;
 use tracing_subscriber::EnvFilter;
 
 /// Default filter: warnings from everything, info from the core.
-pub const DEFAULT_FILTER: &str = "warn,tessera_core=info";
+pub const DEFAULT_FILTER: &str = "warn,twicecat_core=info";
 
 /// Why [`init`] failed.
 #[derive(Debug, Error)]
@@ -59,7 +59,7 @@ mod tests {
     fn default_filter_is_used_without_env() {
         let f = build_filter(DEFAULT_FILTER, None).unwrap();
         let text = f.to_string();
-        assert!(text.contains("tessera_core=info"), "{text}");
+        assert!(text.contains("twicecat_core=info"), "{text}");
         assert!(text.contains("warn"), "{text}");
     }
 
@@ -71,16 +71,16 @@ mod tests {
 
     #[test]
     fn empty_or_invalid_env_falls_back_to_the_default() {
-        for env in ["", "tessera_core=nonsense[["] {
+        for env in ["", "twicecat_core=nonsense[["] {
             let f = build_filter(DEFAULT_FILTER, Some(env)).unwrap();
-            assert!(f.to_string().contains("tessera_core=info"), "{env}");
+            assert!(f.to_string().contains("twicecat_core=info"), "{env}");
         }
     }
 
     #[test]
     fn invalid_default_is_an_error() {
         assert!(matches!(
-            build_filter("tessera_core=nonsense[[", None),
+            build_filter("twicecat_core=nonsense[[", None),
             Err(LogInitError::InvalidDefaultFilter)
         ));
     }

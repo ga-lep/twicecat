@@ -8,7 +8,7 @@
 
 use iced::widget::{Column, button, container, image, scrollable, space, text, tooltip};
 use iced::{Background, Color, Element, border};
-use tessera_core::api::{RoomId, SpaceView};
+use twicecat_core::api::{RoomId, SpaceView};
 
 use crate::avatars::{AvatarState, Avatars, NEUTRAL_INITIALS, initials, placeholder_color};
 use crate::spaces::{Entry, SpacesMessage};

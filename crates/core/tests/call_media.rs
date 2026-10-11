@@ -18,13 +18,13 @@ use common::{
     start_core_with_audio, start_core_with_call_service, unique_room_name, wait_for_room,
 };
 use serde_json::Value;
-use tessera_core::CoreHandle;
-use tessera_core::api::{
+use twicecat_core::CoreHandle;
+use twicecat_core::api::{
     AUDIO_FRAME_LEN, AudioBackend, AudioProcessing, AudioSettings, CallIntent, CallState,
     CleaningStatus, Command, CoreEvent, InputMode, ListDiff, NoiseSuppression, Participant,
     Password, RoomId, SkipReason, SyncState, UserId, VirtualAudio, VoiceCleaning,
 };
-use tessera_core::secrets::InMemorySecretStore;
+use twicecat_core::secrets::InMemorySecretStore;
 
 const TONE_HZ: f32 = 1000.0;
 const RATE: f32 = 48_000.0;
@@ -907,7 +907,7 @@ async fn remote_voices_are_cleaned_on_the_gpu() {
     let on = expect_event(&mut alice, |e| {
         matches!(
             e,
-            CoreEvent::AudioStats(tessera_core::api::AudioStats {
+            CoreEvent::AudioStats(twicecat_core::api::AudioStats {
                 remote_cleaning: Some(_),
                 ..
             })
@@ -926,7 +926,7 @@ async fn remote_voices_are_cleaned_on_the_gpu() {
     assert!(
         matches!(
             stats.remote_cleaning,
-            Some(tessera_core::api::EnhancerBackend::Gpu { .. })
+            Some(twicecat_core::api::EnhancerBackend::Gpu { .. })
         ),
         "{:?}",
         stats.remote_cleaning
@@ -994,8 +994,8 @@ async fn without_a_gpu_voices_are_cleaned_on_the_cpu() {
     expect_event(&mut alice, |e| {
         matches!(
             e,
-            CoreEvent::AudioStats(tessera_core::api::AudioStats {
-                remote_cleaning: Some(tessera_core::api::EnhancerBackend::Cpu),
+            CoreEvent::AudioStats(twicecat_core::api::AudioStats {
+                remote_cleaning: Some(twicecat_core::api::EnhancerBackend::Cpu),
                 ..
             })
         )
@@ -1012,7 +1012,7 @@ async fn without_a_gpu_voices_are_cleaned_on_the_cpu() {
     }
 }
 
-/// Carol says her microphone is cleaned before Tessera: alice, cleaning the
+/// Carol says her microphone is cleaned before Twicecat: alice, cleaning the
 /// voices she hears, leaves carol's alone; once carol stops saying so (or
 /// alice sets her to always), alice cleans it.
 #[tokio::test]

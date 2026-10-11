@@ -1,6 +1,6 @@
-//! Parsing the call and audio commands of `tessera-cli`.
+//! Parsing the call and audio commands of `twicecat-cli`.
 
-use tessera_core::api::{NoiseSuppression, NsLevel, SkipCleaned, VoiceCleaning};
+use twicecat_core::api::{NoiseSuppression, NsLevel, SkipCleaned, VoiceCleaning};
 
 /// A parsed call or audio command.
 #[derive(Clone, Debug, PartialEq)]
@@ -54,7 +54,7 @@ pub(crate) enum CleanArg {
     Skip(SkipCleaned),
     /// Announce our suppressor.
     Announce(bool),
-    /// Our microphone is cleaned before Tessera.
+    /// Our microphone is cleaned before Twicecat.
     Outside(bool),
     /// Clean on a GPU.
     Gpu(bool),

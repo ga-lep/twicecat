@@ -14,9 +14,11 @@ use common::{
     start_core, unique_room_name, wait_for_room,
 };
 use serde_json::Value;
-use tessera_core::CoreHandle;
-use tessera_core::api::{CallIntent, CallState, Command, CoreEvent, ListDiff, RoomId, RoomSummary};
-use tessera_core::secrets::InMemorySecretStore;
+use twicecat_core::CoreHandle;
+use twicecat_core::api::{
+    CallIntent, CallState, Command, CoreEvent, ListDiff, RoomId, RoomSummary,
+};
+use twicecat_core::secrets::InMemorySecretStore;
 
 async fn logged_in(dir: &std::path::Path, n: u8) -> CoreHandle {
     let env = TestEnv::load();

@@ -12,7 +12,7 @@
 use std::fmt;
 
 use iced::Task;
-use tessera_core::api::{Command, RoomId, RoomListQuery, SpaceView};
+use twicecat_core::api::{Command, RoomId, RoomListQuery, SpaceView};
 
 use crate::state::{App, Message};
 

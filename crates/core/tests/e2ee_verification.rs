@@ -16,14 +16,14 @@ use common::{
     pump_recording, pump_with, raw_login_named, reset_e2ee_account, reset_identity_on, start_core,
     try_pump_with,
 };
-use tessera_core::CoreHandle;
-use tessera_core::api::{
+use twicecat_core::CoreHandle;
+use twicecat_core::api::{
     ActionKind, CancelReason, Command, CoreError, CoreEvent, CrossSigning, DeviceVerification,
     ListDiff, Password, PlaceholderKind, RecoveryStatus, RoomId, SasEmoji, SendStatus,
     TimelineItem, TimelineItemKind, UserId, UserTrust, VerificationId, VerificationPeer,
     VerificationPhase,
 };
-use tessera_core::secrets::InMemorySecretStore;
+use twicecat_core::secrets::InMemorySecretStore;
 
 /// Set by the tests that talk to a peer that can scan, so `phase` lets
 /// `ShowQr` through. Tests run one at a time under `e2ee_serial`.
@@ -37,7 +37,7 @@ async fn phase(
     want: impl Fn(&VerificationPhase) -> bool,
 ) -> VerificationPhase {
     let event = expect_event(core, |e| {
-        // Two Tessera cores never offer a QR code to each other (neither
+        // Two Twicecat cores never offer a QR code to each other (neither
         // advertises scanning); tests that expect one use `qr_phase`.
         if let CoreEvent::Verification {
             phase: VerificationPhase::ShowQr(_),
@@ -45,7 +45,7 @@ async fn phase(
         } = e
             && !QR_EXPECTED.load(std::sync::atomic::Ordering::SeqCst)
         {
-            panic!("a QR code was shown between two Tessera cores");
+            panic!("a QR code was shown between two Twicecat cores");
         }
         matches!(e, CoreEvent::Verification { id: i, phase } if i == id && want(phase))
     })
@@ -127,7 +127,7 @@ async fn alice_with_second_device() -> (CoreHandle, CoreHandle, [tempfile::TempD
 /// nothing, and the SDK does not ask again.
 async fn wait_for_backed_up_key(n: u8) {
     use matrix_sdk::ruma::api::client::backup::get_latest_backup_info;
-    let client = raw_login_named(n, "tessera-e2ee-view").await;
+    let client = raw_login_named(n, "twicecat-e2ee-view").await;
     let wait = async {
         loop {
             if let Ok(info) = client
@@ -315,7 +315,7 @@ async fn self_verification_verifies_the_device_and_decrypts_history() {
                             ..
                         }
                     ),
-                    "a QR code was shown between two Tessera cores"
+                    "a QR code was shown between two Twicecat cores"
                 );
                 if let CoreEvent::Verification {
                     id: i,
@@ -398,8 +398,8 @@ async fn user_verification_in_a_dm_verifies_both_users() {
     reset_e2ee_account(1).await;
     reset_e2ee_account(3).await;
     let env = TestEnv::load();
-    let alice_raw = raw_login_named(1, "tessera-e2ee-setup").await;
-    let carol_raw = raw_login_named(3, "tessera-e2ee-setup").await;
+    let alice_raw = raw_login_named(1, "twicecat-e2ee-setup").await;
+    let carol_raw = raw_login_named(3, "twicecat-e2ee-setup").await;
     let room_id = create_dm(&alice_raw, &env.user_id(3)).await;
     carol_raw
         .join_room_by_id(&room_id)
@@ -574,8 +574,8 @@ async fn a_second_incoming_request_from_another_user_is_cancelled() {
     // A DM between alice and carol (the SDK's own check cancels two requests
     // of one user, so the core's check is exercised by a different user).
     let (mut first, mut second, _dirs) = alice_with_second_device().await;
-    let alice_raw = raw_login_named(1, "tessera-e2ee-setup").await;
-    let carol_raw = raw_login_named(3, "tessera-e2ee-setup").await;
+    let alice_raw = raw_login_named(1, "twicecat-e2ee-setup").await;
+    let carol_raw = raw_login_named(3, "twicecat-e2ee-setup").await;
     // Carol creates the DM, so that her `m.direct` has it and her request
     // goes there.
     let room_id = create_dm(&carol_raw, &env.user_id(1)).await;
@@ -677,7 +677,7 @@ struct ScanningPeer {
 
 impl ScanningPeer {
     async fn login() -> Self {
-        let client = raw_login_named(1, "tessera-test-qr").await;
+        let client = raw_login_named(1, "twicecat-test-qr").await;
         // The first sync uploads the device keys.
         client
             .sync_once(matrix_sdk::config::SyncSettings::default())
@@ -768,7 +768,7 @@ async fn core_showing_qr() -> (
     ScanningPeer,
     matrix_sdk::encryption::verification::VerificationRequest,
     VerificationId,
-    tessera_core::api::QrImage,
+    twicecat_core::api::QrImage,
 ) {
     reset_e2ee_account(1).await;
     let env = TestEnv::load();

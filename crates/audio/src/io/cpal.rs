@@ -351,7 +351,7 @@ impl Devices {
     }
 
     /// Windows: opens `device` through our own WASAPI client (streams marked
-    /// as calls; `crate::wasapi`), unless `TESSERA_AUDIO_BACKEND=cpal`.
+    /// as calls; `crate::wasapi`), unless `TWICECAT_AUDIO_BACKEND=cpal`.
     /// `None` when it cannot, and cpal then opens the device instead.
     #[cfg(target_os = "windows")]
     fn open_own(
@@ -359,7 +359,7 @@ impl Devices {
         device: &cpal::Device,
         kind: Own,
     ) -> Option<(crate::wasapi::Stream, OwnSide, StreamInfo)> {
-        if std::env::var_os("TESSERA_AUDIO_BACKEND").is_some_and(|v| v == "cpal") {
+        if std::env::var_os("TWICECAT_AUDIO_BACKEND").is_some_and(|v| v == "cpal") {
             return None;
         }
         let device_id = device.id().ok()?.to_string();
@@ -984,7 +984,7 @@ mod tests {
         // On Windows both are our own client's (marked as calls), not cpal's
         // fallback.
         #[cfg(target_os = "windows")]
-        if std::env::var_os("TESSERA_AUDIO_BACKEND").is_none() {
+        if std::env::var_os("TWICECAT_AUDIO_BACKEND").is_none() {
             assert!(matches!(devices.playback, Some(Held::Own(_))));
             assert!(matches!(devices.loopback, Some(Held::Own(_))));
         }

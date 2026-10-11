@@ -750,7 +750,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "timing: cargo test --release -p tessera-audio -- --ignored timing"]
+    #[ignore = "timing: cargo test --release -p twicecat-audio -- --ignored timing"]
     fn timing_full_chain_with_silent_far_end_stays_real_time() {
         // sonora#34: AEC3 slows 10-50x on a silent render reference unless
         // denormals are flushed. Each case on its own thread: the guard is

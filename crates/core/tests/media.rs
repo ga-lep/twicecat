@@ -14,13 +14,13 @@ use common::{
     login_and_run, pump, pump_recording, raw_login, send_attachment_raw, send_attachment_with,
     send_file_declaring_size, start_core, start_core_with_upload_limit,
 };
-use tessera_core::CoreHandle;
-use tessera_core::api::{
+use twicecat_core::CoreHandle;
+use twicecat_core::api::{
     ActionKind, AttachmentData, Command, CoreError, CoreEvent, ListDiff, MediaBytes, MediaContent,
     MediaKind, MediaSize, OutgoingAttachment, RoomId, RoomSummary, SendStatus, TimelineItem,
     TimelineItemKind, UploadThumbnail,
 };
-use tessera_core::secrets::InMemorySecretStore;
+use twicecat_core::secrets::InMemorySecretStore;
 
 const PHOTO: &[u8] = include_bytes!("fixtures/photo-1200x900.png");
 const THUMB: &[u8] = include_bytes!("fixtures/small-64x48.png");
@@ -33,7 +33,7 @@ fn media_item(items: &[TimelineItem], kind: MediaKind) -> Option<&TimelineItem> 
     })
 }
 
-fn media_of(item: &TimelineItem) -> &tessera_core::api::MediaContent {
+fn media_of(item: &TimelineItem) -> &twicecat_core::api::MediaContent {
     let TimelineItemKind::Message { details, .. } = &item.kind else {
         panic!("not a message");
     };
@@ -67,7 +67,7 @@ async fn login_with_limits(core: &mut CoreHandle, env: &TestEnv, n: u8) -> Optio
     core.commands
         .send(Command::LoginPassword {
             username: env.user(n).to_owned(),
-            password: tessera_core::api::Password::from(env.password(n)),
+            password: twicecat_core::api::Password::from(env.password(n)),
             server: None,
         })
         .await
@@ -76,7 +76,9 @@ async fn login_with_limits(core: &mut CoreHandle, env: &TestEnv, n: u8) -> Optio
     let wait = async {
         while !running || limit.is_none() {
             match core.events.recv().await {
-                Some(CoreEvent::SyncState(tessera_core::api::SyncState::Running)) => running = true,
+                Some(CoreEvent::SyncState(twicecat_core::api::SyncState::Running)) => {
+                    running = true
+                }
                 Some(CoreEvent::MediaLimits { max_upload_bytes }) => limit = Some(max_upload_bytes),
                 Some(_) => {}
                 None => panic!("event channel closed"),

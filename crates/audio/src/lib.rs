@@ -1,4 +1,4 @@
-//! Tessera audio: devices, I/O threads, and the voice engine (mixing,
+//! Twicecat audio: devices, I/O threads, and the voice engine (mixing,
 //! echo cancellation, noise suppression, gain, gate). Knows nothing about Matrix or LiveKit; the core
 //! adapts between this crate and the call.
 //!

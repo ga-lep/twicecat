@@ -12,12 +12,12 @@ use std::time::Duration;
 use iced::Subscription;
 use iced::Task;
 use iced::futures::{Stream, stream};
-use tessera_core::api::{Command, CoreEvent};
-use tessera_core::secrets::SecretStore;
-use tessera_core::{Core, CoreConfig};
 use tokio::runtime::{Builder, Handle, Runtime};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
+use twicecat_core::api::{Command, CoreEvent};
+use twicecat_core::secrets::SecretStore;
+use twicecat_core::{Core, CoreConfig};
 
 use crate::state::Message;
 
@@ -59,7 +59,7 @@ impl EventsSlot {
 
 impl Hash for EventsSlot {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        "tessera-core-events".hash(state);
+        "twicecat-core-events".hash(state);
     }
 }
 
@@ -138,7 +138,7 @@ impl Bridge {
     ) -> io::Result<(Self, EventsSlot)> {
         let runtime = Builder::new_multi_thread()
             .enable_all()
-            .thread_name("tessera-core")
+            .thread_name("twicecat-core")
             .build()?;
         let core = {
             let _guard = runtime.enter();
@@ -198,7 +198,7 @@ mod tests {
     use std::time::Instant;
 
     use iced::futures::StreamExt as _;
-    use tessera_core::api::SyncState;
+    use twicecat_core::api::SyncState;
 
     use super::*;
 

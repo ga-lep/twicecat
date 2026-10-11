@@ -1,4 +1,4 @@
-//! Call and audio commands of `tessera-cli`: parsing, settings edits, and
+//! Call and audio commands of `twicecat-cli`: parsing, settings edits, and
 //! the call shown in the terminal. Pure apart from what the caller prints
 //! and sends, so most of it is unit-tested.
 //!
@@ -11,7 +11,7 @@ mod show;
 use std::collections::{BTreeSet, HashMap};
 use std::time::{Duration, Instant};
 
-use tessera_core::api::{
+use twicecat_core::api::{
     AudioDevices, AudioSettings, CallEndReason, CallIntent, CallState, Command, CoreEvent,
     EnhancerBackend, InputLevel, InputMode, ListDiff, Participant, RoomId, RoomSummary, UserId,
 };
@@ -522,7 +522,7 @@ impl Calls {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tessera_core::api::{AudioDevice, AudioDeviceId, CleaningStatus, DeviceId, ParticipantId};
+    use twicecat_core::api::{AudioDevice, AudioDeviceId, CleaningStatus, DeviceId, ParticipantId};
 
     /// Commands have no `PartialEq` (passwords); compare their debug form.
     fn sent(commands: &[Command]) -> String {
@@ -810,7 +810,7 @@ mod tests {
 
     #[test]
     fn each_settings_command_changes_its_setting() {
-        use tessera_core::api::{NoiseSuppression, SkipCleaned};
+        use twicecat_core::api::{NoiseSuppression, SkipCleaned};
         let ptt = InputMode::PushToTalk {
             release_delay_ms: 300,
         };
@@ -881,7 +881,7 @@ mod tests {
 
     #[test]
     fn people_are_cleaned_by_choice_and_call_events_are_reported() {
-        use tessera_core::api::{GpuEnhancement, VoiceCleaning};
+        use twicecat_core::api::{GpuEnhancement, VoiceCleaning};
         let room = RoomId::from("!r:x");
         let mut calls = loaded();
         assert_eq!(

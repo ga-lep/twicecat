@@ -218,7 +218,7 @@ pub fn valid_server_name(name: &str) -> bool {
 }
 
 /// Parses a user ID, `@localpart:server`, as the core does.
-pub fn parse_user_id(text: &str) -> Option<tessera_core::api::UserId> {
+pub fn parse_user_id(text: &str) -> Option<twicecat_core::api::UserId> {
     let text = text.trim();
     let rest = text.strip_prefix('@')?;
     if text.len() > MAX_USER_ID_BYTES {
@@ -228,7 +228,7 @@ pub fn parse_user_id(text: &str) -> Option<tessera_core::api::UserId> {
     // Historical user IDs allow any visible ASCII; spaces, controls and
     // look-alike or bidirectional characters never.
     let local_ok = !local.is_empty() && local.bytes().all(|b| (0x21..=0x7E).contains(&b));
-    (local_ok && valid_server_name(server)).then(|| tessera_core::api::UserId::from(text))
+    (local_ok && valid_server_name(server)).then(|| twicecat_core::api::UserId::from(text))
 }
 
 /// Parses `#alias:server`, `!id:server` or a `https://matrix.to/#/...` link

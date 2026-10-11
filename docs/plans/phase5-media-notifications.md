@@ -2,7 +2,7 @@
 Status: APPROVED
 
 ## Goal
-Phase 5 adds what makes Tessera feel complete: images and files in the timeline (thumbnails, a full-size viewer, saving to disk), uploads (file picker, drag and drop, clipboard paste, thumbnails generated before sending, upload progress), desktop notifications driven by the SDK's push-rule evaluation and the room notification settings, a tray icon with an unread badge, room management (create, including encrypted rooms, join by alias, invite, leave, room settings, member list with power levels), spaces as a sidebar filter, threads in a side panel with their own `Timeline` focus, a Settings screen (profile, notifications, theme, keyboard shortcuts, a push-to-talk placeholder), and an accessibility pass (Ctrl+K room switcher, arrow keys in lists, documented screen-reader gap). It also closes the items earlier phases deferred here: mention pills labelled from their target (Phase 3 Q20), joining rooms from pills (Phase 3 Q24), creating encrypted rooms from the UI (Phase 4 Q17), and the deferred IME check (Phase 3) goes on this checkpoint.
+Phase 5 adds what makes Twicecat feel complete: images and files in the timeline (thumbnails, a full-size viewer, saving to disk), uploads (file picker, drag and drop, clipboard paste, thumbnails generated before sending, upload progress), desktop notifications driven by the SDK's push-rule evaluation and the room notification settings, a tray icon with an unread badge, room management (create, including encrypted rooms, join by alias, invite, leave, room settings, member list with power levels), spaces as a sidebar filter, threads in a side panel with their own `Timeline` focus, a Settings screen (profile, notifications, theme, keyboard shortcuts, a push-to-talk placeholder), and an accessibility pass (Ctrl+K room switcher, arrow keys in lists, documented screen-reader gap). It also closes the items earlier phases deferred here: mention pills labelled from their target (Phase 3 Q20), joining rooms from pills (Phase 3 Q24), creating encrypted rooms from the UI (Phase 4 Q17), and the deferred IME check (Phase 3) goes on this checkpoint.
 
 The core (behind the additive command/event API, Phase 2 Q6 convention) gains:
 - **Media:** media messages become `Message` items with a `MediaContent` description; the app fetches thumbnails and full files by timeline item (never by MXC URI or encryption key), and the core saves a file to a path the user picked. The SDK decrypts encrypted media.
@@ -56,7 +56,7 @@ Registry root: `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/`. Each i
   - `Thumbnail { data, content_type: Mime, height, width, size }` :154;
   - `AttachmentInfo::{Image(BaseImageInfo), Video, Audio, File, Voice}` :84;
   - `BaseImageInfo { height, width, size, blurhash, is_animated }` :34.
-- **No thumbnail generation in the SDK:** matrix-sdk 0.19.1 has no `image-proc`-style feature (Cargo.toml `[features]` read in full). Thumbnails must be made by Tessera (Q9).
+- **No thumbnail generation in the SDK:** matrix-sdk 0.19.1 has no `image-proc`-style feature (Cargo.toml `[features]` read in full). Thumbnails must be made by Twicecat (Q9).
 - `mime` is not re-exported by matrix-sdk or matrix-sdk-ui. matrix-sdk depends on `mime 0.3.17` (Cargo.toml:291), which is already in Cargo.lock.
 - `Client::load_or_fetch_max_upload_size() -> Result<UInt>` client/mod.rs:3690.
 
@@ -157,7 +157,7 @@ Registry root: `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/`. Each i
      - tray-icon default features (+47 packages, GTK3 bindings through `libappindicator`/`muda/gtk3`);
      - rfd `gtk3`;
      - arboard `wayland-data-control` (wlr-data-control, which GNOME does not implement);
-     - `mime_guess`/`infer` (a small in-house extension table plus `image::guess_format` covers what Tessera sends);
+     - `mime_guess`/`infer` (a small in-house extension table plus `image::guess_format` covers what Twicecat sends);
      - `blurhash`;
      - animated GIF playback (optional in the roadmap; the first frame only);
      - inline video/audio playback (roadmap: "play video externally at first").
@@ -208,12 +208,12 @@ Registry root: `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/`. Each i
    - **Save…** opens `rfd::AsyncFileDialog::save_file()`:
      - parented to the window via `window::run`;
      - the suggested name is the sanitised file name with path separators removed;
-     - then `SaveMedia` runs: the core fetches, writes `<path>.tessera-part` in the same directory, `fsync`s, and renames.
+     - then `SaveMedia` runs: the core fetches, writes `<path>.twicecat-part` in the same directory, `fsync`s, and renames.
    - **Open:** a card offers **Open** only after a successful save. It runs `open::that(saved_path)` in a `Task`, behind the Phase 3 confirmation bar ("Open <file name>?").
    - **Dangerous extensions** are never opened: `exe, msi, bat, cmd, com, scr, ps1, vbs, js, jar, sh, desktop, appimage, app, pkg, dmg, deb, rpm, run`, and anything without an extension. They can only be saved.
      *Changed by the human at the checkpoint (2026-10-08):* any saved file may be opened after the confirmation; for these extensions (extended after the Task 9 audit) the bar adds a warning that the file can run a program.
    - **Video:** "play externally" is Save → Open.
-   - **No decrypted temp files:** Tessera never writes decrypted media to a temp directory (`get_media_file` is not used).
+   - **No decrypted temp files:** Twicecat never writes decrypted media to a temp directory (`get_media_file` is not used).
    - Rejected: opening from a hidden temp file (decrypted content left on disk in clear, outside the user's view); inline playback.
 9. **Q9: upload pipeline.** ACCEPTED AS RECOMMENDED (2026-10-08):
    - **App side (`crates/app/src/upload.rs`, pure where possible):**
@@ -273,8 +273,8 @@ Registry root: `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/`. Each i
     - **Backend:** tray-icon with the KSNI backend on Linux; the native backends on Windows and macOS.
     - **Creation:** in `update` on the first window-opened message (main thread, event loop running; macOS rule). Failures are logged without detail and the app runs without a tray. GNOME needs the AppIndicator extension; this is a checkpoint item.
     - **Icon:** drawn in code as RGBA (no asset file), 32x32 and 64x64, in two variants: plain, and with a red dot when `UnreadTotals.notifications > 0`.
-    - **Tooltip:** "Tessera" or "Tessera – N unread", with N capped at "99+".
-    - **Menu:** **Show Tessera** (`gain_focus`, un-minimise) and **Quit** (the existing close path, so the Phase 4 clipboard flush still runs).
+    - **Tooltip:** "Twicecat" or "Twicecat – N unread", with N capped at "99+".
+    - **Menu:** **Show Twicecat** (`gain_focus`, un-minimise) and **Quit** (the existing close path, so the Phase 4 clipboard flush still runs).
     - **Events:** tray and menu events cross from the `crossbeam` receivers into iced through a `Subscription` on a small forwarding thread.
     - **Totals:** `CoreEvent::UnreadTotals { notifications, highlights }` is computed by the core over **all** joined, non-muted rooms. The app may hold only the first room-list page, so it can't sum them itself. It is emitted at most once per second, on change.
     - **Closing the window still quits.** iced 0.14 has no hide-window task (`window.rs` function list), so "close to tray" is out of scope.
@@ -333,7 +333,7 @@ Registry root: `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/`. Each i
     - **Sessions:** a link to the existing screen.
 
     Local settings (theme override, desktop notifications, show content, tray badge) are stored as a small JSON file `<data root>/settings.json`, written atomically through new `DataPaths::read_settings`/`write_settings`. The file holds the typed `api::UiSettings` (no secrets, no content), so `paths` stays SDK-free and the app needs no serde dependency. The Phase 4 Q16 (c) data-root test is updated to allow exactly `settings.json` besides `last_account` and the store directory.
-    - Rejected: syncing settings as account data (other clients would see Tessera-only keys); custom shortcut rebinding (Phase 6 does the PTT binding).
+    - Rejected: syncing settings as account data (other clients would see Twicecat-only keys); custom shortcut rebinding (Phase 6 does the PTT binding).
 18. **Q18: accessibility pass.** ACCEPTED AS RECOMMENDED (2026-10-08):
     - **Ctrl+K** (Cmd+K on macOS) opens a room switcher: a text field plus a list. The fuzzy match is a pure, tested function over names and aliases the app holds, falling back to the core's room-list search for rooms not loaded yet. ↑/↓ move, Enter opens, Esc closes.
     - **Room list:** with the list focused, Alt+↑/Alt+↓ move to the previous or next room from anywhere, and ↑/↓ move while it is focused. Ctrl+Shift+↑/↓ go to the next unread room.
@@ -344,7 +344,7 @@ Registry root: `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/`. Each i
     - **IME:** the deferred Phase 3 IME check goes on this checkpoint.
 19. **Q19: test accounts, runtime and isolation (rule 6).** ACCEPTED AS RECOMMENDED (2026-10-08):
     - **Accounts:** non-E2EE tests (rooms, spaces, threads, notifications, plain media) use alice and carol, as the timeline tests do, and leave bob alone. Encrypted-media tests take `e2ee_serial()` and `reset_e2ee_account` for alice and carol, as Phase 4 Task 3 did.
-    - **Push rules are account data** and survive between runs. `tests/common` gains `reset_notification_baseline(n)`, which the notification tests call first. It removes every keyword starting with `tessera-kw-`, sets both default modes back to the server defaults, and deletes user-defined rules for rooms the test created. Keywords are unique per run (`tessera-kw-<hex>`).
+    - **Push rules are account data** and survive between runs. `tests/common` gains `reset_notification_baseline(n)`, which the notification tests call first. It removes every keyword starting with `twicecat-kw-`, sets both default modes back to the server defaults, and deletes user-defined rules for rooms the test created. Keywords are unique per run (`twicecat-kw-<hex>`).
     - **Negative tests** ("no notification") are bounded: after the event that must not notify, the test sends a second, notifying sentinel in another room. It asserts the sentinel arrives first and nothing for the muted event arrived in between, with a 30 s overall limit (no fixed sleeps).
     - **Room growth:** every task's acceptance runs `scripts/prune-test-rooms.sh` before an ignored run. Room and space tests leave the rooms they create at the end.
     - **Time:** each task records the ignored-run duration. If the full suite passes 25 minutes, stop and ask (rule 8). (Raised from 15 minutes by the human on 2026-10-11: the suite ran 15 min 6 s after pruning.) A test failing twice in a row is a rule-8 stop.
@@ -377,7 +377,7 @@ Registry root: `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/`. Each i
 ### Conventions for every task
 - **Gate (rule 4)**, required before each commit:
   - `cargo fmt --all --check && cargo clippy --workspace --all-targets --all-features --locked -- -D warnings && cargo test --workspace --locked`, plus `scripts/check-app-deps.sh`, `scripts/check-core-api.sh` and `cargo deny check`.
-  - Tasks that touch the core or the bridge also run `docker compose up -d --wait && scripts/prune-test-rooms.sh && cargo test -p tessera-core -p tessera-app --locked -- --ignored --skip keyring`, then `docker compose stop`, and record the duration.
+  - Tasks that touch the core or the bridge also run `docker compose up -d --wait && scripts/prune-test-rooms.sh && cargo test -p twicecat-core -p twicecat-app --locked -- --ignored --skip keyring`, then `docker compose stop`, and record the duration.
   - Core tasks that add encrypted-media tests run that test binary a second time right after, with no reset in between (Phase 4 Q2 repeat runs).
   - The agent never runs the real-keychain test.
 - **One commit per task**, message `phase5.<task number>: <summary>`, with the attribution trailer as instructed by the session. ROADMAP.md is never committed.
@@ -389,7 +389,7 @@ Registry root: `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/`. Each i
     - open issues and new human items, which also go on the checkpoint list (and the checklist artifact) unasked.
   - Rendering, OS dialogs, clipboard, notifications, tray, drag and drop, keyboard-only use and IME go on the human list, never ticked by the agent (rule 9).
 - **Boundary (rule 7).**
-  - `crates/app` gains only the Q3 dependencies and imports only `tessera_core::{api, Core, CoreConfig, CoreHandle, DEFAULT_ROOM_LIST_PAGE_SIZE, paths, secrets, logging}`.
+  - `crates/app` gains only the Q3 dependencies and imports only `twicecat_core::{api, Core, CoreConfig, CoreHandle, DEFAULT_ROOM_LIST_PAGE_SIZE, paths, secrets, logging}`.
   - `api/` stays SDK-free. New core modules (`media.rs`, `upload.rs`, `notifications.rs`, `rooms.rs`, `spaces.rs`, `threads.rs`) are private.
 - **No network, file I/O, decoding or blocking in `update`.** `update` only mutates state, calls `try_send`, and returns `Task`s:
   - decode, thumbnail and clipboard work runs in `Task::perform` on blocking-safe workers;
@@ -420,7 +420,7 @@ Acceptance criteria:
 - `crates/core/tests/rooms.rs` holds ignored smoke tests (verbatim ignore reason):
   - `create_room_raw` with `encrypted = true` gives a room whose `m.room.encryption` state carol can read;
   - `create_space_raw` gives a room with `room_type == m.space` and one `m.space.child`;
-  - `reset_notification_baseline` leaves no `tessera-kw-` keyword (read back through `NotificationSettings::enabled_keywords`).
+  - `reset_notification_baseline` leaves no `twicecat-kw-` keyword (read back through `NotificationSettings::enabled_keywords`).
 - `.env.test`, `scripts/create-test-users.sh` and bob's tests are unchanged.
 - Gate and the ignored run pass. Commit: `phase5.1: phase 5 ledger, sign-off and test helpers`.
 
@@ -433,13 +433,13 @@ Acceptance criteria:
 - A sorted name/version comparison of Cargo.lock before vs after lists exactly the 19 Q3 packages as added, none removed or changed (or the re-measured list if the human picks other versions; then stop and ask if it differs from the measurement).
 - `deny.toml` gains only the scoped `ksni` Unlicense exception. `cargo deny check` passes.
 - `scripts/check-app-deps.sh` still exits 0 (none of the new crates match the SDK pattern).
-- `cargo tree -p tessera-app -e normal --depth 1` lists the four crates; `cargo tree -p tessera-app -i gtk-sys --target all` finds nothing.
+- `cargo tree -p twicecat-app -e normal --depth 1` lists the four crates; `cargo tree -p twicecat-app -i gtk-sys --target all` finds nothing.
 - PROGRESS.md "Pinned versions" gains the Phase 5 line with the lock diff.
 - Gate passes (no core code touched; no ignored run). Commit: `phase5.2: phase 5 dependencies and ksni licence exception`.
 
 ### Task 3: Additive core API for Phase 5
 Language: rust
-Files: crates/core/src/api/media.rs, crates/core/src/api/rooms.rs, crates/core/src/api/mod.rs, crates/core/src/api/types.rs, crates/core/src/engine.rs, crates/core/src/timeline.rs, crates/core/src/room_list.rs, crates/core/src/bin/tessera-cli.rs, crates/app/src/state.rs, crates/app/src/timeline.rs, PROGRESS.md
+Files: crates/core/src/api/media.rs, crates/core/src/api/rooms.rs, crates/core/src/api/mod.rs, crates/core/src/api/types.rs, crates/core/src/engine.rs, crates/core/src/timeline.rs, crates/core/src/room_list.rs, crates/core/src/bin/twicecat-cli.rs, crates/app/src/state.rs, crates/app/src/timeline.rs, PROGRESS.md
 Depends on: Task 2
 Acceptance criteria:
 - The API has exactly the Q6, Q9-Q17 additions: types, commands, events, `ActionKind` variants, `MessageDetails.media`/`thread`, `RoomSummary.notification_mode`, `RoomListQuery.space`, `OutgoingMessage.thread_root`, `UiSettings`.
@@ -465,12 +465,12 @@ Acceptance criteria:
   - finds the item by `(room_id, item_id)` in the selected room's timeline (an unknown item gives `ItemNotFound`);
   - applies Q7: semaphore of 4, a 30 s thumbnail and 10 min full deadline, the 10 MiB encrypted-thumbnail fallback rule, the 512 MiB full cap from `info.size`;
   - answers `Media { .. }`. The rules are pure, table-tested helpers (`thumbnail_plan(content)`, `allowed_full(size)`).
-- `SaveMedia` writes the bytes to `<path>.tessera-part`, `fsync`s and renames to `path`. A write failure removes the part file and gives `ActionFailed { Media, .. }`. Tested with a tempdir and a fake fetcher (no network).
+- `SaveMedia` writes the bytes to `<path>.twicecat-part`, `fsync`s and renames to `path`. A write failure removes the part file and gives `ActionFailed { Media, .. }`. Tested with a tempdir and a fake fetcher (no network).
 - `MediaLimits` is sent after login and restore from `load_or_fetch_max_upload_size` (`None` on error).
 - Integration tests in `media.rs` (verbatim ignore reason):
   - **plain image:** alice uploads the fixture PNG with `send_attachment_raw` into a plain room with carol. carol's core shows a `Message` with `media.kind == Image`, the width and height, and the file name. `FetchMedia { Full }` returns bytes **identical** to the fixture, and `FetchMedia { Thumbnail }` returns bytes starting with a PNG or JPEG signature (Synapse thumbnail);
   - **encrypted image and file (roadmap acceptance: identical bytes):** under `e2ee_serial` with alice and carol reset, the room is created with `create_room_raw(.., encrypted = true, ..)`. The raw client uploads the fixture image and a 300 KiB random file. carol's `FetchMedia { Full }` gives identical bytes for both. `fetch_raw_event_json` shows each event is `m.room.encrypted`. The raw download of the event's `file.url` (unauthenticated media endpoint via a raw client) differs from the original bytes;
-  - **save:** `SaveMedia` of the random file into a tempdir gives a file with identical bytes and no `.tessera-part` left.
+  - **save:** `SaveMedia` of the random file into a tempdir gives a file with identical bytes and no `.twicecat-part` left.
 - `log_hygiene.rs` adds an encrypted image whose bytes contain the sentinel to its flow. Both the log check and the data-at-rest scan still find no sentinel (Q20).
 - Gate, the ignored run and the repeat run of `media` pass. Commit: `phase5.4: media mapping, fetch and save in the core`.
 
@@ -511,7 +511,7 @@ Acceptance criteria:
 - Integration tests in `notifications.rs` (verbatim ignore reason; `reset_notification_baseline` for alice and carol first; roadmap acceptance "mention in a muted room, DM, keyword"):
   - **DM:** alice sends to a DM with carol; carol's core emits `Notification { is_dm: true, kind: Message, sender: alice }` with the preview;
   - **mention in a muted room:** carol sets the group room to `Mute`. alice mentions carol there, then sends a sentinel in the DM. carol gets the DM sentinel's notification and **no** notification for the mention (Q19 bounding). After `ResetRoomNotificationMode`, the next mention gives `kind: Mention`;
-  - **keyword:** carol adds `tessera-kw-<hex>` and sets the room to `MentionsAndKeywordsOnly`. A plain message from alice gives no notification (bounded as above), and a message containing the keyword gives `kind: Mention`;
+  - **keyword:** carol adds `twicecat-kw-<hex>` and sets the room to `MentionsAndKeywordsOnly`. A plain message from alice gives no notification (bounded as above), and a message containing the keyword gives `kind: Mention`;
   - **own messages:** carol's own message never gives a notification;
   - **invite:** alice invites carol to a new room; carol gets `kind: Invite`;
   - **totals:** carol's `UnreadTotals.notifications` goes up after alice's DM message and returns to 0 after `MarkRead`.
@@ -532,7 +532,7 @@ Acceptance criteria:
 - Spaces per Q15: the core forwards `Spaces`. `RoomListQuery.space` adds `new_filter_identifiers` (unit test of the filter composition in `room_list.rs`).
 - Integration tests in `rooms.rs` (verbatim ignore reason; roadmap acceptance "room create, invite, and leave"):
   - **create encrypted and invite:** alice `CreateRoom { name, topic, encrypted: true, invite: [carol] }` gives `RoomCreated`. alice's list shows the room with `is_encrypted`; carol's list shows it with `is_invite`. carol `AcceptInvite`, and it becomes joined with the name and topic;
-  - **join by alias:** alice creates a public room with alias `tessera-<hex>`; carol `JoinRoom { "#tessera-<hex>:localhost" }` gives `RoomJoined`;
+  - **join by alias:** alice creates a public room with alias `twicecat-<hex>`; carol `JoinRoom { "#twicecat-<hex>:localhost" }` gives `RoomJoined`;
   - **leave:** carol `LeaveRoom`; the room leaves carol's list and alice's member list no longer has carol as joined;
   - **decline:** an invite declined by carol disappears from her list;
   - **settings:** alice sets the name, topic and a 64x48 avatar, and carol's summary reflects the name and avatar. `EnableEncryption` on a plain room makes `is_encrypted` true for both. carol, without power, gets `RoomDetails.permissions` all false, and `SetRoomName` from her gives `ActionFailed`;
@@ -630,7 +630,7 @@ Acceptance criteria:
 - Room header menu: the four Q11 choices send the right command once each. Room list rows show the muted mark from `notification_mode`.
 - Tray:
   - `tray.rs` draws the two icon variants (pure: RGBA size and a red pixel at the dot position only in the badge variant);
-  - `tray_tooltip(totals)` gives "Tessera", "Tessera – 3 unread", "Tessera – 99+ unread";
+  - `tray_tooltip(totals)` gives "Twicecat", "Twicecat – 3 unread", "Twicecat – 99+ unread";
   - the tray is created on the first window-opened message, and creation failure is tolerated (fake test);
   - tray **Show** and **Quit** map to `gain_focus` and the existing close path (`update` tests);
   - `UnreadTotals` updates the icon only when the variant or tooltip changes.
@@ -640,7 +640,7 @@ Acceptance criteria:
   - clicking a notification opens the room (Linux);
   - the tray icon and red dot on KDE, and on GNOME with the AppIndicator extension (note what plain GNOME shows);
   - the tooltip count; Show and Quit;
-  - muting a room silences it in Tessera and in Element Web.
+  - muting a room silences it in Twicecat and in Element Web.
 - Gate passes. Commit: `phase5.11: desktop notifications, room notification modes and tray badge`.
 
 ### Task 12: Room dialogs, room settings, member list and pills (roadmap step 5 UI; Phase 3 and 4 deferrals)
@@ -661,7 +661,7 @@ Acceptance criteria:
 - Human checklist gains:
   - create an encrypted room and see the lock and Element Web's encryption shield;
   - create a public room with an alias and join it from Element Web;
-  - join by alias from Tessera;
+  - join by alias from Twicecat;
   - accept and decline invites from Element Web;
   - invite, leave and the leave warnings;
   - room settings edits seen in Element;
@@ -773,9 +773,9 @@ Acceptance criteria:
 - [ ] Images: thumbnails inline in plain and encrypted rooms, in both themes, with no scroll jump while loading; click opens the viewer (zoom, pan, Esc); a GIF shows its first frame.
 - [ ] Files, video, audio: cards read well; **Save…** opens the native dialog (GNOME Wayland, KDE Wayland, X11) and the saved file matches the original; **Open** after saving plays a video in the system player; a dangerous file offers no Open.
 - [ ] Uploads: picker; drag and drop on X11 (one and several files); confirm nothing happens when dropping on a native Wayland window (recorded gap); Ctrl+V pastes a screenshot on GNOME Wayland, KDE Wayland and X11 and text paste still works; the progress bar on a large file; the EXIF note wording; the received image and thumbnail look right in Element Web.
-- [ ] Notifications (roadmap): a DM, a mention and a keyword notify while Tessera is unfocused, on GNOME and KDE; nothing for the open room while focused; a muted room stays silent; "Show message content" off hides the text; clicking opens the room.
+- [ ] Notifications (roadmap): a DM, a mention and a keyword notify while Twicecat is unfocused, on GNOME and KDE; nothing for the open room while focused; a muted room stays silent; "Show message content" off hides the text; clicking opens the room.
 - [ ] Tray badge (roadmap): the icon and red dot on KDE, and on GNOME with the AppIndicator extension (note plain GNOME's behaviour); the tooltip count; Show and Quit.
-- [ ] Rooms: create an encrypted room (lock in Tessera, shield in Element Web); a public room with an alias joined from Element Web; join by alias; accept and decline invites; invite; leave with its warnings; room settings edits seen in Element; the member list with power levels.
+- [ ] Rooms: create an encrypted room (lock in Twicecat, shield in Element Web); a public room with an alias joined from Element Web; join by alias; accept and decline invites; invite; leave with its warnings; room settings edits seen in Element; the member list with power levels.
 - [ ] Pills: labels come from the target (an Element Web message whose pill text names someone else shows the real user); the user card and **Message**; joining from a room pill.
 - [ ] Spaces sidebar with spaces made in Element Web; Home; filtering.
 - [ ] Threads: summaries match Element Web; the panel opens, scrolls and sends; Element Web shows the reply in the thread; threaded replies are gone from the main timeline.

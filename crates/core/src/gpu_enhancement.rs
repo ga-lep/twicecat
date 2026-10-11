@@ -7,7 +7,7 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use tessera_audio::{BatchCleaner, DeepFilter, DeepFilterBackend, DeepFilterStatus};
+use twicecat_audio::{BatchCleaner, DeepFilter, DeepFilterBackend, DeepFilterStatus};
 
 use crate::api::{EnhancerBackend, GpuBackend};
 
@@ -39,7 +39,7 @@ mod imp {
     use std::path::PathBuf;
 
     use super::*;
-    use tessera_audio::onnx::{Accelerator, OnnxRuntime, default_runtime_dir};
+    use twicecat_audio::onnx::{Accelerator, OnnxRuntime, default_runtime_dir};
 
     /// Tried in this order ([`Accelerator::ALL`]'s). TensorRT first: on an
     /// RTX 5090 it runs a frame in 0.13 ms for 16 µs of CPU, against 0.36 ms
@@ -70,7 +70,7 @@ mod imp {
     fn gpu_parts() -> Result<(OnnxRuntime, PathBuf), String> {
         let runtime = runtime()
             .ok_or("ONNX Runtime is not installed (scripts/fetch-onnxruntime.sh cuda13)")?;
-        let model = tessera_audio::default_stateful_model()
+        let model = twicecat_audio::default_stateful_model()
             .filter(|m| m.exists())
             .ok_or("the GPU model is not installed (scripts/export-deepfilternet.sh)")?;
         Ok((runtime, model))
@@ -121,7 +121,7 @@ mod imp {
         let (runtime, model) = gpu_parts()?;
         let (filter, accelerator) =
             DeepFilter::load_gpu(models, &model, attenuation_limit_db, &runtime, &PREFER)
-                .map_err(|e: tessera_audio::AudioError| e.to_string())?;
+                .map_err(|e: twicecat_audio::AudioError| e.to_string())?;
         let gpu = accelerator.map(backend);
         if let Some(gpu) = gpu {
             remember(&[gpu]);
@@ -140,7 +140,7 @@ mod imp {
     ) -> Result<Option<Bank>, String> {
         let _work = GPU_WORK.lock().unwrap_or_else(|e| e.into_inner());
         let (runtime, model) = gpu_parts()?;
-        let bank = tessera_audio::DeepFilterBank::load(
+        let bank = twicecat_audio::DeepFilterBank::load(
             models,
             &model,
             rows,

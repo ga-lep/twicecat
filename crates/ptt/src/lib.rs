@@ -1,10 +1,10 @@
-//! Tessera push-to-talk: turns a held key or button into "transmit on/off".
+//! Twicecat push-to-talk: turns a held key or button into "transmit on/off".
 //!
 //! Sources, merged so that any one held means transmit:
 //! - a global keyboard shortcut: global-hotkey on X11, Windows and macOS,
 //!   the GlobalShortcuts portal on Wayland;
 //! - a gamepad button (gilrs);
-//! - a key pressed in Tessera's own window, forwarded by the app (the only
+//! - a key pressed in Twicecat's own window, forwarded by the app (the only
 //!   keyboard source in gamescope's game mode, which has no global
 //!   shortcuts).
 //!
@@ -27,7 +27,7 @@ pub use merge::Source;
 use merge::Merger;
 
 /// The app ID the portal knows us by (as the keychain service).
-const APP_ID: &str = "io.github.ga_lep.Tessera";
+const APP_ID: &str = "io.github.ga_lep.Twicecat";
 
 /// What the service reports.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -191,7 +191,7 @@ impl PttService {
         service
     }
 
-    /// The bound key was pressed or released in Tessera's own window.
+    /// The bound key was pressed or released in Twicecat's own window.
     pub fn window_key(&self, pressed: bool) {
         self.shared.report(Source::Window, pressed);
     }

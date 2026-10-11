@@ -3,16 +3,16 @@
 # GPU speech enhancement (plan Task 13b) on Linux x86_64 and Windows x64,
 # without a system CUDA install or root: NVIDIA's own PyPI wheels at pinned versions, checked
 # against the SHA-256 in scripts/cuda-runtime.sha256, their shared libraries
-# unpacked into one cache dir, whose path is printed. Tessera preloads the
+# unpacked into one cache dir, whose path is printed. Twicecat preloads the
 # libraries from there before ONNX Runtime's CUDA provider starts (or from
-# TESSERA_CUDA_DIR). With CUDA 13 and cuDNN 9 installed system-wide this is
+# TWICECAT_CUDA_DIR). With CUDA 13 and cuDNN 9 installed system-wide this is
 # not needed. The NVIDIA driver must be installed either way.
 #
 # The libraries are NVIDIA's, under NVIDIA's licences (copied next to them);
 # about 1.1 GB downloaded, 1.8 GB unpacked.
 #
 # Usage: scripts/fetch-cuda-runtime.sh
-# Env: TESSERA_CUDA_CACHE overrides the cache root.
+# Env: TWICECAT_CUDA_CACHE overrides the cache root.
 # Progress goes to stderr; stdout carries only the path.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -50,7 +50,7 @@ mapfile -t wheels < <(awk -v a="$arch" '!/^#/ && $2 == a {print $1 " " $3}' "$su
 [ "${#wheels[@]}" -gt 0 ] || die "no pinned wheels for $arch in $sums"
 pinned=$(printf '%s\n' "${wheels[@]}" | sha256sum | awk '{print $1}')
 
-cache_root="${TESSERA_CUDA_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/tessera/cuda}"
+cache_root="${TWICECAT_CUDA_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/twicecat/cuda}"
 dest="$cache_root/$version"
 marker="$dest/.verified"
 

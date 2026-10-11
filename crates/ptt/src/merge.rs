@@ -1,5 +1,5 @@
 //! Several push-to-talk sources at once: the microphone transmits while any
-//! of them is held. The release tail is the audio gate's (`tessera-audio`),
+//! of them is held. The release tail is the audio gate's (`twicecat-audio`),
 //! so a release is reported at once.
 
 /// Where a press comes from.
@@ -11,7 +11,7 @@ pub enum Source {
     Portal,
     /// A gamepad button.
     Gamepad,
-    /// A key pressed in Tessera's own window, forwarded by the app.
+    /// A key pressed in Twicecat's own window, forwarded by the app.
     Window,
 }
 

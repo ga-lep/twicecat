@@ -13,7 +13,7 @@ use super::{DeviceId, UserId};
 /// two keys compare by value.
 ///
 /// ```
-/// use tessera_core::api::RecoveryKey;
+/// use twicecat_core::api::RecoveryKey;
 /// let k = RecoveryKey::from("EsTc secret");
 /// assert_eq!(format!("{k:?}"), "RecoveryKey(<redacted>)");
 /// assert_eq!(k.expose(), "EsTc secret");

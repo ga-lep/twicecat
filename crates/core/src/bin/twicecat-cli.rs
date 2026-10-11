@@ -1,10 +1,10 @@
-//! `tessera-cli`: a small command-line front end on the core's command and
+//! `twicecat-cli`: a small command-line front end on the core's command and
 //! event API. It never touches the Matrix SDK directly.
 //!
 //! Message bodies are printed to stdout because that is the program's output;
 //! nothing here sends a token, password, or message body to the log.
 
-#[path = "tessera-cli/calls/mod.rs"]
+#[path = "twicecat-cli/calls/mod.rs"]
 mod calls;
 
 use std::collections::HashSet;
@@ -14,28 +14,28 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tessera_core::api::{
+use tokio::sync::mpsc;
+use twicecat_core::api::{
     AUDIO_FRAME_LEN, AudioBackend, Command, CoreEvent, ListDiff, MessageText, Password, RoomId,
     RoomSummary, SecurityStatus, SyncState, TimelineItem, TimelineItemKind, VirtualAudio,
 };
-use tessera_core::logging;
-use tessera_core::paths::DataPaths;
-use tessera_core::secrets::{
+use twicecat_core::logging;
+use twicecat_core::paths::DataPaths;
+use twicecat_core::secrets::{
     InMemorySecretStore, KEYCHAIN_SERVICE, KeyringSecretStore, SecretStore,
 };
-use tessera_core::{Core, CoreConfig, CoreHandle, DEFAULT_ROOM_LIST_PAGE_SIZE};
-use tokio::sync::mpsc;
+use twicecat_core::{Core, CoreConfig, CoreHandle, DEFAULT_ROOM_LIST_PAGE_SIZE};
 
 const HELP: &str = "\
-tessera-cli: headless Matrix client on the Tessera core
+twicecat-cli: headless Matrix client on the Twicecat core
 
 USAGE:
-    tessera-cli [--data-dir <path> | --ephemeral] [--homeserver <url>] [--password-stdin]
+    twicecat-cli [--data-dir <path> | --ephemeral] [--homeserver <url>] [--password-stdin]
                 [--silent-audio]
 
 OPTIONS:
     --data-dir <path>     Store session data here (default: the OS data directory;
-                          on Linux ~/.local/share/tessera)
+                          on Linux ~/.local/share/twicecat)
     --homeserver <url>    Use this homeserver (URL or server name) instead of
                           discovering it from the user ID
     --ephemeral           Keep the secret store in memory and use a temporary
@@ -83,7 +83,7 @@ CALLS (voice, MatrixRTC; joining opens the microphone and speakers):
                           Tell others which suppressor cleans your voice
                           (default on), so they need not clean it again
     /clean outside on|off
-                          Your microphone is cleaned before Tessera (NVIDIA
+                          Your microphone is cleaned before Twicecat (NVIDIA
                           Broadcast, a Krisp app): announced as cleaned
     /clean gpu on|off     Clean them on a GPU (needs a gpu-enhancement build;
                           every talker at once, little CPU; the CPU takes
@@ -96,7 +96,7 @@ AUDIO SETTINGS (saved; take effect at the next call or mic test):
     /output <n|default>   Choose the speakers
     /ns off|rnnoise|webrtc [low|moderate|high|very_high]|deepfilter [dB] [gpu]
                           Noise suppression: one of them, or off (they do
-                          not stack; processing outside Tessera, such as
+                          not stack; processing outside Twicecat, such as
                           NVIDIA Broadcast, is up to you). DeepFilterNet with
                           `gpu` runs on the GPU when one starts (see /gpu),
                           else on the CPU
@@ -114,7 +114,7 @@ AUDIO SETTINGS (saved; take effect at the next call or mic test):
                           loopback hear yourself
 
 LOGGING:
-    Logs go to stderr; the default filter is `warn,tessera_core=info`.
+    Logs go to stderr; the default filter is `warn,twicecat_core=info`.
     Setting RUST_LOG to debug or trace can make the Matrix SDK and HTTP crates
     log sensitive request data (URLs, user and room identifiers). Even at the
     default filter, the SDK's own error lines can contain request URLs, so do
@@ -609,7 +609,7 @@ impl Cli {
             }
         };
         if tokio::time::timeout(LOGOUT_WAIT, wait).await.is_err() {
-            eprintln!("tessera-cli: server logout did not finish within {LOGOUT_WAIT:?}");
+            eprintln!("twicecat-cli: server logout did not finish within {LOGOUT_WAIT:?}");
         }
     }
 
@@ -893,12 +893,12 @@ fn ephemeral_dir() -> PathBuf {
     let mut bytes = [0_u8; 16];
     rand::fill(&mut bytes[..]);
     let suffix: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    std::env::temp_dir().join(format!("tessera-cli-{suffix}"))
+    std::env::temp_dir().join(format!("twicecat-cli-{suffix}"))
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    tessera_core::require_cpu_level();
+    twicecat_core::require_cpu_level();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let options = match parse_args(&args) {
         Ok(Parsed::Run(options)) => options,
@@ -907,12 +907,12 @@ async fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Err(message) => {
-            eprintln!("tessera-cli: {message}\nTry --help.");
+            eprintln!("twicecat-cli: {message}\nTry --help.");
             return ExitCode::from(2);
         }
     };
     if let Err(error) = logging::init(logging::DEFAULT_FILTER) {
-        eprintln!("tessera-cli: logging not started: {error}");
+        eprintln!("twicecat-cli: logging not started: {error}");
     }
 
     let (data, secrets, cleanup): (DataPaths, Arc<dyn SecretStore>, Option<PathBuf>) =
@@ -929,7 +929,7 @@ async fn main() -> ExitCode {
                 None => match DataPaths::from_os() {
                     Some(data) => data,
                     None => {
-                        eprintln!("tessera-cli: no OS data directory; pass --data-dir");
+                        eprintln!("twicecat-cli: no OS data directory; pass --data-dir");
                         return ExitCode::FAILURE;
                     }
                 },
@@ -959,7 +959,7 @@ async fn main() -> ExitCode {
 
     if options.password_stdin && std::io::stdin().is_terminal() {
         eprintln!(
-            "tessera-cli: warning: --password-stdin with a terminal on stdin; \
+            "twicecat-cli: warning: --password-stdin with a terminal on stdin; \
              the password will be echoed as you type it"
         );
     }
@@ -1006,13 +1006,13 @@ async fn main() -> ExitCode {
     let _ = cli.core.commands.send(Command::Shutdown).await;
     let drain = async { while cli.core.events.recv().await.is_some() {} };
     if tokio::time::timeout(SHUTDOWN_WAIT, drain).await.is_err() {
-        eprintln!("tessera-cli: engine did not stop within {SHUTDOWN_WAIT:?}");
+        eprintln!("twicecat-cli: engine did not stop within {SHUTDOWN_WAIT:?}");
     }
     if let Some(dir) = cleanup
         && let Err(error) = std::fs::remove_dir_all(&dir)
         && error.kind() != std::io::ErrorKind::NotFound
     {
-        eprintln!("tessera-cli: could not remove the temporary data dir: {error}");
+        eprintln!("twicecat-cli: could not remove the temporary data dir: {error}");
     }
     ExitCode::SUCCESS
 }
@@ -1265,7 +1265,9 @@ mod tests {
 
     #[test]
     fn security_line_prints_states_only() {
-        use tessera_core::api::{CrossSigning, DeviceVerification, RecoveryStatus, SecurityStatus};
+        use twicecat_core::api::{
+            CrossSigning, DeviceVerification, RecoveryStatus, SecurityStatus,
+        };
         let status = SecurityStatus {
             recovery: RecoveryStatus::Incomplete,
             device: DeviceVerification::Unverified,
@@ -1281,7 +1283,7 @@ mod tests {
 
     #[test]
     fn phase5_events_print_one_line_without_content() {
-        use tessera_core::api::{
+        use twicecat_core::api::{
             EventId, MediaBytes, MediaSize, NotificationKind, NotificationView, OwnProfileView,
             PaginationState, RoomNotificationModeView, SpaceView,
         };
@@ -1304,13 +1306,13 @@ mod tests {
                 room_id: room(),
                 event_id: EventId::from("$e"),
                 room_name: "secret-name-x".into(),
-                sender: tessera_core::api::UserId::from("@a:x"),
+                sender: twicecat_core::api::UserId::from("@a:x"),
                 sender_name: Some("secret-name-x".into()),
                 is_dm: false,
                 kind: NotificationKind::Message,
                 preview: Some(MessageText::from("secret-body-x")),
             }),
-            CoreEvent::NotificationSettings(tessera_core::api::NotificationSettingsView {
+            CoreEvent::NotificationSettings(twicecat_core::api::NotificationSettingsView {
                 group_default: RoomNotificationModeView::AllMessages,
                 dm_default: RoomNotificationModeView::Mute,
                 keywords: vec!["secret-name-x".into()],
@@ -1321,7 +1323,7 @@ mod tests {
             },
             CoreEvent::RoomCreated { room_id: room() },
             CoreEvent::RoomJoined { room_id: room() },
-            CoreEvent::RoomDetails(tessera_core::api::RoomDetailsView {
+            CoreEvent::RoomDetails(twicecat_core::api::RoomDetailsView {
                 room_id: room(),
                 name: "secret-name-x".into(),
                 topic: None,
@@ -1378,7 +1380,7 @@ mod tests {
 
     #[test]
     fn recovery_key_event_prints_no_key() {
-        use tessera_core::api::RecoveryKey;
+        use twicecat_core::api::RecoveryKey;
         let (mut cli, _keep) = test_cli(Mode::Idle, true);
         // `on_event` must accept it; the line it prints names no key.
         cli.on_event(CoreEvent::RecoveryKeyReady(RecoveryKey::from(
@@ -1390,7 +1392,7 @@ mod tests {
     #[test]
     fn error_during_restore_or_login_leaves_busy() {
         let (mut cli, _keep) = test_cli(Mode::Busy, false);
-        cli.on_event(CoreEvent::Error(tessera_core::api::CoreError::Storage(
+        cli.on_event(CoreEvent::Error(twicecat_core::api::CoreError::Storage(
             "x".into(),
         )));
         assert_eq!(cli.mode, Mode::Idle);
@@ -1401,10 +1403,10 @@ mod tests {
     #[test]
     fn error_keeps_other_modes() {
         let (mut cli, _keep) = test_cli(Mode::Idle, true);
-        cli.on_event(CoreEvent::Error(tessera_core::api::CoreError::NotLoggedIn));
+        cli.on_event(CoreEvent::Error(twicecat_core::api::CoreError::NotLoggedIn));
         assert_eq!(cli.mode, Mode::Idle);
         let (mut cli, _keep) = test_cli(Mode::Username, false);
-        cli.on_event(CoreEvent::Error(tessera_core::api::CoreError::NotLoggedIn));
+        cli.on_event(CoreEvent::Error(twicecat_core::api::CoreError::NotLoggedIn));
         assert_eq!(cli.mode, Mode::Username);
     }
 
@@ -1412,7 +1414,7 @@ mod tests {
     fn other_not_logged_in_failures_leave_busy() {
         let (mut cli, _keep) = test_cli(Mode::Busy, false);
         cli.on_event(CoreEvent::LoginFailed(
-            tessera_core::api::CoreError::Cancelled,
+            twicecat_core::api::CoreError::Cancelled,
         ));
         assert_eq!(cli.mode, Mode::Idle);
         let (mut cli, _keep) = test_cli(Mode::Busy, false);
@@ -1426,7 +1428,7 @@ mod tests {
     #[tokio::test]
     async fn quit_works_after_a_failed_restore() {
         let (mut cli, _keep) = test_cli(Mode::Busy, false);
-        cli.on_event(CoreEvent::Error(tessera_core::api::CoreError::Storage(
+        cli.on_event(CoreEvent::Error(twicecat_core::api::CoreError::Storage(
             "x".into(),
         )));
         assert!(matches!(cli.on_line("/quit\n").await, Flow::Quit));
