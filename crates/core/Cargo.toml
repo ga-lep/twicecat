@@ -10,6 +10,10 @@ publish = false
 name = "twicecat-cli"
 path = "src/bin/twicecat-cli.rs"
 
+[[example]]
+name = "opus_profile"
+test = true
+
 [dependencies]
 # experimental-send-custom-to-device: Olm-encrypted call keys (Phase 6 Task 9).
 matrix-sdk = { version = "=0.19.1", features = ["bundled-sqlite", "local-server", "markdown", "qrcode", "experimental-send-custom-to-device"] }

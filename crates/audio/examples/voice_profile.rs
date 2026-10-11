@@ -5,8 +5,11 @@
 //! worst) and heap allocations per frame, and can run one configuration
 //! alone for `perf`.
 //!
-//! `cargo run --release -p twicecat-audio --example voice_profile -- [name]
-//! [frames]` (no name: every configuration). DeepFilterNet rows need
+//! `cargo run --release -p twicecat-audio --example voice_profile -- [--tsv]
+//! [--voices N] [name] [frames]` (no name: every configuration; `--tsv`: one
+//! tab-separated line per row and nothing else on stdout, for
+//! `scripts/profile-call-path.sh`; `--voices N`: also an engine row with N
+//! voices mixed). DeepFilterNet rows need
 //! `scripts/fetch-models.sh`. On a hybrid CPU, run it on an efficiency core
 //! too (`taskset -c <cpu>`): the processing thread often runs there. With
 //! `--features onnxruntime` (and the GPU parts of Task 13b installed), the
@@ -33,6 +36,8 @@ static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
 /// frames come from (their stacks, counted by caller), to find who
 /// allocates on the processing thread.
 static TRACE_LEFT: AtomicU64 = AtomicU64::new(0);
+/// `--tsv`: one tab-separated line per row, nothing else on stdout.
+static TSV: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static TRACING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 thread_local! {
@@ -183,19 +188,45 @@ struct Run {
 }
 
 impl Run {
-    fn print(mut self, name: &str) {
+    /// Mean, median, p99 and worst time in µs, and allocations per frame.
+    fn figures(&mut self) -> [f64; 5] {
         self.times.sort();
         let n = self.times.len();
         let mean = self.times.iter().sum::<Duration>() / n as u32;
         let us = |d: Duration| d.as_secs_f64() * 1e6;
-        println!(
-            "{name:<34} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1}",
+        [
             us(mean),
             us(self.times[n / 2]),
             us(self.times[n * 99 / 100]),
             us(self.times[n - 1]),
             self.allocations as f64 / n as f64,
-        );
+        ]
+    }
+
+    /// The row as one tab-separated line (`--tsv`): name, mean, median,
+    /// p99, worst (µs per 10 ms frame), allocations per frame.
+    fn tsv(mut self, name: &str) -> String {
+        let [mean, median, p99, worst, allocations] = self.figures();
+        format!("{name}\t{mean:.1}\t{median:.1}\t{p99:.1}\t{worst:.1}\t{allocations:.1}")
+    }
+
+    fn print(mut self, name: &str) {
+        if TSV.load(Ordering::Relaxed) {
+            println!("{}", self.tsv(name));
+            return;
+        }
+        let [mean, median, p99, worst, allocations] = self.figures();
+        println!("{name:<34} {mean:>8.1} {median:>8.1} {p99:>8.1} {worst:>8.1} {allocations:>8.1}");
+    }
+}
+
+/// Prints a row that cannot be measured: in the table, in place of its
+/// figures; with `--tsv`, on stderr, so that stdout holds only rows.
+fn skipped(name: &str, why: &str) {
+    if TSV.load(Ordering::Relaxed) {
+        eprintln!("{name}: {why}");
+    } else {
+        println!("{name:<34} ({why})");
     }
 }
 
@@ -249,7 +280,7 @@ fn chain(name: &str, s: ChainSettings, mic: &[f32], far: &[f32], frames: usize) 
     if s.noise == NoiseMode::Enhancer {
         let Some(filter) = default_model_dir().and_then(|d| DeepFilter::load(&d, 100.0).ok())
         else {
-            println!("{name:<34} (no models: scripts/fetch-models.sh)");
+            skipped(name, "no models: scripts/fetch-models.sh");
             return;
         };
         chain.set_enhancer(Some(Box::new(filter)));
@@ -277,7 +308,7 @@ fn engine(
 ) {
     let model = if cleaned > 0 && !gpu {
         let Some(model) = default_model_dir().and_then(|d| DeepFilterModel::load(&d).ok()) else {
-            println!("{name:<34} (no DeepFilterNet model)");
+            skipped(name, "no DeepFilterNet model");
             return;
         };
         Some(model)
@@ -293,8 +324,9 @@ fn engine(
                 control.set_cleaner_bank(Some(bank));
             }
             None => {
-                println!(
-                    "{name:<34} (no GPU bank: needs --features onnxruntime and the GPU parts)"
+                skipped(
+                    &name,
+                    "no GPU bank: needs --features onnxruntime and the GPU parts",
                 );
                 return;
             }
@@ -376,7 +408,7 @@ fn onnx_cpu_network(name: &str, frames: usize) {
         default_runtime_dir(),
         twicecat_audio::default_stateful_model(),
     ) else {
-        println!("{name:<34} (no ONNX Runtime or stateful model)");
+        skipped(name, "no ONNX Runtime or stateful model");
         return;
     };
     let runtime = OnnxRuntime::load(&dir).expect("ONNX Runtime");
@@ -399,7 +431,25 @@ fn onnx_cpu_network(name: &str, frames: usize) {
 }
 
 fn main() {
+    // `--tsv` and `--voices N` (one more engine row, N voices mixed) may
+    // stand anywhere; the rest is `[name] [frames]`.
+    let mut positional = Vec::new();
+    let mut extra_voices = None;
     let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--tsv" => TSV.store(true, Ordering::Relaxed),
+            "--voices" => {
+                extra_voices = Some(
+                    args.next()
+                        .and_then(|n| n.parse::<usize>().ok())
+                        .expect("--voices N"),
+                );
+            }
+            _ => positional.push(arg),
+        }
+    }
+    let mut args = positional.into_iter();
     let only = args.next().filter(|a| a != "all");
     let frames: usize = args.next().map_or(3000, |n| n.parse().expect("frames"));
     flush_denormals_on_this_thread();
@@ -442,10 +492,12 @@ fn main() {
             settings(true, true, true, NoiseMode::Enhancer),
         ),
     ];
-    println!(
-        "{:<34} {:>8} {:>8} {:>8} {:>8} {:>8}",
-        "per 10 ms frame (µs)", "mean", "median", "p99", "worst", "allocs"
-    );
+    if !TSV.load(Ordering::Relaxed) {
+        println!(
+            "{:<34} {:>8} {:>8} {:>8} {:>8} {:>8}",
+            "per 10 ms frame (µs)", "mean", "median", "p99", "worst", "allocs"
+        );
+    }
     for (name, s) in &rows {
         if only.as_deref().is_none_or(|o| name.contains(o)) {
             chain(name, *s, &mic, &far, frames);
@@ -460,7 +512,7 @@ fn main() {
         onnx_cpu_network("network: ONNX Runtime CPU", frames);
     }
     let default = settings(true, true, true, NoiseMode::RnNoise);
-    for (sources, cleaned, talking, gpu) in [
+    let mut engines = vec![
         (0, 0, 0, false),
         (4, 0, 4, false),
         (16, 0, 16, false),
@@ -473,7 +525,11 @@ fn main() {
         (4, 4, 4, true),
         (16, 16, 16, true),
         (16, 16, 1, true),
-    ] {
+    ];
+    if let Some(n) = extra_voices.filter(|n| !engines.contains(&(*n, 0, *n, false))) {
+        engines.push((n, 0, n, false));
+    }
+    for (sources, cleaned, talking, gpu) in engines {
         let name = match (cleaned, talking, gpu) {
             (0, ..) => format!("engine: default, {sources} voices mixed"),
             (c, t, true) => format!("engine: GPU bank, {sources} voices, {c} cleaned, {t} talk"),
@@ -491,5 +547,23 @@ fn main() {
             );
             print_traces(trace);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_row_is_one_tab_separated_line_in_microseconds() {
+        let times = (1..=100).map(Duration::from_micros).collect();
+        let run = Run {
+            times,
+            allocations: 250,
+        };
+        assert_eq!(
+            run.tsv("chain: AEC3"),
+            "chain: AEC3\t50.5\t51.0\t100.0\t100.0\t2.5"
+        );
     }
 }
