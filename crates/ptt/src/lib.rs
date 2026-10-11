@@ -27,6 +27,7 @@ pub use merge::Source;
 use merge::Merger;
 
 /// The app ID the portal knows us by (as the keychain service).
+#[cfg(target_os = "linux")]
 const APP_ID: &str = "io.github.ga_lep.Twicecat";
 
 /// What the service reports.
