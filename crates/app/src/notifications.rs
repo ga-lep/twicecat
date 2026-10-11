@@ -265,8 +265,10 @@ pub struct SystemNotifier;
 
 /// Most notifications whose click is awaited at once; each waits on its own
 /// thread until the notification is closed.
+#[cfg(all(unix, not(target_os = "macos")))]
 const MAX_WAITING: usize = 16;
 
+#[cfg(all(unix, not(target_os = "macos")))]
 static WAITING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 impl Notifier for SystemNotifier {
