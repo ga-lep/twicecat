@@ -1,0 +1,48 @@
+name: Profile (aarch64)
+
+# On demand only (Actions tab, "Run workflow"): measures the call path per 10 ms
+# frame against the Steam Frame's 5 % CPU budget on an aarch64 Linux runner
+# (phase 6 step 15). It never runs on pushes or pull requests.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  profile:
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Install Linux build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libdbus-1-dev libssl-dev pkg-config libglib2.0-dev lld libasound2-dev libpipewire-0.3-dev libudev-dev
+      # webrtc-sys needs clang >= 21 on Linux (Chromium libc++); the image has 22.
+      - name: Use clang 22
+        run: |
+          clang++-22 --version
+          { echo CC=clang-22; echo CXX=clang++-22; } >> "$GITHUB_ENV"
+      # webrtc-sys would download libwebrtc unverified; use the pinned SHA-256.
+      - name: Fetch pinned libwebrtc
+        shell: bash
+        run: |
+          dir=$(scripts/fetch-libwebrtc.sh)
+          echo "LK_CUSTOM_WEBRTC=$dir" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@v2
+      # Pinned SHA-256; lets the script also measure DeepFilterNet3.
+      - name: Fetch models
+        run: scripts/fetch-models.sh
+      # Appends the call-path table to the job summary ($GITHUB_STEP_SUMMARY).
+      - name: Profile the call path
+        run: scripts/profile-call-path.sh
+      # Inspects the build output the profile step just produced; also when
+      # the profile step failed, but not when the run was cancelled.
+      - name: No unverified libwebrtc download
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: scripts/check-no-webrtc-download.sh
