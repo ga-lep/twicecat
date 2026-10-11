@@ -43,5 +43,7 @@ gpu-enhancement = ["twicecat-audio/onnxruntime"]
 
 [dev-dependencies]
 tempfile = "3"
+# Fake banks in the cleaning tests set DeepFilterStatus; test-only, not in normal builds.
+twicecat-audio = { path = "../audio", features = ["test-fakes"] }
 # Paused time for the unread-totals throttle test; a feature of the pinned-in-lock tokio, no new packages.
 tokio = { version = "1", features = ["test-util"] }

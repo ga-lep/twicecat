@@ -39,7 +39,7 @@ impl DeepFilterModel {
             graphs: self.plans.spawn()?,
             #[cfg(feature = "onnxruntime")]
             gpu: None,
-            status: DeepFilterStatus::new(DeepFilterBackend::Cpu),
+            status: DeepFilterStatus::new_internal(DeepFilterBackend::Cpu),
             cfg: self.cfg.clone(),
         })
     }
@@ -113,7 +113,9 @@ impl DeepFilter {
             warm.median
         );
         if !warm.keeps_up() {
-            filter.status.set(DeepFilterBackend::CpuAfterGpuTooSlow);
+            filter
+                .status
+                .set_internal(DeepFilterBackend::CpuAfterGpuTooSlow);
             return Ok((filter, None));
         }
         filter.gpu = Some(OnGpu {
@@ -121,7 +123,7 @@ impl DeepFilter {
             deadline: Deadline::default(),
             abandoned: false,
         });
-        filter.status.set(DeepFilterBackend::Gpu);
+        filter.status.set_internal(DeepFilterBackend::Gpu);
         Ok((filter, Some(accelerator)))
     }
 
@@ -204,14 +206,16 @@ impl DeepFilter {
                              (last frame {took:?}); the CPU takes over"
                         );
                         gpu.abandoned = true;
-                        self.status.set(DeepFilterBackend::CpuAfterGpuTooSlow);
+                        self.status
+                            .set_internal(DeepFilterBackend::CpuAfterGpuTooSlow);
                     }
                     return Ok(());
                 }
                 Err(_) => {
                     tracing::warn!("DeepFilterNet's GPU failed; the CPU takes over");
                     gpu.abandoned = true;
-                    self.status.set(DeepFilterBackend::CpuAfterGpuError);
+                    self.status
+                        .set_internal(DeepFilterBackend::CpuAfterGpuError);
                 }
             }
         }
