@@ -102,6 +102,7 @@ pub(crate) async fn open(
             root_event_id: root.clone(),
         })
         .with_internal_id_prefix(item_prefix(&root))
+        .event_filter(crate::timeline::event_filter)
         .build()
         .await
         .map_err(|_| CoreError::Internal("could not open the thread".into()))?;
