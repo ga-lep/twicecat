@@ -12,6 +12,7 @@ use iced::keyboard::{Key, Modifiers};
 use iced::Task;
 use twicecat_core::api::{RoomId, RoomSummary};
 
+use crate::calls::CallMessage;
 use crate::settings::SettingsMessage;
 use crate::state::{App, Message, Screen};
 use crate::switcher::SwitcherMessage;
@@ -64,6 +65,10 @@ pub enum Shortcut {
     SwitcherNext,
     /// Highlight the previous room in the switcher.
     SwitcherPrevious,
+    /// Mute or unmute the microphone in a call.
+    ToggleMute,
+    /// Deafen or undeafen in a call.
+    ToggleDeafen,
 }
 
 /// The key of a trigger.
@@ -194,6 +199,24 @@ pub const SHORTCUTS: &[Binding] = &[
         Shortcut::Settings,
     ),
     bound(
+        "Ctrl+Shift+M",
+        "In a call: mute or unmute the microphone",
+        KeySpec::Char('m'),
+        true,
+        true,
+        false,
+        Shortcut::ToggleMute,
+    ),
+    bound(
+        "Ctrl+Shift+D",
+        "In a call: deafen or undeafen",
+        KeySpec::Char('d'),
+        true,
+        true,
+        false,
+        Shortcut::ToggleDeafen,
+    ),
+    bound(
         "Tab",
         "Move to the next field",
         KeySpec::Named(Named::Tab),
@@ -316,6 +339,8 @@ pub const fn composer_takes(shortcut: Shortcut) -> bool {
             | Shortcut::PreviousRoom
             | Shortcut::NextUnread
             | Shortcut::PreviousUnread
+            | Shortcut::ToggleMute
+            | Shortcut::ToggleDeafen
     )
 }
 
@@ -412,6 +437,15 @@ impl App {
             Shortcut::Escape => self.on_escape(captured),
             Shortcut::SwitcherNext => self.on_switcher(SwitcherMessage::Next),
             Shortcut::SwitcherPrevious => self.on_switcher(SwitcherMessage::Previous),
+            // Only in a call; they work over dialogs too, as a call goes on
+            // behind them.
+            Shortcut::ToggleMute | Shortcut::ToggleDeafen
+                if self.screen != Screen::Main || self.calls.call.is_none() =>
+            {
+                Task::none()
+            }
+            Shortcut::ToggleMute => self.update(Message::Call(CallMessage::ToggleMute)),
+            Shortcut::ToggleDeafen => self.update(Message::Call(CallMessage::ToggleDeafen)),
         }
     }
 
@@ -427,7 +461,8 @@ impl App {
 
     /// Esc closes the topmost thing, one per press: the switcher, the upload
     /// confirmation, the viewer, Settings, a room dialog or panel, the
-    /// composer's suggestions, reply or edit, then the thread panel.
+    /// composer's suggestions, reply or edit, then the thread panel, then the
+    /// participants panel.
     ///
     /// `from_field` is set when a text field used the key (it dropped its own
     /// focus): the composer, which leaves Esc alone, was not the target then,
@@ -453,6 +488,9 @@ impl App {
         }
         if self.threads.panel.is_some() {
             return self.update(Message::Threads(ThreadsMessage::Close));
+        }
+        if self.calls.panel_shown(self.selected.as_ref()) {
+            return self.update(Message::Call(CallMessage::TogglePanel));
         }
         Task::none()
     }

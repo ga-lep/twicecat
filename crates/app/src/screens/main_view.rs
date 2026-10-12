@@ -18,8 +18,8 @@ use crate::rooms::RoomsMessage;
 use crate::screens::loading::sync_label;
 use crate::screens::timeline_pane::RichEnv;
 use crate::screens::{
-    media_viewer, room_dialogs, room_list_pane, security, sessions, spaces_sidebar, thread_panel,
-    timeline_pane,
+    call, media_viewer, room_dialogs, room_list_pane, security, sessions, spaces_sidebar,
+    thread_panel, timeline_pane,
 };
 use crate::sessions::SessionsMessage;
 use crate::settings::SettingsMessage;
@@ -98,6 +98,20 @@ fn header<'a>(app: &'a App, title: String) -> Element<'a, Message> {
         line = line.push(room_buttons());
         if let Some(call) = app.calls.button(room) {
             line = line.push(call_button(call));
+        }
+        if app.calls.call_in(&room.id).is_some() {
+            // The participants panel (plan Q4).
+            let open = app.calls.panel_open;
+            line = line.push(
+                button(text("People").size(13))
+                    .padding([2, 8])
+                    .style(if open {
+                        button::primary
+                    } else {
+                        button::secondary
+                    })
+                    .on_press(Message::Call(CallMessage::TogglePanel)),
+            );
         }
     }
     if let Some(room) = selected.filter(|room| room.is_invite) {
@@ -234,6 +248,7 @@ pub(crate) fn main_row(app: &App) -> Element<'_, Message> {
         room_list_pane::view(app),
         room_pane(app),
         thread_panel::slot(app),
+        call::panel_slot(app),
     ])
     .width(Fill)
     .height(Fill)

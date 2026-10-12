@@ -5,15 +5,17 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::time::Duration;
 
 use iced::Task;
 use twicecat_core::api::{
-    AudioDevices, AudioSettings, AudioStats, CallEndReason, CallIntent, CallState, Command,
-    CoreError, CoreEvent, GpuEnhancement, InputLevel, Participant, RoomId, RoomSummary, UserId,
+    AudioDevices, AudioSettings, AudioStats, CallEndReason, CallIntent, CallState, CleaningStatus,
+    Command, CoreError, CoreEvent, GpuEnhancement, InputLevel, Participant, RoomId, RoomMemberView,
+    RoomSummary, SkipReason, UserId, VoiceCleaning,
 };
 
 use crate::state::{App, Message};
-use crate::text_safety::one_line_capped;
+use crate::text_safety::{MAX_NAME_CHARS, name_or_placeholder, one_line_capped};
 
 /// How many ringing rooms are kept; the oldest goes first.
 pub const MAX_RINGS: usize = 16;
@@ -21,9 +23,19 @@ pub const MAX_RINGS: usize = 16;
 pub const MAX_DECLINED: usize = 32;
 /// How many characters a call notice may show.
 pub const MAX_NOTICE_CHARS: usize = 256;
-
 /// The speaker mark of the call pill in the room list.
 pub const CALL_MARK: &str = "\u{1F50A}";
+/// The mark of a muted participant.
+pub const MUTED_MARK: &str = "\u{1F507}";
+/// Highest per-user volume, percent (the core's `limits::MAX_VOLUME_PERCENT`).
+pub const MAX_VOLUME: u16 = 200;
+/// What the participants panel's **−** and **+** change, percent.
+pub const VOLUME_STEP: u16 = 10;
+/// A volume slider moved by the wheel or the keys has no release: its value
+/// is sent after this pause.
+pub const VOLUME_SETTLE: Duration = Duration::from_millis(400);
+/// Width of the participants panel.
+pub const PANEL_WIDTH: f32 = 320.0;
 
 /// A call control.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,6 +44,43 @@ pub enum CallMessage {
     Join(RoomId),
     /// Leave the current call.
     Leave,
+    /// Mute or unmute the microphone (**Mute**, Ctrl+Shift+M). Unmuting
+    /// while deafened also undeafens, as in Discord.
+    ToggleMute,
+    /// Deafen or undeafen (**Deafen**, Ctrl+Shift+D).
+    ToggleDeafen,
+    /// Open or close the participants panel (the header's **People**).
+    TogglePanel,
+    /// Open the call's room with the participants panel (the call bar's
+    /// room name).
+    ShowCall,
+    /// Close the call notice.
+    DismissNotice,
+    /// A volume slider moved.
+    Volume {
+        /// Whose voice.
+        user_id: UserId,
+        /// The slider's value, percent.
+        percent: u16,
+    },
+    /// The volume slider was let go: send its value.
+    VolumeReleased,
+    /// The pause after a slider move ended; stale numbers do nothing.
+    VolumeDue(u64),
+    /// **−** or **+** beside a volume slider.
+    VolumeStep {
+        /// Whose voice.
+        user_id: UserId,
+        /// **+**.
+        up: bool,
+    },
+    /// The voice cleaning menu of a participant.
+    Cleaning {
+        /// Whose voice.
+        user_id: UserId,
+        /// The choice.
+        choice: CleaningChoice,
+    },
 }
 
 /// A command sent and not answered yet: a second press sends nothing.
@@ -73,6 +122,50 @@ impl CallPill {
     }
 }
 
+/// The per-person voice cleaning menu: [`VoiceCleaning`] with words.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CleaningChoice {
+    /// As the global switch says.
+    Automatic,
+    /// Always clean this voice.
+    Always,
+    /// Never clean this voice.
+    Never,
+}
+
+impl CleaningChoice {
+    /// The menu's choices, in order.
+    pub const ALL: [Self; 3] = [Self::Automatic, Self::Always, Self::Never];
+
+    /// The core's setting.
+    pub fn cleaning(self) -> VoiceCleaning {
+        match self {
+            Self::Automatic => VoiceCleaning::Automatic,
+            Self::Always => VoiceCleaning::Always,
+            Self::Never => VoiceCleaning::Never,
+        }
+    }
+
+    /// The choice for the core's setting.
+    pub fn from_cleaning(cleaning: VoiceCleaning) -> Self {
+        match cleaning {
+            VoiceCleaning::Automatic => Self::Automatic,
+            VoiceCleaning::Always => Self::Always,
+            VoiceCleaning::Never => Self::Never,
+        }
+    }
+}
+
+impl fmt::Display for CleaningChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Automatic => "Clean: automatic",
+            Self::Always => "Clean: always",
+            Self::Never => "Clean: never",
+        })
+    }
+}
+
 /// Where the local call is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CallPhase {
@@ -90,6 +183,18 @@ pub enum CallPhase {
     },
 }
 
+impl CallPhase {
+    /// The call bar's line about the phase.
+    pub fn label(self) -> String {
+        match self {
+            Self::Joining => "Connecting\u{2026}".to_owned(),
+            Self::Connected { encrypted: true } => "Voice connected, encrypted".to_owned(),
+            Self::Connected { encrypted: false } => "Voice connected".to_owned(),
+            Self::Reconnecting { attempt } => format!("Reconnecting (attempt {attempt})\u{2026}"),
+        }
+    }
+}
+
 /// The call this device is in, from `Joining` until `Left`.
 #[derive(Clone, PartialEq)]
 pub struct CurrentCall {
@@ -101,16 +206,53 @@ pub struct CurrentCall {
     pub participants: Vec<Participant>,
     /// People who declined the ring of the call we started.
     pub declined: Vec<UserId>,
+    /// The microphone is muted (the core resets it on join).
+    pub muted: bool,
+    /// Nothing plays and the microphone is off (the core resets it on join).
+    pub deafened: bool,
+    /// The call room's members, for names and pictures; `None` until the
+    /// core answered `ListRoomMembers`.
+    pub members: Option<Vec<RoomMemberView>>,
+    /// Participants not in the member list when it was last asked for, so
+    /// one newcomer asks once.
+    pub members_asked: Vec<UserId>,
 }
 
 impl CurrentCall {
-    fn new(room_id: RoomId, phase: CallPhase) -> Self {
+    pub(crate) fn new(room_id: RoomId, phase: CallPhase) -> Self {
         Self {
             room_id,
             phase,
             participants: Vec::new(),
             declined: Vec::new(),
+            muted: false,
+            deafened: false,
+            members: None,
+            members_asked: Vec::new(),
         }
+    }
+
+    /// The member entry of `user`, once the member list is known.
+    pub fn member(&self, user: &UserId) -> Option<&RoomMemberView> {
+        self.members.as_ref()?.iter().find(|m| m.user_id == *user)
+    }
+
+    /// Participants whose user the member list lacks and who were not asked
+    /// for yet. Empty while the list is on its way.
+    fn unknown_users(&self) -> Vec<UserId> {
+        if self.members.is_none() {
+            return Vec::new();
+        }
+        let mut unknown: Vec<UserId> = Vec::new();
+        for p in &self.participants {
+            if self.member(&p.user_id).is_none()
+                && !self.members_asked.contains(&p.user_id)
+                && !unknown.contains(&p.user_id)
+            {
+                unknown.push(p.user_id.clone());
+            }
+        }
+        unknown
     }
 }
 
@@ -121,6 +263,9 @@ impl fmt::Debug for CurrentCall {
             .field("phase", &self.phase)
             .field("participants", &self.participants.len())
             .field("declined", &self.declined.len())
+            .field("muted", &self.muted)
+            .field("deafened", &self.deafened)
+            .field("members", &self.members.as_ref().map(Vec::len))
             .finish_non_exhaustive()
     }
 }
@@ -135,6 +280,53 @@ pub struct Ring {
     pub caller: UserId,
     /// A ring; `false` for a quiet notification.
     pub ring: bool,
+}
+
+/// One row of the participants panel, ready to draw.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ParticipantRow {
+    /// Account.
+    pub user_id: UserId,
+    /// The name to show: the call's, the member list's, else the user ID;
+    /// one line, capped.
+    pub name: String,
+    /// The member's picture, when known.
+    pub avatar: Option<twicecat_core::api::AvatarId>,
+    /// This device.
+    pub is_local: bool,
+    /// Talking now.
+    pub speaking: bool,
+    /// Their microphone is off (for this device, also while deafened).
+    pub muted: bool,
+    /// How this device cleans their voice, when there is something to say.
+    pub cleaning: Option<&'static str>,
+    /// The volume and cleaning controls: on the first row of each other
+    /// person (the core's settings are per person, not per device).
+    pub controls: Option<UserControls>,
+}
+
+/// The controls of a participant row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UserControls {
+    /// Playback volume, percent.
+    pub volume: u16,
+    /// The cleaning choice.
+    pub cleaning: CleaningChoice,
+}
+
+/// What the call bar says about a cleaning status; nothing when off.
+pub fn cleaning_label(status: CleaningStatus) -> Option<&'static str> {
+    match status {
+        CleaningStatus::Off => None,
+        CleaningStatus::Starting => Some("Voice cleaning starts\u{2026}"),
+        CleaningStatus::Cleaned => Some("Voice cleaned"),
+        CleaningStatus::Skipped(SkipReason::Never) => Some("Not cleaned (your choice)"),
+        CleaningStatus::Skipped(SkipReason::Limit) => Some("Not cleaned (too many voices)"),
+        CleaningStatus::Skipped(SkipReason::Unavailable) => Some("Not cleaned (unavailable)"),
+        CleaningStatus::Skipped(SkipReason::AlreadyClean) => {
+            Some("Not cleaned (cleaned on their side)")
+        }
+    }
 }
 
 /// The call and audio state the screens show.
@@ -153,6 +345,12 @@ pub struct CallModel {
     /// A non-secret line about the last call failure: why the call ended, or
     /// a refused call or audio command.
     pub notice: Option<String>,
+    /// The participants panel is open (it shows while the call's room is).
+    pub panel_open: bool,
+    /// A volume slider being moved: whose, and its value, until it is sent.
+    pub volume_drag: Option<(UserId, u16)>,
+    /// Counts slider moves, so only the last pause sends.
+    pub volume_seq: u64,
     /// The audio settings as the core last echoed them. Edits are made on a
     /// copy and sent whole.
     pub settings: Option<AudioSettings>,
@@ -175,6 +373,7 @@ impl fmt::Debug for CallModel {
             .field("counts", &self.counts.len())
             .field("rings", &self.rings.len())
             .field("notice", &self.notice.is_some())
+            .field("panel_open", &self.panel_open)
             .field("settings", &self.settings.is_some())
             .field("devices", &self.devices.is_some())
             .finish_non_exhaustive()
@@ -199,6 +398,11 @@ impl CallModel {
 
     fn call_in_mut(&mut self, room: &RoomId) -> Option<&mut CurrentCall> {
         self.call.as_mut().filter(|c| c.room_id == *room)
+    }
+
+    /// Whether the participants panel shows beside `selected`.
+    pub fn panel_shown(&self, selected: Option<&RoomId>) -> bool {
+        self.panel_open && selected.is_some_and(|room| self.call_in(room).is_some())
     }
 
     /// The header's call button for `room`. A space or an invitation has
@@ -241,16 +445,72 @@ impl CallModel {
         (count > 0 || ringing).then_some(CallPill { count, ringing })
     }
 
+    /// The volume a person's slider shows: the value being moved, else the
+    /// core's.
+    pub fn shown_volume(&self, user: &UserId, reported: u16) -> u16 {
+        match &self.volume_drag {
+            Some((dragged, percent)) if dragged == user => *percent,
+            _ => reported,
+        }
+    }
+
+    /// The participants panel's rows, oldest membership first.
+    pub fn rows(&self) -> Vec<ParticipantRow> {
+        let Some(call) = &self.call else {
+            return Vec::new();
+        };
+        let mut with_controls: Vec<&UserId> = Vec::new();
+        call.participants
+            .iter()
+            .map(|p| {
+                let member = call.member(&p.user_id);
+                let name = p
+                    .display_name
+                    .as_deref()
+                    .or_else(|| member.and_then(|m| m.display_name.as_deref()))
+                    .filter(|n| !n.trim().is_empty())
+                    .unwrap_or(p.user_id.as_str());
+                let controls = (!p.is_local && !with_controls.contains(&&p.user_id)).then(|| {
+                    with_controls.push(&p.user_id);
+                    let volume = self
+                        .settings
+                        .as_ref()
+                        .map_or(p.volume_percent, |s| s.user_volume(&p.user_id));
+                    UserControls {
+                        volume: self.shown_volume(&p.user_id, volume),
+                        cleaning: CleaningChoice::from_cleaning(
+                            self.settings
+                                .as_ref()
+                                .map(|s| s.user_cleaning(&p.user_id))
+                                .unwrap_or_default(),
+                        ),
+                    }
+                });
+                ParticipantRow {
+                    user_id: p.user_id.clone(),
+                    name: name_or_placeholder(name, MAX_NAME_CHARS),
+                    avatar: member.and_then(|m| m.avatar.clone()),
+                    is_local: p.is_local,
+                    speaking: p.speaking,
+                    muted: p.muted || (p.is_local && (call.muted || call.deafened)),
+                    cleaning: cleaning_label(p.cleaning),
+                    controls,
+                }
+            })
+            .collect()
+    }
+
     /// Applies a call state change.
     pub fn on_state(&mut self, state: CallState) {
         // Any call state answers the join or leave sent.
         self.pending = None;
         match state {
-            CallState::Idle => self.call = None,
+            CallState::Idle => self.end_call(),
             CallState::Joining { room_id } => {
                 // Joining answers the room's ring; the core also stops it.
                 self.rings.retain(|r| r.room_id != room_id);
                 self.notice = None;
+                self.volume_drag = None;
                 self.call = Some(CurrentCall::new(room_id, CallPhase::Joining));
             }
             CallState::Connected { room_id, encrypted } => {
@@ -262,13 +522,19 @@ impl CallModel {
             CallState::Left { room_id, reason } => {
                 if self.call_in(&room_id).is_some() {
                     // The core sends no empty participant list on leave.
-                    self.call = None;
+                    self.end_call();
                 }
                 if let CallEndReason::Failed(why) = reason {
                     self.notice = Some(notice_line(&format!("The call ended: {why}")));
                 }
             }
         }
+    }
+
+    fn end_call(&mut self) {
+        self.call = None;
+        self.volume_drag = None;
+        self.panel_open = false;
     }
 
     /// A phase for `room`: a call in another room is replaced, as the core
@@ -385,15 +651,13 @@ fn notice_line(text: &str) -> String {
 impl App {
     /// A call control.
     pub(crate) fn on_call(&mut self, message: CallMessage) -> Task<Message> {
-        if self.calls.pending.is_some() {
-            return Task::none();
-        }
         match message {
             CallMessage::Join(room_id) => {
                 // The room list may be filtered (a search, a tab), so a room
                 // missing from it is still joined; the core answers for an
                 // unknown one. Only an invitation is refused here.
-                if self.calls.call_in(&room_id).is_some()
+                if self.calls.pending.is_some()
+                    || self.calls.call_in(&room_id).is_some()
                     || self.rooms.iter().any(|r| r.id == room_id && r.is_invite)
                 {
                     return Task::none();
@@ -405,27 +669,245 @@ impl App {
                 })
             }
             CallMessage::Leave => {
-                if self.calls.call.is_none() {
+                if self.calls.pending.is_some() || self.calls.call.is_none() {
                     return Task::none();
                 }
                 self.calls.pending = Some(Pending::Leave);
                 self.send(Command::LeaveCall)
             }
+            CallMessage::ToggleMute => {
+                let Some(call) = self.calls.call.as_mut() else {
+                    return Task::none();
+                };
+                if call.deafened {
+                    call.deafened = false;
+                    call.muted = false;
+                    Task::batch([
+                        self.send(Command::SetDeafened(false)),
+                        self.send(Command::SetMicMuted(false)),
+                    ])
+                } else {
+                    call.muted = !call.muted;
+                    let muted = call.muted;
+                    self.send(Command::SetMicMuted(muted))
+                }
+            }
+            CallMessage::ToggleDeafen => {
+                let Some(call) = self.calls.call.as_mut() else {
+                    return Task::none();
+                };
+                call.deafened = !call.deafened;
+                let deafened = call.deafened;
+                self.send(Command::SetDeafened(deafened))
+            }
+            CallMessage::TogglePanel => {
+                if self.calls.call.is_some() {
+                    self.calls.panel_open = !self.calls.panel_open;
+                }
+                Task::none()
+            }
+            CallMessage::ShowCall => {
+                let Some(room) = self.calls.call.as_ref().map(|c| c.room_id.clone()) else {
+                    return Task::none();
+                };
+                self.calls.panel_open = true;
+                if self.selected.as_ref() == Some(&room) {
+                    Task::none()
+                } else {
+                    self.update(Message::SelectRoom(room))
+                }
+            }
+            CallMessage::DismissNotice => {
+                self.calls.notice = None;
+                Task::none()
+            }
+            CallMessage::Volume { user_id, percent } => {
+                if self.calls.call.is_none() {
+                    return Task::none();
+                }
+                // Another person's slider moving first sends the last one's
+                // value, which has no release when moved by the wheel.
+                let earlier = match &self.calls.volume_drag {
+                    Some((other, _)) if *other != user_id => self.send_dragged_volume(),
+                    _ => Task::none(),
+                };
+                self.calls.volume_drag = Some((user_id, percent.min(MAX_VOLUME)));
+                self.calls.volume_seq = self.calls.volume_seq.wrapping_add(1);
+                let seq = self.calls.volume_seq;
+                Task::batch([
+                    earlier,
+                    self.timer(VOLUME_SETTLE, Message::Call(CallMessage::VolumeDue(seq))),
+                ])
+            }
+            CallMessage::VolumeReleased => self.send_dragged_volume(),
+            CallMessage::VolumeDue(seq) if seq == self.calls.volume_seq => {
+                self.send_dragged_volume()
+            }
+            CallMessage::VolumeDue(_) => Task::none(),
+            CallMessage::VolumeStep { user_id, up } => {
+                let Some(current) = self.current_volume(&user_id) else {
+                    return Task::none();
+                };
+                let now = self.calls.shown_volume(&user_id, current);
+                let next = if up {
+                    now.saturating_add(VOLUME_STEP).min(MAX_VOLUME)
+                } else {
+                    now.saturating_sub(VOLUME_STEP)
+                };
+                self.calls.volume_drag = None;
+                if next == current {
+                    return Task::none();
+                }
+                self.set_user_volume(user_id, next)
+            }
+            CallMessage::Cleaning { user_id, choice } => {
+                let now = self
+                    .calls
+                    .settings
+                    .as_ref()
+                    .map(|s| s.user_cleaning(&user_id))
+                    .unwrap_or_default();
+                if self.calls.call.is_none() || now == choice.cleaning() {
+                    return Task::none();
+                }
+                // Kept here at once, so an edit made before the core's echo
+                // builds on it (the echo replaces it).
+                if let Some(settings) = self.calls.settings.as_mut() {
+                    match choice.cleaning() {
+                        VoiceCleaning::Automatic => settings.user_cleaning.remove(&user_id),
+                        other => settings.user_cleaning.insert(user_id.clone(), other),
+                    };
+                }
+                self.send(Command::SetUserCleaning {
+                    user_id,
+                    cleaning: choice.cleaning(),
+                })
+            }
         }
+    }
+
+    /// The volume the core reports for `user` in the call, if they are in it.
+    fn reported_volume(&self, user: &UserId) -> Option<u16> {
+        self.calls
+            .call
+            .as_ref()?
+            .participants
+            .iter()
+            .find(|p| p.user_id == *user && !p.is_local)
+            .map(|p| p.volume_percent)
+    }
+
+    /// Sends the moved slider's value, once.
+    fn send_dragged_volume(&mut self) -> Task<Message> {
+        let Some((user_id, percent)) = self.calls.volume_drag.take() else {
+            return Task::none();
+        };
+        if self.current_volume(&user_id).is_none_or(|v| v == percent) {
+            return Task::none();
+        }
+        self.set_user_volume(user_id, percent)
+    }
+
+    /// The volume of `user`, someone else in the call: the settings' (which
+    /// already hold a change sent before its echo), else what the core
+    /// reports.
+    fn current_volume(&self, user: &UserId) -> Option<u16> {
+        let reported = self.reported_volume(user)?;
+        Some(
+            self.calls
+                .settings
+                .as_ref()
+                .map_or(reported, |s| s.user_volume(user)),
+        )
+    }
+
+    /// Sends a volume, and keeps it in the settings at once, so the next
+    /// change (a second **+**, the Voice & audio card) builds on it.
+    fn set_user_volume(&mut self, user_id: UserId, percent: u16) -> Task<Message> {
+        if let Some(settings) = self.calls.settings.as_mut() {
+            if percent == 100 {
+                settings.user_volumes.remove(&user_id);
+            } else {
+                settings.user_volumes.insert(user_id.clone(), percent);
+            }
+        }
+        self.send(Command::SetUserVolume { user_id, percent })
     }
 
     /// A call or audio event from the core.
     pub(crate) fn on_call_event(&mut self, event: CoreEvent) -> Task<Message> {
+        let joining = match &event {
+            CoreEvent::CallState(CallState::Joining { room_id }) => Some(room_id.clone()),
+            _ => None,
+        };
+        let participants = matches!(event, CoreEvent::CallParticipants { .. });
         let handled = self.calls.on_event(event);
         debug_assert!(handled, "on_call_event got another kind of event");
+        if let Some(room) = joining {
+            // A voice room is the call: its people show at once (plan Q4).
+            if self.rooms.iter().any(|r| r.id == room && r.is_call_room) {
+                self.calls.panel_open = true;
+            }
+            return self.send(Command::ListRoomMembers { room_id: room });
+        }
+        if participants {
+            return self.call_people_changed();
+        }
         Task::none()
+    }
+
+    /// Asks again for the member list when someone it lacks joined, and for
+    /// the pictures of the people in the call.
+    fn call_people_changed(&mut self) -> Task<Message> {
+        let Some(call) = self.calls.call.as_mut() else {
+            return Task::none();
+        };
+        let unknown = call.unknown_users();
+        let ask = if unknown.is_empty() {
+            Task::none()
+        } else {
+            call.members_asked.extend(unknown);
+            let room_id = call.room_id.clone();
+            self.send(Command::ListRoomMembers { room_id })
+        };
+        Task::batch([ask, self.fetch_call_avatars()])
+    }
+
+    fn fetch_call_avatars(&mut self) -> Task<Message> {
+        let Some(call) = &self.calls.call else {
+            return Task::none();
+        };
+        let ids: Vec<_> = call
+            .participants
+            .iter()
+            .filter_map(|p| call.member(&p.user_id)?.avatar.clone())
+            .collect();
+        let ids = self.avatars.take_unrequested(ids);
+        if ids.is_empty() {
+            Task::none()
+        } else {
+            self.send(Command::FetchAvatars(ids))
+        }
+    }
+
+    /// `RoomMembers` for the call's room: kept for the participants panel.
+    pub(crate) fn on_call_members(
+        &mut self,
+        room: &RoomId,
+        members: &[RoomMemberView],
+    ) -> Task<Message> {
+        let Some(call) = self.calls.call_in_mut(room) else {
+            return Task::none();
+        };
+        call.members = Some(members.to_vec());
+        self.fetch_call_avatars()
     }
 
     /// After a login: the audio settings, so the call controls show the
     /// stored choices.
     pub(crate) fn calls_after_login(&mut self) -> Task<Message> {
         self.calls = CallModel::default();
-        self.send(twicecat_core::api::Command::GetAudioSettings)
+        self.send(Command::GetAudioSettings)
     }
 }
 
@@ -1139,6 +1621,7 @@ mod tests {
         call(&mut app, CallMessage::Join(room("i")));
         assert!(drain(&mut rx).is_empty());
         joining(&mut app, "a");
+        drain(&mut rx);
         call(&mut app, CallMessage::Join(room("a")));
         assert!(drain(&mut rx).is_empty());
     }
@@ -1235,5 +1718,663 @@ mod tests {
             }],
         );
         let _ = app.view();
+    }
+
+    // ---- Task 3: the in-call view ----
+
+    use twicecat_core::api::{
+        AvatarId, MembershipView, PowerLevelView, Role, RoomMemberView, SkipReason, VoiceCleaning,
+    };
+
+    use crate::keys::Shortcut;
+
+    fn member(n: &str, name: Option<&str>, avatar: Option<&str>) -> RoomMemberView {
+        RoomMemberView {
+            user_id: user(n),
+            display_name: name.map(str::to_owned),
+            avatar: avatar.map(AvatarId::from),
+            power: PowerLevelView::Level(0),
+            role: Role::User,
+            membership: MembershipView::Joined,
+        }
+    }
+
+    fn members(app: &mut App, n: &str, list: Vec<RoomMemberView>) {
+        let _ = app.update(core(CoreEvent::RoomMembers {
+            room_id: room(n),
+            members: list,
+            truncated: false,
+        }));
+    }
+
+    /// An app in a connected call in room `a` with `a` (this device) and
+    /// `b`, room `b` selected, commands drained.
+    fn in_call() -> (App, mpsc::Receiver<Command>) {
+        let (mut app, mut rx) = main_app();
+        let _ = app.update(Message::SelectRoom(room("b")));
+        joining(&mut app, "a");
+        state(
+            &mut app,
+            CallState::Connected {
+                room_id: room("a"),
+                encrypted: false,
+            },
+        );
+        participants(
+            &mut app,
+            "a",
+            vec![ListDiff::Reset {
+                values: vec![person("a"), person("b")],
+            }],
+        );
+        drain(&mut rx);
+        (app, rx)
+    }
+
+    fn shortcut(app: &mut App, shortcut: Shortcut) {
+        let _ = app.update(Message::Shortcut {
+            shortcut,
+            captured: false,
+        });
+    }
+
+    #[test]
+    fn mute_and_deafen_send_their_commands() {
+        let (mut app, mut rx) = in_call();
+        call(&mut app, CallMessage::ToggleMute);
+        call(&mut app, CallMessage::ToggleMute);
+        call(&mut app, CallMessage::ToggleDeafen);
+        call(&mut app, CallMessage::ToggleDeafen);
+        let sent = drain(&mut rx);
+        assert!(
+            matches!(
+                sent.as_slice(),
+                [
+                    Command::SetMicMuted(true),
+                    Command::SetMicMuted(false),
+                    Command::SetDeafened(true),
+                    Command::SetDeafened(false),
+                ]
+            ),
+            "{sent:?}"
+        );
+    }
+
+    #[test]
+    fn unmuting_while_deafened_also_undeafens() {
+        let (mut app, mut rx) = in_call();
+        call(&mut app, CallMessage::ToggleMute);
+        call(&mut app, CallMessage::ToggleDeafen);
+        drain(&mut rx);
+        call(&mut app, CallMessage::ToggleMute);
+        let sent = drain(&mut rx);
+        assert!(
+            matches!(
+                sent.as_slice(),
+                [Command::SetDeafened(false), Command::SetMicMuted(false)]
+            ),
+            "{sent:?}"
+        );
+        let current = app.calls.call.as_ref().expect("in a call");
+        assert!(!current.muted && !current.deafened);
+    }
+
+    #[test]
+    fn undeafening_keeps_the_mute_from_before() {
+        let (mut app, mut rx) = in_call();
+        call(&mut app, CallMessage::ToggleMute);
+        call(&mut app, CallMessage::ToggleDeafen);
+        call(&mut app, CallMessage::ToggleDeafen);
+        let current = app.calls.call.as_ref().expect("in a call");
+        assert!(current.muted && !current.deafened);
+        // The core keeps the two apart, so undeafening sends only that.
+        assert!(matches!(
+            drain(&mut rx).last(),
+            Some(Command::SetDeafened(false))
+        ));
+    }
+
+    #[test]
+    fn mute_and_deafen_reset_on_a_new_call_and_do_nothing_without_one() {
+        let (mut app, mut rx) = in_call();
+        call(&mut app, CallMessage::ToggleMute);
+        call(&mut app, CallMessage::ToggleDeafen);
+        joining(&mut app, "b");
+        let current = app.calls.call.as_ref().expect("in a call");
+        assert!(!current.muted && !current.deafened);
+        state(
+            &mut app,
+            CallState::Left {
+                room_id: room("b"),
+                reason: CallEndReason::Hangup,
+            },
+        );
+        drain(&mut rx);
+        call(&mut app, CallMessage::ToggleMute);
+        call(&mut app, CallMessage::ToggleDeafen);
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn the_shortcuts_mute_and_deafen_only_in_a_call() {
+        let (mut app, mut rx) = main_app();
+        shortcut(&mut app, Shortcut::ToggleMute);
+        shortcut(&mut app, Shortcut::ToggleDeafen);
+        assert!(drain(&mut rx).is_empty());
+        let (mut app, mut rx) = in_call();
+        shortcut(&mut app, Shortcut::ToggleMute);
+        shortcut(&mut app, Shortcut::ToggleDeafen);
+        let sent = drain(&mut rx);
+        assert!(
+            matches!(
+                sent.as_slice(),
+                [Command::SetMicMuted(true), Command::SetDeafened(true)]
+            ),
+            "{sent:?}"
+        );
+    }
+
+    #[test]
+    fn the_shortcuts_are_in_the_table_and_reach_the_app_from_the_composer() {
+        use iced::keyboard::{Key, Modifiers};
+        let ctrl_shift = Modifiers::CTRL | Modifiers::SHIFT;
+        let other = crate::keys::Platform::Other;
+        assert_eq!(
+            crate::keys::shortcut_for(&Key::Character("M".into()), ctrl_shift, other),
+            Some(Shortcut::ToggleMute)
+        );
+        assert_eq!(
+            crate::keys::shortcut_for(&Key::Character("D".into()), ctrl_shift, other),
+            Some(Shortcut::ToggleDeafen)
+        );
+        assert_eq!(
+            crate::keys::shortcut_for(&Key::Character("m".into()), Modifiers::CTRL, other),
+            None,
+            "Ctrl+M alone is not mute"
+        );
+        assert!(crate::keys::composer_takes(Shortcut::ToggleMute));
+        assert!(crate::keys::composer_takes(Shortcut::ToggleDeafen));
+    }
+
+    #[test]
+    fn joining_asks_for_the_call_rooms_members() {
+        let (mut app, mut rx) = main_app();
+        joining(&mut app, "a");
+        let sent = drain(&mut rx);
+        assert!(
+            matches!(sent.as_slice(), [Command::ListRoomMembers { room_id }] if *room_id == room("a")),
+            "{sent:?}"
+        );
+    }
+
+    #[test]
+    fn the_call_rooms_members_name_and_picture_the_participants() {
+        let (mut app, mut rx) = in_call();
+        let mut b = person("b");
+        b.display_name = None;
+        participants(
+            &mut app,
+            "a",
+            vec![ListDiff::Reset {
+                values: vec![person("a"), b],
+            }],
+        );
+        // The open room is `b`: the call room's list is kept all the same.
+        members(
+            &mut app,
+            "a",
+            vec![
+                member("a", Some("Ann"), None),
+                member("b", Some("Bob"), Some("mxc://x/bob")),
+            ],
+        );
+        let sent = drain(&mut rx);
+        assert!(
+            matches!(sent.as_slice(), [Command::FetchAvatars(ids)] if *ids == vec![AvatarId::from("mxc://x/bob")]),
+            "{sent:?}"
+        );
+        let rows = app.calls.rows();
+        assert_eq!(rows[0].name, "A", "the call's own name comes first");
+        assert_eq!(rows[1].name, "Bob", "then the member list's");
+        assert_eq!(rows[1].avatar, Some(AvatarId::from("mxc://x/bob")));
+        assert!(
+            app.rooms_ui.known.is_none(),
+            "the open room's list is untouched"
+        );
+    }
+
+    #[test]
+    fn a_newcomer_missing_from_the_members_asks_again_once() {
+        let (mut app, mut rx) = in_call();
+        members(
+            &mut app,
+            "a",
+            vec![member("a", None, None), member("b", None, None)],
+        );
+        drain(&mut rx);
+        let mut c = person("c");
+        c.display_name = None;
+        let everyone = vec![person("a"), person("b"), c];
+        participants(
+            &mut app,
+            "a",
+            vec![ListDiff::Reset {
+                values: everyone.clone(),
+            }],
+        );
+        let sent = drain(&mut rx);
+        assert!(
+            matches!(sent.as_slice(), [Command::ListRoomMembers { room_id }] if *room_id == room("a")),
+            "{sent:?}"
+        );
+        participants(&mut app, "a", vec![ListDiff::Reset { values: everyone }]);
+        assert!(drain(&mut rx).is_empty(), "asked once");
+        assert_eq!(app.calls.rows()[2].name, "@c:x", "the user ID until known");
+    }
+
+    #[test]
+    fn participants_before_the_member_list_do_not_ask_twice() {
+        let (mut app, mut rx) = main_app();
+        joining(&mut app, "a");
+        participants(
+            &mut app,
+            "a",
+            vec![ListDiff::Reset {
+                values: vec![person("a"), person("c")],
+            }],
+        );
+        let sent = drain(&mut rx);
+        assert_eq!(sent.len(), 1, "only the join's request: {sent:?}");
+    }
+
+    #[test]
+    fn rows_mark_this_device_speaking_and_muted_and_give_controls_once_per_person() {
+        let (mut app, _rx) = in_call();
+        let mut b1 = person("b");
+        b1.speaking = true;
+        b1.volume_percent = 150;
+        b1.cleaning = CleaningStatus::Cleaned;
+        let mut b2 = person("b");
+        b2.id = ParticipantId::from("b-phone");
+        b2.muted = true;
+        b2.cleaning = CleaningStatus::Skipped(SkipReason::AlreadyClean);
+        participants(
+            &mut app,
+            "a",
+            vec![ListDiff::Reset {
+                values: vec![person("a"), b1, b2],
+            }],
+        );
+        call(&mut app, CallMessage::ToggleMute);
+        let rows = app.calls.rows();
+        assert!(rows[0].is_local && rows[0].muted, "our mute shows at once");
+        assert_eq!(rows[0].controls, None, "no volume for ourselves");
+        assert!(rows[1].speaking && !rows[1].muted);
+        assert_eq!(rows[1].cleaning, Some("Voice cleaned"));
+        assert_eq!(
+            rows[1].controls,
+            Some(UserControls {
+                volume: 150,
+                cleaning: CleaningChoice::Automatic
+            })
+        );
+        assert!(rows[2].muted);
+        assert_eq!(
+            rows[2].cleaning,
+            Some("Not cleaned (cleaned on their side)")
+        );
+        assert_eq!(rows[2].controls, None, "one set of controls per person");
+    }
+
+    #[test]
+    fn a_deafened_device_shows_as_muted() {
+        let (mut app, _rx) = in_call();
+        call(&mut app, CallMessage::ToggleDeafen);
+        assert!(app.calls.rows()[0].muted);
+    }
+
+    #[test]
+    fn a_moved_volume_slider_sends_once_on_release() {
+        let (mut app, mut rx) = in_call();
+        for percent in [110, 140, 170] {
+            call(
+                &mut app,
+                CallMessage::Volume {
+                    user_id: user("b"),
+                    percent,
+                },
+            );
+        }
+        assert!(drain(&mut rx).is_empty(), "nothing while it moves");
+        assert_eq!(app.calls.rows()[1].controls.map(|c| c.volume), Some(170));
+        call(&mut app, CallMessage::VolumeReleased);
+        call(&mut app, CallMessage::VolumeReleased);
+        let seq = app.calls.volume_seq;
+        call(&mut app, CallMessage::VolumeDue(seq));
+        let sent = drain(&mut rx);
+        assert!(
+            matches!(sent.as_slice(), [Command::SetUserVolume { user_id, percent: 170 }] if *user_id == user("b")),
+            "{sent:?}"
+        );
+    }
+
+    #[test]
+    fn a_slider_moved_without_a_release_sends_after_the_last_pause() {
+        let (mut app, mut rx) = in_call();
+        call(
+            &mut app,
+            CallMessage::Volume {
+                user_id: user("b"),
+                percent: 80,
+            },
+        );
+        let stale = app.calls.volume_seq;
+        call(
+            &mut app,
+            CallMessage::Volume {
+                user_id: user("b"),
+                percent: 60,
+            },
+        );
+        call(&mut app, CallMessage::VolumeDue(stale));
+        assert!(drain(&mut rx).is_empty(), "an older pause sends nothing");
+        let seq = app.calls.volume_seq;
+        call(&mut app, CallMessage::VolumeDue(seq));
+        let sent = drain(&mut rx);
+        assert!(
+            matches!(
+                sent.as_slice(),
+                [Command::SetUserVolume { percent: 60, .. }]
+            ),
+            "{sent:?}"
+        );
+    }
+
+    #[test]
+    fn a_slider_put_back_where_it_was_sends_nothing() {
+        let (mut app, mut rx) = in_call();
+        call(
+            &mut app,
+            CallMessage::Volume {
+                user_id: user("b"),
+                percent: 100,
+            },
+        );
+        call(&mut app, CallMessage::VolumeReleased);
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn the_volume_steps_clamp_to_the_range() {
+        let (mut app, mut rx) = in_call();
+        let step = |app: &mut App, up: bool| {
+            call(
+                app,
+                CallMessage::VolumeStep {
+                    user_id: user("b"),
+                    up,
+                },
+            );
+        };
+        step(&mut app, true);
+        let mut b = person("b");
+        b.volume_percent = 195;
+        participants(&mut app, "a", vec![ListDiff::Set { index: 1, value: b }]);
+        step(&mut app, true);
+        let mut b = person("b");
+        b.volume_percent = MAX_VOLUME;
+        participants(&mut app, "a", vec![ListDiff::Set { index: 1, value: b }]);
+        step(&mut app, true);
+        let mut b = person("b");
+        b.volume_percent = 5;
+        participants(&mut app, "a", vec![ListDiff::Set { index: 1, value: b }]);
+        step(&mut app, false);
+        step(&mut app, false);
+        let percents: Vec<u16> = drain(&mut rx)
+            .into_iter()
+            .filter_map(|c| match c {
+                Command::SetUserVolume { percent, .. } => Some(percent),
+                _ => None,
+            })
+            .collect();
+        // 100 -> 110; 195 -> 200; at 200 nothing; 5 -> 0, twice (the core
+        // has not reported 0 yet).
+        assert_eq!(percents, [110, MAX_VOLUME, 0, 0]);
+    }
+
+    fn percents(rx: &mut mpsc::Receiver<Command>) -> Vec<u16> {
+        drain(rx)
+            .into_iter()
+            .filter_map(|c| match c {
+                Command::SetUserVolume { percent, .. } => Some(percent),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn steps_before_the_echo_add_up() {
+        let (mut app, mut rx) = in_call();
+        let _ = app.update(core(CoreEvent::AudioSettings(AudioSettings::default())));
+        for _ in 0..3 {
+            call(
+                &mut app,
+                CallMessage::VolumeStep {
+                    user_id: user("b"),
+                    up: true,
+                },
+            );
+        }
+        assert_eq!(percents(&mut rx), [110, 120, 130]);
+        assert_eq!(app.calls.rows()[1].controls.map(|c| c.volume), Some(130));
+        // Back to 100 is stored as nothing, as the core does.
+        let mut settings = app.calls.settings.clone().expect("echoed");
+        settings.user_volumes.insert(user("b"), 110);
+        let _ = app.update(core(CoreEvent::AudioSettings(settings)));
+        call(
+            &mut app,
+            CallMessage::VolumeStep {
+                user_id: user("b"),
+                up: false,
+            },
+        );
+        assert_eq!(percents(&mut rx), [100]);
+        assert!(
+            app.calls
+                .settings
+                .as_ref()
+                .is_some_and(|s| s.user_volumes.is_empty())
+        );
+    }
+
+    #[test]
+    fn a_second_persons_slider_sends_the_first_ones_value() {
+        let (mut app, mut rx) = in_call();
+        let mut c = person("c");
+        c.id = ParticipantId::from("c-dev");
+        participants(&mut app, "a", vec![ListDiff::PushBack { value: c }]);
+        call(
+            &mut app,
+            CallMessage::Volume {
+                user_id: user("b"),
+                percent: 60,
+            },
+        );
+        call(
+            &mut app,
+            CallMessage::Volume {
+                user_id: user("c"),
+                percent: 140,
+            },
+        );
+        let sent = drain(&mut rx);
+        assert!(
+            matches!(sent.as_slice(), [Command::SetUserVolume { user_id, percent: 60 }] if *user_id == user("b")),
+            "{sent:?}"
+        );
+        call(&mut app, CallMessage::VolumeReleased);
+        assert_eq!(percents(&mut rx), [140]);
+    }
+
+    #[test]
+    fn a_cleaning_choice_is_kept_before_its_echo() {
+        let (mut app, mut rx) = in_call();
+        let _ = app.update(core(CoreEvent::AudioSettings(AudioSettings::default())));
+        call(
+            &mut app,
+            CallMessage::Cleaning {
+                user_id: user("b"),
+                choice: CleaningChoice::Always,
+            },
+        );
+        call(
+            &mut app,
+            CallMessage::Cleaning {
+                user_id: user("b"),
+                choice: CleaningChoice::Always,
+            },
+        );
+        assert_eq!(drain(&mut rx).len(), 1, "the second is already set");
+        assert_eq!(
+            app.calls.rows()[1].controls.map(|c| c.cleaning),
+            Some(CleaningChoice::Always)
+        );
+    }
+
+    #[test]
+    fn volume_for_someone_not_in_the_call_or_ourselves_sends_nothing() {
+        let (mut app, mut rx) = in_call();
+        for user_id in [user("z"), user("a")] {
+            call(
+                &mut app,
+                CallMessage::VolumeStep {
+                    user_id: user_id.clone(),
+                    up: true,
+                },
+            );
+            call(
+                &mut app,
+                CallMessage::Volume {
+                    user_id,
+                    percent: 50,
+                },
+            );
+            call(&mut app, CallMessage::VolumeReleased);
+        }
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn the_cleaning_menu_sends_a_changed_choice() {
+        let (mut app, mut rx) = in_call();
+        let choose = |app: &mut App, choice| {
+            call(
+                app,
+                CallMessage::Cleaning {
+                    user_id: user("b"),
+                    choice,
+                },
+            );
+        };
+        choose(&mut app, CleaningChoice::Automatic);
+        assert!(drain(&mut rx).is_empty(), "already automatic");
+        choose(&mut app, CleaningChoice::Never);
+        let sent = drain(&mut rx);
+        assert!(
+            matches!(sent.as_slice(), [Command::SetUserCleaning { user_id, cleaning: VoiceCleaning::Never }] if *user_id == user("b")),
+            "{sent:?}"
+        );
+        let mut echoed = AudioSettings::default();
+        echoed.user_cleaning.insert(user("b"), VoiceCleaning::Never);
+        let _ = app.update(core(CoreEvent::AudioSettings(echoed)));
+        assert_eq!(
+            app.calls.rows()[1].controls.map(|c| c.cleaning),
+            Some(CleaningChoice::Never)
+        );
+        choose(&mut app, CleaningChoice::Never);
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn cleaning_choices_round_trip_and_read_well() {
+        for choice in CleaningChoice::ALL {
+            assert_eq!(CleaningChoice::from_cleaning(choice.cleaning()), choice);
+        }
+        assert_eq!(CleaningChoice::Always.to_string(), "Clean: always");
+        assert_eq!(cleaning_label(CleaningStatus::Off), None);
+        assert_eq!(
+            cleaning_label(CleaningStatus::Skipped(SkipReason::Limit)),
+            Some("Not cleaned (too many voices)")
+        );
+    }
+
+    #[test]
+    fn a_voice_room_opens_the_panel_and_an_ordinary_room_does_not() {
+        let (mut app, _rx) = main_app();
+        let mut voice = summary("v");
+        voice.is_call_room = true;
+        let _ = app.update(core(CoreEvent::RoomListChanged(vec![ListDiff::PushBack {
+            value: voice,
+        }])));
+        joining(&mut app, "a");
+        assert!(!app.calls.panel_open);
+        joining(&mut app, "v");
+        assert!(app.calls.panel_open);
+    }
+
+    #[test]
+    fn the_panel_shows_beside_the_calls_room_only_and_closes_with_the_call() {
+        let (mut app, _rx) = in_call();
+        call(&mut app, CallMessage::TogglePanel);
+        assert!(app.calls.panel_open);
+        assert!(
+            !app.calls.panel_shown(app.selected.as_ref()),
+            "room b is open"
+        );
+        call(&mut app, CallMessage::ShowCall);
+        assert_eq!(app.selected, Some(room("a")));
+        assert!(app.calls.panel_shown(app.selected.as_ref()));
+        let _ = app.view();
+        state(
+            &mut app,
+            CallState::Left {
+                room_id: room("a"),
+                reason: CallEndReason::Hangup,
+            },
+        );
+        assert!(!app.calls.panel_open);
+        call(&mut app, CallMessage::TogglePanel);
+        assert!(!app.calls.panel_open, "no call, no panel");
+    }
+
+    #[test]
+    fn escape_closes_the_participants_panel() {
+        let (mut app, _rx) = in_call();
+        call(&mut app, CallMessage::ShowCall);
+        shortcut(&mut app, Shortcut::Escape);
+        assert!(!app.calls.panel_open);
+    }
+
+    #[test]
+    fn the_notice_can_be_dismissed() {
+        let (mut app, _rx) = in_call();
+        let _ = app.update(core(CoreEvent::Error(CoreError::NotInCall)));
+        assert!(app.calls.notice.is_some());
+        let _ = app.view();
+        call(&mut app, CallMessage::DismissNotice);
+        assert!(app.calls.notice.is_none());
+    }
+
+    #[test]
+    fn phase_labels_read_well() {
+        assert_eq!(CallPhase::Joining.label(), "Connecting\u{2026}");
+        assert_eq!(
+            CallPhase::Connected { encrypted: true }.label(),
+            "Voice connected, encrypted"
+        );
+        assert_eq!(
+            CallPhase::Reconnecting { attempt: 3 }.label(),
+            "Reconnecting (attempt 3)\u{2026}"
+        );
     }
 }
