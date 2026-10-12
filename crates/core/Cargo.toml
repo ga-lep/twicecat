@@ -35,6 +35,9 @@ rpassword = "7"
 zeroize = { version = "1.9", features = ["serde"] }
 # Names the `Mime` that `Room::send_attachment` takes; already in the lock (matrix-sdk dependency).
 mime = "0.3"
+# Installs the process-wide TLS provider (`Core::start`); already in the lock
+# with this feature (matrix-sdk dependency).
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
 # Build with LK_CUSTOM_WEBRTC from scripts/fetch-libwebrtc.sh (pinned SHA-256);
 # without it webrtc-sys downloads libwebrtc unverified.
 twicecat-audio = { path = "../audio" }

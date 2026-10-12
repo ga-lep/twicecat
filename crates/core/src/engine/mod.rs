@@ -105,6 +105,17 @@ pub struct CoreHandle {
     pub events: mpsc::Receiver<CoreEvent>,
 }
 
+/// Installs the process-wide TLS crypto provider. matrix-sdk turns on
+/// rustls' aws-lc-rs provider and LiveKit's HTTP client its ring provider.
+/// With both built in, rustls cannot pick one by itself, and LiveKit's
+/// websocket (tokio-tungstenite) asks for the process default, so the first
+/// `wss://` call connection panicked. aws-lc-rs is matrix-sdk's choice.
+fn install_tls_provider() {
+    // An error only means that a provider is installed already (an earlier
+    // core in this process, or the program embedding it chose one); it stays.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
+
 /// Entry point of the headless engine.
 #[derive(Debug)]
 pub struct Core;
@@ -114,6 +125,7 @@ impl Core {
     ///
     /// Must be called inside a tokio runtime.
     pub fn start(config: CoreConfig, secrets: Arc<dyn SecretStore>) -> CoreHandle {
+        install_tls_provider();
         let (cmd_tx, cmd_rx) = mpsc::channel(32);
         let (ev_tx, ev_rx) = mpsc::channel(256);
         let engine = Engine {
