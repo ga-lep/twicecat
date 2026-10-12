@@ -1773,7 +1773,7 @@ Plan approved by the human 2026-10-12 (Q1-Q8 answered: the core plays the ringto
 - [x] 20. Ringtone in the core (phase6.20)
 - [x] 21. Incoming calls, with a stack round trip (phase6.21)
 - [x] 22. Voice & audio settings (phase6.22)
-- [ ] 23. Wrap-up (phase6.23)
+- [x] 23. Wrap-up (phase6.23)
 
 ### Step 17: the call model (phase6.17)
 - **Built:** `crates/app/src/calls.rs`, `CallModel` on `App` (`App::calls`):
@@ -1833,7 +1833,7 @@ Plan approved by the human 2026-10-12 (Q1-Q8 answered: the core plays the ringto
     - "Leave call" (danger) while in this room's call, also while reconnecting.
   - **`Message::Call(CallMessage::{Join(room), Leave})`** sends `JoinCall { room_id, intent: Audio }` or `LeaveCall`. `CallModel::pending` keeps a second press, and any other join or leave, from sending until the core answers. Any `CallState` or a call error (`Call`, `Audio`, `NotInCall`) clears it. A join for an invitation or the current call's room sends nothing; so does a leave without a call. A room missing from `App::rooms` is still joined, because that list is filtered by the search and the tabs (the core answers an unknown room with `Joining` and then `Left { Failed }`). A voice room never joins on its own; joining is always a click.
 - **iced API** (rule 2, `iced_widget` 0.14.2 as locked): `button::primary` (`src/button.rs:598`), `button::danger` (:658), `Button::on_press_maybe` (:170). `button::success` (:628) was not used: no app colour test covers it, and the theme's contrast rule is checked for primary and danger only.
-- **Tests:** 9 more in `calls::tests`, plus one row build test in `room_list_pane`. They cover:
+- **Tests:** 10 more in `calls::tests`, plus one row build test in `room_list_pane`. They cover:
   - the labels and presses through every call state;
   - voice rooms;
   - no button for spaces or invitations;
@@ -1941,8 +1941,8 @@ Plan approved by the human 2026-10-12 (Q1-Q8 answered: the core plays the ringto
     - the caller's picture (the DM's avatar) and name (the DM's name, else the caller's ID), with "in <room>" for a group room;
     - **Decline** (danger) and **Accept** (primary);
     - "Esc hides this; the room keeps ringing."
-  - **Accept** sends `JoinCall` through the same path as the header. **Decline** sends `DeclineCall`. Each sends once: `Ring::answered` turns the buttons off until the core answers, and a call error turns them back on (a refused decline: "could not send the decline"). The card goes on `Joining` for that room or on `RingingStopped`.
-  - **Esc** (first in `on_escape`, before the switcher and every dialog) hides the card (`Ring::hidden`) and sends `SilenceRinging`. The room keeps its highlighted pill and the header's join button, and the next ring's card shows. A new `IncomingCall` for the same room (a new call) shows its card again.
+  - **Accept** sends `JoinCall` through the same path as the header. **Decline** sends `DeclineCall`. Each sends once: `Ring::answered` turns the buttons off until the core answers, and a call error turns them back on (a refused decline: "could not send the decline"). The card hides while that room's call is joining or running. The ring itself stays until `RingingStopped`, which the core sends when the join succeeds. A failed join (`Left`) shows the card again with its buttons on, as the core's ringtone sounds again (review fix, step 23).
+  - **Esc** (first in `on_escape`, before the switcher and every dialog) hides the card of every DM ring (`Ring::hidden`; the core's `SilenceRinging` silences them all) and sends `SilenceRinging`. The rooms keep their highlighted pills and the header's join button. A later ring sounds and shows its card (review fix, step 23). A new `IncomingCall` for the same room (a new call) shows its card again.
   - **While the card shows**, `any_overlay_open` and `settings::other_modal_open` count it, so the room shortcuts wait.
   - **A new ring** (not a replay, not for the call we are in) asks for window attention: `Critical` for a DM ring (until focused), `Informational` for a group call (`state::attention_at`). It also shows a desktop notification through `App::notify`, which follows the same `should_show` rule as messages (setting on, window not focused). The text comes from `notifications::call_toast`:
     - the title is the room's name;
@@ -2018,6 +2018,56 @@ Plan approved by the human 2026-10-12 (Q1-Q8 answered: the core plays the ringto
 - As a result, a revoked token during a call left the call's media and the microphone running behind the login screen. Since this branch, the ringtone's gate also stayed "in a call" until the next call.
 - Now `Engine::end_session_audio` (leave the call, stop the mic test) runs first. If the dead token cannot remove the membership, the server's delayed leave removes it.
 - Test: `the_end_of_a_session_stops_the_mic_test`, an engine with virtual audio.
+
+### Step 23: wrap-up (phase6.23)
+- **Branch review** by an independent read-only review agent over `main..HEAD`. It verified 10 defects; privacy was clean (the hand-written `Debug` impls print counts only, the tracing lines are fixed text, call notifications hide the caller without "Show message content"). The fixes were folded into the commits that wrote the code (rule 5: `--fixup`, `git rebase --autosquash main`, a clean rebase, the final tree identical to the unsquashed one, and each rewritten commit's lib tests run again):
+  1. *An expired session left the call and the mic test running* (already on `main`): its own `fix(core)` commit, see above.
+  2. *A failed Accept left the ringtone sounding with nothing on screen* (the app dropped the ring on `Joining`, the core only takes it on success): fixed in step 21. The ring stays until `RingingStopped`, its card hides while that room's call is joining or running, and `Left` turns its buttons back on. Test: `a_failed_accept_shows_the_card_again`.
+  3. *Quick edits overwrote each other* (each built on the last echo, and no echo comes while a join holds the engine): fixed in steps 19 and 22. Every edit (card, volume, cleaning) is kept in the local settings at once and the echo replaces it, so two **+** presses give 110 then 120. Tests: `two_changes_before_the_echo_both_count`, `steps_before_the_echo_add_up`, `a_cleaning_choice_is_kept_before_its_echo`.
+  4. *Answering a ring while in another call opened the gate for a moment* (a burst of tone): fixed in step 20. `join_call` closes the gate before leaving the old call (`end_call(true)`).
+  5. *A refused mic test still looked like it was running*: fixed in step 22. An `Audio` error clears it, and the card shows the call notice (which the card covers in the call bar). Test: `a_refused_mic_test_is_not_shown_as_running`.
+  6. *Esc closed the audio card under the switcher, the upload dialog or the viewer*: fixed in step 22. Esc now follows the layer order. Test: `escape_follows_the_layers_over_the_card`.
+  7. *Esc silenced every ring but hid one card*: fixed in step 21. Every DM ring's card hides with the silence.
+  8. *`pending` and `answered` are cleared by any call state or call error, and `NotLoggedIn` is not an answer*: **open, low.** No path leaves them stuck on the main screen; logout resets them.
+  9. *A second person's slider dropped the first one's value*: fixed in step 19. The first is sent when another starts moving. Test: `a_second_persons_slider_sends_the_first_ones_value`.
+  10. *An early ring could ignore the stored ringtone setting*: fixed in step 20. `start_sync` loads the settings before the ringer starts. Test: `the_stored_ringtone_setting_reaches_the_gate_when_loaded`.
+
+  The review also asked for member names in the declined line, done in step 19 ("Bob declined", the user ID until known).
+- **Issue #14, item by item:**
+  - **Room header** join/leave and the room list call badge, voice rooms included: step 18.
+  - **In-call view:**
+    - participants with name, picture, speaking and muted, plus mute and deafen (`SetDeafened`), per-user volume (0–200 %) and per-user cleaning: step 19;
+    - call state and errors: steps 17 and 19.
+  - **Incoming calls:**
+    - the ring with the caller, Accept (`JoinCall`) and Decline (`DeclineCall`), stopping on `RingingStopped`: step 21. `CallDeclined` is the caller's side (someone declined our ring) and shows in the call bar, step 19;
+    - the ringtone: step 20;
+    - the quiet notification for `ring: false`: step 21.
+  - **Audio settings screen:**
+    - devices with hot-plug, processing, gain, volume and bitrate;
+    - the mic test with its level;
+    - cleaning other voices, and the announcement with its privacy note;
+    - sent whole and echoed.
+
+    All in step 22. The input mode and push-to-talk are left to #15 (plan Q7).
+  - **Constraints:**
+    - the boundary (`check-app-deps.sh` and `check-core-api.sh` reject `twicecat-audio`): step 17;
+    - pure `update` with unit tests, nothing blocking: all steps;
+    - keyboard: every control is in the Tab order, −/+ beside every slider, Ctrl+Shift+M/D, and the Esc order; see `docs/accessibility.md`.
+  - **Acceptance:**
+    - unit tests for every call event: steps 17–22;
+    - the ring round trip with `twicecat-cli` against the local stack: `crates/app/tests/calls.rs`, step 21;
+    - the human checkpoint below.
+- **Deviations from the plan:**
+  - The call bar's **Leave** stays enabled while joining (it cancels the join; the core leaves once joined). The header's button is off then, as planned.
+  - Joining a call does not send `StopMicTest`: the core's `start_call_audio` takes the devices over from the mic test itself, and the card clears its state on `Joining`.
+  - The round-trip test lives in its own `crates/app/tests/calls.rs`, with the CLI binary as the caller.
+  - The incoming-call card shows on the main screen only, not during the first load (`Screen::Loading`). The ring still sounds, and the card shows once the room list is up.
+- **Open, for later or other sessions:**
+  - Review item 8 (low).
+  - A ringback tone for the caller, choosing a ringtone, and a separate ringtone device or volume: out of the approved scope (Q3b).
+  - `Engine::start_mic_test` stops the running audio session before checking for a call, so a `StartMicTest` during a call would cut the call's audio. This is on `main`; the app never sends it in a call. Suggested as a separate task.
+  - `crates/core/src/engine/calls.rs` is not compiled (a stale copy of code in `engine/mod.rs`). Suggested as a separate task.
+  - The 7 ignored tests that need `scripts/fetch-models.sh` (DeepFilterNet3 models) were not run here (no download made).
 
 ## Phase 6 call UI human checkpoint
 - [x] Plan questions answered and plan approved (2026-10-12).

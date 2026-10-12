@@ -1,5 +1,5 @@
 # Phase 6 Call UI Plan
-Status: APPROVED (all questions answered and the plan approved by the human, 2026-10-12)
+Status: APPROVED (all questions answered and the plan approved by the human, 2026-10-12); Tasks 1–7 done 2026-10-12, waiting for the human checkpoint
 
 ## Goal
 Put the finished call engine on screen in `crates/app`. This covers [ga-lep/twicecat#14](https://github.com/ga-lep/twicecat/issues/14), the roadmap's Phase 6 "Call UI" item, which `docs/plans/phase6-calls.md` decision 2 ("core first, then UI") left for the Iced shell. The work happens on branch `feat/call-ui`, cut from `main`.
