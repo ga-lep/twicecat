@@ -11,3 +11,6 @@ Task 3: complete (commit "feat(app): show the call bar and the participants pane
 Task 4: started
 Task 4: complete (commit "feat(core): play a ringtone while a direct call rings", gate ok; local stack: call_ringing 6 passed; full ignored run 145 passed, 7 failed, all needing scripts/fetch-models.sh, which was not run)
   notes: [design] the watcher publishes "a loud ring" on a watch channel; a per-session Ringer opens a playback-only AudioIo while the engine's gate allows it; [api] Command::SilenceRinging and AudioSettings::ringtone (Q3b); [tests] timing-based ringer tests poll with 5 s deadlines, 20 runs clean; [env] DeepFilterNet models not fetched here
+Task 5: started
+Task 5: complete (commit "feat(app): ring with a card, attention and a notification", gate ok; app stack test with twicecat-cli: 4 runs passed, a mutation (Decline sending nothing) caught)
+  notes: [fix, folded into Task 2's commit per rule 5] Join no longer requires the room in the filtered room list (Accept with a search active would have done nothing); [layout] the ring card is the outermost layer of the main screen; [stack test] in crates/app/tests/calls.rs, alice is the real twicecat-cli binary next to the test binary

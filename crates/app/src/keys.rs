@@ -403,6 +403,7 @@ impl App {
     /// room shortcuts wait.
     pub fn any_overlay_open(&self) -> bool {
         self.switcher.open
+            || self.calls.card().is_some()
             || self.uploads.dialog.is_some()
             || self.media.viewer.is_some()
             || self.settings_ui.open
@@ -459,7 +460,8 @@ impl App {
         }
     }
 
-    /// Esc closes the topmost thing, one per press: the switcher, the upload
+    /// Esc closes the topmost thing, one per press: the incoming-call card
+    /// (hidden, still ringing), the switcher, the upload
     /// confirmation, the viewer, Settings, a room dialog or panel, the
     /// composer's suggestions, reply or edit, then the thread panel, then the
     /// participants panel.
@@ -468,6 +470,10 @@ impl App {
     /// focus): the composer, which leaves Esc alone, was not the target then,
     /// so its reply and edit stay.
     pub(crate) fn on_escape(&mut self, from_field: bool) -> Task<Message> {
+        // The incoming-call card is the topmost layer.
+        if self.screen == Screen::Main && self.calls.card().is_some() {
+            return self.update(Message::Call(CallMessage::HideRing));
+        }
         if self.switcher.open {
             return self.close_switcher();
         }

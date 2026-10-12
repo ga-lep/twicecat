@@ -1771,7 +1771,7 @@ Plan approved by the human 2026-10-12 (Q1-Q8 answered: the core plays the ringto
 - [x] 18. Room list call counts, voice rooms, the header's call button (phase6.18)
 - [x] 19. In-call view: call bar, participants, mute, deafen, per-user volume and cleaning (phase6.19)
 - [x] 20. Ringtone in the core (phase6.20)
-- [ ] 21. Incoming calls, with a stack round trip (phase6.21)
+- [x] 21. Incoming calls, with a stack round trip (phase6.21)
 - [ ] 22. Voice & audio settings (phase6.22)
 - [ ] 23. Wrap-up (phase6.23)
 
@@ -1935,8 +1935,49 @@ Plan approved by the human 2026-10-12 (Q1-Q8 answered: the core plays the ringto
   - Every other call suite (`call_media`, `call_signalling`, `call_settings`, `cli`) passed with the ringer running in each session, so the tone does not reach the media tests' virtual devices.
 - **Gate** (with this step's changes only): fmt, clippy (also `--all-features`), `cargo test --workspace` 1643 passed / 0 failed / 149 ignored, and the dependency, API (with the new API), no-download and commit checks: ok.
 
+### Step 21: incoming calls (phase6.21)
+- **Built:**
+  - **Incoming-call card** (`screens/call.rs::ring_layer`). It is the outermost layer of the main screen, above verification, always a stack of two, a dimmed modal (`room_dialogs::modal`). It shows the oldest DM ring (`ring: true`) whose card was not hidden (`CallModel::card`):
+    - the caller's picture (the DM's avatar) and name (the DM's name, else the caller's ID), with "in <room>" for a group room;
+    - **Decline** (danger) and **Accept** (primary);
+    - "Esc hides this; the room keeps ringing."
+  - **Accept** sends `JoinCall` through the same path as the header. **Decline** sends `DeclineCall`. Each sends once: `Ring::answered` turns the buttons off until the core answers, and a call error turns them back on (a refused decline: "could not send the decline"). The card goes on `Joining` for that room or on `RingingStopped`.
+  - **Esc** (first in `on_escape`, before the switcher and every dialog) hides the card (`Ring::hidden`) and sends `SilenceRinging`. The room keeps its highlighted pill and the header's join button, and the next ring's card shows. A new `IncomingCall` for the same room (a new call) shows its card again.
+  - **While the card shows**, `any_overlay_open` and `settings::other_modal_open` count it, so the room shortcuts wait.
+  - **A new ring** (not a replay, not for the call we are in) asks for window attention: `Critical` for a DM ring (until focused), `Informational` for a group call (`state::attention_at`). It also shows a desktop notification through `App::notify`, which follows the same `should_show` rule as messages (setting on, window not focused). The text comes from `notifications::call_toast`:
+    - the title is the room's name;
+    - with "Show message content" on, the body is "<caller> is calling you" or "<caller> started a call";
+    - with it off, the body is "Incoming call" or "A call started", without the caller;
+    - everything is sanitised and markup-escaped like message notifications.
+
+    A click opens the room (the existing `OpenRoomFromNotification`).
+- **iced API** (rule 2): `window::UserAttention::{Critical, Informational}` (`iced_core` 0.14.0 `src/window/user_attention.rs:10-20`: Critical keeps flashing until focus on Windows and bounces until focus on macOS).
+- **Tests:** 11 more in `calls::tests`, plus `call_toasts_name_the_caller_only_with_content_on` and `the_ring_card_names_the_caller_and_a_group_room`. They cover:
+  - a DM ring opens the card and notifies once, and a replay adds nothing;
+  - a group call notifies quietly with no card;
+  - a focused window or notifications off show no notification, but the card still shows;
+  - with content off, the caller stays out of the notification;
+  - a ring for our own call announces nothing;
+  - Accept joins once and the card goes on `Joining`;
+  - Decline sends once and the card goes on `RingingStopped`;
+  - a refused answer can be tried again;
+  - a ring in a room hidden by the search can be accepted;
+  - Esc hides the card and silences, the next card shows, and a new call shows the card again;
+  - the card closes before Settings.
+- **Stack round trip with `twicecat-cli`** (new `crates/app/tests/calls.rs`, ignored). Alice is the real `twicecat-cli` binary (`--ephemeral --silent-audio`, found next to the test binary in `target/<profile>/`), driven through stdin. Carol is the app on the real `Bridge` with silent virtual audio, logged in through the login form. The DM is made over plain HTTP against the local homeserver only, with alice's `m.direct` naming it so that her call rings. The test:
+  - alice `/call`, and the app shows the card with `ring: true` from alice;
+  - **Decline**, and the CLI prints "@carol:… declined the call in"; the ring stops in the app;
+  - alice leaves and calls again; **Accept**; the app is `Connected` with itself and alice (alice's row has controls); the CLI prints "… joined the call.";
+  - the app leaves, and the CLI prints "… left the call.".
+- **Runs:**
+  - `cargo test -p twicecat-app --test calls -- --ignored`: passed 4 times in a row, about 8 s each.
+  - Mutation, caught and reverted: **Decline** sending nothing makes the CLI never print the decline.
+  - Gate: fmt, clippy (also `--all-features`), `cargo test --workspace` 1656 passed / 0 failed / 150 ignored, and the dependency, API, no-download and commit checks: ok.
+- **Docs:** `docs/accessibility.md` covers the card in the Esc order, its buttons, and that a ring is never only a sound.
+
 ## Phase 6 call UI human checkpoint
 - [x] Plan questions answered and plan approved (2026-10-12).
 - [ ] (step 18) The call pill (🔊 with the count; highlighted while ringing), the "Voice" tag and the header's call button (Call, Join call (N), Join voice, Joining…, Leave call) read well in light and dark themes, and the emoji renders on each OS; Tab reaches the call button.
 - [ ] (step 19) In a call: the call bar (name, phase, lock, Mute/Deafen/Leave, notice ✕) at the bottom of the room list and the participants panel (pictures, speaking ring, 🔇, "(you)", cleaning words, −/+ and slider, cleaning menu) in light and dark themes on each OS; mute and deafen heard (or not) on the other side, including Ctrl+Shift+M/D with the composer focused; per-person volume and cleaning by ear; the slider sends after a mouse release and after a wheel turn; a voice room opens the panel on join.
 - [ ] (step 20) The ringtone by ear: a DM call from Element Web or another Twicecat rings on the chosen output device at the master volume (not too loud in headphones, audible across a room on speakers), stops when answered, declined (here or on another device), when the caller hangs up, after about 90 s, and with `/silence` in the CLI (Esc in the app, Task 5); no tone for a group call or while in a call; `/ringtone off` keeps it quiet. Also with a Bluetooth headset as the output device.
+- [ ] (step 21) Incoming calls with Element Web/X and another Twicecat: the card (picture, name, Decline/Accept) in both themes; Accept joins, Decline tells the caller; Esc hides the card and silences the tone; the taskbar/dock flashes (Critical) for a DM ring on Windows, macOS, GNOME and KDE; the desktop notification shows while the window is unfocused (with and without "Show message content") and a click opens the room; a group call only notifies.

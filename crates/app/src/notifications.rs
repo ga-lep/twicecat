@@ -49,6 +49,10 @@ pub const BODY_NEW_MESSAGE: &str = "New message";
 pub const BODY_MENTIONED: &str = "Mentioned you";
 /// Body of an invitation without message content.
 pub const BODY_INVITED: &str = "Invited you";
+/// Body of a ringing call without message content.
+pub const BODY_CALLING: &str = "Incoming call";
+/// Body of a group call's quiet notification without message content.
+pub const BODY_CALL_STARTED: &str = "A call started";
 
 /// Whether a notification may be shown now: desktop notifications are on and
 /// the window is **not** focused. A focused window never shows one, which
@@ -195,6 +199,37 @@ pub fn build_toast(view: &NotificationView, show_content: bool, folded: Option<u
         Some(count) if count >= 2 => format!("{count} new messages"),
         _ if !show_content => generic_body(view.kind).to_owned(),
         _ => content_body(view),
+    };
+    Toast {
+        title,
+        body: escape_markup(&body),
+    }
+}
+
+/// The notification of an incoming call (`IncomingCall`): the room's name
+/// as the title; the caller in the body only with "Show message content" on,
+/// as for messages.
+pub fn call_toast(
+    room_name: Option<&str>,
+    caller: &twicecat_core::api::UserId,
+    ring: bool,
+    show_content: bool,
+) -> Toast {
+    let title = room_name
+        .and_then(|name| visible_line(name, MAX_TITLE_CHARS))
+        .unwrap_or_else(|| crate::text_safety::NAME_PLACEHOLDER.to_owned());
+    let body = match (show_content, ring) {
+        (false, true) => BODY_CALLING.to_owned(),
+        (false, false) => BODY_CALL_STARTED.to_owned(),
+        (true, ring) => {
+            let caller = visible_line(caller.as_str(), MAX_SENDER_CHARS)
+                .unwrap_or_else(|| "Someone".to_owned());
+            if ring {
+                format!("{caller} is calling you")
+            } else {
+                format!("{caller} started a call")
+            }
+        }
     };
     Toast {
         title,
@@ -427,6 +462,25 @@ mod fake {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn call_toasts_name_the_caller_only_with_content_on() {
+        use twicecat_core::api::UserId;
+        let caller = UserId::from("@bob<b>:x");
+        let shown = super::call_toast(Some("Bob"), &caller, true, true);
+        assert_eq!(shown.title, "Bob");
+        assert_eq!(shown.body, "@bob&lt;b&gt;:x is calling you");
+        let quiet = super::call_toast(Some("Team\nroom"), &caller, false, true);
+        assert_eq!(quiet.title, "Team\u{23ce}room");
+        assert_eq!(quiet.body, "@bob&lt;b&gt;:x started a call");
+        let hidden = super::call_toast(None, &caller, true, false);
+        assert_eq!(hidden.title, crate::text_safety::NAME_PLACEHOLDER);
+        assert_eq!(hidden.body, super::BODY_CALLING);
+        assert_eq!(
+            super::call_toast(Some("Team"), &caller, false, false).body,
+            super::BODY_CALL_STARTED
+        );
+    }
+
     use twicecat_core::api::{EventId, MessageText, UserId};
 
     use super::*;
