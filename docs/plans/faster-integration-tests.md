@@ -2,7 +2,7 @@
 Status: APPROVED (human, 2026-10-12)
 
 ## Goal
-Cut the wall-clock time of `scripts/run-integration-tests.sh`, locally and in the CI `integration` job, without losing coverage or adding flakiness (issue ga-lep/twicecat#13). We measure first. Then we replace fixed sleeps with condition waits, stop first-sync cost growing during a run, reuse setup sessions instead of logging in again, link `matrix-sdk` into one homeserver test binary instead of 26 so its tests run in parallel under an explicit account lock, and overlap stack start-up with the build in CI. No test is dropped or newly ignored. The `keyring` and `hardware_` skips stay. No pinned dependency changes (AGENTS.md rule 3). Tests run only against the local stack and the `.env.test` accounts (rule 6). `crates/app` keeps talking to `crates/core` only through its command and event API (rule 7).
+Cut the wall-clock time of `scripts/run-integration-tests.sh`, locally and in the CI `integration` job, without losing coverage or adding flakiness (issue ga-lep/twicecat#13). We measure first. Then we replace fixed sleeps with condition waits, stop first-sync cost growing during a run, reuse setup sessions instead of logging in again, split the CI `integration` job into 4 shards that each run their own stack, and overlap stack start-up with the build in CI. No test is dropped or newly ignored. The `keyring` and `hardware_` skips stay. No pinned dependency changes (AGENTS.md rule 3). Tests run only against the local stack and the `.env.test` accounts (rule 6). `crates/app` keeps talking to `crates/core` only through its command and event API (rule 7).
 
 ## Facts verified while planning (2026-10-12, branch `feat/faster-integration-tests` at `d568ac9`)
 - `crates/core/tests/` holds 26 test files plus `common/mod.rs` (1178 lines) and `common/stack_env.rs`. Each file is its own binary. `crates/app/tests/` has 3 binaries; `bridge.rs` has 3 ignored homeserver tests.
@@ -29,14 +29,14 @@ Cut the wall-clock time of `scripts/run-integration-tests.sh`, locally and in th
 ## Decisions (2026-10-12, by the human)
 - **D1. Step trailer: accepted.** Every commit carries `Step: ci-speed.N`, with N the task number below. Commit types on this branch: `feat`, `fix`, `docs` only (AGENTS.md rule 5). Test-only and CI changes fold into the step commit they belong to.
 - **D2. `5ebc5da`: cherry-pick now.** Do not wait for `feat/phase6-finish`. The cherry-pick is Task 3, a prerequisite of Task 4. It is a `fix(core)`, which is allowed because `expect_event_within` is already on `main`. Known consequence: when `feat/phase6-finish` merges, rebasing this branch on `main` may conflict in `crates/core/tests/common/mod.rs`. Keep `main`'s version, and drop the cherry-pick if it becomes empty.
-- **D3. Parallelism: one merged `homeserver` binary with a process-wide account lock (Tasks 7 and 8).** No `cargo-nextest`, and no new CI tool.
+- **D3. Parallelism: 4 CI shards, each with its own stack (Task 7), instead of one merged `homeserver` binary with an account lock (changed 2026-10-12, by the human; supersedes the first D3).** A shard is a CI job with its own Synapse and test accounts, so shards cannot interfere. Tests inside one binary keep running in parallel threads as today, and binaries inside a shard run one after another. Task 8 is dropped. No `cargo-nextest`, and no new CI tool. Local runs are not sharded; they gain only from Tasks 4 to 6 and 9.
 - **D4. Shorter delayed leave in tests: approved, as a core start-config change.** `CoreConfig` gets an optional `delayed_leave`. `call_signalling` sets it to about 4 s and waits about 6 s instead of 2 × 25 s. With `None`, the default behaviour (18 s delay, 4 s restart) is unchanged for the app, the CLI and every other test. This is folded into Task 6.
 
 ## Open question
 - **D5. Target X%.** Stays open until the Task 2 baseline checkpoint, where the human sets it.
 
 ## What can be verified where
-- **Locally, without the stack:** `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` (non-ignored tests, including the moved modules), `cargo test --no-run` build and link times, `scripts/check-app-deps.sh`, `scripts/check-core-api.sh`, the static isolation lint (Task 8), and shellcheck on the scripts.
+- **Locally, without the stack:** `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` (non-ignored tests), `cargo test --no-run` build and link times, `scripts/check-app-deps.sh`, `scripts/check-core-api.sh`, the shard coverage check (Task 7), and shellcheck on the scripts.
 - **Locally, with the stack (`scripts/stack.sh up -d --wait` + `scripts/create-test-users.sh`):** all timings, the ignored suite, and the 3 consecutive passing runs. If the controller's environment has no Docker stack, each of these is a **HUMAN** item.
 - **CI only (HUMAN: push and read the run):** job step durations, whether the rust-cache key hits, the 3 consecutive CI passes, and the overlapped stack start-up.
 
@@ -113,38 +113,31 @@ Acceptance criteria:
 - With the stack: each touched binary passes 3 times in a row.
 Evidence: `scripts/time-integration-tests.sh` per-binary rows against the baseline (needs the stack; HUMAN if unavailable).
 
-### Task 7: One homeserver test binary
+### Task 7: Shard the CI integration job into 4 jobs
 Language: rust
-Files: crates/core/tests/homeserver/main.rs (new), crates/core/tests/homeserver/*.rs (moved from crates/core/tests/*.rs, with `git mv`), crates/core/tests/common/ (stays, `#[path]` include), scripts/time-integration-tests.sh
-Depends on: Task 6
+Files: scripts/integration-shards.sh (new), scripts/run-integration-tests.sh, scripts/time-integration-tests.sh, .github/workflows/ci.yml
+Depends on: Task 2
 Acceptance criteria:
-- Every core test file is a module of the single `homeserver` test binary, except files whose process-level setup cannot share a process. Candidates: `cli.rs`, if it spawns the CLI binary; `gpu_enhancement.rs` (feature-gated runtime loading); `livekit_link.rs` (link check). Any such file stays a separate binary, and the reason is written in `main.rs`.
-- `cargo test -p twicecat-core -- --list` and `-- --list --ignored` list the same test names as before, now prefixed by module (the before and after lists, module prefix stripped, are diffed in the ledger).
-- In this task the merged binary still runs the ignored tests one at a time: `run-integration-tests.sh` passes `--test-threads=1` for `homeserver` until Task 8 adds the account lock, so isolation is no weaker than today.
-- `cargo test -p twicecat-core --no-run` link time and `target/debug/deps` size before and after are recorded in the ledger. This part is verifiable locally without the stack.
-- The gate passes. The `keyring` and `hardware_` skips match by name, unchanged.
-Evidence: `cargo test -p twicecat-core --no-run` → one `homeserver-*` binary instead of about 24. The full suite passes with the stack (HUMAN if unavailable).
+- `scripts/integration-shards.sh` holds the shard table: shard name (`1` to `4`) to its test binaries (core and app). The shards are balanced by the per-binary seconds recorded in the Task 2 baseline, which must come from a run with no failures. The table and the sums per shard are written into the ledger.
+- `run-integration-tests.sh --shard N` runs the pruning, then `cargo test --locked` with one `--test <binary>` per binary of that shard (`-p` chosen from the binary's crate), and the same trailing `--ignored --skip keyring --skip hardware_` as today. With no `--shard`, behaviour is unchanged: everything runs.
+- Nothing is dropped. A check, in the same script (`integration-shards.sh --check`, also run in the CI lint job and passing locally without the stack), fails if a test binary that has `#[ignore = "needs local homeserver…"]` tests is in no shard or in two shards. A new test file therefore fails the lint until it is placed. The unit-test side (`cargo test --workspace`) is untouched.
+- CI: `integration` becomes a matrix job of 4 shards (`fail-fast: false`), each with its own checkout, build (rust-cache with a per-job `shared-key`), local Synapse, test users and `--shard N` run, plus a final `integration-ok` job that needs all four and is the required check. The open-files print stays in the run step.
+- The ignored-test count across the four shards equals the baseline count.
+- With CI (**HUMAN**: push and read the runs): 3 consecutive green runs, and the wall time of the slowest shard against the Task 2 baseline.
+- The gate passes.
+Evidence: `scripts/integration-shards.sh --check` → exit 0; `scripts/run-integration-tests.sh --shard 1` (needs the stack; HUMAN if unavailable); the CI run's per-shard durations (**HUMAN**: `gh run view <id> --json jobs`).
 
-### Task 8: Account lock and parallel runs
-Language: rust
-Files: crates/core/tests/common/mod.rs, crates/core/tests/homeserver/*.rs, scripts/check-test-isolation.sh (new), scripts/run-integration-tests.sh, .github/workflows/ci.yml (lint job step)
-Depends on: Task 7
-Acceptance criteria:
-- `common` gets a process-wide `tokio::sync::RwLock<()>`. `common::shared_accounts()` returns a read guard. `e2ee_serial()` becomes `exclusive_accounts()`, a write guard (the old name stays as an alias, or is renamed at every call site). Tests that reset devices or identities, delete devices, or change per-account global state take the write guard. Per-account global state: display name, avatar, push rules, global account data, the notification baseline (`reset_notification_baseline`), and login/logout-all.
-- An audit table in `docs/plans/faster-integration-tests.progress.md` lists, per module, the user-global side effects found and the guard chosen. This list is the "must stay serial" documentation the issue asks for.
-- `scripts/check-test-isolation.sh` fails if an `#[ignore = "needs local homeserver…"]` test in `homeserver/` takes neither `shared_accounts()` nor `exclusive_accounts()`. It runs in the CI lint job and passes locally without the stack.
-- `run-integration-tests.sh` drops `--test-threads=1`. Thread count: libtest's default, or an explicit `INTEGRATION_TEST_THREADS` setting with a default picked from the Task 2 numbers.
-- With the stack: the full suite passes 3 times in a row. A test that fails twice stops the work and is reported (AGENTS.md rule 8).
-Evidence: `scripts/check-test-isolation.sh` → exit 0. `scripts/run-integration-tests.sh` wall time against the baseline (needs the stack; HUMAN if unavailable).
+### Task 8: Dropped (D3)
+The merged `homeserver` binary, the process-wide account lock and the `check-test-isolation.sh` audit are dropped in favour of Task 7. The number stays so later tasks keep theirs.
 
 ### Task 9: Keep first-sync cost flat and reuse setup sessions
 Language: rust
-Files: crates/core/tests/common/mod.rs, crates/core/tests/homeserver/*.rs, scripts/run-integration-tests.sh
-Depends on: Task 8
+Files: crates/core/tests/common/mod.rs, crates/core/tests/*.rs, scripts/run-integration-tests.sh
+Depends on: Task 6
 Acceptance criteria:
 - Room cleanup: `common` gets a `CreatedRooms` record. `create_room`/`create_encrypted_room`/`create_dm`/`create_space`/`create_room_raw`/`create_space_raw` register the room. Each test's finish path (`EncryptedPair::finish` and the equivalent end of the other tests) leaves and forgets the rooms it created, for every invited test user, through the existing `leave_all_created`. Rooms of a panicking test are cleaned by the next `prune-test-rooms.sh`, which stays as the pre-run safety net.
 - After a full passing run, `scripts/time-integration-tests.sh --first-sync` reports a joined-room count per user that does not exceed a small bound set from the Task 2 numbers (for example ≤ 5), instead of growing with the run.
-- Setup-session reuse: `common::setup_client(n)` logs in once per process and caches the `MatrixSession` (never printed). Every later call builds a fresh `Client` in the calling test's runtime and calls `matrix_auth().restore_session(...)`, so no client crosses `#[tokio::test]` runtimes. A generation counter, bumped in `reset_to_b0` under the write guard, forces a re-login after a reset. Setup-only `raw_login` call sites (room creation, invites, sends that do not depend on device identity) switch to it. e2ee call sites whose device identity matters keep `raw_login_named`.
+- Setup-session reuse: `common::setup_client(n)` logs in once per process and caches the `MatrixSession` (never printed). Every later call builds a fresh `Client` in the calling test's runtime and calls `matrix_auth().restore_session(...)`, so no client crosses `#[tokio::test]` runtimes. A generation counter, bumped in `reset_to_b0` while the binary's existing `e2ee_serial()` lock is held, forces a re-login after a reset. Setup-only `raw_login` call sites (room creation, invites, sends that do not depend on device identity) switch to it. e2ee call sites whose device identity matters keep `raw_login_named`.
 - The number of devices left per user after a full run is no higher than before (`prune-test-devices.sh` output, recorded in the ledger).
 - The gate passes. With the stack, the full suite passes 3 times in a row.
 Evidence: `scripts/time-integration-tests.sh --first-sync` before and after counts; the full-run wall time against the baseline (needs the stack; HUMAN if unavailable).
@@ -152,11 +145,11 @@ Evidence: `scripts/time-integration-tests.sh --first-sync` before and after coun
 ### Task 10: CI: overlap stack start-up, check the cache
 Language: rust
 Files: .github/workflows/ci.yml, scripts/stack.sh (only if a non-waiting start needs a flag)
-Depends on: Task 8
+Depends on: Task 7
 Acceptance criteria:
 - The `integration` job starts the stack detached (`scripts/stack.sh up -d`, no `--wait`) before "Fetch pinned libwebrtc" and the build. After the build it runs `scripts/stack.sh up -d --wait`, which returns at once if the stack is already healthy, then `create-test-users.sh`. The 30 s start-up runs under the build.
 - `Swatinem/rust-cache@v2` gets an explicit `shared-key` for the `integration` job and saves only on `main` (`save-if: ${{ github.ref == 'refs/heads/main' }}`), so pull requests restore the main cache instead of writing their own. A CI run on the PR shows "Cache restored from key" in the rust-cache step (**HUMAN**: read the log).
-- Decision recorded in the ledger, from the Task 2 and Task 8 numbers: does starting the two SFUs (or two separate jobs, calls and the rest) still save time once start-up overlaps the build? If the measured saving is under 30 s, the stack stays whole and the reason is written down. Otherwise the call tests get their own job or step, and the ignored-test total across both stays equal to the baseline.
+- Decision recorded in the ledger, from the Task 2 and Task 7 numbers: does the 30 s stack start-up still sit on a shard's critical path once it overlaps the build? Write down the measured saving per shard.
 - `actionlint` (if available) or a CI run validates the workflow. The lint job passes.
 Evidence: the CI `integration` job's step durations (no separate 30 s "Start local Synapse" wait on the critical path) and the rust-cache restore line. **HUMAN**: push, then `gh run view <id> --json jobs`.
 
@@ -165,7 +158,7 @@ Language: rust
 Files: scripts/run-integration-tests.sh (comment), scripts/prune-test-rooms.sh (comment), PROGRESS.md, docs/plans/faster-integration-tests.progress.md
 Depends on: Task 9, Task 10
 Acceptance criteria:
-- The `run-integration-tests.sh` header states the new typical wall time (local and CI), the repeat-run recipe (`create-test-users.sh`, then the script, repeatable without `down -v`), the thread setting, and which tests are serial and why (a pointer to the audit table).
+- The `run-integration-tests.sh` header states the new typical wall time (local and CI, per shard), the repeat-run recipe (`create-test-users.sh`, then the script, repeatable without `down -v`), and the `--shard N` option with a pointer to `integration-shards.sh`.
 - The ledger and a comment on issue #13 record the after-numbers next to the baseline, with the percentage cut against the target X.
 - 3 consecutive local passes and 3 consecutive CI passes, with no new flakes, are recorded with their run IDs. Local passes need the stack (HUMAN if unavailable); the CI passes are **HUMAN**.
 - The ignored-test count across all binaries equals the baseline. `--skip keyring --skip hardware_` is unchanged. `scripts/check-app-deps.sh` and `scripts/check-core-api.sh` pass.
