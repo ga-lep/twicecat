@@ -9,6 +9,7 @@ use iced::{Element, Fill};
 use twicecat_core::api::{MessageText, RoomId, UserId, UserTrust};
 
 use crate::actions::{self, Picker};
+use crate::calls::{CallButton, CallMessage};
 use crate::composer::{self, EditorAction, Mode, Suggestions};
 use crate::emoji;
 use crate::links::{CheckedUrl, LinkBar, LinkKind};
@@ -95,6 +96,9 @@ fn header<'a>(app: &'a App, title: String) -> Element<'a, Message> {
     if let Some(room) = selected.filter(|room| !room.is_invite) {
         line = line.push(notification_menu(app, &room.id));
         line = line.push(room_buttons());
+        if let Some(call) = app.calls.button(room) {
+            line = line.push(call_button(call));
+        }
     }
     if let Some(room) = selected.filter(|room| room.is_invite) {
         line = line.push(invite_buttons(app, &room.id));
@@ -149,6 +153,21 @@ fn room_buttons<'a>() -> Element<'a, Message> {
     ]
     .spacing(6)
     .into()
+}
+
+/// The call button of a joined room (plan Q6): **Call**, **Join call (N)**,
+/// **Join voice**, **Leave call**, or **Joining…** while it is off.
+fn call_button<'a>(call: CallButton) -> Element<'a, Message> {
+    let style = if call.press == Some(CallMessage::Leave) {
+        button::danger
+    } else {
+        button::primary
+    };
+    button(text(call.label).size(13))
+        .padding([2, 8])
+        .style(style)
+        .on_press_maybe(call.press.map(Message::Call))
+        .into()
 }
 
 /// **Accept** and **Decline**, in the header of an invitation. They are off

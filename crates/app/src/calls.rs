@@ -8,8 +8,8 @@ use std::fmt;
 
 use iced::Task;
 use twicecat_core::api::{
-    AudioDevices, AudioSettings, AudioStats, CallEndReason, CallState, CoreError, CoreEvent,
-    GpuEnhancement, InputLevel, Participant, RoomId, UserId,
+    AudioDevices, AudioSettings, AudioStats, CallEndReason, CallIntent, CallState, Command,
+    CoreError, CoreEvent, GpuEnhancement, InputLevel, Participant, RoomId, RoomSummary, UserId,
 };
 
 use crate::state::{App, Message};
@@ -21,6 +21,57 @@ pub const MAX_RINGS: usize = 16;
 pub const MAX_DECLINED: usize = 32;
 /// How many characters a call notice may show.
 pub const MAX_NOTICE_CHARS: usize = 256;
+
+/// The speaker mark of the call pill in the room list.
+pub const CALL_MARK: &str = "\u{1F50A}";
+
+/// A call control.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CallMessage {
+    /// Join (or start) the call of a room: the header's call button.
+    Join(RoomId),
+    /// Leave the current call.
+    Leave,
+}
+
+/// A command sent and not answered yet: a second press sends nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Pending {
+    /// `JoinCall` for this room, until its first call state.
+    Join(RoomId),
+    /// `LeaveCall`, until `Left`.
+    Leave,
+}
+
+/// The header's call button: its label, and what a press does (`None`
+/// draws it off).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CallButton {
+    /// The words on the button.
+    pub label: String,
+    /// The message of a press; `None` while nothing can be done.
+    pub press: Option<CallMessage>,
+}
+
+/// The call pill of a room list row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CallPill {
+    /// Devices in the room's call (0 while only a ring is known).
+    pub count: u32,
+    /// The room rings (or notifies of a call) for us.
+    pub ringing: bool,
+}
+
+impl CallPill {
+    /// The pill's words: the speaker and the count.
+    pub fn label(self) -> String {
+        if self.count == 0 {
+            CALL_MARK.to_owned()
+        } else {
+            format!("{CALL_MARK} {}", self.count)
+        }
+    }
+}
 
 /// Where the local call is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,6 +142,8 @@ pub struct Ring {
 pub struct CallModel {
     /// The call this device is in.
     pub call: Option<CurrentCall>,
+    /// A join or leave sent and not answered yet.
+    pub pending: Option<Pending>,
     /// Devices in each room's call, for the room list; rooms without a call
     /// are not kept.
     pub counts: HashMap<RoomId, u32>,
@@ -118,6 +171,7 @@ impl fmt::Debug for CallModel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CallModel")
             .field("call", &self.call)
+            .field("pending", &self.pending.is_some())
             .field("counts", &self.counts.len())
             .field("rings", &self.rings.len())
             .field("notice", &self.notice.is_some())
@@ -147,8 +201,50 @@ impl CallModel {
         self.call.as_mut().filter(|c| c.room_id == *room)
     }
 
+    /// The header's call button for `room`. A space or an invitation has
+    /// none. Voice rooms (MSC3417) say "Join voice", other rooms "Call".
+    pub fn button(&self, room: &RoomSummary) -> Option<CallButton> {
+        if room.is_space || room.is_invite {
+            return None;
+        }
+        let id = &room.id;
+        let busy = self.pending.is_some();
+        if let Some(call) = self.call_in(id) {
+            let label = if call.phase == CallPhase::Joining {
+                "Joining\u{2026}"
+            } else {
+                "Leave call"
+            };
+            let press = (call.phase != CallPhase::Joining && !busy).then_some(CallMessage::Leave);
+            return Some(CallButton {
+                label: label.to_owned(),
+                press,
+            });
+        }
+        let count = self.count(id);
+        let label = match (room.is_call_room, count) {
+            (true, 0) => "Join voice".to_owned(),
+            (true, n) => format!("Join voice ({n})"),
+            (false, 0) => "Call".to_owned(),
+            (false, n) => format!("Join call ({n})"),
+        };
+        Some(CallButton {
+            label,
+            press: (!busy).then(|| CallMessage::Join(id.clone())),
+        })
+    }
+
+    /// The call pill of `room`'s row: when its call has devices or it rings.
+    pub fn pill(&self, room: &RoomId) -> Option<CallPill> {
+        let count = self.count(room);
+        let ringing = self.ring(room).is_some();
+        (count > 0 || ringing).then_some(CallPill { count, ringing })
+    }
+
     /// Applies a call state change.
     pub fn on_state(&mut self, state: CallState) {
+        // Any call state answers the join or leave sent.
+        self.pending = None;
         match state {
             CallState::Idle => self.call = None,
             CallState::Joining { room_id } => {
@@ -256,6 +352,8 @@ impl CallModel {
 
     /// Shows a refused call or audio command.
     pub fn on_error(&mut self, error: &CoreError) {
+        // A refused leave (`NotInCall`) or join is answered.
+        self.pending = None;
         self.notice = Some(notice_line(&error_text(error)));
     }
 }
@@ -285,6 +383,37 @@ fn notice_line(text: &str) -> String {
 }
 
 impl App {
+    /// A call control.
+    pub(crate) fn on_call(&mut self, message: CallMessage) -> Task<Message> {
+        if self.calls.pending.is_some() {
+            return Task::none();
+        }
+        match message {
+            CallMessage::Join(room_id) => {
+                // The room list may be filtered (a search, a tab), so a room
+                // missing from it is still joined; the core answers for an
+                // unknown one. Only an invitation is refused here.
+                if self.calls.call_in(&room_id).is_some()
+                    || self.rooms.iter().any(|r| r.id == room_id && r.is_invite)
+                {
+                    return Task::none();
+                }
+                self.calls.pending = Some(Pending::Join(room_id.clone()));
+                self.send(Command::JoinCall {
+                    room_id,
+                    intent: CallIntent::Audio,
+                })
+            }
+            CallMessage::Leave => {
+                if self.calls.call.is_none() {
+                    return Task::none();
+                }
+                self.calls.pending = Some(Pending::Leave);
+                self.send(Command::LeaveCall)
+            }
+        }
+    }
+
     /// A call or audio event from the core.
     pub(crate) fn on_call_event(&mut self, event: CoreEvent) -> Task<Message> {
         let handled = self.calls.on_event(event);
@@ -875,5 +1004,236 @@ mod tests {
             assert!(!dbg.contains(secret), "{dbg}");
         }
         assert!(dbg.contains("participants: 1"), "{dbg}");
+    }
+
+    fn summary(n: &str) -> RoomSummary {
+        RoomSummary::new(room(n), n.to_owned())
+    }
+
+    fn button_of(app: &App, room: &RoomSummary) -> Option<(String, Option<CallMessage>)> {
+        app.calls.button(room).map(|b| (b.label, b.press))
+    }
+
+    fn call(app: &mut App, message: CallMessage) {
+        let _ = app.update(Message::Call(message));
+    }
+
+    #[test]
+    fn the_header_button_follows_the_room_and_the_call() {
+        let (mut app, _rx) = main_app();
+        let a = summary("a");
+        assert_eq!(
+            button_of(&app, &a),
+            Some(("Call".into(), Some(CallMessage::Join(room("a")))))
+        );
+        let _ = app.update(core(CoreEvent::ActiveCall {
+            room_id: room("a"),
+            participants: 3,
+        }));
+        assert_eq!(
+            button_of(&app, &a),
+            Some(("Join call (3)".into(), Some(CallMessage::Join(room("a")))))
+        );
+        joining(&mut app, "a");
+        assert_eq!(button_of(&app, &a), Some(("Joining\u{2026}".into(), None)));
+        state(
+            &mut app,
+            CallState::Connected {
+                room_id: room("a"),
+                encrypted: false,
+            },
+        );
+        assert_eq!(
+            button_of(&app, &a),
+            Some(("Leave call".into(), Some(CallMessage::Leave)))
+        );
+        state(
+            &mut app,
+            CallState::Reconnecting {
+                room_id: room("a"),
+                attempt: 1,
+            },
+        );
+        assert_eq!(
+            button_of(&app, &a),
+            Some(("Leave call".into(), Some(CallMessage::Leave)))
+        );
+        // Another room offers a join, which moves the call there.
+        assert_eq!(
+            button_of(&app, &summary("b")),
+            Some(("Call".into(), Some(CallMessage::Join(room("b")))))
+        );
+    }
+
+    #[test]
+    fn voice_rooms_offer_join_voice() {
+        let (mut app, _rx) = main_app();
+        let mut voice = summary("a");
+        voice.is_call_room = true;
+        assert_eq!(
+            button_of(&app, &voice).map(|b| b.0),
+            Some("Join voice".into())
+        );
+        let _ = app.update(core(CoreEvent::ActiveCall {
+            room_id: room("a"),
+            participants: 2,
+        }));
+        assert_eq!(
+            button_of(&app, &voice).map(|b| b.0),
+            Some("Join voice (2)".into())
+        );
+    }
+
+    #[test]
+    fn spaces_and_invitations_have_no_call_button() {
+        let (app, _rx) = main_app();
+        let mut space = summary("s");
+        space.is_space = true;
+        let mut invite = summary("i");
+        invite.is_invite = true;
+        assert_eq!(app.calls.button(&space), None);
+        assert_eq!(app.calls.button(&invite), None);
+    }
+
+    #[test]
+    fn a_join_sends_one_command_until_the_core_answers() {
+        let (mut app, mut rx) = main_app();
+        call(&mut app, CallMessage::Join(room("a")));
+        call(&mut app, CallMessage::Join(room("a")));
+        call(&mut app, CallMessage::Join(room("b")));
+        let sent = drain(&mut rx);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(matches!(
+            &sent[0],
+            Command::JoinCall { room_id, intent: CallIntent::Audio } if *room_id == room("a")
+        ));
+        assert_eq!(
+            button_of(&app, &summary("b")).and_then(|b| b.1),
+            None,
+            "off while pending"
+        );
+        joining(&mut app, "a");
+        assert!(app.calls.pending.is_none());
+    }
+
+    #[test]
+    fn a_refused_join_can_be_tried_again() {
+        let (mut app, mut rx) = main_app();
+        call(&mut app, CallMessage::Join(room("a")));
+        let _ = app.update(core(CoreEvent::Error(CoreError::Call(
+            "no call service".into(),
+        ))));
+        call(&mut app, CallMessage::Join(room("a")));
+        assert_eq!(drain(&mut rx).len(), 2);
+    }
+
+    #[test]
+    fn joining_an_invitation_or_the_current_call_sends_nothing() {
+        let (mut app, mut rx) = main_app();
+        let mut invite = summary("i");
+        invite.is_invite = true;
+        let _ = app.update(core(CoreEvent::RoomListChanged(vec![ListDiff::PushBack {
+            value: invite,
+        }])));
+        drain(&mut rx);
+        call(&mut app, CallMessage::Join(room("i")));
+        assert!(drain(&mut rx).is_empty());
+        joining(&mut app, "a");
+        call(&mut app, CallMessage::Join(room("a")));
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn a_room_missing_from_the_filtered_list_is_still_joined() {
+        let (mut app, mut rx) = main_app();
+        call(&mut app, CallMessage::Join(room("hidden")));
+        let sent = drain(&mut rx);
+        assert!(
+            matches!(sent.as_slice(), [Command::JoinCall { room_id, .. }] if *room_id == room("hidden")),
+            "{sent:?}"
+        );
+    }
+
+    #[test]
+    fn a_leave_sends_one_command_until_the_call_is_left() {
+        let (mut app, mut rx) = main_app();
+        call(&mut app, CallMessage::Leave);
+        assert!(drain(&mut rx).is_empty(), "no call, nothing to leave");
+        state(
+            &mut app,
+            CallState::Connected {
+                room_id: room("a"),
+                encrypted: false,
+            },
+        );
+        call(&mut app, CallMessage::Leave);
+        call(&mut app, CallMessage::Leave);
+        let sent = drain(&mut rx);
+        assert!(matches!(sent.as_slice(), [Command::LeaveCall]), "{sent:?}");
+        assert_eq!(
+            button_of(&app, &summary("a")),
+            Some(("Leave call".into(), None))
+        );
+        state(
+            &mut app,
+            CallState::Left {
+                room_id: room("a"),
+                reason: CallEndReason::Hangup,
+            },
+        );
+        assert!(app.calls.pending.is_none());
+        assert_eq!(
+            button_of(&app, &summary("a")).map(|b| b.0),
+            Some("Call".into())
+        );
+    }
+
+    #[test]
+    fn the_row_pill_shows_the_count_and_the_ring() {
+        let (mut app, _rx) = main_app();
+        assert_eq!(app.calls.pill(&room("a")), None);
+        let _ = app.update(core(CoreEvent::ActiveCall {
+            room_id: room("a"),
+            participants: 2,
+        }));
+        let pill = app.calls.pill(&room("a")).expect("a call");
+        assert_eq!((pill.count, pill.ringing), (2, false));
+        assert_eq!(pill.label(), format!("{CALL_MARK} 2"));
+        incoming(&mut app, "b", "c", true);
+        let pill = app.calls.pill(&room("b")).expect("ringing");
+        assert_eq!((pill.count, pill.ringing), (0, true));
+        assert_eq!(pill.label(), CALL_MARK);
+        let _ = app.update(core(CoreEvent::RingingStopped { room_id: room("b") }));
+        assert_eq!(app.calls.pill(&room("b")), None);
+    }
+
+    #[test]
+    fn the_main_view_builds_in_every_call_state() {
+        let (mut app, _rx) = main_app();
+        let _ = app.update(Message::SelectRoom(room("a")));
+        let _ = app.view();
+        let _ = app.update(core(CoreEvent::ActiveCall {
+            room_id: room("a"),
+            participants: 2,
+        }));
+        incoming(&mut app, "b", "c", true);
+        let _ = app.view();
+        joining(&mut app, "a");
+        let _ = app.view();
+        state(
+            &mut app,
+            CallState::Connected {
+                room_id: room("a"),
+                encrypted: true,
+            },
+        );
+        participants(
+            &mut app,
+            "a",
+            vec![ListDiff::Reset {
+                values: vec![person("a"), person("b")],
+            }],
+        );
+        let _ = app.view();
     }
 }

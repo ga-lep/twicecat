@@ -11,6 +11,7 @@ use iced::{Background, Color, Element, Fill, Length, border};
 use twicecat_core::api::{RoomListTab, RoomNotificationModeView, RoomSummary};
 
 use crate::avatars::{AvatarState, Avatars, NEUTRAL_INITIALS, initials, placeholder_color};
+use crate::calls::CallPill;
 use crate::notifications::muted_mark;
 use crate::room_list::{
     Badge, OVERSCAN_ROWS, ROW_HEIGHT, badge_for, empty_label, preview_line, row_name,
@@ -76,6 +77,8 @@ pub fn count_label(count: u64) -> String {
 
 /// The mark of an encrypted room, in the list row and the room header.
 pub const LOCK_MARK: &str = "\u{1F512}";
+/// The tag of a voice room (MSC3417 call room).
+pub const VOICE_TAG: &str = "Voice";
 
 /// The lock of `room`, when it is known to be encrypted. The core reports
 /// `is_encrypted` as false while the SDK does not know the room's encryption
@@ -132,6 +135,7 @@ fn windowed_list(app: &App) -> Element<'_, Message> {
             &app.avatars,
             app.selected.as_ref() == Some(&room.id),
             app.effective_room_mode(&room.id),
+            app.calls.pill(&room.id),
         )
     });
     let content = column![space().height(top)]
@@ -146,13 +150,15 @@ fn windowed_list(app: &App) -> Element<'_, Message> {
         .into()
 }
 
-/// One fixed-height row: avatar, name (and "Invite" or "Muted"), preview,
-/// badge. `mode` is the room's notification mode as the app knows it.
+/// One fixed-height row: avatar, name (and "Voice", "Invite" or "Muted"),
+/// preview, the call pill, the badge. `mode` is the room's notification mode
+/// as the app knows it; `call` the room's call, if any.
 fn room_row<'a>(
     room: &'a RoomSummary,
     avatars: &Avatars,
     selected: bool,
     mode: Option<RoomNotificationModeView>,
+    call: Option<CallPill>,
 ) -> Element<'a, Message> {
     let muted = |t: &iced::Theme| text::Style {
         color: Some(theme::semantic(t).muted),
@@ -164,6 +170,9 @@ fn room_row<'a>(
         .align_y(iced::Center);
     if let Some(lock) = encrypted_mark(room) {
         name_line = name_line.push(text(lock).size(12));
+    }
+    if room.is_call_room {
+        name_line = name_line.push(tag(VOICE_TAG));
     }
     if room.is_invite {
         name_line = name_line.push(tag("Invite"));
@@ -181,6 +190,7 @@ fn room_row<'a>(
     let content = row![
         avatar,
         body,
+        call_pill(call),
         badge_view(badge_for(room), muted_mark(mode).is_some()),
     ]
     .spacing(8)
@@ -243,6 +253,17 @@ fn avatar_view<'a>(room: &RoomSummary, name: &str, avatars: &Avatars) -> Element
             ..container::Style::default()
         })
         .into()
+}
+
+/// The call pill: the speaker and how many devices are in the room's call,
+/// in the highlight colour while the room rings, an outline otherwise. An
+/// empty space without a call, so a row keeps its widget types.
+fn call_pill<'a>(call: Option<CallPill>) -> Element<'a, Message> {
+    match call {
+        None => space().width(0).into(),
+        Some(call) if call.ringing => pill(call.label(), Tone::Highlight),
+        Some(call) => pill(call.label(), Tone::Muted),
+    }
 }
 
 /// A small pill with a label.
@@ -342,11 +363,36 @@ mod tests {
             Some(RoomNotificationModeView::MentionsAndKeywords),
             Some(RoomNotificationModeView::Mute),
         ] {
-            let _: Element<'_, Message> = room_row(&room, &avatars, false, mode);
+            let _: Element<'_, Message> = room_row(&room, &avatars, false, mode, None);
         }
         room.highlights = 1;
-        let _: Element<'_, Message> =
-            room_row(&room, &avatars, true, Some(RoomNotificationModeView::Mute));
+        let _: Element<'_, Message> = room_row(
+            &room,
+            &avatars,
+            true,
+            Some(RoomNotificationModeView::Mute),
+            None,
+        );
+    }
+
+    #[test]
+    fn rows_build_with_a_voice_tag_and_every_call_pill() {
+        let mut room = RoomSummary::new(twicecat_core::api::RoomId::from("!r:x"), "r".to_owned());
+        room.is_call_room = true;
+        let avatars = Avatars::default();
+        for call in [
+            None,
+            Some(CallPill {
+                count: 2,
+                ringing: false,
+            }),
+            Some(CallPill {
+                count: 0,
+                ringing: true,
+            }),
+        ] {
+            let _: Element<'_, Message> = room_row(&room, &avatars, false, None, call);
+        }
     }
 
     #[test]

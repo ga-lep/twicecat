@@ -1768,7 +1768,7 @@ First build and gate on Windows itself (Windows 11 26300, i9-14900K, RTX 5090; M
 ## Phase 6 call UI steps (plan docs/plans/phase6-call-ui.md, ga-lep/twicecat#14; branch feat/call-ui)
 Plan approved by the human 2026-10-12 (Q1-Q8 answered: the core plays the ringtone and rings by itself; a call bar plus a participants panel; a separate Voice & audio card; a call button in every joined room; the input mode and push-to-talk are left to #15; Ctrl+Shift+M/D; the app's twicecat-audio ban is enforced by script).
 - [x] 17. Call model and core events in the app (phase6.17)
-- [ ] 18. Room list call counts, voice rooms, the header's call button (phase6.18)
+- [x] 18. Room list call counts, voice rooms, the header's call button (phase6.18)
 - [ ] 19. In-call view: call bar, participants, mute, deafen, per-user volume and cleaning (phase6.19)
 - [ ] 20. Ringtone in the core (phase6.20)
 - [ ] 21. Incoming calls, with a stack round trip (phase6.21)
@@ -1823,5 +1823,31 @@ Plan approved by the human 2026-10-12 (Q1-Q8 answered: the core plays the ringto
   - `scripts/check-app-deps.sh` (also `livekit`), `scripts/check-core-api.sh`, `scripts/check-no-webrtc-download.sh` and `scripts/check-commits.sh main`: ok.
 - **Nothing on screen yet**, so no human item in this step.
 
+### Step 18: room list and header (phase6.18)
+- **Built:**
+  - **Room list rows** (`screens/room_list_pane.rs`). A "Voice" tag for MSC3417 call rooms (`RoomSummary::is_call_room`). A call pill (`calls::CallPill`, "🔊 N") before the unread badge whenever the room's call has devices (`ActiveCall`) or the room rings. It is in the highlight colour while the room rings and an outline otherwise. Without a call the pill is an empty space, so a row keeps its widget types, as `badge_view` does.
+  - **Room header** (`screens/main_view.rs`). Every joined room has a call button after Members and Settings (plan Q6). Spaces and invitations have none. The button comes from `CallModel::button`:
+    - "Call" (primary), or "Join call (N)" while a call has devices;
+    - "Join voice" or "Join voice (N)" in a voice room;
+    - "Joining…" (off) while joining;
+    - "Leave call" (danger) while in this room's call, also while reconnecting.
+  - **`Message::Call(CallMessage::{Join(room), Leave})`** sends `JoinCall { room_id, intent: Audio }` or `LeaveCall`. `CallModel::pending` keeps a second press, and any other join or leave, from sending until the core answers. Any `CallState` or a call error (`Call`, `Audio`, `NotInCall`) clears it. A join for an invitation or the current call's room sends nothing; so does a leave without a call. A room missing from `App::rooms` is still joined, because that list is filtered by the search and the tabs (the core answers an unknown room with `Joining` and then `Left { Failed }`). A voice room never joins on its own; joining is always a click.
+- **iced API** (rule 2, `iced_widget` 0.14.2 as locked): `button::primary` (`src/button.rs:598`), `button::danger` (:658), `Button::on_press_maybe` (:170). `button::success` (:628) was not used: no app colour test covers it, and the theme's contrast rule is checked for primary and danger only.
+- **Tests:** 9 more in `calls::tests`, plus one row build test in `room_list_pane`. They cover:
+  - the labels and presses through every call state;
+  - voice rooms;
+  - no button for spaces or invitations;
+  - one `JoinCall` per press until answered, with the other rooms' buttons off meanwhile;
+  - a refused join tried again;
+  - the joins that send nothing;
+  - one `LeaveCall`, and the button after `Left`;
+  - the pill's count and ring;
+  - `App::view` building in every call state.
+
+  Mutation, caught and reverted: without the pending check, `a_join_sends_one_command_until_the_core_answers` and `a_leave_sends_one_command_until_the_call_is_left` fail.
+- **Gate:** fmt, clippy (also `--all-features`), `cargo test --workspace` 1603 passed / 0 failed / 147 ignored, and the dependency, API, no-download and commit checks: ok.
+- **Human items:** the pill, the Voice tag and the header button in light and dark themes (Phase 6 call UI checkpoint).
+
 ## Phase 6 call UI human checkpoint
 - [x] Plan questions answered and plan approved (2026-10-12).
+- [ ] (step 18) The call pill (🔊 with the count; highlighted while ringing), the "Voice" tag and the header's call button (Call, Join call (N), Join voice, Joining…, Leave call) read well in light and dark themes, and the emoji renders on each OS; Tab reaches the call button.
