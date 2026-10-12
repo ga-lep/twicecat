@@ -11,7 +11,7 @@ use twicecat_core::api::{AudioSettings, NoiseSuppression};
 
 use crate::audio_settings::{
     AudioMessage, AudioUi, CLEANING_LIMIT_RANGE, INPUT_GAIN_RANGE, LevelChoice, NoiseChoice,
-    SkipChoice, Slider, backend_label, bitrate_menu, device_menu, diagnostics, meter,
+    SkipChoice, Slider, backend_label, bitrate_menu, device_menu, diagnostics, meter, no_gpu_note,
 };
 use crate::screens::room_dialogs::{modal, muted};
 use crate::state::{App, Message};
@@ -167,6 +167,8 @@ fn processing_section<'a>(app: &'a App, settings: &'a AudioSettings) -> Element<
                         .label("Use the GPU")
                         .on_toggle(|on| msg(AudioMessage::MicCleaningGpu(on))),
                 );
+            } else if let Some(why) = no_gpu_note(app.calls.gpu.as_ref()) {
+                section = section.push(note(why));
             }
             if let Some(running) = app.calls.gpu.as_ref().and_then(|g| g.running) {
                 section = section.push(note(backend_label(running)));
