@@ -11,13 +11,20 @@ LK_CUSTOM_WEBRTC = { value = "dev/libwebrtc", relative = true }
 # FMA (plan Task 15). twicecat_core::require_cpu_level refuses older CPUs at startup
 # with a message instead of a crash. RUSTFLAGS from the environment replaces
 # this.
+#
+# Linux keeps debug info in split DWARF files (.dwo) beside the objects instead
+# of copying it into every executable: each of the ~40 test binaries links the
+# core, and one debug build of the tests went from 43 GB to 27 GB (934 MB to
+# 500 MB per test binary). Backtraces, gdb and lldb read the .dwo files. Not in
+# Cargo.toml's profile: Windows MSVC supports only `packed`.
 [target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "target-cpu=x86-64-v3"]
+rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "split-debuginfo=unpacked"]
 
 # Link flags libwebrtc needs, as in livekit/rust-sdks' own .cargo/config.toml.
-# aarch64 Linux (Steam Frame): GNU ld fails on libwebrtc.a, lld works.
+# aarch64 Linux (Steam Frame): GNU ld fails on libwebrtc.a, lld works. Split
+# debug info as on x86_64.
 [target.aarch64-unknown-linux-gnu]
-rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "split-debuginfo=unpacked"]
 
 # libwebrtc is built against the static MSVC runtime (/MT); without this the
 # link fails with LNK2038 RuntimeLibrary mismatches.

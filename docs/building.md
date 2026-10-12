@@ -33,3 +33,11 @@ In the app, open **Settings → Voice & audio**.
 - **During a call or a mic test**, the card shows where the cleaning actually runs, for example "Running on the GPU (NVIDIA · CUDA)". If the GPU fails or falls behind, it says the CPU took over. "Falls behind" means late on 10 of the last 100 frames (one second), not one slow frame. Your microphone's cleaning then tries the GPU again after 30 seconds, and waits twice as long after each try that falls behind again, up to 5 minutes.
 
 The core prefers TensorRT, then CUDA, DirectML, WebGPU and Core ML, and uses the first that starts.
+
+## Disk use
+
+Cargo never deletes an older build. Every new mix of features (the GPU build, `--all-features`), of packages picked with `-p`, or of dependencies gets a full set of build files beside the others, so `target/debug` only grows. One debug build of all the tests is about 27 GB: each of the ~40 test binaries links the core and WebRTC.
+
+- On Linux, debug info goes into split DWARF files (`-C split-debuginfo=unpacked` in `.cargo/config.toml`) instead of into every test binary, which roughly halves each binary. Backtraces, gdb and lldb still show file and line.
+- `scripts/trim-target.sh [GB]` removes `target/debug` once it is over the limit (80 GB by default, or `TWICECAT_TARGET_LIMIT_GB`); release builds stay. Run it now and then, or from a timer.
+- `cargo clean --profile dev` removes the debug builds at once.
