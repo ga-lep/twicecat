@@ -1612,6 +1612,15 @@ Phase 2 signed off by the human on 2026-10-02 (merge of PR #3). Every other unti
 - **Fix:** `Rig::frames_until` feeds frames until the awaited result is visible (rows taken and cleaning running, the give-up handled, a new bank loaded), with a 10 s real-time limit. Every wait on a load uses it; the give-up's own timing (`frames(2000)`) is unchanged.
 - **Checks:** the 12 cleaning tests pass, also 30 runs pinned to one busy CPU. The old tests did not fail locally under that load either; the CI failure and the 1 ms-per-frame budget are the evidence. The gate was clean.
 
+## Phase 6 / flaky `io::tests::virtual_device_runs_in_real_time` on CI (fixed 2026-10-12)
+
+- **Symptom:** on `test (macos-latest)` (`aebc678`), "7 frames in 200 ms"; the test wanted 10 to 30.
+- **Cause (the test):** it counted the frames of a fixed 200 ms sleep. A late device thread on a busy runner makes fewer, and the device skips ahead instead of catching up (`next = now`), so lateness only ever lowers the count.
+- **Fix:**
+  - It waits (at most 5 s) until 10 frames are out, which shows the device runs.
+  - It then checks that the count never exceeds the elapsed real time (one frame per 10 ms, plus 2), which shows it runs in real time and not free-running.
+- **Checks:** the test passes, also 30 runs pinned to one busy CPU; the gate was clean.
+
 ## Phase 6 steps (calls: MatrixRTC, LiveKit SFU, native audio; plan docs/plans/phase6-calls.md)
 Order (revised 2026-10-02, plan decision 12; again 2026-10-03 by the human): 1–8, 8b, 9, 10, 11, 12, 14, 13, then 15 and 13b. Deferred options (audio-only libwebrtc build, pure-Rust WebRTC stack, PulseAudio backend) are recorded in the plan.
 - [x] 1. libwebrtc supply chain (pinned SHA-256 fetch script, fail-closed build) and livekit dependency (phase6.1)
