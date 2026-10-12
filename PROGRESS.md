@@ -1772,7 +1772,7 @@ Plan approved by the human 2026-10-12 (Q1-Q8 answered: the core plays the ringto
 - [x] 19. In-call view: call bar, participants, mute, deafen, per-user volume and cleaning (phase6.19)
 - [x] 20. Ringtone in the core (phase6.20)
 - [x] 21. Incoming calls, with a stack round trip (phase6.21)
-- [ ] 22. Voice & audio settings (phase6.22)
+- [x] 22. Voice & audio settings (phase6.22)
 - [ ] 23. Wrap-up (phase6.23)
 
 ### Step 17: the call model (phase6.17)
@@ -1975,9 +1975,48 @@ Plan approved by the human 2026-10-12 (Q1-Q8 answered: the core plays the ringto
   - Gate: fmt, clippy (also `--all-features`), `cargo test --workspace` 1656 passed / 0 failed / 150 ignored, and the dependency, API, no-download and commit checks: ok.
 - **Docs:** `docs/accessibility.md` covers the card in the Esc order, its buttons, and that a ring is never only a sound.
 
+### Step 22: the Voice & audio card (phase6.22)
+- **Built.** New `crates/app/src/audio_settings.rs` (model, `AudioMessage`, `App::on_audio`) and `screens/audio_settings.rs`. The card is a modal layer above Settings and below the media viewer. It opens from Settings ("Voice & audio…", which closes Settings, as "Manage sessions…" does; plan Q5) and from the call bar's **Audio…**. Opening sends `GetAudioSettings`, `ListAudioDevices` (which also starts the core's hot-plug watcher) and `ProbeGpuEnhancement`. Esc or **Close** closes it, after sending a moved slider and stopping the mic test it started. The card shows the last echoed `AudioSettings`. Every change copies it, changes one field, and sends the whole value with `UpdateAudioSettings`. An unchanged value sends nothing. Before the first echo a change asks for the settings again. The input mode and push-to-talk bindings pass through untouched (plan Q7, #15).
+  - **Devices.** Microphone and speakers menus: "System default" (`None`) and the listed devices. A saved device that is not listed stays chosen, as "<name> (not connected)", using names seen this session, else "Saved device". During a call: "A new device is used from the next call." (the core's behaviour).
+  - **Microphone.** Noise suppression: Off / WebRTC / RNNoise / DeepFilterNet3. Picking the one already set keeps its options; WebRTC starts at Moderate, DeepFilterNet3 at 100 dB without the GPU. Then:
+    - WebRTC's strength menu, or DeepFilterNet3's limit slider;
+    - "Use the GPU" only when `GpuEnhancement::available` is not empty, where it runs (`GpuEnhancement::running`), and the RNNoise fallback note;
+    - echo cancellation, and "Also remove other apps' sound", which is disabled without echo cancellation; turning echo cancellation off turns it off too;
+    - automatic gain and high-pass;
+    - the note on what runs together and what excludes, as the core's docs ask.
+  - **Levels.** Microphone gain (−20…20 dB, step 0.5), volume (0…200 %, step 5), and voice quality (16–128 kb/s; an unusual current value up to 510 stays in the menu).
+  - **Mic test.** Start/Stop with "Hear myself (use headphones)"; changing it during a test restarts the test. Off during a call, with the reason; a `Joining` ends the card's test (the call takes the devices). A level bar from `InputLevel` (−60…0 dBFS) with "N dB, peak N dB, sending/not sending".
+  - **Ringtone.** "Play a ringtone when someone calls you directly" (`AudioSettings::ringtone`, step 20).
+  - **Other people's voices.** On/off with its cost; when on, the limit slider, the skip policy menu, "Clean on the GPU" when offered, and where it runs (`AudioStats::remote_cleaning`).
+  - **Your microphone's cleaning.** "Tell others my microphone is cleaned", with the privacy note (everyone in the call and the call server's operator can see which suppressor you use), and "cleaned outside Twicecat" (off unless announcing).
+  - **Diagnostics** (hidden by default), from `AudioStats`: echo removed, echo left, echo delay, processing µs, late wake-ups, over- and underruns.
+  - **Sliders** send on release or after a 400 ms pause, as in the participants panel. **−**/**+** beside each send one step at once, clamped. The echo always wins, so a clamped value snaps back.
+  - **Settings.** The push-to-talk placeholder becomes a "Voice & audio" section, and `PUSH_TO_TALK_LINE` now reads "Push-to-talk arrives in a later version." (#15).
+- **iced API** (rule 2, `iced_widget` 0.14.2): `checkbox(is_checked).label().on_toggle()` and `on_toggle_maybe` (`src/checkbox.rs:119-167`); `progress_bar(range, value)` (`src/helpers.rs:1779`) with `.girth` (`src/progress_bar.rs:97`).
+- **Tests:** 24 in `audio_settings::tests`, plus a layout test in `state.rs`. They cover:
+  - opening;
+  - closed controls do nothing;
+  - each of 16 controls sends the whole settings with its one change, with the input mode and bindings intact;
+  - unchanged choices send nothing;
+  - strength and GPU only for their suppressor; system audio needs AEC;
+  - before the first echo;
+  - sliders (release, last pause, stale pause); the steps clamp; the cleaning limits;
+  - the echo winning;
+  - closing sends the slider and stops the test;
+  - the mic test (start, stop, hear myself, refused in a call, ended by a call);
+  - hot-plug with a saved device not connected;
+  - bitrates, the meter, diagnostics and backend words;
+  - the view with every section;
+  - Esc; Settings opening the card and waiting while it is open; logout;
+  - the card keeping the window filled.
+
+  Mutation, caught and reverted: sending unchanged settings fails 3 tests.
+- **Gate:** fmt, clippy (also `--all-features`), `cargo test --workspace` 1680 passed / 0 failed / 150 ignored, and the dependency, API, no-download and commit checks: ok.
+
 ## Phase 6 call UI human checkpoint
 - [x] Plan questions answered and plan approved (2026-10-12).
 - [ ] (step 18) The call pill (🔊 with the count; highlighted while ringing), the "Voice" tag and the header's call button (Call, Join call (N), Join voice, Joining…, Leave call) read well in light and dark themes, and the emoji renders on each OS; Tab reaches the call button.
 - [ ] (step 19) In a call: the call bar (name, phase, lock, Mute/Deafen/Leave, notice ✕) at the bottom of the room list and the participants panel (pictures, speaking ring, 🔇, "(you)", cleaning words, −/+ and slider, cleaning menu) in light and dark themes on each OS; mute and deafen heard (or not) on the other side, including Ctrl+Shift+M/D with the composer focused; per-person volume and cleaning by ear; the slider sends after a mouse release and after a wheel turn; a voice room opens the panel on join.
 - [ ] (step 20) The ringtone by ear: a DM call from Element Web or another Twicecat rings on the chosen output device at the master volume (not too loud in headphones, audible across a room on speakers), stops when answered, declined (here or on another device), when the caller hangs up, after about 90 s, and with `/silence` in the CLI (Esc in the app, Task 5); no tone for a group call or while in a call; `/ringtone off` keeps it quiet. Also with a Bluetooth headset as the output device.
 - [ ] (step 21) Incoming calls with Element Web/X and another Twicecat: the card (picture, name, Decline/Accept) in both themes; Accept joins, Decline tells the caller; Esc hides the card and silences the tone; the taskbar/dock flashes (Critical) for a DM ring on Windows, macOS, GNOME and KDE; the desktop notification shows while the window is unfocused (with and without "Show message content") and a click opens the room; a group call only notifies.
+- [ ] (step 22) The Voice & audio card in both themes on each OS: device menus with a USB and a Bluetooth headset plugged in and out while it is open ("(not connected)" keeps the choice, and the device comes back), each processing option by ear (WebRTC strengths, RNNoise, DeepFilterNet3 with and without the GPU; echo cancellation on open speakers; "other apps' sound" with a game or video), gain and volume, the voice quality menu, the mic test meter and "Hear myself" on headphones, the ringtone switch, cleaning other voices and its skip menu in a call with Element Call, the announcement switch, and the diagnostics during a call.

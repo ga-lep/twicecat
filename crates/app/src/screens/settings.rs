@@ -16,7 +16,7 @@ use twicecat_core::api::ThemeChoice;
 use crate::screens::room_dialogs::{modal, muted};
 use crate::settings::{
     DRAG_AND_DROP_NOTE, DefaultChoice, KEYWORD_INPUT_ID, NAME_INPUT_ID, PUSH_TO_TALK_LINE,
-    SettingsMessage,
+    SettingsMessage, VOICE_AUDIO_LINE,
 };
 use crate::state::{App, Message};
 
@@ -64,7 +64,17 @@ fn view(app: &App) -> Element<'_, Message> {
         .push(notifications_section(app))
         .push(appearance_section(app))
         .push(shortcuts_section())
-        .push(column![heading("Push-to-talk"), note(PUSH_TO_TALK_LINE)].spacing(6))
+        .push(
+            column![
+                heading("Voice & audio"),
+                note(VOICE_AUDIO_LINE),
+                button(text("Voice & audio\u{2026}"))
+                    .on_press(msg(SettingsMessage::OpenVoiceAudio))
+                    .style(button::secondary),
+                note(PUSH_TO_TALK_LINE),
+            ]
+            .spacing(6),
+        )
         .push(
             column![
                 heading("Sessions"),

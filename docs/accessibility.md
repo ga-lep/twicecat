@@ -35,7 +35,8 @@ Rules the code follows (all in tests):
   is open. The order is the widget tree's order; overlays are layers in a
   fixed stack of two, so opening one never reshuffles the base.
 - Esc closes one layer per press, topmost first: the incoming-call card
-  (hidden, and its ringtone silenced; the room keeps ringing), the switcher,
+  (hidden, and its ringtone silenced; the room keeps ringing), the Voice &
+  audio card, the switcher,
   the upload
   confirmation, the viewer, Settings, a room dialog or panel, then the
   composer's suggestions or reply/edit, then the thread panel, then the
@@ -59,6 +60,8 @@ order, so Tab reaches it:
   call notice;
 - per person in the participants panel: **−** and **+** (10 % each), the
   volume slider, and the voice cleaning menu;
+- the Voice & audio card (from Settings or the call bar's **Audio…**): menus,
+  checkboxes, and for each slider **−** and **+** beside it; Esc closes it;
 - the incoming-call card, a modal layer above everything else: **Decline**
   then **Accept**, and Esc to hide it. While it shows, the room shortcuts
   wait, as under any dialog.
@@ -69,7 +72,8 @@ window is not focused, and the room's highlighted call pill.
 
 iced 0.14's slider takes no keyboard focus: its arrow keys work only while
 the mouse is over it (`iced_widget` 0.14.2 `src/slider.rs:393-405`), which
-is why **−** and **+** sit beside it. A slider moved by the wheel or the
+is why **−** and **+** sit beside every slider (the people's volumes, the
+microphone gain, the volume, the cleaning limits). A slider moved by the wheel or the
 keys, which never reports a release, sends its value after a 400 ms pause.
 Speaking is shown by a ring around the picture and by the word "Speaking",
 muted by a mark and the word "Muted", so neither relies on colour alone.

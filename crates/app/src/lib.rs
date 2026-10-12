@@ -4,6 +4,7 @@
 //! `twicecat_core::api`); it never depends on the Matrix SDK.
 
 pub mod actions;
+pub mod audio_settings;
 pub mod avatars;
 pub mod blocking;
 pub mod bridge;
