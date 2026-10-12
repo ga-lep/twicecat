@@ -148,7 +148,7 @@ Files: .github/workflows/ci.yml, scripts/stack.sh (only if a non-waiting start n
 Depends on: Task 7
 Acceptance criteria:
 - The `integration` job starts the stack detached (`scripts/stack.sh up -d`, no `--wait`) before "Fetch pinned libwebrtc" and the build. After the build it runs `scripts/stack.sh up -d --wait`, which returns at once if the stack is already healthy, then `create-test-users.sh`. The 30 s start-up runs under the build.
-- `Swatinem/rust-cache@v2` gets an explicit `shared-key` for the `integration` job and saves only on `main` (`save-if: ${{ github.ref == 'refs/heads/main' }}`), so pull requests restore the main cache instead of writing their own. A CI run on the PR shows "Cache restored from key" in the rust-cache step (**HUMAN**: read the log).
+- The shards share one rust-cache `shared-key: integration` and only `main` saves it (`save-if: ${{ github.ref == 'refs/heads/main' }}`). A separate build job was tried and dropped (2026-10-12, CI run 38305564860): rust-cache does not keep the workspace crates, so each shard recompiled `twicecat-core` and its tests for 3 to 4 minutes anyway, and the job only added about 3 minutes to the critical path.
 - Decision recorded in the ledger, from the Task 2 and Task 7 numbers: does the 30 s stack start-up still sit on a shard's critical path once it overlaps the build? Write down the measured saving per shard.
 - `actionlint` (if available) or a CI run validates the workflow. The lint job passes.
 Evidence: the CI `integration` job's step durations (no separate 30 s "Start local Synapse" wait on the critical path) and the rust-cache restore line. **HUMAN**: push, then `gh run view <id> --json jobs`.
