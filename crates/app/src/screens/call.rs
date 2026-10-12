@@ -6,7 +6,7 @@
 //! call starts or ends.
 
 use iced::widget::{
-    Column, button, column, container, pick_list, row, rule, scrollable, slider, space, text,
+    Column, button, column, container, pick_list, row, rule, scrollable, slider, space, stack, text,
 };
 use iced::{Background, Element, Fill, Length, border};
 
@@ -14,7 +14,7 @@ use crate::calls::{
     CallMessage, CleaningChoice, MAX_VOLUME, MUTED_MARK, PANEL_WIDTH, ParticipantRow,
 };
 use crate::screens::main_view::display_name;
-use crate::screens::room_dialogs::{PERSON_SLOT, person_avatar};
+use crate::screens::room_dialogs::{PERSON_SLOT, modal, person_avatar};
 use crate::screens::room_list_pane::LOCK_MARK;
 use crate::state::{App, Message};
 use crate::theme;
@@ -65,6 +65,66 @@ pub fn declined_line(call: &crate::calls::CurrentCall) -> Option<String> {
     } else {
         format!("{} and {rest} more declined", named.join(", "))
     })
+}
+
+/// Width of the incoming-call card.
+const RING_CARD_WIDTH: f32 = 380.0;
+
+/// The words of the incoming-call card: the headline and the line under it.
+/// A DM's name is the caller's; a group room names the room under it.
+pub fn ring_lines(caller: &str, room_name: Option<&str>, is_dm: bool) -> (String, Option<String>) {
+    let caller = elide_middle(caller, 64);
+    let headline = format!("{caller} is calling");
+    let under = match (is_dm, room_name) {
+        (false, Some(room)) => Some(format!("in {}", display_name(room))),
+        _ => None,
+    };
+    (headline, under)
+}
+
+/// The base with the incoming-call card as the layer above it (plan Task 5):
+/// always a stack of two, so the card coming and going keeps the widget
+/// state under it.
+pub fn ring_layer<'a>(base: Element<'a, Message>, app: &'a App) -> Element<'a, Message> {
+    let card = app.calls.card().map(|ring| {
+        let room = app.rooms.iter().find(|r| r.id == ring.room_id);
+        // A DM's room is named after the other person and has their picture.
+        let is_dm = room.is_some_and(|r| r.is_dm);
+        let caller_name = room.filter(|r| r.is_dm).map_or_else(
+            || ring.caller.as_str().to_owned(),
+            |r| display_name(&r.name),
+        );
+        let (headline, under) = ring_lines(&caller_name, room.map(|r| r.name.as_str()), is_dm);
+        let picture = person_avatar(
+            &ring.caller,
+            &caller_name,
+            room.filter(|r| r.is_dm).and_then(|r| r.avatar.as_ref()),
+            &app.avatars,
+        );
+        let mut words = column![text(headline).size(18)].spacing(4);
+        if let Some(under) = under {
+            words = words.push(text(under).size(13).style(muted_style));
+        }
+        let idle = !ring.answered;
+        let accept = button(text("Accept").size(14))
+            .padding([6, 14])
+            .style(button::primary)
+            .on_press_maybe(idle.then(|| call(CallMessage::Accept(ring.room_id.clone()))));
+        let decline = button(text("Decline").size(14))
+            .padding([6, 14])
+            .style(button::danger)
+            .on_press_maybe(idle.then(|| call(CallMessage::Decline(ring.room_id.clone()))));
+        let content = column![
+            row![picture, words].spacing(12).align_y(iced::Center),
+            row![space().width(Fill), decline, accept].spacing(8),
+            text("Esc hides this; the room keeps ringing.")
+                .size(12)
+                .style(muted_style),
+        ]
+        .spacing(16);
+        modal(content, RING_CARD_WIDTH)
+    });
+    stack([base, card.unwrap_or_else(|| space().into())]).into()
 }
 
 /// The call bar, or an empty slot without a call or a notice.
@@ -305,6 +365,22 @@ mod tests {
     use twicecat_core::api::UserId;
 
     use super::*;
+
+    #[test]
+    fn the_ring_card_names_the_caller_and_a_group_room() {
+        assert_eq!(
+            ring_lines("Bob", Some("Bob"), true),
+            ("Bob is calling".to_owned(), None)
+        );
+        assert_eq!(
+            ring_lines("@bob:x", Some("Team\nroom"), false),
+            (
+                "@bob:x is calling".to_owned(),
+                Some("in Team\u{23ce}room".to_owned())
+            )
+        );
+        assert_eq!(ring_lines("@bob:x", None, false).1, None);
+    }
 
     #[test]
     fn mute_and_deafen_labels_follow_the_state() {

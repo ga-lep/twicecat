@@ -433,6 +433,7 @@ impl App {
     fn other_modal_open(&self) -> bool {
         self.sessions.open
             || self.verification.is_some()
+            || self.calls.card().is_some()
             || self.uploads.dialog.is_some()
             || self.media.viewer.is_some()
             || self.rooms_ui.overlay_open()

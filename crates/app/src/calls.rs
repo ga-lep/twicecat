@@ -81,6 +81,14 @@ pub enum CallMessage {
         /// The choice.
         choice: CleaningChoice,
     },
+    /// **Accept** on the incoming-call card: join that room's call.
+    Accept(RoomId),
+    /// **Decline** on the incoming-call card.
+    Decline(RoomId),
+    /// Esc on the incoming-call card: hide the cards of every ring sounding
+    /// now and stop the ringtone; the rooms still ring (their pills, the
+    /// header's button).
+    HideRing,
 }
 
 /// A command sent and not answered yet: a second press sends nothing.
@@ -280,6 +288,11 @@ pub struct Ring {
     pub caller: UserId,
     /// A ring; `false` for a quiet notification.
     pub ring: bool,
+    /// Esc hid its card.
+    pub hidden: bool,
+    /// Accept or Decline was pressed; its buttons are off until the core
+    /// answers (or refuses).
+    pub answered: bool,
 }
 
 /// One row of the participants panel, ready to draw.
@@ -438,6 +451,15 @@ impl CallModel {
         })
     }
 
+    /// The ring whose card shows: the oldest DM ring not hidden, unless we
+    /// are joining or in that room's call (the ring stays until the core
+    /// stops it, so a failed join shows the card again).
+    pub fn card(&self) -> Option<&Ring> {
+        self.rings
+            .iter()
+            .find(|r| r.ring && !r.hidden && self.call_in(&r.room_id).is_none())
+    }
+
     /// The call pill of `room`'s row: when its call has devices or it rings.
     pub fn pill(&self, room: &RoomId) -> Option<CallPill> {
         let count = self.count(room);
@@ -507,8 +529,8 @@ impl CallModel {
         match state {
             CallState::Idle => self.end_call(),
             CallState::Joining { room_id } => {
-                // Joining answers the room's ring; the core also stops it.
-                self.rings.retain(|r| r.room_id != room_id);
+                // The room's ring stays until the core says it stopped (a
+                // join that fails keeps it ringing); its card hides meanwhile.
                 self.notice = None;
                 self.volume_drag = None;
                 self.call = Some(CurrentCall::new(room_id, CallPhase::Joining));
@@ -523,6 +545,10 @@ impl CallModel {
                 if self.call_in(&room_id).is_some() {
                     // The core sends no empty participant list on leave.
                     self.end_call();
+                }
+                // A ring answered by a join that failed can be answered again.
+                for ring in self.rings.iter_mut().filter(|r| r.room_id == room_id) {
+                    ring.answered = false;
                 }
                 if let CallEndReason::Failed(why) = reason {
                     self.notice = Some(notice_line(&format!("The call ended: {why}")));
@@ -602,8 +628,14 @@ impl CallModel {
             return;
         }
         if let Some(known) = self.rings.iter_mut().find(|r| r.room_id == room_id) {
-            known.caller = caller;
-            known.ring = ring;
+            // A new call in the same room: its card shows again.
+            *known = Ring {
+                room_id,
+                caller,
+                ring,
+                hidden: false,
+                answered: false,
+            };
             return;
         }
         if self.rings.len() >= MAX_RINGS {
@@ -613,13 +645,19 @@ impl CallModel {
             room_id,
             caller,
             ring,
+            hidden: false,
+            answered: false,
         });
     }
 
     /// Shows a refused call or audio command.
     pub fn on_error(&mut self, error: &CoreError) {
-        // A refused leave (`NotInCall`) or join is answered.
+        // A refused leave (`NotInCall`) or join is answered, and so is a
+        // refused decline: the card's buttons work again.
         self.pending = None;
+        for ring in &mut self.rings {
+            ring.answered = false;
+        }
         self.notice = Some(notice_line(&error_text(error)));
     }
 }
@@ -760,6 +798,41 @@ impl App {
                 }
                 self.set_user_volume(user_id, next)
             }
+            CallMessage::Accept(room_id) => {
+                if self.calls.ring(&room_id).is_none_or(|r| r.answered) {
+                    return Task::none();
+                }
+                let join = self.on_call(CallMessage::Join(room_id.clone()));
+                if self.calls.pending == Some(Pending::Join(room_id.clone()))
+                    && let Some(ring) = self.calls.rings.iter_mut().find(|r| r.room_id == room_id)
+                {
+                    ring.answered = true;
+                }
+                join
+            }
+            CallMessage::Decline(room_id) => {
+                let Some(ring) = self
+                    .calls
+                    .rings
+                    .iter_mut()
+                    .find(|r| r.room_id == room_id && !r.answered)
+                else {
+                    return Task::none();
+                };
+                ring.answered = true;
+                self.send(Command::DeclineCall { room_id })
+            }
+            CallMessage::HideRing => {
+                if self.calls.card().is_none() {
+                    return Task::none();
+                }
+                // The core silences every ring sounding now, so every card
+                // hides; a later ring shows its card and sounds again.
+                for ring in self.calls.rings.iter_mut().filter(|r| r.ring) {
+                    ring.hidden = true;
+                }
+                self.send(Command::SilenceRinging)
+            }
             CallMessage::Cleaning { user_id, choice } => {
                 let now = self
                     .calls
@@ -841,6 +914,12 @@ impl App {
             _ => None,
         };
         let participants = matches!(event, CoreEvent::CallParticipants { .. });
+        let incoming = match &event {
+            CoreEvent::IncomingCall { room_id, .. } if self.calls.ring(room_id).is_none() => {
+                Some(room_id.clone())
+            }
+            _ => None,
+        };
         let handled = self.calls.on_event(event);
         debug_assert!(handled, "on_call_event got another kind of event");
         if let Some(room) = joining {
@@ -853,7 +932,41 @@ impl App {
         if participants {
             return self.call_people_changed();
         }
+        if let Some(room) = incoming {
+            return self.announce_ring(&room);
+        }
         Task::none()
+    }
+
+    /// A new ring: the window asks for attention (until focused for a DM
+    /// ring), and a desktop notification shows while the window is not
+    /// focused. A ring the model ignored (we are in that call) does nothing.
+    fn announce_ring(&mut self, room: &RoomId) -> Task<Message> {
+        let Some(ring) = self.calls.ring(room).cloned() else {
+            return Task::none();
+        };
+        let level = if ring.ring {
+            iced::window::UserAttention::Critical
+        } else {
+            iced::window::UserAttention::Informational
+        };
+        let room_name = self
+            .rooms
+            .iter()
+            .find(|r| r.id == *room)
+            .map(|r| r.name.as_str());
+        let toast = crate::notifications::call_toast(
+            room_name,
+            &ring.caller,
+            ring.ring,
+            self.ui_settings.show_message_content,
+        );
+        let shown = self.notify(crate::notifications::Request {
+            room_id: room.clone(),
+            toast,
+            replace: None,
+        });
+        Task::batch([crate::state::attention_at(level), shown])
     }
 
     /// Asks again for the member list when someone it lacks joined, and for
@@ -1298,13 +1411,15 @@ mod tests {
     }
 
     #[test]
-    fn joining_a_ringing_room_answers_it() {
+    fn joining_a_ringing_room_hides_its_card_until_the_ring_stops() {
         let (mut app, _rx) = main_app();
         incoming(&mut app, "a", "b", true);
         incoming(&mut app, "b", "c", true);
         joining(&mut app, "a");
+        assert!(app.calls.ring(&room("a")).is_some(), "the core stops it");
+        assert_eq!(app.calls.card().map(|r| r.room_id.clone()), Some(room("b")));
+        let _ = app.update(core(CoreEvent::RingingStopped { room_id: room("a") }));
         assert!(app.calls.ring(&room("a")).is_none());
-        assert!(app.calls.ring(&room("b")).is_some());
     }
 
     #[test]
@@ -2376,5 +2491,247 @@ mod tests {
             CallPhase::Reconnecting { attempt: 3 }.label(),
             "Reconnecting (attempt 3)\u{2026}"
         );
+    }
+
+    // ---- Task 5: incoming calls ----
+
+    use crate::notifications::RecordingNotifier;
+
+    /// An app with a recording notifier and an unfocused window; room `b`
+    /// is a DM named "Bob".
+    fn ring_app() -> (App, mpsc::Receiver<Command>, RecordingNotifier) {
+        let (mut app, rx) = main_app();
+        let notifier = RecordingNotifier::default();
+        app.set_notifier(Box::new(notifier.clone()));
+        let mut dm = summary("b");
+        dm.is_dm = true;
+        dm.name = "Bob".into();
+        let _ = app.update(core(CoreEvent::RoomListChanged(vec![ListDiff::Set {
+            index: 1,
+            value: dm,
+        }])));
+        let _ = app.update(Message::WindowFocus(false));
+        (app, rx, notifier)
+    }
+
+    fn shown(notifier: &RecordingNotifier) -> Vec<(RoomId, String, String)> {
+        notifier
+            .shown
+            .lock()
+            .expect("test mutex")
+            .iter()
+            .map(|r| {
+                (
+                    r.room_id.clone(),
+                    r.toast.title.clone(),
+                    r.toast.body.clone(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_dm_ring_opens_the_card_and_notifies_once() {
+        let (mut app, _rx, notifier) = ring_app();
+        incoming(&mut app, "b", "bob", true);
+        assert_eq!(app.calls.card().map(|r| r.room_id.clone()), Some(room("b")));
+        assert!(app.any_overlay_open(), "room shortcuts wait under the card");
+        let _ = app.view();
+        assert_eq!(
+            shown(&notifier),
+            [(
+                room("b"),
+                "Bob".to_owned(),
+                "@bob:x is calling you".to_owned()
+            )]
+        );
+        // The same ring again (a sync replay) adds nothing.
+        incoming(&mut app, "b", "bob", true);
+        assert_eq!(shown(&notifier).len(), 1);
+    }
+
+    #[test]
+    fn a_group_call_notifies_quietly_without_a_card() {
+        let (mut app, _rx, notifier) = ring_app();
+        incoming(&mut app, "a", "carol", false);
+        assert!(app.calls.card().is_none());
+        assert!(app.calls.pill(&room("a")).is_some_and(|p| p.ringing));
+        assert_eq!(
+            shown(&notifier),
+            [(
+                room("a"),
+                "a".to_owned(),
+                "@carol:x started a call".to_owned()
+            )]
+        );
+    }
+
+    #[test]
+    fn a_focused_window_or_notifications_off_shows_no_notification() {
+        let (mut app, _rx, notifier) = ring_app();
+        let _ = app.update(Message::WindowFocus(true));
+        incoming(&mut app, "b", "bob", true);
+        assert!(shown(&notifier).is_empty());
+        assert!(app.calls.card().is_some(), "the card shows all the same");
+        let _ = app.update(Message::WindowFocus(false));
+        app.ui_settings.desktop_notifications = false;
+        incoming(&mut app, "a", "carol", false);
+        assert!(shown(&notifier).is_empty());
+    }
+
+    #[test]
+    fn without_message_content_the_caller_stays_out_of_the_notification() {
+        let (mut app, _rx, notifier) = ring_app();
+        app.ui_settings.show_message_content = false;
+        incoming(&mut app, "b", "bob", true);
+        assert_eq!(
+            shown(&notifier),
+            [(
+                room("b"),
+                "Bob".to_owned(),
+                crate::notifications::BODY_CALLING.to_owned()
+            )]
+        );
+    }
+
+    #[test]
+    fn a_ring_for_the_call_we_are_in_announces_nothing() {
+        let (mut app, _rx, notifier) = ring_app();
+        joining(&mut app, "b");
+        incoming(&mut app, "b", "bob", true);
+        assert!(app.calls.card().is_none());
+        assert!(shown(&notifier).is_empty());
+    }
+
+    #[test]
+    fn accept_joins_once_and_the_card_goes_when_joining() {
+        let (mut app, mut rx, _) = ring_app();
+        incoming(&mut app, "b", "bob", true);
+        drain(&mut rx);
+        call(&mut app, CallMessage::Accept(room("b")));
+        call(&mut app, CallMessage::Accept(room("b")));
+        call(&mut app, CallMessage::Decline(room("b")));
+        let sent = drain(&mut rx);
+        assert!(
+            matches!(sent.as_slice(), [Command::JoinCall { room_id, .. }] if *room_id == room("b")),
+            "{sent:?}"
+        );
+        assert!(app.calls.card().is_some_and(|r| r.answered), "buttons off");
+        joining(&mut app, "b");
+        assert!(app.calls.card().is_none());
+    }
+
+    #[test]
+    fn a_failed_accept_shows_the_card_again() {
+        let (mut app, mut rx, _) = ring_app();
+        incoming(&mut app, "b", "bob", true);
+        call(&mut app, CallMessage::Accept(room("b")));
+        joining(&mut app, "b");
+        assert!(app.calls.card().is_none());
+        state(
+            &mut app,
+            CallState::Left {
+                room_id: room("b"),
+                reason: CallEndReason::Failed("no call service".into()),
+            },
+        );
+        // The core's ringtone sounds again: the card is back, its buttons on.
+        let card = app.calls.card().expect("the card again");
+        assert!(!card.answered);
+        drain(&mut rx);
+        call(&mut app, CallMessage::Decline(room("b")));
+        assert!(matches!(
+            drain(&mut rx).as_slice(),
+            [Command::DeclineCall { .. }]
+        ));
+    }
+
+    #[test]
+    fn decline_sends_once_and_the_card_goes_when_the_ringing_stops() {
+        let (mut app, mut rx, _) = ring_app();
+        incoming(&mut app, "b", "bob", true);
+        drain(&mut rx);
+        call(&mut app, CallMessage::Decline(room("b")));
+        call(&mut app, CallMessage::Decline(room("b")));
+        call(&mut app, CallMessage::Accept(room("b")));
+        let sent = drain(&mut rx);
+        assert!(
+            matches!(sent.as_slice(), [Command::DeclineCall { room_id }] if *room_id == room("b")),
+            "{sent:?}"
+        );
+        let _ = app.update(core(CoreEvent::RingingStopped { room_id: room("b") }));
+        assert!(app.calls.card().is_none());
+    }
+
+    #[test]
+    fn a_ring_in_a_room_hidden_by_the_search_can_be_accepted() {
+        let (mut app, mut rx, _) = ring_app();
+        incoming(&mut app, "elsewhere", "dan", true);
+        drain(&mut rx);
+        call(&mut app, CallMessage::Accept(room("elsewhere")));
+        let sent = drain(&mut rx);
+        assert!(
+            matches!(sent.as_slice(), [Command::JoinCall { room_id, .. }] if *room_id == room("elsewhere")),
+            "{sent:?}"
+        );
+        // The core answers an unknown room with Joining, then Left.
+        joining(&mut app, "elsewhere");
+        state(
+            &mut app,
+            CallState::Left {
+                room_id: room("elsewhere"),
+                reason: CallEndReason::Failed("unknown room".into()),
+            },
+        );
+        assert!(app.calls.pending.is_none());
+    }
+
+    #[test]
+    fn a_refused_answer_can_be_tried_again() {
+        let (mut app, mut rx, _) = ring_app();
+        incoming(&mut app, "b", "bob", true);
+        call(&mut app, CallMessage::Decline(room("b")));
+        let _ = app.update(core(CoreEvent::Error(CoreError::Call(
+            "could not send the decline; the caller keeps ringing".into(),
+        ))));
+        assert!(app.calls.card().is_some_and(|r| !r.answered));
+        drain(&mut rx);
+        call(&mut app, CallMessage::Decline(room("b")));
+        assert_eq!(drain(&mut rx).len(), 1);
+    }
+
+    #[test]
+    fn escape_hides_the_card_and_silences_the_ringtone() {
+        let (mut app, mut rx, _) = ring_app();
+        incoming(&mut app, "b", "bob", true);
+        incoming(&mut app, "a", "carol", true);
+        drain(&mut rx);
+        shortcut(&mut app, Shortcut::Escape);
+        let sent = drain(&mut rx);
+        assert!(
+            matches!(sent.as_slice(), [Command::SilenceRinging]),
+            "{sent:?}"
+        );
+        // The core silenced both: both cards hide, both rooms still ring.
+        assert!(app.calls.card().is_none());
+        assert!(app.calls.pill(&room("a")).is_some_and(|p| p.ringing));
+        assert!(app.calls.pill(&room("b")).is_some_and(|p| p.ringing));
+        assert!(!app.any_overlay_open());
+        shortcut(&mut app, Shortcut::Escape);
+        assert!(drain(&mut rx).is_empty(), "nothing left to silence");
+        // A new call in that room shows its card again.
+        incoming(&mut app, "b", "bob", true);
+        assert_eq!(app.calls.card().map(|r| r.room_id.clone()), Some(room("b")));
+    }
+
+    #[test]
+    fn the_card_closes_before_any_other_layer() {
+        let (mut app, _rx, _) = ring_app();
+        let _ = app.update(Message::Settings(crate::settings::SettingsMessage::Open));
+        assert!(app.settings_ui.open);
+        incoming(&mut app, "b", "bob", true);
+        shortcut(&mut app, Shortcut::Escape);
+        assert!(app.calls.card().is_none());
+        assert!(app.settings_ui.open, "Settings stays for the next Esc");
     }
 }

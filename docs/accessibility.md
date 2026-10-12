@@ -34,7 +34,9 @@ Rules the code follows (all in tests):
 - Tab moves the focus only when no widget used the key and no suggestion list
   is open. The order is the widget tree's order; overlays are layers in a
   fixed stack of two, so opening one never reshuffles the base.
-- Esc closes one layer per press, topmost first: the switcher, the upload
+- Esc closes one layer per press, topmost first: the incoming-call card
+  (hidden, and its ringtone silenced; the room keeps ringing), the switcher,
+  the upload
   confirmation, the viewer, Settings, a room dialog or panel, then the
   composer's suggestions or reply/edit, then the thread panel, then the
   participants panel of a call. A text field
@@ -56,7 +58,14 @@ order, so Tab reaches it:
   it with the panel), **Mute**, **Deafen**, **Leave**, and the cross of a
   call notice;
 - per person in the participants panel: **−** and **+** (10 % each), the
-  volume slider, and the voice cleaning menu.
+  volume slider, and the voice cleaning menu;
+- the incoming-call card, a modal layer above everything else: **Decline**
+  then **Accept**, and Esc to hide it. While it shows, the room shortcuts
+  wait, as under any dialog.
+
+A ring is not only a sound: the card, the window asking for attention
+(until it is focused, for a direct call), a desktop notification while the
+window is not focused, and the room's highlighted call pill.
 
 iced 0.14's slider takes no keyboard focus: its arrow keys work only while
 the mouse is over it (`iced_widget` 0.14.2 `src/slider.rs:393-405`), which

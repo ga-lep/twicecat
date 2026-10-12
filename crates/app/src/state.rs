@@ -86,9 +86,13 @@ fn focus_window() -> Task<Message> {
 /// Asks the window system to flag the window (taskbar, dock) without taking
 /// the focus.
 fn attention() -> Task<Message> {
-    window::oldest().and_then(|id| {
-        window::request_user_attention(id, Some(window::UserAttention::Informational))
-    })
+    attention_at(window::UserAttention::Informational)
+}
+
+/// [`attention`] at a chosen level: `Critical` keeps flagging until the
+/// window is focused (a ringing call).
+pub(crate) fn attention_at(level: window::UserAttention) -> Task<Message> {
+    window::oldest().and_then(move |id| window::request_user_attention(id, Some(level)))
 }
 
 fn open_link_task(url: links::CheckedUrl) -> Task<Message> {
@@ -786,6 +790,16 @@ impl App {
                 Task::none()
             };
         Task::batch([select, focus_window()])
+    }
+
+    /// Shows a desktop notification built elsewhere (an incoming call), when
+    /// the settings and the window's focus allow it.
+    pub(crate) fn notify(&mut self, request: notifications::Request) -> Task<Message> {
+        if notifications::should_show(self.window_focused, &self.ui_settings) {
+            self.notifier.show(request)
+        } else {
+            Task::none()
+        }
     }
 
     /// Replaces the system dialogs (tests use a fake).
@@ -2459,12 +2473,15 @@ impl App {
                 );
                 screens::verification::layer(base, self)
             }
-            Screen::Main => screens::verification::layer(
-                screens::switcher::layer(
-                    screens::upload_dialog::layer(
-                        screens::media_viewer::layer(
-                            screens::settings::layer(
-                                screens::room_dialogs::layer(main_view::view(self), self),
+            Screen::Main => screens::call::ring_layer(
+                screens::verification::layer(
+                    screens::switcher::layer(
+                        screens::upload_dialog::layer(
+                            screens::media_viewer::layer(
+                                screens::settings::layer(
+                                    screens::room_dialogs::layer(main_view::view(self), self),
+                                    self,
+                                ),
                                 self,
                             ),
                             self,
