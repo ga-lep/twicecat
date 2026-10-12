@@ -1605,6 +1605,13 @@ Phase 2 signed off by the human on 2026-10-02 (merge of PR #3). Every other unti
 - **Fix:** the test waits for both, in either order.
 - **Checks:** 6 of 6 runs passed; the gate was clean.
 
+## Phase 6 / flaky `call::cleaning` unit tests on CI (fixed 2026-10-12)
+
+- **Symptom:** `a_bank_that_fails_hands_its_voices_to_the_cpu` failed on `test (ubuntu-26.04)` (`aebc678`): the voices were still `AwaitingModel` where the test expected `Row(0), Row(1)`.
+- **Cause (the tests):** the bank and model loads run on blocking threads, while the tests run on paused tokio time. Each simulated 10 ms frame gives the loads about 1 ms of real time, so "100 ms of frames" was about 10 ms of real time. A busy CI runner may not even schedule the load in that window.
+- **Fix:** `Rig::frames_until` feeds frames until the awaited result is visible (rows taken and cleaning running, the give-up handled, a new bank loaded), with a 10 s real-time limit. Every wait on a load uses it; the give-up's own timing (`frames(2000)`) is unchanged.
+- **Checks:** the 12 cleaning tests pass, also 30 runs pinned to one busy CPU. The old tests did not fail locally under that load either; the CI failure and the 1 ms-per-frame budget are the evidence. The gate was clean.
+
 ## Phase 6 steps (calls: MatrixRTC, LiveKit SFU, native audio; plan docs/plans/phase6-calls.md)
 Order (revised 2026-10-02, plan decision 12; again 2026-10-03 by the human): 1–8, 8b, 9, 10, 11, 12, 14, 13, then 15 and 13b. Deferred options (audio-only libwebrtc build, pure-Rust WebRTC stack, PulseAudio backend) are recorded in the plan.
 - [x] 1. libwebrtc supply chain (pinned SHA-256 fetch script, fail-closed build) and livekit dependency (phase6.1)
