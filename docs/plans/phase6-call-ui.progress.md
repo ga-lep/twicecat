@@ -17,3 +17,5 @@ Task 5: complete (commit "feat(app): ring with a card, attention and a notificat
 Task 6: started
 Task 6: complete (commit "feat(app): add the Voice & audio card", gate ok)
   notes: [a11y] −/+ beside every slider (iced 0.14 sliders take no keyboard focus); [Q7] input mode and push-to-talk pass through untouched; [Q5] Settings closes when it opens the card, as for Sessions
+Review: an independent read-only review of main..HEAD found 10 verified defects, privacy clean; 9 fixed and folded into their commits (--fixup, rebase --autosquash: clean, final tree identical, each rewritten commit's lib tests run again), 1 open (low: pending/answered cleared broadly, NotLoggedIn not an answer); the expired-session leak on main became "fix(core): end the call and the mic test when the session expires"
+Task 7: complete (commit "docs(plan): wrap up the Phase 6 call UI")
