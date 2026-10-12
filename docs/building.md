@@ -21,4 +21,15 @@ Nothing GPU-related is linked at build time. The full build loads these files wh
 - **The GPU graph of DeepFilterNet3**: `scripts/export-deepfilternet.sh`. It builds a Python venv with CPU PyTorch, about 1 GB, and needs `uv` or Python 3.13.
 - **Optional, for more backends:** TensorRT (`scripts/fetch-tensorrt.sh`, a 3.7 GB download) and WebGPU (`scripts/fetch-webgpu-ep.sh`).
 
-In the app, open **Settings → Voice & audio** and choose **DeepFilterNet3** as noise suppression. When the full build finds a GPU it can use, a **Use the GPU** checkbox appears, and the card shows where the cleaning runs, for example "Running on the GPU (CUDA)". If no GPU is offered, the card says why: the light build has no GPU support, or the full build found no usable GPU.
+In the app, open **Settings → Voice & audio**.
+
+- **Where each option runs.** Every noise suppression choice says whether it runs on the CPU or the GPU.
+- **The GPU entry.** When the full build finds a GPU, the menu adds **DeepFilterNet3 on the GPU**, naming the backend it starts on:
+  - NVIDIA's own: **NVIDIA · TensorRT** or **NVIDIA · CUDA**.
+  - Any vendor's GPU: **any GPU · WebGPU on Vulkan** (Direct3D 12 on Windows, Metal on macOS), or **any GPU · DirectML**.
+  - Apple's: **Apple · Core ML**.
+- **The GPU line.** It says which backend is used and which others are available here. Without a GPU it says why: the light build has no GPU support, or the full build found no usable GPU.
+- **Cleaning other voices.** It offers **Clean on the GPU** with the same backend name.
+- **During a call or a mic test**, the card shows where the cleaning actually runs, for example "Running on the GPU (NVIDIA · CUDA)". If the GPU fails or falls behind, it says the CPU took over.
+
+The core prefers TensorRT, then CUDA, DirectML, WebGPU and Core ML, and uses the first that starts.

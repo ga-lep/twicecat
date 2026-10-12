@@ -2207,6 +2207,17 @@ Plan approved by the human 2026-10-12 (Q1-Q8 answered: the core plays the ringto
 - **Docs:** `docs/building.md` has both builds and the GPU parts the full build loads at run time.
 - **Checks:** both commands build; the gate was clean (1691 tests).
 
+### The card says what runs on the GPU, and on which backend (2026-10-12, at the human's request)
+- **Why:** in the full build, the GPU still sat behind a checkbox that appeared only once DeepFilterNet3 was chosen, so the human did not find it. The human also asked to tell NVIDIA's backends from the generic ones.
+- **The menu:**
+  - Every noise suppression entry says where it runs: "WebRTC (light, CPU)", "RNNoise (CPU, default)", "DeepFilterNet3 (best, CPU)".
+  - With a GPU found, there is also **DeepFilterNet3 on the GPU (…)**, naming the backend it starts on. The probe lists backends in the core's order of preference, so the first one is used.
+  - The entry replaces the old "Use the GPU" checkbox (`MicCleaningGpu` is gone). Moving between the CPU and GPU entries keeps the limit.
+  - A GPU setting from another machine keeps its entry.
+- **Backend names:** by vendor and API. "NVIDIA · TensorRT" and "NVIDIA · CUDA"; "any GPU · WebGPU on Vulkan" (on Direct3D 12 on Windows, on Metal on macOS); "any GPU · DirectML"; "Apple · Core ML". They appear in the menu, in "Clean on the GPU (…)" and in the "Running on the GPU (…)" notes.
+- **The GPU line**, under the menu, always shown: "looking for one…", "X is used. Also here: Y.", or why there is none (light build, or nothing usable found).
+- **Tests:** `the_menu_names_the_gpu_backend_that_runs`, `moving_deepfilter_between_cpu_and_gpu_keeps_its_limit`, `the_card_says_why_no_gpu_is_offered`, and the settings cases with the GPU entry. They pass in both builds; the gate was clean (1694 tests).
+
 ## Phase 6 call UI human checkpoint
 - [x] Plan questions answered and plan approved (2026-10-12).
 - [ ] (step 18) The call pill (🔊 with the count; highlighted while ringing), the "Voice" tag and the header's call button (Call, Join call (N), Join voice, Joining…, Leave call) read well in light and dark themes, and the emoji renders on each OS; Tab reaches the call button.
@@ -2214,5 +2225,5 @@ Plan approved by the human 2026-10-12 (Q1-Q8 answered: the core plays the ringto
 - [ ] (step 20) The ringtone by ear: a DM call from Element Web or another Twicecat rings on the chosen output device at the master volume (not too loud in headphones, audible across a room on speakers), stops when answered, declined (here or on another device), when the caller hangs up, after about 90 s, and with `/silence` in the CLI (Esc in the app, Task 5); no tone for a group call or while in a call; `/ringtone off` keeps it quiet. Also with a Bluetooth headset as the output device.
 - [ ] (step 21) Incoming calls with Element Web/X and another Twicecat: the card (picture, name, Decline/Accept) in both themes; Accept joins, Decline tells the caller; Esc hides the card and silences the tone; the taskbar/dock flashes (Critical) for a DM ring on Windows, macOS, GNOME and KDE; the desktop notification shows while the window is unfocused (with and without "Show message content") and a click opens the room; a group call only notifies.
 - [ ] Joining a call on a server whose LiveKit uses `wss://` connects (it panicked in rustls before the TLS provider fix).
-- [ ] RustRover lists **Twicecat full (GPU)** and **Twicecat light (CPU only)** and both run. In the light build, with DeepFilterNet3 chosen, the card says it is the light build; in the full build it offers **Use the GPU** and shows "Running on the GPU (CUDA)" during a mic test.
+- [ ] RustRover lists **Twicecat full (GPU)** and **Twicecat light (CPU only)** and both run. In the light build the card's GPU line says it is the light build. In the full build the menu has **DeepFilterNet3 on the GPU (NVIDIA · CUDA)**, the GPU line says CUDA is used, and a mic test shows "Running on the GPU (NVIDIA · CUDA)". Check that the labels fit the menu's width in both themes.
 - [ ] (step 22) The Voice & audio card in both themes on each OS: device menus with a USB and a Bluetooth headset plugged in and out while it is open ("(not connected)" keeps the choice, and the device comes back), each processing option by ear (WebRTC strengths, RNNoise, DeepFilterNet3 with and without the GPU; echo cancellation on open speakers; "other apps' sound" with a game or video), gain and volume, the voice quality menu, the mic test meter and "Hear myself" on headphones, the ringtone switch, cleaning other voices and its skip menu in a call with Element Call, the announcement switch, and the diagnostics during a call.
