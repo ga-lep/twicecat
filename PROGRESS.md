@@ -1542,6 +1542,18 @@ Phase 2 signed off by the human on 2026-10-02 (merge of PR #3). Every other unti
 - Evidence: with 24 busy loops on the 24-core machine, the old test failed 2 of 8 runs with the reported `left: MentionsAndKeywords, right: AllMessages`; a trace of the events showed `AllMessages, MentionsAndKeywords, MentionsAndKeywords` (failure) and, with the fix, `.., MentionsAndKeywords, MentionsAndKeywords, AllMessages` (two stale events, then the right one). Unloaded runs never failed, which fits "passes on rerun". Slow first sync / room count is ruled out: the test failed on a pruned account with a fast sync, and uses no rooms.
 - Fix: the test waits for the specific published value (`Fixture::wait_group_default`) instead of reading the first event; the assertion is as strict as before. 14 loaded runs passed after the change.
 
+## Phase 5 / flaky `rooms::members_have_roles_and_dms_are_reused` (fixed 2026-10-12)
+
+- **Cause (a core bug, not the test):**
+  - Right after a room is created or joined, `ListRoomMembers` could answer before the sync had brought the room's state. The members come from the server (`/members`), but the roles need the `m.room.create` event (the creators) and the power levels, which only the sync brings.
+  - Without them the SDK falls back to default power levels with no creators, so everyone was listed as a plain user at level 0. A debug print showed `creators=None`, no power levels and no room version on the failing call; 0.6 s later the room had them (v10, alice at 100).
+  - The app asks for members once, when the member list or room details open, so the creator could be shown without admin rights until the next request. Room details were not affected: `watch_details` resends on every room info change.
+- **Evidence:** the test failed 6 of 6 on `main` and 2 of 4 on `feat/call-ui`. alice listed the members as soon as carol had joined, which is the race.
+- **Fix:** before listing, the members job waits (at most 10 s, `STATE_WAIT`) until the room's create event is known, using `Room::subscribe_info`.
+  - Every room has a create event, and the power levels come in the same sync response (both are in matrix-sdk-ui's `DEFAULT_REQUIRED_STATE`, room_list_service/mod.rs:79).
+  - `Room::sync_up` was not used: sliding sync (MSC4186) only ever marks a room's state as partially synced (matrix-sdk-base response_processors/room/msc4186/mod.rs:107), so it would never return.
+- **Checks:** the test passed 10 of 10 after the fix; the gate was clean.
+
 ## Phase 6 steps (calls: MatrixRTC, LiveKit SFU, native audio; plan docs/plans/phase6-calls.md)
 Order (revised 2026-10-02, plan decision 12; again 2026-10-03 by the human): 1–8, 8b, 9, 10, 11, 12, 14, 13, then 15 and 13b. Deferred options (audio-only libwebrtc build, pure-Rust WebRTC stack, PulseAudio backend) are recorded in the plan.
 - [x] 1. libwebrtc supply chain (pinned SHA-256 fetch script, fail-closed build) and livekit dependency (phase6.1)
