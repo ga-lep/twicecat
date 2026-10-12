@@ -24,6 +24,7 @@ fn rnnoise() -> CaptureChain {
         echo_cancellation: false,
         high_pass: false,
         auto_gain: false,
+        auto_gain_max_db: 30.0,
         noise: NoiseMode::RnNoise,
         gate: GateMode::VoiceActivity {
             automatic: false,
@@ -201,6 +202,7 @@ fn plugged_into_the_chain_it_replaces_rnnoise() {
         echo_cancellation: false,
         high_pass: false,
         auto_gain: false,
+        auto_gain_max_db: 30.0,
         noise: NoiseMode::Enhancer,
         gate: GateMode::VoiceActivity {
             automatic: false,

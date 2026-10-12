@@ -47,6 +47,7 @@ fn plain() -> ChainSettings {
         echo_cancellation: false,
         high_pass: false,
         auto_gain: false,
+        auto_gain_max_db: 30.0,
         noise: NoiseMode::Off,
         gate: GateMode::VoiceActivity {
             automatic: false,

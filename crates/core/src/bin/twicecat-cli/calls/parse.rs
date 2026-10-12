@@ -25,6 +25,8 @@ pub(crate) enum CallCmd {
     /// Cancel other applications' sound too (`/aec system`).
     AecSystem(Option<bool>),
     Agc(Option<bool>),
+    /// The most automatic gain may boost, dB; turns it on.
+    AgcMax(f32),
     Gate(GateArg),
     /// Participant index from `/who`, or a user ID.
     Vol {
@@ -98,7 +100,10 @@ pub(crate) fn parse(name: &str, arg: &str) -> Option<Result<CallCmd, &'static st
             }
             _ => switch(arg, "/aec [on|off] | /aec system [on|off]").map(CallCmd::Aec),
         },
-        "agc" => switch(arg, "/agc [on|off]").map(CallCmd::Agc),
+        "agc" => match arg.parse::<f32>() {
+            Ok(db) if db.is_finite() => Ok(CallCmd::AgcMax(db)),
+            _ => switch(arg, "/agc [on|off|<dB>]").map(CallCmd::Agc),
+        },
         "gate" => gate(arg).map(CallCmd::Gate),
         "vol" => volume(arg),
         "clean" => clean(arg).map(CallCmd::Clean),
@@ -298,6 +303,10 @@ mod tests {
         assert_eq!(cmd("/ns deepfilter gpu"), deepfilter(100.0, true));
         assert_eq!(cmd("/ns deepfilter 30 gpu"), deepfilter(30.0, true));
         assert_eq!(cmd("/gpu"), Ok(CallCmd::Gpu));
+        assert_eq!(cmd("/agc off"), Ok(CallCmd::Agc(Some(false))));
+        assert_eq!(cmd("/agc 20"), Ok(CallCmd::AgcMax(20.0)));
+        assert_eq!(cmd("/agc loud"), Err("/agc [on|off|<dB>]"));
+        assert_eq!(cmd("/agc NaN"), Err("/agc [on|off|<dB>]"));
         assert_eq!(cmd("/aec off"), Ok(CallCmd::Aec(Some(false))));
         assert_eq!(cmd("/aec system"), Ok(CallCmd::AecSystem(None)));
         assert_eq!(cmd("/aec system on"), Ok(CallCmd::AecSystem(Some(true))));

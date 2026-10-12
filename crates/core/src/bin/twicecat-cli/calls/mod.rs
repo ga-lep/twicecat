@@ -205,6 +205,10 @@ impl Calls {
                 let p = &mut s.processing;
                 p.auto_gain = on.unwrap_or(!p.auto_gain);
             }),
+            CallCmd::AgcMax(db) => self.edit(|s| {
+                s.processing.auto_gain = true;
+                s.processing.auto_gain_max_db = db;
+            }),
             CallCmd::Ringtone(on) => self.edit(|s| s.ringtone = on.unwrap_or(!s.ringtone)),
             CallCmd::Silence => Reply::send(Command::SilenceRinging, "Ringtone silenced."),
             CallCmd::Gate(arg) => self.edit(|s| {
@@ -819,7 +823,7 @@ mod tests {
             release_delay_ms: 300,
         };
         type Check = fn(&AudioSettings) -> bool;
-        let cases: [(CallCmd, Check); 14] = [
+        let cases: [(CallCmd, Check); 15] = [
             (CallCmd::Ringtone(None), |s| !s.ringtone),
             (CallCmd::Ringtone(Some(true)), |s| s.ringtone),
             (CallCmd::Ns(NoiseSuppression::Off), |s| {
@@ -829,6 +833,9 @@ mod tests {
                 s.processing.cancel_system_audio && s.processing.echo_cancellation
             }),
             (CallCmd::Agc(None), |s| !s.processing.auto_gain),
+            (CallCmd::AgcMax(20.0), |s| {
+                s.processing.auto_gain && s.processing.auto_gain_max_db == 20.0
+            }),
             (CallCmd::Gate(GateArg::Auto), |s| {
                 s.input_mode
                     == InputMode::VoiceActivity {

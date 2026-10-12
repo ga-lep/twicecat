@@ -33,6 +33,7 @@ pub(crate) fn chain_settings(settings: &AudioSettings) -> ChainSettings {
         echo_cancellation: p.echo_cancellation,
         high_pass: p.high_pass,
         auto_gain: p.auto_gain,
+        auto_gain_max_db: p.auto_gain_max_db,
         noise: match p.noise_suppression {
             NoiseSuppression::Off => NoiseMode::Off,
             NoiseSuppression::WebRtc { level } => NoiseMode::WebRtc(match level {
@@ -517,6 +518,7 @@ mod tests {
                     level: NsLevel::High,
                 },
                 auto_gain: false,
+                auto_gain_max_db: 30.0,
                 high_pass: true,
                 cancel_system_audio: false,
             },

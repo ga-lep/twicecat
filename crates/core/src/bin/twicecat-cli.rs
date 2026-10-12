@@ -107,7 +107,8 @@ AUDIO SETTINGS (saved; take effect at the next call or mic test):
     /aec [on|off]         Echo cancellation
     /aec system [on|off]  Also cancel other apps' sound (a game) picked up by
                           the microphone (Linux with PipeWire, Windows)
-    /agc [on|off]         Automatic gain
+    /agc [on|off|<dB>]    Automatic gain; a number sets the most it may boost
+                          (1 to 50 dB, 30 by default) and turns it on
     /gate auto|<dB>|ptt [ms]
                           Voice activity (automatic or above a level in dBFS),
                           or push-to-talk with a release tail in ms

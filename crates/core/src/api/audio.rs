@@ -15,6 +15,10 @@ use super::types::{UserId, string_newtype};
 /// An attenuation limit that limits nothing (DeepFilterNet removes all it
 /// can): the default, and what an invalid value becomes.
 const NO_ATTENUATION_LIMIT_DB: f32 = 100.0;
+/// Default of [`AudioProcessing::auto_gain_max_db`]: enough for a quiet
+/// microphone's speech, without lifting a silent room as far as AGC2's own
+/// 50 dB would.
+const DEFAULT_AUTO_GAIN_MAX_DB: f32 = 30.0;
 
 string_newtype!(
     /// An audio device, as named by the platform's audio system. Opaque and
@@ -284,6 +288,10 @@ pub struct AudioProcessing {
     pub noise_suppression: NoiseSuppression,
     /// Automatic gain control (AGC2).
     pub auto_gain: bool,
+    /// The most automatic gain may boost the voice, in dB (1..=50; AGC2's
+    /// `max_gain_db`). Missing from files written before it existed, which
+    /// read as 30.
+    pub auto_gain_max_db: f32,
     /// Remove low-frequency rumble.
     pub high_pass: bool,
     /// Also cancel other applications' sound (a game, a video) picked up by
@@ -299,6 +307,7 @@ impl Default for AudioProcessing {
             echo_cancellation: true,
             noise_suppression: NoiseSuppression::RnNoise,
             auto_gain: true,
+            auto_gain_max_db: DEFAULT_AUTO_GAIN_MAX_DB,
             high_pass: true,
             cancel_system_audio: false,
         }
@@ -408,6 +417,8 @@ pub mod limits {
     pub const VOLUME_PERCENT: u16 = 200;
     /// `voice_bitrate_kbps` (Opus range for 48 kHz voice).
     pub const VOICE_BITRATE_KBPS: (u16, u16) = (16, 510);
+    /// `AudioProcessing::auto_gain_max_db` (AGC2 needs more than 0).
+    pub const AUTO_GAIN_MAX_DB: (f32, f32) = (1.0, 50.0);
     /// `NoiseSuppression::DeepFilter::attenuation_limit_db`.
     pub const DF_ATTENUATION_DB: (f32, f32) = (0.0, 100.0);
     /// Length of a push-to-talk binding string, bytes.
@@ -483,6 +494,11 @@ impl AudioSettings {
                 *binding = None;
             }
         }
+        self.processing.auto_gain_max_db = clamp_f32(
+            self.processing.auto_gain_max_db,
+            limits::AUTO_GAIN_MAX_DB,
+            DEFAULT_AUTO_GAIN_MAX_DB,
+        );
         if let NoiseSuppression::DeepFilter {
             attenuation_limit_db,
             ..
@@ -586,12 +602,14 @@ mod tests {
                     attenuation_limit_db: 500.0,
                     gpu: true,
                 },
+                auto_gain_max_db: 0.0,
                 ..AudioProcessing::default()
             },
             ..AudioSettings::default()
         }
         .validated();
         assert_eq!(s.input_gain_db, -20.0);
+        assert_eq!(s.processing.auto_gain_max_db, 1.0, "AGC2 refuses 0");
         assert_eq!(s.output_volume_percent, 200);
         assert_eq!(s.voice_bitrate_kbps, 16);
         assert_eq!(s.user_volume(&UserId::from("@loud:x")), 200);
@@ -675,10 +693,15 @@ mod tests {
                 automatic: false,
                 threshold_db: f32::NAN,
             },
+            processing: AudioProcessing {
+                auto_gain_max_db: f32::NAN,
+                ..AudioProcessing::default()
+            },
             ..AudioSettings::default()
         }
         .validated();
         assert_eq!(s.input_gain_db, 0.0);
+        assert_eq!(s.processing.auto_gain_max_db, 30.0);
         assert_eq!(
             s.input_mode,
             InputMode::VoiceActivity {
@@ -700,6 +723,7 @@ mod tests {
                     "echo_cancellation": true,
                     "noise_suppression": { "kind": "rn_noise" },
                     "auto_gain": true,
+                    "auto_gain_max_db": 30.0,
                     "high_pass": true,
                     "cancel_system_audio": false,
                 },
@@ -727,6 +751,7 @@ mod tests {
         let s: AudioSettings =
             serde_json::from_str(r#"{ "processing": { "auto_gain": false } }"#).unwrap();
         assert!(!s.processing.auto_gain);
+        assert_eq!(s.processing.auto_gain_max_db, 30.0);
         assert!(s.processing.echo_cancellation);
         assert_eq!(s.voice_bitrate_kbps, 64);
         assert_eq!(s.remote_cleaning, RemoteCleaning::default());

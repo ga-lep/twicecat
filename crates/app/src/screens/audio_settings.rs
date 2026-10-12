@@ -10,9 +10,9 @@ use iced::{Element, Fill, Length};
 use twicecat_core::api::{AudioSettings, NoiseSuppression};
 
 use crate::audio_settings::{
-    AudioMessage, AudioUi, CLEANING_LIMIT_RANGE, INPUT_GAIN_RANGE, LevelChoice, NoiseChoice,
-    SkipChoice, Slider, backend_label, bitrate_menu, device_menu, diagnostics, gpu_name,
-    gpu_status, gpu_used, meter,
+    AUTO_GAIN_MAX_RANGE, AudioMessage, AudioUi, CLEANING_LIMIT_RANGE, INPUT_GAIN_RANGE,
+    LevelChoice, NoiseChoice, SkipChoice, Slider, backend_label, bitrate_menu, device_menu,
+    diagnostics, gpu_name, gpu_status, gpu_used, meter,
 };
 use crate::screens::room_dialogs::{modal, muted};
 use crate::state::{App, Message};
@@ -159,16 +159,20 @@ fn processing_section<'a>(app: &'a App, settings: &'a AudioSettings) -> Element<
                 Slider::MicCleaningLimit,
                 "Most removed",
             ));
-            if let Some(running) = app.calls.gpu.as_ref().and_then(|g| g.running) {
-                section = section.push(note(backend_label(running)));
+            // Once it runs, its model is there; a missing one is reported
+            // as an error when a call or mic test starts.
+            match app.calls.gpu.as_ref().and_then(|g| g.running) {
+                Some(running) => section = section.push(note(backend_label(running))),
+                None => {
+                    section = section.push(note(
+                        "Without its model, RNNoise runs instead (scripts/fetch-models.sh).",
+                    ));
+                }
             }
-            section = section.push(note(
-                "Without its model, RNNoise runs instead (scripts/fetch-models.sh).",
-            ));
         }
         NoiseSuppression::Off | NoiseSuppression::RnNoise => {}
     }
-    section
+    section = section
         .push(
             checkbox(p.echo_cancellation)
                 .label("Echo cancellation")
@@ -186,7 +190,20 @@ fn processing_section<'a>(app: &'a App, settings: &'a AudioSettings) -> Element<
             checkbox(p.auto_gain)
                 .label("Automatic gain")
                 .on_toggle(|on| msg(AudioMessage::AutoGain(on))),
-        )
+        );
+    section = if p.auto_gain {
+        section.push(a_slider(
+            &app.audio_ui,
+            settings,
+            Slider::AutoGainMax,
+            "Most boost",
+            AUTO_GAIN_MAX_RANGE,
+            1.0,
+        ))
+    } else {
+        section.push(note("Set the level with Microphone gain, under Levels."))
+    };
+    section
         .push(
             checkbox(p.high_pass)
                 .label("Remove low rumble")
@@ -205,7 +222,9 @@ fn value_text(slider: Slider, value: f32) -> String {
     match slider {
         Slider::InputGain => format!("{value:+.1} dB"),
         Slider::MasterVolume => format!("{value:.0}\u{a0}%"),
-        Slider::MicCleaningLimit | Slider::OthersCleaningLimit => format!("{value:.0} dB"),
+        Slider::MicCleaningLimit | Slider::OthersCleaningLimit | Slider::AutoGainMax => {
+            format!("{value:.0} dB")
+        }
     }
 }
 

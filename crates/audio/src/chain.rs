@@ -57,6 +57,8 @@ pub struct ChainSettings {
     pub high_pass: bool,
     /// AGC2 (adaptive digital gain with its limiter).
     pub auto_gain: bool,
+    /// The most AGC2 may boost, dB (more than 0).
+    pub auto_gain_max_db: f32,
     /// Noise suppressor.
     pub noise: NoiseMode,
     /// Transmit gate.
@@ -71,6 +73,7 @@ impl Default for ChainSettings {
             echo_cancellation: true,
             high_pass: true,
             auto_gain: true,
+            auto_gain_max_db: 30.0,
             noise: NoiseMode::RnNoise,
             gate: GateMode::VoiceActivity {
                 automatic: true,
@@ -155,13 +158,24 @@ fn front_key(s: &ChainSettings) -> (bool, bool, Option<NsLevel>) {
 }
 
 fn back_config(s: &ChainSettings) -> Config {
+    let defaults = AdaptiveDigital::default();
     Config {
         gain_controller2: s.auto_gain.then(|| GainController2 {
-            adaptive_digital: Some(AdaptiveDigital::default()),
+            adaptive_digital: Some(AdaptiveDigital {
+                max_gain_db: s.auto_gain_max_db,
+                // AGC2 starts at 15 dB; never above the most it may apply.
+                initial_gain_db: defaults.initial_gain_db.min(s.auto_gain_max_db),
+                ..defaults
+            }),
             ..GainController2::default()
         }),
         ..Config::default()
     }
+}
+
+/// The settings `back_config` depends on.
+fn back_key(s: &ChainSettings) -> Option<f32> {
+    s.auto_gain.then_some(s.auto_gain_max_db)
 }
 
 fn apm(config: Config) -> AudioProcessing {
@@ -248,7 +262,7 @@ impl CaptureChain {
         if front_key(&settings) != front_key(&self.settings) {
             self.front.apply_config(front_config(&settings));
         }
-        if settings.auto_gain != self.settings.auto_gain {
+        if back_key(&settings) != back_key(&self.settings) {
             self.back.apply_config(back_config(&settings));
         }
         self.settings = settings;
@@ -435,6 +449,7 @@ mod tests {
             echo_cancellation: true,
             high_pass: false,
             auto_gain: false,
+            auto_gain_max_db: 30.0,
             noise: NoiseMode::Off,
             gate: open_gate(),
             input_gain_db: 0.0,
@@ -475,6 +490,7 @@ mod tests {
             echo_cancellation: false,
             high_pass: false,
             auto_gain: false,
+            auto_gain_max_db: 30.0,
             noise,
             gate: open_gate(),
             input_gain_db: 0.0,
@@ -494,6 +510,71 @@ mod tests {
             }
         }
         10.0 * (energy(&before) / energy(&after).max(1e-12)).log10()
+    }
+
+    /// How much automatic gain lifts a quiet speech-like signal after 6 s,
+    /// dB, with `max_db` as its most; `configure` sets it on a running chain.
+    fn auto_gain_db(max_db: f32) -> f32 {
+        flush_denormals_on_this_thread();
+        let mut settings = ChainSettings {
+            echo_cancellation: false,
+            high_pass: false,
+            auto_gain: true,
+            auto_gain_max_db: 50.0,
+            noise: NoiseMode::Off,
+            gate: open_gate(),
+            input_gain_db: 0.0,
+        };
+        let mut chain = CaptureChain::new(settings);
+        settings.auto_gain_max_db = max_db;
+        chain.configure(settings);
+        let mut source = Noise(0x2545_f491);
+        let (mut before, mut after) = (Vec::new(), Vec::new());
+        for i in 0..600 {
+            let mut f = far_end(&mut source, i);
+            for s in &mut f {
+                *s *= 0.01;
+            }
+            let input = f;
+            chain.capture(&mut f);
+            if i >= 400 {
+                before.push(input);
+                after.push(f);
+            }
+        }
+        10.0 * (energy(&after) / energy(&before).max(1e-12)).log10()
+    }
+
+    #[test]
+    fn auto_gain_boosts_no_more_than_its_most() {
+        let low = auto_gain_db(6.0);
+        assert!(low <= 6.5, "boost with a 6 dB most: {low:.1} dB");
+        // AGC2 takes this signal for background noise and keeps it under
+        // -50 dBFS (about 10 dB here), but no longer at 6 dB.
+        let high = auto_gain_db(40.0);
+        assert!(high >= low + 3.0, "boost with a 40 dB most: {high:.1} dB");
+    }
+
+    #[test]
+    fn auto_gain_settings_reach_agc2() {
+        let mut s = ChainSettings {
+            auto_gain_max_db: 10.0,
+            ..ChainSettings::default()
+        };
+        let agc = back_config(&s).gain_controller2.unwrap();
+        let adaptive = agc.adaptive_digital.unwrap();
+        assert_eq!(adaptive.max_gain_db, 10.0);
+        assert_eq!(adaptive.initial_gain_db, 10.0, "starts within its most");
+        s.auto_gain_max_db = 40.0;
+        let adaptive = back_config(&s)
+            .gain_controller2
+            .unwrap()
+            .adaptive_digital
+            .unwrap();
+        assert_eq!(adaptive.initial_gain_db, 15.0, "AGC2's own start");
+        s.auto_gain = false;
+        assert!(back_config(&s).gain_controller2.is_none());
+        assert_eq!(back_key(&s), None, "the most does not matter while off");
     }
 
     #[test]
@@ -562,6 +643,7 @@ mod tests {
             echo_cancellation: false,
             high_pass: false,
             auto_gain: false,
+            auto_gain_max_db: 30.0,
             noise: NoiseMode::Enhancer,
             gate: open_gate(),
             input_gain_db: 0.0,
@@ -604,6 +686,7 @@ mod tests {
             echo_cancellation: false,
             high_pass: false,
             auto_gain: false,
+            auto_gain_max_db: 30.0,
             noise: NoiseMode::Enhancer,
             gate: open_gate(),
             input_gain_db: 0.0,
@@ -652,6 +735,7 @@ mod tests {
             echo_cancellation: false,
             high_pass: false,
             auto_gain: false,
+            auto_gain_max_db: 30.0,
             noise: NoiseMode::Off,
             gate: GateMode::PushToTalk { release_ms: 0 },
             input_gain_db: 0.0,
@@ -673,6 +757,7 @@ mod tests {
             echo_cancellation: false,
             high_pass: false,
             auto_gain: false,
+            auto_gain_max_db: 30.0,
             noise: NoiseMode::Off,
             gate: open_gate(),
             input_gain_db: 20.0,

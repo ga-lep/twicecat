@@ -502,6 +502,7 @@ fn sent_while_a_game_plays(echo_reference: bool) -> (f32, f32) {
         echo_cancellation: true,
         high_pass: true,
         auto_gain: false,
+        auto_gain_max_db: 30.0,
         noise: NoiseMode::Off,
         // Always open: we measure the echo canceller, not the gate.
         gate: GateMode::VoiceActivity {

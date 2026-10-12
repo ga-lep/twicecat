@@ -209,7 +209,7 @@ pub(super) fn describe(s: &AudioSettings, devices: &AudioDevices) -> Vec<String>
             device_name(devices, s.output_device.as_ref(), false)
         ),
         format!(
-            "Echo cancellation {}{}, noise suppression {ns}, auto gain {}, high-pass {}.",
+            "Echo cancellation {}{}, noise suppression {ns}, auto gain {}{}, high-pass {}.",
             on_off(s.processing.echo_cancellation),
             if s.processing.cancel_system_audio {
                 " (other apps' sound too)"
@@ -217,6 +217,11 @@ pub(super) fn describe(s: &AudioSettings, devices: &AudioDevices) -> Vec<String>
                 ""
             },
             on_off(s.processing.auto_gain),
+            if s.processing.auto_gain {
+                format!(" (at most {} dB)", s.processing.auto_gain_max_db)
+            } else {
+                String::new()
+            },
             on_off(s.processing.high_pass)
         ),
         format!("Gate: {gate}."),

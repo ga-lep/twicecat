@@ -44,6 +44,8 @@ pub enum Slider {
     MicCleaningLimit,
     /// The attenuation limit for other voices, dB.
     OthersCleaningLimit,
+    /// The most automatic gain may boost, dB.
+    AutoGainMax,
 }
 
 impl Slider {
@@ -60,6 +62,7 @@ impl Slider {
                 _ => DEFAULT_DF_LIMIT_DB,
             },
             Self::OthersCleaningLimit => settings.remote_cleaning.attenuation_limit_db,
+            Self::AutoGainMax => settings.processing.auto_gain_max_db,
         }
     }
 
@@ -69,6 +72,7 @@ impl Slider {
             Self::InputGain => limits::INPUT_GAIN_DB,
             Self::MasterVolume => (0.0, f32::from(limits::VOLUME_PERCENT)),
             Self::MicCleaningLimit | Self::OthersCleaningLimit => limits::DF_ATTENUATION_DB,
+            Self::AutoGainMax => limits::AUTO_GAIN_MAX_DB,
         }
     }
 
@@ -77,7 +81,7 @@ impl Slider {
         match self {
             Self::InputGain => 1.0,
             Self::MasterVolume => 10.0,
-            Self::MicCleaningLimit | Self::OthersCleaningLimit => 5.0,
+            Self::MicCleaningLimit | Self::OthersCleaningLimit | Self::AutoGainMax => 5.0,
         }
     }
 
@@ -98,6 +102,7 @@ impl Slider {
                 }
             }
             Self::OthersCleaningLimit => settings.remote_cleaning.attenuation_limit_db = value,
+            Self::AutoGainMax => settings.processing.auto_gain_max_db = value,
         }
     }
 }
@@ -705,6 +710,8 @@ impl App {
 pub const INPUT_GAIN_RANGE: (f32, f32) = limits::INPUT_GAIN_DB;
 /// The bounds of the attenuation limit sliders, dB.
 pub const CLEANING_LIMIT_RANGE: (f32, f32) = limits::DF_ATTENUATION_DB;
+/// The bounds of the automatic gain's most boost, dB.
+pub const AUTO_GAIN_MAX_RANGE: (f32, f32) = limits::AUTO_GAIN_MAX_DB;
 
 #[cfg(test)]
 mod tests {
@@ -1034,6 +1041,23 @@ mod tests {
         assert_eq!(
             sent_settings(&mut rx).remote_cleaning.attenuation_limit_db,
             12.0
+        );
+    }
+
+    #[test]
+    fn the_most_boost_follows_its_slider_and_steps() {
+        let (mut app, mut rx) = card();
+        let _ = app.update(audio(AudioMessage::Slide(Slider::AutoGainMax, 12.0)));
+        let _ = app.update(audio(AudioMessage::SlideReleased));
+        assert_eq!(sent_settings(&mut rx).processing.auto_gain_max_db, 12.0);
+        let mut low = stored();
+        low.processing.auto_gain_max_db = 3.0;
+        let _ = app.update(core(CoreEvent::AudioSettings(low)));
+        let _ = app.update(audio(AudioMessage::Step(Slider::AutoGainMax, false)));
+        assert_eq!(
+            sent_settings(&mut rx).processing.auto_gain_max_db,
+            1.0,
+            "- stops at AGC2's least"
         );
     }
 
