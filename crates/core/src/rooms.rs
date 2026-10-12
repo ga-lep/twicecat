@@ -265,6 +265,8 @@ pub(crate) fn check_image(data: &[u8], declared: &str) -> Result<mime::Mime, Cor
 const MAX_PENDING_JOBS: usize = 32;
 /// How long one request may take.
 const JOB_DEADLINE: Duration = Duration::from_secs(60);
+/// How long a member list waits for a just-joined room's state.
+const STATE_WAIT: Duration = Duration::from_secs(10);
 
 /// One request to run in the background. The engine has already checked its
 /// input and found the rooms.
@@ -567,6 +569,7 @@ async fn execute(client: &Client, dms: &StartedDms, job: Job) -> Done {
             Ok(None)
         }
         Job::Members(room) => {
+            wait_for_state(&room).await;
             let members = room
                 .members(RoomMemberships::ACTIVE)
                 .await
@@ -647,6 +650,23 @@ fn member_views(members: &[RoomMember]) -> (Vec<RoomMemberView>, bool) {
     let truncated = views.len() > MAX_MEMBERS;
     views.truncate(MAX_MEMBERS);
     (views, truncated)
+}
+
+/// Waits, at most [`STATE_WAIT`], until the sync has brought `room`'s create
+/// event. Right after creating or joining a room the members come from the
+/// server (`/members`) before the sync has brought the room's state; the
+/// roles would then all fall back to "user". Every room has a create event,
+/// and the power levels come in the same response.
+async fn wait_for_state(room: &Room) {
+    let mut info = room.subscribe_info();
+    let known = async {
+        while room.creators().is_none() {
+            if info.next().await.is_none() {
+                return;
+            }
+        }
+    };
+    let _ = tokio::time::timeout(STATE_WAIT, known).await;
 }
 
 /// The settings of `room` for the panel.
