@@ -2067,7 +2067,9 @@ Plan approved by the human 2026-10-12 (Q1-Q8 answered: the core plays the ringto
   - A ringback tone for the caller, choosing a ringtone, and a separate ringtone device or volume: out of the approved scope (Q3b).
   - `crates/core/src/engine/calls.rs` is not compiled (a stale copy of code in `engine/mod.rs`). Suggested as a separate task.
   - The 7 ignored tests that need `scripts/fetch-models.sh` were run later, once the human asked for the models to be fetched; all pass (see "Full ignored run with the models" below).
-  - Not run by the agent: the GPU suites (they need ONNX Runtime, which is not installed here: `scripts/fetch-onnxruntime.sh` and friends), the real-speech DeepFilterNet test (it skips without `TWICECAT_SPEECH_WAV` and `TWICECAT_NOISE_WAV`), the Windows and macOS cross-clippy (the targets are not installed), and `keyring` and `hardware_*` (never run by the agent).
+  - The GPU suites and the real-speech test were run too, at the human's request (see "GPU suites and real speech" below).
+  - Not run by the agent: TensorRT and WebGPU (`scripts/fetch-tensorrt.sh` and `scripts/fetch-webgpu-ep.sh` were not run), the Windows and macOS cross-clippy (the targets are not installed), and `keyring` and `hardware_*` (never run by the agent).
+  - `members_have_roles_and_dms_are_reused` (rooms, Phase 5) is flaky, and already so on `main`; see below. Suggested as a separate task.
 
 ### Fix: a mic test asked for during a call no longer cuts the call (found at the wrap-up, done at the human's request)
 - `Engine::start_mic_test` stopped the running audio session before it checked for a call. This was already the case on `main`. During a call that session is the call's audio, so a `StartMicTest` mid-call (the CLI's `/mictest`; the app's button is off in a call) silenced the call's speakers and microphone, then answered "not available during a call".
@@ -2087,6 +2089,24 @@ Plan approved by the human 2026-10-12 (Q1-Q8 answered: the core plays the ringto
   - WebRTC NS: 15.3 %;
   - RNNoise: 17.8 %;
   - DeepFilterNet3 on the CPU: 76.9 %.
+
+### GPU suites and real speech (2026-10-12, at the human's request)
+- Fetched, each checked against its pinned SHA-256:
+  - `scripts/fetch-onnxruntime.sh cuda13` (ONNX Runtime 1.28.3);
+  - `scripts/fetch-cuda-runtime.sh` (CUDA 13.0 and cuDNN 9);
+  - `scripts/export-deepfilternet.sh` (the stateful graph; at most 1.5e-5 from upstream's graphs over 200 frames);
+  - DeepFilterNet's `assets/clean_freesound_33711.wav` and `noise_freesound_2530.wav` at the models' pinned commit, into `~/.cache/twicecat/test-audio/`, for `TWICECAT_SPEECH_WAV` and `TWICECAT_NOISE_WAV`.
+- Machine: NVIDIA RTX 5080 Laptop (compute 12.0, driver 615.78), Linux.
+- `cargo test --release -p twicecat-audio --features onnxruntime --test onnxruntime --test deepfilter -- --ignored`: 9 passed, and the process exits cleanly.
+  - CUDA against the CPU graphs: 91.4 dB apart. Per frame: median 602 µs, p99 950 µs.
+  - Each voice in a bank of 4 against its own CPU filter: 68–84 dB.
+  - TensorRT did not start (not fetched).
+  - Real speech at 5.1 dB SNR: DeepFilterNet3 14.6 dB, RNNoise 8.7 dB.
+- `cargo test -p twicecat-core --features gpu-enhancement --test call_media --test gpu_enhancement -- --ignored`: 9 passed. `remote_voices_are_cleaned_on_the_gpu` ran on CUDA, and the probe found CUDA and ran DeepFilterNet on it.
+- `cargo test --workspace --all-features`: 1694 passed.
+- The same with `-- --ignored --skip keyring --skip hardware_` on the local stack: 158 passed, 2 failed, neither in code this branch touches:
+  - `notifications::a_keyword_notifies_in_a_mentions_only_room` timed out once, then passed 3 reruns.
+  - `rooms::members_have_roles_and_dms_are_reused` fails at `rooms.rs:815`: alice's role is not Creator or Admin. It failed 2 of 4 reruns on this branch and 6 of 6 on `main` (a worktree at `main`). It is older than this branch: the member list seems to answer before the room's power levels are known. Not fixed here (rule 8, another phase's code); suggested as a separate task.
 
 ## Phase 6 call UI human checkpoint
 - [x] Plan questions answered and plan approved (2026-10-12).
