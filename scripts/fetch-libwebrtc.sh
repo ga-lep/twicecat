@@ -122,7 +122,9 @@ if [ ! -f "$marker" ] || [ "$(cat "$marker")" != "$expected" ]; then
     trap 'rm -rf "$work"' EXIT
     url="https://github.com/livekit/rust-sdks/releases/download/${tag}/${zip}"
     echo "downloading $url" >&2
-    curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o "$work/$zip" "$url"
+    # GitHub's release downloads answer 5xx now and then (a 504 failed CI);
+    # six retries back off over about a minute.
+    curl -fsSL --proto '=https' --tlsv1.2 --retry 6 -o "$work/$zip" "$url"
     actual=$(sha256_of "$work/$zip")
     if [ "$actual" != "$expected" ]; then
         die "SHA-256 mismatch for $zip: expected $expected, got $actual"
