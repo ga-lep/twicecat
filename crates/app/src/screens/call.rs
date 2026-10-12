@@ -193,6 +193,10 @@ pub fn bar(app: &App) -> Element<'_, Message> {
                     current.muted || current.deafened
                 ),
                 control(deafen, CallMessage::ToggleDeafen, current.deafened),
+                button(text("Audio\u{2026}").size(13))
+                    .padding([4, 8])
+                    .style(button::secondary)
+                    .on_press(Message::Audio(crate::audio_settings::AudioMessage::Open)),
                 space().width(Fill),
                 leave,
             ]

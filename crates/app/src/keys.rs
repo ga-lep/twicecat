@@ -404,6 +404,7 @@ impl App {
     pub fn any_overlay_open(&self) -> bool {
         self.switcher.open
             || self.calls.card().is_some()
+            || self.audio_ui.open
             || self.uploads.dialog.is_some()
             || self.media.viewer.is_some()
             || self.settings_ui.open
@@ -462,7 +463,8 @@ impl App {
 
     /// Esc closes the topmost thing, one per press: the incoming-call card
     /// (hidden, still ringing), the switcher, the upload
-    /// confirmation, the viewer, Settings, a room dialog or panel, the
+    /// confirmation, the viewer, the Voice & audio card, Settings, a room
+    /// dialog or panel, the
     /// composer's suggestions, reply or edit, then the thread panel, then the
     /// participants panel.
     ///
@@ -482,6 +484,11 @@ impl App {
         }
         if self.media.viewer.is_some() {
             return self.update(Message::ViewerClosed);
+        }
+        // In the order of the layers: the card is drawn under the switcher,
+        // the upload confirmation and the viewer, over Settings.
+        if self.audio_ui.open {
+            return self.update(Message::Audio(crate::audio_settings::AudioMessage::Close));
         }
         if self.settings_ui.open {
             return self.update(Message::Settings(SettingsMessage::Close));

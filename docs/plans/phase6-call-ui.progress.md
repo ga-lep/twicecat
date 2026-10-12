@@ -14,3 +14,6 @@ Task 4: complete (commit "feat(core): play a ringtone while a direct call rings"
 Task 5: started
 Task 5: complete (commit "feat(app): ring with a card, attention and a notification", gate ok; app stack test with twicecat-cli: 4 runs passed, a mutation (Decline sending nothing) caught)
   notes: [fix, folded into Task 2's commit per rule 5] Join no longer requires the room in the filtered room list (Accept with a search active would have done nothing); [layout] the ring card is the outermost layer of the main screen; [stack test] in crates/app/tests/calls.rs, alice is the real twicecat-cli binary next to the test binary
+Task 6: started
+Task 6: complete (commit "feat(app): add the Voice & audio card", gate ok)
+  notes: [a11y] −/+ beside every slider (iced 0.14 sliders take no keyboard focus); [Q7] input mode and push-to-talk pass through untouched; [Q5] Settings closes when it opens the card, as for Sessions

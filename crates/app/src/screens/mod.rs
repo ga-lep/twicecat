@@ -3,6 +3,7 @@
 //! Views only read the [`App`](crate::state::App) state and build widgets;
 //! every state change goes through `App::update`.
 
+pub mod audio_settings;
 pub mod call;
 pub mod loading;
 pub mod login;

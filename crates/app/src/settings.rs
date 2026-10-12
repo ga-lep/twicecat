@@ -42,7 +42,9 @@ pub const MAX_KEYWORDS: usize = 50;
 pub const MAX_STALE_EVENTS: u8 = 3;
 
 /// The line of the push-to-talk section.
-pub const PUSH_TO_TALK_LINE: &str = "Push-to-talk arrives with voice calls in a later version.";
+pub const PUSH_TO_TALK_LINE: &str = "Push-to-talk arrives in a later version.";
+/// The Voice & audio section of Settings.
+pub const VOICE_AUDIO_LINE: &str = "Devices, microphone processing, volume, the mic test, the ringtone, and cleaning other voices.";
 /// The note under the shortcut list.
 pub const DRAG_AND_DROP_NOTE: &str = "Dragging files into the window does not work on a native Wayland window (an upstream limit). Use Attach (Ctrl+U) or paste instead.";
 
@@ -391,6 +393,8 @@ pub enum SettingsMessage {
     Close,
     /// **Manage sessions**.
     OpenSessions,
+    /// **Voice & audio** (plan Q5): closes Settings and opens that card.
+    OpenVoiceAudio,
     /// The display name field changed.
     NameInput(MessageText),
     /// **Save** next to the display name.
@@ -434,6 +438,7 @@ impl App {
         self.sessions.open
             || self.verification.is_some()
             || self.calls.card().is_some()
+            || self.audio_ui.open
             || self.uploads.dialog.is_some()
             || self.media.viewer.is_some()
             || self.rooms_ui.overlay_open()
@@ -481,6 +486,14 @@ impl App {
                 self.settings_ui.open = false;
                 self.settings_ui.error = None;
                 Task::none()
+            }
+            M::OpenVoiceAudio => {
+                if !self.settings_ui.open {
+                    return Task::none();
+                }
+                self.settings_ui.open = false;
+                self.settings_ui.error = None;
+                self.on_audio(crate::audio_settings::AudioMessage::Open)
             }
             M::OpenSessions => {
                 if !self.settings_ui.open {

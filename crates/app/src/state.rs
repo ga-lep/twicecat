@@ -385,6 +385,8 @@ pub enum Message {
     Call(CallMessage),
     /// A control of the Settings screen, or Ctrl+,.
     Settings(SettingsMessage),
+    /// A control of the Voice & audio card.
+    Audio(crate::audio_settings::AudioMessage),
     /// A button of the spaces sidebar.
     Spaces(SpacesMessage),
     /// A thread summary row or a control of the thread panel.
@@ -537,6 +539,8 @@ pub struct App {
     pub sessions: SessionsModel,
     /// The call, call counts, rings and audio settings.
     pub calls: CallModel,
+    /// The Voice & audio card.
+    pub audio_ui: crate::audio_settings::AudioUi,
     /// Set when the app decided to exit (the task itself is opaque to tests).
     pub exit_requested: bool,
     /// Clipboard reads sent by `drop_secrets` whose answer is still due.
@@ -571,6 +575,7 @@ impl std::fmt::Debug for App {
             .field("verification", &self.verification)
             .field("sessions", &self.sessions)
             .field("calls", &self.calls)
+            .field("audio_ui", &self.audio_ui.open)
             .finish_non_exhaustive()
     }
 }
@@ -642,6 +647,7 @@ impl App {
             verification: None,
             sessions: SessionsModel::default(),
             calls: CallModel::default(),
+            audio_ui: crate::audio_settings::AudioUi::default(),
             exit_requested: false,
             flushes_pending: 0,
             core_closed: false,
@@ -1113,6 +1119,7 @@ impl App {
             Message::Rooms(message) => self.on_rooms(message),
             Message::Settings(message) => self.on_settings(message),
             Message::Call(message) => self.on_call(message),
+            Message::Audio(message) => self.on_audio(message),
             Message::Spaces(SpacesMessage::Select(space)) => self.select_space(space),
             Message::Threads(message) => self.on_threads(message),
             Message::Shortcut { shortcut, captured } => self.on_shortcut(shortcut, captured),
@@ -1418,6 +1425,7 @@ impl App {
                     && matches!(self.screen, Screen::Main | Screen::Loading) =>
             {
                 self.calls.on_error(&error);
+                self.audio_card_error(&error);
             }
             CoreEvent::Error(error) => task = self.on_core_error(&error),
             CoreEvent::Avatar { id, image } => self.avatars.answer(&id, image),
@@ -1604,7 +1612,10 @@ impl App {
             | CoreEvent::AudioSettings(_)
             | CoreEvent::InputLevel(_)
             | CoreEvent::AudioStats(_)
-            | CoreEvent::GpuEnhancement(_)) => task = self.on_call_event(event),
+            | CoreEvent::GpuEnhancement(_)) => {
+                self.audio_card_saw(&event);
+                task = self.on_call_event(event);
+            }
         }
         task
     }
@@ -2109,6 +2120,7 @@ impl App {
         self.verification = None;
         self.sessions = SessionsModel::default();
         self.calls = CallModel::default();
+        self.audio_ui = crate::audio_settings::AudioUi::default();
         self.rooms_ui = RoomsModel::default();
         self.settings_ui = SettingsModel::default();
         self.notification_settings = None;
@@ -2478,8 +2490,11 @@ impl App {
                     screens::switcher::layer(
                         screens::upload_dialog::layer(
                             screens::media_viewer::layer(
-                                screens::settings::layer(
-                                    screens::room_dialogs::layer(main_view::view(self), self),
+                                screens::audio_settings::layer(
+                                    screens::settings::layer(
+                                        screens::room_dialogs::layer(main_view::view(self), self),
+                                        self,
+                                    ),
                                     self,
                                 ),
                                 self,
@@ -6722,6 +6737,26 @@ mod tests {
         let (mut app, _rx) = recovery_app();
         let _ = sec(&mut app, SecurityMessage::SetupRecovery);
         assert_eq!(laid_out_size(&app), window, "setting up recovery");
+    }
+
+    /// The Voice & audio card is a modal over the main view: the window
+    /// keeps its size with every section shown.
+    #[test]
+    fn the_voice_and_audio_card_keeps_the_window_filled() {
+        use twicecat_core::api::{AudioSettings, NoiseSuppression};
+        let (mut app, _rx) = main_app();
+        let mut settings = AudioSettings::default();
+        settings.processing.noise_suppression = NoiseSuppression::DeepFilter {
+            attenuation_limit_db: 40.0,
+            gpu: false,
+        };
+        settings.remote_cleaning.enabled = true;
+        let _ = app.update(core(CoreEvent::AudioSettings(settings)));
+        let _ = app.update(Message::Audio(crate::audio_settings::AudioMessage::Open));
+        let _ = app.update(Message::Audio(
+            crate::audio_settings::AudioMessage::Diagnostics,
+        ));
+        assert_eq!(laid_out_size(&app), iced::Size::new(1000.0, 700.0));
     }
 
     // ---- Task 15: change the recovery key ----
