@@ -160,62 +160,112 @@ pub fn device_menu(
     (menu, selected)
 }
 
-/// The noise suppression menu.
+/// The noise suppression menu. Each entry says where it runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NoiseChoice {
     /// None.
     Off,
-    /// WebRTC's classic suppressor.
+    /// WebRTC's classic suppressor (CPU).
     WebRtc,
-    /// RNNoise.
+    /// RNNoise (CPU).
     RnNoise,
-    /// DeepFilterNet3.
+    /// DeepFilterNet3 on the CPU.
     DeepFilter,
+    /// DeepFilterNet3 on the GPU, with the backend it starts on when the
+    /// probe has named one.
+    DeepFilterGpu(Option<GpuBackend>),
 }
 
 impl NoiseChoice {
-    /// The menu, in order.
-    pub const ALL: [Self; 4] = [Self::Off, Self::WebRtc, Self::RnNoise, Self::DeepFilter];
+    /// The menu, in order. The GPU entry is there when the probe found a
+    /// GPU, or when it is the setting (a GPU set up on another machine).
+    pub fn menu(gpu: Option<&GpuEnhancement>, now: &NoiseSuppression) -> Vec<Self> {
+        let mut menu = vec![Self::Off, Self::WebRtc, Self::RnNoise, Self::DeepFilter];
+        let set = matches!(now, NoiseSuppression::DeepFilter { gpu: true, .. });
+        if set || gpu_used(gpu).is_some() {
+            menu.push(Self::DeepFilterGpu(gpu_used(gpu)));
+        }
+        menu
+    }
 
     /// The entry of a setting.
-    pub fn of(ns: &NoiseSuppression) -> Self {
+    pub fn of(ns: &NoiseSuppression, gpu: Option<&GpuEnhancement>) -> Self {
         match ns {
             NoiseSuppression::Off => Self::Off,
             NoiseSuppression::WebRtc { .. } => Self::WebRtc,
             NoiseSuppression::RnNoise => Self::RnNoise,
-            NoiseSuppression::DeepFilter { .. } => Self::DeepFilter,
+            NoiseSuppression::DeepFilter { gpu: false, .. } => Self::DeepFilter,
+            NoiseSuppression::DeepFilter { gpu: true, .. } => Self::DeepFilterGpu(gpu_used(gpu)),
         }
     }
 
-    /// The setting for this entry; picking the one already set keeps its
-    /// options.
+    /// The setting for this entry. Picking the one already set keeps its
+    /// options, and moving DeepFilterNet3 between the CPU and the GPU keeps
+    /// its limit.
     pub fn setting(self, now: &NoiseSuppression) -> NoiseSuppression {
-        if Self::of(now) == self {
-            return *now;
-        }
-        match self {
-            Self::Off => NoiseSuppression::Off,
-            Self::WebRtc => NoiseSuppression::WebRtc {
-                level: NsLevel::Moderate,
-            },
-            Self::RnNoise => NoiseSuppression::RnNoise,
-            Self::DeepFilter => NoiseSuppression::DeepFilter {
-                attenuation_limit_db: DEFAULT_DF_LIMIT_DB,
-                gpu: false,
-            },
+        let on_gpu = match self {
+            Self::Off => return NoiseSuppression::Off,
+            Self::WebRtc => {
+                return match now {
+                    NoiseSuppression::WebRtc { .. } => *now,
+                    _ => NoiseSuppression::WebRtc {
+                        level: NsLevel::Moderate,
+                    },
+                };
+            }
+            Self::RnNoise => return NoiseSuppression::RnNoise,
+            Self::DeepFilter => false,
+            Self::DeepFilterGpu(_) => true,
+        };
+        let attenuation_limit_db = match now {
+            NoiseSuppression::DeepFilter {
+                attenuation_limit_db,
+                ..
+            } => *attenuation_limit_db,
+            _ => DEFAULT_DF_LIMIT_DB,
+        };
+        NoiseSuppression::DeepFilter {
+            attenuation_limit_db,
+            gpu: on_gpu,
         }
     }
 }
 
 impl fmt::Display for NoiseChoice {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Off => "Off",
-            Self::WebRtc => "WebRTC (light)",
-            Self::RnNoise => "RNNoise (default)",
-            Self::DeepFilter => "DeepFilterNet3 (best, more CPU)",
-        })
+        match self {
+            Self::Off => f.write_str("Off"),
+            Self::WebRtc => f.write_str("WebRTC (light, CPU)"),
+            Self::RnNoise => f.write_str("RNNoise (CPU, default)"),
+            Self::DeepFilter => f.write_str("DeepFilterNet3 (best, CPU)"),
+            Self::DeepFilterGpu(Some(backend)) => {
+                write!(f, "DeepFilterNet3 on the GPU ({})", gpu_name(*backend))
+            }
+            Self::DeepFilterGpu(None) => f.write_str("DeepFilterNet3 on the GPU"),
+        }
     }
+}
+
+/// The backend a GPU choice starts on: the probe lists the backends in the
+/// core's order of preference, and the core takes the first that starts.
+pub fn gpu_used(gpu: Option<&GpuEnhancement>) -> Option<GpuBackend> {
+    gpu.and_then(|gpu| gpu.available.first().copied())
+}
+
+/// The card's GPU line: what the probe found, or why there is no GPU.
+pub fn gpu_status(gpu: Option<&GpuEnhancement>) -> String {
+    let Some(found) = gpu else {
+        return "GPU: looking for one\u{2026}".to_owned();
+    };
+    let Some((used, others)) = found.available.split_first() else {
+        return format!("GPU: {}", no_gpu_note(gpu).unwrap_or(NO_GPU_FOUND));
+    };
+    let mut line = format!("GPU: {} is used.", gpu_name(*used));
+    if !others.is_empty() {
+        let others: Vec<&str> = others.iter().map(|b| gpu_name(*b)).collect();
+        line.push_str(&format!(" Also here: {}.", others.join(", ")));
+    }
+    line
 }
 
 /// The WebRTC suppressor's strength menu.
@@ -318,15 +368,26 @@ pub fn no_gpu_note(gpu: Option<&GpuEnhancement>) -> Option<&'static str> {
     }
 }
 
-fn gpu_name(backend: GpuBackend) -> &'static str {
+/// A backend by vendor and API: NVIDIA's own (CUDA, TensorRT) or one that
+/// runs on any vendor's GPU.
+pub fn gpu_name(backend: GpuBackend) -> &'static str {
     match backend {
-        GpuBackend::Cuda => "CUDA",
-        GpuBackend::TensorRt => "TensorRT",
-        GpuBackend::WebGpu => "WebGPU",
-        GpuBackend::DirectMl => "DirectML",
-        GpuBackend::CoreMl => "Core ML",
+        GpuBackend::Cuda => "NVIDIA \u{b7} CUDA",
+        GpuBackend::TensorRt => "NVIDIA \u{b7} TensorRT",
+        GpuBackend::WebGpu => WEBGPU_NAME,
+        GpuBackend::DirectMl => "any GPU \u{b7} DirectML",
+        GpuBackend::CoreMl => "Apple \u{b7} Core ML",
     }
 }
+
+/// WebGPU runs on the system's own graphics API.
+const WEBGPU_NAME: &str = if cfg!(target_os = "windows") {
+    "any GPU \u{b7} WebGPU on Direct3D 12"
+} else if cfg!(target_os = "macos") {
+    "any GPU \u{b7} WebGPU on Metal"
+} else {
+    "any GPU \u{b7} WebGPU on Vulkan"
+};
 
 /// The level meter: how full (0 to 1, from [`METER_FLOOR_DB`] to 0 dBFS),
 /// and its words.
@@ -436,8 +497,6 @@ pub enum AudioMessage {
     Noise(NoiseChoice),
     /// The WebRTC strength menu.
     Level(LevelChoice),
-    /// "Use the GPU" for the microphone's DeepFilterNet3.
-    MicCleaningGpu(bool),
     /// Echo cancellation.
     EchoCancellation(bool),
     /// Also cancel other apps' sound.
@@ -502,13 +561,6 @@ impl App {
             M::Level(LevelChoice(new)) => self.edit_audio(|s| {
                 if let NoiseSuppression::WebRtc { level } = &mut s.processing.noise_suppression {
                     *level = new;
-                }
-            }),
-            M::MicCleaningGpu(on) => self.edit_audio(|s| {
-                if let NoiseSuppression::DeepFilter { gpu, .. } =
-                    &mut s.processing.noise_suppression
-                {
-                    *gpu = on;
                 }
             }),
             M::EchoCancellation(on) => self.edit_audio(|s| {
@@ -807,6 +859,16 @@ mod tests {
                         gpu: false,
                     }
             }),
+            (
+                AudioMessage::Noise(NoiseChoice::DeepFilterGpu(Some(GpuBackend::Cuda))),
+                |s| {
+                    s.processing.noise_suppression
+                        == NoiseSuppression::DeepFilter {
+                            attenuation_limit_db: DEFAULT_DF_LIMIT_DB,
+                            gpu: true,
+                        }
+                },
+            ),
             (AudioMessage::EchoCancellation(false), |s| {
                 !s.processing.echo_cancellation
             }),
@@ -860,8 +922,7 @@ mod tests {
     fn the_level_and_gpu_options_apply_only_to_their_suppressor() {
         let (mut app, mut rx) = card();
         let _ = app.update(audio(AudioMessage::Level(LevelChoice(NsLevel::High))));
-        let _ = app.update(audio(AudioMessage::MicCleaningGpu(true)));
-        assert!(drain(&mut rx).is_empty(), "RNNoise has neither");
+        assert!(drain(&mut rx).is_empty(), "RNNoise has no strength");
         let mut webrtc = stored();
         webrtc.processing.noise_suppression = NoiseSuppression::WebRtc {
             level: NsLevel::Low,
@@ -1087,25 +1148,87 @@ mod tests {
         ));
     }
 
+    fn found(available: Vec<GpuBackend>) -> GpuEnhancement {
+        GpuEnhancement {
+            available,
+            running: None,
+        }
+    }
+
     #[test]
     fn the_card_says_why_no_gpu_is_offered() {
-        let none = GpuEnhancement {
-            available: Vec::new(),
-            running: None,
-        };
-        let cuda = GpuEnhancement {
-            available: vec![GpuBackend::Cuda],
-            running: None,
-        };
-        // Before the probe answers, and with a GPU offered: nothing to say.
-        assert_eq!(no_gpu_note(None), None);
-        assert_eq!(no_gpu_note(Some(&cuda)), None);
         let expected = if cfg!(feature = "gpu") {
             NO_GPU_FOUND
         } else {
             NO_GPU_IN_BUILD
         };
-        assert_eq!(no_gpu_note(Some(&none)), Some(expected));
+        assert_eq!(
+            gpu_status(Some(&found(Vec::new()))),
+            format!("GPU: {expected}")
+        );
+        assert_eq!(gpu_status(None), "GPU: looking for one\u{2026}");
+        // No GPU: the menu has no GPU entry.
+        let rnnoise = NoiseSuppression::RnNoise;
+        assert!(
+            !NoiseChoice::menu(Some(&found(Vec::new())), &rnnoise)
+                .iter()
+                .any(|c| matches!(c, NoiseChoice::DeepFilterGpu(_)))
+        );
+    }
+
+    #[test]
+    fn the_menu_names_the_gpu_backend_that_runs() {
+        let gpu = found(vec![GpuBackend::Cuda, GpuBackend::WebGpu]);
+        let menu = NoiseChoice::menu(Some(&gpu), &NoiseSuppression::RnNoise);
+        let last = menu.last().copied().expect("entries");
+        assert_eq!(last, NoiseChoice::DeepFilterGpu(Some(GpuBackend::Cuda)));
+        assert_eq!(
+            last.to_string(),
+            "DeepFilterNet3 on the GPU (NVIDIA \u{b7} CUDA)"
+        );
+        // Every entry says where it runs.
+        for choice in &menu[1..] {
+            let label = choice.to_string();
+            assert!(label.contains("CPU") || label.contains("GPU"), "{label}");
+        }
+        // The first backend is used; the others are listed.
+        assert_eq!(
+            gpu_status(Some(&gpu)),
+            format!(
+                "GPU: NVIDIA \u{b7} CUDA is used. Also here: {}.",
+                gpu_name(GpuBackend::WebGpu)
+            )
+        );
+        assert!(gpu_name(GpuBackend::WebGpu).starts_with("any GPU"));
+        // The setting picks the same entry the menu shows.
+        let on_gpu = NoiseSuppression::DeepFilter {
+            attenuation_limit_db: 30.0,
+            gpu: true,
+        };
+        assert!(menu.contains(&NoiseChoice::of(&on_gpu, Some(&gpu))));
+        // A GPU setting from another machine stays in the menu.
+        let none = found(Vec::new());
+        assert!(
+            NoiseChoice::menu(Some(&none), &on_gpu)
+                .contains(&NoiseChoice::of(&on_gpu, Some(&none)))
+        );
+    }
+
+    #[test]
+    fn moving_deepfilter_between_cpu_and_gpu_keeps_its_limit() {
+        let cpu = NoiseSuppression::DeepFilter {
+            attenuation_limit_db: 42.0,
+            gpu: false,
+        };
+        assert_eq!(
+            NoiseChoice::DeepFilterGpu(None).setting(&cpu),
+            NoiseSuppression::DeepFilter {
+                attenuation_limit_db: 42.0,
+                gpu: true,
+            }
+        );
+        let gpu = NoiseChoice::DeepFilterGpu(None).setting(&cpu);
+        assert_eq!(NoiseChoice::DeepFilter.setting(&gpu), cpu);
     }
 
     #[test]
@@ -1207,7 +1330,7 @@ mod tests {
             backend_label(EnhancerBackend::Gpu {
                 backend: GpuBackend::TensorRt
             }),
-            "Running on the GPU (TensorRT)."
+            "Running on the GPU (NVIDIA \u{b7} TensorRT)."
         );
         assert!(backend_label(EnhancerBackend::CpuAfterGpuTooSlow).contains("too slow"));
     }

@@ -11,7 +11,8 @@ use twicecat_core::api::{AudioSettings, NoiseSuppression};
 
 use crate::audio_settings::{
     AudioMessage, AudioUi, CLEANING_LIMIT_RANGE, INPUT_GAIN_RANGE, LevelChoice, NoiseChoice,
-    SkipChoice, Slider, backend_label, bitrate_menu, device_menu, diagnostics, meter, no_gpu_note,
+    SkipChoice, Slider, backend_label, bitrate_menu, device_menu, diagnostics, gpu_name,
+    gpu_status, gpu_used, meter,
 };
 use crate::screens::room_dialogs::{modal, muted};
 use crate::state::{App, Message};
@@ -124,23 +125,20 @@ fn devices_section<'a>(app: &'a App, settings: &'a AudioSettings) -> Element<'a,
 
 fn processing_section<'a>(app: &'a App, settings: &'a AudioSettings) -> Element<'a, Message> {
     let p = &settings.processing;
-    let gpu_offered = app
-        .calls
-        .gpu
-        .as_ref()
-        .is_some_and(|g| !g.available.is_empty());
+    let gpu = app.calls.gpu.as_ref();
     let mut section = column![
         heading("Microphone"),
         labelled(
             "Noise suppression",
             pick_list(
-                NoiseChoice::ALL,
-                Some(NoiseChoice::of(&p.noise_suppression)),
+                NoiseChoice::menu(gpu, &p.noise_suppression),
+                Some(NoiseChoice::of(&p.noise_suppression, gpu)),
                 |c| msg(AudioMessage::Noise(c))
             )
             .width(Fill)
             .into()
         ),
+        note(gpu_status(gpu)),
     ]
     .spacing(8);
     match p.noise_suppression {
@@ -154,22 +152,13 @@ fn processing_section<'a>(app: &'a App, settings: &'a AudioSettings) -> Element<
                 .into(),
             ));
         }
-        NoiseSuppression::DeepFilter { gpu, .. } => {
+        NoiseSuppression::DeepFilter { .. } => {
             section = section.push(limit_slider(
                 &app.audio_ui,
                 settings,
                 Slider::MicCleaningLimit,
                 "Most removed",
             ));
-            if gpu_offered {
-                section = section.push(
-                    checkbox(gpu)
-                        .label("Use the GPU")
-                        .on_toggle(|on| msg(AudioMessage::MicCleaningGpu(on))),
-                );
-            } else if let Some(why) = no_gpu_note(app.calls.gpu.as_ref()) {
-                section = section.push(note(why));
-            }
             if let Some(running) = app.calls.gpu.as_ref().and_then(|g| g.running) {
                 section = section.push(note(backend_label(running)));
             }
@@ -375,15 +364,10 @@ fn others_section<'a>(app: &'a App, settings: &'a AudioSettings) -> Element<'a, 
                 )
                 .width(Fill),
             );
-        if app
-            .calls
-            .gpu
-            .as_ref()
-            .is_some_and(|g| !g.available.is_empty())
-        {
+        if let Some(backend) = gpu_used(app.calls.gpu.as_ref()) {
             section = section.push(
                 checkbox(cleaning.gpu)
-                    .label("Clean on the GPU")
+                    .label(format!("Clean on the GPU ({})", gpu_name(backend)))
                     .on_toggle(|on| msg(AudioMessage::CleanOthersGpu(on))),
             );
         }
