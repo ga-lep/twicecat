@@ -13,6 +13,7 @@
 mod common;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use common::{
     DEFAULT_TIMEOUT, TestEnv, assert_local_homeserver, create_dm, create_room, hex, login_and_run,
@@ -325,6 +326,11 @@ async fn a_keyword_notifies_in_a_mentions_only_room() {
     let mut f = Fixture::new().await;
     let group = f.create_group().await;
     let keyword = format!("twicecat-kw-{}", hex());
+    // Let the new room go quiet: its mode must reach the room list on its
+    // own, not with the room's next update. (Without the pause the creation's
+    // last updates carried the mode, and its absence went unnoticed.)
+    f.fence().await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
 
     f.change_settings(Command::AddKeyword {
         keyword: format!("  {keyword}  "),
