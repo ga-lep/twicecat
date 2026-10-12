@@ -24,7 +24,7 @@ use crate::actions::{self, ActionButtons, ActionState, NOTICE_DURATION, Notice, 
 use crate::avatars::Avatars;
 use crate::blocking;
 use crate::bridge::{self, Bridge, EventsSlot};
-use crate::calls::{self, CallModel};
+use crate::calls::{self, CallMessage, CallModel};
 use crate::composer::{self, Composer, ComposerKey, EditorAction, SearchStep};
 use crate::dialogs::{self, Clipboard, ClipboardContent, Dialogs, SystemClipboard, SystemDialogs};
 use crate::emoji;
@@ -376,6 +376,9 @@ pub enum Message {
     Tray(TrayAction),
     /// A message of the room dialogs, panels, user card and join bar.
     Rooms(RoomsMessage),
+    /// A call control: the header's call button, the call bar, the
+    /// participants panel, the incoming-call card, the Voice & audio card.
+    Call(CallMessage),
     /// A control of the Settings screen, or Ctrl+,.
     Settings(SettingsMessage),
     /// A button of the spaces sidebar.
@@ -1095,6 +1098,7 @@ impl App {
             Message::Sessions(message) => self.on_sessions(message),
             Message::Rooms(message) => self.on_rooms(message),
             Message::Settings(message) => self.on_settings(message),
+            Message::Call(message) => self.on_call(message),
             Message::Spaces(SpacesMessage::Select(space)) => self.select_space(space),
             Message::Threads(message) => self.on_threads(message),
             Message::Shortcut { shortcut, captured } => self.on_shortcut(shortcut, captured),
