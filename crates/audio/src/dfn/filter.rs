@@ -1,6 +1,8 @@
 //! One voice's DeepFilterNet3: the networks on the CPU (tract), or, with
 //! the `onnxruntime` feature, as one stateful graph on a GPU, the CPU
-//! graphs staying loaded to take over if the GPU fails or falls behind.
+//! graphs staying loaded to take over if the GPU fails or falls behind. A
+//! GPU that fell behind is tried again later (see `super::gpu::Retry`); one
+//! that failed is not.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -54,6 +56,8 @@ struct OnGpu {
     /// thread, see `crate::Enhancer`), as tearing down a GPU session there
     /// would stall the audio.
     abandoned: bool,
+    /// When to try it again after it fell behind.
+    retry: super::gpu::Retry,
 }
 
 /// DeepFilterNet3 on 48 kHz mono 10 ms frames.
@@ -122,6 +126,7 @@ impl DeepFilter {
             graph,
             deadline: Deadline::default(),
             abandoned: false,
+            retry: Default::default(),
         });
         filter.status.set_internal(DeepFilterBackend::Gpu);
         Ok((filter, Some(accelerator)))
@@ -161,10 +166,23 @@ impl DeepFilter {
             .collect()
     }
 
-    /// Where the networks run; the handle follows a fallback to the CPU
-    /// while the filter runs.
+    /// Where the networks run; the handle follows a fallback to the CPU,
+    /// and a return to the GPU, while the filter runs.
     pub fn status(&self) -> DeepFilterStatus {
         self.status.clone()
+    }
+
+    /// Hands the frames to the CPU as if the GPU had fallen behind, with
+    /// its next try due at once. Only with the `test-fakes` feature, for
+    /// the GPU tests; not part of the audio crate's API.
+    #[cfg(all(feature = "onnxruntime", feature = "test-fakes"))]
+    pub fn fall_behind(&mut self) {
+        if let Some(gpu) = self.gpu.as_mut() {
+            gpu.abandoned = true;
+            gpu.retry = super::gpu::Retry::due_at(std::time::Instant::now());
+            self.status
+                .set_internal(DeepFilterBackend::CpuAfterGpuTooSlow);
+        }
     }
 
     /// How late the output is, in samples: one hop for the STFT, plus the
@@ -192,30 +210,47 @@ impl DeepFilter {
     /// keeps up, else on the CPU.
     fn infer(&mut self) -> Result<(), AudioError> {
         #[cfg(feature = "onnxruntime")]
-        if let Some(gpu) = self.gpu.as_mut().filter(|gpu| !gpu.abandoned) {
-            use super::gpu::GPU_MISSES;
-            let start = std::time::Instant::now();
-            match gpu.graph.infer(&self.cfg, &mut self.dsp.net) {
-                // Another thread holds the GPU this frame: the CPU runs it.
-                Err(AudioError::GpuBusy) => {}
-                Ok(()) => {
-                    let took = start.elapsed();
-                    if gpu.deadline.gives_up(took) {
-                        tracing::warn!(
-                            "DeepFilterNet's GPU missed {GPU_MISSES} deadlines in a row \
-                             (last frame {took:?}); the CPU takes over"
-                        );
+        if let Some(gpu) = self.gpu.as_mut() {
+            use super::gpu::{GPU_LATE_LIMIT, GPU_WINDOW};
+            let now = std::time::Instant::now();
+            if gpu.abandoned && gpu.retry.due(now) {
+                // From a clean state: the GPU's is as old as when it was
+                // given up on. A failed reset waits for the next try.
+                if gpu.graph.reset().is_ok() {
+                    tracing::info!("DeepFilterNet tries the GPU again");
+                    gpu.deadline.reset();
+                    gpu.abandoned = false;
+                    self.status.set_internal(DeepFilterBackend::Gpu);
+                } else {
+                    gpu.retry.gave_up(now);
+                }
+            }
+            if !gpu.abandoned {
+                let start = std::time::Instant::now();
+                match gpu.graph.infer(&self.cfg, &mut self.dsp.net) {
+                    // Another thread holds the GPU this frame: the CPU runs it.
+                    Err(AudioError::GpuBusy) => {}
+                    Ok(()) => {
+                        let took = start.elapsed();
+                        if gpu.deadline.gives_up(took) {
+                            tracing::warn!(
+                                "DeepFilterNet's GPU missed its deadline in {GPU_LATE_LIMIT} of \
+                                 the last {GPU_WINDOW} frames (last frame {took:?}); the CPU \
+                                 takes over and the GPU is tried again later"
+                            );
+                            gpu.abandoned = true;
+                            gpu.retry.gave_up(now);
+                            self.status
+                                .set_internal(DeepFilterBackend::CpuAfterGpuTooSlow);
+                        }
+                        return Ok(());
+                    }
+                    Err(_) => {
+                        tracing::warn!("DeepFilterNet's GPU failed; the CPU takes over");
                         gpu.abandoned = true;
                         self.status
-                            .set_internal(DeepFilterBackend::CpuAfterGpuTooSlow);
+                            .set_internal(DeepFilterBackend::CpuAfterGpuError);
                     }
-                    return Ok(());
-                }
-                Err(_) => {
-                    tracing::warn!("DeepFilterNet's GPU failed; the CPU takes over");
-                    gpu.abandoned = true;
-                    self.status
-                        .set_internal(DeepFilterBackend::CpuAfterGpuError);
                 }
             }
         }

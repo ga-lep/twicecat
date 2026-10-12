@@ -129,6 +129,43 @@ fn filter(input: &[f32], filter: &mut DeepFilter) -> (Vec<f32>, Vec<Duration>) {
 }
 
 #[test]
+#[cfg(feature = "test-fakes")]
+#[ignore = "needs scripts/fetch-onnxruntime.sh cuda13, fetch-models.sh, export-deepfilternet.sh and a GPU"]
+fn a_gpu_that_fell_behind_is_tried_again() {
+    let _gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    flush_denormals_on_this_thread();
+    let runtime =
+        OnnxRuntime::load(&default_runtime_dir().expect("run scripts/fetch-onnxruntime.sh"))
+            .expect("load ONNX Runtime");
+    let dir = default_model_dir().unwrap();
+    let model = default_stateful_model().unwrap();
+    let (mut filter, accelerator) =
+        DeepFilter::load_gpu(&dir, &model, 100.0, &runtime, &[Accelerator::Cuda])
+            .expect("load DeepFilterNet");
+    assert_eq!(accelerator, Some(Accelerator::Cuda), "needs CUDA here");
+    let status = filter.status();
+    let input = voice_in_noise(300);
+    let mut frames = input.chunks_exact(FRAME_LEN);
+    let mut run = |filter: &mut DeepFilter, n: usize| {
+        for chunk in frames.by_ref().take(n) {
+            let mut frame: Frame = chunk.try_into().unwrap();
+            filter.process(&mut frame).expect("process");
+            assert!(frame.iter().all(|s| s.is_finite()));
+        }
+    };
+    run(&mut filter, 100);
+    assert_eq!(status.get(), DeepFilterBackend::Gpu);
+    filter.fall_behind();
+    assert_eq!(status.get(), DeepFilterBackend::CpuAfterGpuTooSlow);
+    run(&mut filter, 100);
+    assert_eq!(
+        status.get(),
+        DeepFilterBackend::Gpu,
+        "the due try put it back on the GPU, where it keeps up"
+    );
+}
+
+#[test]
 #[ignore = "needs scripts/fetch-onnxruntime.sh cuda13, fetch-models.sh, export-deepfilternet.sh and a GPU"]
 fn deepfilternet_on_the_gpu_sounds_like_on_the_cpu() {
     let _gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());

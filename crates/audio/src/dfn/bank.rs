@@ -7,7 +7,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use super::config::Config;
-use super::gpu::{Deadline, GPU_MISSES, hold_webgpu, warm_up};
+use super::gpu::{Deadline, GPU_LATE_LIMIT, GPU_WINDOW, hold_webgpu, warm_up};
 use super::signal::Dsp;
 use super::stateful::{StatefulGraph, read_output};
 use super::{DeepFilterBackend, DeepFilterStatus};
@@ -149,8 +149,8 @@ impl crate::BatchCleaner for DeepFilterBank {
         let took = start.elapsed();
         if self.deadline.gives_up(took) {
             tracing::warn!(
-                "cleaning other voices on the GPU missed {GPU_MISSES} deadlines in a row \
-                 (last call {took:?})"
+                "cleaning other voices on the GPU missed its deadline in {GPU_LATE_LIMIT} of the \
+                 last {GPU_WINDOW} calls (last call {took:?})"
             );
             self.status
                 .set_internal(DeepFilterBackend::CpuAfterGpuTooSlow);

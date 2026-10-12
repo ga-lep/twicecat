@@ -30,6 +30,6 @@ In the app, open **Settings → Voice & audio**.
   - Apple's: **Apple · Core ML**.
 - **The GPU line.** It says which backend is used and which others are available here. Without a GPU it says why: the light build has no GPU support, or the full build found no usable GPU.
 - **Cleaning other voices.** It offers **Clean on the GPU** with the same backend name.
-- **During a call or a mic test**, the card shows where the cleaning actually runs, for example "Running on the GPU (NVIDIA · CUDA)". If the GPU fails or falls behind, it says the CPU took over.
+- **During a call or a mic test**, the card shows where the cleaning actually runs, for example "Running on the GPU (NVIDIA · CUDA)". If the GPU fails or falls behind, it says the CPU took over. "Falls behind" means late on 10 of the last 100 frames (one second), not one slow frame. Your microphone's cleaning then tries the GPU again after 30 seconds, and waits twice as long after each try that falls behind again, up to 5 minutes.
 
 The core prefers TensorRT, then CUDA, DirectML, WebGPU and Core ML, and uses the first that starts.

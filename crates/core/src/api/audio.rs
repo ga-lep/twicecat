@@ -250,7 +250,9 @@ pub enum EnhancerBackend {
     /// On the CPU after the GPU failed (a driver error, a lost device).
     CpuAfterGpuError,
     /// On the CPU because the GPU kept missing its deadline (a game may be
-    /// using it).
+    /// using it). The microphone's filter tries the GPU again after 30 s,
+    /// then waits twice as long after each try that falls behind again (at
+    /// most 5 min), and is reported as `Gpu` again when it keeps up.
     CpuAfterGpuTooSlow,
 }
 

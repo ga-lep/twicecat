@@ -349,7 +349,9 @@ pub fn backend_label(backend: EnhancerBackend) -> String {
         EnhancerBackend::Gpu { backend } => format!("Running on the GPU ({}).", gpu_name(backend)),
         EnhancerBackend::CpuAfterGpuError => "Running on the CPU: the GPU failed.".to_owned(),
         EnhancerBackend::CpuAfterGpuTooSlow => {
-            "Running on the CPU: the GPU was too slow (a game may be using it).".to_owned()
+            "Running on the CPU for now: the GPU fell behind (a game may be using it). \
+             It is tried again in a while."
+                .to_owned()
         }
     }
 }
@@ -1356,7 +1358,7 @@ mod tests {
             }),
             "Running on the GPU (NVIDIA \u{b7} TensorRT)."
         );
-        assert!(backend_label(EnhancerBackend::CpuAfterGpuTooSlow).contains("too slow"));
+        assert!(backend_label(EnhancerBackend::CpuAfterGpuTooSlow).contains("fell behind"));
     }
 
     #[test]
