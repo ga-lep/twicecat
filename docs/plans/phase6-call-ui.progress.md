@@ -21,3 +21,4 @@ Review: an independent read-only review of main..HEAD found 10 verified defects,
 Task 7: complete (commit "docs(plan): wrap up the Phase 6 call UI")
 Fix: complete (commit "fix(core): refuse a mic test during a call before touching its audio", gate ok: 1690 tests passed; full ignored run 147 passed, 7 failed, all needing scripts/fetch-models.sh)
   notes: [bug, on main] StartMicTest stopped the call's audio session before refusing; now refused first, also while the session is in Mode::Call; unit and stack tests both catch the mutation
+Checks: with the DeepFilterNet3 models fetched (at the human's request), the full ignored run passed 154, failed 0; profile-call-path.sh: every mode under the 500 us budget (DeepFilterNet3 CPU p99 76.9 %)
