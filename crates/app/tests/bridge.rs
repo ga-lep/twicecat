@@ -470,7 +470,9 @@ fn carol_resets_her_identity_sets_up_recovery_and_logs_out() {
         180,
         "no recovery key in 180 s",
         app.security.visible() == Visible::Key
+            || (app.security.busy.is_none() && app.security.notice.is_some())
     );
+    assert_eq!(app.security.notice, None, "the recovery setup failed");
     let _ = app.update(Message::Security(SecurityMessage::Done));
     assert_eq!(app.security.visible(), Visible::Key, "refused until ticked");
     let _ = app.update(Message::Security(SecurityMessage::SavedToggled(true)));
