@@ -2242,6 +2242,17 @@ Plan approved by the human 2026-10-12 (Q1-Q8 answered: the core plays the ringto
 - **The GPU line**, under the menu, always shown: "looking for one…", "X is used. Also here: Y.", or why there is none (light build, or nothing usable found).
 - **Tests:** `the_menu_names_the_gpu_backend_that_runs`, `moving_deepfilter_between_cpu_and_gpu_keeps_its_limit`, `the_card_says_why_no_gpu_is_offered`, and the settings cases with the GPU entry. They pass in both builds; the gate was clean (1694 tests).
 
+### Automatic gain's most boost (2026-10-12, human request)
+
+- **Asked:** a slider for each processing option where it makes sense. Only automatic gain has a setting worth one:
+  - AEC3 has no strength (it measures the echo path itself); its only option, the transparent-mode algorithm, is internal.
+  - sonora's high-pass filter has a fixed cutoff; a cutoff slider would need our own filter. Left as a switch.
+- **Core:** `AudioProcessing::auto_gain_max_db` (1..=50 dB, `limits::AUTO_GAIN_MAX_DB`; AGC2 refuses 0), default 30 dB instead of AGC2's 50, so a quiet room is not lifted as far. Older settings files read as 30. The chain passes it to AGC2's adaptive digital controller as `max_gain_db`, with its start gain (15 dB) capped to it, and reconfigures AGC2 only when it changes while on.
+- **App:** under **Automatic gain**, a **Most boost** slider while it is on; while it is off, a note points to **Microphone gain** under Levels.
+- **CLI:** `/agc <dB>` sets it and turns automatic gain on; `/audio` shows it.
+- **Fix in the card:** "Without its model, RNNoise runs instead" showed while DeepFilterNet3 ran. It now shows only until the card knows where DeepFilterNet3 runs; a missing model is still reported as an error when a call or mic test starts.
+- **Tests:** `auto_gain_boosts_no_more_than_its_most` (a 6 dB most holds a quiet signal at 6 dB; 40 dB lifts it further), `auto_gain_settings_reach_agc2`, `the_most_boost_follows_its_slider_and_steps`, the validation and serde cases, and the CLI's `/agc` parse and settings cases. The gate was clean (1698 tests).
+
 ## Phase 6 call UI human checkpoint
 - [x] Plan questions answered and plan approved (2026-10-12).
 - [ ] (step 18) The call pill (🔊 with the count; highlighted while ringing), the "Voice" tag and the header's call button (Call, Join call (N), Join voice, Joining…, Leave call) read well in light and dark themes, and the emoji renders on each OS; Tab reaches the call button.
@@ -2250,5 +2261,6 @@ Plan approved by the human 2026-10-12 (Q1-Q8 answered: the core plays the ringto
 - [ ] (step 21) Incoming calls with Element Web/X and another Twicecat: the card (picture, name, Decline/Accept) in both themes; Accept joins, Decline tells the caller; Esc hides the card and silences the tone; the taskbar/dock flashes (Critical) for a DM ring on Windows, macOS, GNOME and KDE; the desktop notification shows while the window is unfocused (with and without "Show message content") and a click opens the room; a group call only notifies.
 - [ ] Joining a call on a server whose LiveKit uses `wss://` connects (it panicked in rustls before the TLS provider fix).
 - [ ] On a slow or lossy link (the human's own server, about 700 ms away), joining a call connects instead of stopping after LiveKit's first attempts.
+- [ ] Automatic gain's **Most boost** by ear: with a quiet microphone in a mic test, 30 dB brings speech up without lifting the room much; 5 dB barely lifts it; the slider hides while automatic gain is off and the note about Microphone gain shows. With DeepFilterNet3 running, the "Without its model" note is gone.
 - [ ] RustRover lists **Twicecat full (GPU)** and **Twicecat light (CPU only)** and both run. In the light build the card's GPU line says it is the light build. In the full build the menu has **DeepFilterNet3 on the GPU (NVIDIA · CUDA)**, the GPU line says CUDA is used, and a mic test shows "Running on the GPU (NVIDIA · CUDA)". Check that the labels fit the menu's width in both themes.
 - [ ] (step 22) The Voice & audio card in both themes on each OS: device menus with a USB and a Bluetooth headset plugged in and out while it is open ("(not connected)" keeps the choice, and the device comes back), each processing option by ear (WebRTC strengths, RNNoise, DeepFilterNet3 with and without the GPU; echo cancellation on open speakers; "other apps' sound" with a game or video), gain and volume, the voice quality menu, the mic test meter and "Hear myself" on headphones, the ringtone switch, cleaning other voices and its skip menu in a call with Element Call, the announcement switch, and the diagnostics during a call.

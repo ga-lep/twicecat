@@ -172,6 +172,7 @@ fn settings(
         echo_cancellation,
         high_pass,
         auto_gain,
+        auto_gain_max_db: 30.0,
         noise,
         gate: GateMode::VoiceActivity {
             automatic: true,
