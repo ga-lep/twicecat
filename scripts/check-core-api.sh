@@ -2,7 +2,7 @@
 # Fails if the public core API leaks SDK or media types: crates/core/src/api/
 # and the other public modules (paths, secrets, logging) must not mention
 # matrix_sdk, ruma, eyeball or imbl, nor the media crates (livekit, libwebrtc,
-# webrtc-sys, cpal, sonora, nnnoiseless, tract), and crates/core/src/lib.rs
+# webrtc-sys, cpal, sonora, nnnoiseless, tract, twicecat-audio), and crates/core/src/lib.rs
 # must not `pub use` any of them. Fails closed: a missing path or grep error is
 # an error.
 set -euo pipefail
@@ -10,7 +10,7 @@ cd "$(dirname "$0")/.."
 api_dir="crates/core/src/api"
 lib_rs="crates/core/src/lib.rs"
 # Media crate names are matched as whole words, so "contract" is not "tract".
-crates='(matrix_sdk|matrix-sdk|ruma|eyeball|imbl|\blivekit|\blibwebrtc|\bwebrtc[_-]sys|\bcpal\b|\bsonora|\bnnnoiseless|\btract(_onnx|_core)?\b)'
+crates='(matrix_sdk|matrix-sdk|ruma|eyeball|imbl|\blivekit|\blibwebrtc|\bwebrtc[_-]sys|\bcpal\b|\bsonora|\bnnnoiseless|\btract(_onnx|_core)?\b|\btwicecat[_-]audio\b)'
 [ -d "$api_dir" ] || { echo "error: $api_dir not found" >&2; exit 2; }
 [ -f "$lib_rs" ] || { echo "error: $lib_rs not found" >&2; exit 2; }
 

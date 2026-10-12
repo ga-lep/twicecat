@@ -24,6 +24,7 @@ use crate::actions::{self, ActionButtons, ActionState, NOTICE_DURATION, Notice, 
 use crate::avatars::Avatars;
 use crate::blocking;
 use crate::bridge::{self, Bridge, EventsSlot};
+use crate::calls::{self, CallModel};
 use crate::composer::{self, Composer, ComposerKey, EditorAction, SearchStep};
 use crate::dialogs::{self, Clipboard, ClipboardContent, Dialogs, SystemClipboard, SystemDialogs};
 use crate::emoji;
@@ -527,6 +528,8 @@ pub struct App {
     pub verification: Option<VerificationModel>,
     /// The Sessions screen and the logout warning.
     pub sessions: SessionsModel,
+    /// The call, call counts, rings and audio settings.
+    pub calls: CallModel,
     /// Set when the app decided to exit (the task itself is opaque to tests).
     pub exit_requested: bool,
     /// Clipboard reads sent by `drop_secrets` whose answer is still due.
@@ -560,6 +563,7 @@ impl std::fmt::Debug for App {
             .field("security", &self.security)
             .field("verification", &self.verification)
             .field("sessions", &self.sessions)
+            .field("calls", &self.calls)
             .finish_non_exhaustive()
     }
 }
@@ -630,6 +634,7 @@ impl App {
             security: SecurityModel::default(),
             verification: None,
             sessions: SessionsModel::default(),
+            calls: CallModel::default(),
             exit_requested: false,
             flushes_pending: 0,
             core_closed: false,
@@ -1296,7 +1301,7 @@ impl App {
                 // Any cancel reply would have come before this login.
                 self.pending_cancel = false;
                 // A copy still on the clipboard is checked, not forgotten.
-                task = self.drop_secrets();
+                task = Task::batch([self.drop_secrets(), self.calls_after_login()]);
                 self.security = SecurityModel::default();
                 self.security.fresh_login = !restored;
                 self.room_modes.clear();
@@ -1389,6 +1394,12 @@ impl App {
                 if self.selected.as_ref() == Some(&room_id) {
                     self.send_error = Some(safe_line(&error.to_string()));
                 }
+            }
+            CoreEvent::Error(error)
+                if calls::is_call_error(&error)
+                    && matches!(self.screen, Screen::Main | Screen::Loading) =>
+            {
+                self.calls.on_error(&error);
             }
             CoreEvent::Error(error) => task = self.on_core_error(&error),
             CoreEvent::Avatar { id, image } => self.avatars.answer(&id, image),
@@ -1565,8 +1576,7 @@ impl App {
                 task = self.thread_event(event);
             }
             CoreEvent::OwnProfile(view) => self.on_own_profile(&view),
-            // Calls and audio have no UI yet (Phase 6 UI tasks).
-            CoreEvent::CallState(_)
+            event @ (CoreEvent::CallState(_)
             | CoreEvent::CallParticipants { .. }
             | CoreEvent::ActiveCall { .. }
             | CoreEvent::IncomingCall { .. }
@@ -1576,7 +1586,7 @@ impl App {
             | CoreEvent::AudioSettings(_)
             | CoreEvent::InputLevel(_)
             | CoreEvent::AudioStats(_)
-            | CoreEvent::GpuEnhancement(_) => {}
+            | CoreEvent::GpuEnhancement(_)) => task = self.on_call_event(event),
         }
         task
     }
@@ -2080,6 +2090,7 @@ impl App {
         self.security = SecurityModel::default();
         self.verification = None;
         self.sessions = SessionsModel::default();
+        self.calls = CallModel::default();
         self.rooms_ui = RoomsModel::default();
         self.settings_ui = SettingsModel::default();
         self.notification_settings = None;
@@ -8734,6 +8745,7 @@ mod tests {
         fn settings_without_a_selected_room_do_not_open() {
             let (mut app, mut rx) = login_app();
             logged_in(&mut app);
+            drain(&mut rx);
             rooms(&mut app, R::OpenSettings);
             rooms(&mut app, R::OpenMembers);
             assert!(app.rooms_ui.settings.is_none() && app.rooms_ui.members_panel.is_none());

@@ -1764,3 +1764,64 @@ First build and gate on Windows itself (Windows 11 26300, i9-14900K, RTX 5090; M
 - [ ] DirectML on Windows (Task 13b): on an AMD or Intel GPU, `scripts/build-onnxruntime-directml.sh`, `scripts/fetch-webgpu-ep.sh`, `scripts/fetch-models.sh`, `scripts/export-deepfilternet.sh`, then `cargo test -p twicecat-audio --release --features onnxruntime --test onnxruntime -- --ignored --nocapture` (DirectML and WebGPU both measured; `dfn_profile directml` and `dfn_profile webgpu` for the CPU per frame) and `/ns deepfilter gpu` by ear. If WebGPU is faster there at the same quality, the order (DirectML first, measured on NVIDIA) is revisited.
 - [ ] Decide on a `.gitattributes` with `* text=auto eol=lf` for Windows clones (see "Windows, native").
 - [ ] CLI call against a real account (`twicecat-cli`, then `/rooms`, `/call <n>`, `/who`, `/mute`, `/leave`; Element users hear you and you hear them); leave by crash (kill -9) clears the membership within the delayed-event timeout; `/mictest loopback` sounds right on headphones.
+
+## Phase 6 call UI steps (plan docs/plans/phase6-call-ui.md, ga-lep/twicecat#14; branch feat/call-ui)
+Plan approved by the human 2026-10-12 (Q1-Q8 answered: the core plays the ringtone and rings by itself; a call bar plus a participants panel; a separate Voice & audio card; a call button in every joined room; the input mode and push-to-talk are left to #15; Ctrl+Shift+M/D; the app's twicecat-audio ban is enforced by script).
+- [x] 17. Call model and core events in the app (phase6.17)
+- [ ] 18. Room list call counts, voice rooms, the header's call button (phase6.18)
+- [ ] 19. In-call view: call bar, participants, mute, deafen, per-user volume and cleaning (phase6.19)
+- [ ] 20. Ringtone in the core (phase6.20)
+- [ ] 21. Incoming calls, with a stack round trip (phase6.21)
+- [ ] 22. Voice & audio settings (phase6.22)
+- [ ] 23. Wrap-up (phase6.23)
+
+### Step 17: the call model (phase6.17)
+- **Built:** `crates/app/src/calls.rs`, `CallModel` on `App` (`App::calls`):
+  - the current call (`CurrentCall`: room, `CallPhase` Joining/Connected/Reconnecting, participants, people who declined);
+  - call counts per room;
+  - rooms that ring (one entry per room, oldest first, at most 16);
+  - a call notice;
+  - the last echoed `AudioSettings`, `AudioDevices`, `InputLevel`, `AudioStats` and `GpuEnhancement`.
+
+  In `state.rs`, the arm that ignored the call and audio events now hands them to `App::on_call_event`. Login sends `GetAudioSettings` and resets the model, and logout resets it. `Error(Call | Audio | NotInCall)` on the main and loading screens becomes the call notice. On other screens it goes through the old path, so a failed restore still reaches the login screen. `CallModel` and `CurrentCall` have hand-written `Debug` impls that print counts only, no room, user, display name or reason.
+- **Core API used** (rule 2, read in this tree):
+  - `CallState`, `CallEndReason`, `Participant` (`crates/core/src/api/call.rs:23-86`);
+  - the call and audio events (`api/mod.rs:1021-1074`);
+  - `CoreError::{Call, Audio, NotInCall}` (`api/types.rs:1177-1185`);
+  - `ListDiff::apply`, which ignores indexes out of range (`api/diff.rs`);
+  - `AudioDevices`, `GpuEnhancement`, `InputLevel`, `AudioStats` (`api/audio.rs:155-175, 255-263, 505-545`);
+  - `Command::GetAudioSettings`, answered with `AudioSettings` (`engine/mod.rs:1320`).
+
+  Order, from the engine: no empty participant list is sent on leave, so the app clears the list on `Left`; a ring is stopped before `Connected`.
+- **Behaviour choices:**
+  - joining a ringing room removes its ring (the core also sends `RingingStopped`);
+  - a ring for the room we are in is ignored;
+  - a second ring for a room replaces the caller;
+  - participants and declines for another room are ignored;
+  - `Connected` or `Reconnecting` without a `Joining` starts the call;
+  - a `Joining` in another room replaces the call (one call at a time, as in the core);
+  - a failed call keeps "The call ended: <reason>" until the next join. Newlines show as ⏎ (`one_line_capped`), capped at 256 characters.
+- **Boundary (Q2):** `scripts/check-app-deps.sh` also rejects `twicecat-audio`/`twicecat_audio`, and `scripts/check-core-api.sh` rejects `twicecat-audio` in `api/` and the public modules. Mutations (reverted): `twicecat-audio` added to the app's dependencies made the first fail; a `twicecat_audio` comment in `api/call.rs` made the second fail.
+- **Tests:** 25 unit tests in `calls::tests`, driving `App::update`. They cover:
+  - the state changes;
+  - hang-up and failure;
+  - the participant diffs, and the speaking and muted flags;
+  - other rooms;
+  - counts;
+  - rings (cap, replacement, answered by joining);
+  - declines (cap);
+  - settings, devices (a hot-plug list replaces the old one), level, stats and GPU;
+  - error routing;
+  - logout;
+  - the `Debug` output.
+
+  `rooms_ui::settings_without_a_selected_room_do_not_open` now drains the login's `GetAudioSettings` before checking that nothing is sent. The tests are inline, not in `calls/tests.rs`, because `tests/no_secret_logging.rs` only skips `#[cfg(test)]` code inside a file. Mutations, both caught and reverted: joining no longer removing the ring (`joining_a_ringing_room_answers_it` fails); call errors not routed to the notice (`call_and_audio_errors_become_the_call_notice` fails).
+- **Gate:**
+  - `cargo fmt --all`: clean;
+  - `cargo clippy --workspace --all-targets -- -D warnings`: clean, also with `--all-features`;
+  - `cargo test --workspace`: 1593 passed, 147 ignored, 0 failed;
+  - `scripts/check-app-deps.sh` (also `livekit`), `scripts/check-core-api.sh`, `scripts/check-no-webrtc-download.sh` and `scripts/check-commits.sh main`: ok.
+- **Nothing on screen yet**, so no human item in this step.
+
+## Phase 6 call UI human checkpoint
+- [x] Plan questions answered and plan approved (2026-10-12).
