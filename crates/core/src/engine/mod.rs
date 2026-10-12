@@ -3029,6 +3029,10 @@ impl Engine {
     async fn on_change(&mut self, change: Option<SessionChange>) {
         match change {
             Some(SessionChange::UnknownToken(_)) => {
+                // Nothing of the session may keep running: its call (whose
+                // membership the server's delayed leave removes if the dead
+                // token cannot) and the microphone.
+                self.end_session_audio().await;
                 if let Some(mut active) = self.active.take() {
                     active.stop_tasks().await;
                     let record = active.record.clone();
@@ -3039,6 +3043,14 @@ impl Engine {
             }
             // `None` means we lagged: rewrite the record to be safe.
             Some(SessionChange::TokensRefreshed) | None => self.rewrite_record().await,
+        }
+    }
+
+    /// Leaves the call and stops the mic test, when the session ends.
+    async fn end_session_audio(&mut self) {
+        self.leave_call().await;
+        if let Some(session) = self.audio_session.take() {
+            session.stop().await;
         }
     }
 
@@ -3199,6 +3211,26 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(none, None);
+    }
+
+    /// An expired session ends the mic test (and the call): nothing of it
+    /// keeps the microphone open behind the login screen.
+    #[tokio::test]
+    async fn the_end_of_a_session_stops_the_mic_test() {
+        struct Silence;
+        impl crate::api::VirtualAudio for Silence {
+            fn capture(&self, frame: &mut [f32; crate::api::AUDIO_FRAME_LEN]) {
+                frame.fill(0.0);
+            }
+            fn playback(&self, _: &[f32; crate::api::AUDIO_FRAME_LEN]) {}
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, _rx) = oauth_engine(dir.path());
+        engine.config.audio = AudioBackend::Virtual(Arc::new(Silence));
+        engine.start_mic_test(false).await;
+        assert!(engine.audio_session.is_some(), "the mic test runs");
+        engine.end_session_audio().await;
+        assert!(engine.audio_session.is_none());
     }
 
     #[tokio::test]
