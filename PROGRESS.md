@@ -1586,6 +1586,18 @@ Phase 2 signed off by the human on 2026-10-02 (merge of PR #3). Every other unti
   - The new-account scenario passed 11 of 11 after the fix.
   - On the local stack: `e2ee_identity`, `e2ee_recovery`, `e2ee_verification`, `log_hygiene`, the app's `bridge` and `calls` (28 tests) all pass, and the gate is clean (1690 tests).
 
+## Phase 6 / CI: a failed libwebrtc fetch no longer goes on with an empty path (fixed 2026-10-12)
+
+- **Symptom:** `test (macos-latest)` sometimes failed with a panic in `webrtc-sys-build` (lib.rs:245, `parent().unwrap()` on `None`).
+- **Cause:**
+  - GitHub answered the pinned libwebrtc download with a 504, and `curl --retry 3` (about 7 s of retries) gave up.
+  - The workflow ran the fetch inside `echo "LK_CUSTOM_WEBRTC=$(scripts/fetch-libwebrtc.sh)"`. A failed command substitution there does not stop bash, so the step passed and set `LK_CUSTOM_WEBRTC` to an empty string.
+  - The empty value overrides `.cargo/config.toml`'s `dev/libwebrtc`, so `webrtc-sys` downloaded libwebrtc itself, without the pinned SHA-256, then panicked on the empty path.
+- **Fix:**
+  - The three fetch steps in `ci.yml` assign the path first (`dir=$(…)`), as `profile.yml` already did, so a failed fetch fails the step.
+  - `fetch-libwebrtc.sh` retries 6 times (about a minute of back-off).
+- **Checked:** under CI's `bash -e -o pipefail`, the old form exits 0 with an empty value and the new one exits 1; the workflow still parses; the script still fetches and verifies.
+
 ## Phase 6 steps (calls: MatrixRTC, LiveKit SFU, native audio; plan docs/plans/phase6-calls.md)
 Order (revised 2026-10-02, plan decision 12; again 2026-10-03 by the human): 1–8, 8b, 9, 10, 11, 12, 14, 13, then 15 and 13b. Deferred options (audio-only libwebrtc build, pure-Rust WebRTC stack, PulseAudio backend) are recorded in the plan.
 - [x] 1. libwebrtc supply chain (pinned SHA-256 fetch script, fail-closed build) and livekit dependency (phase6.1)

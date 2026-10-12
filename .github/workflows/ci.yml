@@ -43,7 +43,11 @@ jobs:
       # webrtc-sys would download libwebrtc unverified; use the pinned SHA-256.
       - name: Fetch pinned libwebrtc
         shell: bash
-        run: echo "LK_CUSTOM_WEBRTC=$(scripts/fetch-libwebrtc.sh)" >> "$GITHUB_ENV"
+        # Not inside the echo: a failed fetch must fail the step, not set
+        # an empty LK_CUSTOM_WEBRTC (webrtc-sys then downloads unverified).
+        run: |
+          dir=$(scripts/fetch-libwebrtc.sh)
+          echo "LK_CUSTOM_WEBRTC=$dir" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
@@ -78,7 +82,11 @@ jobs:
       # webrtc-sys would download libwebrtc unverified; use the pinned SHA-256.
       - name: Fetch pinned libwebrtc
         shell: bash
-        run: echo "LK_CUSTOM_WEBRTC=$(scripts/fetch-libwebrtc.sh)" >> "$GITHUB_ENV"
+        # Not inside the echo: a failed fetch must fail the step, not set
+        # an empty LK_CUSTOM_WEBRTC (webrtc-sys then downloads unverified).
+        run: |
+          dir=$(scripts/fetch-libwebrtc.sh)
+          echo "LK_CUSTOM_WEBRTC=$dir" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
       # The lint job already runs clippy on Linux.
       - name: Clippy (non-Linux only)
@@ -107,7 +115,11 @@ jobs:
       # webrtc-sys would download libwebrtc unverified; use the pinned SHA-256.
       - name: Fetch pinned libwebrtc
         shell: bash
-        run: echo "LK_CUSTOM_WEBRTC=$(scripts/fetch-libwebrtc.sh)" >> "$GITHUB_ENV"
+        # Not inside the echo: a failed fetch must fail the step, not set
+        # an empty LK_CUSTOM_WEBRTC (webrtc-sys then downloads unverified).
+        run: |
+          dir=$(scripts/fetch-libwebrtc.sh)
+          echo "LK_CUSTOM_WEBRTC=$dir" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
       # The ignored cleaning tests (core lib and call_media) need DeepFilterNet3;
       # the script (pinned SHA-256) fills the default cache dir core reads.
