@@ -1669,6 +1669,18 @@ Phase 2 signed off by the human on 2026-10-02 (merge of PR #3). Every other unti
 - **Tests:** `a_few_late_calls_in_a_second_are_tolerated` (the human's pattern), `the_gpu_is_given_up_after_too_many_late_calls_in_a_second`, `a_gpu_given_up_on_is_tried_again_later_and_later`, and on the GPU `a_gpu_that_fell_behind_is_tried_again` (`--features onnxruntime,test-fakes --ignored`; a `test-fakes` hook, `DeepFilter::fall_behind`, makes the try due at once). The audio GPU suite (6) and the core's `gpu_enhancement` (1) pass on CUDA here; the gate was clean (1698 tests; the `dfn::gpu` unit tests run with `--features onnxruntime`, 4 passed).
 - **Not done:** the bank for other voices is not tried again after giving up (the CPU filters take over for the call, as before); it only gains the more patient rule.
 
+## Dev / the debug builds filled the disk (fixed 2026-10-12)
+
+- **Symptom:** `target/` reached 259 GB (debug 252 GB: test binaries 146 GB, incremental 80 GB, rlibs 27 GB).
+- **Cause:** Cargo keeps every build variant: each mix of features, of `-p` package selections (feature unification differs per selection; `resolver.feature-unification` is still unstable in cargo 1.97.1) and of dependencies gets a full set. Each test binary was about 930 MB (the core, WebRTC and the workspace crates' full debug info), and about 40 of them make one set; there were 5 sets from one day.
+- **Fix:**
+  - Linux builds keep debug info in split DWARF files (`-C split-debuginfo=unpacked` in `.cargo/config.toml`, x86_64 and aarch64; not in the Cargo.toml profile because Windows MSVC supports only `packed`). One debug build of the tests: 43 GB before, 27 GB after; a test binary 934 MB before, 500 MB after; the build took 143 s instead of 166 s. A panic backtrace still shows file and line, and gdb stops on a breakpoint with the source line.
+  - `scripts/trim-target.sh [GB]` removes `target/debug` (`cargo clean --profile dev`) once it is over a limit (80 GB by default); release builds stay.
+  - `docs/building.md` gains a "Disk use" section.
+- **Cleanup done:** `cargo clean --profile dev` (267 GB); the release build was kept.
+- **Left:** the ~40 integration test binaries each link everything; one binary per crate (modules under `tests/`) would save most of the rest, but reorganises the tests and keeps the ones that need a process of their own (`tls_provider`, `log_hygiene`) apart. Not done.
+- **Checks:** a clean `cargo test --workspace --no-run` with the new flags; the gate was clean (1698 tests).
+
 ## Phase 6 steps (calls: MatrixRTC, LiveKit SFU, native audio; plan docs/plans/phase6-calls.md)
 Order (revised 2026-10-02, plan decision 12; again 2026-10-03 by the human): 1–8, 8b, 9, 10, 11, 12, 14, 13, then 15 and 13b. Deferred options (audio-only libwebrtc build, pure-Rust WebRTC stack, PulseAudio backend) are recorded in the plan.
 - [x] 1. libwebrtc supply chain (pinned SHA-256 fetch script, fail-closed build) and livekit dependency (phase6.1)
