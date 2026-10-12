@@ -39,8 +39,13 @@ use super::{UserVolumes, user_volume};
 use crate::api::{CleaningStatus, CoreError, UserId};
 use crate::audio_session::{self, Voice};
 
-/// How long `Room::connect` may take.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long one attempt to open the SFU's signalling websocket may take.
+/// LiveKit's own default is 5 s, too short on a slow or lossy link (TCP,
+/// TLS and the upgrade over a 700 ms round trip with packet loss);
+/// livekit-client, which Element Call uses, allows 15 s.
+const SIGNAL_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long `Room::connect` may take, LiveKit's own retries included.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(45);
 /// Buffer inside the LiveKit audio source, ms (multiple of 10).
 const SOURCE_QUEUE_MS: u32 = 50;
 /// How often what senders say about their voice is read again: a track's
@@ -240,6 +245,7 @@ impl SfuConnection {
     ) -> Result<Self, CoreError> {
         let mut options = RoomOptions::default();
         options.encryption = shared.encryption.clone();
+        options.connect_timeout = SIGNAL_TIMEOUT;
         let (room, room_events) =
             tokio::time::timeout(CONNECT_TIMEOUT, Room::connect(&sfu.url, &sfu.jwt, options))
                 .await
