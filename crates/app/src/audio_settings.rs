@@ -17,7 +17,7 @@ use std::time::Duration;
 use iced::Task;
 use twicecat_core::api::{
     AudioDevice, AudioDeviceId, AudioDevices, AudioSettings, AudioStats, Command, EnhancerBackend,
-    GpuBackend, InputLevel, NoiseSuppression, NsLevel, SkipCleaned, limits,
+    GpuBackend, GpuEnhancement, InputLevel, NoiseSuppression, NsLevel, SkipCleaned, limits,
 };
 
 use crate::state::{App, Message};
@@ -296,6 +296,25 @@ pub fn backend_label(backend: EnhancerBackend) -> String {
         EnhancerBackend::CpuAfterGpuTooSlow => {
             "Running on the CPU: the GPU was too slow (a game may be using it).".to_owned()
         }
+    }
+}
+
+/// The light build has no GPU support at all.
+pub const NO_GPU_IN_BUILD: &str = "This is the light build: it cleans on the CPU only. The full build (cargo feature gpu) can use the GPU.";
+/// The full build found no GPU it can use.
+pub const NO_GPU_FOUND: &str =
+    "No usable GPU found. The GPU needs ONNX Runtime and the GPU model (see docs/building.md).";
+
+/// Why DeepFilterNet3 offers no GPU, once the probe has answered with none;
+/// `None` while a GPU is offered or before the answer.
+pub fn no_gpu_note(gpu: Option<&GpuEnhancement>) -> Option<&'static str> {
+    match gpu {
+        Some(gpu) if gpu.available.is_empty() => Some(if cfg!(feature = "gpu") {
+            NO_GPU_FOUND
+        } else {
+            NO_GPU_IN_BUILD
+        }),
+        _ => None,
     }
 }
 
@@ -1066,6 +1085,27 @@ mod tests {
             drain(&mut rx).as_slice(),
             [Command::StartMicTest { .. }]
         ));
+    }
+
+    #[test]
+    fn the_card_says_why_no_gpu_is_offered() {
+        let none = GpuEnhancement {
+            available: Vec::new(),
+            running: None,
+        };
+        let cuda = GpuEnhancement {
+            available: vec![GpuBackend::Cuda],
+            running: None,
+        };
+        // Before the probe answers, and with a GPU offered: nothing to say.
+        assert_eq!(no_gpu_note(None), None);
+        assert_eq!(no_gpu_note(Some(&cuda)), None);
+        let expected = if cfg!(feature = "gpu") {
+            NO_GPU_FOUND
+        } else {
+            NO_GPU_IN_BUILD
+        };
+        assert_eq!(no_gpu_note(Some(&none)), Some(expected));
     }
 
     #[test]

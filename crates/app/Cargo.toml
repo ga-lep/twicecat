@@ -23,5 +23,11 @@ notify-rust = "=4.18.2"
 tray-icon = { version = "=0.26.1", default-features = false, features = ["ksni"] }
 twicecat-core = { path = "../core" }
 
+[features]
+# The full build: speech enhancement on the GPU (DeepFilterNet3 on ONNX
+# Runtime, loaded at run time; see docs/building.md). Off by default: the
+# light build cleans voices on the CPU only.
+gpu = ["twicecat-core/gpu-enhancement"]
+
 [dev-dependencies]
 iced = { version = "=0.14.0", features = ["image-without-codecs", "advanced"] }
