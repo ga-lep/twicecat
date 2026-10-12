@@ -1598,6 +1598,13 @@ Phase 2 signed off by the human on 2026-10-02 (merge of PR #3). Every other unti
   - `fetch-libwebrtc.sh` retries 6 times (about a minute of back-off).
 - **Checked:** under CI's `bash -e -o pipefail`, the old form exits 0 with an empty value and the new one exits 1; the workflow still parses; the script still fetches and verifies.
 
+## Phase 5 / flaky `rooms::an_encrypted_room_is_created_invited_and_accepted` (fixed 2026-10-12)
+
+- **Symptom:** it failed once in CI (`6d9c00b`) at `rooms.rs:412`: carol's `RoomJoined` had not arrived yet.
+- **Cause (the test):** it waited until carol's room list showed the room as joined, then asserted that the answer to `AcceptInvite` (`RoomJoined`) was already in. The API promises no such order: the sync can bring the joined room before the join request returns, and the core sends `RoomJoined` only then. The app copes with both orders (`select_when_listed`).
+- **Fix:** the test waits for both, in either order.
+- **Checks:** 6 of 6 runs passed; the gate was clean.
+
 ## Phase 6 steps (calls: MatrixRTC, LiveKit SFU, native audio; plan docs/plans/phase6-calls.md)
 Order (revised 2026-10-02, plan decision 12; again 2026-10-03 by the human): 1–8, 8b, 9, 10, 11, 12, 14, 13, then 15 and 13b. Deferred options (audio-only libwebrtc build, pure-Rust WebRTC stack, PulseAudio backend) are recorded in the plan.
 - [x] 1. libwebrtc supply chain (pinned SHA-256 fetch script, fail-closed build) and livekit dependency (phase6.1)

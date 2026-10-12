@@ -403,19 +403,15 @@ async fn an_encrypted_room_is_created_invited_and_accepted() {
             room_id: api_id(&room),
         })
         .await;
+    // The room list and the answer to `AcceptInvite` come in either order:
+    // the sync can bring the joined room before the join request returns.
     p.carol
-        .wait("carol joined", |s| {
+        .wait("carol joined, in the list and answered", |s| {
             s.room(&room).is_some_and(|r| !r.is_invite)
+                && s.joined.iter().any(|r| r.as_str() == room.as_str())
         })
         .await;
     assert_eq!(p.carol.seen.room(&room).unwrap().name, name);
-    assert!(
-        p.carol
-            .seen
-            .joined
-            .iter()
-            .any(|r| r.as_str() == room.as_str())
-    );
 
     p.carol
         .send(Command::OpenRoomDetails {
