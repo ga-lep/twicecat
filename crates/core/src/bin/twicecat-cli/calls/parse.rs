@@ -39,6 +39,10 @@ pub(crate) enum CallCmd {
     Gpu,
     /// Show the audio settings.
     Audio,
+    /// Play a ringtone for direct calls; `None` toggles.
+    Ringtone(Option<bool>),
+    /// Stop the ringtone of the rings sounding now.
+    Silence,
 }
 
 /// `/clean` arguments.
@@ -105,6 +109,8 @@ pub(crate) fn parse(name: &str, arg: &str) -> Option<Result<CallCmd, &'static st
             _ => Err("/mictest [loopback|stop]"),
         },
         "audio" => none(arg, "/audio").map(|()| CallCmd::Audio),
+        "ringtone" => switch(arg, "/ringtone [on|off]").map(CallCmd::Ringtone),
+        "silence" => none(arg, "/silence").map(|()| CallCmd::Silence),
         "gpu" => none(arg, "/gpu").map(|()| CallCmd::Gpu),
         _ => return None,
     };
@@ -261,6 +267,11 @@ mod tests {
         assert_eq!(cmd("/call"), Ok(CallCmd::Call(None)));
         assert_eq!(cmd("/call 2"), Ok(CallCmd::Call(Some("2".into()))));
         assert_eq!(cmd("/leave"), Ok(CallCmd::Leave));
+        assert_eq!(cmd("/ringtone"), Ok(CallCmd::Ringtone(None)));
+        assert_eq!(cmd("/ringtone off"), Ok(CallCmd::Ringtone(Some(false))));
+        assert_eq!(cmd("/ringtone loud"), Err("/ringtone [on|off]"));
+        assert_eq!(cmd("/silence"), Ok(CallCmd::Silence));
+        assert_eq!(cmd("/silence now"), Err("/silence"));
         assert_eq!(cmd("/mute"), Ok(CallCmd::Mute(None)));
         assert_eq!(cmd("/deafen off"), Ok(CallCmd::Deafen(Some(false))));
         assert_eq!(cmd("/ptt on"), Ok(CallCmd::Ptt(Some(true))));

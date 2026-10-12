@@ -8,15 +8,18 @@
 mod common;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use common::{
     DEFAULT_TIMEOUT, TestEnv, create_dm, create_room, expect_event, login_and_run, raw_login,
-    start_core, unique_room_name, wait_for_room,
+    start_core, start_core_with_audio, unique_room_name, wait_for_room,
 };
 use serde_json::Value;
 use twicecat_core::CoreHandle;
 use twicecat_core::api::{
-    CallIntent, CallState, Command, CoreEvent, ListDiff, RoomId, RoomSummary,
+    AUDIO_FRAME_LEN, AudioBackend, CallIntent, CallState, Command, CoreEvent, ListDiff, RoomId,
+    RoomSummary, VirtualAudio,
 };
 use twicecat_core::secrets::InMemorySecretStore;
 
@@ -46,6 +49,65 @@ async fn join(core: &mut CoreHandle, room_id: &str) {
         matches!(state, CoreEvent::CallState(CallState::Connected { .. })),
         "{state:?}"
     );
+}
+
+/// A virtual speaker counting the frames it plays, and the audible ones.
+#[derive(Default)]
+struct Speaker {
+    frames: AtomicU64,
+    audible: AtomicU64,
+}
+
+impl VirtualAudio for Speaker {
+    fn capture(&self, frame: &mut [f32; AUDIO_FRAME_LEN]) {
+        frame.fill(0.0);
+    }
+    fn playback(&self, frame: &[f32; AUDIO_FRAME_LEN]) {
+        self.frames.fetch_add(1, Ordering::Relaxed);
+        if frame.iter().any(|s| s.abs() > 0.01) {
+            self.audible.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Speaker {
+    /// Waits until the speaker played something audible.
+    async fn until_ringing(&self) {
+        let start = self.audible.load(Ordering::Relaxed);
+        let wait = async {
+            while self.audible.load(Ordering::Relaxed) == start {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        tokio::time::timeout(DEFAULT_TIMEOUT, wait)
+            .await
+            .expect("the ringtone plays");
+    }
+
+    /// Waits until nothing plays any more: no frame for 300 ms.
+    async fn until_quiet(&self) {
+        let wait = async {
+            loop {
+                let before = self.frames.load(Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                if self.frames.load(Ordering::Relaxed) == before {
+                    return;
+                }
+            }
+        };
+        tokio::time::timeout(DEFAULT_TIMEOUT, wait)
+            .await
+            .expect("the ringtone stops");
+    }
+}
+
+/// carol with `speaker` as her audio device.
+async fn carol_with(dir: &std::path::Path, speaker: &Arc<Speaker>) -> CoreHandle {
+    let env = TestEnv::load();
+    let audio = AudioBackend::Virtual(speaker.clone() as Arc<dyn VirtualAudio>);
+    let mut core = start_core_with_audio(dir, Arc::new(InMemorySecretStore::new()), audio);
+    login_and_run(&mut core, &env, 3).await;
+    core
 }
 
 /// Lets members at power level 0 publish call memberships (as Element does).
@@ -315,4 +377,108 @@ async fn call_rooms_are_marked_in_the_room_list() {
         .expect("listed as a call room");
     assert!(!summary.is_dm && !summary.is_space);
     alice.commands.send(Command::Shutdown).await.unwrap();
+}
+
+/// A DM ring plays the ringtone on carol's output device; `SilenceRinging`
+/// stops the tone and keeps the ring, which can still be declined.
+#[tokio::test]
+#[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
+async fn a_dm_ring_plays_the_ringtone_until_silenced() {
+    let env = TestEnv::load();
+    let alice_raw = raw_login(1).await;
+    let carol_raw = raw_login(3).await;
+    let room_id = create_dm(&alice_raw, &env.user_id(3)).await.to_string();
+    carol_raw
+        .join_room_by_id(room_id.as_str().try_into().unwrap())
+        .await
+        .unwrap();
+    let (dir_a, dir_c) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let speaker = Arc::new(Speaker::default());
+    let mut alice = logged_in(dir_a.path(), 1).await;
+    let mut carol = carol_with(dir_c.path(), &speaker).await;
+    wait_for_room(&mut alice, &room_id).await;
+    wait_for_room(&mut carol, &room_id).await;
+    speaker.until_quiet().await;
+
+    join(&mut alice, &room_id).await;
+    expect_event(&mut carol, |e| is_ring_in(e, &room_id)).await;
+    speaker.until_ringing().await;
+    carol.commands.send(Command::SilenceRinging).await.unwrap();
+    speaker.until_quiet().await;
+
+    // Still ringing: the decline goes through.
+    carol
+        .commands
+        .send(Command::DeclineCall {
+            room_id: RoomId::from(room_id.as_str()),
+        })
+        .await
+        .unwrap();
+    expect_event(&mut carol, |e| is_stop_in(e, &room_id)).await;
+    expect_event(&mut alice, |e| matches!(e, CoreEvent::CallDeclined { .. })).await;
+
+    for core in [&alice, &carol] {
+        core.commands.send(Command::LeaveCall).await.unwrap();
+        core.commands.send(Command::Shutdown).await.unwrap();
+    }
+}
+
+/// Answering stops the ringtone: no tone during a call.
+#[tokio::test]
+#[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
+async fn answering_stops_the_ringtone() {
+    let env = TestEnv::load();
+    let alice_raw = raw_login(1).await;
+    let carol_raw = raw_login(3).await;
+    let room_id = create_dm(&alice_raw, &env.user_id(3)).await.to_string();
+    carol_raw
+        .join_room_by_id(room_id.as_str().try_into().unwrap())
+        .await
+        .unwrap();
+    let (dir_a, dir_c) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let speaker = Arc::new(Speaker::default());
+    let mut alice = logged_in(dir_a.path(), 1).await;
+    let mut carol = carol_with(dir_c.path(), &speaker).await;
+    wait_for_room(&mut alice, &room_id).await;
+    wait_for_room(&mut carol, &room_id).await;
+
+    join(&mut alice, &room_id).await;
+    expect_event(&mut carol, |e| is_ring_in(e, &room_id)).await;
+    speaker.until_ringing().await;
+    carol
+        .commands
+        .send(Command::JoinCall {
+            room_id: RoomId::from(room_id.as_str()),
+            intent: CallIntent::Audio,
+        })
+        .await
+        .unwrap();
+    expect_all(
+        &mut carol,
+        &[
+            &|e| matches!(e, CoreEvent::CallState(CallState::Connected { .. })),
+            &|e| is_stop_in(e, &room_id),
+        ],
+    )
+    .await;
+    // The call itself plays to the same virtual speaker (silence from
+    // alice's virtual microphone): the tone is gone once nothing audible
+    // arrives for longer than the tone's two-second rest.
+    let wait = async {
+        loop {
+            let before = speaker.audible.load(Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_millis(3200)).await;
+            if speaker.audible.load(Ordering::Relaxed) == before {
+                return;
+            }
+        }
+    };
+    tokio::time::timeout(DEFAULT_TIMEOUT, wait)
+        .await
+        .expect("no tone in a call");
+
+    for core in [&alice, &carol] {
+        core.commands.send(Command::LeaveCall).await.unwrap();
+        core.commands.send(Command::Shutdown).await.unwrap();
+    }
 }

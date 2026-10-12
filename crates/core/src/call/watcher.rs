@@ -22,7 +22,7 @@ use matrix_sdk::ruma::events::{AnySyncMessageLikeEvent, AnySyncStateEvent, State
 use matrix_sdk::ruma::serde::Raw;
 use matrix_sdk::{Client, Room};
 use serde_json::Value;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use super::membership::CALL_MEMBER_EVENT;
@@ -44,6 +44,10 @@ const HELD_FOR_MS: u64 = ringing::MAX_LIFETIME_MS;
 struct Ring {
     event_id: String,
     expires_ms: u64,
+    /// A ring (a DM call), not a quiet notification: it plays the ringtone.
+    loud: bool,
+    /// `SilenceRinging` stopped its ringtone; it still rings.
+    silenced: bool,
 }
 
 /// A notification for a call whose membership has not reached us yet.
@@ -80,6 +84,37 @@ struct WatchState {
     sent: HashMap<String, String>,
     /// Events waiting for their room keys, oldest first.
     held: Vec<Held>,
+    /// Whether a ring should sound: a loud ring not silenced. Updated by
+    /// [`WatchState::sync_loud`] after every change to `rings`.
+    loud: watch::Sender<bool>,
+}
+
+impl WatchState {
+    /// Publishes whether a ring should sound now; only a change wakes the
+    /// ringtone.
+    fn sync_loud(&self) {
+        let loud = self.rings.values().any(|r| r.loud && !r.silenced);
+        self.loud.send_if_modified(|now| {
+            let changed = *now != loud;
+            *now = loud;
+            changed
+        });
+    }
+
+    /// Silences the rings sounding now (`SilenceRinging`).
+    fn silence(&mut self) {
+        for ring in self.rings.values_mut() {
+            ring.silenced = true;
+        }
+        self.sync_loud();
+    }
+
+    /// Removes the ring of `room_id`, if any.
+    fn remove_ring(&mut self, room_id: &str) -> Option<Ring> {
+        let ring = self.rings.remove(room_id);
+        self.sync_loud();
+        ring
+    }
 }
 
 type State = Arc<StdMutex<WatchState>>;
@@ -151,7 +186,18 @@ impl CallWatch {
     /// notification that rang.
     pub(crate) fn take_ring(&self, room_id: &RoomId) -> Option<String> {
         let mut st = self.state.lock().expect("call watch lock");
-        st.rings.remove(room_id.as_str()).map(|r| r.event_id)
+        st.remove_ring(room_id.as_str()).map(|r| r.event_id)
+    }
+
+    /// Whether a ring should sound now, for the ringtone; `false` once the
+    /// watch stops.
+    pub(crate) fn loud(&self) -> watch::Receiver<bool> {
+        self.state.lock().expect("call watch lock").loud.subscribe()
+    }
+
+    /// Stops the ringtone of the rings sounding now; they still ring.
+    pub(crate) fn silence(&self) {
+        self.state.lock().expect("call watch lock").silence();
     }
 
     /// Remembers the notification we sent for our call in `room_id`
@@ -165,6 +211,12 @@ impl CallWatch {
     }
 
     pub(crate) async fn stop(self) {
+        // The ringtone ends with the session.
+        self.state
+            .lock()
+            .expect("call watch lock")
+            .loud
+            .send_replace(false);
         for handle in self.handlers {
             self.client.remove_event_handler(handle);
         }
@@ -410,13 +462,19 @@ async fn ring(
     events: &mpsc::Sender<CoreEvent>,
 ) {
     tracing::debug!(room = %room_id, user = own, "call notification rings");
-    state.lock().expect("call watch lock").rings.insert(
-        room_id.to_owned(),
-        Ring {
-            event_id: waiting.event_id,
-            expires_ms: waiting.incoming.expires_ms,
-        },
-    );
+    {
+        let mut st = state.lock().expect("call watch lock");
+        st.rings.insert(
+            room_id.to_owned(),
+            Ring {
+                event_id: waiting.event_id,
+                expires_ms: waiting.incoming.expires_ms,
+                loud: waiting.incoming.ring,
+                silenced: false,
+            },
+        );
+        st.sync_loud();
+    }
     let _ = events
         .send(CoreEvent::IncomingCall {
             room_id: RoomId::from(room_id),
@@ -449,7 +507,7 @@ async fn on_decline(
             // Declined on another of our devices.
             let ours = st.rings.get(room_id).is_some_and(|r| r.event_id == target);
             if ours {
-                st.rings.remove(room_id);
+                st.remove_ring(room_id);
             }
             ours.then(|| CoreEvent::RingingStopped {
                 room_id: RoomId::from(room_id),
@@ -482,7 +540,7 @@ async fn on_members(room: &Room, own: &str, state: &State, events: &mpsc::Sender
         if count == 0 {
             st.counts.remove(room_id);
         }
-        let ring_stopped = stop_ring && st.rings.remove(room_id).is_some();
+        let ring_stopped = stop_ring && st.remove_ring(room_id).is_some();
         // A waiting notification rings once its sender is in the call (not
         // for someone else's call), unless we joined meanwhile.
         let caller_in = |w: &Waiting| active.iter().any(|m| m.user_id == w.caller);
@@ -530,7 +588,7 @@ async fn recheck(client: Client, own: String, state: State, events: mpsc::Sender
                 .map(|(room, _)| room.clone())
                 .collect();
             for room in &expired {
-                st.rings.remove(room);
+                st.remove_ring(room);
             }
             st.held
                 .retain(|h| now.saturating_sub(h.held_at_ms) < HELD_FOR_MS);
@@ -553,5 +611,65 @@ async fn recheck(client: Client, own: String, state: State, events: mpsc::Sender
                 on_members(&room, &own, &state, &events).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ring(loud: bool) -> Ring {
+        Ring {
+            event_id: "$e".into(),
+            expires_ms: u64::MAX,
+            loud,
+            silenced: false,
+        }
+    }
+
+    fn add(st: &mut WatchState, room: &str, loud: bool) {
+        st.rings.insert(room.into(), ring(loud));
+        st.sync_loud();
+    }
+
+    #[test]
+    fn only_a_loud_ring_sounds() {
+        let mut st = WatchState::default();
+        let rx = st.loud.subscribe();
+        assert!(!*rx.borrow());
+        add(&mut st, "!group:x", false);
+        assert!(!*rx.borrow(), "a quiet notification plays no tone");
+        add(&mut st, "!dm:x", true);
+        assert!(*rx.borrow());
+        st.remove_ring("!group:x");
+        assert!(*rx.borrow(), "the DM still rings");
+        assert!(st.remove_ring("!dm:x").is_some());
+        assert!(!*rx.borrow());
+        assert!(st.remove_ring("!dm:x").is_none());
+    }
+
+    #[test]
+    fn silencing_stops_the_rings_sounding_now_but_not_later_ones() {
+        let mut st = WatchState::default();
+        let mut rx = st.loud.subscribe();
+        add(&mut st, "!a:x", true);
+        st.silence();
+        assert!(!*rx.borrow_and_update());
+        assert!(st.rings.contains_key("!a:x"), "it still rings");
+        add(&mut st, "!b:x", true);
+        assert!(*rx.borrow_and_update(), "a new ring sounds");
+        st.silence();
+        assert!(!*rx.borrow_and_update());
+    }
+
+    #[test]
+    fn only_a_change_wakes_the_ringtone() {
+        let mut st = WatchState::default();
+        let mut rx = st.loud.subscribe();
+        add(&mut st, "!a:x", true);
+        assert!(rx.has_changed().expect("open"));
+        rx.borrow_and_update();
+        add(&mut st, "!b:x", true);
+        assert!(!rx.has_changed().expect("open"), "still loud: no wake-up");
     }
 }
