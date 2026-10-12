@@ -344,6 +344,78 @@ async fn alices_tone_reaches_carols_speakers_and_mute_stops_it() {
     }
 }
 
+/// A mic test asked for during a call is refused, and the call's audio
+/// keeps playing: carol still hears alice's tone afterwards (the core used
+/// to stop the call's audio before refusing).
+#[tokio::test]
+#[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
+async fn a_mic_test_during_a_call_leaves_the_call_playing() {
+    let env = TestEnv::load();
+    let alice_raw = raw_login(1).await;
+    let carol_raw = raw_login(3).await;
+    let room_id = create_room(&alice_raw, &unique_room_name(), Some(&env.user_id(3)))
+        .await
+        .to_string();
+    allow_calls(&alice_raw, &room_id).await;
+    carol_raw
+        .join_room_by_id(room_id.as_str().try_into().unwrap())
+        .await
+        .unwrap();
+
+    let recorder = Arc::new(Recorder::default());
+    let (dir_a, dir_c) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let mut alice = logged_in(
+        dir_a.path(),
+        1,
+        AudioBackend::Virtual(Arc::new(ToneMic::default())),
+    )
+    .await;
+    let mut carol = logged_in(dir_c.path(), 3, AudioBackend::Virtual(recorder.clone())).await;
+    wait_for_room(&mut alice, &room_id).await;
+    wait_for_room(&mut carol, &room_id).await;
+    alice
+        .commands
+        .send(Command::UpdateAudioSettings(tone_settings()))
+        .await
+        .unwrap();
+    expect_event(&mut alice, |e| matches!(e, CoreEvent::AudioSettings(_))).await;
+
+    join(&mut alice, &room_id).await;
+    join(&mut carol, &room_id).await;
+    let alice_id = env.user_id(1);
+    alice_as_seen_by(&mut carol, &alice_id, |p| p.speaking).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(recorder.tone_level(1.0) > HEARD, "the tone before");
+
+    carol
+        .commands
+        .send(Command::StartMicTest { loopback: true })
+        .await
+        .unwrap();
+    let refused = expect_event(&mut carol, |e| matches!(e, CoreEvent::Error(_))).await;
+    assert!(
+        matches!(&refused, CoreEvent::Error(twicecat_core::api::CoreError::Audio(m)) if m.contains("during a call")),
+        "{refused:?}"
+    );
+    // Only what plays after the refusal counts: a stopped call would leave
+    // the recording as it was.
+    let before = recorder.played.lock().unwrap().len();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let new = recorder.played.lock().unwrap()[before..].to_vec();
+    assert!(
+        new.len() as f32 > 1.5 * RATE,
+        "the speakers stopped: {} new samples in 2 s",
+        new.len()
+    );
+    let heard = level_of(&new, TONE_HZ, 1.0);
+    assert!(heard > HEARD, "the tone after the refusal: {heard:.4}");
+
+    for core in [&alice, &carol] {
+        core.commands.send(Command::LeaveCall).await.unwrap();
+        core.commands.send(Command::Shutdown).await.unwrap();
+    }
+}
+
 /// Carol publishes on the second call service (another homeserver's, in
 /// Element Call's multi-SFU mode), alice on the first. Each subscribes on
 /// the other's SFU: alice hears carol's 600 Hz tone, carol alice's 1 kHz.

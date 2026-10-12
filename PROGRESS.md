@@ -2065,9 +2065,17 @@ Plan approved by the human 2026-10-12 (Q1-Q8 answered: the core plays the ringto
 - **Open, for later or other sessions:**
   - Review item 8 (low).
   - A ringback tone for the caller, choosing a ringtone, and a separate ringtone device or volume: out of the approved scope (Q3b).
-  - `Engine::start_mic_test` stops the running audio session before checking for a call, so a `StartMicTest` during a call would cut the call's audio. This is on `main`; the app never sends it in a call. Suggested as a separate task.
   - `crates/core/src/engine/calls.rs` is not compiled (a stale copy of code in `engine/mod.rs`). Suggested as a separate task.
   - The 7 ignored tests that need `scripts/fetch-models.sh` (DeepFilterNet3 models) were not run here (no download made).
+
+### Fix: a mic test asked for during a call no longer cuts the call (found at the wrap-up, done at the human's request)
+- `Engine::start_mic_test` stopped the running audio session before it checked for a call. This was already the case on `main`. During a call that session is the call's audio, so a `StartMicTest` mid-call (the CLI's `/mictest`; the app's button is off in a call) silenced the call's speakers and microphone, then answered "not available during a call".
+- Now the refusal comes first. It also counts an audio session in `Mode::Call` as a call, which covers the time between `start_call_audio` and the call being set.
+- Tests:
+  - `engine::tests::a_mic_test_during_a_call_keeps_the_calls_audio`: a virtual call-mode session stays, and the error is sent.
+  - The ignored stack test `call_media::a_mic_test_during_a_call_leaves_the_call_playing`: carol hears alice's 1 kHz tone, asks for a mic test, is refused, and still hears the tone in the samples played after the refusal.
+- Mutation, caught by both and reverted: stopping the session before the check. The stack test then fails with "the speakers stopped: 0 new samples in 2 s", which is the original bug.
+- Checks: fmt, both clippy runs, `cargo test --workspace` (1690 passed, 151 ignored), the boundary, API, WebRTC and commit scripts all ok. The full ignored run on the local stack passed 147 tests. The only failures were the 7 tests that need `scripts/fetch-models.sh` (the DeepFilterNet models), which was not run here.
 
 ## Phase 6 call UI human checkpoint
 - [x] Plan questions answered and plan approved (2026-10-12).

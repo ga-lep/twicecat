@@ -2024,15 +2024,22 @@ impl Engine {
     /// Opens the microphone (and, with `loopback`, the speakers) and starts
     /// reporting levels; replaces a running mic test.
     async fn start_mic_test(&mut self, loopback: bool) {
-        if let Some(session) = self.audio_session.take() {
-            session.stop().await;
-        }
-        if self.call.is_some() {
+        // Refused before the running session is touched: during a call it
+        // is the call's audio (also while joining, once the call's audio
+        // has started).
+        let call_audio = self
+            .audio_session
+            .as_ref()
+            .is_some_and(|s| s.mode() == Mode::Call);
+        if self.call.is_some() || call_audio {
             self.emit(CoreEvent::Error(CoreError::Audio(
                 "the mic test is not available during a call".into(),
             )))
             .await;
             return;
+        }
+        if let Some(session) = self.audio_session.take() {
+            session.stop().await;
         }
         let settings = self.audio_settings().await.clone();
         let mode = Mode::MicTest { loopback };
@@ -3211,6 +3218,52 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(none, None);
+    }
+
+    /// A mic test asked for during a call is refused and leaves the call's
+    /// audio running (it used to stop it before refusing).
+    #[tokio::test]
+    async fn a_mic_test_during_a_call_keeps_the_calls_audio() {
+        struct Silence;
+        impl crate::api::VirtualAudio for Silence {
+            fn capture(&self, frame: &mut [f32; crate::api::AUDIO_FRAME_LEN]) {
+                frame.fill(0.0);
+            }
+            fn playback(&self, _: &[f32; crate::api::AUDIO_FRAME_LEN]) {}
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, mut rx) = oauth_engine(dir.path());
+        engine.config.audio = AudioBackend::Virtual(Arc::new(Silence));
+        // The call's audio, as `start_call_audio` opens it.
+        let (session, outgoing) = AudioSession::start(
+            &AudioSettings::default(),
+            Mode::Call,
+            &engine.config.audio,
+            engine.events.clone(),
+        )
+        .await
+        .expect("virtual call audio");
+        assert!(outgoing.is_some());
+        engine.audio_session = Some(session);
+        engine.start_mic_test(true).await;
+        assert_eq!(
+            engine.audio_session.as_ref().map(AudioSession::mode),
+            Some(Mode::Call),
+            "the call's audio still runs"
+        );
+        let refused = loop {
+            match rx.recv().await.expect("an event") {
+                CoreEvent::Error(e) => break e,
+                _ => continue,
+            }
+        };
+        assert!(
+            matches!(&refused, CoreError::Audio(m) if m.contains("during a call")),
+            "{refused:?}"
+        );
+        if let Some(session) = engine.audio_session.take() {
+            session.stop().await;
+        }
     }
 
     /// An expired session ends the mic test (and the call): nothing of it
