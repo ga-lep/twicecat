@@ -1621,6 +1621,18 @@ Phase 2 signed off by the human on 2026-10-02 (merge of PR #3). Every other unti
   - It then checks that the count never exceeds the elapsed real time (one frame per 10 ms, plus 2), which shows it runs in real time and not free-running.
 - **Checks:** the test passes, also 30 runs pinned to one busy CPU; the gate was clean.
 
+## Phase 6 / joining a call over `wss://` panicked (fixed 2026-10-12)
+
+- **Symptom:** the human joined a call in the app against a real server. The core thread panicked in rustls: "Could not automatically determine the process-level CryptoProvider". The backtrace went through LiveKit's `Room::connect`, then tokio-tungstenite, then `ClientConfig::builder_with_protocol_versions`.
+- **Cause:**
+  - matrix-sdk turns on rustls' `aws-lc-rs` provider, and LiveKit's reqwest turns on `ring` (`cargo tree -e features -i rustls`). With both built in, rustls will not pick a process default.
+  - matrix-sdk's own client passes its provider explicitly, but tokio-tungstenite asks for the process default.
+  - The local stack's LiveKit is plain `ws://`, so no test ever reached TLS. Both builds, light and full, were affected.
+- **Fix:** `Core::start` installs aws-lc-rs (matrix-sdk's choice) as the process default; one that is already installed stays. `rustls` is now a direct dependency of the core. It was already in the lock at 0.23.45 with that feature, so the lock only gains the dependency entry.
+- **Test:** `tests/tls_provider.rs`, a binary of its own so that the process starts without a provider. It checks there is none before `Core::start`, one after, and that `ClientConfig::builder()` (the call that panicked) works. It fails without the fix.
+- **Checks:** the gate was clean (1692 tests); `call_signalling` and `login` on the local stack pass.
+- **Open (human):** join a call on a real `wss://` server again (added to the checkpoint list).
+
 ## Phase 6 steps (calls: MatrixRTC, LiveKit SFU, native audio; plan docs/plans/phase6-calls.md)
 Order (revised 2026-10-02, plan decision 12; again 2026-10-03 by the human): 1–8, 8b, 9, 10, 11, 12, 14, 13, then 15 and 13b. Deferred options (audio-only libwebrtc build, pure-Rust WebRTC stack, PulseAudio backend) are recorded in the plan.
 - [x] 1. libwebrtc supply chain (pinned SHA-256 fetch script, fail-closed build) and livekit dependency (phase6.1)
@@ -2201,5 +2213,6 @@ Plan approved by the human 2026-10-12 (Q1-Q8 answered: the core plays the ringto
 - [ ] (step 19) In a call: the call bar (name, phase, lock, Mute/Deafen/Leave, notice ✕) at the bottom of the room list and the participants panel (pictures, speaking ring, 🔇, "(you)", cleaning words, −/+ and slider, cleaning menu) in light and dark themes on each OS; mute and deafen heard (or not) on the other side, including Ctrl+Shift+M/D with the composer focused; per-person volume and cleaning by ear; the slider sends after a mouse release and after a wheel turn; a voice room opens the panel on join.
 - [ ] (step 20) The ringtone by ear: a DM call from Element Web or another Twicecat rings on the chosen output device at the master volume (not too loud in headphones, audible across a room on speakers), stops when answered, declined (here or on another device), when the caller hangs up, after about 90 s, and with `/silence` in the CLI (Esc in the app, Task 5); no tone for a group call or while in a call; `/ringtone off` keeps it quiet. Also with a Bluetooth headset as the output device.
 - [ ] (step 21) Incoming calls with Element Web/X and another Twicecat: the card (picture, name, Decline/Accept) in both themes; Accept joins, Decline tells the caller; Esc hides the card and silences the tone; the taskbar/dock flashes (Critical) for a DM ring on Windows, macOS, GNOME and KDE; the desktop notification shows while the window is unfocused (with and without "Show message content") and a click opens the room; a group call only notifies.
+- [ ] Joining a call on a server whose LiveKit uses `wss://` connects (it panicked in rustls before the TLS provider fix).
 - [ ] RustRover lists **Twicecat full (GPU)** and **Twicecat light (CPU only)** and both run. In the light build, with DeepFilterNet3 chosen, the card says it is the light build; in the full build it offers **Use the GPU** and shows "Running on the GPU (CUDA)" during a mic test.
 - [ ] (step 22) The Voice & audio card in both themes on each OS: device menus with a USB and a Bluetooth headset plugged in and out while it is open ("(not connected)" keeps the choice, and the device comes back), each processing option by ear (WebRTC strengths, RNNoise, DeepFilterNet3 with and without the GPU; echo cancellation on open speakers; "other apps' sound" with a game or video), gain and volume, the voice quality menu, the mic test meter and "Hear myself" on headphones, the ringtone switch, cleaning other voices and its skip menu in a call with Element Call, the announcement switch, and the diagnostics during a call.
