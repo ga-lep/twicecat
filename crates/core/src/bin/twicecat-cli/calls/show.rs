@@ -226,6 +226,7 @@ pub(super) fn describe(s: &AudioSettings, devices: &AudioDevices) -> Vec<String>
         ),
         others,
         announced.to_owned(),
+        format!("Ringtone {}.", on_off(s.ringtone)),
     ]
 }
 

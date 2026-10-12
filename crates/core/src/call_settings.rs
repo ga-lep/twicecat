@@ -137,6 +137,31 @@ mod tests {
     }
 
     #[test]
+    fn a_file_from_before_the_ringtone_setting_rings() {
+        let (_dir, paths) = paths();
+        paths
+            .write_call_settings(
+                br#"{"version": 1, "settings": {"output_volume_percent": 80, "voice_bitrate_kbps": 32}}"#,
+            )
+            .unwrap();
+        let loaded = load(&paths);
+        assert!(loaded.problem.is_none());
+        assert!(loaded.settings.ringtone, "missing reads as on");
+        assert_eq!(loaded.settings.output_volume_percent, 80);
+    }
+
+    #[test]
+    fn the_ringtone_setting_round_trips() {
+        let (_dir, paths) = paths();
+        let settings = AudioSettings {
+            ringtone: false,
+            ..AudioSettings::default()
+        };
+        save(&paths, &settings).unwrap();
+        assert!(!load(&paths).settings.ringtone);
+    }
+
+    #[test]
     fn loaded_values_are_validated() {
         let (_dir, paths) = paths();
         paths

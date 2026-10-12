@@ -8,3 +8,6 @@ Task 2: complete (commit "feat(app): show calls in the room list and a call butt
 Task 3: started
 Task 3: complete (commit "feat(app): show the call bar and the participants panel", gate ok: 1630 tests passed)
   notes: [iced] slider takes no keyboard focus, so −/+ buttons and a 400 ms settle timer (wheel has no release); [layout] the participants panel is a fifth slot of the panes row (the room pane tree is unchanged); [members] the call room's member list is kept by the call model even when another room is open
+Task 4: started
+Task 4: complete (commit "feat(core): play a ringtone while a direct call rings", gate ok; local stack: call_ringing 6 passed; full ignored run 145 passed, 7 failed, all needing scripts/fetch-models.sh, which was not run)
+  notes: [design] the watcher publishes "a loud ring" on a watch channel; a per-session Ringer opens a playback-only AudioIo while the engine's gate allows it; [api] Command::SilenceRinging and AudioSettings::ringtone (Q3b); [tests] timing-based ringer tests poll with 5 s deadlines, 20 runs clean; [env] DeepFilterNet models not fetched here

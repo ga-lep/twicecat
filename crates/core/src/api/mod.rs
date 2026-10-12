@@ -435,6 +435,9 @@ pub enum Command {
         /// Room that rings.
         room_id: RoomId,
     },
+    /// Stop the ringtone of the rooms ringing now, and keep their rings
+    /// (they can still be answered or declined). A later ring sounds again.
+    SilenceRinging,
     /// Mute or unmute the microphone in the current call.
     SetMicMuted(bool),
     /// Deafen: play nothing and mute the microphone (Discord semantics).
@@ -765,6 +768,7 @@ impl fmt::Debug for Command {
                 .field("intent", intent)
                 .finish(),
             Self::LeaveCall => f.write_str("LeaveCall"),
+            Self::SilenceRinging => f.write_str("SilenceRinging"),
             Self::DeclineCall { room_id } => f
                 .debug_struct("DeclineCall")
                 .field("room_id", room_id)
@@ -1038,6 +1042,11 @@ pub enum CoreEvent {
     },
     /// Someone rings this user, or (with `ring: false`) lets them know a
     /// call started in a group room.
+    ///
+    /// A ring also plays a ringtone on the output device
+    /// ([`AudioSettings::ringtone`]) until the ringing stops
+    /// ([`CoreEvent::RingingStopped`]), the user joins a call, or
+    /// [`Command::SilenceRinging`]; never while this device is in a call.
     IncomingCall {
         /// Room that rings.
         room_id: RoomId,

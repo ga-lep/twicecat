@@ -205,6 +205,8 @@ impl Calls {
                 let p = &mut s.processing;
                 p.auto_gain = on.unwrap_or(!p.auto_gain);
             }),
+            CallCmd::Ringtone(on) => self.edit(|s| s.ringtone = on.unwrap_or(!s.ringtone)),
+            CallCmd::Silence => Reply::send(Command::SilenceRinging, "Ringtone silenced."),
             CallCmd::Gate(arg) => self.edit(|s| {
                 s.input_mode = match (arg, s.input_mode) {
                     (GateArg::Auto, InputMode::VoiceActivity { threshold_db, .. }) => {
@@ -402,7 +404,7 @@ impl Calls {
                 self.last_ring = Some(room_id);
                 if ring {
                     vec![format!(
-                        "Incoming call from {caller} in {room}. /call to answer, /decline to decline."
+                        "Incoming call from {caller} in {room}. /call to answer, /decline to decline, /silence to stop the ringtone."
                     )]
                 } else {
                     vec![format!("{caller} started a call in {room}. /call to join.")]
@@ -776,7 +778,9 @@ mod tests {
         );
         assert_eq!(
             lines,
-            ["Incoming call from @alice:x in !dm:x. /call to answer, /decline to decline."]
+            [
+                "Incoming call from @alice:x in !dm:x. /call to answer, /decline to decline, /silence to stop the ringtone."
+            ]
         );
         let decline = calls.command(CallCmd::Decline(None), &[], None);
         assert_eq!(
@@ -815,7 +819,9 @@ mod tests {
             release_delay_ms: 300,
         };
         type Check = fn(&AudioSettings) -> bool;
-        let cases: [(CallCmd, Check); 12] = [
+        let cases: [(CallCmd, Check); 14] = [
+            (CallCmd::Ringtone(None), |s| !s.ringtone),
+            (CallCmd::Ringtone(Some(true)), |s| s.ringtone),
             (CallCmd::Ns(NoiseSuppression::Off), |s| {
                 s.processing.noise_suppression == NoiseSuppression::Off
             }),

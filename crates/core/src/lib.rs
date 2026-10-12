@@ -22,6 +22,7 @@ mod oauth;
 mod outgoing;
 pub mod paths;
 mod rich_text;
+mod ringtone;
 mod room_list;
 mod rooms;
 pub mod secrets;

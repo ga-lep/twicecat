@@ -1770,7 +1770,7 @@ Plan approved by the human 2026-10-12 (Q1-Q8 answered: the core plays the ringto
 - [x] 17. Call model and core events in the app (phase6.17)
 - [x] 18. Room list call counts, voice rooms, the header's call button (phase6.18)
 - [x] 19. In-call view: call bar, participants, mute, deafen, per-user volume and cleaning (phase6.19)
-- [ ] 20. Ringtone in the core (phase6.20)
+- [x] 20. Ringtone in the core (phase6.20)
 - [ ] 21. Incoming calls, with a stack round trip (phase6.21)
 - [ ] 22. Voice & audio settings (phase6.22)
 - [ ] 23. Wrap-up (phase6.23)
@@ -1897,7 +1897,46 @@ Plan approved by the human 2026-10-12 (Q1-Q8 answered: the core plays the ringto
 - **Docs:** `docs/accessibility.md` covers the two shortcuts, the Esc order, the call controls, the slider's keyboard limit, and the "not colour alone" marks.
 - **Gate:** fmt, clippy (also `--all-features`), `cargo test --workspace` 1630 passed / 0 failed / 147 ignored, and the dependency, API, no-download and commit checks: ok.
 
+### Step 20: the ringtone in the core (phase6.20)
+- **API addition** (approved in plan Q3b):
+  - `Command::SilenceRinging`;
+  - `AudioSettings::ringtone: bool`, default `true`. Older `call_settings.json` files read as `true` through the struct's `#[serde(default)]`, with no version bump.
+  - The rustdoc of `CoreEvent::IncomingCall` says when the tone plays.
+  - `scripts/check-core-api.sh` passes.
+- **Built:**
+  - **The watcher.** `call/watcher.rs`: `Ring` gains `loud` (from the notification's `ring`) and `silenced`. `WatchState` gains a `watch::Sender<bool>`, "a loud, unsilenced ring exists". It is republished by `sync_loud` after every change to the rings: ring, take, decline on another device, the call ending or joined on another device, expiry, silence. All removals go through `remove_ring`. `CallWatch::loud()` subscribes, `CallWatch::silence()` silences the rings sounding now (later rings sound again), and `CallWatch::stop` sends `false` first.
+  - **The tone.** New `crates/core/src/ringtone.rs`. `Tone` is a `twicecat_audio::FrameProcessor`: 440 + 480 Hz, 1 s on and 2 s off, 10 ms fades, each sine at 0.15 × master volume / 100 (peak 0.3, about −10 dBFS at 100 %).
+  - **The ringer.** `Ringer::start(loud, gate, backend)` runs a task that opens a playback-only `AudioIo` (`IoConfig { capture: false, playback: true, output_device, .. }`, or `start_virtual` for `AudioBackend::Virtual`) while `loud` and the gate's `playable()` agree. It reopens the device when the gate's device or volume changes, and closes it otherwise. Opening and closing run in `spawn_blocking`, because dropping an `AudioIo` joins its thread. A failure to open is logged (fixed text) and retried on the next change. `Ringer::stop` closes the device and ends the task, and so does the watch closing.
+  - **The engine.** It keeps `ring_gate: watch::Sender<RingGate>` (in a call, `ringtone`, output device, master volume) and updates it on:
+    - joining (in a call from `Joining` on);
+    - a failed join, a leave, a lost call server;
+    - the settings' first load and every `store_audio_settings`.
+
+    Each session's `Syncing` owns a `Ringer`, started with the `CallWatch` and stopped right after it in `stop_tasks` (logout, shutdown). `SilenceRinging` calls `CallWatch::silence`; with nothing ringing it does nothing.
+  - **CLI.** `/silence` and `/ringtone [on|off]`, with help lines. `/audio` adds "Ringtone on/off." The incoming-call line adds "/silence to stop the ringtone".
+- **APIs read** (rule 2):
+  - `twicecat_audio::FrameProcessor` (`crates/audio/src/pipeline.rs:22`).
+  - `AudioIo::start`, which refuses only when nothing is open (`io/mod.rs:148-150`); with no capture, a 10 ms timer paces processing (`pipeline.rs:8`). `AudioIo::start_virtual` (:237), and the `Drop` that joins the thread (:316).
+  - tokio 1.53.1 `watch::Sender::{send_if_modified (sync/watch.rs:1171), send_replace (:1229), subscribe (:1387)}`, `Default` (:211), `Receiver::{borrow_and_update (:676), changed (:818)}`.
+- **Tests:**
+  - **Unit, `ringtone::tests` (8).** The cycle (on, silent rest, the next cycle), the fades (first sample 0, largest step < 0.03), the volume (200 % twice 100 %, 0 % silent), the gate. Ringer runs against a virtual speaker: a loud ring plays until it stops; no tone in a call or when turned off, and joining a call stops it; a new volume reopens it and `stop` closes it; the watch closing ends it. These are timing-based on the virtual 10 ms clock, so they poll with 5 s deadlines; 20 runs in a row passed.
+  - **Unit, `call::watcher::tests` (3).** Only loud rings sound; silencing keeps the ring and a later ring sounds; only a change wakes the receiver.
+  - **Unit, `call_settings` (2).** A file without `ringtone` reads as on; `ringtone: false` round-trips.
+  - **The serde shape lock** `api::audio::tests::serde_shape_is_stable` now includes `"ringtone": true`. It caught the format change in the gate, as it should.
+  - **CLI.** Parsing of `/ringtone` and `/silence`; `/ringtone` toggles and sets.
+  - **Stack** (`crates/core/tests/call_ringing.rs`, ignored, carol on a counting virtual speaker):
+    - `a_dm_ring_plays_the_ringtone_until_silenced`: the tone reaches the speaker; `SilenceRinging` closes it; the ring can still be declined, and alice gets `CallDeclined`.
+    - `answering_stops_the_ringtone`: nothing audible for 3.2 s, longer than the tone's 2 s rest, once connected.
+
+    Mutation, caught and reverted: `SilenceRinging` doing nothing makes the first test time out.
+- **Local stack runs:**
+  - `scripts/stack.sh up -d --wait`, `scripts/create-test-users.sh`, then `cargo test -p twicecat-core --test call_ringing -- --ignored --test-threads=1`: 6 passed.
+  - The full ignored run, `cargo test --workspace --no-fail-fast -- --ignored --skip keyring --skip hardware_`: 145 passed, 7 failed. The 7 are all marked "needs scripts/fetch-models.sh", and the DeepFilterNet models are not fetched on this machine: `twicecat-audio` `deepfilter` (3), `call::cleaning::tests::the_cpu_filters_take_over_after_a_give_up`, and `call_media`'s `remote_voices_are_cleaned_when_asked`, `voices_cleaned_at_their_source_are_left_alone`, `without_a_gpu_voices_are_cleaned_on_the_cpu`. The models were not fetched, because that is a download.
+  - Every other call suite (`call_media`, `call_signalling`, `call_settings`, `cli`) passed with the ringer running in each session, so the tone does not reach the media tests' virtual devices.
+- **Gate** (with this step's changes only): fmt, clippy (also `--all-features`), `cargo test --workspace` 1643 passed / 0 failed / 149 ignored, and the dependency, API (with the new API), no-download and commit checks: ok.
+
 ## Phase 6 call UI human checkpoint
 - [x] Plan questions answered and plan approved (2026-10-12).
 - [ ] (step 18) The call pill (🔊 with the count; highlighted while ringing), the "Voice" tag and the header's call button (Call, Join call (N), Join voice, Joining…, Leave call) read well in light and dark themes, and the emoji renders on each OS; Tab reaches the call button.
 - [ ] (step 19) In a call: the call bar (name, phase, lock, Mute/Deafen/Leave, notice ✕) at the bottom of the room list and the participants panel (pictures, speaking ring, 🔇, "(you)", cleaning words, −/+ and slider, cleaning menu) in light and dark themes on each OS; mute and deafen heard (or not) on the other side, including Ctrl+Shift+M/D with the composer focused; per-person volume and cleaning by ear; the slider sends after a mouse release and after a wheel turn; a voice room opens the panel on join.
+- [ ] (step 20) The ringtone by ear: a DM call from Element Web or another Twicecat rings on the chosen output device at the master volume (not too loud in headphones, audible across a room on speakers), stops when answered, declined (here or on another device), when the caller hangs up, after about 90 s, and with `/silence` in the CLI (Esc in the app, Task 5); no tone for a group call or while in a call; `/ringtone off` keeps it quiet. Also with a Bluetooth headset as the output device.

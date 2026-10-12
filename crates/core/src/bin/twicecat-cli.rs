@@ -64,6 +64,8 @@ CALLS (voice, MatrixRTC; joining opens the microphone and speakers):
                           answer the last ring)
     /leave                Hang up
     /decline [n|id]       Decline the ring (the last one by default)
+    /silence              Stop the ringtone (the call still rings)
+    /ringtone [on|off]    Play a ringtone for direct calls
     /who                  List the call's participants
     /mute [on|off]        Mute the microphone (toggles without an argument)
     /deafen [on|off]      Hear nothing and mute the microphone

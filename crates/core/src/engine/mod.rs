@@ -47,6 +47,7 @@ use crate::notifications::{self, NotificationTasks};
 use crate::oauth::authorize;
 use crate::outgoing::outgoing_content;
 use crate::paths::DataPaths;
+use crate::ringtone::{RingGate, Ringer};
 use crate::room_list::{Registered, filter_for, loaded_event, map_batch, map_diff};
 use crate::rooms::{self, RoomTasks};
 use crate::secrets::{SecretError, SecretStore};
@@ -130,6 +131,7 @@ impl Core {
             mic_muted: false,
             deafened: false,
             call_reconnects: 0,
+            ring_gate: watch::channel(RingGate::default()).0,
         };
         tokio::spawn(engine.run(cmd_rx));
         CoreHandle {
@@ -153,6 +155,8 @@ struct Syncing {
     more_rooms: mpsc::Sender<()>,
     /// Rings and the calls in every room.
     calls: CallWatch,
+    /// The ringtone of this session's rings.
+    ringer: Ringer,
 }
 
 /// The room whose timeline is open, the task forwarding its diffs and the
@@ -296,6 +300,7 @@ impl Active {
         // of, then ends. Only then is the service stopped here, so the store
         // is never deleted while SDK tasks still use it.
         sync.calls.stop().await;
+        sync.ringer.stop().await;
         sync.cancel.cancel();
         let _ = sync.supervisor.await;
         sync.room_list.abort();
@@ -523,6 +528,9 @@ struct Engine {
     deafened: bool,
     /// Consecutive SFU reconnects of the current call.
     call_reconnects: u32,
+    /// Whether the ringtone may play, and where; each session's ringer
+    /// follows it.
+    ring_gate: watch::Sender<RingGate>,
 }
 
 /// An OAuth login in progress. Its task builds the client, emits `OAuthUrl`,
@@ -1383,6 +1391,11 @@ impl Engine {
                 }
             }
             Command::DeclineCall { room_id } => self.decline_call(room_id).await,
+            Command::SilenceRinging => {
+                if let Some(calls) = self.calls() {
+                    calls.silence();
+                }
+            }
             Command::ListAudioDevices => self.list_audio_devices().await,
             Command::StartMicTest { loopback } => self.start_mic_test(loopback).await,
             Command::StopMicTest => {
@@ -1675,6 +1688,7 @@ impl Engine {
                 self.emit(CoreEvent::Error(problem)).await;
             }
             self.audio_settings = Some(loaded.settings);
+            self.update_ring_gate(self.call.is_some());
         }
         self.audio_settings.as_ref().expect("loaded above")
     }
@@ -1688,6 +1702,7 @@ impl Engine {
             .await
             .and_then(|r| r);
         self.audio_settings = Some(settings.clone());
+        self.update_ring_gate(self.call.is_some());
         if let Ok(mut shared) = self.user_volumes.write() {
             shared.clone_from(&settings.user_volumes);
         }
@@ -1733,7 +1748,11 @@ impl Engine {
                 .await;
                 return;
             }
-            self.leave_call().await;
+            // The gate stays closed from here: a ring still sounding (the
+            // one being answered) must not play while one call ends and
+            // the next begins.
+            self.update_ring_gate(true);
+            self.end_call(true).await;
         }
         // Participants carry the per-user volumes.
         let volumes = self.audio_settings().await.user_volumes.clone();
@@ -1742,6 +1761,8 @@ impl Engine {
         }
         self.mic_muted = false;
         self.deafened = false;
+        // No ringtone while joining or in a call.
+        self.update_ring_gate(true);
         self.emit(CoreEvent::CallState(CallState::Joining {
             room_id: room_id.clone(),
         }))
@@ -1778,6 +1799,7 @@ impl Engine {
             }
             Err(e) => {
                 self.stop_call_audio().await;
+                self.update_ring_gate(false);
                 self.emit(CoreEvent::CallState(CallState::Left {
                     room_id,
                     reason: CallEndReason::Failed(e.to_string()),
@@ -1889,6 +1911,7 @@ impl Engine {
                     call.leave().await;
                 }
                 self.stop_call_audio().await;
+                self.update_ring_gate(false);
                 self.emit(CoreEvent::CallState(CallState::Left {
                     room_id,
                     reason: CallEndReason::Failed("the call server connection was lost".into()),
@@ -1896,6 +1919,19 @@ impl Engine {
                 .await;
             }
         }
+    }
+
+    /// Tells the ringtone whether it may play (not `in_call`, the setting)
+    /// and where (output device, master volume). Settings not loaded yet
+    /// read as the defaults.
+    fn update_ring_gate(&self, in_call: bool) {
+        let settings = self.audio_settings.clone().unwrap_or_default();
+        let gate = RingGate::from_settings(&settings, in_call);
+        self.ring_gate.send_if_modified(|now| {
+            let changed = *now != gate;
+            *now = gate;
+            changed
+        });
     }
 
     /// The session's call watcher, while syncing.
@@ -1943,6 +1979,12 @@ impl Engine {
 
     /// Leaves the current call, if any.
     async fn leave_call(&mut self) {
+        self.end_call(false).await;
+    }
+
+    /// Leaves the current call, if any; `joining_next` keeps the ringtone's
+    /// gate closed for the call joined right after.
+    async fn end_call(&mut self, joining_next: bool) {
         if let Some(call) = self.call.take() {
             let room_id = call.room_id.clone();
             if let Some(calls) = self.calls() {
@@ -1950,6 +1992,7 @@ impl Engine {
             }
             call.leave().await;
             self.stop_call_audio().await;
+            self.update_ring_gate(joining_next);
             self.emit(CoreEvent::CallState(CallState::Left {
                 room_id,
                 reason: CallEndReason::Hangup,
@@ -2923,6 +2966,12 @@ impl Engine {
 
     /// Builds and starts the sync service and the event forwarders.
     async fn start_sync(&mut self) {
+        if self.active.is_none() {
+            return;
+        }
+        // The ringtone's gate needs the stored settings (ringtone on or
+        // off, device, volume) before the first ring can arrive.
+        let _ = self.audio_settings().await;
         let Some(active) = self.active.as_ref() else {
             return;
         };
@@ -2957,6 +3006,11 @@ impl Engine {
             self.events.clone(),
         ));
         let calls = CallWatch::start(&active.client, self.events.clone());
+        let ringer = Ringer::start(
+            calls.loud(),
+            self.ring_gate.subscribe(),
+            self.config.audio.clone(),
+        );
         service.start().await;
         if let Some(active) = self.active.as_mut() {
             active.sync = Some(Syncing {
@@ -2967,6 +3021,7 @@ impl Engine {
                 room_list,
                 more_rooms,
                 calls,
+                ringer,
             });
         }
     }
@@ -3074,6 +3129,7 @@ mod tests {
             mic_muted: false,
             deafened: false,
             call_reconnects: 0,
+            ring_gate: watch::channel(RingGate::default()).0,
         }
     }
 
@@ -3145,6 +3201,32 @@ mod tests {
         assert_eq!(none, None);
     }
 
+    #[tokio::test]
+    async fn the_stored_ringtone_setting_reaches_the_gate_when_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let stored = AudioSettings {
+            ringtone: false,
+            output_volume_percent: 40,
+            ..AudioSettings::default()
+        };
+        call_settings::save(&DataPaths::at(dir.path()), &stored).unwrap();
+        let (mut engine, _rx) = oauth_engine(dir.path());
+        let gate = engine.ring_gate.subscribe();
+        assert!(gate.borrow().enabled, "the defaults until loaded");
+        let _ = engine.audio_settings().await;
+        let now = gate.borrow().clone();
+        assert!(!now.enabled && !now.in_call);
+        assert_eq!(now.volume_percent, 40);
+        // Joining closes it; the call's end opens it again.
+        engine.update_ring_gate(true);
+        assert!(gate.borrow().in_call);
+        engine.end_call(false).await;
+        // No call to end: the gate is left as it was.
+        assert!(gate.borrow().in_call);
+        engine.update_ring_gate(false);
+        assert!(!gate.borrow().in_call);
+    }
+
     fn oauth_engine(dir: &std::path::Path) -> (Engine, mpsc::Receiver<CoreEvent>) {
         let (events, rx) = mpsc::channel(8);
         let engine = Engine {
@@ -3169,6 +3251,7 @@ mod tests {
             mic_muted: false,
             deafened: false,
             call_reconnects: 0,
+            ring_gate: watch::channel(RingGate::default()).0,
         };
         (engine, rx)
     }

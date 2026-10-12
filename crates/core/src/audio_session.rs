@@ -97,7 +97,7 @@ pub(crate) enum Mode {
 }
 
 /// Adapts the API's [`VirtualAudio`] to the audio crate.
-struct Virtual(Arc<dyn VirtualAudio>);
+pub(crate) struct Virtual(pub(crate) Arc<dyn VirtualAudio>);
 
 impl VirtualDevice for Virtual {
     fn capture(&mut self, frame: &mut Frame) {

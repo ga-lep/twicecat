@@ -366,6 +366,10 @@ pub struct AudioSettings {
     pub user_cleaning: BTreeMap<UserId, VoiceCleaning>,
     /// What others learn about your microphone's cleaning.
     pub announce_cleaning: CleaningAnnouncement,
+    /// Play a ringtone on the output device, at the master volume, while a
+    /// direct call rings (`CoreEvent::IncomingCall { ring: true }`). Missing
+    /// from files written before it existed, which read as `true`.
+    pub ringtone: bool,
 }
 
 impl Default for AudioSettings {
@@ -387,6 +391,7 @@ impl Default for AudioSettings {
             remote_cleaning: RemoteCleaning::default(),
             user_cleaning: BTreeMap::new(),
             announce_cleaning: CleaningAnnouncement::default(),
+            ringtone: true,
         }
     }
 }
@@ -712,6 +717,7 @@ mod tests {
                 },
                 "user_cleaning": {},
                 "announce_cleaning": { "enabled": true, "cleaned_outside": false },
+                "ringtone": true,
             })
         );
     }
