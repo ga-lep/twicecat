@@ -2013,6 +2013,12 @@ Plan approved by the human 2026-10-12 (Q1-Q8 answered: the core plays the ringto
   Mutation, caught and reverted: sending unchanged settings fails 3 tests.
 - **Gate:** fmt, clippy (also `--all-features`), `cargo test --workspace` 1680 passed / 0 failed / 150 ignored, and the dependency, API, no-download and commit checks: ok.
 
+### Fix: an expired session ends the call and the mic test (found by the branch review)
+- On `SessionChange::UnknownToken`, the engine used to stop the session's tasks without leaving the call or stopping the audio session. This was already the case on `main`.
+- As a result, a revoked token during a call left the call's media and the microphone running behind the login screen. Since this branch, the ringtone's gate also stayed "in a call" until the next call.
+- Now `Engine::end_session_audio` (leave the call, stop the mic test) runs first. If the dead token cannot remove the membership, the server's delayed leave removes it.
+- Test: `the_end_of_a_session_stops_the_mic_test`, an engine with virtual audio.
+
 ## Phase 6 call UI human checkpoint
 - [x] Plan questions answered and plan approved (2026-10-12).
 - [ ] (step 18) The call pill (🔊 with the count; highlighted while ringing), the "Voice" tag and the header's call button (Call, Join call (N), Join voice, Joining…, Leave call) read well in light and dark themes, and the emoji renders on each OS; Tab reaches the call button.
