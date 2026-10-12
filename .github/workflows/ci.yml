@@ -129,9 +129,13 @@ jobs:
         run: |
           dir=$(scripts/fetch-libwebrtc.sh)
           echo "LK_CUSTOM_WEBRTC=$dir" >> "$GITHUB_ENV"
+      # One key for all shards: they restore the dependencies built on main.
+      # rust-cache never keeps the workspace crates, so each shard compiles
+      # twicecat-core and its tests itself. Only main saves the cache.
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: integration
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # The ignored cleaning tests (core lib and call_media) need DeepFilterNet3;
       # the script (pinned SHA-256) fills the default cache dir core reads.
       - name: Fetch models
