@@ -7,6 +7,7 @@ pub mod actions;
 pub mod avatars;
 pub mod blocking;
 pub mod bridge;
+pub mod calls;
 pub mod composer;
 pub mod dates;
 pub mod dialogs;
