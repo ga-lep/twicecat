@@ -155,6 +155,21 @@ impl Rig {
         }
     }
 
+    /// Frames until `done` holds. The loads run on blocking threads and each
+    /// frame gives them only about 1 ms of real time, so a busy machine (a
+    /// CI runner) needs more frames than a fixed count allows.
+    async fn frames_until(&mut self, what: &str, done: impl Fn(&Self) -> bool) {
+        let limit = std::time::Instant::now() + Duration::from_secs(10);
+        while !done(self) {
+            assert!(
+                std::time::Instant::now() < limit,
+                "{what}: not within 10 s, states {:?}",
+                self.states()
+            );
+            self.frame().await;
+        }
+    }
+
     fn states(&self) -> Vec<State> {
         self.cleaning
             .lock()
@@ -188,18 +203,25 @@ async fn gives_up(why: Option<DeepFilterBackend>) -> Rig {
     let mut rig = rig(false);
     rig.join("a");
     rig.join("b");
-    rig.frames(100).await;
-    assert_eq!(rig.states(), [State::Row(0), State::Row(1)]);
-    assert!(
-        rig.sources
-            .iter()
-            .all(|(_, i)| i.cleaning() == SourceCleaning::Running)
-    );
+    rig.frames_until("both voices on rows and cleaned", |r| {
+        r.states() == [State::Row(0), State::Row(1)]
+            && r.sources
+                .iter()
+                .all(|(_, i)| i.cleaning() == SourceCleaning::Running)
+    })
+    .await;
     if let Some(why) = why {
         rig.status.set(why);
     }
     rig.fail.store(true, Ordering::Relaxed);
     rig.frames(2000).await;
+    // The CPU model is asked for on a blocking thread too.
+    rig.frames_until("the give-up handled", |r| {
+        r.gpu_gave_up().is_some()
+            && r.model_loads.load(Ordering::Relaxed) >= 1
+            && r.states().iter().all(|s| !matches!(s, State::Row(_)))
+    })
+    .await;
     rig
 }
 
@@ -242,7 +264,10 @@ async fn the_gpu_setting_turned_off_and_on_loads_a_new_bank_after_a_give_up() {
     rig.frames(100).await;
     rig.fail.store(false, Ordering::Relaxed);
     rig.cleaning.set_settings(settings(true), BTreeMap::new());
-    rig.frames(100).await;
+    rig.frames_until("a new bank", |r| {
+        r.bank_loads.load(Ordering::Relaxed) == 2 && r.gpu_gave_up().is_none()
+    })
+    .await;
     assert_eq!(rig.bank_loads.load(Ordering::Relaxed), 2);
     assert_eq!(rig.gpu_gave_up(), None);
 }
@@ -251,12 +276,13 @@ async fn the_gpu_setting_turned_off_and_on_loads_a_new_bank_after_a_give_up() {
 async fn a_voice_that_leaves_frees_its_row() {
     let mut rig = rig(false);
     rig.join("a");
-    rig.frames(100).await;
-    assert_eq!(rig.states(), [State::Row(0)]);
+    rig.frames_until("a on a row", |r| r.states() == [State::Row(0)])
+        .await;
     rig.cleaning.remove("@a:test:DEV");
     rig.join("b");
-    rig.frames(100).await;
-    assert_eq!(rig.states(), [State::Row(0)], "the next voice gets row 0");
+    // "the next voice gets row 0"
+    rig.frames_until("b on row 0", |r| r.states() == [State::Row(0)])
+        .await;
 }
 
 #[tokio::test(start_paused = true)]
