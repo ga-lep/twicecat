@@ -2,15 +2,16 @@
 //!
 //! Senders and bodies are untrusted server data: nothing here logs them.
 
-use matrix_sdk::ruma::events::StateEventContentChange;
 use matrix_sdk::ruma::events::room::message::{MessageFormat, MessageType};
+use matrix_sdk::ruma::events::{AnySyncTimelineEvent, StateEventContentChange, TimelineEventType};
+use matrix_sdk::ruma::room_version_rules::RoomVersionRules;
 use matrix_sdk::ruma::{OwnedRoomId, UserId as SdkUserId};
 use matrix_sdk_crypto::types::events::UtdCause;
 use matrix_sdk_ui::timeline::{
     AnyOtherStateEventContentChange, EmbeddedEvent, EncryptedMessage, EventSendState,
     EventTimelineItem, InReplyToDetails, MembershipChange, MsgLikeKind, Profile, ThreadSummary,
     TimelineDetails, TimelineEventShieldState, TimelineEventShieldStateCode,
-    TimelineItem as SdkItem, TimelineItemContent, VirtualTimelineItem,
+    TimelineItem as SdkItem, TimelineItemContent, VirtualTimelineItem, default_event_filter,
 };
 
 use crate::api::{
@@ -225,10 +226,17 @@ fn map_event(event: &EventTimelineItem, own: Option<&SdkUserId>) -> TimelineItem
         TimelineItemContent::OtherState(other) => state(map_other_state(other.content())),
         TimelineItemContent::FailedToParseMessageLike { .. }
         | TimelineItemContent::FailedToParseState { .. } => state(other_state("unknown")),
-        TimelineItemContent::CallInvite | TimelineItemContent::RtcNotification { .. } => {
-            placeholder(PlaceholderKind::Unsupported)
-        }
+        TimelineItemContent::RtcNotification { .. } => state(StateChange::CallStarted),
+        TimelineItemContent::CallInvite => state(StateChange::LegacyCall),
     }
+}
+
+/// What the timelines show: the SDK's choice, without MatrixRTC call
+/// memberships (`org.matrix.msc3401.call.member`). A call client sends one on
+/// every join, leave and refresh, which buried the messages. The room list's
+/// call pill and the call bar show who is in a call.
+pub(crate) fn event_filter(event: &AnySyncTimelineEvent, rules: &RoomVersionRules) -> bool {
+    default_event_filter(event, rules) && event.event_type() != TimelineEventType::CallMember
 }
 
 /// Maps the SDK's non-strict shield to the public one.
@@ -1094,5 +1102,42 @@ mod tests {
             parse_room_id(&bad).unwrap_err(),
             CoreError::UnknownRoom(bad.clone())
         );
+    }
+
+    #[test]
+    fn call_memberships_are_hidden_and_the_rest_kept() {
+        let rules = matrix_sdk::ruma::RoomVersionId::V10.rules().unwrap();
+        let event = |json: serde_json::Value| -> AnySyncTimelineEvent {
+            serde_json::from_value(json).expect("a valid event")
+        };
+        let member = event(serde_json::json!({
+            "type": "org.matrix.msc3401.call.member",
+            "state_key": "_@alice:x_DEVICE",
+            "sender": "@alice:x",
+            "event_id": "$m",
+            "origin_server_ts": 1,
+            "content": {}
+        }));
+        assert!(
+            !event_filter(&member, &rules),
+            "a call membership is hidden"
+        );
+        let text = event(serde_json::json!({
+            "type": "m.room.message",
+            "sender": "@alice:x",
+            "event_id": "$t",
+            "origin_server_ts": 1,
+            "content": { "msgtype": "m.text", "body": "hi" }
+        }));
+        assert!(event_filter(&text, &rules), "a message stays");
+        let name = event(serde_json::json!({
+            "type": "m.room.name",
+            "state_key": "",
+            "sender": "@alice:x",
+            "event_id": "$n",
+            "origin_server_ts": 1,
+            "content": { "name": "Lounge" }
+        }));
+        assert!(event_filter(&name, &rules), "other state stays");
     }
 }

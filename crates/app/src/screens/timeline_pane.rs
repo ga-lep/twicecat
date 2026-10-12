@@ -1077,6 +1077,8 @@ pub fn state_text(actor: &str, change: &StateChange) -> String {
         StateChange::Topic => format!("{actor} changed the topic"),
         StateChange::RoomAvatar => format!("{actor} changed the room avatar"),
         StateChange::Encryption => format!("{actor} turned on encryption"),
+        StateChange::CallStarted => format!("{actor} started a call"),
+        StateChange::LegacyCall => format!("{actor} placed an old-style call Twicecat cannot join"),
         StateChange::Other { event_type } => format!(
             "{actor} changed the room ({})",
             one_line_capped(event_type, MAX_EVENT_TYPE_CHARS)
@@ -1491,6 +1493,8 @@ mod tests {
             StateChange::Topic,
             StateChange::RoomAvatar,
             StateChange::Encryption,
+            StateChange::CallStarted,
+            StateChange::LegacyCall,
             StateChange::Other {
                 event_type: "m.x\n.y".into(),
             },

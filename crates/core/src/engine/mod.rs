@@ -2460,6 +2460,7 @@ impl Engine {
             .with_focus(TimelineFocus::Live {
                 hide_threaded_events: true,
             })
+            .event_filter(crate::timeline::event_filter)
             .build()
             .await
             .map_err(|_| CoreError::Internal("could not open the room timeline".into()))?;

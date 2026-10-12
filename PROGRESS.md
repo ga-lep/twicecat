@@ -1633,6 +1633,19 @@ Phase 2 signed off by the human on 2026-10-02 (merge of PR #3). Every other unti
 - **Checks:** the gate was clean (1692 tests); `call_signalling` and `login` on the local stack pass.
 - **Open (human):** join a call on a real `wss://` server again (added to the checkpoint list).
 
+## Phase 3 / calls cluttered the timeline (fixed 2026-10-12)
+
+- **Symptom:** in a room with calls, the human saw many "X changed the room (org.matrix.msc3401.call.member)" lines, and "X sent something Twicecat cannot show yet" after them.
+- **Cause:**
+  - The SDK's default timeline filter shows every state event, so each MatrixRTC membership (sent on every join, leave and refresh of a call) became a generic "changed the room" line.
+  - The call's `m.rtc.notification`, and the old `m.call.invite`, were mapped to the "unsupported" placeholder (since Phase 3.3, before calls existed).
+- **Fix:**
+  - Both timelines, the room's and a thread's, use `timeline::event_filter`: the SDK's `default_event_filter`, without `org.matrix.msc3401.call.member` events. The room list's call pill and the call bar show who is in a call.
+  - Two new `StateChange` variants: `CallStarted` (`m.rtc.notification`), shown as "X started a call", and `LegacyCall` (`m.call.invite`), shown as "X placed an old-style call Twicecat cannot join".
+- **Tests:** `call_memberships_are_hidden_and_the_rest_kept` (a call membership is filtered out; a message and a room name stay); the app's state-text test covers both new lines.
+- **Checks:** the gate was clean (1695 tests). On the local stack, `timeline`, `timeline_live`, `timeline_items`, `timeline_actions`, `threads`, `call_signalling`, `call_ringing` and `cli` (41 tests) pass.
+- **Open (human):** the room from the screenshot shows "X started a call" lines and no membership lines.
+
 ## Phase 6 steps (calls: MatrixRTC, LiveKit SFU, native audio; plan docs/plans/phase6-calls.md)
 Order (revised 2026-10-02, plan decision 12; again 2026-10-03 by the human): 1–8, 8b, 9, 10, 11, 12, 14, 13, then 15 and 13b. Deferred options (audio-only libwebrtc build, pure-Rust WebRTC stack, PulseAudio backend) are recorded in the plan.
 - [x] 1. libwebrtc supply chain (pinned SHA-256 fetch script, fail-closed build) and livekit dependency (phase6.1)

@@ -823,6 +823,11 @@ pub enum StateChange {
     RoomAvatar,
     /// Encryption was turned on.
     Encryption,
+    /// The sender started a call in the room (MatrixRTC, `m.rtc.notification`).
+    CallStarted,
+    /// The sender placed an old-style one-to-one call (`m.call.invite`),
+    /// which Twicecat cannot join.
+    LegacyCall,
     /// Any other state event.
     Other {
         /// Its event type.
