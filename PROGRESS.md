@@ -1769,7 +1769,7 @@ First build and gate on Windows itself (Windows 11 26300, i9-14900K, RTX 5090; M
 Plan approved by the human 2026-10-12 (Q1-Q8 answered: the core plays the ringtone and rings by itself; a call bar plus a participants panel; a separate Voice & audio card; a call button in every joined room; the input mode and push-to-talk are left to #15; Ctrl+Shift+M/D; the app's twicecat-audio ban is enforced by script).
 - [x] 17. Call model and core events in the app (phase6.17)
 - [x] 18. Room list call counts, voice rooms, the header's call button (phase6.18)
-- [ ] 19. In-call view: call bar, participants, mute, deafen, per-user volume and cleaning (phase6.19)
+- [x] 19. In-call view: call bar, participants, mute, deafen, per-user volume and cleaning (phase6.19)
 - [ ] 20. Ringtone in the core (phase6.20)
 - [ ] 21. Incoming calls, with a stack round trip (phase6.21)
 - [ ] 22. Voice & audio settings (phase6.22)
@@ -1848,6 +1848,56 @@ Plan approved by the human 2026-10-12 (Q1-Q8 answered: the core plays the ringto
 - **Gate:** fmt, clippy (also `--all-features`), `cargo test --workspace` 1603 passed / 0 failed / 147 ignored, and the dependency, API, no-download and commit checks: ok.
 - **Human items:** the pill, the Voice tag and the header button in light and dark themes (Phase 6 call UI checkpoint).
 
+### Step 19: the in-call view (phase6.19)
+- **Built:**
+  - **Call bar** (`screens/call.rs::bar`, the last child of the room list pane's column, an empty space without a call or a notice). It shows:
+    - the call's room name, as a button that opens the room with the panel (`ShowCall`);
+    - a lock when the media is encrypted;
+    - the phase: "Connecting…", "Voice connected[, encrypted]", or "Reconnecting (attempt n)…" in the danger colour;
+    - who declined our ring (three names, then "and N more");
+    - **Mute**/**Unmute**, **Deafen**/**Undeafen** (primary while on), and **Leave** (danger, off while a join or leave is in flight);
+    - the call notice with a ✕ (`DismissNotice`).
+  - **Participants panel** (`screens/call.rs::panel_slot`, a fifth slot of the panes row after the thread panel, 320 px). It shows only while it is open and the call's room is the open room. It opens:
+    - from the header's **People** button, shown in the call's room only (`TogglePanel`);
+    - from the call bar;
+    - on its own when joining a voice room (plan Q4).
+
+    It closes with ✕, Esc (after the thread panel), or the call's end. Rows come from `CallModel::rows`:
+    - the picture from the call room's member list (the initials fallback while it is unknown), ringed in the highlight colour while speaking;
+    - the name: the call's display name, else the member list's, else the user ID; one line, capped;
+    - "(you)", 🔇, and "Speaking" / "Muted" as words (not colour alone);
+    - the cleaning status ("Voice cleaned", "Not cleaned (too many voices)", …);
+    - for other people, on their first device's row only (the core's settings are per user): **−** / **+** (10 %), a 0–200 % slider (step 5, Shift 1, double-click back to 100), the value, and a "Clean: automatic/always/never" menu.
+  - **Mute and deafen** (`ToggleMute`, `ToggleDeafen`; Ctrl+Shift+M and Ctrl+Shift+D, only during a call, and taken by the composer's key binding when it has focus) send `SetMicMuted` and `SetDeafened`. The core keeps the two flags apart (`engine/mod.rs:1369-1384`, `apply_mute` at :1849: the effective mute is mic_muted || deafened). So undeafening restores the earlier mute by itself, and unmuting while deafened sends `SetDeafened(false)` then `SetMicMuted(false)`, as Discord does. Our own row shows muted at once, from the local flags. Both reset on `Joining`, as in the core.
+  - **Volume.** A slider move only updates `volume_drag` and starts a 400 ms timer. The value is sent once with `SetUserVolume`, on release or when the latest timer fires (stale sequence numbers do nothing). Wheel and arrow-key moves never report a release, hence the timer. A value equal to the core's is not sent; **−**/**+** send at once, clamped to 0..=200. Nothing is sent for ourselves or for someone not in the call.
+  - **Cleaning.** `SetUserCleaning` is sent when the choice differs from the echoed settings' `user_cleaning`.
+  - **Members.** `Joining` sends `ListRoomMembers` for the call's room. `App::on_room_members` hands the answer to the call model whatever room is open. Then:
+    - the participants' pictures are fetched (`FetchAvatars`, each once per session);
+    - a newcomer missing from the list asks for it again, once per user;
+    - nothing more is asked while the first answer is on its way.
+- **iced API** (rule 2, `iced_widget` 0.14.2):
+  - `slider(range, value, on_change)` with `T: Copy + From<u8> + PartialOrd` (`src/helpers.rs:1534`, `src/slider.rs:100-117`), plus `.step`, `.shift_step`, `.default` and `.on_release` (:151-188). Arrow keys work only with the cursor over it (:393-405), and the wheel changes it without a release (:375-390).
+  - `pick_list` (`src/helpers.rs:1656`), `rule::vertical`, `scrollable`.
+- **Tests:** 25 more in `calls::tests` and 2 in `screens::call::tests`. They cover:
+  - mute and deafen commands, unmute while deafened, undeafen keeping the mute, the reset on a new call, nothing without a call;
+  - the shortcuts (in a call only, in the table, taken by the composer);
+  - the members request on join; names and pictures from a member list of a room that is not open (the open room's list untouched); a newcomer asking once; no second request before the first answer;
+  - the rows (our mute, speaking, cleaning words, one set of controls per user, deafened shows muted);
+  - the volume (release sends once, the latest pause sends, a stale pause does nothing, an unchanged value sends nothing, the steps clamp, nobody else or ourselves);
+  - the cleaning menu;
+  - the panel (voice room opens it, ordinary does not, beside the call's room only, `ShowCall` opens the room, closes on `Left`, Esc);
+  - the notice ✕;
+  - labels.
+
+  In `state.rs`:
+  - the panes-row test now expects five slots and checks that the participants panel leaves the room pane's tree alone;
+  - a new layout test shows the panel taking exactly its 320 px from the room pane, the room list keeping its width with the call bar and a long notice, and the window still filled.
+
+  Mutation, caught and reverted: controls on every device's row (`rows_mark_…_once_per_person` fails).
+- **Docs:** `docs/accessibility.md` covers the two shortcuts, the Esc order, the call controls, the slider's keyboard limit, and the "not colour alone" marks.
+- **Gate:** fmt, clippy (also `--all-features`), `cargo test --workspace` 1630 passed / 0 failed / 147 ignored, and the dependency, API, no-download and commit checks: ok.
+
 ## Phase 6 call UI human checkpoint
 - [x] Plan questions answered and plan approved (2026-10-12).
 - [ ] (step 18) The call pill (🔊 with the count; highlighted while ringing), the "Voice" tag and the header's call button (Call, Join call (N), Join voice, Joining…, Leave call) read well in light and dark themes, and the emoji renders on each OS; Tab reaches the call button.
+- [ ] (step 19) In a call: the call bar (name, phase, lock, Mute/Deafen/Leave, notice ✕) at the bottom of the room list and the participants panel (pictures, speaking ring, 🔇, "(you)", cleaning words, −/+ and slider, cleaning menu) in light and dark themes on each OS; mute and deafen heard (or not) on the other side, including Ctrl+Shift+M/D with the composer focused; per-person volume and cleaning by ear; the slider sends after a mouse release and after a wheel turn; a voice room opens the panel on join.

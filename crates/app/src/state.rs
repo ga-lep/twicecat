@@ -9865,7 +9865,7 @@ mod tests {
         }
 
         #[test]
-        fn the_panes_row_keeps_four_slots_and_the_room_pane_its_tree() {
+        fn the_panes_row_keeps_five_slots_and_the_room_pane_its_tree() {
             let (mut app, _rx) = main_app();
             let slots = |app: &App| {
                 let element = crate::screens::main_view::main_row(app);
@@ -9875,18 +9875,34 @@ mod tests {
                 (tree.children.len(), room_tags)
             };
             let (n_closed, room_closed) = slots(&app);
-            assert_eq!(n_closed, 4);
+            assert_eq!(n_closed, 5);
             let _ = app.update(Message::Threads(ThreadsMessage::Open(root("r"))));
             let (n_open, room_open) = slots(&app);
-            assert_eq!(n_open, 4);
+            assert_eq!(n_open, 5);
             assert_eq!(room_open, room_closed, "the room pane keeps its widgets");
             let _ = app.update(core(CoreEvent::Spaces(vec![space("!s1:x", 0)])));
             let (n_spaces, room_spaces) = slots(&app);
-            assert_eq!(n_spaces, 4);
+            assert_eq!(n_spaces, 5);
             assert_eq!(room_spaces, room_closed);
+            // In a call in the open room, the participants panel comes and
+            // goes in its own slot.
+            let _ = app.update(core(CoreEvent::CallState(
+                twicecat_core::api::CallState::Joining {
+                    room_id: RoomId::from("!a:x"),
+                },
+            )));
+            let (_, room_in_call) = slots(&app);
+            let _ = app.update(Message::Call(crate::calls::CallMessage::TogglePanel));
+            assert!(app.calls.panel_shown(app.selected.as_ref()));
+            let (n_panel, room_panel) = slots(&app);
+            assert_eq!(n_panel, 5);
+            assert_eq!(
+                room_panel, room_in_call,
+                "the panel leaves the room pane alone"
+            );
         }
 
-        /// The widths of the panes row and of its four slots, laid out in a
+        /// The widths of the panes row and of its five slots, laid out in a
         /// 1000 x 700 window.
         fn pane_widths(app: &App) -> (f32, Vec<f32>) {
             use iced::advanced::layout::Limits;
@@ -9933,6 +9949,48 @@ mod tests {
                 room_alone - slots[3],
                 "the panel takes its width from the room pane only: {slots:?}"
             );
+        }
+
+        #[test]
+        fn the_participants_panel_takes_its_width_from_the_room_pane() {
+            use twicecat_core::api::{CallState, CleaningStatus, ListDiff, Participant};
+            let (mut app, _rx) = spaces_app();
+            let room = app.selected.clone().expect("a room is open");
+            let (_, alone) = pane_widths(&app);
+            let _ = app.update(core(CoreEvent::CallState(CallState::Connected {
+                room_id: room.clone(),
+                encrypted: true,
+            })));
+            let person = |n: &str, local: bool| Participant {
+                id: twicecat_core::api::ParticipantId::from(n),
+                user_id: UserId::from(format!("@{n}:x")),
+                device_id: DeviceId::from("D"),
+                display_name: Some(n.repeat(40)),
+                is_local: local,
+                muted: !local,
+                speaking: local,
+                volume_percent: 100,
+                cleaning: CleaningStatus::Cleaned,
+            };
+            let _ = app.update(core(CoreEvent::CallParticipants {
+                room_id: room,
+                diffs: vec![ListDiff::Reset {
+                    values: vec![person("a", true), person("b", false)],
+                }],
+            }));
+            let _ = app.update(core(CoreEvent::Error(CoreError::Call(
+                "a long reason ".repeat(20),
+            ))));
+            let _ = app.update(Message::Call(crate::calls::CallMessage::TogglePanel));
+            let (row, slots) = pane_widths(&app);
+            assert_eq!(row, 1000.0, "the row fills the window: {slots:?}");
+            assert_eq!(slots[4], crate::calls::PANEL_WIDTH, "{slots:?}");
+            assert_eq!(
+                slots[1], alone[1],
+                "the call bar keeps the list's width: {slots:?}"
+            );
+            assert_eq!(slots[2], alone[2] - slots[4], "{slots:?}");
+            assert_eq!(laid_out_size(&app), iced::Size::new(1000.0, 700.0));
         }
 
         #[test]

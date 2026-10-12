@@ -18,7 +18,7 @@ use crate::room_list::{
     spacer_heights, visible_range,
 };
 use crate::rooms::RoomsMessage;
-use crate::screens::centered_text;
+use crate::screens::{call, centered_text};
 use crate::state::{App, Message};
 use crate::theme;
 
@@ -111,7 +111,8 @@ pub fn view(app: &App) -> Element<'_, Message> {
     } else {
         windowed_list(app)
     };
-    container(column![room_actions(), tabs, search, list].spacing(8))
+    // The call bar is last, so the list keeps its place when a call starts.
+    container(column![room_actions(), tabs, search, list, call::bar(app)].spacing(8))
         .width(Length::Fixed(crate::screens::main_view::LIST_PANE_WIDTH))
         .height(Fill)
         .padding(8)

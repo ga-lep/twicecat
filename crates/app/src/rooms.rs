@@ -1375,15 +1375,18 @@ impl App {
         }
     }
 
-    /// `RoomMembers`: kept for pills, the leave warning and the panel.
+    /// `RoomMembers`: kept for pills, the leave warning and the panel, and
+    /// for the participants panel when it is the call's room.
     pub(crate) fn on_room_members(
         &mut self,
         room: RoomId,
         mut members: Vec<RoomMemberView>,
         truncated: bool,
     ) -> Task<Message> {
+        // The call's room may not be the open one (participants panel).
+        let call = self.on_call_members(&room, &members);
         if self.selected.as_ref() != Some(&room) {
-            return Task::none();
+            return call;
         }
         sort_members(&mut members);
         self.rooms_ui.known = Some(KnownMembers {
@@ -1391,7 +1394,7 @@ impl App {
             members,
             truncated,
         });
-        self.fetch_member_avatars()
+        Task::batch([call, self.fetch_member_avatars()])
     }
 
     /// Asks for the avatars of the rows on screen and of the card's user.

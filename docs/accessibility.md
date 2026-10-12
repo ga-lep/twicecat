@@ -16,6 +16,8 @@ on macOS.
 | Ctrl+Shift+Down / Ctrl+Shift+Up | Open the next / previous room with unread messages |
 | Ctrl+U | Attach a file to the open room |
 | Ctrl+, | Open Settings |
+| Ctrl+Shift+M | In a call: mute or unmute the microphone |
+| Ctrl+Shift+D | In a call: deafen or undeafen |
 | Tab / Shift+Tab | Move to the next / previous field |
 | Esc | Close the topmost dialog, panel, Settings or the switcher |
 | Up / Down (switcher open) | Highlight the previous / next room |
@@ -34,11 +36,34 @@ Rules the code follows (all in tests):
   fixed stack of two, so opening one never reshuffles the base.
 - Esc closes one layer per press, topmost first: the switcher, the upload
   confirmation, the viewer, Settings, a room dialog or panel, then the
-  composer's suggestions or reply/edit, then the thread panel. A text field
+  composer's suggestions or reply/edit, then the thread panel, then the
+  participants panel of a call. A text field
   that took the Esc to drop its focus does not keep an overlay open.
 - Closing the switcher with Esc gives the focus back to the composer.
 - Ctrl+K and the room-stepping keys do nothing while another overlay covers
   the main view.
+- Ctrl+Shift+M and Ctrl+Shift+D act only during a call, also over a dialog
+  (the call goes on behind it); without a call they do nothing.
+
+## Calls
+
+Every call control is a button, a menu or a slider in the widget tree's
+order, so Tab reaches it:
+
+- the room header's call button (Call, Join call, Join voice, Leave call)
+  and, in the call's room, **People** for the participants panel;
+- the call bar at the bottom of the room list: the call's room name (opens
+  it with the panel), **Mute**, **Deafen**, **Leave**, and the cross of a
+  call notice;
+- per person in the participants panel: **−** and **+** (10 % each), the
+  volume slider, and the voice cleaning menu.
+
+iced 0.14's slider takes no keyboard focus: its arrow keys work only while
+the mouse is over it (`iced_widget` 0.14.2 `src/slider.rs:393-405`), which
+is why **−** and **+** sit beside it. A slider moved by the wheel or the
+keys, which never reports a release, sends its value after a 400 ms pause.
+Speaking is shown by a ring around the picture and by the word "Speaking",
+muted by a mark and the word "Muted", so neither relies on colour alone.
 
 ## Screen readers: not supported
 
