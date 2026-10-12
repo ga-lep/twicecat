@@ -1554,6 +1554,19 @@ Phase 2 signed off by the human on 2026-10-02 (merge of PR #3). Every other unti
   - `Room::sync_up` was not used: sliding sync (MSC4186) only ever marks a room's state as partially synced (matrix-sdk-base response_processors/room/msc4186/mod.rs:107), so it would never return.
 - **Checks:** the test passed 10 of 10 after the fix; the gate was clean.
 
+## Phase 5 / flaky `notifications::a_keyword_notifies_in_a_mentions_only_room` (fixed 2026-10-12)
+
+- **Cause (a core bug, not the test):**
+  - The room list's `notification_mode` comes from the SDK's cached user-defined mode. The SDK refreshes that cache after a sync that changes the push rules (matrix-sdk sliding_sync/client.rs:268), but `update_cached_user_defined_notification_mode` raises no `RoomInfoNotableUpdate`. The room list only re-emits an entry on such an update (matrix-sdk-ui room_list_service/room_list.rs:230).
+  - So a new mode, set here or on another device, reached the room list only when something else happened in the room.
+  - The test usually passed because the room it had just created was still receiving its last updates.
+- **Evidence:** the test timed out once in a full all-features run and passed 3 reruns. With the room left quiet for 5 s before the change, it timed out 2 of 2 (30 s, no update ever came).
+- **Fix:** a session task, `refresh_room_modes` in `notifications.rs`, follows the push rules (`NotificationSettings::subscribe_to_changes`). For every joined room whose user-defined mode changed, it updates the cached mode and raises a room info update. That update has no reason, so the SDK gives it its catch-all `NONE`, which it documents for updates the room list would otherwise miss. A local change now shows in the room list in about 20 ms.
+- **Test:**
+  - The test now lets the new room go quiet (a fence, then 3 s) before changing the mode, so it no longer depends on leftover updates.
+  - Without the fix it failed 3 of 3; with it, it passed 10 of 10. The gate was clean.
+- Also seen in that run: `call_media::remote_voices_are_cleaned_on_the_gpu` (all features) once fell back to the CPU ("GPU too slow"). That was under the full suite's load in a debug build; alone it passed 3 of 3 on CUDA. Not changed here.
+
 ## Phase 6 steps (calls: MatrixRTC, LiveKit SFU, native audio; plan docs/plans/phase6-calls.md)
 Order (revised 2026-10-02, plan decision 12; again 2026-10-03 by the human): 1–8, 8b, 9, 10, 11, 12, 14, 13, then 15 and 13b. Deferred options (audio-only libwebrtc build, pure-Rust WebRTC stack, PulseAudio backend) are recorded in the plan.
 - [x] 1. libwebrtc supply chain (pinned SHA-256 fetch script, fail-closed build) and livekit dependency (phase6.1)

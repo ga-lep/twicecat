@@ -6,7 +6,7 @@
 //! Message text, names and keywords are user content: nothing here logs them,
 //! and no error text quotes server data.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -780,6 +780,45 @@ async fn forward_room_changes(client: Client, changed: Arc<Notify>) {
     }
 }
 
+/// Keeps each joined room's cached notification mode in step with the push
+/// rules, and tells the room list about every room whose mode changed. The
+/// SDK refreshes that cache after a sync but raises no room info update for
+/// it, so the room list showed a new mode (set here or on another device)
+/// only once something else happened in the room.
+async fn refresh_room_modes(client: Client, settings: NotificationSettings) {
+    let mut changes = settings.subscribe_to_changes();
+    let mut shown: HashMap<OwnedRoomId, Option<RoomNotificationMode>> = client
+        .joined_rooms()
+        .iter()
+        .map(|room| {
+            let mode = room.cached_user_defined_notification_mode();
+            (room.room_id().to_owned(), mode)
+        })
+        .collect();
+    loop {
+        match changes.recv().await {
+            Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+            Err(broadcast::error::RecvError::Closed) => return,
+        }
+        for room in client.joined_rooms() {
+            let mode = settings
+                .get_user_defined_room_notification_mode(room.room_id())
+                .await;
+            if shown.insert(room.room_id().to_owned(), mode) == Some(mode) {
+                continue;
+            }
+            match mode {
+                Some(mode) => room.update_cached_user_defined_notification_mode(mode),
+                None => room.clear_user_defined_notification_mode(),
+            }
+            // No reason given: the SDK sends its catch-all one, which the room
+            // list answers with the room's entry.
+            room.update_room_info(|info| (info, Default::default()))
+                .await;
+        }
+    }
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -830,6 +869,7 @@ impl NotificationTasks {
             changed.clone(),
         ));
         tasks.spawn(forward_room_changes(client.clone(), changed.clone()));
+        tasks.spawn(refresh_room_modes(client.clone(), settings.clone()));
         tasks.spawn(run_totals(
             SdkTotals {
                 client: client.clone(),
