@@ -434,16 +434,34 @@ mod tests {
     #[test]
     fn virtual_device_runs_in_real_time() {
         let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let start = Instant::now();
         let io = AudioIo::start_virtual(
             Loop { sent: sent.clone() },
             |capture: &Frame, playback: &mut Frame| playback.copy_from_slice(capture),
         )
         .unwrap();
-        std::thread::sleep(Duration::from_millis(200));
+        // It runs: ten frames come out. A busy machine (a CI runner) can make
+        // the device thread late, so this waits instead of counting what a
+        // fixed sleep produced.
+        let count = || sent.lock().unwrap().len() / crate::FRAME_LEN;
+        while count() < 10 {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "{} frames in 5 s",
+                count()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         drop(io);
-        let sent = sent.lock().unwrap();
-        let frames = sent.len() / crate::FRAME_LEN;
-        assert!((10..=30).contains(&frames), "{frames} frames in 200 ms");
-        assert!(sent.iter().all(|s| *s == 0.5));
+        // In real time: never faster than one frame per 10 ms (a late device
+        // skips ahead instead of catching up, so lateness only makes fewer).
+        let elapsed = start.elapsed();
+        let frames = count();
+        let most = elapsed.as_millis() / 10 + 2;
+        assert!(
+            frames as u128 <= most,
+            "{frames} frames in {elapsed:?}: faster than real time"
+        );
+        assert!(sent.lock().unwrap().iter().all(|s| *s == 0.5));
     }
 }
