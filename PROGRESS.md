@@ -1646,6 +1646,17 @@ Phase 2 signed off by the human on 2026-10-02 (merge of PR #3). Every other unti
 - **Checks:** the gate was clean (1695 tests). On the local stack, `timeline`, `timeline_live`, `timeline_items`, `timeline_actions`, `threads`, `call_signalling`, `call_ringing` and `cli` (41 tests) pass.
 - **Open (human):** the room from the screenshot shows "X started a call" lines and no membership lines.
 
+## Phase 6 / a call on a slow link gave up after 5 s per attempt (fixed 2026-10-12)
+
+- **Symptom:** the human's call on their own server did not connect. The log showed "signal connection failed on v1 path: Timeout" on LiveKit's first two attempts, then the join stopped.
+- **Cause:**
+  - From the human's network, the call server is 690 ms away with 20 % packet loss. `tracepath` shows the delay starting on the transit backbone (hops 9 to 11), not on the home network; the same network reaches 1.1.1.1 in 23 ms. A TLS handshake to the server took 1.4 to 8.6 s.
+  - LiveKit 0.9.3 allows 5 s for each attempt to open the signalling websocket (`SIGNAL_CONNECT_TIMEOUT`), and our `CONNECT_TIMEOUT` of 20 s stopped the join during its third attempt.
+- **Fix:** `RoomOptions::connect_timeout` is now 15 s (`SIGNAL_TIMEOUT`, as livekit-client, which Element Call uses, allows), and `CONNECT_TIMEOUT` is 45 s, so LiveKit's retries all fit. A good network connects as fast as before.
+- **Not fixed by this:** audio over such a link may still be late or choppy (700 ms, lost packets); that is the network.
+- **Checks:** the gate was clean (1695 tests). Not tested on a slow link here (it needs a shaped network); added to the checkpoint list.
+- **Element's MatrixRTC modes** (the human asked): Twicecat sends and reads the "Compatibility" format (state events, multi-SFU), the one the human's Element uses. It also reads "Legacy" members (oldest-membership SFU) and listens on that SFU. It cannot see "Matrix 2.0" members (MSC4354 sticky `m.rtc.member` events): ruma 0.17 has no such type, as plan decision 10 recorded. A mode setting would only offer one choice, so there is none.
+
 ## Phase 6 steps (calls: MatrixRTC, LiveKit SFU, native audio; plan docs/plans/phase6-calls.md)
 Order (revised 2026-10-02, plan decision 12; again 2026-10-03 by the human): 1–8, 8b, 9, 10, 11, 12, 14, 13, then 15 and 13b. Deferred options (audio-only libwebrtc build, pure-Rust WebRTC stack, PulseAudio backend) are recorded in the plan.
 - [x] 1. libwebrtc supply chain (pinned SHA-256 fetch script, fail-closed build) and livekit dependency (phase6.1)
@@ -2238,5 +2249,6 @@ Plan approved by the human 2026-10-12 (Q1-Q8 answered: the core plays the ringto
 - [ ] (step 20) The ringtone by ear: a DM call from Element Web or another Twicecat rings on the chosen output device at the master volume (not too loud in headphones, audible across a room on speakers), stops when answered, declined (here or on another device), when the caller hangs up, after about 90 s, and with `/silence` in the CLI (Esc in the app, Task 5); no tone for a group call or while in a call; `/ringtone off` keeps it quiet. Also with a Bluetooth headset as the output device.
 - [ ] (step 21) Incoming calls with Element Web/X and another Twicecat: the card (picture, name, Decline/Accept) in both themes; Accept joins, Decline tells the caller; Esc hides the card and silences the tone; the taskbar/dock flashes (Critical) for a DM ring on Windows, macOS, GNOME and KDE; the desktop notification shows while the window is unfocused (with and without "Show message content") and a click opens the room; a group call only notifies.
 - [ ] Joining a call on a server whose LiveKit uses `wss://` connects (it panicked in rustls before the TLS provider fix).
+- [ ] On a slow or lossy link (the human's own server, about 700 ms away), joining a call connects instead of stopping after LiveKit's first attempts.
 - [ ] RustRover lists **Twicecat full (GPU)** and **Twicecat light (CPU only)** and both run. In the light build the card's GPU line says it is the light build. In the full build the menu has **DeepFilterNet3 on the GPU (NVIDIA · CUDA)**, the GPU line says CUDA is used, and a mic test shows "Running on the GPU (NVIDIA · CUDA)". Check that the labels fit the menu's width in both themes.
 - [ ] (step 22) The Voice & audio card in both themes on each OS: device menus with a USB and a Bluetooth headset plugged in and out while it is open ("(not connected)" keeps the choice, and the device comes back), each processing option by ear (WebRTC strengths, RNNoise, DeepFilterNet3 with and without the GPU; echo cancellation on open speakers; "other apps' sound" with a game or video), gain and volume, the voice quality menu, the mic test meter and "Hear myself" on headphones, the ringtone switch, cleaning other voices and its skip menu in a call with Element Call, the announcement switch, and the diagnostics during a call.
