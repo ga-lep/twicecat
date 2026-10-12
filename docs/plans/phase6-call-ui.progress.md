@@ -19,3 +19,5 @@ Task 6: complete (commit "feat(app): add the Voice & audio card", gate ok)
   notes: [a11y] −/+ beside every slider (iced 0.14 sliders take no keyboard focus); [Q7] input mode and push-to-talk pass through untouched; [Q5] Settings closes when it opens the card, as for Sessions
 Review: an independent read-only review of main..HEAD found 10 verified defects, privacy clean; 9 fixed and folded into their commits (--fixup, rebase --autosquash: clean, final tree identical, each rewritten commit's lib tests run again), 1 open (low: pending/answered cleared broadly, NotLoggedIn not an answer); the expired-session leak on main became "fix(core): end the call and the mic test when the session expires"
 Task 7: complete (commit "docs(plan): wrap up the Phase 6 call UI")
+Fix: complete (commit "fix(core): refuse a mic test during a call before touching its audio", gate ok: 1690 tests passed; full ignored run 147 passed, 7 failed, all needing scripts/fetch-models.sh)
+  notes: [bug, on main] StartMicTest stopped the call's audio session before refusing; now refused first, also while the session is in Mode::Call; unit and stack tests both catch the mutation
