@@ -2,7 +2,9 @@
 //! Systems) and prints the frame times.
 //!
 //! `cargo run --release -p twicecat-audio --features onnxruntime --example
-//! dfn_profile -- <cpu|gpu|trt|webgpu|directml> [frames]`; the models from
+//! dfn_profile -- <cpu|gpu|trt|webgpu|directml> [frames] [paced]`; `paced`
+//! feeds one frame every 10 ms, as a call does, and counts the frames over
+//! the GPU deadline (4 ms) and the longest run of them. The models from
 //! `scripts/fetch-models.sh` and, for the GPU modes, `scripts/export-deepfilternet.sh`,
 //! `scripts/fetch-onnxruntime.sh cuda13` (and NVIDIA's libraries), or for
 //! `directml` `scripts/build-onnxruntime-directml.sh` (Windows; with
@@ -100,6 +102,7 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let mode = args.next().unwrap_or_else(|| "cpu".into());
     let frames: usize = args.next().map_or(3000, |n| n.parse().expect("frames"));
+    let paced = args.next().is_some_and(|a| a == "paced");
     flush_denormals_on_this_thread();
     let started = Instant::now();
     let mut filter = load(&mode);
@@ -109,12 +112,26 @@ fn main() {
     let mut times = Vec::with_capacity(frames);
     let cpu_before = process_cpu_ns();
     let mut sink = 0.0_f32;
+    let (mut late, mut run, mut longest_run) = (0, 0, 0);
+    let mut tick = Instant::now();
     for chunk in input.chunks_exact(FRAME_LEN) {
+        if paced {
+            tick += Duration::from_millis(10);
+            std::thread::sleep(tick.saturating_duration_since(Instant::now()));
+        }
         let mut frame: Frame = chunk.try_into().unwrap();
         let start = Instant::now();
         filter.process(&mut frame).expect("process");
-        times.push(start.elapsed());
+        let took = start.elapsed();
+        times.push(took);
         sink += frame[0];
+        if took > Duration::from_millis(4) {
+            late += 1;
+            run += 1;
+            longest_run = longest_run.max(run);
+        } else {
+            run = 0;
+        }
     }
     let cpu = process_cpu_ns()
         .zip(cpu_before)
@@ -130,4 +147,5 @@ fn main() {
         times.last().unwrap(),
         filter.status().get(),
     );
+    println!("over 4 ms: {late} frames, at most {longest_run} in a row");
 }
