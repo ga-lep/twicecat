@@ -1567,6 +1567,25 @@ Phase 2 signed off by the human on 2026-10-02 (merge of PR #3). Every other unti
   - Without the fix it failed 3 of 3; with it, it passed 10 of 10. The gate was clean.
 - Also seen in that run: `call_media::remote_voices_are_cleaned_on_the_gpu` (all features) once fell back to the CPU ("GPU too slow"). That was under the full suite's load in a debug build; alone it passed 3 of 3 on CUDA. Not changed here.
 
+## Phase 4 / flaky `bridge::carol_resets_her_identity_sets_up_recovery_and_logs_out` (fixed 2026-10-12)
+
+- **Symptom:** in CI (fresh stack), "no recovery key in 180 s". It failed on `feat/phase6-finish` (`649f10d`, `34c77df`, `3a91b05`) and on `feat/call-ui` (`205f37b`). It never failed locally, where carol already had an identity and a backup.
+- **Cause (an app bug):**
+  - The app ended its "resetting" wait on the first status that looked like a finished reset (this device verified, no backup; `reset_finished`).
+  - On a new account the status *before* a reset is exactly that: login set the identity up and there is no backup. So a status from the login's setup, still on its way when the reset was confirmed, ended the wait while the core's reset still ran.
+  - The test's **Set up recovery** then got `busy`, which the test did not look at, so it waited the full 180 s.
+  - A user on a new account could hit the same thing: the reset looked done, and the next security action was refused.
+- **Reproduced:** with a brand-new account (registered on the local stack as CI's fresh stack gives one) and the whole `bridge` binary pinned to 2 CPUs. It failed 3 of 3, in 6 s, with the notice `busy`. A temporary trace showed `CrossSigning start`, then `Recovery start ok=false`, then `CrossSigning end`.
+- **Fix:**
+  - The core answers a successful `ResetIdentity` with a new `CoreEvent::IdentityReset`. It is sent after the identity slot is free and after the status that follows the reset: `announce_end` now also waits for the forwarder's round after a success, as it already did after a stop for the password; a failure is still reported at once.
+  - The app ends a reset only on that event (`on_reset_done`). A status no longer ends it, and `reset_finished` is gone.
+  - The CLI ignores the event.
+  - The test now stops at once with the app's notice when the recovery setup fails, instead of waiting 180 s in silence.
+- **Tests:**
+  - Unit: `a_status_from_before_the_reset_does_not_end_it` now has the new-account status (verified, no backup) and checks that nothing starts until `IdentityReset`. The password-reset test ends on the event too. `a_success_sends_the_status_again_before_it_returns` replaces the old success test of `announce_end`.
+  - The new-account scenario passed 11 of 11 after the fix.
+  - On the local stack: `e2ee_identity`, `e2ee_recovery`, `e2ee_verification`, `log_hygiene`, the app's `bridge` and `calls` (28 tests) all pass, and the gate is clean (1690 tests).
+
 ## Phase 6 steps (calls: MatrixRTC, LiveKit SFU, native audio; plan docs/plans/phase6-calls.md)
 Order (revised 2026-10-02, plan decision 12; again 2026-10-03 by the human): 1–8, 8b, 9, 10, 11, 12, 14, 13, then 15 and 13b. Deferred options (audio-only libwebrtc build, pure-Rust WebRTC stack, PulseAudio backend) are recorded in the plan.
 - [x] 1. libwebrtc supply chain (pinned SHA-256 fetch script, fail-closed build) and livekit dependency (phase6.1)

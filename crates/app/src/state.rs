@@ -1557,6 +1557,7 @@ impl App {
             | CoreEvent::RecoveryProgress(_)
             | CoreEvent::RecoveryKeyReady(_)
             | CoreEvent::Recovered
+            | CoreEvent::IdentityReset
             | CoreEvent::ReauthRequired { .. }
             | CoreEvent::OpenAccountManagement(_)) => {
                 task = self.on_security_event(event);
@@ -4902,12 +4903,16 @@ mod tests {
             DeviceVerification::Verified,
             RecoveryStatus::Disabled,
         );
+        let _ = app.update(core(CoreEvent::IdentityReset));
         assert_eq!(app.security.visible(), Visible::Nothing);
         assert_eq!(app.security.busy, None);
         assert_eq!(app.security.notice, None);
         assert_eq!(app.security.banner(), Some(Banner::RecoveryDisabled));
     }
 
+    /// Only the core's answer ends a reset. On a new account the status from
+    /// before the reset (verified, no backup) equals the one after it, and
+    /// ending on it let the next action start while the reset still ran.
     #[test]
     fn a_status_from_before_the_reset_does_not_end_it() {
         let (mut app, mut rx) = identity_app();
@@ -4933,7 +4938,16 @@ mod tests {
             DeviceVerification::Verified,
             RecoveryStatus::Disabled,
         );
+        assert_eq!(app.security.busy, Some(Busy::Resetting));
+        let _ = sec(&mut app, SecurityMessage::SetupRecovery);
+        assert!(drain(&mut rx).is_empty(), "nothing starts during the reset");
+        let _ = app.update(core(CoreEvent::IdentityReset));
         assert_eq!(app.security.busy, None);
+        let _ = sec(&mut app, SecurityMessage::SetupRecovery);
+        assert!(matches!(
+            drain(&mut rx).as_slice(),
+            [Command::EnableRecovery]
+        ));
     }
 
     #[test]

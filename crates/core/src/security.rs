@@ -438,19 +438,25 @@ impl From<CoreError> for Stop {
     }
 }
 
-/// The longest `announce_end` waits for the status forwarder after a stop for
-/// the password (it reads the status, which may ask the server).
+/// The longest `announce_end` waits for the status forwarder (it reads the
+/// status, which may ask the server).
 const FORWARDER_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Ends the hold on the paused sync of `bootstrap` or `reset` and wakes the
-/// status forwarder.
+/// status forwarder. After a success or a stop for the password it also
+/// waits for the forwarder's round, so that the status goes out before the
+/// operation's answer.
 ///
 /// An attempt that stopped for the password changed nothing and goes on once
-/// the password is in, so it announces nothing. Its stop is reported only
-/// after the forwarder has run one round: the status that waited for the
-/// `paused` lock goes out first. A status that came after the front end had
-/// sent the password would look like the end of the second attempt when the
-/// device is already verified and has no backup (a new account).
+/// the password is in, so it announces nothing. Its stop is reported after
+/// the forwarder's round: the status that waited for the `paused` lock goes
+/// out first. A status that came after the front end had sent the password
+/// would look like the end of the second attempt when the device is already
+/// verified and has no backup (a new account).
+///
+/// A success announces its end: the forwarder sends the status even when it
+/// equals the last one. The reset then answers `IdentityReset`, after this
+/// status, so a front end never has to guess the end from a status.
 ///
 /// The order does not rest on the fairness of the lock. The round counter
 /// `op.rounds` is read while `paused` is still held, and the forwarder bumps
@@ -466,14 +472,16 @@ async fn announce_end(
     result: &Result<(), Stop>,
     paused: MutexGuard<'_, ()>,
 ) {
-    if announces_end(result) {
-        drop(paused);
+    let mut rounds = op.rounds.subscribe();
+    let announce = announces_end(result);
+    if announce {
         op.announce.store(true, Ordering::Release);
-        refresh.notify_one();
-    } else {
-        let mut rounds = op.rounds.subscribe();
-        drop(paused);
-        refresh.notify_one();
+    }
+    drop(paused);
+    refresh.notify_one();
+    // A failure is reported at once; its order against the status does not
+    // matter, since the front end ends its wait on the failure itself.
+    if result.is_ok() || !announce {
         // An error only means that the counter is gone; nothing to wait for.
         let _ = tokio::time::timeout(FORWARDER_WAIT, rounds.changed()).await;
     }
@@ -708,7 +716,7 @@ impl SecurityTasks {
             })
             .await;
             announce_end(&op, &refresh, &result, paused).await;
-            result.map(|()| None)
+            result.map(|()| Some(CoreEvent::IdentityReset))
         });
     }
 
@@ -1719,15 +1727,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_success_announces_its_end_and_wakes_the_forwarder() {
+    async fn a_success_sends_the_status_again_before_it_returns() {
         let op = Arc::new(IdentityOp::default());
-        let refresh = Notify::new();
+        let refresh = Arc::new(Notify::new());
+        let (tx, mut rx) = unlimited_events();
+        // The forwarder has sent this status already.
+        let first = fake_forwarder(&op, &refresh, &tx, true);
+        assert!(matches!(next_event(&mut rx).await, CoreEvent::Security(_)));
         let paused = op.paused.lock().await;
         announce_end(&op, &refresh, &Ok(()), paused).await;
-        assert!(op.announce.load(Ordering::Acquire));
-        tokio::time::timeout(std::time::Duration::from_secs(1), refresh.notified())
-            .await
-            .expect("the forwarder is woken");
+        // The same status again, out before the answer would be sent.
+        assert!(matches!(rx.try_recv(), Ok(CoreEvent::Security(_))));
+        assert!(
+            !op.announce.load(Ordering::Acquire),
+            "the forwarder took the announcement"
+        );
+        first.abort();
     }
 
     #[test]

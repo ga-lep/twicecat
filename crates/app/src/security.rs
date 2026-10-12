@@ -96,13 +96,6 @@ pub fn needs_identity_screen(status: &SecurityStatus, fresh_login: bool, skipped
         && status.device == DeviceVerification::Unverified
 }
 
-/// Whether `status` is what a finished reset leaves: this device verified
-/// by the new identity and the backup deleted (plan Q14). A status sent
-/// before the reset began does not match, so it cannot end the wait early.
-pub fn reset_finished(status: &SecurityStatus) -> bool {
-    status.device == DeviceVerification::Verified && status.recovery == RecoveryStatus::Disabled
-}
-
 /// A new recovery key on the show-once screen.
 pub struct RecoverySetup {
     /// The key. Dropped (and zeroized) on **Done**, logout and window close.
@@ -691,6 +684,10 @@ impl App {
     pub(crate) fn on_security_event(&mut self, event: CoreEvent) -> Task<Message> {
         match event {
             CoreEvent::Security(status) => self.on_status(status),
+            CoreEvent::IdentityReset => {
+                self.on_reset_done();
+                Task::none()
+            }
             CoreEvent::RecoveryProgress(progress) => {
                 if self.security.busy == Some(Busy::SettingUp) {
                     self.security.progress = Some(progress);
@@ -747,19 +744,9 @@ impl App {
     fn on_status(&mut self, status: SecurityStatus) -> Task<Message> {
         let model = &mut self.security;
         let was_restore = model.overlay == Some(Overlay::Restore);
+        // A status never ends a reset: on a new account the status before it
+        // equals the one after it. `IdentityReset` does.
         model.status = status;
-        if model.busy == Some(Busy::Resetting) && reset_finished(&status) {
-            // The core holds the reset's own event until the reset is over;
-            // an earlier status must not end the wait.
-            model.busy = None;
-            model.reset_started = false;
-            model.waiting_approval = false;
-            model.reauth = None;
-            model.notice = None;
-            if model.overlay == Some(Overlay::ResetConfirm) {
-                model.overlay = None;
-            }
-        }
         if status.recovery == RecoveryStatus::Enabled {
             model.progress = None;
         }
@@ -800,6 +787,23 @@ impl App {
             return operation::focus(RESTORE_INPUT_ID);
         }
         Task::none()
+    }
+
+    /// The core's answer to a reset: it is over, and the status after it was
+    /// sent before this.
+    fn on_reset_done(&mut self) {
+        let model = &mut self.security;
+        if model.busy != Some(Busy::Resetting) {
+            return;
+        }
+        model.busy = None;
+        model.reset_started = false;
+        model.waiting_approval = false;
+        model.reauth = None;
+        model.notice = None;
+        if model.overlay == Some(Overlay::ResetConfirm) {
+            model.overlay = None;
+        }
     }
 
     fn on_cross_signing_failed(&mut self, error: &CoreError) {

@@ -801,6 +801,7 @@ impl Cli {
             // QR codes), devices and trust are for the graphical app.
             CoreEvent::RecoveryProgress(_)
             | CoreEvent::Recovered
+            | CoreEvent::IdentityReset
             | CoreEvent::ReauthRequired { .. }
             | CoreEvent::OpenAccountManagement(_)
             | CoreEvent::VerificationRequested { .. }

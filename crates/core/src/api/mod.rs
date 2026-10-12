@@ -909,6 +909,11 @@ pub enum CoreEvent {
     RecoveryKeyReady(RecoveryKey),
     /// [`Command::Recover`] succeeded.
     Recovered,
+    /// [`Command::ResetIdentity`] succeeded. The [`CoreEvent::Security`]
+    /// status after the reset was sent before it, and the next security
+    /// command may start. A status alone cannot mark the end: on a new
+    /// account the status before the reset can equal the one after it.
+    IdentityReset,
     /// The action needs the account password; resend the command with it.
     ReauthRequired {
         /// The action that was refused.
