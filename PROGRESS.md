@@ -2439,3 +2439,34 @@ Plan approved by the human 2026-10-13 (Q1-Q6 answered: the service runs only in 
 - [ ] The key grabbed only while needed: with the card closed and no call, the same key works in other apps again.
 - [ ] With the composer focused, the bound key in the window talks; the window losing focus while held lets go.
 
+## Phase 9 steps (video: camera and screen sharing up to 4K60; plan docs/plans/phase9-video.md, ga-lep/twicecat#22; branch feat/video)
+Plan approved by the human 2026-10-13: Q6-Q8 as the human chose them (NVENC/NVDEC through CUDA on NVIDIA Ada and newer; Vulkan Video on Intel, AMD and NVIDIA before Ada; no VA-API; GPU-decoded frames copied to host memory for the app until iced moves to wgpu ≥30), the other questions as recommended (livekit 0.9.3 → 0.9.5; H.264 by default with AV1 opt-in; our own encoders through LiveKit's passthrough source with simulcast added in a webrtc-sys fork; the crates listed in Q11). `feat/video` is cut from `fix/pre-video` (the two pre-phase fixes above), which goes to `main` first.
+- [ ] 1. Bump livekit and check the logs for key material (phase9.1)
+- [ ] 2. `twicecat-video` skeleton, frames, test pattern, ladder, API shape (phase9.2)
+- [ ] 3. Hardware probe and backend measurement spike (phase9.3)
+- [ ] 4. Vulkan compute and Vulkan Video H.264 encoder (phase9.4)
+- [ ] 5. Publishing and receiving in the core, software path (phase9.5)
+- [ ] 6. Our encoder through the passthrough, with layers (phase9.6)
+- [ ] 7. NVENC encoder through CUDA, NVIDIA Ada and newer (phase9.7)
+- [ ] 8. Linux screen sharing (phase9.8)
+- [ ] 9. Linux camera (phase9.9)
+- [ ] 10. App: video renderer and call stage (phase9.10)
+- [ ] 11. App: controls, pickers, preview, Video settings (phase9.11)
+- [ ] 12. Windows and macOS (phase9.12)
+- [ ] 13. Steam Frame (phase9.13, conditional)
+- [ ] 14. 4K60 acceptance and tuning (phase9.14)
+- [ ] 15. Hardware decode (phase9.15)
+- [ ] 16. Wrap-up (phase9.16)
+
+## Phase 9 human checkpoint
+- [x] Plan questions Q1-Q12 answered and plan approved; crates in Q11 approved. Approved 2026-10-13 (Q6-Q8 as the human chose, the rest as recommended).
+- [ ] Encrypted call with Element Call in Chrome and Firefox (and Safari if a Mac, iPhone or iPad is available): our 4K60 screen share and camera shown sharp, with sound, in spotlight; their VP8 camera and screen share, and their share audio, shown and heard here.
+- [ ] Lip sync by eye and ear with a camera at 4K60 and 1080p30.
+- [ ] Wayland portal picker on KDE and GNOME, restore token, stop from the compositor; X11 picker.
+- [ ] A real 4K60 webcam (or the best camera on hand) at its top mode; hot-plug.
+- [ ] Screen-share audio from a game and a video, without our own call audio in it.
+- [ ] Colours (limited/full range), fullscreen and pop-out, HiDPI and mixed-scale monitors, the sharing bar always visible, light and dark themes, keyboard-only use.
+- [ ] Unplugging power during a 4K60 share on the hybrid laptop: encoding moves to the iGPU or lowers quality without dropping the share.
+- [ ] Windows and macOS: permissions, pickers, capture and encode on real hardware.
+- [ ] An AMD GPU and an NVIDIA GPU before Ada encoding (and, after Task 15, decoding) through Vulkan Video; an NVIDIA GPU on nouveau or NVK falling back as the probe says.
+- [ ] Steam Frame, if Task 13 runs.
