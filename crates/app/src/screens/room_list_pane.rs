@@ -21,6 +21,7 @@ use crate::rooms::RoomsMessage;
 use crate::screens::{call, centered_text};
 use crate::state::{App, Message};
 use crate::theme;
+use crate::ui::icons::Icon;
 
 /// **New room**, **Direct message** and **Join**, above the tabs.
 fn room_actions<'a>() -> Element<'a, Message> {
@@ -76,7 +77,7 @@ pub fn count_label(count: u64) -> String {
 }
 
 /// The mark of an encrypted room, in the list row and the room header.
-pub const LOCK_MARK: &str = "\u{1F512}";
+pub const LOCK_MARK: &str = Icon::Lock.glyph();
 /// The tag of a voice room (MSC3417 call room).
 pub const VOICE_TAG: &str = "Voice";
 

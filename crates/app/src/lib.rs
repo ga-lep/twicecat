@@ -33,6 +33,7 @@ pub mod theme;
 pub mod threads;
 pub mod timeline;
 pub mod tray;
+pub mod ui;
 pub mod upload;
 pub mod verification;
 

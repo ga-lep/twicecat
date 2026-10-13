@@ -14,12 +14,12 @@ use iced::widget::{
 use iced::{Element, Fill};
 use twicecat_core::api::ThemeChoice;
 
-use crate::screens::room_dialogs::{modal, muted};
 use crate::settings::{
     DRAG_AND_DROP_NOTE, DefaultChoice, KEYWORD_INPUT_ID, NAME_INPUT_ID, SettingsMessage,
     VOICE_AUDIO_LINE,
 };
 use crate::state::{App, Message};
+use crate::ui::kit::{modal, muted};
 
 /// Width of the card.
 const CARD_WIDTH: f32 = 640.0;

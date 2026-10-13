@@ -16,6 +16,7 @@ use twicecat_core::api::{
 
 use crate::state::{App, Message};
 use crate::text_safety::{MAX_NAME_CHARS, name_or_placeholder, one_line_capped};
+use crate::ui::icons::Icon;
 
 /// How many ringing rooms are kept; the oldest goes first.
 pub const MAX_RINGS: usize = 16;
@@ -24,9 +25,9 @@ pub const MAX_DECLINED: usize = 32;
 /// How many characters a call notice may show.
 pub const MAX_NOTICE_CHARS: usize = 256;
 /// The speaker mark of the call pill in the room list.
-pub const CALL_MARK: &str = "\u{1F50A}";
+pub const CALL_MARK: &str = Icon::Call.glyph();
 /// The mark of a muted participant.
-pub const MUTED_MARK: &str = "\u{1F507}";
+pub const MUTED_MARK: &str = Icon::Muted.glyph();
 /// Highest per-user volume, percent (the core's `limits::MAX_VOLUME_PERCENT`).
 pub const MAX_VOLUME: u16 = 200;
 /// What the participants panel's **−** and **+** change, percent.
