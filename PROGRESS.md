@@ -2399,3 +2399,21 @@ Plan approved by the human 2026-10-13 (Q1-Q6 answered: the service runs only in 
 - [ ] The key grabbed only while needed: with the card closed and no call, the same key works in other apps again.
 - [ ] With the composer focused, the bound key in the window talks; the window losing focus while held lets go.
 
+
+## UI/UX rework steps (plan docs/plans/ui-ux-rework.md; branch feat/ui-ux-rework)
+
+### Step 1: design tokens, icon module and component kit (ui.1)
+- **Added** `crates/app/src/ui/` (`tokens`, `icons`, `kit`):
+  - `tokens`: spacing, radii, type sizes and `Density` (`pad`, `gap`, `room_row_height` 64/44, `timeline_row_pad`). Not wired to any screen yet.
+  - `icons`: the `Icon` enum (33 icons), `glyph()` (const), `label()` and `icon()`. A test scans every other source file for symbols in U+2190-U+2BFF and U+1F300-U+1FAFF outside comments and test code.
+  - `kit`: the four buttons, `icon_button` (always with a tooltip) and `toggle_icon_button`, `card`, `modal`, `section`, `tag`, `count_badge`, `banner(Severity, ..)`, `empty_state`, `field`, `divider`, `avatar`, `speaking_ring`, `page_nav`, `muted`. All styles are pure `fn(&Theme, Status)` or `fn(&Theme)`.
+  - `theme::Semantic` gained `surface`, `surface_raised`, `border`, `focus`, `sidebar`, `danger_soft` and `speaking` in both palettes.
+- **Moved** `modal`, `muted`, `person_avatar` (now `kit::avatar`) and `PERSON_SLOT` from `room_dialogs` to the kit; the callers in `members`, `room_settings`, `settings`, `switcher`, `audio_settings`, `call` and `upload_dialog` use the kit (the private `muted` helpers of `upload_dialog` and `call` are gone). `CALL_MARK`, `MUTED_MARK` and `LOCK_MARK` are now `Icon::{Call,Muted,Lock}.glyph()`. Widget trees are unchanged except `modal`'s card (`surface_raised`, `LARGE` radius).
+- **Checks:** `cargo fmt --all`; `cargo clippy --workspace --all-targets -- -D warnings`, also with `--all-features`; `cargo test --workspace` (1064 app lib tests pass, 0 failed; the homeserver integration tests stay `#[ignore]`d by repo convention and were not run); `scripts/check-app-deps.sh`, `scripts/check-core-api.sh`.
+- **Not run in this step:** `cargo deny check` (no dependency or licence change) and the font check (Task 2).
+- **Contrast:** tests cover every button style in both palettes and all four statuses (4.5:1; 3:1 for Disabled), the new `Semantic` fields, banner text, and `speaking` (3:1 against the background).
+- **Open issues:**
+  - The icon scan reads source characters, so inline `"\u{2715}"`-style escapes in other screens (close, minus, home, sending, gamepad labels) are not flagged yet. They move to `ui::icons` as each screen is redone (Tasks 4 onward).
+  - `toggle_icon_button` shows the on state by colour plus a trailing check glyph, since it takes one `Icon`.
+- **Human checkpoint:** the only visible change is the modal card (raised surface, 12 px radius) on every dialog, Settings, the switcher and the Voice & audio card: look at it in both themes.
+- **Build note:** this machine's default clang is 18 and webrtc-sys needs 21+; building used `CC=clang-22 CXX=clang++-22`.

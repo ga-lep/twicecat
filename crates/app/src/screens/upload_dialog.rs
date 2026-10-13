@@ -11,7 +11,7 @@ use iced::{Background, Color, ContentFit, Element, Fill, Length, Theme};
 
 use crate::media::{card_name, kind_label, size_label};
 use crate::state::{App, Message};
-use crate::theme;
+use crate::ui::kit::muted;
 use crate::upload::{Entry, EntryState, PREVIEW_MAX, Prepared, UploadDialog};
 
 /// Width of the confirmation card.
@@ -48,12 +48,6 @@ pub fn detail_text(prepared: &Prepared) -> String {
         size_label(Some(prepared.size)),
         prepared.mime
     )
-}
-
-fn muted(theme: &Theme) -> text::Style {
-    text::Style {
-        color: Some(theme::semantic(theme).muted),
-    }
 }
 
 fn backdrop(_theme: &Theme) -> container::Style {

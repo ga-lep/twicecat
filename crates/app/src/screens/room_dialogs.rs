@@ -8,19 +8,18 @@
 //! draw goes through [`crate::text_safety`].
 
 use iced::widget::{
-    Column, button, checkbox, column, container, image, opaque, row, space, stack, text, text_input,
+    Column, button, checkbox, column, container, row, space, stack, text, text_input,
 };
-use iced::{Background, Color, Element, Fill, Length, Theme, border};
-use twicecat_core::api::{AvatarId, MessageText, RoomId, UserId};
+use iced::{Element, Fill, Length};
+use twicecat_core::api::MessageText;
 
-use crate::avatars::{AvatarState, Avatars, NEUTRAL_INITIALS, initials, placeholder_color};
 use crate::rooms::{
     CreateDialog, Dialog, InputDialog, JoinBar, MAX_ID_CHARS, RoomsMessage, UserCard,
 };
 use crate::screens::{members, room_settings};
 use crate::state::{App, Message};
 use crate::text_safety::{name_or_placeholder, one_line_capped};
-use crate::theme;
+use crate::ui::kit::{self, modal, muted};
 use crate::verification::elide_middle;
 
 /// Widget ID of the new room's name field.
@@ -32,8 +31,6 @@ pub const JOIN_INPUT_ID: &str = "rooms-join-input";
 
 /// Width of a dialog card.
 pub const CARD_WIDTH: f32 = 460.0;
-/// Size of a person's picture in the card and the member list.
-pub const PERSON_SLOT: f32 = 36.0;
 /// Characters of an ID on the join bar.
 const BAR_ID_CHARS: usize = 64;
 
@@ -68,36 +65,6 @@ fn top(app: &App) -> Option<Element<'_, Message>> {
         return members::view(app);
     }
     None
-}
-
-fn backdrop(_theme: &Theme) -> container::Style {
-    container::Style {
-        background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.6))),
-        ..container::Style::default()
-    }
-}
-
-/// A card in the middle of a dimmed window; it takes every click.
-pub(crate) fn modal<'a>(
-    content: impl Into<Element<'a, Message>>,
-    width: f32,
-) -> Element<'a, Message> {
-    opaque(
-        container(
-            container(content)
-                .padding(20)
-                .max_width(width)
-                .style(container::bordered_box),
-        )
-        .center(Fill)
-        .style(backdrop),
-    )
-}
-
-pub(crate) fn muted(theme: &Theme) -> text::Style {
-    text::Style {
-        color: Some(theme::semantic(theme).muted),
-    }
 }
 
 /// A line of text under a form, in the danger colour.
@@ -250,43 +217,6 @@ fn join_dialog(dialog: &InputDialog) -> Element<'_, Message> {
     )
 }
 
-/// A round picture or the initials of `name`, `PERSON_SLOT` wide.
-pub(crate) fn person_avatar<'a>(
-    user: &UserId,
-    name: &str,
-    avatar: Option<&AvatarId>,
-    avatars: &Avatars,
-) -> Element<'a, Message> {
-    let ready = avatar
-        .and_then(|id| avatars.state(id))
-        .and_then(|state| match state {
-            AvatarState::Ready(handle) => Some(handle),
-            AvatarState::Unavailable => None,
-        });
-    if let Some(handle) = ready {
-        return image(handle.clone())
-            .width(PERSON_SLOT)
-            .height(PERSON_SLOT)
-            .border_radius(PERSON_SLOT / 2.0)
-            .into();
-    }
-    let label = initials(name);
-    let fill = (label != NEUTRAL_INITIALS).then(|| placeholder_color(&RoomId::from(user.as_str())));
-    container(text(label).size(14).color(Color::WHITE))
-        .width(PERSON_SLOT)
-        .height(PERSON_SLOT)
-        .center_x(PERSON_SLOT)
-        .center_y(PERSON_SLOT)
-        .style(move |t| container::Style {
-            background: Some(Background::Color(
-                fill.unwrap_or_else(|| theme::semantic(t).muted),
-            )),
-            border: border::rounded(PERSON_SLOT / 2.0),
-            ..container::Style::default()
-        })
-        .into()
-}
-
 /// The words on the user card: the name of the card's target when the
 /// member list knows it, and the ID in full (cleaned and capped, not cut in
 /// the middle unless it is absurdly long).
@@ -317,7 +247,7 @@ fn user_card<'a>(app: &'a App, card: &'a UserCard) -> Element<'a, Message> {
     let message = (!card.busy).then(|| ("Message", msg(RoomsMessage::CardMessage)));
     let body = column![
         row![
-            person_avatar(&card.user, &shown_name, avatar, &app.avatars),
+            kit::avatar(&card.user, &shown_name, avatar, &app.avatars),
             who
         ]
         .spacing(12)
@@ -356,7 +286,8 @@ mod tests {
     use iced::advanced::widget::Tree;
     use iced::widget::text_editor;
     use twicecat_core::api::{
-        MembershipView, PowerLevelView, Role, RoomDetailsView, RoomMemberView, RoomPermissions,
+        MembershipView, PowerLevelView, Role, RoomDetailsView, RoomId, RoomMemberView,
+        RoomPermissions, UserId,
     };
 
     use super::*;
