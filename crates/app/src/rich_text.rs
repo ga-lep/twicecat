@@ -300,7 +300,7 @@ fn font_for(style: TextStyle) -> Option<Font> {
     let base = if style.code {
         Font::MONOSPACE
     } else {
-        Font::DEFAULT
+        crate::ui::fonts::BODY
     };
     Some(Font {
         weight: if style.bold {
@@ -924,7 +924,7 @@ mod tests {
         let code = models.iter().find(|m| m.style.code).expect("code span");
         let span = to_span(code, &theme);
         let font = span.font.expect("code has a font");
-        assert_eq!(font.family, Font::MONOSPACE.family);
+        assert_eq!(font.family, crate::ui::fonts::MONO.family);
         assert_eq!(font.weight, Weight::Bold);
         assert!(span.highlight.is_some());
         let italic = SpanModel {
