@@ -10593,6 +10593,7 @@ mod tests {
                     desktop_notifications: false,
                     show_message_content: false,
                     tray_badge: false,
+                    ..UiSettings::default()
                 }
             );
             assert!(
