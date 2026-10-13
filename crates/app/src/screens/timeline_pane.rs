@@ -11,7 +11,6 @@
 use std::cell::Cell;
 
 use chrono::{Local, TimeZone};
-use iced::font::{Style as FontStyle, Weight};
 use iced::widget::{
     Column, Row, button, column, container, image, mouse_area, progress_bar, row, rule, scrollable,
     sensor, space, stack, text, tooltip,
@@ -181,15 +180,9 @@ pub fn view_pane<'a, Tz: TimeZone>(
     stack([list.into(), badge]).into()
 }
 
-const BOLD: Font = Font {
-    weight: Weight::Bold,
-    ..Font::DEFAULT
-};
+const BOLD: Font = crate::ui::fonts::BODY_BOLD;
 
-const ITALIC: Font = Font {
-    style: FontStyle::Italic,
-    ..Font::DEFAULT
-};
+const ITALIC: Font = crate::ui::fonts::BODY_ITALIC;
 
 fn muted(theme: &Theme) -> text::Style {
     text::Style {
