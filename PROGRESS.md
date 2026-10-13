@@ -2318,7 +2318,7 @@ Plan approved by the human 2026-10-12 (Q1-Q8 answered: the core plays the ringto
 Plan approved by the human 2026-10-13 (Q1-Q6 answered: the service runs only in push-to-talk or toggle mode while a call, the mic test or the Voice & audio card needs it; push-to-talk and toggle-to-talk both offered in the GUI, the choice saved in the core's input mode; the gamepad button from a menu; the app depends on twicecat-ptt directly; a desktop entry with the portal's app ID).
 - [x] 24. Toggle-to-talk in the core's input mode (phase6.24)
 - [x] 25. The push-to-talk service in the app (phase6.25)
-- [ ] 26. The release tail end to end (phase6.26)
+- [x] 26. The release tail end to end (phase6.26)
 - [ ] 27. The Talking section of the Voice & audio card (phase6.27)
 - [ ] 28. The desktop entry (phase6.28)
 - [ ] 29. Wrap-up (phase6.29)
@@ -2341,4 +2341,10 @@ Plan approved by the human 2026-10-13 (Q1-Q6 answered: the service runs only in 
 - **APIs read** (rule 2): `iced_core-0.14.0` `keyboard/event.rs:12-55` (`KeyPressed`/`KeyReleased`), `keyboard/key.rs:849` (`Code`), `:1325` (`Physical`), `keyboard/modifiers.rs:48-69`; `iced_futures-0.14.0/src/event.rs:26` (`listen_with`); `iced-0.14.0/src/advanced.rs:4` (`into_recipes`, tests only); `futures-channel-0.3.34/src/mpsc/mod.rs:420` (`unbounded`), `:1262` (`try_recv`); `tokio-1.53.1/src/sync/mpsc/bounded.rs:1046` (`blocking_send`, on a plain thread); `global-hotkey-0.8.0/src/hotkey.rs:168-233` (parsing: one token is a key; names are case-insensitive W3C codes).
 - **Tests** (12 in `ptt::tests`, 2 in `twicecat_ptt::binding`): bindings to config (voice activity, none bound, bad key, bad button); hold and toggle; when the service runs (card, call, mic test, voice activity, logout); a changed binding restarts once and the delay does not; `Transmit` reaching the command channel in order while the test never calls `update`; toggle flipping and letting go on leave; a new audio session letting go; window keys (modifiers on press only, repeats, other keys, focus loss, no key bound); events to messages; sources per source with stale ones dropped after a restart; the key subscription only while running; the forwarding thread ending with the app. The fake's drop asserts it runs on the thread that started it.
 - **Known:** dropping the service joins the hotkey thread (it checks for a stop every 200 ms) and the gamepad thread (100 ms), so leaving a call or changing a binding can hold `update` up to about 200 ms. Joining keeps an old hotkey thread from taking the new one's events from global-hotkey's shared channel.
+
+### Step 26: the release tail end to end (phase6.26)
+- **`crates/app/tests/ptt.rs` (new), not ignored:** it needs no homeserver. The real `Bridge` and core run with `AudioBackend::Virtual` (silence). The app is put on its main screen with made-up session events, and only audio events are passed to it. A fake service gives the test its sink. Settings go to the core directly; the card and the mic test are opened through `App::update`, which starts the (fake) service.
+  - `a_release_keeps_transmitting_for_the_delay_then_stops`: 1000 ms delay. Closed until pressed; a press reaches the core through the forwarding thread and the mic test's `InputLevel::transmitting` turns on; after the release it is still on at least 500 ms later and off between 0.7 and 3 s.
+  - `without_a_delay_a_release_stops_at_once_and_voice_activity_ignores_presses`: 0 ms delay closes within 500 ms; in voice activity, with a silent microphone, a press opens nothing for 500 ms.
+- **Runs:** 10 in a row, all passed (about 1.2 s each). Mutation: the forwarding thread always sending `pressed: true` fails both tests; reverted.
 
