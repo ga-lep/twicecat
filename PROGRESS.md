@@ -1899,7 +1899,7 @@ First build and gate on Windows itself (Windows 11 26300, i9-14900K, RTX 5090; M
 - [x] Approve the Task 13b part 4 additions: fetching Microsoft's `onnxruntime-ep-webgpu` 0.4.0 wheel from PyPI (MIT; third-party notices copied beside the library) and `GpuBackend::WebGpu` (API addition, Task 3 contract). Approved 2026-10-04.
 - [x] Post the WebGPU grouped-convolution report to microsoft/onnxruntime (decided 2026-10-04; the agent drafted the text). Posted by the human 2026-10-04: https://github.com/microsoft/onnxruntime/issues/33086. No existing issue or pull request covers it (related, different: #32928, #29651, #32478). Cause, from main's source: for a channels-last grouped Conv, `conv.cc` sizes the vector width from the total output channels, while `grouped_conv.cc` derives the group once per vector. A vector spanning two groups reads the first group's inputs whenever `output_channels_per_group % components != 0` (`df_convp`: 10 outputs, 2 groups, 2 components). `preferredLayout=NCHW` is correct. JSEP's `conv-grouped.ts` has the same logic (not tested).
 - [ ] GPU enhancement (Task 13b): each offered backend on real hardware (NVIDIA and Intel CPU on the human's machine; AMD CPU and GPU on Galep's: Ryzen 7 7800X3D and Radeon RX 6950 XT, for the WebGPU/Vulkan path of Task 13b part 4, with the same latency and CPU numbers as CUDA, and the x86-64-v3 build on Zen 4), by ear and with the recorded latency; the fallback when the GPU is busy with a game.
-- [ ] Global PTT hotkey on X11, Wayland (KDE/GNOME portal), Windows and macOS; gamepad PTT. On Linux: `cargo run -p twicecat-ptt --example ptt_probe -- --key ctrl+shift+KeyT --button left_thumb` prints `Transmit(true)`/`Transmit(false)` while the key or button is held; on Wayland the portal's dialog appears once and the confirmed key is printed (`Ready`); on SteamOS (desktop and game mode) the Steam Input pad works. Windows and macOS keys are checked once the app starts the service (call UI).
+- [ ] Global PTT hotkey on X11, Wayland (KDE/GNOME portal), Windows and macOS; gamepad PTT. On Linux: `cargo run -p twicecat-ptt --example ptt_probe -- --key ctrl+shift+KeyT --button left_thumb` prints `Transmit(true)`/`Transmit(false)` while the key or button is held; on Wayland the portal's dialog appears once and the confirmed key is printed (`Ready`); on SteamOS (desktop and game mode) the Steam Input pad works. Windows and macOS keys are checked once the app starts the service (call UI). The app now does: see "Phase 6 push-to-talk human checkpoint".
 - [x] Choose how the processing thread gets real-time priority on Windows and macOS: Mozilla's `audio_thread_priority` =0.35.1 (MPL-2.0), with cpal's `realtime` feature on Windows. Chosen 2026-10-04.
 - [x] Approve the Task 15 part 4 API addition: `AudioStats::{late_wakes, max_wake_us, capture_overruns, playback_underruns}`. Approved 2026-10-04.
 - [ ] Real-time priority on Windows and macOS (Task 15 part 4): in a call or `/mictest`, the core logs "audio processing runs at real-time priority (MMCSS Audio task)" on Windows, "(time-constraint policy)" on macOS, or why not; no crackles while a game loads the CPU.
@@ -2321,7 +2321,7 @@ Plan approved by the human 2026-10-13 (Q1-Q6 answered: the service runs only in 
 - [x] 26. The release tail end to end (phase6.26)
 - [x] 27. The Talking section of the Voice & audio card (phase6.27)
 - [x] 28. The desktop entry (phase6.28)
-- [ ] 29. Wrap-up (phase6.29)
+- [x] 29. Wrap-up (phase6.29)
 
 ### Step 24: toggle-to-talk in the core (phase6.24)
 - **Core:** `InputMode::PushToTalk { release_delay_ms, toggle }`. `toggle` is `#[serde(default)]`, so files written before it read as push-to-talk. The gate ignores it: the app turns presses into on and off and still sends `Command::PushToTalk` (plan Q2). `validated` keeps it.
@@ -2368,4 +2368,34 @@ Plan approved by the human 2026-10-13 (Q1-Q6 answered: the service runs only in 
 - **App ID in one place:** `twicecat_ptt::APP_ID` is now public on every platform. On Linux the window's Wayland app ID is set to it (`iced::window::Settings::platform_specific.application_id`, `iced_core-0.14.0/src/window/settings/linux.rs:5-10`, given through `application(..).window(..)`, `iced-0.14.0/src/application.rs:253`, before `exit_on_close_request`, which edits the same settings), so compositors and the portal tie the window to the entry.
 - **`docs/building.md`:** a "Push-to-talk on Linux" section: installing the entry to `~/.local/share/applications/` for the portal during development, the one-time confirmation, X11/Windows/macOS needing nothing, game mode, and the probe.
 - **Test:** `the_desktop_entry_carries_the_app_id` (in `main.rs`): the file is named after `APP_ID`, has the keys above, `APP_ID` equals the keychain service name, the window's app ID is `APP_ID` on Linux, the app refuses a URL argument, and `desktop-file-validate` passes where it is installed.
+
+### Step 29: wrap-up (phase6.29)
+- **Branch review** by an independent read-only agent over `main..HEAD`. It found 3 defects and 1 likely race, all fixed and folded into the commits that wrote the code (rule 5: `--fixup`, `git rebase --autosquash main`, clean; the final tree identical to the unsquashed one; the app's lib tests run again on both rewritten commits: 1039 and 1051 passed):
+  1. *(high) The window never got push-to-talk updates.* Iced builds the subscriptions once at boot, and a stream that ends is never started again under the same ID. The update channel was made only when the forwarding thread started, so the stream taken at boot was empty: no "Talking", no source lines. The channel is now made with the model. The tests had read the channel directly. New test `the_stream_taken_at_boot_carries_later_updates` takes the stream before any service, as Iced does.
+  2. *(medium) Waiting for a new key while holding the old one left the microphone open.* The release was dropped while capturing. Now only presses are dropped; the test checks a release lets go.
+  3. *(low) The `twicecat-ptt` tree check matched whole names only*, so `ruma-common` or `livekit-api` would have passed. It now matches by prefix, as the app check does.
+  4. *(likely race) A late event from a stopped service could turn toggle-to-talk on* (a portal task outlives the service). Stopping a service now retires its generation in the forwarding thread; `a_stopped_service_cannot_start_talking` checks it.
+- **Gate:** fmt, clippy (also `--all-features`), `cargo test --workspace` 1730 passed / 0 failed / 151 ignored, and the dependency, API and commit checks: ok.
+- **Issue #15's scope, by commit:**
+  - start, restart and drop the service from the settings, on the main thread; forward `Transmit` outside `update`; the window fallback; `Ready`/`Unavailable` kept per source; the dependency boundary: `feat(app): run push-to-talk and forward it to the core`;
+  - toggle-to-talk: `feat(core): offer toggle-to-talk in the push-to-talk input mode`, and the app's flipping in the commit above;
+  - the release tail driven by a fake sink: `feat(app): check the push-to-talk release tail end to end`;
+  - the settings UI (mode, key capture, gamepad button, release delay, the current binding and what each source reports) and the state shown in the call bar: `feat(app): set voice activity, push-to-talk or toggle-to-talk in the card`;
+  - the `.desktop` file with the app ID: `feat(app): ship a desktop entry with the app ID the portal knows`;
+  - backend selection stays covered by `twicecat-ptt`'s tests.
+- **Open issues:**
+  - (low) Dropping the service joins the hotkey and gamepad threads, which can hold `update` up to about 200 ms when a call ends or a binding changes (step 25).
+  - (low, UX) While the card waits for a new key, only the window source is off. The global shortcut (or portal) of the old key still talks, and on X11, Windows and macOS it is grabbed, so pressing the old key again cannot capture it. Rebinding to another key works.
+  - The rendering and the real sources are on the checkpoint below.
+
+## Phase 6 push-to-talk human checkpoint
+- [x] Plan questions answered and plan approved (2026-10-13).
+- [ ] The global key held and let go in a call (the other side hears only while held, plus the release delay) on Windows, macOS, X11, GNOME Wayland and KDE Wayland. On Wayland, after installing the desktop entry (`docs/building.md`), the portal dialog appears once and the card shows the key it reports ("Desktop shortcut: ready, press …").
+- [ ] macOS: the microphone prompt, and whether global-hotkey needs Input Monitoring for releases.
+- [ ] A gamepad button (Xbox, PlayStation, Steam Input) held in a call, picked from the menu; a pad unplugged while held lets go.
+- [ ] SteamOS: desktop mode (portal or X11) and game mode (gamescope: the key in Twicecat's window and the gamepad only; the card's note says so).
+- [ ] Toggle-to-talk: one press starts, the next stops; leaving the call stops.
+- [ ] The Talking section in both themes: the menus, **Set key…** with a chord (Ctrl+Shift+T), a function key and a refused key, Esc while waiting (the card stays open), the source lines, and the call bar's "Talking" / "Not talking: hold …" line.
+- [ ] The key grabbed only while needed: with the card closed and no call, the same key works in other apps again.
+- [ ] With the composer focused, the bound key in the window talks; the window losing focus while held lets go.
 

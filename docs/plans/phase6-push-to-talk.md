@@ -1,5 +1,5 @@
 # Phase 6 Push-to-Talk Plan
-Status: APPROVED (questions Q1–Q6 answered and the plan approved by the human, 2026-10-13)
+Status: APPROVED (questions Q1–Q6 answered and the plan approved by the human, 2026-10-13); Tasks 1–6 done 2026-10-13, waiting for the human checkpoint
 
 ## Goal
 Wire the finished push-to-talk service (`crates/ptt`) into the desktop app. This covers [ga-lep/twicecat#15](https://github.com/ga-lep/twicecat/issues/15), the "Push-to-talk" part of roadmap Phase 6, which `docs/plans/phase6-calls.md` Task 11 left for the call UI and `docs/plans/phase6-call-ui.md` Q7 (c) left entirely to this issue. The work happens on branch `15-featapp-wire-push-to-talk-into-the-app`, cut from `main` at `62639d6`.
