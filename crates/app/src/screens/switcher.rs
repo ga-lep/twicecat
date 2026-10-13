@@ -11,9 +11,9 @@ use iced::widget::{Column, button, column, container, scrollable, space, stack, 
 use iced::{Element, Fill};
 
 use crate::room_list::row_name;
-use crate::screens::room_dialogs::{modal, muted};
 use crate::state::{App, Message};
 use crate::switcher::{INPUT_ID, LIST_ID, SwitcherMessage};
+use crate::ui::kit::{modal, muted};
 
 /// Width of the card.
 const CARD_WIDTH: f32 = 480.0;

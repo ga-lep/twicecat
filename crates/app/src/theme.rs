@@ -53,6 +53,20 @@ pub struct Semantic {
     pub message_highlight: Color,
     /// Background of the timeline message under the pointer.
     pub message_hover: Color,
+    /// Background of a panel or card resting on the window background.
+    pub surface: Color,
+    /// Background of what floats above a surface: dialogs, menus, banners.
+    pub surface_raised: Color,
+    /// Lines and outlines (dividers, card borders).
+    pub border: Color,
+    /// The keyboard focus ring.
+    pub focus: Color,
+    /// Background of the spaces sidebar.
+    pub sidebar: Color,
+    /// Soft background of an error banner.
+    pub danger_soft: Color,
+    /// The ring around a person who is talking (a non-text mark).
+    pub speaking: Color,
 }
 
 /// Semantic colours of the light theme.
@@ -65,6 +79,13 @@ pub const LIGHT_SEMANTIC: Semantic = Semantic {
     selection: color!(0xDDE1FA),
     message_highlight: color!(0xFFF1B8),
     message_hover: color!(0xF3F4F6),
+    surface: color!(0xF6F8FA),
+    surface_raised: color!(0xEDF0F4),
+    border: color!(0xD0D7DE),
+    focus: color!(0x3B4CCA),
+    sidebar: color!(0xE6EAF0),
+    danger_soft: color!(0xFFEBE9),
+    speaking: color!(0x1A7F37),
 };
 
 /// Semantic colours of the dark theme.
@@ -77,6 +98,13 @@ pub const DARK_SEMANTIC: Semantic = Semantic {
     selection: color!(0x35385A),
     message_highlight: color!(0x3D3519),
     message_hover: color!(0x2B2D31),
+    surface: color!(0x25272B),
+    surface_raised: color!(0x2F3136),
+    border: color!(0x41444B),
+    focus: color!(0x8C99F7),
+    sidebar: color!(0x17181A),
+    danger_soft: color!(0x2D1517),
+    speaking: color!(0x3FB950),
 };
 
 /// The theme for a system mode. `Mode::None` is light.
@@ -280,5 +308,39 @@ mod tests {
     fn semantic_colours_follow_the_theme() {
         assert_eq!(semantic(&theme_for(Mode::Dark)), DARK_SEMANTIC);
         assert_eq!(semantic(&theme_for(Mode::Light)), LIGHT_SEMANTIC);
+    }
+
+    #[test]
+    fn the_new_surfaces_differ_and_their_text_is_readable() {
+        for (name, palette, sem) in [
+            ("light", LIGHT, LIGHT_SEMANTIC),
+            ("dark", DARK, DARK_SEMANTIC),
+        ] {
+            let bg = palette.background;
+            let surfaces = [bg, sem.surface, sem.surface_raised, sem.sidebar];
+            for (i, a) in surfaces.iter().enumerate() {
+                for b in &surfaces[i + 1..] {
+                    assert_ne!(a, b, "{name}: two surfaces are the same colour");
+                }
+            }
+            for (what, fg, back) in [
+                ("text/surface", palette.text, sem.surface),
+                ("text/surface_raised", palette.text, sem.surface_raised),
+                ("text/sidebar", palette.text, sem.sidebar),
+                ("muted/surface", sem.muted, sem.surface),
+                ("muted/surface_raised", sem.muted, sem.surface_raised),
+                ("muted/sidebar", sem.muted, sem.sidebar),
+                ("text/danger_soft", palette.text, sem.danger_soft),
+                ("danger/danger_soft", palette.danger, sem.danger_soft),
+                ("focus/background", sem.focus, bg),
+            ] {
+                let ratio = contrast(fg, back);
+                assert!(ratio >= 4.5, "{name} {what}: {ratio}");
+            }
+            // Non-text: the speaking ring and the focus ring (WCAG 1.4.11).
+            let ring = contrast(sem.speaking, bg);
+            assert!(ring >= 3.0, "{name} speaking/background: {ring}");
+            assert!(contrast(sem.border, bg) > 1.0, "{name} border");
+        }
     }
 }

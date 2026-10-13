@@ -7,9 +7,10 @@ use iced::{Element, Fill};
 use twicecat_core::api::MessageText;
 
 use crate::rooms::{RoomsMessage, SettingsPanel};
-use crate::screens::room_dialogs::{error_line, modal, msg, muted};
+use crate::screens::room_dialogs::{error_line, msg};
 use crate::state::{App, Message};
 use crate::text_safety::one_line_capped;
+use crate::ui::kit::{modal, muted};
 
 /// Width of the panel.
 const PANEL_WIDTH: f32 = 520.0;

@@ -14,10 +14,10 @@ use crate::calls::{
     CallMessage, CleaningChoice, MAX_VOLUME, MUTED_MARK, PANEL_WIDTH, ParticipantRow,
 };
 use crate::screens::main_view::display_name;
-use crate::screens::room_dialogs::{PERSON_SLOT, modal, person_avatar};
 use crate::screens::room_list_pane::LOCK_MARK;
 use crate::state::{App, Message};
 use crate::theme;
+use crate::ui::kit::{PERSON_SLOT, avatar, modal, muted};
 use crate::verification::elide_middle;
 use twicecat_core::api::InputMode;
 
@@ -28,12 +28,6 @@ const DECLINED_NAMED: usize = 3;
 
 fn call(message: CallMessage) -> Message {
     Message::Call(message)
-}
-
-fn muted_style(theme: &iced::Theme) -> text::Style {
-    text::Style {
-        color: Some(theme::semantic(theme).muted),
-    }
 }
 
 /// The words on the call bar's mute and deafen buttons.
@@ -96,7 +90,7 @@ pub fn ring_layer<'a>(base: Element<'a, Message>, app: &'a App) -> Element<'a, M
             |r| display_name(&r.name),
         );
         let (headline, under) = ring_lines(&caller_name, room.map(|r| r.name.as_str()), is_dm);
-        let picture = person_avatar(
+        let picture = avatar(
             &ring.caller,
             &caller_name,
             room.filter(|r| r.is_dm).and_then(|r| r.avatar.as_ref()),
@@ -104,7 +98,7 @@ pub fn ring_layer<'a>(base: Element<'a, Message>, app: &'a App) -> Element<'a, M
         );
         let mut words = column![text(headline).size(18)].spacing(4);
         if let Some(under) = under {
-            words = words.push(text(under).size(13).style(muted_style));
+            words = words.push(text(under).size(13).style(muted));
         }
         let idle = !ring.answered;
         let accept = button(text("Accept").size(14))
@@ -120,7 +114,7 @@ pub fn ring_layer<'a>(base: Element<'a, Message>, app: &'a App) -> Element<'a, M
             row![space().width(Fill), decline, accept].spacing(8),
             text("Esc hides this; the room keeps ringing.")
                 .size(12)
-                .style(muted_style),
+                .style(muted),
         ]
         .spacing(16);
         modal(content, RING_CARD_WIDTH)
@@ -186,25 +180,23 @@ pub fn bar(app: &App) -> Element<'_, Message> {
                     if reconnecting {
                         text::danger(t)
                     } else {
-                        muted_style(t)
+                        muted(t)
                     }
                 })
                 .into(),
         );
         if let Some(line) = declined_line(current) {
-            lines.push(text(line).size(12).style(muted_style).into());
+            lines.push(text(line).size(12).style(muted).into());
         }
         if let Some((line, talking)) = talk_line(app) {
             lines.push(
                 text(line)
                     .size(12)
-                    .style(move |t: &iced::Theme| {
-                        if talking {
-                            text::primary(t)
-                        } else {
-                            muted_style(t)
-                        }
-                    })
+                    .style(
+                        move |t: &iced::Theme| {
+                            if talking { text::primary(t) } else { muted(t) }
+                        },
+                    )
                     .into(),
             );
         }
@@ -307,7 +299,7 @@ pub fn panel_slot(app: &App) -> Element<'_, Message> {
 /// and for other people the volume and cleaning controls.
 fn participant(app: &App, row_view: ParticipantRow) -> Element<'_, Message> {
     let speaking = row_view.speaking;
-    let picture = container(person_avatar(
+    let picture = container(avatar(
         &row_view.user_id,
         &row_view.name,
         row_view.avatar.as_ref(),
@@ -328,7 +320,7 @@ fn participant(app: &App, row_view: ParticipantRow) -> Element<'_, Message> {
         .spacing(4)
         .align_y(iced::Center);
     if row_view.is_local {
-        name = name.push(text("(you)").size(12).style(muted_style));
+        name = name.push(text("(you)").size(12).style(muted));
     }
     if row_view.muted {
         name = name.push(text(MUTED_MARK).size(12));
@@ -340,10 +332,10 @@ fn participant(app: &App, row_view: ParticipantRow) -> Element<'_, Message> {
         (false, false) => None,
     };
     if let Some(status) = status {
-        details = details.push(text(status).size(12).style(muted_style));
+        details = details.push(text(status).size(12).style(muted));
     }
     if let Some(cleaning) = row_view.cleaning {
-        details = details.push(text(cleaning).size(12).style(muted_style));
+        details = details.push(text(cleaning).size(12).style(muted));
     }
     if let Some(controls) = row_view.controls {
         let user = row_view.user_id.clone();

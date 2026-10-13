@@ -7,8 +7,9 @@ use iced::{Element, Fill};
 use twicecat_core::api::MessageText;
 
 use crate::rooms::{MembersPanel, RoomsMessage, member_lines, role_badge};
-use crate::screens::room_dialogs::{error_line, modal, msg, muted, person_avatar};
+use crate::screens::room_dialogs::{error_line, msg};
 use crate::state::{App, Message};
+use crate::ui::kit::{avatar, modal, muted};
 
 /// Width of the panel.
 const PANEL_WIDTH: f32 = 520.0;
@@ -92,7 +93,7 @@ pub fn view(app: &App) -> Option<Element<'_, Message>> {
                     );
                 }
                 let mut line = row![
-                    person_avatar(&member.user_id, &name, member.avatar.as_ref(), &app.avatars),
+                    avatar(&member.user_id, &name, member.avatar.as_ref(), &app.avatars),
                     who
                 ]
                 .spacing(10)

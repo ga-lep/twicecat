@@ -17,8 +17,8 @@ use crate::audio_settings::{
     gpu_status, gpu_used, key_label, meter,
 };
 use crate::ptt::{BadBinding, SourceState};
-use crate::screens::room_dialogs::{modal, muted};
 use crate::state::{App, Message};
+use crate::ui::kit::{modal, muted};
 
 /// Width of the card.
 const CARD_WIDTH: f32 = 600.0;
