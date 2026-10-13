@@ -4,3 +4,4 @@ Task 1: complete (afd86cc..6695175, gate ok, security PASS, review PASS, evidenc
 Task 2: complete (6a6c5d6..e7969ed, gate ok, security PASS, review PASS, evidence PROVEN)
   evidence: docs/plans/ui-ux-rework.evidence/task-2.md
   notes: first review FAILED (font check not in CI) -> fixed and folded; font hashes live next to files (CODEOWNERS/upstream re-check job suggested); shellcheck unavailable (human); Font::DEFAULT grep test splits at first #[cfg(test)] so timeline_pane.rs prod code unscanned; release size +1,676,472 B unverified by evidence
+Task 3: started
