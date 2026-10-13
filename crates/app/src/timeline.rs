@@ -886,6 +886,13 @@ impl TimelineView {
         self.settle(&candidates)
     }
 
+    /// Forgets the measured row heights, as when a density switch changes
+    /// them. The distance from the bottom stays, so the view keeps its place.
+    pub fn reset_measurements(&mut self) {
+        self.measured.clear();
+        self.prefix = rebuild_prefix(&self.items, &self.measured, self.width);
+    }
+
     /// The pane scrolled or changed size. A width change beyond one pixel
     /// drops the measured heights, because lines wrap differently.
     pub fn scrolled(&mut self, offset_from_bottom: f32, viewport_h: f32, width: f32) -> Effects {
@@ -1620,6 +1627,23 @@ mod tests {
         assert_eq!(app.timeline.prefix, vec![0.0]);
         assert_eq!(app.timeline.pagination, PaginationState::Idle);
         assert!(app.timeline.anchor.is_none());
+    }
+
+    #[test]
+    fn reset_measurements_drops_heights_and_keeps_the_place() {
+        let (mut app, _rx) = app();
+        let _ = app.update(reset(many(3)));
+        let estimated = app.timeline.prefix.clone();
+        let _ = app.update(Message::RowMeasured {
+            id: "m0".into(),
+            height: estimated[1] + 40.0,
+        });
+        app.timeline.offset_from_bottom = 77.0;
+        assert_ne!(app.timeline.prefix, estimated);
+        app.timeline.reset_measurements();
+        assert!(app.timeline.measured.is_empty());
+        assert_eq!(app.timeline.offset_from_bottom, 77.0);
+        assert_eq!(app.timeline.prefix, estimated);
     }
 
     #[test]

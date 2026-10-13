@@ -16,6 +16,7 @@ on macOS.
 | Ctrl+Shift+Down / Ctrl+Shift+Up | Open the next / previous room with unread messages |
 | Ctrl+U | Attach a file to the open room |
 | Ctrl+, | Open Settings |
+| Ctrl+= / Ctrl+- / Ctrl+0 | Make the text larger / smaller / back to 100 % |
 | Ctrl+Shift+M | In a call: mute or unmute the microphone |
 | Ctrl+Shift+D | In a call: deafen or undeafen |
 | Tab / Shift+Tab | Move to the next / previous field |
@@ -112,16 +113,30 @@ iced 0.14 / winit stack delivers no file-drop events there (works on X11 and
 XWayland). Use **Attach...** or Ctrl+U, or paste with Ctrl+V. Settings shows
 the same note under the shortcut list.
 
-## High contrast
+## Colour sets, High contrast and zoom
 
-- Both palettes (`theme::LIGHT`, `theme::DARK`) are tested for a contrast of
-  at least 4.5:1 (WCAG AA for body text) for text on background, muted text,
-  badge and highlight text, text on selection, message highlight and hover,
-  and the primary colour on the background.
+- There are four colour sets ("families"): Twicecat, Frost, Ember and High
+  contrast, each with a light and a dark palette (`theme::Family`). Settings,
+  Appearance picks the family (four swatches, the one in use is outlined and
+  has a check) and the mode (System, Light or Dark). **Use the default** goes
+  back to the app's default set (`theme::DEFAULT_FAMILY`).
+- All eight palettes are tested for a contrast of at least 4.5:1 (WCAG AA for
+  body text) for text on background, muted text, badge and highlight text,
+  text on selection, message highlight, hover, surface, raised surface and
+  sidebar, the error text on its soft background, and the primary and focus
+  colours on the background.
+- **High contrast** (black on white, white on black, saturated accents) is
+  tested for 7:1 (WCAG AAA) on all of those pairs. Choose it in Settings,
+  Appearance, Colours, with Light or Dark mode.
+- The ring around a person who is talking (`speaking`) reaches 3:1 against the
+  background in all eight palettes (WCAG 1.4.11, non-text contrast).
 - Sender names take a colour derived from the user ID and are lightened or
-  darkened until they reach 4.5:1 on the current background.
-- Settings, Appearance: System, Light or Dark. There is no separate
-  high-contrast theme yet; the two palettes are the only ones.
+  darkened until they reach 4.5:1 on the current background, in all eight.
+- **Zoom** scales the whole window from 80 % to 200 % in steps of 10 %:
+  Ctrl+= makes it larger, Ctrl+- smaller and Ctrl+0 resets to 100 % (Cmd on
+  macOS). Settings, Appearance has the same as **Smaller**, **Larger** and
+  **Reset** buttons. The keys are ignored while the Voice & audio card waits
+  for a push-to-talk key. The choice is kept on this device.
 - Not tested by code (on the human checklist): that the keyboard focus is
   visible on every control in both themes, since it depends on iced's widget
   styles.

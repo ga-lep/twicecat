@@ -147,6 +147,7 @@ fn run(options: Options) -> Result<(), String> {
         .title(TITLE)
         .subscription(App::subscription)
         .theme(App::theme)
+        .scale_factor(App::scale_factor)
         .window(window_settings())
         .exit_on_close_request(false)
         .run();

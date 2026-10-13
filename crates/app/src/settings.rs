@@ -14,8 +14,8 @@ use std::sync::{Arc, Mutex};
 
 use iced::Task;
 use twicecat_core::api::{
-    Command, MediaBytes, MessageText, NotificationSettingsView, OwnProfileView,
-    RoomNotificationModeView, ThemeChoice, UiSettings,
+    Command, DensityChoice, MediaBytes, MessageText, NotificationSettingsView, OwnProfileView,
+    PaletteChoice, RoomListChoice, RoomNotificationModeView, ThemeChoice, UiSettings,
 };
 use twicecat_core::paths::DataPaths;
 
@@ -382,6 +382,76 @@ impl SettingsStore for DiskSettings {
     }
 }
 
+/// Least text scale, in percent.
+pub const MIN_TEXT_SCALE: u16 = 80;
+/// Largest text scale, in percent.
+pub const MAX_TEXT_SCALE: u16 = 200;
+/// The step of the zoom buttons and keys, in percent.
+pub const TEXT_SCALE_STEP: u16 = 10;
+/// The text scale of a fresh install, in percent.
+pub const DEFAULT_TEXT_SCALE: u16 = 100;
+
+/// A change of the text scale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Zoom {
+    /// One step larger (Ctrl+=).
+    In,
+    /// One step smaller (Ctrl+-).
+    Out,
+    /// Back to 100 % (Ctrl+0).
+    Reset,
+}
+
+impl Zoom {
+    /// The scale after this change, kept within the limits.
+    pub fn apply(self, percent: u16) -> u16 {
+        match self {
+            Self::In => (percent + TEXT_SCALE_STEP).min(MAX_TEXT_SCALE),
+            Self::Out => percent.saturating_sub(TEXT_SCALE_STEP).max(MIN_TEXT_SCALE),
+            Self::Reset => DEFAULT_TEXT_SCALE,
+        }
+    }
+}
+
+/// A density as a pick-list entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DensityOption(pub DensityChoice);
+
+impl DensityOption {
+    /// Both densities, in menu order.
+    pub const ALL: [Self; 2] = [
+        Self(DensityChoice::Comfortable),
+        Self(DensityChoice::Compact),
+    ];
+}
+
+impl fmt::Display for DensityOption {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self.0 {
+            DensityChoice::Comfortable => "Comfortable",
+            DensityChoice::Compact => "Compact",
+        })
+    }
+}
+
+/// A room list layout as a pick-list entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoomListOption(pub RoomListChoice);
+
+impl RoomListOption {
+    /// Both layouts, in menu order.
+    pub const ALL: [Self; 2] = [Self(RoomListChoice::Expanded), Self(RoomListChoice::Rail)];
+}
+
+impl fmt::Display for RoomListOption {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self.0 {
+            RoomListChoice::Expanded => "Expanded",
+            RoomListChoice::Rail => "Collapsed to a rail",
+        })
+    }
+}
+
 /// A message of the Settings screen.
 #[derive(Debug, Clone)]
 pub enum SettingsMessage {
@@ -426,6 +496,14 @@ pub enum SettingsMessage {
     TrayBadge(bool),
     /// A theme choice.
     Theme(ThemeChoice),
+    /// A colour set; `None` is the app's default.
+    Palette(Option<PaletteChoice>),
+    /// A density choice.
+    Density(DensityChoice),
+    /// A room list layout choice.
+    RoomList(RoomListChoice),
+    /// A change of the text scale (buttons and Ctrl+=, Ctrl+-, Ctrl+0).
+    Zoom(Zoom),
     /// The settings file was written (`true`) or not.
     Saved(bool),
 }
@@ -556,6 +634,41 @@ impl App {
                     return Task::none();
                 }
                 self.ui_settings.theme = choice;
+                self.save_local()
+            }
+            M::Palette(choice) => {
+                if self.ui_settings.palette == choice {
+                    return Task::none();
+                }
+                self.ui_settings.palette = choice;
+                self.save_local()
+            }
+            M::Density(choice) => {
+                if self.ui_settings.density == choice {
+                    return Task::none();
+                }
+                self.ui_settings.density = choice;
+                // Rows change height: the measured ones are stale. The place
+                // in the timeline (the offset from the bottom) stays.
+                self.timeline.reset_measurements();
+                if let Some(panel) = self.threads.panel.as_mut() {
+                    panel.timeline.reset_measurements();
+                }
+                self.save_local()
+            }
+            M::RoomList(choice) => {
+                if self.ui_settings.room_list == choice {
+                    return Task::none();
+                }
+                self.ui_settings.room_list = choice;
+                self.save_local()
+            }
+            M::Zoom(zoom) => {
+                let percent = zoom.apply(self.ui_settings.text_scale_percent);
+                if percent == self.ui_settings.text_scale_percent {
+                    return Task::none();
+                }
+                self.ui_settings.text_scale_percent = percent;
                 self.save_local()
             }
             M::Saved(ok) => {
@@ -724,6 +837,11 @@ impl App {
         }
         *slot = on;
         self.save_local()
+    }
+
+    /// The factor the whole window is scaled by (the text scale).
+    pub fn scale_factor(&self) -> f32 {
+        f32::from(self.ui_settings.text_scale_percent) / 100.0
     }
 
     /// Writes the local settings through the store, in a task.
