@@ -47,6 +47,10 @@ Rules the code follows (all in tests):
   the main view.
 - Ctrl+Shift+M and Ctrl+Shift+D act only during a call, also over a dialog
   (the call goes on behind it); without a call they do nothing.
+- While the Voice & audio card waits for a push-to-talk key (**Set key…**),
+  every key goes to it and no shortcut runs: the next key with its
+  modifiers becomes the binding, a modifier alone keeps waiting, and Esc,
+  **Cancel**, closing the card or leaving the window stop waiting.
 
 ## Calls
 
@@ -61,10 +65,19 @@ order, so Tab reaches it:
 - per person in the participants panel: **−** and **+** (10 % each), the
   volume slider, and the voice cleaning menu;
 - the Voice & audio card (from Settings or the call bar's **Audio…**): menus,
-  checkboxes, and for each slider **−** and **+** beside it; Esc closes it;
+  checkboxes, and for each slider **−** and **+** beside it; Esc closes it.
+  Its Talking section sets voice activity, push-to-talk or toggle-to-talk,
+  the key (**Set key…**, **Clear**), the gamepad button (a menu, so no pad
+  is needed to pick one) and the release delay;
 - the incoming-call card, a modal layer above everything else: **Decline**
   then **Accept**, and Esc to hide it. While it shows, the room shortcuts
   wait, as under any dialog.
+
+Push-to-talk works from the keyboard alone: the bound key in Twicecat's
+window always talks, also with the composer focused (a key that types text
+also types it, so a function key or a chord is the better choice), and the
+window losing focus lets go. The call bar says "Talking", or which key to
+hold or press, in words.
 
 A ring is not only a sound: the card, the window asking for attention
 (until it is focused, for a direct call), a desktop notification while the
@@ -73,7 +86,8 @@ window is not focused, and the room's highlighted call pill.
 iced 0.14's slider takes no keyboard focus: its arrow keys work only while
 the mouse is over it (`iced_widget` 0.14.2 `src/slider.rs:393-405`), which
 is why **−** and **+** sit beside every slider (the people's volumes, the
-microphone gain, the volume, the cleaning limits). A slider moved by the wheel or the
+microphone gain, the volume, the cleaning limits, the voice level, the
+release delay). A slider moved by the wheel or the
 keys, which never reports a release, sends its value after a 400 ms pause.
 Speaking is shown by a ring around the picture and by the word "Speaking",
 muted by a mark and the word "Muted", so neither relies on colour alone.

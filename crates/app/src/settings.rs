@@ -41,10 +41,8 @@ pub const MAX_KEYWORDS: usize = 50;
 /// for late echoes of an earlier setting before the UI believes them.
 pub const MAX_STALE_EVENTS: u8 = 3;
 
-/// The line of the push-to-talk section.
-pub const PUSH_TO_TALK_LINE: &str = "Push-to-talk arrives in a later version.";
 /// The Voice & audio section of Settings.
-pub const VOICE_AUDIO_LINE: &str = "Devices, microphone processing, volume, the mic test, the ringtone, and cleaning other voices.";
+pub const VOICE_AUDIO_LINE: &str = "Devices, voice activity or push-to-talk (a key or a gamepad button), microphone processing, volume, the mic test, the ringtone, and cleaning other voices.";
 /// The note under the shortcut list.
 pub const DRAG_AND_DROP_NOTE: &str = "Dragging files into the window does not work on a native Wayland window (an upstream limit). Use Attach (Ctrl+U) or paste instead.";
 

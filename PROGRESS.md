@@ -2319,7 +2319,7 @@ Plan approved by the human 2026-10-13 (Q1-Q6 answered: the service runs only in 
 - [x] 24. Toggle-to-talk in the core's input mode (phase6.24)
 - [x] 25. The push-to-talk service in the app (phase6.25)
 - [x] 26. The release tail end to end (phase6.26)
-- [ ] 27. The Talking section of the Voice & audio card (phase6.27)
+- [x] 27. The Talking section of the Voice & audio card (phase6.27)
 - [ ] 28. The desktop entry (phase6.28)
 - [ ] 29. Wrap-up (phase6.29)
 
@@ -2347,4 +2347,19 @@ Plan approved by the human 2026-10-13 (Q1-Q6 answered: the service runs only in 
   - `a_release_keeps_transmitting_for_the_delay_then_stops`: 1000 ms delay. Closed until pressed; a press reaches the core through the forwarding thread and the mic test's `InputLevel::transmitting` turns on; after the release it is still on at least 500 ms later and off between 0.7 and 3 s.
   - `without_a_delay_a_release_stops_at_once_and_voice_activity_ignores_presses`: 0 ms delay closes within 500 ms; in voice activity, with a silent microphone, a press opens nothing for 500 ms.
 - **Runs:** 10 in a row, all passed (about 1.2 s each). Mutation: the forwarding thread always sending `pressed: true` fails both tests; reverted.
+
+### Step 27: the Talking section of the Voice & audio card (phase6.27)
+- **Talking** (under Devices). A **Send** menu: voice activity, push-to-talk (held), toggle-to-talk (press to start, press to stop). Between push-to-talk and toggle-to-talk the release delay is kept; coming from voice activity it starts at 200 ms; going back to voice activity the level is automatic. The bindings are always kept.
+  - **Voice activity:** "Set the level automatically", and when off, a **Send above** slider (−100…0 dB, step 1, with **−**/**+**). A note says the mic test's level line shows when the voice would be sent.
+  - **Push-to-talk and toggle-to-talk:**
+    - **Key:** the binding as people write it (`Ctrl+Shift+T`, `Super`/`Cmd`), with **Set key…** and **Clear**. While waiting, the row says "Press the key, with its modifiers (Esc cancels)…" with **Cancel**, and the app's key listener is swapped for a capture-only one, so no shortcut (Esc included) is made of the keys and the two never race. A modifier alone keeps waiting; Esc, **Cancel**, closing the card or the window losing focus stop waiting; a key global-hotkey cannot name shows "This key cannot be used for push-to-talk. Try another, or Esc." The old key's window source is off meanwhile.
+    - **Gamepad button:** a menu (Q3): None, then the 19 positions with what common pads print on them ("Bottom face button (A, ✕)", "Left bumper (LB, L1)"…). A saved button Twicecat does not know shows as "Saved button (not recognised)".
+    - **Release delay** slider (0…2000 ms, step 50), with why it exists.
+    - A note on the session's keyboard mechanism (global shortcut, Wayland portal, or window only), saved bindings that cannot be used, and one line per source from the running service ("Desktop shortcut: ready, press Ctrl+Shift+T.", "Gamepad: not available (…)."). Reasons and triggers are capped to one line.
+- **Call bar:** in push-to-talk or toggle-to-talk, "Talking" (primary colour), else "Not talking: hold Ctrl+Shift+T" / "press …" / "…the gamepad button" / "no key or button is set (Audio…)". Nothing in voice activity.
+- **Settings:** the "Push-to-talk arrives in a later version." line is gone (`PUSH_TO_TALK_LINE` removed); the Voice & audio line names voice activity and push-to-talk.
+- **`docs/accessibility.md`:** key capture, the Talking controls, and push-to-talk from the keyboard alone.
+- **APIs** (rule 2): `iced_core-0.14.0/src/widget/text.rs:445` (`text::primary`); the keyboard types as in step 25. Iced 0.14 buttons take no keys (`iced_widget-0.14.2/src/button.rs` has no keyboard handling), so a captured Space or Enter cannot also press **Set key…**.
+- **Mutation:** without the capture guard in `on_shortcut`, Esc closed the card while waiting (1 test failed); reverted.
+- **Tests** (12 in `audio_settings::tests::talking`): the mode menu both ways (delay kept, 200 ms from voice activity, bindings kept, an unchanged choice sends nothing); the level switch, slider and steps (the delay slider does nothing in voice activity); the release delay's steps, slider and clamp; capture (modifiers wait, a refused key keeps waiting with the note, the binding stored in the stored syntax, the other binding kept, **Clear**); Esc as a shortcut ignored while waiting and Esc, focus loss, **Cancel** and close all stopping it with nothing saved; capture messages from fresh presses only; the button menu (every button, distinct labels, unknown kept, None, Unknown changes nothing); key labels; source and keyboard lines; the call bar line in each case; the view in each mode, while waiting, with a refused key and with bad bindings; the old window key off while waiting, and source reports shown. The other controls' tests still check that they leave the input mode and bindings alone.
 

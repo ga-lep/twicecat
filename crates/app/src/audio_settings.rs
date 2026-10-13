@@ -1,24 +1,28 @@
 //! The Voice & audio card (Phase 6 call UI plan, Task 6, Q5): devices,
-//! microphone processing, levels, the mic test, the ringtone, cleaning other
-//! voices and what others learn about ours.
+//! when the microphone sends (voice activity, push-to-talk, toggle-to-talk;
+//! the push-to-talk plan's Task 4, #15), microphone processing, levels, the
+//! mic test, the ringtone, cleaning other voices and what others learn
+//! about ours.
 //!
 //! The card shows the audio settings as the core last echoed them
 //! ([`crate::calls::CallModel::settings`]). Every change copies that value,
 //! changes one field and sends it whole with `UpdateAudioSettings`; the
 //! core validates, saves and echoes it back, so a clamped value snaps back
-//! on screen. The input mode and push-to-talk are left to #15 (plan Q7):
-//! they pass through untouched. Pure: only `App`'s handlers here send
-//! commands.
+//! on screen. Pure: only `App`'s handlers here send commands.
 
 use std::collections::HashMap;
 use std::fmt;
 use std::time::Duration;
 
 use iced::Task;
+use iced::keyboard::Modifiers;
+use iced::keyboard::key::{Code, Physical};
 use twicecat_core::api::{
     AudioDevice, AudioDeviceId, AudioDevices, AudioSettings, AudioStats, Command, EnhancerBackend,
-    GpuBackend, GpuEnhancement, InputLevel, NoiseSuppression, NsLevel, SkipCleaned, limits,
+    GpuBackend, GpuEnhancement, InputLevel, InputMode, NoiseSuppression, NsLevel, SkipCleaned,
+    limits,
 };
+use twicecat_ptt::{GamepadButton, KeyBinding};
 
 use crate::state::{App, Message};
 use crate::text_safety::{MAX_NAME_CHARS, name_or_placeholder};
@@ -32,6 +36,14 @@ pub const BITRATES: [u16; 7] = [16, 24, 32, 48, 64, 96, 128];
 pub const METER_FLOOR_DB: f32 = -60.0;
 /// The DeepFilterNet3 attenuation limit given when it is picked.
 pub const DEFAULT_DF_LIMIT_DB: f32 = 100.0;
+/// The release delay push-to-talk starts with, coming from voice activity
+/// (the roadmap's "about 200 ms", so word endings are not cut).
+pub const DEFAULT_RELEASE_MS: u32 = 200;
+/// The voice activity threshold shown before one is set, dBFS (the core's
+/// default).
+pub const DEFAULT_THRESHOLD_DB: f32 = -50.0;
+/// Said when a captured key cannot be a push-to-talk key.
+pub const UNBINDABLE_KEY: &str = "This key cannot be used for push-to-talk. Try another, or Esc.";
 
 /// A slider of the card.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,6 +58,10 @@ pub enum Slider {
     OthersCleaningLimit,
     /// The most automatic gain may boost, dB.
     AutoGainMax,
+    /// The voice activity threshold, dBFS.
+    Threshold,
+    /// How long push-to-talk keeps sending after a release, ms.
+    ReleaseDelay,
 }
 
 impl Slider {
@@ -63,6 +79,16 @@ impl Slider {
             },
             Self::OthersCleaningLimit => settings.remote_cleaning.attenuation_limit_db,
             Self::AutoGainMax => settings.processing.auto_gain_max_db,
+            Self::Threshold => match settings.input_mode {
+                InputMode::VoiceActivity { threshold_db, .. } => threshold_db,
+                InputMode::PushToTalk { .. } => DEFAULT_THRESHOLD_DB,
+            },
+            Self::ReleaseDelay => match settings.input_mode {
+                InputMode::PushToTalk {
+                    release_delay_ms, ..
+                } => release_delay_ms as f32,
+                InputMode::VoiceActivity { .. } => DEFAULT_RELEASE_MS as f32,
+            },
         }
     }
 
@@ -73,6 +99,8 @@ impl Slider {
             Self::MasterVolume => (0.0, f32::from(limits::VOLUME_PERCENT)),
             Self::MicCleaningLimit | Self::OthersCleaningLimit => limits::DF_ATTENUATION_DB,
             Self::AutoGainMax => limits::AUTO_GAIN_MAX_DB,
+            Self::Threshold => limits::VAD_THRESHOLD_DB,
+            Self::ReleaseDelay => (0.0, limits::PTT_RELEASE_DELAY_MS as f32),
         }
     }
 
@@ -82,6 +110,8 @@ impl Slider {
             Self::InputGain => 1.0,
             Self::MasterVolume => 10.0,
             Self::MicCleaningLimit | Self::OthersCleaningLimit | Self::AutoGainMax => 5.0,
+            Self::Threshold => 1.0,
+            Self::ReleaseDelay => 50.0,
         }
     }
 
@@ -103,8 +133,252 @@ impl Slider {
             }
             Self::OthersCleaningLimit => settings.remote_cleaning.attenuation_limit_db = value,
             Self::AutoGainMax => settings.processing.auto_gain_max_db = value,
+            Self::Threshold => {
+                if let InputMode::VoiceActivity { threshold_db, .. } = &mut settings.input_mode {
+                    *threshold_db = value;
+                }
+            }
+            Self::ReleaseDelay => {
+                if let InputMode::PushToTalk {
+                    release_delay_ms, ..
+                } = &mut settings.input_mode
+                {
+                    *release_delay_ms = value.round().max(0.0) as u32;
+                }
+            }
         }
     }
+}
+
+/// When the microphone sends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModeChoice {
+    /// While a voice is heard.
+    VoiceActivity,
+    /// While the key or button is held.
+    PushToTalk,
+    /// From one press to the next.
+    ToggleToTalk,
+}
+
+impl ModeChoice {
+    /// The menu, in order.
+    pub const ALL: [Self; 3] = [Self::VoiceActivity, Self::PushToTalk, Self::ToggleToTalk];
+
+    /// The entry of a setting.
+    pub fn of(mode: &InputMode) -> Self {
+        match mode {
+            InputMode::VoiceActivity { .. } => Self::VoiceActivity,
+            InputMode::PushToTalk { toggle: false, .. } => Self::PushToTalk,
+            InputMode::PushToTalk { toggle: true, .. } => Self::ToggleToTalk,
+        }
+    }
+
+    /// The setting for this entry. Between push-to-talk and toggle-to-talk
+    /// the release delay is kept; from voice activity it starts at
+    /// [`DEFAULT_RELEASE_MS`]; back to voice activity the threshold is
+    /// automatic.
+    pub fn setting(self, now: &InputMode) -> InputMode {
+        let release_delay_ms = match now {
+            InputMode::PushToTalk {
+                release_delay_ms, ..
+            } => *release_delay_ms,
+            InputMode::VoiceActivity { .. } => DEFAULT_RELEASE_MS,
+        };
+        match self {
+            Self::VoiceActivity => match now {
+                InputMode::VoiceActivity { .. } => *now,
+                InputMode::PushToTalk { .. } => InputMode::VoiceActivity {
+                    automatic: true,
+                    threshold_db: DEFAULT_THRESHOLD_DB,
+                },
+            },
+            Self::PushToTalk | Self::ToggleToTalk => InputMode::PushToTalk {
+                release_delay_ms,
+                toggle: self == Self::ToggleToTalk,
+            },
+        }
+    }
+}
+
+impl fmt::Display for ModeChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::VoiceActivity => "Voice activity (sends when you speak)",
+            Self::PushToTalk => "Push-to-talk (sends while held)",
+            Self::ToggleToTalk => "Toggle-to-talk (press to start, press to stop)",
+        })
+    }
+}
+
+/// An entry of the gamepad button menu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ButtonChoice {
+    /// No button.
+    None,
+    /// A button.
+    Button(GamepadButton),
+    /// The saved button is not one Twicecat knows (shown, not offered).
+    Unknown,
+}
+
+impl ButtonChoice {
+    /// The menu: none, then every button; plus the unknown saved one.
+    pub fn menu(saved: Option<&str>) -> (Vec<Self>, Self) {
+        let mut menu = vec![Self::None];
+        menu.extend(
+            GamepadButton::names()
+                .filter_map(|name| name.parse().ok())
+                .map(Self::Button),
+        );
+        let chosen = match saved {
+            None => Self::None,
+            Some(text) => match text.parse() {
+                Ok(button) => Self::Button(button),
+                Err(_) => {
+                    menu.push(Self::Unknown);
+                    Self::Unknown
+                }
+            },
+        };
+        (menu, chosen)
+    }
+}
+
+impl fmt::Display for ButtonChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let button = match self {
+            Self::None => return f.write_str("None"),
+            Self::Unknown => return f.write_str("Saved button (not recognised)"),
+            Self::Button(button) => *button,
+        };
+        let name = button.to_string();
+        // By position, then what common pads print on it.
+        let label = match name.as_str() {
+            "south" => "Bottom face button (A, \u{2715})",
+            "east" => "Right face button (B, \u{25cb})",
+            "north" => "Top face button (Y, \u{25b3})",
+            "west" => "Left face button (X, \u{25a1})",
+            "c" => "C button",
+            "z" => "Z button",
+            "left_trigger" => "Left bumper (LB, L1)",
+            "left_trigger2" => "Left trigger (LT, L2)",
+            "right_trigger" => "Right bumper (RB, R1)",
+            "right_trigger2" => "Right trigger (RT, R2)",
+            "select" => "Select (View, Share)",
+            "start" => "Start (Menu, Options)",
+            "mode" => "Guide (Xbox, PS, Steam)",
+            "left_thumb" => "Left stick press (L3)",
+            "right_thumb" => "Right stick press (R3)",
+            "dpad_up" => "D-pad up",
+            "dpad_down" => "D-pad down",
+            "dpad_left" => "D-pad left",
+            "dpad_right" => "D-pad right",
+            other => other,
+        };
+        f.write_str(label)
+    }
+}
+
+/// A stored key binding as people write it: `Ctrl+Shift+T`, `F13`. A
+/// binding that does not parse is shown as stored.
+pub fn key_label(binding: &str) -> String {
+    let Ok(parsed) = binding.parse::<KeyBinding>() else {
+        return binding.to_owned();
+    };
+    let text = parsed.to_string();
+    let mut parts: Vec<&str> = text.split('+').collect();
+    let key = parts.pop().unwrap_or_default();
+    let mut out = String::new();
+    let logo = if cfg!(target_os = "macos") {
+        "Cmd"
+    } else {
+        "Super"
+    };
+    for (written, shown) in [
+        ("control", "Ctrl"),
+        ("alt", "Alt"),
+        ("shift", "Shift"),
+        ("super", logo),
+    ] {
+        if parts.iter().any(|p| p.eq_ignore_ascii_case(written)) {
+            out.push_str(shown);
+            out.push('+');
+        }
+    }
+    let key = key
+        .strip_prefix("Key")
+        .or_else(|| key.strip_prefix("Digit"))
+        .unwrap_or(key);
+    out.push_str(key);
+    out
+}
+
+/// A key pressed while the card waits for the push-to-talk key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CapturedKey {
+    /// The physical key.
+    pub code: Code,
+    /// The modifiers held.
+    pub modifiers: Modifiers,
+}
+
+/// What a captured key means.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Capture {
+    /// A modifier alone: keep waiting for the key.
+    Wait,
+    /// Esc: stop waiting.
+    Cancel,
+    /// The binding, in the stored syntax.
+    Bound(String),
+    /// Not a key push-to-talk can use.
+    Refused,
+}
+
+/// Turns a captured key into a binding.
+pub fn capture(key: CapturedKey) -> Capture {
+    use Code as C;
+    match key.code {
+        C::Escape => Capture::Cancel,
+        C::ShiftLeft
+        | C::ShiftRight
+        | C::ControlLeft
+        | C::ControlRight
+        | C::AltLeft
+        | C::AltRight
+        | C::SuperLeft
+        | C::SuperRight
+        | C::Meta
+        | C::Hyper
+        | C::Fn
+        | C::FnLock => Capture::Wait,
+        code => match KeyBinding::from_key(
+            &crate::ptt::code_name(code),
+            crate::ptt::held(key.modifiers),
+        ) {
+            Ok(binding) => Capture::Bound(binding.to_string()),
+            Err(_) => Capture::Refused,
+        },
+    }
+}
+
+/// The capture message for a window event: key presses (not repeats) of
+/// identified keys.
+pub fn capture_message(event: &iced::Event) -> Option<Message> {
+    let iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+        physical_key: Physical::Code(code),
+        modifiers,
+        repeat: false,
+        ..
+    }) = event
+    else {
+        return None;
+    };
+    Some(Message::Audio(AudioMessage::Captured(CapturedKey {
+        code: *code,
+        modifiers: *modifiers,
+    })))
 }
 
 /// An entry of a device menu: a device, or the system default (`id: None`).
@@ -470,6 +744,11 @@ pub struct AudioUi {
     /// Device names seen this session, for a saved device that is not
     /// connected now.
     pub names: HashMap<AudioDeviceId, String>,
+    /// Waiting for the push-to-talk key: the shortcuts and the window key
+    /// are off meanwhile.
+    pub capturing: bool,
+    /// Why the last captured key was refused.
+    pub capture_note: Option<&'static str>,
 }
 
 impl AudioUi {
@@ -540,6 +819,20 @@ pub enum AudioMessage {
     CleanedOutside(bool),
     /// Show or hide the diagnostics.
     Diagnostics,
+    /// The input mode menu.
+    Mode(ModeChoice),
+    /// Pick the voice activity threshold automatically.
+    AutoThreshold(bool),
+    /// **Set key…**: wait for the push-to-talk key.
+    CaptureKey,
+    /// **Cancel** while waiting.
+    CancelCapture,
+    /// A key pressed while waiting.
+    Captured(CapturedKey),
+    /// **Clear** beside the key.
+    ClearKey,
+    /// The gamepad button menu.
+    Button(ButtonChoice),
 }
 
 impl App {
@@ -631,7 +924,53 @@ impl App {
                 self.audio_ui.diagnostics = !self.audio_ui.diagnostics;
                 Task::none()
             }
+            M::Mode(choice) => self.edit_audio(|s| s.input_mode = choice.setting(&s.input_mode)),
+            M::AutoThreshold(on) => self.edit_audio(|s| {
+                if let InputMode::VoiceActivity { automatic, .. } = &mut s.input_mode {
+                    *automatic = on;
+                }
+            }),
+            M::CaptureKey => {
+                self.audio_ui.capturing = true;
+                self.audio_ui.capture_note = None;
+                Task::none()
+            }
+            M::CancelCapture => {
+                self.stop_capture();
+                Task::none()
+            }
+            M::Captured(_) if !self.audio_ui.capturing => Task::none(),
+            M::Captured(key) => match capture(key) {
+                Capture::Wait => Task::none(),
+                Capture::Cancel => {
+                    self.stop_capture();
+                    Task::none()
+                }
+                Capture::Refused => {
+                    self.audio_ui.capture_note = Some(UNBINDABLE_KEY);
+                    Task::none()
+                }
+                Capture::Bound(binding) => {
+                    self.stop_capture();
+                    self.edit_audio(|s| s.push_to_talk.key = Some(binding))
+                }
+            },
+            M::ClearKey => self.edit_audio(|s| s.push_to_talk.key = None),
+            M::Button(choice) => self.edit_audio(|s| {
+                s.push_to_talk.gamepad_button = match choice {
+                    ButtonChoice::None => None,
+                    ButtonChoice::Button(button) => Some(button.to_string()),
+                    // Not offered; picking it again keeps what is saved.
+                    ButtonChoice::Unknown => s.push_to_talk.gamepad_button.take(),
+                };
+            }),
         }
+    }
+
+    /// Stops waiting for the push-to-talk key.
+    pub(crate) fn stop_capture(&mut self) {
+        self.audio_ui.capturing = false;
+        self.audio_ui.capture_note = None;
     }
 
     /// Copies the echoed settings, changes them, and sends the whole value
@@ -684,6 +1023,7 @@ impl App {
             Task::none()
         };
         self.audio_ui.open = false;
+        self.stop_capture();
         Task::batch([slider, stop])
     }
 
@@ -714,6 +1054,10 @@ pub const INPUT_GAIN_RANGE: (f32, f32) = limits::INPUT_GAIN_DB;
 pub const CLEANING_LIMIT_RANGE: (f32, f32) = limits::DF_ATTENUATION_DB;
 /// The bounds of the automatic gain's most boost, dB.
 pub const AUTO_GAIN_MAX_RANGE: (f32, f32) = limits::AUTO_GAIN_MAX_DB;
+/// The bounds of the voice activity threshold, dBFS.
+pub const THRESHOLD_RANGE: (f32, f32) = limits::VAD_THRESHOLD_DB;
+/// The bounds of the release delay, ms.
+pub const RELEASE_DELAY_RANGE: (f32, f32) = (0.0, limits::PTT_RELEASE_DELAY_MS as f32);
 
 #[cfg(test)]
 mod tests {
@@ -785,14 +1129,28 @@ mod tests {
     }
 
     /// The one `UpdateAudioSettings` sent, checked for the untouched input
-    /// mode and bindings.
+    /// mode and bindings (only the Talking section changes them).
     fn sent_settings(rx: &mut mpsc::Receiver<Command>) -> AudioSettings {
+        let settings = sent_one(rx);
+        assert_eq!(
+            settings.input_mode,
+            stored().input_mode,
+            "not this control's"
+        );
+        assert_eq!(
+            settings.push_to_talk,
+            stored().push_to_talk,
+            "not this control's"
+        );
+        settings
+    }
+
+    /// The one `UpdateAudioSettings` sent.
+    fn sent_one(rx: &mut mpsc::Receiver<Command>) -> AudioSettings {
         let sent = drain(rx);
         let [Command::UpdateAudioSettings(settings)] = sent.as_slice() else {
             panic!("expected one UpdateAudioSettings, got {sent:?}");
         };
-        assert_eq!(settings.input_mode, stored().input_mode, "left to #15");
-        assert_eq!(settings.push_to_talk, stored().push_to_talk, "left to #15");
         settings.clone()
     }
 
@@ -1427,5 +1785,411 @@ mod tests {
         let (mut app, _rx) = card();
         let _ = app.update(core(CoreEvent::LoggedOut));
         assert!(!app.audio_ui.open);
+    }
+
+    /// The Talking section (push-to-talk plan, Task 4).
+    mod talking {
+        use iced::keyboard::Modifiers;
+        use iced::keyboard::key::Code;
+        use twicecat_ptt::{KeyBinding, KeyboardBackend, Source};
+
+        use super::*;
+        use crate::ptt::{PttMessage, PttUpdate, SourceState};
+
+        fn voice(automatic: bool, threshold_db: f32) -> AudioSettings {
+            AudioSettings {
+                input_mode: InputMode::VoiceActivity {
+                    automatic,
+                    threshold_db,
+                },
+                ..stored()
+            }
+        }
+
+        fn key(code: Code, modifiers: Modifiers) -> Message {
+            audio(AudioMessage::Captured(CapturedKey { code, modifiers }))
+        }
+
+        fn binding(text: &str) -> KeyBinding {
+            text.parse().unwrap()
+        }
+
+        #[test]
+        fn the_mode_menu_keeps_what_each_mode_needs() {
+            let (mut app, mut rx) = card();
+            let _ = app.update(audio(AudioMessage::Mode(ModeChoice::ToggleToTalk)));
+            let s = sent_one(&mut rx);
+            assert_eq!(
+                s.input_mode,
+                InputMode::PushToTalk {
+                    release_delay_ms: 300,
+                    toggle: true
+                },
+                "the delay is kept"
+            );
+            assert_eq!(s.push_to_talk, stored().push_to_talk);
+            let _ = app.update(core(CoreEvent::AudioSettings(s)));
+            let _ = app.update(audio(AudioMessage::Mode(ModeChoice::VoiceActivity)));
+            let s = sent_one(&mut rx);
+            assert_eq!(
+                s.input_mode,
+                InputMode::VoiceActivity {
+                    automatic: true,
+                    threshold_db: DEFAULT_THRESHOLD_DB
+                }
+            );
+            assert_eq!(s.push_to_talk, stored().push_to_talk, "bindings are kept");
+            let _ = app.update(core(CoreEvent::AudioSettings(voice(false, -42.0))));
+            let _ = app.update(audio(AudioMessage::Mode(ModeChoice::VoiceActivity)));
+            assert!(drain(&mut rx).is_empty(), "already set");
+            let _ = app.update(audio(AudioMessage::Mode(ModeChoice::PushToTalk)));
+            assert_eq!(
+                sent_one(&mut rx).input_mode,
+                InputMode::PushToTalk {
+                    release_delay_ms: DEFAULT_RELEASE_MS,
+                    toggle: false
+                },
+                "from voice activity: 200 ms"
+            );
+            assert_eq!(
+                ModeChoice::of(&voice(true, -50.0).input_mode),
+                ModeChoice::VoiceActivity
+            );
+        }
+
+        #[test]
+        fn the_voice_activity_level_follows_its_switch_and_slider() {
+            let (mut app, mut rx) = card();
+            let _ = app.update(core(CoreEvent::AudioSettings(voice(true, -50.0))));
+            let _ = app.update(audio(AudioMessage::AutoThreshold(false)));
+            let s = sent_one(&mut rx);
+            assert_eq!(s.input_mode, voice(false, -50.0).input_mode);
+            let _ = app.update(core(CoreEvent::AudioSettings(s)));
+            let _ = app.update(audio(AudioMessage::Step(Slider::Threshold, true)));
+            assert_eq!(sent_one(&mut rx).input_mode, voice(false, -49.0).input_mode);
+            let _ = app.update(audio(AudioMessage::Slide(Slider::Threshold, -61.0)));
+            let _ = app.update(audio(AudioMessage::SlideReleased));
+            assert_eq!(sent_one(&mut rx).input_mode, voice(false, -61.0).input_mode);
+            // Not a push-to-talk setting: the delay slider changes nothing.
+            let _ = app.update(audio(AudioMessage::Step(Slider::ReleaseDelay, true)));
+            assert!(drain(&mut rx).is_empty());
+        }
+
+        #[test]
+        fn the_release_delay_follows_its_slider_and_steps() {
+            let (mut app, mut rx) = card();
+            let _ = app.update(audio(AudioMessage::Step(Slider::ReleaseDelay, true)));
+            let s = sent_one(&mut rx);
+            assert_eq!(
+                s.input_mode,
+                InputMode::PushToTalk {
+                    release_delay_ms: 350,
+                    toggle: false
+                }
+            );
+            let _ = app.update(audio(AudioMessage::Slide(Slider::ReleaseDelay, 1999.6)));
+            let _ = app.update(audio(AudioMessage::SlideReleased));
+            assert_eq!(
+                sent_one(&mut rx).input_mode,
+                InputMode::PushToTalk {
+                    release_delay_ms: 2000,
+                    toggle: false
+                }
+            );
+            let _ = app.update(core(CoreEvent::AudioSettings(AudioSettings {
+                input_mode: InputMode::PushToTalk {
+                    release_delay_ms: 0,
+                    toggle: false,
+                },
+                ..stored()
+            })));
+            let _ = app.update(audio(AudioMessage::Step(Slider::ReleaseDelay, false)));
+            assert!(drain(&mut rx).is_empty(), "clamped at 0: unchanged");
+            assert_eq!(Slider::ReleaseDelay.range(), (0.0, 2000.0));
+            assert_eq!(Slider::Threshold.range(), (-100.0, 0.0));
+        }
+
+        #[test]
+        fn a_captured_key_becomes_the_binding() {
+            let (mut app, mut rx) = card();
+            let _ = app.update(key(Code::KeyY, Modifiers::CTRL));
+            assert!(drain(&mut rx).is_empty(), "not waiting: nothing");
+            let _ = app.update(audio(AudioMessage::CaptureKey));
+            assert!(app.audio_ui.capturing);
+            let _ = app.update(key(Code::ShiftLeft, Modifiers::SHIFT));
+            let _ = app.update(key(Code::ControlRight, Modifiers::CTRL));
+            assert!(
+                app.audio_ui.capturing && drain(&mut rx).is_empty(),
+                "modifiers wait"
+            );
+            let _ = app.update(key(Code::ContextMenu, Modifiers::empty()));
+            assert_eq!(app.audio_ui.capture_note, Some(UNBINDABLE_KEY));
+            assert!(app.audio_ui.capturing && drain(&mut rx).is_empty());
+            let _ = app.update(key(Code::KeyY, Modifiers::CTRL | Modifiers::ALT));
+            assert!(!app.audio_ui.capturing && app.audio_ui.capture_note.is_none());
+            let s = sent_one(&mut rx);
+            let saved = s.push_to_talk.key.as_deref().unwrap();
+            assert_eq!(binding(saved), binding("ctrl+alt+KeyY"));
+            assert_eq!(s.input_mode, stored().input_mode);
+            assert_eq!(
+                s.push_to_talk.gamepad_button,
+                stored().push_to_talk.gamepad_button
+            );
+
+            let _ = app.update(core(CoreEvent::AudioSettings(s)));
+            let _ = app.update(audio(AudioMessage::ClearKey));
+            assert_eq!(sent_one(&mut rx).push_to_talk.key, None);
+        }
+
+        #[test]
+        fn esc_focus_loss_cancel_and_close_stop_waiting() {
+            let (mut app, mut rx) = card();
+            let wait = |app: &mut App| {
+                let _ = app.update(audio(AudioMessage::CaptureKey));
+                assert!(app.audio_ui.capturing);
+            };
+            wait(&mut app);
+            // The app's Esc shortcut is off while waiting (it would close
+            // the card); the captured Esc cancels.
+            let _ = app.update(Message::Shortcut {
+                shortcut: Shortcut::Escape,
+                captured: false,
+            });
+            assert!(app.audio_ui.open && app.audio_ui.capturing);
+            let _ = app.update(key(Code::Escape, Modifiers::empty()));
+            assert!(app.audio_ui.open && !app.audio_ui.capturing);
+            wait(&mut app);
+            let _ = app.update(Message::WindowFocus(false));
+            assert!(!app.audio_ui.capturing);
+            wait(&mut app);
+            let _ = app.update(audio(AudioMessage::CancelCapture));
+            assert!(!app.audio_ui.capturing);
+            wait(&mut app);
+            let _ = app.update(audio(AudioMessage::Close));
+            assert!(!app.audio_ui.capturing);
+            assert!(
+                drain(&mut rx)
+                    .iter()
+                    .all(|c| !matches!(c, Command::UpdateAudioSettings(_))),
+                "nothing saved"
+            );
+        }
+
+        #[test]
+        fn capture_messages_come_from_fresh_presses_only() {
+            use iced::keyboard::{Event, Key, Location};
+            let press = |repeat| {
+                iced::Event::Keyboard(Event::KeyPressed {
+                    key: Key::Unidentified,
+                    modified_key: Key::Unidentified,
+                    physical_key: iced::keyboard::key::Physical::Code(Code::F13),
+                    location: Location::Standard,
+                    modifiers: Modifiers::SHIFT,
+                    text: None,
+                    repeat,
+                })
+            };
+            assert!(matches!(
+                capture_message(&press(false)),
+                Some(Message::Audio(AudioMessage::Captured(CapturedKey {
+                    code: Code::F13,
+                    modifiers: Modifiers::SHIFT,
+                })))
+            ));
+            assert!(capture_message(&press(true)).is_none());
+            let release = iced::Event::Keyboard(Event::KeyReleased {
+                key: Key::Unidentified,
+                modified_key: Key::Unidentified,
+                physical_key: iced::keyboard::key::Physical::Code(Code::F13),
+                location: Location::Standard,
+                modifiers: Modifiers::empty(),
+            });
+            assert!(capture_message(&release).is_none());
+            assert_eq!(
+                capture(CapturedKey {
+                    code: Code::F13,
+                    modifiers: Modifiers::SHIFT
+                }),
+                Capture::Bound("shift+F13".into())
+            );
+        }
+
+        #[test]
+        fn the_gamepad_menu_offers_every_button_and_keeps_an_unknown_one() {
+            let (menu, chosen) = ButtonChoice::menu(Some("south"));
+            assert_eq!(menu.len(), 1 + GamepadButton::names().count());
+            assert_eq!(chosen, ButtonChoice::Button("south".parse().unwrap()));
+            assert_eq!(chosen.to_string(), "Bottom face button (A, \u{2715})");
+            let labels: std::collections::HashSet<String> =
+                menu.iter().map(ToString::to_string).collect();
+            assert_eq!(labels.len(), menu.len(), "every label differs");
+            for name in GamepadButton::names() {
+                let label = ButtonChoice::Button(name.parse().unwrap()).to_string();
+                assert_ne!(label, name, "{name} has words");
+            }
+            let (menu, chosen) = ButtonChoice::menu(Some("paddle9"));
+            assert_eq!(chosen, ButtonChoice::Unknown);
+            assert_eq!(menu.last(), Some(&ButtonChoice::Unknown));
+            assert_eq!(ButtonChoice::menu(None).1, ButtonChoice::None);
+
+            let (mut app, mut rx) = card();
+            let east = ButtonChoice::Button("east".parse().unwrap());
+            let _ = app.update(audio(AudioMessage::Button(east)));
+            let s = sent_one(&mut rx);
+            assert_eq!(s.push_to_talk.gamepad_button.as_deref(), Some("east"));
+            assert_eq!(s.push_to_talk.key, stored().push_to_talk.key);
+            let _ = app.update(core(CoreEvent::AudioSettings(s)));
+            let _ = app.update(audio(AudioMessage::Button(ButtonChoice::None)));
+            assert_eq!(sent_one(&mut rx).push_to_talk.gamepad_button, None);
+            let _ = app.update(audio(AudioMessage::Button(ButtonChoice::Unknown)));
+            assert!(drain(&mut rx).is_empty(), "not offered: nothing changes");
+        }
+
+        #[test]
+        fn keys_read_as_people_write_them() {
+            assert_eq!(key_label("shift+control+KeyT"), "Ctrl+Shift+T");
+            assert_eq!(key_label("ctrl+shift+KeyT"), "Ctrl+Shift+T");
+            assert_eq!(key_label("F13"), "F13");
+            assert_eq!(key_label("alt+Digit5"), "Alt+5");
+            assert_eq!(key_label("Numpad0"), "Numpad0");
+            let logo = if cfg!(target_os = "macos") {
+                "Cmd"
+            } else {
+                "Super"
+            };
+            assert_eq!(key_label("super+Space"), format!("{logo}+Space"));
+            assert_eq!(key_label("Banana"), "Banana", "shown as stored");
+        }
+
+        #[test]
+        fn sources_and_the_keyboard_read_well() {
+            use crate::screens::audio_settings::{keyboard_note, source_line};
+            assert_eq!(
+                source_line(Source::Portal, &SourceState::Ready("Ctrl+Shift+T".into())),
+                "Desktop shortcut: ready, press Ctrl+Shift+T."
+            );
+            assert_eq!(
+                source_line(Source::Portal, &SourceState::Ready(String::new())),
+                "Desktop shortcut: ready."
+            );
+            assert_eq!(
+                source_line(
+                    Source::Gamepad,
+                    &SourceState::Unavailable("no pad\nat all".into())
+                ),
+                "Gamepad: not available (no pad\u{23ce}at all)."
+            );
+            assert!(keyboard_note(KeyboardBackend::WindowOnly).contains("has focus"));
+            assert!(keyboard_note(KeyboardBackend::Portal).contains("Wayland"));
+            assert!(keyboard_note(KeyboardBackend::Hotkey).contains("every app"));
+        }
+
+        #[test]
+        fn the_call_bar_says_whether_you_are_talking() {
+            use crate::screens::call::talk_line;
+            let (mut app, _rx) = card();
+            assert_eq!(
+                talk_line(&app),
+                Some(("Not talking: hold Ctrl+Shift+T".into(), false))
+            );
+            app.ptt.talking = true;
+            assert_eq!(talk_line(&app), Some(("Talking".into(), true)));
+            app.ptt.talking = false;
+            let mut toggle = stored();
+            toggle.input_mode = InputMode::PushToTalk {
+                release_delay_ms: 0,
+                toggle: true,
+            };
+            toggle.push_to_talk.key = None;
+            let _ = app.update(core(CoreEvent::AudioSettings(toggle.clone())));
+            assert_eq!(
+                talk_line(&app),
+                Some(("Not talking: press the gamepad button".into(), false))
+            );
+            toggle.push_to_talk.gamepad_button = None;
+            let _ = app.update(core(CoreEvent::AudioSettings(toggle)));
+            assert!(talk_line(&app).unwrap().0.contains("no key or button"));
+            let _ = app.update(core(CoreEvent::AudioSettings(voice(true, -50.0))));
+            assert_eq!(talk_line(&app), None);
+        }
+
+        #[test]
+        fn the_view_builds_in_each_mode() {
+            let (mut app, _rx) = card();
+            app.ptt.sources = vec![
+                (Source::Portal, SourceState::Ready("Ctrl+Shift+T".into())),
+                (Source::Gamepad, SourceState::Unavailable("no pad".into())),
+            ];
+            let _ = app.view();
+            let _ = app.update(audio(AudioMessage::CaptureKey));
+            let _ = app.update(key(Code::ContextMenu, Modifiers::empty()));
+            let _ = app.view();
+            let _ = app.update(audio(AudioMessage::CancelCapture));
+            let mut bad = stored();
+            bad.push_to_talk.key = Some("ctrl+Banana".into());
+            bad.push_to_talk.gamepad_button = Some("paddle9".into());
+            let _ = app.update(core(CoreEvent::AudioSettings(bad)));
+            let _ = app.view();
+            for settings in [voice(true, -50.0), voice(false, -30.0)] {
+                let _ = app.update(core(CoreEvent::AudioSettings(settings)));
+                let _ = app.view();
+            }
+        }
+
+        /// A started service that records the window keys it gets.
+        #[derive(Clone, Default)]
+        struct Keys(std::sync::Arc<std::sync::Mutex<Vec<bool>>>);
+
+        impl crate::ptt::PttHandle for Keys {
+            fn window_key(&self, pressed: bool) {
+                self.0.lock().unwrap().push(pressed);
+            }
+        }
+
+        impl crate::ptt::PttStarter for Keys {
+            fn start(
+                &self,
+                _config: twicecat_ptt::PttConfig,
+                _sink: twicecat_ptt::Sink,
+            ) -> Box<dyn crate::ptt::PttHandle> {
+                Box::new(self.clone())
+            }
+        }
+
+        #[test]
+        fn the_old_key_is_off_while_a_new_one_is_awaited() {
+            let (mut app, _rx) = card();
+            let keys = Keys::default();
+            app.set_ptt_starter(Box::new(keys.clone()), KeyboardBackend::Hotkey);
+            let _ = app.update(audio(AudioMessage::Close));
+            let _ = app.update(audio(AudioMessage::Open));
+            assert!(app.ptt.is_running());
+            let window_key = |pressed| {
+                Message::Ptt(PttMessage::WindowKey(crate::ptt::WindowKey {
+                    code: Code::KeyT,
+                    modifiers: Modifiers::CTRL | Modifiers::SHIFT,
+                    pressed,
+                }))
+            };
+            let _ = app.update(audio(AudioMessage::CaptureKey));
+            let _ = app.update(window_key(true));
+            assert!(keys.0.lock().unwrap().is_empty(), "no press while waiting");
+            let _ = app.update(audio(AudioMessage::CancelCapture));
+            let _ = app.update(window_key(true));
+            assert_eq!(*keys.0.lock().unwrap(), [true]);
+            // Held when the card starts waiting: the release still lets go.
+            let _ = app.update(audio(AudioMessage::CaptureKey));
+            let _ = app.update(window_key(false));
+            let _ = app.update(audio(AudioMessage::CancelCapture));
+            assert_eq!(*keys.0.lock().unwrap(), [true, false]);
+            // What the sources report is shown for the running service.
+            let generation = 1;
+            let _ = app.update(Message::Ptt(PttMessage::Update(PttUpdate::Ready {
+                generation,
+                source: Source::Hotkey,
+                trigger: "shift+control+KeyT".into(),
+            })));
+            assert_eq!(app.ptt.sources.len(), 1);
+        }
     }
 }

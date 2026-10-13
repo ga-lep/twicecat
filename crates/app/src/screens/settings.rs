@@ -1,5 +1,6 @@
 //! The Settings screen (plan Q17, Task 15): profile, notifications,
-//! appearance, keyboard shortcuts, push-to-talk and a link to Sessions.
+//! appearance, keyboard shortcuts, Voice & audio (with push-to-talk) and a
+//! link to Sessions.
 //!
 //! A card over a dimmed window, in a layer that is always a stack of two (the
 //! base first), so opening it keeps the timeline's scroll offset and the
@@ -15,8 +16,8 @@ use twicecat_core::api::ThemeChoice;
 
 use crate::screens::room_dialogs::{modal, muted};
 use crate::settings::{
-    DRAG_AND_DROP_NOTE, DefaultChoice, KEYWORD_INPUT_ID, NAME_INPUT_ID, PUSH_TO_TALK_LINE,
-    SettingsMessage, VOICE_AUDIO_LINE,
+    DRAG_AND_DROP_NOTE, DefaultChoice, KEYWORD_INPUT_ID, NAME_INPUT_ID, SettingsMessage,
+    VOICE_AUDIO_LINE,
 };
 use crate::state::{App, Message};
 
@@ -71,7 +72,6 @@ fn view(app: &App) -> Element<'_, Message> {
                 button(text("Voice & audio\u{2026}"))
                     .on_press(msg(SettingsMessage::OpenVoiceAudio))
                     .style(button::secondary),
-                note(PUSH_TO_TALK_LINE),
             ]
             .spacing(6),
         )

@@ -1076,6 +1076,7 @@ impl App {
                 self.window_focused = focused;
                 if !focused {
                     self.ptt.window_unfocused();
+                    self.stop_capture();
                 }
                 // A second chance to create the tray, should the first
                 // window event not have reached the app.
@@ -1198,7 +1199,11 @@ impl App {
                 Task::none()
             }
             Message::Ptt(PttMessage::WindowKey(key)) => {
-                self.ptt.window_key(key);
+                // While the card waits for a new key, the old one does not
+                // press; its release still lets go.
+                if !self.audio_ui.capturing || !key.pressed {
+                    self.ptt.window_key(key);
+                }
                 Task::none()
             }
             Message::Spaces(SpacesMessage::Select(space)) => self.select_space(space),
@@ -2599,13 +2604,28 @@ impl App {
         Subscription::batch([
             bridge::events_subscription(self.events.clone()),
             window::close_requests().map(|_| Message::CloseRequested),
-            iced::event::listen_with(|event, status, _id| match event {
-                iced::Event::Window(window::Event::Focused) => Some(Message::WindowFocus(true)),
-                iced::Event::Window(window::Event::Unfocused) => Some(Message::WindowFocus(false)),
-                other => upload::event_message(&other).or_else(|| {
-                    keys::event_message(&other, status == iced::event::Status::Captured)
-                }),
-            }),
+            // While the Voice & audio card waits for the push-to-talk key,
+            // keys go to it and no shortcut (Esc included) is made of them:
+            // one listener, so the two never race.
+            if self.audio_ui.capturing {
+                iced::event::listen_with(|event, _status, _id| match event {
+                    iced::Event::Window(window::Event::Focused) => Some(Message::WindowFocus(true)),
+                    iced::Event::Window(window::Event::Unfocused) => {
+                        Some(Message::WindowFocus(false))
+                    }
+                    other => crate::audio_settings::capture_message(&other),
+                })
+            } else {
+                iced::event::listen_with(|event, status, _id| match event {
+                    iced::Event::Window(window::Event::Focused) => Some(Message::WindowFocus(true)),
+                    iced::Event::Window(window::Event::Unfocused) => {
+                        Some(Message::WindowFocus(false))
+                    }
+                    other => upload::event_message(&other).or_else(|| {
+                        keys::event_message(&other, status == iced::event::Status::Captured)
+                    }),
+                })
+            },
             system::theme_changes().map(Message::ThemeMode),
             window::open_events().map(Message::WindowOpened),
             tray::subscription(),

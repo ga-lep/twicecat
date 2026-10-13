@@ -7,13 +7,16 @@ use iced::widget::{
     space, stack, text,
 };
 use iced::{Element, Fill, Length};
-use twicecat_core::api::{AudioSettings, NoiseSuppression};
+use twicecat_core::api::{AudioSettings, InputMode, NoiseSuppression};
+use twicecat_ptt::{KeyboardBackend, Source};
 
 use crate::audio_settings::{
-    AUTO_GAIN_MAX_RANGE, AudioMessage, AudioUi, CLEANING_LIMIT_RANGE, INPUT_GAIN_RANGE,
-    LevelChoice, NoiseChoice, SkipChoice, Slider, backend_label, bitrate_menu, device_menu,
-    diagnostics, gpu_name, gpu_status, gpu_used, meter,
+    AUTO_GAIN_MAX_RANGE, AudioMessage, AudioUi, ButtonChoice, CLEANING_LIMIT_RANGE,
+    INPUT_GAIN_RANGE, LevelChoice, ModeChoice, NoiseChoice, RELEASE_DELAY_RANGE, SkipChoice,
+    Slider, THRESHOLD_RANGE, backend_label, bitrate_menu, device_menu, diagnostics, gpu_name,
+    gpu_status, gpu_used, key_label, meter,
 };
+use crate::ptt::{BadBinding, SourceState};
 use crate::screens::room_dialogs::{modal, muted};
 use crate::state::{App, Message};
 
@@ -64,6 +67,7 @@ fn view(app: &App) -> Element<'_, Message> {
         Some(settings) => {
             body = body
                 .push(devices_section(app, settings))
+                .push(talking_section(app, settings))
                 .push(processing_section(app, settings))
                 .push(levels_section(&app.audio_ui, settings))
                 .push(mic_test_section(app))
@@ -225,7 +229,174 @@ fn value_text(slider: Slider, value: f32) -> String {
         Slider::MicCleaningLimit | Slider::OthersCleaningLimit | Slider::AutoGainMax => {
             format!("{value:.0} dB")
         }
+        Slider::Threshold => format!("{value:.0} dB"),
+        Slider::ReleaseDelay => format!("{value:.0} ms"),
     }
+}
+
+/// Where a source listens, in words.
+pub fn source_name(source: Source) -> &'static str {
+    match source {
+        Source::Hotkey => "Global shortcut",
+        Source::Portal => "Desktop shortcut",
+        Source::Gamepad => "Gamepad",
+        Source::Window => "Twicecat's window",
+    }
+}
+
+/// One line per source the service reported.
+pub fn source_line(source: Source, state: &SourceState) -> String {
+    match state {
+        SourceState::Ready(trigger) if trigger.is_empty() => {
+            format!("{}: ready.", source_name(source))
+        }
+        SourceState::Ready(trigger) => format!(
+            "{}: ready, press {}.",
+            source_name(source),
+            crate::text_safety::one_line_capped(trigger, 80)
+        ),
+        SourceState::Unavailable(reason) => format!(
+            "{}: not available ({}).",
+            source_name(source),
+            crate::text_safety::one_line_capped(reason, 200)
+        ),
+    }
+}
+
+/// What the session's keyboard mechanism means for the key.
+pub fn keyboard_note(keyboard: KeyboardBackend) -> &'static str {
+    match keyboard {
+        KeyboardBackend::Hotkey => {
+            "During a call, the mic test, or while this card is open, the key works in every \
+             app, and other apps do not receive it. It also works in Twicecat's window."
+        }
+        KeyboardBackend::Portal => {
+            "On Wayland the desktop asks once to confirm the shortcut, and may give it another \
+             key: the key it chose is shown below. It also works in Twicecat's window."
+        }
+        KeyboardBackend::WindowOnly => {
+            "There is no global shortcut here (game mode, or no desktop shortcut service): the \
+             key works while Twicecat's window has focus. A gamepad button works everywhere."
+        }
+    }
+}
+
+fn talking_section<'a>(app: &'a App, settings: &'a AudioSettings) -> Element<'a, Message> {
+    let mut section = column![
+        heading("Talking"),
+        labelled(
+            "Send",
+            pick_list(
+                ModeChoice::ALL,
+                Some(ModeChoice::of(&settings.input_mode)),
+                |c| msg(AudioMessage::Mode(c))
+            )
+            .width(Fill)
+            .into()
+        ),
+    ]
+    .spacing(8);
+    match settings.input_mode {
+        InputMode::VoiceActivity { automatic, .. } => {
+            section = section.push(
+                checkbox(automatic)
+                    .label("Set the level automatically")
+                    .on_toggle(|on| msg(AudioMessage::AutoThreshold(on))),
+            );
+            if !automatic {
+                section = section.push(a_slider(
+                    &app.audio_ui,
+                    settings,
+                    Slider::Threshold,
+                    "Send above",
+                    THRESHOLD_RANGE,
+                    1.0,
+                ));
+            }
+            section = section.push(note(
+                "The mic test's level line says when your voice would be sent.",
+            ));
+        }
+        InputMode::PushToTalk { .. } => {
+            section = section
+                .push(key_row(app, settings))
+                .push(labelled("Gamepad button", button_menu(settings)))
+                .push(a_slider(
+                    &app.audio_ui,
+                    settings,
+                    Slider::ReleaseDelay,
+                    "Release delay",
+                    RELEASE_DELAY_RANGE,
+                    50.0,
+                ))
+                .push(note(
+                    "Keeps sending this long after you let go, so word endings are not cut.",
+                ))
+                .push(note(keyboard_note(app.ptt.keyboard())));
+            if let Some(setup) = app.ptt.setup() {
+                for bad in &setup.bad {
+                    section = section.push(
+                        text(match bad {
+                            BadBinding::Key => "The saved key cannot be used: set it again.",
+                            BadBinding::Button => {
+                                "The saved gamepad button cannot be used: pick it again."
+                            }
+                        })
+                        .size(13)
+                        .style(text::danger),
+                    );
+                }
+            }
+            for (source, state) in &app.ptt.sources {
+                let line = text(source_line(*source, state)).size(13);
+                section = section.push(match state {
+                    SourceState::Ready(_) => line.style(muted),
+                    SourceState::Unavailable(_) => line.style(text::danger),
+                });
+            }
+        }
+    }
+    section.into()
+}
+
+fn key_row<'a>(app: &'a App, settings: &'a AudioSettings) -> Element<'a, Message> {
+    let ui = &app.audio_ui;
+    let bound = settings.push_to_talk.key.as_deref();
+    let mut control = row![].spacing(8).align_y(iced::Center);
+    if ui.capturing {
+        control = control
+            .push(text("Press the key, with its modifiers (Esc cancels)\u{2026}").width(Fill))
+            .push(
+                button(text("Cancel"))
+                    .style(button::secondary)
+                    .on_press(msg(AudioMessage::CancelCapture)),
+            );
+    } else {
+        control = control
+            .push(text(bound.map_or_else(|| "None".to_owned(), key_label)).width(Fill))
+            .push(
+                button(text("Set key\u{2026}"))
+                    .style(button::secondary)
+                    .on_press(msg(AudioMessage::CaptureKey)),
+            )
+            .push(
+                button(text("Clear"))
+                    .style(button::secondary)
+                    .on_press_maybe(bound.is_some().then_some(msg(AudioMessage::ClearKey))),
+            );
+    }
+    let mut row_and_note = column![labelled("Key", control.into())].spacing(4);
+    if let Some(why) = ui.capture_note {
+        row_and_note = row_and_note.push(text(why).size(13).style(text::danger));
+    }
+    row_and_note.into()
+}
+
+fn button_menu(settings: &AudioSettings) -> Element<'_, Message> {
+    let (menu, chosen) = ButtonChoice::menu(settings.push_to_talk.gamepad_button.as_deref());
+    pick_list(menu, Some(chosen), |c| msg(AudioMessage::Button(c)))
+        .width(Fill)
+        .into()
 }
 
 fn a_slider<'a>(
