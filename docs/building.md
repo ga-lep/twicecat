@@ -34,6 +34,20 @@ In the app, open **Settings → Voice & audio**.
 
 The core prefers TensorRT, then CUDA, DirectML, WebGPU and Core ML, and uses the first that starts.
 
+## Push-to-talk on Linux
+
+On Wayland the global push-to-talk key goes through the desktop's shortcuts portal (KDE Plasma, and GNOME and Hyprland in recent versions). The portal knows Twicecat by its app ID, `io.github.ga_lep.Twicecat`, and looks for a desktop entry with that name. A build run with `cargo run` has none, so install the one in the repository once:
+
+```bash
+install -Dm644 packaging/linux/io.github.ga_lep.Twicecat.desktop ~/.local/share/applications/io.github.ga_lep.Twicecat.desktop
+```
+
+The first time push-to-talk starts (a call, the mic test, or the Voice & audio card in push-to-talk mode), the desktop asks you to confirm the shortcut, and may let you pick another key. The card then shows the key it chose. The entry's `Exec=twicecat` only matters for starting Twicecat from the app menu, which needs `twicecat` on your `PATH`.
+
+On X11, Windows and macOS the key is registered directly; nothing needs installing. In SteamOS game mode (gamescope) there is no global shortcut: the key works while Twicecat's window has focus, and a gamepad button works everywhere.
+
+To see what push-to-talk receives on a desktop, without the app: `cargo run -p twicecat-ptt --example ptt_probe -- --key ctrl+shift+KeyT --button left_thumb`.
+
 ## Disk use
 
 Cargo never deletes an older build. Every new mix of features (the GPU build, `--all-features`), of packages picked with `-p`, or of dependencies gets a full set of build files beside the others, so `target/debug` only grows. One debug build of all the tests is about 27 GB: each of the ~40 test binaries links the core and WebRTC.

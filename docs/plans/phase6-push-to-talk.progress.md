@@ -3,3 +3,4 @@ Task 1: complete (toggle-to-talk in InputMode::PushToTalk, /gate toggle in the C
 Task 2: complete (ptt model, forwarding thread, window key, dependency check)
 Task 3: complete (crates/app/tests/ptt.rs: release tail with the real core and virtual audio; 10 runs clean; mutation caught)
 Task 4: complete (Talking section: mode, level, key capture, gamepad menu, release delay, sources; call bar line; Settings line)
+Task 5: complete (desktop entry, window app ID, docs/building.md)

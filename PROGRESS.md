@@ -2320,7 +2320,7 @@ Plan approved by the human 2026-10-13 (Q1-Q6 answered: the service runs only in 
 - [x] 25. The push-to-talk service in the app (phase6.25)
 - [x] 26. The release tail end to end (phase6.26)
 - [x] 27. The Talking section of the Voice & audio card (phase6.27)
-- [ ] 28. The desktop entry (phase6.28)
+- [x] 28. The desktop entry (phase6.28)
 - [ ] 29. Wrap-up (phase6.29)
 
 ### Step 24: toggle-to-talk in the core (phase6.24)
@@ -2362,4 +2362,10 @@ Plan approved by the human 2026-10-13 (Q1-Q6 answered: the service runs only in 
 - **APIs** (rule 2): `iced_core-0.14.0/src/widget/text.rs:445` (`text::primary`); the keyboard types as in step 25. Iced 0.14 buttons take no keys (`iced_widget-0.14.2/src/button.rs` has no keyboard handling), so a captured Space or Enter cannot also press **Set key…**.
 - **Mutation:** without the capture guard in `on_shortcut`, Esc closed the card while waiting (1 test failed); reverted.
 - **Tests** (12 in `audio_settings::tests::talking`): the mode menu both ways (delay kept, 200 ms from voice activity, bindings kept, an unchanged choice sends nothing); the level switch, slider and steps (the delay slider does nothing in voice activity); the release delay's steps, slider and clamp; capture (modifiers wait, a refused key keeps waiting with the note, the binding stored in the stored syntax, the other binding kept, **Clear**); Esc as a shortcut ignored while waiting and Esc, focus loss, **Cancel** and close all stopping it with nothing saved; capture messages from fresh presses only; the button menu (every button, distinct labels, unknown kept, None, Unknown changes nothing); key labels; source and keyboard lines; the call bar line in each case; the view in each mode, while waiting, with a refused key and with bad bindings; the old window key off while waiting, and source reports shown. The other controls' tests still check that they leave the input mode and bindings alone.
+
+### Step 28: the desktop entry (phase6.28)
+- **`packaging/linux/io.github.ga_lep.Twicecat.desktop` (new, Q5):** Type Application, Name Twicecat, `Exec=twicecat`, Categories `Network;InstantMessaging;Chat;`, `StartupWMClass=io.github.ga_lep.Twicecat`, no icon (Phase 7). `desktop-file-validate` passes. `Exec` takes no `%u`, unlike the plan's draft: the app refuses unknown arguments, so a URL would stop it.
+- **App ID in one place:** `twicecat_ptt::APP_ID` is now public on every platform. On Linux the window's Wayland app ID is set to it (`iced::window::Settings::platform_specific.application_id`, `iced_core-0.14.0/src/window/settings/linux.rs:5-10`, given through `application(..).window(..)`, `iced-0.14.0/src/application.rs:253`, before `exit_on_close_request`, which edits the same settings), so compositors and the portal tie the window to the entry.
+- **`docs/building.md`:** a "Push-to-talk on Linux" section: installing the entry to `~/.local/share/applications/` for the portal during development, the one-time confirmation, X11/Windows/macOS needing nothing, game mode, and the probe.
+- **Test:** `the_desktop_entry_carries_the_app_id` (in `main.rs`): the file is named after `APP_ID`, has the keys above, `APP_ID` equals the keychain service name, the window's app ID is `APP_ID` on Linux, the app refuses a URL argument, and `desktop-file-validate` passes where it is installed.
 

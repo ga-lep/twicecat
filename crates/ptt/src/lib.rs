@@ -26,9 +26,10 @@ pub use merge::Source;
 
 use merge::Merger;
 
-/// The app ID the portal knows us by (as the keychain service).
-#[cfg(target_os = "linux")]
-const APP_ID: &str = "io.github.ga_lep.Twicecat";
+/// The app ID the portal knows us by (as the keychain service). The
+/// desktop entry `packaging/linux/io.github.ga_lep.Twicecat.desktop` and the
+/// window's Wayland app ID use it too.
+pub const APP_ID: &str = "io.github.ga_lep.Twicecat";
 
 /// What the service reports.
 #[derive(Clone, Debug, PartialEq, Eq)]

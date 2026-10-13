@@ -141,6 +141,7 @@ fn run(options: Options) -> Result<(), String> {
     .title(TITLE)
     .subscription(App::subscription)
     .theme(App::theme)
+    .window(window_settings())
     .exit_on_close_request(false)
     .run();
     if let Some(dir) = cleanup {
@@ -148,6 +149,26 @@ fn run(options: Options) -> Result<(), String> {
         let _ = std::fs::remove_dir_all(dir);
     }
     result.map_err(|error| format!("the window failed: {error}"))
+}
+
+/// The window's settings: on Linux its app ID is the desktop entry's name
+/// (`packaging/linux/`), so the compositor and the shortcuts portal tie the
+/// window to it.
+fn window_settings() -> iced::window::Settings {
+    #[cfg(target_os = "linux")]
+    {
+        iced::window::Settings {
+            platform_specific: iced::window::settings::PlatformSpecific {
+                application_id: twicecat_ptt::APP_ID.to_owned(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        iced::window::Settings::default()
+    }
 }
 
 fn main() -> ExitCode {
@@ -223,6 +244,51 @@ mod tests {
     fn help_carries_the_shared_data_dir_note() {
         assert!(HELP.contains("twicecat-cli"));
         assert!(HELP.contains("at the same time"));
+    }
+
+    /// The desktop entry is named after the app ID the shortcuts portal and
+    /// the window use, starts the binary, and is valid where
+    /// `desktop-file-validate` is installed.
+    #[test]
+    fn the_desktop_entry_carries_the_app_id() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packaging/linux")
+            .join(format!("{}.desktop", twicecat_ptt::APP_ID));
+        let entry = std::fs::read_to_string(&path).expect("the desktop entry exists");
+        let lines: Vec<&str> = entry.lines().collect();
+        assert_eq!(lines.first(), Some(&"[Desktop Entry]"));
+        for wanted in [
+            "Type=Application",
+            "Name=Twicecat",
+            "Exec=twicecat",
+            &format!("StartupWMClass={}", twicecat_ptt::APP_ID),
+        ] {
+            assert!(lines.contains(&wanted), "missing {wanted}");
+        }
+        assert_eq!(
+            twicecat_ptt::APP_ID,
+            twicecat_core::secrets::KEYCHAIN_SERVICE,
+            "one name for the app everywhere"
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            window_settings().platform_specific.application_id,
+            twicecat_ptt::APP_ID
+        );
+        // `Exec` takes no arguments: the app refuses unknown ones.
+        assert!(parse_args(&args(&["https://matrix.to/#/@a:x"])).is_err());
+        // Where it is not installed, the checks above stand.
+        if let Ok(out) = std::process::Command::new("desktop-file-validate")
+            .arg(&path)
+            .output()
+        {
+            assert!(
+                out.status.success() && out.stdout.is_empty(),
+                "desktop-file-validate: {}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
     }
 
     #[test]
