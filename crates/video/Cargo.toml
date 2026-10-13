@@ -10,3 +10,10 @@ publish = false
 thiserror = "2"
 # CPU colour conversion (pure Rust, SIMD; plan Q11, approved 2026-10-13).
 yuvutils-rs = "=0.8.3"
+# Vulkan Video and compute (plan Q6/Q11): the version already locked through
+# wgpu, with its default `loaded` feature (the system's loader, opened at run
+# time).
+ash = "=0.38.0"
+# NVIDIA's CUDA, NVENC and NVDEC libraries, opened at run time (plan Q11):
+# the version already locked through ash.
+libloading = "=0.8.9"

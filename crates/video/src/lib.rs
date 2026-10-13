@@ -10,6 +10,7 @@ pub mod annexb;
 pub mod convert;
 mod frame;
 pub mod ladder;
+pub mod probe;
 pub mod test_pattern;
 
 pub use frame::{ColorSpace, CpuFrame, Frame, Matrix, PixelFormat, Plane, Range};
