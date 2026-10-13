@@ -216,8 +216,8 @@ async fn alice_as_seen_by(core: &mut CoreHandle, alice: &str, done: impl Fn(&Par
         .expect("timed out waiting for alice's participant state");
 }
 
-/// The call service `user`'s membership publishes on (`foci_preferred[0]`).
-async fn call_service_of(reader: &matrix_sdk::Client, room_id: &str, user: &str) -> Option<String> {
+/// The content of a call membership `user` sent.
+async fn membership_of(reader: &matrix_sdk::Client, room_id: &str, user: &str) -> Option<Value> {
     use matrix_sdk::ruma::api::client::state::get_state_events;
     let reply = reader
         .send(get_state_events::v3::Request::new(
@@ -228,13 +228,15 @@ async fn call_service_of(reader: &matrix_sdk::Client, room_id: &str, user: &str)
     reply.room_state.iter().find_map(|raw| {
         let event: Value = raw.deserialize_as().ok()?;
         (event["type"] == "org.matrix.msc3401.call.member" && event["sender"] == user)
-            .then(|| {
-                event["content"]["foci_preferred"][0]["livekit_service_url"]
-                    .as_str()
-                    .map(str::to_owned)
-            })
-            .flatten()
+            .then(|| event["content"].clone())
     })
+}
+
+/// The call service `user`'s membership publishes on (`foci_preferred[0]`).
+async fn call_service_of(reader: &matrix_sdk::Client, room_id: &str, user: &str) -> Option<String> {
+    membership_of(reader, room_id, user).await?["foci_preferred"][0]["livekit_service_url"]
+        .as_str()
+        .map(str::to_owned)
 }
 
 /// Lets members at power level 0 publish call memberships (as Element does).
@@ -503,15 +505,15 @@ async fn members_on_different_sfus_hear_each_other() {
     }
 }
 
-/// Joins the call's LiveKit room as `client`'s user with a made-up device
-/// (a token from the call service, no call membership) and publishes a
-/// `hz` tone: what anyone with a Matrix account could do.
-async fn intrude(client: &matrix_sdk::Client, room_id: &str, hz: f32) -> livekit::prelude::Room {
-    use livekit::options::TrackPublishOptions;
-    use livekit::prelude::{LocalAudioTrack, LocalTrack, Room, RoomOptions, TrackSource};
-    use livekit::webrtc::audio_frame::AudioFrame;
-    use livekit::webrtc::audio_source::native::NativeAudioSource;
-    use livekit::webrtc::audio_source::{AudioSourceOptions, RtcAudioSource};
+/// Joins the call's LiveKit room as `client`'s user with the made-up
+/// `device` (a token from the call service, with or without a call
+/// membership).
+async fn sfu_room(
+    client: &matrix_sdk::Client,
+    room_id: &str,
+    device: &str,
+) -> livekit::prelude::Room {
+    use livekit::prelude::{Room, RoomOptions};
     use matrix_sdk::ruma::api::client::account::request_openid_token;
 
     let env = TestEnv::load();
@@ -529,7 +531,7 @@ async fn intrude(client: &matrix_sdk::Client, room_id: &str, hz: f32) -> livekit
             "matrix_server_name": openid.matrix_server_name,
             "expires_in": openid.expires_in.as_secs(),
         },
-        "device_id": "INTRUDER",
+        "device_id": device,
     });
     let reply = matrix_sdk::reqwest::Client::new()
         .post(format!("{}/sfu/get", env.get("LK_JWT_URL")))
@@ -548,19 +550,35 @@ async fn intrude(client: &matrix_sdk::Client, room_id: &str, hz: f32) -> livekit
         RoomOptions::default(),
     )
     .await
-    .expect("intruder connects");
-    let source = NativeAudioSource::new(AudioSourceOptions::default(), 48_000, 1, 50);
-    let track = LocalAudioTrack::create_audio_track("tone", RtcAudioSource::Native(source.clone()));
-    room.local_participant()
+    .expect("connects to the SFU");
+    room
+}
+
+/// Publishes a `hz` tone on `room` as `source`.
+async fn publish_tone(
+    room: &livekit::prelude::Room,
+    hz: f32,
+    source: livekit::prelude::TrackSource,
+) -> livekit::prelude::LocalTrackPublication {
+    use livekit::options::TrackPublishOptions;
+    use livekit::prelude::{LocalAudioTrack, LocalTrack};
+    use livekit::webrtc::audio_frame::AudioFrame;
+    use livekit::webrtc::audio_source::native::NativeAudioSource;
+    use livekit::webrtc::audio_source::{AudioSourceOptions, RtcAudioSource};
+
+    let audio = NativeAudioSource::new(AudioSourceOptions::default(), 48_000, 1, 50);
+    let track = LocalAudioTrack::create_audio_track("tone", RtcAudioSource::Native(audio.clone()));
+    let publication = room
+        .local_participant()
         .publish_track(
             LocalTrack::Audio(track),
             TrackPublishOptions {
-                source: TrackSource::Microphone,
+                source,
                 ..TrackPublishOptions::default()
             },
         )
         .await
-        .expect("intruder publishes");
+        .expect("publishes a tone");
     tokio::spawn(async move {
         let mut n = 0u64;
         let mut ticker = tokio::time::interval(Duration::from_millis(10));
@@ -579,11 +597,20 @@ async fn intrude(client: &matrix_sdk::Client, room_id: &str, hz: f32) -> livekit
                 num_channels: 1,
                 samples_per_channel: 480,
             };
-            if source.capture_frame(&frame).await.is_err() {
+            if audio.capture_frame(&frame).await.is_err() {
                 return;
             }
         }
     });
+    publication
+}
+
+/// Joins the call's LiveKit room as `client`'s user with a made-up device
+/// (a token from the call service, no call membership) and publishes a
+/// `hz` tone: what anyone with a Matrix account could do.
+async fn intrude(client: &matrix_sdk::Client, room_id: &str, hz: f32) -> livekit::prelude::Room {
+    let room = sfu_room(client, room_id, "INTRUDER").await;
+    publish_tone(&room, hz, livekit::prelude::TrackSource::Microphone).await;
     room
 }
 
@@ -641,6 +668,84 @@ async fn a_participant_without_a_membership_is_not_played() {
         core.commands.send(Command::LeaveCall).await.unwrap();
         core.commands.send(Command::Shutdown).await.unwrap();
     }
+}
+
+/// Element Call sends a screen share's sound as a second audio track next
+/// to the microphone: alice plays both, and when carol stops sharing her
+/// voice keeps playing (players were keyed by participant only, so the
+/// share replaced the voice and its end silenced carol).
+#[tokio::test]
+#[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
+async fn a_screen_share_sound_plays_next_to_the_voice() {
+    use livekit::prelude::TrackSource;
+    use matrix_sdk::ruma::api::client::state::send_state_event;
+    use matrix_sdk::ruma::events::StateEventType;
+    const VOICE_HZ: f32 = 600.0;
+    const SHARE_HZ: f32 = 800.0;
+    const DEVICE: &str = "SHARER";
+    let env = TestEnv::load();
+    let alice_raw = raw_login(1).await;
+    let carol_raw = raw_login(3).await;
+    let room_id = create_room(&alice_raw, &unique_room_name(), Some(&env.user_id(3)))
+        .await
+        .to_string();
+    allow_calls(&alice_raw, &room_id).await;
+    carol_raw
+        .join_room_by_id(room_id.as_str().try_into().unwrap())
+        .await
+        .unwrap();
+
+    let alice_audio = Arc::new(Duplex::new(TONE_HZ));
+    let dir_a = tempfile::tempdir().unwrap();
+    let mut alice = logged_in(dir_a.path(), 1, AudioBackend::Virtual(alice_audio.clone())).await;
+    wait_for_room(&mut alice, &room_id).await;
+    join(&mut alice, &room_id).await;
+
+    // Carol joins as another client would: alice's membership, as hers.
+    let carol_id = env.user_id(3);
+    let mut membership = membership_of(&carol_raw, &room_id, &env.user_id(1))
+        .await
+        .expect("alice's membership");
+    membership["device_id"] = DEVICE.into();
+    membership["membershipID"] = format!("{carol_id}:{DEVICE}").into();
+    carol_raw
+        .send(send_state_event::v3::Request::new_raw(
+            room_id.as_str().try_into().unwrap(),
+            StateEventType::from("org.matrix.msc3401.call.member"),
+            format!("_{carol_id}_{DEVICE}_m.call"),
+            matrix_sdk::ruma::serde::Raw::new(&membership)
+                .unwrap()
+                .cast_unchecked(),
+        ))
+        .await
+        .unwrap();
+    let sharer = sfu_room(&carol_raw, &room_id, DEVICE).await;
+    publish_tone(&sharer, VOICE_HZ, TrackSource::Microphone).await;
+    let share = publish_tone(&sharer, SHARE_HZ, TrackSource::ScreenshareAudio).await;
+
+    alice_as_seen_by(&mut alice, &carol_id, |p| p.speaking).await;
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let voice = alice_audio.level(VOICE_HZ, 3.0);
+    let sound = alice_audio.level(SHARE_HZ, 3.0);
+    eprintln!("alice hears carol's voice {voice:.4} and her share {sound:.4} (each sent 0.3)");
+    assert!(voice > HEARD, "voice while sharing: amplitude {voice:.4}");
+    assert!(sound > HEARD, "share: amplitude {sound:.4}");
+
+    sharer
+        .local_participant()
+        .unpublish_track(&share.sid())
+        .await
+        .expect("stops sharing");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let voice = alice_audio.level(VOICE_HZ, 2.0);
+    let sound = alice_audio.level(SHARE_HZ, 2.0);
+    eprintln!("after the share: voice {voice:.4}, share {sound:.5}");
+    assert!(voice > HEARD, "voice after the share: amplitude {voice:.4}");
+    assert!(sound < 0.01, "share after it stopped: amplitude {sound:.4}");
+
+    let _ = sharer.close().await;
+    alice.commands.send(Command::LeaveCall).await.unwrap();
+    alice.commands.send(Command::Shutdown).await.unwrap();
 }
 
 /// Joins the call's LiveKit room as `client`'s user with a made-up device,
