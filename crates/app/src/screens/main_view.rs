@@ -1,14 +1,18 @@
 //! The two-pane main layout: the room list pane on the left and the room view
 //! (timeline pane and composer) on the right.
 
+use std::fmt;
+
+use iced::widget::text::Wrapping;
 use iced::widget::{
     Column, Row, button, column, container, opaque, pick_list, row, space, stack, text,
     text_editor, text_input,
 };
 use iced::{Element, Fill};
-use twicecat_core::api::{MessageText, RoomId, UserId, UserTrust};
+use twicecat_core::api::{MessageText, RoomId, SyncState, UserId, UserTrust};
 
 use crate::actions::{self, Picker};
+use crate::audio_settings::AudioMessage;
 use crate::calls::{CallButton, CallMessage};
 use crate::composer::{self, EditorAction, Mode, Suggestions};
 use crate::emoji;
@@ -26,7 +30,10 @@ use crate::settings::SettingsMessage;
 use crate::state::{App, Message};
 use crate::text_safety::{MAX_NAME_CHARS, name_or_placeholder, one_line_capped};
 use crate::theme;
-use crate::verification::{MAX_PEER_USER_ID_CHARS, elide_middle};
+use crate::ui::icons::{self, Icon};
+use crate::ui::kit::{self, Severity};
+use crate::ui::tokens;
+use crate::verification::elide_middle;
 
 /// Width of the left pane.
 pub const LIST_PANE_WIDTH: f32 = 300.0;
@@ -57,6 +64,16 @@ impl Badge {
         }
     }
 
+    /// How serious the badge is, which sets the colour of its tag: an
+    /// identity that changed must never look like a verified one.
+    pub fn severity(self) -> Severity {
+        match self {
+            Self::Verified => Severity::Success,
+            Self::NotVerified => Severity::Info,
+            Self::IdentityChanged => Severity::Danger,
+        }
+    }
+
     /// Whether the header offers **Verify** next to it.
     pub fn can_verify(self) -> bool {
         !matches!(self, Self::Verified)
@@ -74,114 +91,191 @@ pub fn trust_badge(trust: UserTrust) -> Option<Badge> {
     }
 }
 
-/// The peer's user ID as the header shows it: one sanitized line, never cut
-/// from the end (see [`crate::verification::elide_middle`]).
+/// Longest peer ID in the header, in characters. Longer IDs are cut in the
+/// middle, so the server name stays visible.
+pub const HEADER_PEER_ID_CHARS: usize = 48;
+
+/// The peer's user ID as the header shows it: one sanitized line, cut only in
+/// the middle (see [`crate::verification::elide_middle`]), never from the end.
+/// The full ID is in the verification dialog.
 pub fn peer_id_line(peer: &UserId) -> String {
-    elide_middle(peer.as_str(), MAX_PEER_USER_ID_CHARS)
+    elide_middle(peer.as_str(), HEADER_PEER_ID_CHARS)
 }
 
-/// The room header: the name, a lock for an encrypted room, and for a direct
-/// message the trust of the other person with **Verify** where it helps. Always
+/// Longest topic line in the header, in characters.
+const TOPIC_CHARS: usize = 120;
+
+/// The topic as the header shows it: one sanitised line, capped; `None`
+/// when there is no topic.
+pub fn topic_line(topic: Option<&str>) -> Option<String> {
+    let topic = topic?.trim();
+    (!topic.is_empty()).then(|| one_line_capped(topic, TOPIC_CHARS))
+}
+
+/// The topic of the selected room. The room list carries no topic (the
+/// core reports it to the room settings panel only), so the header shows
+/// none yet.
+fn room_topic(_app: &App) -> Option<&str> {
+    None
+}
+
+/// A control in the room header, with the message a press sends.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HeaderAction {
+    /// **Members**.
+    Members,
+    /// The room's **Settings**.
+    Settings,
+    /// **People**: the participants panel of a call.
+    People,
+    /// **Verify** the other person of a direct message.
+    Verify(UserId),
+    /// **Accept** an invitation.
+    Accept(RoomId),
+    /// **Decline** an invitation.
+    Decline(RoomId),
+}
+
+impl HeaderAction {
+    /// The message a press sends.
+    pub fn message(self) -> Message {
+        match self {
+            Self::Members => Message::Rooms(RoomsMessage::OpenMembers),
+            Self::Settings => Message::Rooms(RoomsMessage::OpenSettings),
+            Self::People => Message::Call(CallMessage::TogglePanel),
+            Self::Verify(peer) => Message::VerifyPeerRequested(peer),
+            Self::Accept(room) => Message::Rooms(RoomsMessage::Accept(room)),
+            Self::Decline(room) => Message::Rooms(RoomsMessage::Decline(room)),
+        }
+    }
+}
+
+/// The room header: the avatar, the name and a line under it, tags for the
+/// lock, Voice and the trust of the other person (with Verify), then the buttons. Always
 /// one row, so the column around it keeps its widget types.
 fn header<'a>(app: &'a App, title: String) -> Element<'a, Message> {
-    let mut line = Row::new().spacing(8).align_y(iced::Center);
-    line = line.push(text(title).size(22));
     let selected = app
         .selected
         .as_ref()
         .and_then(|id| app.rooms.iter().find(|room| room.id == *id));
-    if let Some(lock) = selected.and_then(room_list_pane::encrypted_mark) {
-        line = line.push(text(lock).size(16));
+    let trust = app
+        .dm_peer_trust()
+        .and_then(|(peer, trust)| trust_badge(trust).map(|badge| (peer, badge)));
+
+    let mut line = Row::new().spacing(tokens::S).align_y(iced::Center);
+    if let Some(room) = selected {
+        // A room's placeholder colour comes from its ID: the same string as
+        // a user ID gives the same colour as the room list's row.
+        let id = UserId::from(room.id.as_str());
+        line = line.push(kit::avatar(&id, &title, room.avatar.as_ref(), &app.avatars));
     }
+    // Under the name: a row of tags (it wraps rather than clips, so the
+    // trust tag is always seen), then the topic or, in a direct message, the
+    // other person's ID on its own line.
+    let mut tag_list: Vec<Element<'a, Message>> = Vec::new();
+    if let Some(room) = selected {
+        if room.is_encrypted {
+            tag_list.push(kit::tag(Icon::Lock.label()));
+        }
+        if room.is_call_room {
+            tag_list.push(kit::tag("Voice"));
+        }
+    }
+    if let Some((_, badge)) = trust {
+        tag_list.push(kit::severity_tag(badge.severity(), badge.label()));
+    }
+    // Verify sits with the trust tag, in the row that wraps: in the header's
+    // own row it would take the width the tag and the ID need.
+    if let Some((peer, _)) = trust.filter(|(_, badge)| badge.can_verify()) {
+        tag_list.push(
+            kit::secondary_button("Verify", Some(HeaderAction::Verify(peer.clone()).message()))
+                .into(),
+        );
+    }
+    let tags = Row::with_children(tag_list)
+        .spacing(tokens::S)
+        .align_y(iced::Center)
+        .wrap()
+        .vertical_spacing(2.0);
+    let mut under = Column::new().spacing(2.0).push(tags);
+    match trust {
+        // Cut by `elide_middle` to a budget, never by clipping: if the pane
+        // is narrower still, the line wraps so no part of it is lost.
+        Some((peer, _)) => {
+            under = under.push(
+                text(peer_id_line(peer))
+                    .size(tokens::CAPTION)
+                    .wrapping(Wrapping::WordOrGlyph)
+                    .style(kit::muted),
+            );
+        }
+        None => {
+            if let Some(topic) = topic_line(room_topic(app)) {
+                under = under.push(
+                    text(topic)
+                        .size(tokens::CAPTION)
+                        .wrapping(Wrapping::None)
+                        .style(kit::muted),
+                );
+            }
+        }
+    }
+    let names = Column::from_vec(vec![
+        text(title)
+            .size(tokens::TITLE)
+            .wrapping(Wrapping::None)
+            .into(),
+        under.into(),
+    ]);
+    line = line.push(container(names).width(Fill).clip(true));
+
     if let Some(room) = selected.filter(|room| !room.is_invite) {
         line = line.push(notification_menu(app, &room.id));
-        line = line.push(room_buttons());
+        line = line.push(kit::icon_button(
+            Icon::Members,
+            HeaderAction::Members.message(),
+        ));
+        line = line.push(kit::icon_button(
+            Icon::Settings,
+            HeaderAction::Settings.message(),
+        ));
         if let Some(call) = app.calls.button(room) {
             line = line.push(call_button(call));
         }
         if app.calls.call_in(&room.id).is_some() {
             // The participants panel (plan Q4).
-            let open = app.calls.panel_open;
-            line = line.push(
-                button(text("People").size(13))
-                    .padding([2, 8])
-                    .style(if open {
-                        button::primary
-                    } else {
-                        button::secondary
-                    })
-                    .on_press(Message::Call(CallMessage::TogglePanel)),
-            );
+            line = line.push(kit::toggle_icon_button(
+                Icon::People,
+                app.calls.panel_open,
+                HeaderAction::People.message(),
+            ));
         }
     }
     if let Some(room) = selected.filter(|room| room.is_invite) {
         line = line.push(invite_buttons(app, &room.id));
     }
-    if let Some((peer, badge)) = app
-        .dm_peer_trust()
-        .and_then(|(peer, trust)| trust_badge(trust).map(|badge| (peer, badge)))
-    {
-        line = line.push(
-            text(badge.label())
-                .size(13)
-                .style(move |theme: &iced::Theme| text::Style {
-                    color: Some(match badge {
-                        Badge::Verified => theme.palette().success,
-                        Badge::NotVerified => theme::semantic(theme).muted,
-                        Badge::IdentityChanged => theme.palette().danger,
-                    }),
-                }),
-        );
-        // Whose identity the badge vouches for: the full ID, one line, cut in
-        // the middle if at all (the server name at the end tells users apart).
-        line = line.push(
-            text(peer_id_line(peer))
-                .size(13)
-                .style(|theme: &iced::Theme| text::Style {
-                    color: Some(theme::semantic(theme).muted),
-                }),
-        );
-        if badge.can_verify() {
-            line = line.push(
-                button(text("Verify").size(13))
-                    .padding([2, 8])
-                    .style(button::secondary)
-                    .on_press(Message::VerifyPeerRequested(peer.clone())),
-            );
-        }
-    }
     line.into()
 }
 
-/// **Members** and **Settings**, in the header of a joined room.
-fn room_buttons<'a>() -> Element<'a, Message> {
-    row![
-        button(text("Members").size(13))
-            .padding([2, 8])
-            .style(button::secondary)
-            .on_press(Message::Rooms(RoomsMessage::OpenMembers)),
-        button(text("Settings").size(13))
-            .padding([2, 8])
-            .style(button::secondary)
-            .on_press(Message::Rooms(RoomsMessage::OpenSettings)),
-    ]
-    .spacing(6)
-    .into()
+/// The message a press of the call button sends, if it is on.
+pub fn call_message(call: &CallButton) -> Option<Message> {
+    call.press.clone().map(Message::Call)
+}
+
+/// Whether the call button leaves the call (and so is a danger button).
+fn is_leave(call: &CallButton) -> bool {
+    call.press == Some(CallMessage::Leave)
 }
 
 /// The call button of a joined room (plan Q6): **Call**, **Join call (N)**,
-/// **Join voice**, **Leave call**, or **Joining…** while it is off.
+/// **Join voice**, **Leave call**, or **Joining...** while it is off.
 fn call_button<'a>(call: CallButton) -> Element<'a, Message> {
-    let style = if call.press == Some(CallMessage::Leave) {
-        button::danger
+    let press = call_message(&call);
+    if is_leave(&call) {
+        kit::danger_button(call.label, press).into()
     } else {
-        button::primary
-    };
-    button(text(call.label).size(13))
-        .padding([2, 8])
-        .style(style)
-        .on_press_maybe(call.press.map(Message::Call))
-        .into()
+        kit::primary_button(call.label, press).into()
+    }
 }
 
 /// **Accept** and **Decline**, in the header of an invitation. They are off
@@ -189,16 +283,17 @@ fn call_button<'a>(call: CallButton) -> Element<'a, Message> {
 fn invite_buttons<'a>(app: &App, room: &RoomId) -> Element<'a, Message> {
     let idle = !app.rooms_ui.invite_busy.contains(room);
     row![
-        text("You were invited").size(13),
-        button(text("Accept").size(13))
-            .padding([2, 8])
-            .on_press_maybe(idle.then(|| Message::Rooms(RoomsMessage::Accept(room.clone())))),
-        button(text("Decline").size(13))
-            .padding([2, 8])
-            .style(button::secondary)
-            .on_press_maybe(idle.then(|| Message::Rooms(RoomsMessage::Decline(room.clone())))),
+        text("You were invited").size(tokens::CAPTION),
+        kit::primary_button(
+            "Accept",
+            idle.then(|| HeaderAction::Accept(room.clone()).message()),
+        ),
+        kit::secondary_button(
+            "Decline",
+            idle.then(|| HeaderAction::Decline(room.clone()).message()),
+        ),
     ]
-    .spacing(6)
+    .spacing(tokens::S)
     .align_y(iced::Center)
     .into()
 }
@@ -207,19 +302,15 @@ fn invite_buttons<'a>(app: &App, room: &RoomId) -> Element<'a, Message> {
 /// Q11. It shows what the user picked at once, since the room list lags
 /// behind a change.
 fn notification_menu<'a>(app: &'a App, room: &RoomId) -> Element<'a, Message> {
-    let label = text("Notifications")
-        .size(13)
-        .style(|theme: &iced::Theme| text::Style {
-            color: Some(theme::semantic(theme).muted),
-        });
     let menu = pick_list(
         ModeChoice::ALL,
         Some(app.room_mode_choice(room)),
         Message::RoomModeChosen,
     )
-    .text_size(13)
-    .padding([2, 8]);
-    row![label, menu].spacing(6).align_y(iced::Center).into()
+    .text_size(tokens::CAPTION)
+    .padding([tokens::XS, tokens::S])
+    .style(kit::menu_style);
+    kit::tip(menu, "Notifications")
 }
 
 /// The main screen: panes above a status bar.
@@ -245,7 +336,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
 pub(crate) fn main_row(app: &App) -> Element<'_, Message> {
     Row::from_vec(vec![
         spaces_sidebar::view(app),
-        room_list_pane::view(app),
+        list_pane(app),
         room_pane(app),
         thread_panel::slot(app),
         call::panel_slot(app),
@@ -253,6 +344,13 @@ pub(crate) fn main_row(app: &App) -> Element<'_, Message> {
     .width(Fill)
     .height(Fill)
     .into()
+}
+
+/// The room list pane and the line on its right, as one slot of the row.
+fn list_pane(app: &App) -> Element<'_, Message> {
+    row![room_list_pane::view(app), kit::vertical_divider()]
+        .height(Fill)
+        .into()
 }
 
 /// What the timeline pane needs besides the timeline, for the open room.
@@ -617,36 +715,302 @@ pub fn account_label(user_id: Option<&UserId>) -> String {
     })
 }
 
-/// Sync state, account and **Log out**.
+/// An entry of the account menu in the status bar. Log out is not one: the
+/// menu has nothing selected, and iced's `pick_list` then picks its last
+/// option on Ctrl + wheel up (the zoom gesture), so no destructive action may
+/// be in it. Log out is its own button.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccountAction {
+    /// **Settings**.
+    Settings,
+    /// **Voice & audio**.
+    VoiceAudio,
+    /// **Sessions**.
+    Sessions,
+}
+
+impl AccountAction {
+    /// The menu's entries, in order. Log out is deliberately absent: the
+    /// menu is a `pick_list` with nothing selected, and Ctrl + wheel up (the
+    /// zoom gesture) makes it pick its last entry, which must never be
+    /// destructive. Log out is a separate button, see [`log_out_message`].
+    pub const ALL: [Self; 3] = [Self::Settings, Self::VoiceAudio, Self::Sessions];
+
+    /// The message choosing the entry sends.
+    pub fn message(self) -> Message {
+        match self {
+            Self::Settings => Message::Settings(SettingsMessage::Open),
+            Self::VoiceAudio => Message::Audio(AudioMessage::Open),
+            Self::Sessions => Message::Sessions(SessionsMessage::Open),
+        }
+    }
+}
+
+impl fmt::Display for AccountAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Settings => "Settings",
+            Self::VoiceAudio => "Voice & audio",
+            Self::Sessions => "Sessions",
+        })
+    }
+}
+
+/// What the status bar's **Log out** button sends.
+pub fn log_out_message() -> Message {
+    Message::LogoutRequested
+}
+
+/// How well the sync is going, for the colour of the status dot. The words
+/// next to the dot say the same, so the colour is never the only sign.
+pub fn sync_severity(state: &SyncState) -> Severity {
+    match state {
+        SyncState::Running => Severity::Success,
+        SyncState::Idle => Severity::Info,
+        SyncState::Offline | SyncState::Reconnecting { .. } => Severity::Warning,
+        SyncState::Error(_) | SyncState::Terminated => Severity::Danger,
+    }
+}
+
+/// The words of the status bar's sync part.
+pub fn sync_text(state: &SyncState) -> String {
+    format!("Sync: {}", sync_label(state))
+}
+
+/// A thin line, then the sync dot with words, the account and the account
+/// menu (Settings, Voice & audio, Sessions), then a Log out button.
 fn status_bar(app: &App) -> Element<'_, Message> {
     let account = account_label(app.user_id.as_ref());
-    container(
-        row![
-            text(format!("Sync: {}", sync_label(&app.sync_state))).style(|t| text::Style {
-                color: Some(theme::semantic(t).muted),
-            }),
-            space().width(Fill),
-            text(account),
-            button(text("Settings"))
-                .on_press(Message::Settings(SettingsMessage::Open))
-                .style(button::secondary),
-            button(text("Sessions"))
-                .on_press(Message::Sessions(SessionsMessage::Open))
-                .style(button::secondary),
-            button(text("Log out"))
-                .on_press(Message::LogoutRequested)
-                .style(button::secondary),
-        ]
-        .spacing(12)
-        .align_y(iced::Center),
-    )
-    .padding(8)
+    let severity = sync_severity(&app.sync_state);
+    let dot =
+        container(icons::icon(Icon::Dot)).style(move |theme: &iced::Theme| container::Style {
+            text_color: Some(severity.color(theme)),
+            ..container::Style::default()
+        });
+    let menu = pick_list(AccountAction::ALL, None::<AccountAction>, |action| {
+        action.message()
+    })
+    .placeholder(if account.is_empty() {
+        "Account".to_owned()
+    } else {
+        account
+    })
+    .text_size(tokens::BODY)
+    .padding([tokens::XS, tokens::S])
+    .style(kit::menu_style);
+    column![
+        kit::divider(),
+        container(
+            row![
+                dot,
+                text(sync_text(&app.sync_state))
+                    .size(tokens::CAPTION)
+                    .style(kit::muted),
+                space().width(Fill),
+                menu,
+                kit::secondary_button("Log out", Some(log_out_message())),
+            ]
+            .spacing(tokens::S)
+            .align_y(iced::Center),
+        )
+        .padding([tokens::XS, tokens::M])
+        .width(Fill)
+        .style(kit::surface_style),
+    ]
     .into()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn debug(message: &Message) -> String {
+        format!("{message:?}")
+    }
+
+    fn app() -> App {
+        use crate::state::Startup;
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let (_etx, erx) = tokio::sync::mpsc::channel(1);
+        App::new(Startup {
+            sink: Box::new(tx),
+            events: crate::bridge::EventsSlot::new(erx),
+        })
+        .0
+    }
+
+    #[test]
+    fn the_status_bar_still_reaches_every_message_the_old_one_sent() {
+        // The old bar was one pick_list: Settings, Sessions, Log out. Settings
+        // and Sessions are menu entries now; Log out is its own button.
+        assert_eq!(debug(&log_out_message()), debug(&Message::LogoutRequested));
+        let menu: Vec<String> = AccountAction::ALL
+            .into_iter()
+            .map(|a| debug(&a.message()))
+            .collect();
+        for old in [
+            Message::Settings(SettingsMessage::Open),
+            Message::Sessions(SessionsMessage::Open),
+        ] {
+            assert!(menu.contains(&debug(&old)), "{old:?} unreachable");
+        }
+    }
+
+    #[test]
+    fn the_account_menu_has_no_log_out_and_adds_voice_and_audio() {
+        let menu: Vec<(String, String)> = AccountAction::ALL
+            .into_iter()
+            .map(|a| (a.to_string(), debug(&a.message())))
+            .collect();
+        let expect = [
+            ("Settings", debug(&Message::Settings(SettingsMessage::Open))),
+            (
+                "Voice & audio",
+                debug(&Message::Audio(crate::audio_settings::AudioMessage::Open)),
+            ),
+            ("Sessions", debug(&Message::Sessions(SessionsMessage::Open))),
+        ];
+        let expect: Vec<(String, String)> = expect
+            .into_iter()
+            .map(|(label, msg)| (label.to_owned(), msg))
+            .collect();
+        assert_eq!(menu, expect);
+    }
+
+    #[test]
+    fn every_header_action_sends_what_the_old_header_sent() {
+        let room = RoomId::from("!r:example.org");
+        let peer = UserId::from("@bob:example.org");
+        let cases = [
+            (
+                HeaderAction::Members,
+                Message::Rooms(RoomsMessage::OpenMembers),
+            ),
+            (
+                HeaderAction::Settings,
+                Message::Rooms(RoomsMessage::OpenSettings),
+            ),
+            (
+                HeaderAction::People,
+                Message::Call(CallMessage::TogglePanel),
+            ),
+            (
+                HeaderAction::Verify(peer.clone()),
+                Message::VerifyPeerRequested(peer),
+            ),
+            (
+                HeaderAction::Accept(room.clone()),
+                Message::Rooms(RoomsMessage::Accept(room.clone())),
+            ),
+            (
+                HeaderAction::Decline(room.clone()),
+                Message::Rooms(RoomsMessage::Decline(room)),
+            ),
+        ];
+        for (action, old) in cases {
+            assert_eq!(debug(&action.message()), debug(&old));
+        }
+    }
+
+    #[test]
+    fn the_call_button_presses_are_still_reachable() {
+        let room = RoomId::from("!r:example.org");
+        let call = |label: &str, press| CallButton {
+            label: label.to_owned(),
+            press,
+        };
+        for press in [
+            CallMessage::Join(room.clone()),
+            CallMessage::Leave,
+            CallMessage::TogglePanel,
+        ] {
+            let button = call("x", Some(press.clone()));
+            assert_eq!(
+                call_message(&button).as_ref().map(debug),
+                Some(debug(&Message::Call(press)))
+            );
+        }
+        assert!(call_message(&call("Joining\u{2026}", None)).is_none());
+
+        // Every state of the real button: Call, Join call (N), Join voice.
+        let app = app();
+        let mut summary = twicecat_core::api::RoomSummary::new(room.clone(), "Lounge".into());
+        let button = app.calls.button(&summary).expect("a call button");
+        assert_eq!(button.label, "Call");
+        assert_eq!(
+            call_message(&button).as_ref().map(debug),
+            Some(debug(&Message::Call(CallMessage::Join(room.clone()))))
+        );
+        summary.is_call_room = true;
+        let button = app.calls.button(&summary).expect("a call button");
+        assert_eq!(button.label, "Join voice");
+        assert!(call_message(&button).is_some());
+    }
+
+    #[test]
+    fn leave_is_the_only_danger_button_and_keeps_its_words() {
+        let leave = CallButton {
+            label: "Leave call".to_owned(),
+            press: Some(CallMessage::Leave),
+        };
+        assert!(is_leave(&leave));
+        for press in [None, Some(CallMessage::TogglePanel)] {
+            let other = CallButton {
+                label: "Call".to_owned(),
+                press,
+            };
+            assert!(!is_leave(&other));
+        }
+    }
+
+    #[test]
+    fn the_sync_dot_has_a_tone_for_every_state_and_the_words_stay() {
+        use crate::ui::kit::Severity;
+        use twicecat_core::api::SyncState;
+        assert_eq!(sync_severity(&SyncState::Running), Severity::Success);
+        assert_eq!(sync_severity(&SyncState::Idle), Severity::Info);
+        assert_eq!(sync_severity(&SyncState::Offline), Severity::Warning);
+        assert_eq!(
+            sync_severity(&SyncState::Reconnecting { attempt: 2 }),
+            Severity::Warning
+        );
+        assert_eq!(
+            sync_severity(&SyncState::Error("x".into())),
+            Severity::Danger
+        );
+        assert_eq!(sync_severity(&SyncState::Terminated), Severity::Danger);
+        assert_eq!(sync_text(&SyncState::Running), "Sync: Running");
+    }
+
+    #[test]
+    fn the_topic_is_one_capped_line_or_nothing() {
+        assert_eq!(topic_line(None), None);
+        assert_eq!(topic_line(Some("  \n ")), None);
+        assert_eq!(
+            topic_line(Some("Plans\nfor lunch")).as_deref(),
+            Some("Plans\u{23CE}for lunch")
+        );
+        let long = topic_line(Some(&"t".repeat(1000))).expect("a line");
+        assert_eq!(long.chars().count(), TOPIC_CHARS);
+        assert!(long.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn the_frame_builds_for_every_header_state() {
+        use twicecat_core::api::RoomSummary;
+        let mut app = app();
+        let mut joined = RoomSummary::new(RoomId::from("!j:example.org"), "Lounge".into());
+        joined.is_encrypted = true;
+        joined.is_call_room = true;
+        let mut invite = RoomSummary::new(RoomId::from("!i:example.org"), "Club".into());
+        invite.is_invite = true;
+        app.rooms = vec![joined.clone(), invite.clone()];
+        for room in [None, Some(joined), Some(invite)] {
+            app.selected = room.map(|r| r.id);
+            let _ = header(&app, "title".to_owned());
+            let _ = status_bar(&app);
+        }
+    }
 
     #[test]
     fn the_peer_line_is_one_line_and_keeps_the_server_name() {
@@ -655,9 +1019,16 @@ mod tests {
         let long = UserId::from(format!("@{}:evil.example", "a".repeat(400)));
         let line = peer_id_line(&long);
         assert!(line.ends_with(":evil.example"), "{line}");
-        assert!(line.chars().count() <= MAX_PEER_USER_ID_CHARS);
+        assert!(line.chars().count() <= HEADER_PEER_ID_CHARS);
         let split = UserId::from("@bo\nb:x");
         assert!(!peer_id_line(&split).contains('\n'));
+    }
+
+    #[test]
+    fn each_trust_badge_has_its_own_severity() {
+        assert_eq!(Badge::Verified.severity(), Severity::Success);
+        assert_eq!(Badge::NotVerified.severity(), Severity::Info);
+        assert_eq!(Badge::IdentityChanged.severity(), Severity::Danger);
     }
 
     #[test]
