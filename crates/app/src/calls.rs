@@ -11,7 +11,7 @@ use iced::Task;
 use twicecat_core::api::{
     AudioDevices, AudioSettings, AudioStats, CallEndReason, CallIntent, CallState, CleaningStatus,
     Command, CoreError, CoreEvent, GpuEnhancement, InputLevel, Participant, RoomId, RoomMemberView,
-    RoomSummary, SkipReason, UserId, VoiceCleaning,
+    RoomSummary, SkipReason, SoundSource, UserId, VoiceCleaning,
 };
 
 use crate::state::{App, Message};
@@ -904,7 +904,13 @@ impl App {
                 settings.user_volumes.insert(user_id.clone(), percent);
             }
         }
-        self.send(Command::SetUserVolume { user_id, percent })
+        // The app sets voices only for now; screen-share sound gets its own
+        // control with the call stage (Phase 9 Task 10).
+        self.send(Command::SetUserVolume {
+            user_id,
+            source: SoundSource::Voice,
+            percent,
+        })
     }
 
     /// A call or audio event from the core.
@@ -1108,6 +1114,7 @@ mod tests {
             muted: false,
             speaking: false,
             volume_percent: 100,
+            share_volume_percent: 100,
             cleaning: CleaningStatus::Off,
         }
     }
@@ -2168,7 +2175,7 @@ mod tests {
         call(&mut app, CallMessage::VolumeDue(seq));
         let sent = drain(&mut rx);
         assert!(
-            matches!(sent.as_slice(), [Command::SetUserVolume { user_id, percent: 170 }] if *user_id == user("b")),
+            matches!(sent.as_slice(), [Command::SetUserVolume { user_id, percent: 170, .. }] if *user_id == user("b")),
             "{sent:?}"
         );
     }
@@ -2324,7 +2331,7 @@ mod tests {
         );
         let sent = drain(&mut rx);
         assert!(
-            matches!(sent.as_slice(), [Command::SetUserVolume { user_id, percent: 60 }] if *user_id == user("b")),
+            matches!(sent.as_slice(), [Command::SetUserVolume { user_id, percent: 60, .. }] if *user_id == user("b")),
             "{sent:?}"
         );
         call(&mut app, CallMessage::VolumeReleased);

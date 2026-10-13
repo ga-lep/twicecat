@@ -2,6 +2,8 @@
 //!
 //! Only plain API types cross the public boundary. SDK types stay in here.
 
+mod video;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,6 +33,7 @@ use crate::api::{
     CallEndReason, CallIntent, CallState, Command, CoreError, CoreEvent, DeviceId, Draft, ListDiff,
     MediaSize, Member, MessageText, OutgoingAttachment, OutgoingMessage, PaginationState, Password,
     RoomId, RoomListQuery, RoomNotificationModeView, TimelineItem, TypingUser, UserId,
+    VideoBackend,
 };
 use crate::audio_session::{AudioSession, Mode};
 use crate::avatars::{Avatars, SdkFetcher, answer_unavailable};
@@ -94,6 +97,9 @@ pub struct CoreConfig {
     /// to publish on instead of the homeserver's advertised one: a
     /// self-hosted SFU, or tests. `https`, or `http` on loopback.
     pub call_service_override: Option<String>,
+    /// Cameras and screens for calls (`VideoBackend::System` unless
+    /// testing).
+    pub video: VideoBackend,
 }
 
 /// The channels to talk to a running engine.
@@ -1362,14 +1368,24 @@ impl Engine {
             Command::UpdateAudioSettings(settings) => {
                 self.store_audio_settings(settings.validated()).await;
             }
-            Command::SetUserVolume { user_id, percent } => {
+            Command::SetUserVolume {
+                user_id,
+                source,
+                percent,
+            } => {
                 let mut settings = self.audio_settings().await.clone();
-                settings.user_volumes.insert(user_id.clone(), percent);
+                settings
+                    .volumes_of_mut(source)
+                    .insert(user_id.clone(), percent);
                 let settings = settings.validated();
-                let applied = settings.user_volume(&user_id);
+                let applied = settings
+                    .volumes_of(source)
+                    .get(&user_id)
+                    .copied()
+                    .unwrap_or(100);
                 self.store_audio_settings(settings).await;
                 if let Some(call) = &self.call {
-                    call.set_user_volume(&user_id, applied);
+                    call.set_user_volume(&user_id, source, applied);
                 }
             }
             Command::SetUserCleaning { user_id, cleaning } => {
@@ -1410,7 +1426,7 @@ impl Engine {
             }
             Command::ListAudioDevices => self.list_audio_devices().await,
             Command::StartMicTest { loopback } => self.start_mic_test(loopback).await,
-            Command::ListVideoDevices
+            command @ (Command::ListVideoDevices
             | Command::ListScreenSources
             | Command::StartCamera { .. }
             | Command::StopCamera
@@ -1421,10 +1437,7 @@ impl Engine {
             | Command::UpdateVideoSettings(_)
             | Command::ProbeVideoEncoders
             | Command::StartCameraPreview { .. }
-            | Command::StopCameraPreview => {
-                self.emit(CoreEvent::Error(CoreError::NotSupported("video".into())))
-                    .await;
-            }
+            | Command::StopCameraPreview) => self.video_command(command).await,
             Command::StopMicTest => {
                 if let Some(session) = self.audio_session.take() {
                     session.stop().await;
@@ -1731,7 +1744,7 @@ impl Engine {
         self.audio_settings = Some(settings.clone());
         self.update_ring_gate(self.call.is_some());
         if let Ok(mut shared) = self.user_volumes.write() {
-            shared.clone_from(&settings.user_volumes);
+            *shared = crate::call::volumes_of(&settings);
         }
         if let Some(call) = &self.call {
             call.set_cleaning(&settings);
@@ -1782,7 +1795,7 @@ impl Engine {
             self.end_call(true).await;
         }
         // Participants carry the per-user volumes.
-        let volumes = self.audio_settings().await.user_volumes.clone();
+        let volumes = crate::call::volumes_of(self.audio_settings().await);
         if let Ok(mut shared) = self.user_volumes.write() {
             *shared = volumes;
         }
@@ -1936,7 +1949,9 @@ impl Engine {
                     if let Some(calls) = self.calls() {
                         calls.set_sent(&call.room_id, None);
                     }
+                    let video = (call.has_video(), call.local_video());
                     call.leave().await;
+                    self.video_ended(room_id.clone(), video).await;
                 }
                 self.stop_call_audio().await;
                 self.update_ring_gate(false);
@@ -2018,7 +2033,9 @@ impl Engine {
             if let Some(calls) = self.calls() {
                 calls.set_sent(&room_id, None);
             }
+            let video = (call.has_video(), call.local_video());
             call.leave().await;
+            self.video_ended(room_id.clone(), video).await;
             self.stop_call_audio().await;
             self.update_ring_gate(joining_next);
             self.emit(CoreEvent::CallState(CallState::Left {
@@ -3163,6 +3180,7 @@ mod tests {
                 max_upload_bytes_override: None,
                 audio: AudioBackend::default(),
                 call_service_override: None,
+                video: VideoBackend::System,
             },
             secrets,
             events,
@@ -3351,6 +3369,7 @@ mod tests {
                 max_upload_bytes_override: None,
                 audio: AudioBackend::default(),
                 call_service_override: None,
+                video: VideoBackend::System,
             },
             secrets: Arc::new(InMemorySecretStore::new()),
             events,

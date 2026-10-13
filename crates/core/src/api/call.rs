@@ -24,6 +24,19 @@ pub enum CallIntent {
     Video,
 }
 
+/// Which of a participant's sounds a playback volume applies to.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SoundSource {
+    /// Their microphone.
+    #[default]
+    Voice,
+    /// The sound of their screen share (a game, a video).
+    ScreenShare,
+}
+
 impl CallIntent {
     /// The value of `m.call.intent` (matrix-js-sdk's spelling).
     pub fn as_str(self) -> &'static str {
@@ -102,8 +115,12 @@ pub struct Participant {
     pub muted: bool,
     /// Currently speaking (SFU or local voice activity).
     pub speaking: bool,
-    /// Local playback volume for this user, percent (100 = unchanged).
+    /// Local playback volume for this user's voice, percent (100 =
+    /// unchanged).
     pub volume_percent: u16,
+    /// Local playback volume for the sound of this user's screen shares,
+    /// percent (100 = unchanged).
+    pub share_volume_percent: u16,
     /// Whether this device cleans their voice ([`AudioSettings::remote_cleaning`](super::AudioSettings::remote_cleaning)).
     pub cleaning: CleaningStatus,
 }

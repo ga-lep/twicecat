@@ -5,6 +5,7 @@
 // Each test file uses a different subset of these helpers.
 #![allow(dead_code)]
 
+pub mod calls;
 pub mod stack_env;
 
 use std::collections::HashMap;
@@ -105,6 +106,24 @@ pub fn start_core_with_call_service(
     audio: twicecat_core::api::AudioBackend,
     call_service: Option<String>,
 ) -> CoreHandle {
+    start_core_with_video(
+        dir,
+        secrets,
+        audio,
+        call_service,
+        twicecat_core::api::VideoBackend::System,
+    )
+}
+
+/// Like [`start_core_with_call_service`], with `video` as its cameras and
+/// screens.
+pub fn start_core_with_video(
+    dir: &Path,
+    secrets: Arc<InMemorySecretStore>,
+    audio: twicecat_core::api::AudioBackend,
+    call_service: Option<String>,
+    video: twicecat_core::api::VideoBackend,
+) -> CoreHandle {
     let env = TestEnv::load();
     Core::start(
         CoreConfig {
@@ -114,6 +133,7 @@ pub fn start_core_with_call_service(
             max_upload_bytes_override: None,
             audio,
             call_service_override: call_service,
+            video,
         },
         secrets,
     )
@@ -131,7 +151,7 @@ impl twicecat_core::api::VirtualAudio for Silence {
     fn playback(&self, _: &[f32; twicecat_core::api::AUDIO_FRAME_LEN]) {}
 }
 
-fn silence() -> twicecat_core::api::AudioBackend {
+pub fn silence() -> twicecat_core::api::AudioBackend {
     twicecat_core::api::AudioBackend::Virtual(Arc::new(Silence))
 }
 
@@ -179,6 +199,7 @@ fn start_core_with(
             max_upload_bytes_override,
             audio: silence(),
             call_service_override: None,
+            video: twicecat_core::api::VideoBackend::System,
         },
         secrets,
     )

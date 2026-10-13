@@ -213,3 +213,106 @@ fn cli_joins_mutes_and_leaves_a_call() {
         "password in stdout"
     );
 }
+
+/// Logs a CLI in as test user `n`, with the test pattern as its camera.
+fn video_cli(env: &TestEnv, n: u8) -> Session {
+    let mut cli = Session::start(&[
+        "--ephemeral",
+        "--homeserver",
+        env.homeserver_url(),
+        "--password-stdin",
+        "--silent-audio",
+        "--test-video",
+    ]);
+    cli.write(env.user(n));
+    cli.write(env.password(n));
+    cli.expect(&format!("Logged in as {}", env.user_id(n)));
+    cli
+}
+
+/// Joins `room_id`'s call once the CLI's sync knows the room.
+fn join_call(cli: &mut Session, name: &str, room_id: &str) {
+    let listed = (0..30).any(|_| {
+        cli.write("/rooms");
+        cli.expect_within(name, Duration::from_secs(1)).is_some()
+    });
+    assert!(listed, "the room never showed up in /rooms");
+    cli.write(&format!("/call {room_id}"));
+    let connected = cli.expect("In the call in");
+    assert!(connected.contains("(end-to-end encrypted)"), "{connected}");
+}
+
+/// Two CLIs in an encrypted call: alice sends the test pattern as her
+/// camera (`/video pattern`), carol lists it, asks for its full size and
+/// receives about 30 fps of it (`/video stats`); alice's hang-up removes
+/// it. Audio is silent and virtual.
+#[test]
+#[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
+fn two_clis_send_and_receive_a_test_pattern() {
+    let env = TestEnv::load();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let alice = runtime.block_on(common::raw_login(1));
+    let carol = runtime.block_on(common::raw_login(3));
+    let name = common::unique_room_name();
+    let room_id = runtime
+        .block_on(common::create_encrypted_room(
+            &alice,
+            &name,
+            Some(&env.user_id(3)),
+        ))
+        .to_string();
+    runtime.block_on(async {
+        common::calls::allow_calls(&alice, &room_id).await;
+        carol
+            .join_room_by_id(room_id.as_str().try_into().unwrap())
+            .await
+            .unwrap();
+    });
+
+    let mut sender = video_cli(&env, 1);
+    let mut viewer = video_cli(&env, 3);
+    join_call(&mut sender, &name, &room_id);
+    join_call(&mut viewer, &name, &room_id);
+    sender.write("/video pattern 720p 30");
+    sender.expect("[video] camera on, screen share off");
+    viewer.expect(&format!("[video] + {} camera", env.user_id(1)));
+    viewer.write("/video view 1 1280x720");
+    // The SFU moves to the top layer within a few seconds. The first stats
+    // at that size cover the switch (20 fps on a CI runner), so the rate is
+    // read for up to 10 s more until it reaches 25 fps.
+    let stats_at_full_size = |viewer: &mut Session| {
+        std::thread::sleep(Duration::from_secs(1));
+        viewer.write("/video stats");
+        viewer.expect_within("received 1280x720", Duration::from_secs(2))
+    };
+    let first = (0..20).find_map(|_| stats_at_full_size(&mut viewer));
+    let mut readings = vec![first.expect("never received the 1280x720 layer")];
+    let fps_of = |line: &str| -> f32 {
+        line.split_whitespace()
+            .skip_while(|w| *w != "1280x720")
+            .nth(1)
+            .and_then(|w| w.parse().ok())
+            .unwrap_or_else(|| panic!("no fps in {line:?}"))
+    };
+    for _ in 0..10 {
+        if fps_of(readings.last().unwrap()) >= 25.0 {
+            break;
+        }
+        if let Some(line) = stats_at_full_size(&mut viewer) {
+            readings.push(line);
+        }
+    }
+    assert!(
+        fps_of(readings.last().unwrap()) >= 25.0,
+        "never 25 fps at 1280x720: {readings:#?}"
+    );
+
+    sender.write("/leave");
+    sender.expect("Left the call in");
+    viewer.expect(&format!("[video] - {} camera", env.user_id(1)));
+    for mut cli in [sender, viewer] {
+        cli.write("/quit");
+        let status = cli.child.wait().expect("wait for twicecat-cli");
+        assert!(status.success(), "exit status {status:?}");
+    }
+}

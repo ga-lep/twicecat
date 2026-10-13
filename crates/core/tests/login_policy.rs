@@ -25,6 +25,7 @@ async fn http_non_loopback_homeserver_is_refused_before_login() {
             max_upload_bytes_override: None,
             audio: Default::default(),
             call_service_override: None,
+            video: twicecat_core::api::VideoBackend::System,
         },
         secrets.clone(),
     );

@@ -10148,6 +10148,7 @@ mod tests {
                 muted: !local,
                 speaking: local,
                 volume_percent: 100,
+                share_volume_percent: 100,
                 cleaning: CleaningStatus::Cleaned,
             };
             let _ = app.update(core(CoreEvent::CallParticipants {

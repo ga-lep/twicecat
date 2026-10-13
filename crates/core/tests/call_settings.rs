@@ -6,11 +6,12 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{expect_event, start_core, start_core_with_audio};
+use common::{expect_event, silence, start_core, start_core_with_audio, start_core_with_video};
 use twicecat_core::CoreHandle;
 use twicecat_core::api::{
     AudioSettings, CallIntent, Command, CoreError, CoreEvent, InputMode, PushToTalkBindings,
-    RoomId, UserId, VideoQuality, VideoSettings, VideoTrackId,
+    RoomId, SoundSource, TEST_PATTERN_ID, UserId, VideoBackend, VideoQuality, VideoSettings,
+    VideoTrackId,
 };
 use twicecat_core::paths::DataPaths;
 use twicecat_core::secrets::InMemorySecretStore;
@@ -82,6 +83,7 @@ async fn user_volume_is_remembered() {
         &handle,
         Command::SetUserVolume {
             user_id: bob.clone(),
+            source: SoundSource::Voice,
             percent: 300,
         },
     )
@@ -91,6 +93,19 @@ async fn user_volume_is_remembered() {
         &handle,
         Command::SetUserVolume {
             user_id: bob.clone(),
+            source: SoundSource::ScreenShare,
+            percent: 30,
+        },
+    )
+    .await;
+    let s = settings(&mut handle).await;
+    assert_eq!(s.user_share_volume(&bob), 30);
+    assert_eq!(s.user_volume(&bob), 200, "the voice keeps its own");
+    send(
+        &handle,
+        Command::SetUserVolume {
+            user_id: bob.clone(),
+            source: SoundSource::Voice,
             percent: 100,
         },
     )
@@ -98,6 +113,7 @@ async fn user_volume_is_remembered() {
     let s = settings(&mut handle).await;
     assert_eq!(s.user_volume(&bob), 100);
     assert!(s.user_volumes.is_empty(), "100 % is not stored");
+    assert_eq!(s.user_share_volume(&bob), 30);
 }
 
 #[tokio::test]
@@ -139,49 +155,126 @@ async fn call_commands_need_a_session_or_a_call() {
     assert!(matches!(e, CoreEvent::Error(CoreError::NotInCall)), "{e:?}");
 }
 
-/// Phase 9 Task 2: the video API is in place, and each command answers
-/// `NotSupported` until the video tasks land.
+/// The error a command should answer with.
+enum Answer {
+    NotSupported(&'static str),
+    NotInCall,
+}
+
+/// The video commands without a call and without real cameras or screens
+/// (Phase 9 Task 5): what needs a call says so, what needs hardware, the
+/// settings or our encoders answers `NotSupported` until its task.
 #[tokio::test]
-async fn video_commands_answer_not_supported_for_now() {
+async fn video_commands_answer_without_a_call_or_hardware() {
     let dir = tempfile::tempdir().unwrap();
     let mut handle = core(dir.path());
-    for command in [
-        Command::ListVideoDevices,
-        Command::ListScreenSources,
-        Command::StartCamera {
-            device: None,
-            quality: VideoQuality::Auto,
-        },
-        Command::StopCamera,
-        Command::StartScreenShare {
-            source: None,
-            quality: VideoQuality::Uhd2160p60,
-            audio: true,
-        },
-        Command::StopScreenShare,
-        Command::SetVideoView {
-            track: VideoTrackId::from("t"),
-            width: 640,
-            height: 360,
-            visible: true,
-        },
-        Command::GetVideoSettings,
-        Command::UpdateVideoSettings(VideoSettings::default()),
-        Command::ProbeVideoEncoders,
-        Command::StartCameraPreview {
-            device: None,
-            quality: VideoQuality::Hd720p30,
-        },
-        Command::StopCameraPreview,
-    ] {
+    use Answer::{NotInCall, NotSupported};
+    let cases = [
+        (Command::ListVideoDevices, NotSupported("cameras")),
+        (Command::ListScreenSources, NotSupported("screen sharing")),
+        (
+            Command::StartCamera {
+                device: None,
+                quality: VideoQuality::Auto,
+            },
+            NotSupported("cameras"),
+        ),
+        (Command::StopCamera, NotInCall),
+        (
+            Command::StartScreenShare {
+                source: None,
+                quality: VideoQuality::Uhd2160p60,
+                audio: true,
+            },
+            NotSupported("screen-share sound"),
+        ),
+        (Command::StopScreenShare, NotInCall),
+        (
+            Command::SetVideoView {
+                track: VideoTrackId::from("t"),
+                width: 640,
+                height: 360,
+                visible: true,
+            },
+            NotInCall,
+        ),
+        (Command::GetVideoSettings, NotSupported("video")),
+        (
+            Command::UpdateVideoSettings(VideoSettings::default()),
+            NotSupported("video"),
+        ),
+        (Command::ProbeVideoEncoders, NotSupported("video")),
+        (
+            Command::StartCameraPreview {
+                device: None,
+                quality: VideoQuality::Hd720p30,
+            },
+            NotSupported("video"),
+        ),
+        (Command::StopCameraPreview, NotSupported("video")),
+    ];
+    for (command, answer) in cases {
         let name = format!("{command:?}");
         send(&handle, command).await;
         let e = expect_event(&mut handle, |e| matches!(e, CoreEvent::Error(_))).await;
-        assert!(
-            matches!(&e, CoreEvent::Error(CoreError::NotSupported(what)) if what == "video"),
-            "{name}: {e:?}"
-        );
+        let ok = match answer {
+            NotSupported(what) => {
+                matches!(&e, CoreEvent::Error(CoreError::NotSupported(w)) if w == what)
+            }
+            NotInCall => matches!(e, CoreEvent::Error(CoreError::NotInCall)),
+        };
+        assert!(ok, "{name}: {e:?}");
     }
+    send(&handle, Command::Shutdown).await;
+}
+
+/// With the test pattern as camera and screen, both are listed, and
+/// sending one needs a call.
+#[tokio::test]
+async fn the_test_pattern_is_the_camera_and_the_screen() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut handle = start_core_with_video(
+        dir.path(),
+        Arc::new(InMemorySecretStore::new()),
+        silence(),
+        None,
+        VideoBackend::TestPattern,
+    );
+    send(&handle, Command::ListVideoDevices).await;
+    let e = expect_event(&mut handle, |e| matches!(e, CoreEvent::VideoDevices(_))).await;
+    let CoreEvent::VideoDevices(devices) = e else {
+        unreachable!("filtered by the predicate")
+    };
+    assert_eq!(devices.cameras.len(), 1);
+    assert_eq!(devices.cameras[0].id.as_str(), TEST_PATTERN_ID);
+    assert!(devices.cameras[0].is_default);
+    send(&handle, Command::ListScreenSources).await;
+    let e = expect_event(&mut handle, |e| matches!(e, CoreEvent::ScreenSources(_))).await;
+    let CoreEvent::ScreenSources(sources) = e else {
+        unreachable!("filtered by the predicate")
+    };
+    assert!(!sources.system_picker);
+    assert_eq!(sources.sources[0].id.as_str(), TEST_PATTERN_ID);
+    send(
+        &handle,
+        Command::StartCamera {
+            device: None,
+            quality: VideoQuality::Hd720p30,
+        },
+    )
+    .await;
+    let e = expect_event(&mut handle, |e| matches!(e, CoreEvent::Error(_))).await;
+    assert!(matches!(e, CoreEvent::Error(CoreError::NotInCall)), "{e:?}");
+    send(
+        &handle,
+        Command::StartCamera {
+            device: Some("usb-cam".into()),
+            quality: VideoQuality::Hd720p30,
+        },
+    )
+    .await;
+    let e = expect_event(&mut handle, |e| matches!(e, CoreEvent::Error(_))).await;
+    assert!(matches!(e, CoreEvent::Error(CoreError::Call(_))), "{e:?}");
     send(&handle, Command::Shutdown).await;
 }
 

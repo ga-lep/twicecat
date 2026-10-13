@@ -13,7 +13,9 @@
 //!    service, e.g. another homeserver's), opened and closed as members come
 //!    and go;
 //! 8. in an encrypted room, encrypt our media with our own key and send it
-//!    to the other members, Olm-encrypted (`e2ee`).
+//!    to the other members, Olm-encrypted (`e2ee`);
+//! 9. send our camera and screen share, and hand the front end everyone's
+//!    video (`video`).
 //!
 //! Leaving fires the delayed leave at once (or sends the empty membership).
 
@@ -26,6 +28,7 @@ mod own_membership;
 mod participants;
 pub(crate) mod ringing;
 mod sfus;
+mod video;
 pub(crate) mod watcher;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -57,8 +60,11 @@ use self::own_membership::{
 pub(crate) use self::participants::active_memberships;
 use self::participants::{Ours, watch_participants};
 use self::sfus::{Expected, Remotes, SfuManager, manage_sfus};
+use self::video::Videos;
+pub(crate) use self::video::software_mode;
 use crate::api::{
-    AudioSettings, CallIntent, CoreError, CoreEvent, RemoteCleaning, RoomId, UserId, VoiceCleaning,
+    AudioSettings, CallIntent, CoreError, CoreEvent, LocalVideo, RemoteCleaning, RoomId,
+    SoundSource, UserId, VideoKind, VideoTrackId, VoiceCleaning,
 };
 
 pub(crate) fn now_ms() -> u64 {
@@ -67,16 +73,29 @@ pub(crate) fn now_ms() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
-/// Per-user playback volumes, shared with the engine so participants carry
-/// the current value.
-pub(crate) type UserVolumes = Arc<RwLock<BTreeMap<UserId, u16>>>;
+/// Per-user playback volumes of voices and of screen-share sound, shared
+/// with the engine so participants carry the current values.
+pub(crate) type UserVolumes = Arc<RwLock<BTreeMap<(SoundSource, UserId), u16>>>;
 
-/// `user`'s playback volume, percent (100 when not set).
-pub(crate) fn user_volume(volumes: &UserVolumes, user: &UserId) -> u16 {
+/// The volumes of `settings`, as [`UserVolumes`] holds them.
+pub(crate) fn volumes_of(settings: &AudioSettings) -> BTreeMap<(SoundSource, UserId), u16> {
+    [SoundSource::Voice, SoundSource::ScreenShare]
+        .into_iter()
+        .flat_map(|source| {
+            settings
+                .volumes_of(source)
+                .iter()
+                .map(move |(user, percent)| ((source, user.clone()), *percent))
+        })
+        .collect()
+}
+
+/// `user`'s playback volume for `source`, percent (100 when not set).
+pub(crate) fn user_volume(volumes: &UserVolumes, user: &UserId, source: SoundSource) -> u16 {
     volumes
         .read()
         .ok()
-        .and_then(|v| v.get(user).copied())
+        .and_then(|v| v.get(&(source, user.clone())).copied())
         .unwrap_or(100)
 }
 
@@ -91,6 +110,8 @@ pub(crate) struct CallSession {
     remotes: Remotes,
     flags: SharedFlags,
     cleaning: Cleaning,
+    /// The call's video tracks, ours and the others'.
+    videos: Videos,
     /// What our SFU connection announces about our microphone's cleaning.
     announce: watch::Sender<Option<&'static str>>,
     own_identity: String,
@@ -219,6 +240,7 @@ impl CallSession {
         let (notices_all, from_connections) = mpsc::channel(16);
         let own_identity = membership::member_id(&user_id, &device_id);
         let remotes: Remotes = Arc::default();
+        let videos = Videos::new(&user_id, &device_id);
         let mut session = Self {
             room_id: room_id.clone(),
             room: room.clone(),
@@ -228,6 +250,7 @@ impl CallSession {
             remotes: remotes.clone(),
             flags: flags.clone(),
             cleaning: cleaning.clone(),
+            videos: videos.clone(),
             announce,
             own_identity: own_identity.clone(),
             encrypted,
@@ -301,6 +324,7 @@ impl CallSession {
             volumes: volumes.clone(),
             flags: flags.clone(),
             cleaning: cleaning.clone(),
+            videos: videos.clone(),
             notices: notices_all,
         };
         let (own_expected, own_expected_rx) = watch::channel(BTreeSet::new());
@@ -344,12 +368,16 @@ impl CallSession {
             )));
         }
 
+        session.tasks.push(tokio::spawn(
+            videos.clone().report(room_id.clone(), events.clone()),
+        ));
         session.tasks.push(tokio::spawn(watch_participants(
             room,
             room_id.clone(),
             events,
             volumes,
             flags,
+            videos,
             Ours {
                 identity: own_identity,
                 service: service_url.clone(),
@@ -389,13 +417,14 @@ impl CallSession {
         self.flags.changed.notify_one();
     }
 
-    /// Applies a user's new playback volume (and re-reports participants).
-    pub(crate) fn set_user_volume(&self, user: &UserId, percent: u16) {
+    /// Applies a user's new playback volume for one of their sounds (and
+    /// re-reports participants).
+    pub(crate) fn set_user_volume(&self, user: &UserId, source: SoundSource, percent: u16) {
         if let Some(own) = &self.own {
-            own.set_user_volume(user, percent);
+            own.set_user_volume(user, source, percent);
         }
         for remote in self.remotes.lock().expect("remotes lock").values() {
-            remote.set_user_volume(user, percent);
+            remote.set_user_volume(user, source, percent);
         }
         self.flags.changed.notify_one();
     }
@@ -411,6 +440,53 @@ impl CallSession {
             *announced = now;
             changed
         });
+    }
+
+    /// Sends a test pattern as our camera or screen share, `mode` = (width,
+    /// height, fps), replacing the one of that kind we send.
+    pub(crate) async fn start_pattern(
+        &mut self,
+        kind: VideoKind,
+        mode: (u32, u32, u32),
+    ) -> Result<VideoTrackId, CoreError> {
+        match self.own.as_mut() {
+            Some(own) => own.start_pattern(kind, mode).await,
+            None => Err(CoreError::NotInCall),
+        }
+    }
+
+    /// Stops sending our camera or screen share.
+    pub(crate) async fn stop_video(&mut self, kind: VideoKind) {
+        if let Some(own) = self.own.as_mut() {
+            own.stop_video(kind).await;
+        }
+    }
+
+    /// What we send.
+    pub(crate) fn local_video(&self) -> LocalVideo {
+        let sent = |kind| self.own.as_ref().and_then(|own| own.video_sent(kind));
+        LocalVideo {
+            camera: sent(VideoKind::Camera),
+            screen: sent(VideoKind::Screen),
+            screen_audio: false,
+        }
+    }
+
+    /// How the front end shows a received track; `false` when there is no
+    /// such received track.
+    pub(crate) fn set_video_view(
+        &self,
+        track: &VideoTrackId,
+        width: u32,
+        height: u32,
+        visible: bool,
+    ) -> bool {
+        self.videos.set_view(track, width, height, visible)
+    }
+
+    /// Whether video tracks were reported (leaving reports none).
+    pub(crate) fn has_video(&self) -> bool {
+        self.videos.any_shown()
     }
 
     /// Leaves: stops the tasks and removes our membership.

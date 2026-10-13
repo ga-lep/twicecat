@@ -13,3 +13,6 @@ Task 3: complete (Q6 revisited with the human 2026-10-13 and kept: Vulkan Video 
 Task 4: started
 Task 4: complete (commit "feat(video): convert, scale and encode H.264 with Vulkan", gate ok: 1748 tests; hardware suite 6 passed, also under the validation layer)
   notes: [accepted] p99 7.9-12 ms (plan 8) and 540p15 +19% (plan 15%) on the RTX 5080's Vulkan path, accepted by the human 2026-10-13 for Task 14; [nvidia] rate control needs VkVideoEncodeH264RateControlLayerInfoKHR; LOW_LATENCY faster than ULTRA_LOW_LATENCY; Baseline works; [intel] readback memory must be the cached type; [dma-buf] dGPU VRAM buffers lose the iGPU device
+Task 5: started
+Task 5: complete (commit "feat(core): send and receive video in calls on the software path", gate ok: 1756 tests; ignored suite 140 passed)
+  notes: [measured] 720p30 pattern in an encrypted call: 29.3 fps over 30 s, in order, every stamp read; adaptive stream starts at 320x180 until SetVideoView; [api] CoreConfig::video (VideoBackend::TestPattern), SetUserVolume source; [share-audio] the SFU never marks share sound as speaking; [open] received colour space not exposed by libwebrtc (BT.601 assumed), LiveKit's 720p default is 3 Mb/s

@@ -303,6 +303,7 @@ impl AppUnderTest {
                 max_upload_bytes_override: None,
                 audio: AudioBackend::Virtual(Arc::new(Silence)),
                 call_service_override: None,
+                video: twicecat_core::api::VideoBackend::System,
             },
             Arc::new(InMemorySecretStore::new()),
         )
@@ -334,7 +335,7 @@ impl AppUnderTest {
             });
             match event {
                 Ok(Some(BridgeEvent::Core(event))) => {
-                    let _ = self.app.update(Message::Core(Box::new(event)));
+                    let _ = self.app.update(Message::Core(event));
                 }
                 Ok(Some(BridgeEvent::Closed)) => {
                     let _ = self.app.update(Message::CoreClosed);

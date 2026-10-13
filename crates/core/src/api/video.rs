@@ -69,6 +69,22 @@ private_newtype!(
     ScreenSourceId
 );
 
+/// Where cameras and screens come from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum VideoBackend {
+    /// The system's cameras and screens.
+    #[default]
+    System,
+    /// A moving test pattern instead, as a camera and as a screen (tests,
+    /// the CLI): each frame carries its number and send time in a stamp
+    /// at the top that survives encoding and scaling.
+    TestPattern,
+}
+
+/// The identifier of the test pattern, as a camera and as a screen
+/// ([`VideoBackend::TestPattern`]).
+pub const TEST_PATTERN_ID: &str = "test-pattern";
+
 /// What a video track carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

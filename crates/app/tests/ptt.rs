@@ -109,6 +109,7 @@ impl Rig {
                 room_list_page_size: twicecat_core::DEFAULT_ROOM_LIST_PAGE_SIZE,
                 max_upload_bytes_override: None,
                 audio: AudioBackend::Virtual(Arc::new(Silence(frames.clone()))),
+                video: twicecat_core::api::VideoBackend::System,
                 call_service_override: None,
             },
             Arc::new(InMemorySecretStore::new()),
@@ -168,6 +169,7 @@ impl Rig {
             .block_on(async { tokio::time::timeout(within, self.events.next()).await });
         match event {
             Ok(Some(BridgeEvent::Core(event))) => {
+                let event = *event;
                 if matches!(
                     event,
                     CoreEvent::AudioSettings(_) | CoreEvent::InputLevel(_) | CoreEvent::Error(_)

@@ -8486,6 +8486,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "twicecat-audio",
+ "twicecat-video",
  "url",
  "zeroize",
 ]

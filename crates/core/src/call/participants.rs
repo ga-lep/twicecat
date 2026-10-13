@@ -1,7 +1,8 @@
 //! Who is in the call: the active memberships in the room state, reported
 //! as `CallParticipants` with what the media layer knows of each (speaking,
-//! muted, cleaned), and handed to the SFU manager (who publishes where) and
-//! the key distribution (whom to send our key).
+//! muted, cleaned), and handed to the SFU manager (who publishes where), the
+//! key distribution (whom to send our key) and the video tracks (whose are
+//! shown).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,8 +17,11 @@ use super::e2ee::Recipient;
 use super::media::SharedFlags;
 use super::membership::{self, CALL_MEMBER_EVENT, Membership};
 use super::sfus::Expected;
+use super::video::Videos;
 use super::{UserVolumes, now_ms, user_volume};
-use crate::api::{CoreEvent, DeviceId, ListDiff, Participant, ParticipantId, RoomId, UserId};
+use crate::api::{
+    CoreEvent, DeviceId, ListDiff, Participant, ParticipantId, RoomId, SoundSource, UserId,
+};
 
 /// How often participants are re-read even without a state change, so that
 /// expired memberships disappear.
@@ -83,7 +87,8 @@ async fn participants(
             Err(_) => None,
         };
         let user_id = UserId::from(m.user_id.as_str());
-        let volume_percent = user_volume(volumes, &user_id);
+        let volume_percent = user_volume(volumes, &user_id, SoundSource::Voice);
+        let share_volume_percent = user_volume(volumes, &user_id, SoundSource::ScreenShare);
         let (speaking, muted, cleaning) = flags
             .flags
             .read()
@@ -107,6 +112,7 @@ async fn participants(
             muted,
             speaking,
             volume_percent,
+            share_volume_percent,
             cleaning,
         });
     }
@@ -133,6 +139,7 @@ pub(super) async fn watch_participants(
     events: mpsc::Sender<CoreEvent>,
     volumes: UserVolumes,
     flags: SharedFlags,
+    videos: Videos,
     ours: Ours,
 ) {
     let mut info = room.subscribe_info();
@@ -150,6 +157,7 @@ pub(super) async fn watch_participants(
             tracing::warn!("our call membership is gone; joining again");
             ours.gone.notify_one();
         }
+        videos.set_members(&active);
         let expected = membership::expected_by_sfu(&active, &ours.identity, &ours.service);
         ours.expected.send_if_modified(|e| {
             let changed = *e != expected;

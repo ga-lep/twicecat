@@ -23,6 +23,7 @@ pub use audio::{
 };
 pub use call::{
     CallEndReason, CallIntent, CallState, CleaningStatus, Participant, ParticipantId, SkipReason,
+    SoundSource,
 };
 pub use diff::ListDiff;
 pub use media::{
@@ -50,11 +51,11 @@ pub use types::{
 };
 pub use video::{
     CodecLimits, EncoderBackend, EncoderChoice, LocalVideo, QualityLimitation, ScreenSource,
-    ScreenSourceId, ScreenSourceKind, ScreenSources, ScreenThumbnail, VideoCodec, VideoCodecChoice,
-    VideoDevice, VideoDeviceId, VideoDevices, VideoDirection, VideoEncoderInfo, VideoEncoders,
-    VideoFeed, VideoFeedSender, VideoFrame, VideoKind, VideoMatrix, VideoMode, VideoPixelFormat,
-    VideoPlane, VideoQuality, VideoRange, VideoSettings, VideoStats, VideoTrackId, VideoTrackStats,
-    VideoTrackView,
+    ScreenSourceId, ScreenSourceKind, ScreenSources, ScreenThumbnail, TEST_PATTERN_ID,
+    VideoBackend, VideoCodec, VideoCodecChoice, VideoDevice, VideoDeviceId, VideoDevices,
+    VideoDirection, VideoEncoderInfo, VideoEncoders, VideoFeed, VideoFeedSender, VideoFrame,
+    VideoKind, VideoMatrix, VideoMode, VideoPixelFormat, VideoPlane, VideoQuality, VideoRange,
+    VideoSettings, VideoStats, VideoTrackId, VideoTrackStats, VideoTrackView,
 };
 
 /// A request from the front end to the engine.
@@ -457,10 +458,13 @@ pub enum Command {
         /// Held down.
         pressed: bool,
     },
-    /// Playback volume for one user, percent (0..=200); remembered.
+    /// Playback volume for one user's voice or screen-share sound,
+    /// percent (0..=200); remembered.
     SetUserVolume {
         /// Account.
         user_id: UserId,
+        /// Their voice, or their screen share's sound.
+        source: SoundSource,
         /// Percent; 100 is unchanged.
         percent: u16,
     },
@@ -490,8 +494,11 @@ pub enum Command {
     /// Close the mic test.
     StopMicTest,
 
-    // Video (Phase 9). Until the video tasks land, each of these answers
-    // `CoreError::NotSupported`.
+    // Video (Phase 9). Until the video tasks land, the ones that need real
+    // cameras, screens, settings or encoders answer
+    // `CoreError::NotSupported`; with `CoreConfig::video` set to
+    // `VideoBackend::TestPattern` the cameras and screens are a test
+    // pattern.
     /// Re-enumerate cameras; answered by `VideoDevices`.
     ListVideoDevices,
     /// List the monitors and windows for our own picker; answered by
@@ -846,9 +853,14 @@ impl fmt::Debug for Command {
                 .debug_struct("PushToTalk")
                 .field("pressed", pressed)
                 .finish(),
-            Self::SetUserVolume { user_id, percent } => f
+            Self::SetUserVolume {
+                user_id,
+                source,
+                percent,
+            } => f
                 .debug_struct("SetUserVolume")
                 .field("user_id", user_id)
+                .field("source", source)
                 .field("percent", percent)
                 .finish(),
             Self::SetUserCleaning { user_id, cleaning } => f
