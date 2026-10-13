@@ -17,6 +17,7 @@ pub mod keys;
 pub mod links;
 pub mod media;
 pub mod notifications;
+pub mod ptt;
 pub mod rich_text;
 pub mod room_list;
 pub mod rooms;

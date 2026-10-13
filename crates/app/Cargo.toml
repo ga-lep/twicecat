@@ -22,6 +22,8 @@ arboard = { version = "=3.6.1", default-features = false, features = ["image-dat
 notify-rust = "=4.18.2"
 tray-icon = { version = "=0.26.1", default-features = false, features = ["ksni"] }
 twicecat-core = { path = "../core" }
+# Push-to-talk sources; no matrix-sdk or media crates (scripts/check-app-deps.sh).
+twicecat-ptt = { path = "../ptt" }
 
 [features]
 # The full build: speech enhancement on the GPU (DeepFilterNet3 on ONNX

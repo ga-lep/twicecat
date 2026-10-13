@@ -21,7 +21,7 @@ mod merge;
 #[cfg(target_os = "linux")]
 mod portal;
 
-pub use binding::{BindingError, GamepadButton, KeyBinding};
+pub use binding::{BindingError, GamepadButton, Held, KeyBinding};
 pub use merge::Source;
 
 use merge::Merger;
@@ -90,7 +90,7 @@ impl KeyboardBackend {
 }
 
 /// What to listen to.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PttConfig {
     /// The global keyboard shortcut, if any.
     pub key: Option<KeyBinding>,

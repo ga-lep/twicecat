@@ -23,9 +23,66 @@ pub enum BindingError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KeyBinding(HotKey);
 
+/// The modifier keys held with a key pressed in Twicecat's window. `logo`
+/// is the Windows key, or Command on macOS.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Held {
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: bool,
+    pub logo: bool,
+}
+
+impl Held {
+    fn modifiers(self) -> Modifiers {
+        let mut mods = Modifiers::empty();
+        for (held, modifier) in [
+            (self.ctrl, Modifiers::CONTROL),
+            (self.alt, Modifiers::ALT),
+            (self.shift, Modifiers::SHIFT),
+            (self.logo, Modifiers::SUPER),
+        ] {
+            if held {
+                mods |= modifier;
+            }
+        }
+        mods
+    }
+}
+
 impl KeyBinding {
     pub(crate) fn hotkey(self) -> HotKey {
         self.0
+    }
+
+    /// The binding for the key `code` pressed with `held`, from a window's
+    /// key event. `code` is the key's W3C code name (`KeyT`, `Digit5`,
+    /// `F13`), as winit and Iced name physical keys. A modifier key alone,
+    /// or a key global-hotkey has no name for, is refused.
+    pub fn from_key(code: &str, held: Held) -> Result<Self, BindingError> {
+        let key = Self::key_code(code).ok_or_else(|| BindingError::Key(code.to_owned()))?;
+        Ok(Self(HotKey::new(Some(held.modifiers()), key)))
+    }
+
+    /// Whether `code` (a W3C code name) is this binding's key, whatever the
+    /// modifiers: a release counts even when a modifier was let go first.
+    pub fn is_key(self, code: &str) -> bool {
+        Self::key_code(code) == Some(self.0.key)
+    }
+
+    /// Whether `held` are exactly this binding's modifiers: a press counts
+    /// only then, as for the global shortcut.
+    pub fn has_modifiers(self, held: Held) -> bool {
+        self.0.mods == held.modifiers()
+    }
+
+    /// The key a W3C code name stands for, if global-hotkey can bind it.
+    fn key_code(code: &str) -> Option<Code> {
+        // One token: no `+`, so it is read as a key, never as a modifier.
+        if code.is_empty() || code.contains('+') {
+            return None;
+        }
+        HotKey::from_str(code).ok().map(|hotkey| hotkey.key)
     }
 
     /// The trigger suggested to the GlobalShortcuts portal, in the XDG
@@ -205,6 +262,88 @@ mod tests {
         for bad in ["", "ctrl+", "KeyT+ctrl", "ctrl+KeyT+KeyU", "Banana"] {
             assert!(bad.parse::<KeyBinding>().is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn window_keys_become_bindings() {
+        let ctrl_shift = Held {
+            ctrl: true,
+            shift: true,
+            ..Held::default()
+        };
+        let made = KeyBinding::from_key("KeyT", ctrl_shift).unwrap();
+        assert_eq!(made, key("ctrl+shift+KeyT"));
+        assert_eq!(made.to_string(), "shift+control+KeyT");
+        for (code, held, written) in [
+            ("F13", Held::default(), "F13"),
+            ("Digit5", Held::default(), "Digit5"),
+            ("Numpad0", Held::default(), "Numpad0"),
+            ("Backquote", Held::default(), "Backquote"),
+            (
+                "Space",
+                Held {
+                    alt: true,
+                    ..Held::default()
+                },
+                "alt+Space",
+            ),
+            (
+                "KeyM",
+                Held {
+                    logo: true,
+                    ..Held::default()
+                },
+                "super+KeyM",
+            ),
+        ] {
+            assert_eq!(
+                KeyBinding::from_key(code, held).unwrap().to_string(),
+                written
+            );
+        }
+        // Modifier keys alone, keys with no name, and malformed codes.
+        for bad in [
+            "ShiftLeft",
+            "ControlRight",
+            "SuperLeft",
+            "AltLeft",
+            "Fn",
+            "",
+            "ctrl+KeyT",
+            "KeyT+",
+        ] {
+            assert!(
+                KeyBinding::from_key(bad, Held::default()).is_err(),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn window_keys_match_the_binding() {
+        let binding = key("ctrl+shift+KeyT");
+        let ctrl_shift = Held {
+            ctrl: true,
+            shift: true,
+            ..Held::default()
+        };
+        assert!(binding.is_key("KeyT"));
+        assert!(!binding.is_key("KeyY"));
+        assert!(!binding.is_key("ControlLeft"));
+        assert!(binding.has_modifiers(ctrl_shift));
+        assert!(
+            !binding.has_modifiers(Held::default()),
+            "a press needs them"
+        );
+        assert!(
+            !binding.has_modifiers(Held {
+                alt: true,
+                ..ctrl_shift
+            }),
+            "and no others"
+        );
+        let plain = key("F13");
+        assert!(plain.is_key("F13") && plain.has_modifiers(Held::default()));
     }
 
     #[test]
