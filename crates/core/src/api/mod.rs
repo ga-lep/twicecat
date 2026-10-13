@@ -31,10 +31,10 @@ pub use media::{
     UploadProgress, UploadThumbnail,
 };
 pub use rooms::{
-    CreateRoomRequest, MembershipView, NotificationKind, NotificationSettingsView,
-    NotificationView, OwnProfileView, PowerLevelView, Role, RoomDetailsView, RoomMemberView,
-    RoomNotificationModeView, RoomPermissions, RoomVisibility, SpaceView, ThemeChoice,
-    ThreadSummaryView, UiSettings,
+    CreateRoomRequest, DensityChoice, MembershipView, NotificationKind, NotificationSettingsView,
+    NotificationView, OwnProfileView, PaletteChoice, PowerLevelView, Role, RoomDetailsView,
+    RoomListChoice, RoomMemberView, RoomNotificationModeView, RoomPermissions, RoomVisibility,
+    SpaceView, ThemeChoice, ThreadSummaryView, UiSettings,
 };
 pub use security::{
     CancelReason, CrossSigning, DeviceSummary, DeviceTrust, DeviceVerification, QrImage,
