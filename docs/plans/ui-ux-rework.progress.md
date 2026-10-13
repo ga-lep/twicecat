@@ -10,4 +10,6 @@ Task 3: complete (65c72b0..6a58698, gate ok, security PASS, review PASS, evidenc
 Task 4: complete (ec68957..4332f03, gate ok, security PASS, review PASS, evidence PROVEN)
   evidence: docs/plans/ui-ux-rework.evidence/task-4.md
   notes: Zoom::In lacks saturating_add; Ctrl+Shift+= and numpad plus unbound; red step was compile failure for most tests; GUI session, settings.json key removal end to end and a resize-keeps-heights test not shown (human checkpoint / gap); one settings write per zoom step
-Task 5: started
+Task 5: complete (095ed12..942366b, gate ok, security PASS, review PASS, evidence PROVEN)
+  evidence: docs/plans/ui-ux-rework.evidence/task-5.md
+  notes: TWICECAT_GALLERY_DIR unvalidated path (Low, opt-in test); unplanned dev-profile opt-level=3 list in root Cargo.toml (no version change); -rail PNGs identical to expanded until Task 7; no_secret_logging (needs homeserver) not run; layout glitches seen in gallery for later tasks: "Leave call" wraps/clipped in header, "Audio..." cut off in call bar, Voice&audio Close/Set key under scrollbar, low-contrast login button labels; gallery view: TWICECAT_GALLERY_DIR=target/ui-gallery cargo test -p twicecat-app --test ui_gallery -- --ignored
