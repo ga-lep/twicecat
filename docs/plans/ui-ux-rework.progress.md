@@ -7,3 +7,4 @@ Task 2: complete (6a6c5d6..e7969ed, gate ok, security PASS, review PASS, evidenc
 Task 3: complete (65c72b0..6a58698, gate ok, security PASS, review PASS, evidence PROVEN)
   evidence: docs/plans/ui-ux-rework.evidence/task-3.md
   notes: UiSettings/ThemeChoice lost Deserialize (not purely additive; unknown theme now falls back instead of marking file bad); write_settings does not clamp text_scale_percent (read does); settings.json read follows symlinks and .bad rename overwrites (pre-existing); fallback test lacks unknown-theme case
+Task 4: started
