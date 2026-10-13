@@ -28,9 +28,9 @@ use zeroize::Zeroizing;
 
 use crate::api::{
     ActionKind, AudioBackend, AudioDevice, AudioDeviceId, AudioDevices, AudioSettings,
-    CallEndReason, CallState, Command, CoreError, CoreEvent, DeviceId, Draft, ListDiff, MediaSize,
-    Member, MessageText, OutgoingAttachment, OutgoingMessage, PaginationState, Password, RoomId,
-    RoomListQuery, RoomNotificationModeView, TimelineItem, TypingUser, UserId,
+    CallEndReason, CallIntent, CallState, Command, CoreError, CoreEvent, DeviceId, Draft, ListDiff,
+    MediaSize, Member, MessageText, OutgoingAttachment, OutgoingMessage, PaginationState, Password,
+    RoomId, RoomListQuery, RoomNotificationModeView, TimelineItem, TypingUser, UserId,
 };
 use crate::audio_session::{AudioSession, Mode};
 use crate::avatars::{Avatars, SdkFetcher, answer_unavailable};
@@ -1378,7 +1378,7 @@ impl Engine {
                 // Stored, echoed and applied to the call like any change.
                 self.store_audio_settings(settings.validated()).await;
             }
-            Command::JoinCall { room_id, intent: _ } => self.join_call(room_id).await,
+            Command::JoinCall { room_id, intent } => self.join_call(room_id, intent).await,
             Command::LeaveCall => {
                 if self.call.is_some() {
                     self.leave_call().await;
@@ -1410,6 +1410,21 @@ impl Engine {
             }
             Command::ListAudioDevices => self.list_audio_devices().await,
             Command::StartMicTest { loopback } => self.start_mic_test(loopback).await,
+            Command::ListVideoDevices
+            | Command::ListScreenSources
+            | Command::StartCamera { .. }
+            | Command::StopCamera
+            | Command::StartScreenShare { .. }
+            | Command::StopScreenShare
+            | Command::SetVideoView { .. }
+            | Command::GetVideoSettings
+            | Command::UpdateVideoSettings(_)
+            | Command::ProbeVideoEncoders
+            | Command::StartCameraPreview { .. }
+            | Command::StopCameraPreview => {
+                self.emit(CoreEvent::Error(CoreError::NotSupported("video".into())))
+                    .await;
+            }
             Command::StopMicTest => {
                 if let Some(session) = self.audio_session.take() {
                     session.stop().await;
@@ -1744,7 +1759,7 @@ impl Engine {
     }
 
     /// Joins `room_id`'s call, leaving another call first.
-    async fn join_call(&mut self, room_id: RoomId) {
+    async fn join_call(&mut self, room_id: RoomId, intent: CallIntent) {
         let Some(active) = self.active.as_ref() else {
             self.emit(CoreEvent::Error(CoreError::NotLoggedIn)).await;
             return;
@@ -1783,6 +1798,7 @@ impl Engine {
         match CallSession::join(
             &client,
             room_id.clone(),
+            intent,
             audio,
             self.events.clone(),
             self.user_volumes.clone(),

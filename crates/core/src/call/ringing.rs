@@ -18,6 +18,8 @@
 
 use serde_json::{Value, json};
 
+use crate::api::CallIntent;
+
 /// The notification event type.
 pub(crate) const NOTIFICATION_EVENT: &str = "org.matrix.msc4075.rtc.notification";
 /// The decline event type.
@@ -35,7 +37,12 @@ pub(crate) const MAX_LIFETIME_MS: u64 = 120_000;
 const MAX_SENDER_TS_AHEAD_MS: u64 = 20_000;
 
 /// Our notification for a call we started, referencing our membership.
-pub(crate) fn notification_content(membership_event_id: &str, ring: bool, sender_ts: u64) -> Value {
+pub(crate) fn notification_content(
+    membership_event_id: &str,
+    ring: bool,
+    sender_ts: u64,
+    intent: CallIntent,
+) -> Value {
     json!({
         "slot_id": SLOT_ID,
         "m.mentions": { "user_ids": [], "room": true },
@@ -44,7 +51,7 @@ pub(crate) fn notification_content(membership_event_id: &str, ring: bool, sender
         "sender_ts": sender_ts,
         "lifetime": LIFETIME_MS,
         "msc4354_sticky_key": SLOT_ID,
-        "m.call.intent": "audio",
+        "m.call.intent": intent.as_str(),
     })
 }
 
@@ -81,6 +88,8 @@ pub(crate) struct Incoming {
     pub ring: bool,
     /// When it stops ringing, ms since the epoch.
     pub expires_ms: u64,
+    /// A voice or a video call (`m.call.intent`).
+    pub intent: CallIntent,
 }
 
 /// What the receiving rules need besides the event.
@@ -150,6 +159,7 @@ pub(crate) fn parse_notification(
     Some(Incoming {
         ring: content.get("notification_type").and_then(Value::as_str) == Some("ring"),
         expires_ms,
+        intent: CallIntent::from_intent(content.get("m.call.intent").and_then(Value::as_str)),
     })
 }
 
@@ -192,7 +202,7 @@ mod tests {
 
     #[test]
     fn our_notification_matches_element_call() {
-        let c = notification_content("$member", true, 5);
+        let c = notification_content("$member", true, 5, CallIntent::Audio);
         assert_eq!(
             c,
             json!({
@@ -207,7 +217,7 @@ mod tests {
             })
         );
         assert_eq!(
-            notification_content("$m", false, 5)["notification_type"],
+            notification_content("$m", false, 5, CallIntent::Audio)["notification_type"],
             "notification"
         );
         assert_eq!(
@@ -219,15 +229,35 @@ mod tests {
 
     #[test]
     fn a_fresh_ring_from_someone_who_may_notify_the_room_rings() {
-        let c = notification_content("$m", true, NOW - 1_000);
+        let c = notification_content("$m", true, NOW - 1_000, CallIntent::Audio);
         let got = parse_notification("@alice:x", NOW - 1_000, &c, &rx(true)).unwrap();
         assert!(got.ring);
         assert_eq!(got.expires_ms, NOW - 1_000 + 90_000);
     }
 
     #[test]
+    fn a_ring_says_whether_it_is_a_video_call() {
+        let video = notification_content("$m", true, NOW - 1_000, CallIntent::Video);
+        assert_eq!(video["m.call.intent"], "video");
+        let got = parse_notification("@alice:x", NOW - 1_000, &video, &rx(true)).unwrap();
+        assert_eq!(got.intent, CallIntent::Video);
+        // Missing or unknown: a voice call (Element Call before intents).
+        for intent in [None, Some("audio"), Some("conference")] {
+            let mut c = notification_content("$m", true, NOW - 1_000, CallIntent::Audio);
+            match intent {
+                None => {
+                    c.as_object_mut().unwrap().remove("m.call.intent");
+                }
+                Some(v) => c["m.call.intent"] = v.into(),
+            }
+            let got = parse_notification("@alice:x", NOW - 1_000, &c, &rx(true)).unwrap();
+            assert_eq!(got.intent, CallIntent::Audio, "{intent:?}");
+        }
+    }
+
+    #[test]
     fn rings_that_must_not_ring() {
-        let c = notification_content("$m", true, NOW - 1_000);
+        let c = notification_content("$m", true, NOW - 1_000, CallIntent::Audio);
         assert!(
             parse_notification("@bob:x", NOW, &c, &rx(true)).is_none(),
             "our own"
@@ -236,7 +266,7 @@ mod tests {
             parse_notification("@alice:x", NOW, &c, &rx(false)).is_none(),
             "may not notify the room"
         );
-        let old = notification_content("$m", true, NOW - 91_000);
+        let old = notification_content("$m", true, NOW - 91_000, CallIntent::Audio);
         assert!(
             parse_notification("@alice:x", NOW - 91_000, &old, &rx(true)).is_none(),
             "expired"

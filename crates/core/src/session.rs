@@ -325,12 +325,14 @@ mod tests {
                     dirs.push(path);
                 } else if path.extension().is_some_and(|e| e == "rs")
                     && path.file_name().is_some_and(|n| n != "session.rs")
-                    // call_settings.rs, call.rs, types.rs and audio.rs serialize
-                    // non-secret audio settings, room IDs and similar public data.
+                    // call_settings.rs, call.rs, types.rs, audio.rs and video.rs
+                    // serialize non-secret audio and video settings, room IDs
+                    // and similar public data.
                     && path.file_name().is_some_and(|n| n != "call_settings.rs")
                     && path.file_name().is_some_and(|n| n != "call.rs")
                     && path.file_name().is_some_and(|n| n != "types.rs")
                     && path.file_name().is_some_and(|n| n != "audio.rs")
+                    && path.file_name().is_some_and(|n| n != "video.rs")
                 {
                     let code = std::fs::read_to_string(&path).unwrap();
                     if code.contains("serde_json::to_") || code.contains("Serialize") {

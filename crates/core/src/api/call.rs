@@ -11,12 +11,35 @@ string_newtype!(
     /// for the length of that device's membership.
     ParticipantId
 );
-/// What a call is for. Only voice for now; video comes later.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// What a call is for, as MatrixRTC's `m.call.intent` says it: rings and
+/// call lists show it. It does not decide what is sent; cameras and shares
+/// are turned on with their own commands.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CallIntent {
-    /// Voice only.
+    /// A voice call.
+    #[default]
     Audio,
+    /// A video call.
+    Video,
+}
+
+impl CallIntent {
+    /// The value of `m.call.intent` (matrix-js-sdk's spelling).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Audio => "audio",
+            Self::Video => "video",
+        }
+    }
+
+    /// From `m.call.intent`; anything but `video` is a voice call.
+    pub fn from_intent(value: Option<&str>) -> Self {
+        match value {
+            Some("video") => Self::Video,
+            _ => Self::Audio,
+        }
+    }
 }
 
 /// The local user's call, if any.
@@ -116,4 +139,27 @@ pub enum SkipReason {
     /// them to [`VoiceCleaning::Always`](super::VoiceCleaning::Always) to clean
     /// it here too.
     AlreadyClean,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn intents_use_matrix_js_sdk_spelling() {
+        assert_eq!(CallIntent::Audio.as_str(), "audio");
+        assert_eq!(CallIntent::Video.as_str(), "video");
+        assert_eq!(CallIntent::from_intent(Some("video")), CallIntent::Video);
+        for other in [None, Some("audio"), Some("Video"), Some("")] {
+            assert_eq!(
+                CallIntent::from_intent(other),
+                CallIntent::Audio,
+                "{other:?}"
+            );
+        }
+        assert_eq!(
+            serde_json::to_string(&CallIntent::Video).unwrap(),
+            "\"video\""
+        );
+    }
 }

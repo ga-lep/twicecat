@@ -58,7 +58,7 @@ pub(crate) use self::participants::active_memberships;
 use self::participants::{Ours, watch_participants};
 use self::sfus::{Expected, Remotes, SfuManager, manage_sfus};
 use crate::api::{
-    AudioSettings, CoreError, CoreEvent, RemoteCleaning, RoomId, UserId, VoiceCleaning,
+    AudioSettings, CallIntent, CoreError, CoreEvent, RemoteCleaning, RoomId, UserId, VoiceCleaning,
 };
 
 pub(crate) fn now_ms() -> u64 {
@@ -121,9 +121,13 @@ pub(crate) struct CallAudio {
 /// Rings the room: `ring` in a DM, a quiet `notification` elsewhere (as
 /// Element Call). Returns the notification's event ID; a failure only
 /// means nobody is rung.
-async fn send_notification(room: &Room, membership_event: &str) -> Option<String> {
+async fn send_notification(
+    room: &Room,
+    membership_event: &str,
+    intent: CallIntent,
+) -> Option<String> {
     let ring = room.is_direct().await.unwrap_or(false);
-    let content = ringing::notification_content(membership_event, ring, now_ms());
+    let content = ringing::notification_content(membership_event, ring, now_ms(), intent);
     match room.send_raw(ringing::NOTIFICATION_EVENT, content).await {
         Ok(sent) => Some(sent.response.event_id.to_string()),
         Err(_) => {
@@ -162,6 +166,7 @@ impl CallSession {
     pub(crate) async fn join(
         client: &Client,
         room_id: RoomId,
+        intent: CallIntent,
         audio: CallAudio,
         events: mpsc::Sender<CoreEvent>,
         volumes: UserVolumes,
@@ -197,6 +202,7 @@ impl CallSession {
             room_id.as_str(),
             None,
             MEMBERSHIP_EXPIRES,
+            intent,
         );
         let delay_id = Arc::new(Mutex::new(delay_id));
         let flags = SharedFlags::default();
@@ -241,6 +247,7 @@ impl CallSession {
                 user_id: user_id.clone(),
                 device_id: device_id.clone(),
                 service_url: service_url.clone(),
+                intent,
                 delay_id,
                 gone: own_gone.clone(),
             },
@@ -283,7 +290,7 @@ impl CallSession {
             }
         };
         if first {
-            session.notification = send_notification(&room, &membership_event).await;
+            session.notification = send_notification(&room, &membership_event, intent).await;
         }
         let shared = ConnectionShared {
             encryption: keys.as_ref().map(|provider| E2eeOptions {

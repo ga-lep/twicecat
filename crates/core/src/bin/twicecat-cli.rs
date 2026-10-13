@@ -858,6 +858,16 @@ impl Cli {
                     println!("{line}");
                 }
             }
+            // Video comes to the CLI with the core's video (Phase 9 Task 5).
+            CoreEvent::VideoDevices(_)
+            | CoreEvent::ScreenSources(_)
+            | CoreEvent::VideoSettings(_)
+            | CoreEvent::VideoTracks { .. }
+            | CoreEvent::VideoFeed { .. }
+            | CoreEvent::CameraPreview(_)
+            | CoreEvent::LocalVideo(_)
+            | CoreEvent::VideoEncoders(_)
+            | CoreEvent::VideoStats(_) => {}
         }
     }
 

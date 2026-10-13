@@ -10,7 +10,7 @@ use common::{expect_event, start_core, start_core_with_audio};
 use twicecat_core::CoreHandle;
 use twicecat_core::api::{
     AudioSettings, CallIntent, Command, CoreError, CoreEvent, InputMode, PushToTalkBindings,
-    RoomId, UserId,
+    RoomId, UserId, VideoQuality, VideoSettings, VideoTrackId,
 };
 use twicecat_core::paths::DataPaths;
 use twicecat_core::secrets::InMemorySecretStore;
@@ -137,6 +137,52 @@ async fn call_commands_need_a_session_or_a_call() {
     send(&handle, Command::SetMicMuted(true)).await;
     let e = expect_event(&mut handle, |e| matches!(e, CoreEvent::Error(_))).await;
     assert!(matches!(e, CoreEvent::Error(CoreError::NotInCall)), "{e:?}");
+}
+
+/// Phase 9 Task 2: the video API is in place, and each command answers
+/// `NotSupported` until the video tasks land.
+#[tokio::test]
+async fn video_commands_answer_not_supported_for_now() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut handle = core(dir.path());
+    for command in [
+        Command::ListVideoDevices,
+        Command::ListScreenSources,
+        Command::StartCamera {
+            device: None,
+            quality: VideoQuality::Auto,
+        },
+        Command::StopCamera,
+        Command::StartScreenShare {
+            source: None,
+            quality: VideoQuality::Uhd2160p60,
+            audio: true,
+        },
+        Command::StopScreenShare,
+        Command::SetVideoView {
+            track: VideoTrackId::from("t"),
+            width: 640,
+            height: 360,
+            visible: true,
+        },
+        Command::GetVideoSettings,
+        Command::UpdateVideoSettings(VideoSettings::default()),
+        Command::ProbeVideoEncoders,
+        Command::StartCameraPreview {
+            device: None,
+            quality: VideoQuality::Hd720p30,
+        },
+        Command::StopCameraPreview,
+    ] {
+        let name = format!("{command:?}");
+        send(&handle, command).await;
+        let e = expect_event(&mut handle, |e| matches!(e, CoreEvent::Error(_))).await;
+        assert!(
+            matches!(&e, CoreEvent::Error(CoreError::NotSupported(what)) if what == "video"),
+            "{name}: {e:?}"
+        );
+    }
+    send(&handle, Command::Shutdown).await;
 }
 
 #[tokio::test]

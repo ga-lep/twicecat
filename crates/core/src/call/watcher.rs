@@ -27,7 +27,7 @@ use tokio::task::JoinHandle;
 
 use super::membership::CALL_MEMBER_EVENT;
 use super::ringing::{self, Callee, DECLINE_EVENT, NOTIFICATION_EVENT, SLOT_EVENT, SLOT_ID};
-use crate::api::{CallIntent, CoreEvent, RoomId, UserId};
+use crate::api::{CoreEvent, RoomId, UserId};
 
 /// How often rings are checked for expiry and calls for stale memberships.
 const RECHECK: Duration = Duration::from_secs(2);
@@ -479,7 +479,7 @@ async fn ring(
         .send(CoreEvent::IncomingCall {
             room_id: RoomId::from(room_id),
             caller: UserId::from(waiting.caller.as_str()),
-            intent: CallIntent::Audio,
+            intent: waiting.incoming.intent,
             ring: waiting.incoming.ring,
         })
         .await;
