@@ -7,6 +7,9 @@
 //! about theirs.
 //!
 //! A LiveKit identity is the member's `user:device` (session memberships).
+//! A participant may send two audio tracks, its voice and the sound of a
+//! screen share (Element Call): each plays as its own source, and only the
+//! voice is cleaned and counts as muted.
 //! A participant that is not an active member on that SFU is not played:
 //! the call services hand out tokens to any Matrix user (as Element Call,
 //! which only shows participants matching a membership).
@@ -137,47 +140,75 @@ fn volume_of(volumes: &UserVolumes, identity: &str) -> u16 {
     user_volume(volumes, &UserId::from(user_of(identity)))
 }
 
+/// What a remote audio track carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Feed {
+    /// The microphone, or a track that names no source.
+    Voice,
+    /// A screen share's sound: never cleaned, its mute is not the
+    /// participant's.
+    Share,
+}
+
+impl Feed {
+    fn of(source: TrackSource) -> Self {
+        match source {
+            TrackSource::ScreenshareAudio => Self::Share,
+            _ => Self::Voice,
+        }
+    }
+}
+
+/// A participant's track: its identity and what the track carries.
+type TrackKey = (String, Feed);
+
 /// The subscribed remote audio tracks of one connection and the ones
 /// playing: exactly those of expected identities.
 #[derive(Default)]
 struct Players {
-    tracks: HashMap<String, RemoteAudioTrack>,
-    playing: HashMap<String, (SourceId, JoinHandle<()>)>,
+    tracks: HashMap<TrackKey, RemoteAudioTrack>,
+    playing: HashMap<TrackKey, (SourceId, JoinHandle<()>)>,
     expected: BTreeSet<String>,
     /// Cleans the voices that play (shared by the call's connections).
     cleaning: Option<Cleaning>,
 }
 
 impl Players {
-    fn stop(&mut self, identity: &str, voice: Option<&Voice>) {
-        if let Some((id, task)) = self.playing.remove(identity) {
+    fn stop(&mut self, key: &TrackKey, voice: Option<&Voice>) {
+        if let Some((id, task)) = self.playing.remove(key) {
             task.abort();
             if let Some(voice) = voice {
                 audio_session::voice_control(voice).remove_source(id);
             }
-            if let Some(cleaning) = &self.cleaning {
+            if let (Some(cleaning), (identity, Feed::Voice)) = (&self.cleaning, key) {
                 cleaning.remove(identity);
             }
         }
     }
 
+    /// Forgets every track of `identity`.
+    fn forget(&mut self, identity: &str) {
+        self.tracks.retain(|(id, _), _| id != identity);
+    }
+
     /// Starts and stops mixer sources so that exactly the subscribed tracks
     /// of expected identities play.
     fn reconcile(&mut self, voice: Option<&Voice>, volumes: &UserVolumes) {
-        let stale: Vec<String> = self
+        let stale: Vec<TrackKey> = self
             .playing
             .keys()
-            .filter(|id| !self.tracks.contains_key(*id) || !self.expected.contains(*id))
+            .filter(|key| !self.tracks.contains_key(*key) || !self.expected.contains(&key.0))
             .cloned()
             .collect();
-        for identity in stale {
-            self.stop(&identity, voice);
+        for key in stale {
+            self.stop(&key, voice);
         }
         let Some(voice) = voice else {
             return;
         };
-        for (identity, track) in &self.tracks {
-            if self.playing.contains_key(identity) || !self.expected.contains(identity) {
+        for (key, track) in &self.tracks {
+            let (identity, feed) = key;
+            if self.playing.contains_key(key) || !self.expected.contains(identity) {
                 continue;
             }
             let Some((id, input)) =
@@ -189,19 +220,19 @@ impl Players {
             let stream = NativeAudioStream::new(track.rtc_track(), SAMPLE_RATE as i32, 1);
             let flag = input.cleaning_flag();
             self.playing.insert(
-                identity.clone(),
+                key.clone(),
                 (id, spawn_audio_task(read_track(stream, input))),
             );
-            if let Some(cleaning) = &self.cleaning {
+            if let (Some(cleaning), Feed::Voice) = (&self.cleaning, feed) {
                 cleaning.add(identity, id, flag);
             }
         }
     }
 
     fn stop_all(&mut self, voice: Option<&Voice>) {
-        let all: Vec<String> = self.playing.keys().cloned().collect();
-        for identity in all {
-            self.stop(&identity, voice);
+        let all: Vec<TrackKey> = self.playing.keys().cloned().collect();
+        for key in all {
+            self.stop(&key, voice);
         }
     }
 }
@@ -356,7 +387,7 @@ impl SfuConnection {
             return;
         };
         let players = self.players.lock().expect("players lock");
-        for (identity, (id, _)) in &players.playing {
+        for ((identity, _), (id, _)) in &players.playing {
             if user_of(identity) == user.as_str() {
                 audio_session::voice_control(voice).set_source_volume(*id, percent);
             }
@@ -375,7 +406,7 @@ impl SfuConnection {
             players
                 .tracks
                 .drain()
-                .map(|(identity, _)| identity)
+                .map(|((identity, _), _)| identity)
                 .collect()
         };
         if let Ok(mut f) = self.flags.flags.write() {
@@ -604,25 +635,36 @@ async fn handle_events(
                 publication,
                 participant,
             } => {
-                let identity = participant.identity().as_str().to_owned();
-                cx.read_claim(&participant, &publication);
-                heard.insert(identity.clone(), (participant, publication));
+                let key = (
+                    participant.identity().as_str().to_owned(),
+                    Feed::of(publication.source()),
+                );
+                if key.1 == Feed::Voice {
+                    cx.read_claim(&participant, &publication);
+                    heard.insert(key.0.clone(), (participant, publication));
+                }
                 cx.with_players(|p| {
-                    // A new track of the same identity replaces the old one.
-                    p.stop(&identity, cx.voice.as_ref());
-                    p.tracks.insert(identity, track);
+                    // A new track of the same identity and feed replaces the
+                    // old one.
+                    p.stop(&key, cx.voice.as_ref());
+                    p.tracks.insert(key, track);
                 });
             }
             RoomEvent::TrackUnsubscribed {
                 track: RemoteTrack::Audio(_),
+                publication,
                 participant,
-                ..
             } => {
-                let identity = participant.identity().as_str().to_owned();
-                heard.remove(&identity);
-                cx.cleaning.set_claim(&identity, Claim::None);
+                let key = (
+                    participant.identity().as_str().to_owned(),
+                    Feed::of(publication.source()),
+                );
+                if key.1 == Feed::Voice {
+                    heard.remove(&key.0);
+                    cx.cleaning.set_claim(&key.0, Claim::None);
+                }
                 cx.with_players(|p| {
-                    p.tracks.remove(&identity);
+                    p.tracks.remove(&key);
                 });
             }
             RoomEvent::ParticipantAttributesChanged {
@@ -638,9 +680,7 @@ async fn handle_events(
                 talkers.remove(&identity);
                 heard.remove(&identity);
                 cx.cleaning.set_claim(&identity, Claim::None);
-                cx.with_players(|p| {
-                    p.tracks.remove(&identity);
-                });
+                cx.with_players(|p| p.forget(&identity));
                 cx.flags(|f| {
                     if let Some(s) = f.speaking.get_mut(&cx.key) {
                         s.remove(&identity);
@@ -665,7 +705,9 @@ async fn handle_events(
             RoomEvent::TrackMuted {
                 participant,
                 publication,
-            } if publication.kind() == TrackKind::Audio => {
+            } if publication.kind() == TrackKind::Audio
+                && Feed::of(publication.source()) == Feed::Voice =>
+            {
                 let identity = participant.identity().as_str().to_owned();
                 cx.flags(|f| {
                     f.muted.insert(identity);
@@ -674,7 +716,9 @@ async fn handle_events(
             RoomEvent::TrackUnmuted {
                 participant,
                 publication,
-            } if publication.kind() == TrackKind::Audio => {
+            } if publication.kind() == TrackKind::Audio
+                && Feed::of(publication.source()) == Feed::Voice =>
+            {
                 let identity = participant.identity().as_str().to_owned();
                 cx.flags(|f| {
                     f.muted.remove(&identity);
@@ -721,6 +765,14 @@ mod tests {
         assert_eq!(s[0], i16::MAX);
         assert_eq!(s[1], -i16::MAX);
         assert_eq!(s[2], i16::MAX / 2);
+    }
+
+    #[test]
+    fn only_screen_share_audio_is_a_share() {
+        assert_eq!(Feed::of(TrackSource::ScreenshareAudio), Feed::Share);
+        for source in [TrackSource::Microphone, TrackSource::Unknown] {
+            assert_eq!(Feed::of(source), Feed::Voice);
+        }
     }
 
     #[test]
