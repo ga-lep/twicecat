@@ -1686,6 +1686,13 @@ Phase 2 signed off by the human on 2026-10-02 (merge of PR #3). Every other unti
 - **Left:** the ~40 integration test binaries each link everything; one binary per crate (modules under `tests/`) would save most of the rest, but reorganises the tests and keeps the ones that need a process of their own (`tls_provider`, `log_hygiene`) apart. Not done.
 - **Checks:** a clean `cargo test --workspace --no-run` with the new flags; the gate was clean (1698 tests).
 
+## Phase 3 / `timeline_batches_under_16ms` failed on the x86 Linux CI runner (fixed 2026-10-13)
+
+- **Symptom:** PR #16's `test (ubuntu-26.04)` job failed: "1 reset of 10,000: median 16.245726ms is over 16ms". The other five jobs passed, and the branch does not touch `crates/app/src/timeline.rs`.
+- **Cause:** the runner is slow for this debug-build timing, not the code. Here the same reset takes a 4 to 5 ms median, also with the whole app suite squeezed onto 2 or 4 cores (`taskset`, `--test-threads`). Passing CI runs do not print the timing, so earlier margins there are unknown; Windows had already needed 50 ms (fd5aafb).
+- **Fix:** the 16 ms frame budget stays on developer machines; on Windows or wherever `CI` is set (GitHub Actions sets it) the bound is 50 ms, which still catches an order-of-magnitude regression.
+- **Checks:** the test passes with and without `CI=true`; the gate was clean (1698 tests).
+
 ## Phase 6 steps (calls: MatrixRTC, LiveKit SFU, native audio; plan docs/plans/phase6-calls.md)
 Order (revised 2026-10-02, plan decision 12; again 2026-10-03 by the human): 1–8, 8b, 9, 10, 11, 12, 14, 13, then 15 and 13b. Deferred options (audio-only libwebrtc build, pure-Rust WebRTC stack, PulseAudio backend) are recorded in the plan.
 - [x] 1. libwebrtc supply chain (pinned SHA-256 fetch script, fail-closed build) and livekit dependency (phase6.1)
