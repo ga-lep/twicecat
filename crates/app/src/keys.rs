@@ -13,7 +13,7 @@ use iced::Task;
 use twicecat_core::api::{RoomId, RoomSummary};
 
 use crate::calls::CallMessage;
-use crate::settings::SettingsMessage;
+use crate::settings::{SettingsMessage, Zoom};
 use crate::state::{App, Message, Screen};
 use crate::switcher::SwitcherMessage;
 use crate::threads::ThreadsMessage;
@@ -69,6 +69,12 @@ pub enum Shortcut {
     ToggleMute,
     /// Deafen or undeafen in a call.
     ToggleDeafen,
+    /// Make the text one step larger.
+    ZoomIn,
+    /// Make the text one step smaller.
+    ZoomOut,
+    /// Back to the normal text size.
+    ZoomReset,
 }
 
 /// The key of a trigger.
@@ -217,6 +223,33 @@ pub const SHORTCUTS: &[Binding] = &[
         Shortcut::ToggleDeafen,
     ),
     bound(
+        "Ctrl+=",
+        "Make the text larger",
+        KeySpec::Char('='),
+        true,
+        false,
+        false,
+        Shortcut::ZoomIn,
+    ),
+    bound(
+        "Ctrl+-",
+        "Make the text smaller",
+        KeySpec::Char('-'),
+        true,
+        false,
+        false,
+        Shortcut::ZoomOut,
+    ),
+    bound(
+        "Ctrl+0",
+        "Reset the text size",
+        KeySpec::Char('0'),
+        true,
+        false,
+        false,
+        Shortcut::ZoomReset,
+    ),
+    bound(
         "Tab",
         "Move to the next field",
         KeySpec::Named(Named::Tab),
@@ -341,6 +374,9 @@ pub const fn composer_takes(shortcut: Shortcut) -> bool {
             | Shortcut::PreviousUnread
             | Shortcut::ToggleMute
             | Shortcut::ToggleDeafen
+            | Shortcut::ZoomIn
+            | Shortcut::ZoomOut
+            | Shortcut::ZoomReset
     )
 }
 
@@ -449,6 +485,11 @@ impl App {
                 if self.screen != Screen::Main || self.calls.call.is_none() =>
             {
                 Task::none()
+            }
+            Shortcut::ZoomIn => self.update(Message::Settings(SettingsMessage::Zoom(Zoom::In))),
+            Shortcut::ZoomOut => self.update(Message::Settings(SettingsMessage::Zoom(Zoom::Out))),
+            Shortcut::ZoomReset => {
+                self.update(Message::Settings(SettingsMessage::Zoom(Zoom::Reset)))
             }
             Shortcut::ToggleMute => self.update(Message::Call(CallMessage::ToggleMute)),
             Shortcut::ToggleDeafen => self.update(Message::Call(CallMessage::ToggleDeafen)),

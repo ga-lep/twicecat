@@ -8,18 +8,22 @@
 //! `App::update`.
 
 use iced::widget::{
-    Column, button, checkbox, column, container, pick_list, radio, row, scrollable, space, stack,
-    text, text_input,
+    Column, Row, button, checkbox, column, container, pick_list, radio, row, scrollable, space,
+    stack, text, text_input,
 };
-use iced::{Element, Fill};
+use iced::{Background, Border, Element, Fill};
 use twicecat_core::api::ThemeChoice;
 
 use crate::settings::{
-    DRAG_AND_DROP_NOTE, DefaultChoice, KEYWORD_INPUT_ID, NAME_INPUT_ID, SettingsMessage,
-    VOICE_AUDIO_LINE,
+    DEFAULT_TEXT_SCALE, DRAG_AND_DROP_NOTE, DefaultChoice, DensityOption, KEYWORD_INPUT_ID,
+    MAX_TEXT_SCALE, MIN_TEXT_SCALE, NAME_INPUT_ID, RoomListOption, SettingsMessage,
+    VOICE_AUDIO_LINE, Zoom,
 };
 use crate::state::{App, Message};
-use crate::ui::kit::{modal, muted};
+use crate::theme::{self, Family};
+use crate::ui::icons::{Icon, icon};
+use crate::ui::kit::{modal, muted, secondary_button};
+use crate::ui::tokens;
 
 /// Width of the card.
 const CARD_WIDTH: f32 = 640.0;
@@ -199,14 +203,121 @@ fn appearance_section(app: &App) -> Element<'_, Message> {
     let choice = |label: &'static str, value: ThemeChoice| {
         radio(label, value, current, |c| msg(SettingsMessage::Theme(c)))
     };
+    let dark = app.current_theme().extended_palette().is_dark;
+    let chosen = theme::resolve_family(app.ui_settings.palette);
+    let mut swatches = Row::new().spacing(tokens::S);
+    for family in Family::ALL {
+        swatches = swatches.push(swatch(family, dark, family == chosen));
+    }
+    let on_default = app.ui_settings.palette.is_none();
+    let scale = app.ui_settings.text_scale_percent;
+    let zoom = row![
+        text("Text size").width(Fill),
+        secondary_button(
+            "Smaller",
+            (scale > MIN_TEXT_SCALE).then(|| msg(SettingsMessage::Zoom(Zoom::Out))),
+        ),
+        text(format!("{scale}%")).width(48).align_x(iced::Center),
+        secondary_button(
+            "Larger",
+            (scale < MAX_TEXT_SCALE).then(|| msg(SettingsMessage::Zoom(Zoom::In))),
+        ),
+        secondary_button(
+            "Reset",
+            (scale != DEFAULT_TEXT_SCALE).then(|| msg(SettingsMessage::Zoom(Zoom::Reset))),
+        ),
+    ]
+    .spacing(tokens::S)
+    .align_y(iced::Center);
     column![
         heading("Appearance"),
         choice("Follow the system", ThemeChoice::System),
         choice("Light", ThemeChoice::Light),
         choice("Dark", ThemeChoice::Dark),
+        text("Colours").size(14),
+        swatches,
+        secondary_button(
+            "Use the default",
+            (!on_default).then(|| msg(SettingsMessage::Palette(None))),
+        ),
+        row![
+            text("Density").width(Fill),
+            pick_list(
+                DensityOption::ALL,
+                Some(DensityOption(app.ui_settings.density)),
+                |o: DensityOption| msg(SettingsMessage::Density(o.0)),
+            ),
+        ]
+        .spacing(tokens::S)
+        .align_y(iced::Center),
+        row![
+            text("Room list").width(Fill),
+            pick_list(
+                RoomListOption::ALL,
+                Some(RoomListOption(app.ui_settings.room_list)),
+                |o: RoomListOption| msg(SettingsMessage::RoomList(o.0)),
+            ),
+        ]
+        .spacing(tokens::S)
+        .align_y(iced::Center),
+        zoom,
+        note("Ctrl+= and Ctrl+- change the text size, Ctrl+0 resets it."),
     ]
     .spacing(6)
     .into()
+}
+
+/// One colour set as a button: samples of its accent, surface and text, the
+/// name, and a check and an outline when it is the one in use.
+fn swatch<'a>(family: Family, dark: bool, selected: bool) -> Element<'a, Message> {
+    let colours = theme::palette(family, dark);
+    let sem = theme::semantic_of(family, dark);
+    let sample = move |color: iced::Color| {
+        container(space().width(18).height(18)).style(move |_: &iced::Theme| container::Style {
+            background: Some(Background::Color(color)),
+            border: Border {
+                color: sem.border,
+                width: 1.0,
+                radius: tokens::SMALL.into(),
+            },
+            ..container::Style::default()
+        })
+    };
+    let name = if family == theme::DEFAULT_FAMILY {
+        format!("{} (default)", family.label())
+    } else {
+        family.label().to_owned()
+    };
+    let mut title = Row::new().spacing(tokens::XS).align_y(iced::Center);
+    if selected {
+        title = title.push(icon::<Message>(Icon::Check));
+    }
+    title = title.push(text(name).size(tokens::CAPTION));
+    let samples = row![
+        sample(colours.primary),
+        sample(sem.surface),
+        sample(colours.text)
+    ]
+    .spacing(tokens::XS);
+    button(column![samples, title].spacing(tokens::XS))
+        .padding(tokens::S)
+        .on_press(msg(SettingsMessage::Palette(Some(family.choice()))))
+        .style(move |theme: &iced::Theme, status| {
+            let mut style = button::secondary(theme, status);
+            style.background = Some(Background::Color(colours.background));
+            style.text_color = colours.text;
+            style.border = Border {
+                color: if selected {
+                    theme.palette().primary
+                } else {
+                    sem.border
+                },
+                width: if selected { 3.0 } else { 1.0 },
+                radius: tokens::MEDIUM.into(),
+            };
+            style
+        })
+        .into()
 }
 
 fn shortcuts_section<'a>() -> Element<'a, Message> {

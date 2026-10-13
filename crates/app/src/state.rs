@@ -733,7 +733,11 @@ impl App {
 
     /// The theme the window uses: the user's override, else the system's.
     pub fn current_theme(&self) -> Theme {
-        crate::theme::theme_for_choice(self.theme_mode, self.ui_settings.theme)
+        crate::theme::theme_for_choice(
+            self.theme_mode,
+            self.ui_settings.theme,
+            crate::theme::resolve_family(self.ui_settings.palette),
+        )
     }
 
     /// Replaces the desktop notification service (tests use a fake).
@@ -2783,14 +2787,16 @@ mod tests {
     fn theme_follows_the_mode() {
         let (mut app, _rx) = app_with(8);
         let name = |app: &App| app.theme().expect("always themed").to_string();
-        assert_eq!(name(&app), crate::theme::LIGHT_NAME);
+        let light = crate::theme::theme_for(theme::Mode::Light).to_string();
+        let dark = crate::theme::theme_for(theme::Mode::Dark).to_string();
+        assert_eq!(name(&app), light);
         let _ = app.update(Message::ThemeMode(theme::Mode::Dark));
-        assert_eq!(name(&app), crate::theme::DARK_NAME);
+        assert_eq!(name(&app), dark);
         assert!(app.theme().expect("themed").extended_palette().is_dark);
         let _ = app.update(Message::ThemeMode(theme::Mode::Light));
-        assert_eq!(name(&app), crate::theme::LIGHT_NAME);
+        assert_eq!(name(&app), light);
         let _ = app.update(Message::ThemeMode(theme::Mode::None));
-        assert_eq!(name(&app), crate::theme::LIGHT_NAME);
+        assert_eq!(name(&app), light);
     }
 
     // ---- Task 9: screens ----
@@ -10686,6 +10692,122 @@ mod tests {
             assert!(!dark(&rig.app));
             st(&mut rig, S::Theme(ThemeChoice::System));
             assert!(dark(&rig.app));
+        }
+
+        #[test]
+        fn the_colour_set_applies_at_once_is_saved_and_can_go_back_to_the_default() {
+            use twicecat_core::api::PaletteChoice;
+            let mut rig = rig();
+            let name = |app: &App| app.theme().expect("a theme").to_string();
+            let default_name = name(&rig.app);
+            st(&mut rig, S::Palette(Some(PaletteChoice::Frost)));
+            st(&mut rig, S::Palette(Some(PaletteChoice::Frost)));
+            assert!(name(&rig.app).starts_with("Frost"), "{}", name(&rig.app));
+            assert_eq!(writes(&rig).len(), 1, "an unchanged pick writes nothing");
+            assert_eq!(rig.app.ui_settings.palette, Some(PaletteChoice::Frost));
+            st(&mut rig, S::Palette(None));
+            assert_eq!(name(&rig.app), default_name);
+            let saved = writes(&rig);
+            assert_eq!(saved.len(), 2);
+            assert_eq!(saved[1].palette, None);
+        }
+
+        #[test]
+        fn the_appearance_section_builds_for_every_set_and_mode() {
+            use twicecat_core::api::PaletteChoice;
+            let mut rig = rig();
+            open(&mut rig);
+            for choice in [
+                None,
+                Some(PaletteChoice::Twicecat),
+                Some(PaletteChoice::Frost),
+                Some(PaletteChoice::Ember),
+                Some(PaletteChoice::HighContrast),
+            ] {
+                for theme in [ThemeChoice::Light, ThemeChoice::Dark] {
+                    st(&mut rig, S::Palette(choice));
+                    st(&mut rig, S::Theme(theme));
+                    let _ = rig.app.view();
+                }
+            }
+        }
+
+        #[test]
+        fn density_and_room_list_are_saved_once_per_change() {
+            use twicecat_core::api::{DensityChoice, RoomListChoice};
+            let mut rig = rig();
+            st(&mut rig, S::Density(DensityChoice::Compact));
+            st(&mut rig, S::Density(DensityChoice::Compact));
+            st(&mut rig, S::RoomList(RoomListChoice::Rail));
+            st(&mut rig, S::RoomList(RoomListChoice::Rail));
+            let saved = writes(&rig);
+            assert_eq!(saved.len(), 2, "{saved:?}");
+            assert_eq!(saved[1].density, DensityChoice::Compact);
+            assert_eq!(saved[1].room_list, RoomListChoice::Rail);
+        }
+
+        #[test]
+        fn a_density_switch_drops_measured_heights_but_keeps_the_place() {
+            use twicecat_core::api::DensityChoice;
+            let mut rig = rig();
+            rig.app.timeline.measured.insert("a".to_owned(), 40.0);
+            rig.app.timeline.offset_from_bottom = 120.0;
+            st(&mut rig, S::Density(DensityChoice::Compact));
+            assert!(rig.app.timeline.measured.is_empty());
+            assert_eq!(rig.app.timeline.offset_from_bottom, 120.0);
+            // Another setting keeps what was measured.
+            rig.app.timeline.measured.insert("a".to_owned(), 40.0);
+            st(&mut rig, S::TrayBadge(false));
+            assert_eq!(rig.app.timeline.measured.len(), 1);
+        }
+
+        #[test]
+        fn zoom_steps_by_ten_within_80_and_200_and_resets() {
+            use crate::settings::Zoom;
+            let mut rig = rig();
+            let scale = |rig: &Rig| rig.app.scale_factor();
+            assert_eq!(scale(&rig), 1.0);
+            st(&mut rig, S::Zoom(Zoom::In));
+            assert_eq!(rig.app.ui_settings.text_scale_percent, 110);
+            assert!((scale(&rig) - 1.1).abs() < 1e-6);
+            for _ in 0..20 {
+                st(&mut rig, S::Zoom(Zoom::In));
+            }
+            assert_eq!(rig.app.ui_settings.text_scale_percent, 200);
+            let writes_at_max = writes(&rig).len();
+            st(&mut rig, S::Zoom(Zoom::In));
+            assert_eq!(writes(&rig).len(), writes_at_max, "no write at the limit");
+            for _ in 0..20 {
+                st(&mut rig, S::Zoom(Zoom::Out));
+            }
+            assert_eq!(rig.app.ui_settings.text_scale_percent, 80);
+            assert!((scale(&rig) - 0.8).abs() < 1e-6);
+            st(&mut rig, S::Zoom(Zoom::Reset));
+            assert_eq!(rig.app.ui_settings.text_scale_percent, 100);
+            assert_eq!(scale(&rig), 1.0);
+        }
+
+        #[test]
+        fn the_zoom_keys_work_but_not_while_a_push_to_talk_key_is_awaited() {
+            use crate::keys::Shortcut;
+            let mut rig = rig();
+            let key = |rig: &mut Rig, shortcut| {
+                let _ = rig.app.update(Message::Shortcut {
+                    shortcut,
+                    captured: false,
+                });
+            };
+            key(&mut rig, Shortcut::ZoomIn);
+            assert_eq!(rig.app.ui_settings.text_scale_percent, 110);
+            key(&mut rig, Shortcut::ZoomOut);
+            key(&mut rig, Shortcut::ZoomOut);
+            assert_eq!(rig.app.ui_settings.text_scale_percent, 90);
+            key(&mut rig, Shortcut::ZoomReset);
+            assert_eq!(rig.app.ui_settings.text_scale_percent, 100);
+            rig.app.audio_ui.capturing = true;
+            key(&mut rig, Shortcut::ZoomIn);
+            key(&mut rig, Shortcut::ZoomOut);
+            assert_eq!(rig.app.ui_settings.text_scale_percent, 100);
         }
 
         #[test]
