@@ -77,11 +77,15 @@ pub enum Icon {
     Gamepad,
     /// A small status dot.
     Dot,
+    /// The home view, with no space chosen.
+    Home,
+    /// The members of a room.
+    Members,
 }
 
 impl Icon {
     /// Every icon, in declaration order.
-    pub const ALL: [Self; 33] = [
+    pub const ALL: [Self; 35] = [
         Self::Lock,
         Self::Call,
         Self::Speaker,
@@ -115,6 +119,8 @@ impl Icon {
         Self::Keyboard,
         Self::Gamepad,
         Self::Dot,
+        Self::Home,
+        Self::Members,
     ];
 
     /// The Unicode text that draws the icon today.
@@ -153,6 +159,8 @@ impl Icon {
             Self::Keyboard => "\u{2328}",
             Self::Gamepad => "\u{1F3AE}",
             Self::Dot => "\u{25CF}",
+            Self::Home => "\u{2302}",
+            Self::Members => "\u{1F464}",
         }
     }
 
@@ -192,6 +200,8 @@ impl Icon {
             Self::Keyboard => "Keyboard",
             Self::Gamepad => "Gamepad",
             Self::Dot => "Status",
+            Self::Home => "Home",
+            Self::Members => "Members",
         }
     }
 }
@@ -258,7 +268,9 @@ mod tests {
             assert!(!icon.label().trim().is_empty(), "{icon:?}");
             assert!(seen.insert(icon.glyph()), "{icon:?} repeats a glyph");
         }
-        assert_eq!(Icon::ALL.len(), 33);
+        assert_eq!(Icon::ALL.len(), 35);
+        assert_eq!(Icon::Home.label(), "Home");
+        assert_eq!(Icon::Members.label(), "Members");
     }
 
     #[test]
