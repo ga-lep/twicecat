@@ -160,6 +160,16 @@ impl Bridge {
             .map(Pending::into_task)
     }
 
+    /// A clone of the core's command channel.
+    pub fn command_sender(&self) -> mpsc::Sender<Command> {
+        self.commands.clone()
+    }
+
+    /// The core's runtime.
+    pub fn runtime(&self) -> Handle {
+        self.handle.clone()
+    }
+
     /// A task that yields [`Message::ShutdownDeadline`] after `after`. The
     /// timer runs on the core's runtime.
     pub fn deadline(&self, after: Duration) -> Task<Message> {

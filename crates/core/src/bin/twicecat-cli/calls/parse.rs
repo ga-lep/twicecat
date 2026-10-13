@@ -73,8 +73,9 @@ pub(crate) enum GateArg {
     Auto,
     /// Voice activity above this level, dBFS.
     Threshold(f32),
-    /// Push-to-talk with this release tail, ms (`None` keeps the current).
-    Ptt(Option<u32>),
+    /// Push-to-talk, or with `toggle` toggle-to-talk, with this release
+    /// tail, ms (`None` keeps the current).
+    Ptt { release: Option<u32>, toggle: bool },
 }
 
 /// Parses `/name arg` if it is a call or audio command: `None` when it is
@@ -183,12 +184,14 @@ fn noise_suppression(arg: &str) -> Result<NoiseSuppression, &'static str> {
 }
 
 fn gate(arg: &str) -> Result<GateArg, &'static str> {
-    const USAGE: &str = "/gate auto|<threshold dB>|ptt [release ms]";
+    const USAGE: &str = "/gate auto|<threshold dB>|ptt|toggle [release ms]";
     let mut words = arg.split_whitespace();
     let gate = match (words.next(), words.next()) {
         (Some("auto"), None) => GateArg::Auto,
-        (Some("ptt"), None) => GateArg::Ptt(None),
-        (Some("ptt"), Some(ms)) => GateArg::Ptt(Some(ms.parse().map_err(|_| USAGE)?)),
+        (Some(mode @ ("ptt" | "toggle")), ms) => GateArg::Ptt {
+            release: ms.map(str::parse).transpose().map_err(|_| USAGE)?,
+            toggle: mode == "toggle",
+        },
         (Some(db), None) => GateArg::Threshold(
             db.parse::<f32>()
                 .ok()
@@ -316,7 +319,17 @@ mod tests {
         );
         assert_eq!(
             cmd("/gate ptt 300"),
-            Ok(CallCmd::Gate(GateArg::Ptt(Some(300))))
+            Ok(CallCmd::Gate(GateArg::Ptt {
+                release: Some(300),
+                toggle: false
+            }))
+        );
+        assert_eq!(
+            cmd("/gate toggle"),
+            Ok(CallCmd::Gate(GateArg::Ptt {
+                release: None,
+                toggle: true
+            }))
         );
         assert_eq!(
             cmd("/vol 1 150%"),
@@ -375,6 +388,7 @@ mod tests {
             "/ns off please",
             "/gate NaN",
             "/gate ptt soon",
+            "/gate toggle 1 2",
             "/vol 1",
             "/vol 1 -5",
             "/mictest twice",

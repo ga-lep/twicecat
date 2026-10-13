@@ -21,14 +21,15 @@ mod merge;
 #[cfg(target_os = "linux")]
 mod portal;
 
-pub use binding::{BindingError, GamepadButton, KeyBinding};
+pub use binding::{BindingError, GamepadButton, Held, KeyBinding};
 pub use merge::Source;
 
 use merge::Merger;
 
-/// The app ID the portal knows us by (as the keychain service).
-#[cfg(target_os = "linux")]
-const APP_ID: &str = "io.github.ga_lep.Twicecat";
+/// The app ID the portal knows us by (as the keychain service). The
+/// desktop entry `packaging/linux/io.github.ga_lep.Twicecat.desktop` and the
+/// window's Wayland app ID use it too.
+pub const APP_ID: &str = "io.github.ga_lep.Twicecat";
 
 /// What the service reports.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -90,7 +91,7 @@ impl KeyboardBackend {
 }
 
 /// What to listen to.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PttConfig {
     /// The global keyboard shortcut, if any.
     pub key: Option<KeyBinding>,

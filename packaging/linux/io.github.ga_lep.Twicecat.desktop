@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Twicecat
+GenericName=Matrix Client
+Comment=Encrypted chat and voice calls on Matrix
+Exec=twicecat
+Terminal=false
+Categories=Network;InstantMessaging;Chat;
+Keywords=Matrix;Chat;Voice;Call;Push-to-talk;
+StartupNotify=true
+StartupWMClass=io.github.ga_lep.Twicecat

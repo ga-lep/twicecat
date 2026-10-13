@@ -32,6 +32,7 @@ use crate::keys;
 use crate::links::{self, LinkBar};
 use crate::media::{self, Decoded, MediaModel, SavePath};
 use crate::notifications::{self, Folding, ModeChoice, NoNotifier, Notifier};
+use crate::ptt::{PttMessage, PttModel, PttStarter, ServiceStarter};
 use crate::rich_text::{LinkTarget, MAX_REVEALED, Revealed};
 use crate::room_list;
 use crate::rooms::{RoomsMessage, RoomsModel};
@@ -113,6 +114,13 @@ pub trait CommandSink: Send {
 
     /// A task that yields `message` after `after`.
     fn timer(&self, after: Duration, message: Message) -> Task<Message>;
+
+    /// The core's command channel, for push-to-talk's forwarding thread,
+    /// which sends outside `update`.
+    fn command_sender(&self) -> Option<mpsc::Sender<Command>>;
+
+    /// The core's runtime, where the shortcuts portal runs.
+    fn runtime(&self) -> Option<tokio::runtime::Handle>;
 }
 
 impl CommandSink for Bridge {
@@ -126,6 +134,14 @@ impl CommandSink for Bridge {
 
     fn timer(&self, after: Duration, message: Message) -> Task<Message> {
         Bridge::timer(self, after, message)
+    }
+
+    fn command_sender(&self) -> Option<mpsc::Sender<Command>> {
+        Some(Bridge::command_sender(self))
+    }
+
+    fn runtime(&self) -> Option<tokio::runtime::Handle> {
+        Some(Bridge::runtime(self))
     }
 }
 
@@ -144,6 +160,15 @@ impl CommandSink for mpsc::Sender<Command> {
     /// Likewise: tests call the timer's handler themselves.
     fn timer(&self, _after: Duration, _message: Message) -> Task<Message> {
         Task::none()
+    }
+
+    fn command_sender(&self) -> Option<mpsc::Sender<Command>> {
+        Some(self.clone())
+    }
+
+    /// Tests start no real service.
+    fn runtime(&self) -> Option<tokio::runtime::Handle> {
+        None
     }
 }
 
@@ -387,6 +412,8 @@ pub enum Message {
     Settings(SettingsMessage),
     /// A control of the Voice & audio card.
     Audio(crate::audio_settings::AudioMessage),
+    /// Push-to-talk: the service's state, and keys in the window.
+    Ptt(PttMessage),
     /// A button of the spaces sidebar.
     Spaces(SpacesMessage),
     /// A thread summary row or a control of the thread panel.
@@ -541,6 +568,8 @@ pub struct App {
     pub calls: CallModel,
     /// The Voice & audio card.
     pub audio_ui: crate::audio_settings::AudioUi,
+    /// Push-to-talk: the service while it is needed, and what it reports.
+    pub ptt: PttModel,
     /// Set when the app decided to exit (the task itself is opaque to tests).
     pub exit_requested: bool,
     /// Clipboard reads sent by `drop_secrets` whose answer is still due.
@@ -576,6 +605,7 @@ impl std::fmt::Debug for App {
             .field("sessions", &self.sessions)
             .field("calls", &self.calls)
             .field("audio_ui", &self.audio_ui.open)
+            .field("ptt", &self.ptt)
             .finish_non_exhaustive()
     }
 }
@@ -648,6 +678,8 @@ impl App {
             sessions: SessionsModel::default(),
             calls: CallModel::default(),
             audio_ui: crate::audio_settings::AudioUi::default(),
+            // Inert until `booter` installs the real service.
+            ptt: PttModel::default(),
             exit_requested: false,
             flushes_pending: 0,
             core_closed: false,
@@ -679,6 +711,12 @@ impl App {
             app.set_settings_store(Box::new(store.clone()));
             app.set_notifier(Box::new(notifications::SystemNotifier));
             app.set_tray_factory(Box::new(SystemTrayFactory));
+            if let Some(runtime) = app.sink.runtime() {
+                app.set_ptt_starter(
+                    Box::new(ServiceStarter(runtime)),
+                    twicecat_ptt::KeyboardBackend::detect(),
+                );
+            }
             (app, task)
         }
     }
@@ -701,6 +739,37 @@ impl App {
     /// Replaces the desktop notification service (tests use a fake).
     pub fn set_notifier(&mut self, notifier: Box<dyn Notifier>) {
         self.notifier = notifier;
+    }
+
+    /// Installs what starts push-to-talk (tests use a fake) for a session
+    /// with `keyboard`. A running service is stopped.
+    pub fn set_ptt_starter(
+        &mut self,
+        starter: Box<dyn PttStarter>,
+        keyboard: twicecat_ptt::KeyboardBackend,
+    ) {
+        self.ptt.set_starter(starter, keyboard);
+    }
+
+    /// Runs push-to-talk while it is needed (plan Q1): in push-to-talk or
+    /// toggle mode, during a call, the mic test, or with the Voice & audio
+    /// card open. Called after every message, from `update`, so the service
+    /// is started and dropped on the main thread.
+    fn sync_ptt(&mut self) {
+        let in_call = self.calls.call.is_some();
+        let mic_test = self.audio_ui.mic_test.is_some();
+        let needed = self.screen == Screen::Main && (in_call || mic_test || self.audio_ui.open);
+        let wanted = if needed {
+            self.calls
+                .settings
+                .as_ref()
+                .and_then(|s| crate::ptt::setup_for(s, self.ptt.keyboard()))
+        } else {
+            None
+        };
+        let sink = &self.sink;
+        self.ptt
+            .sync(wanted, (in_call, mic_test), || sink.command_sender());
     }
 
     /// Replaces the tray factory (tests use a fake). Only before the tray is
@@ -871,6 +940,7 @@ impl App {
                 | Message::PasteFallback(_)
         );
         let task = self.update_inner(message);
+        self.sync_ptt();
         if touches_composer && self.selected.is_some() {
             self.draft_dirty = true;
             self.draft_seq = self.draft_seq.wrapping_add(1);
@@ -1004,6 +1074,10 @@ impl App {
             Message::Tray(TrayAction::Quit) => self.update_inner(Message::CloseRequested),
             Message::WindowFocus(focused) => {
                 self.window_focused = focused;
+                if !focused {
+                    self.ptt.window_unfocused();
+                    self.stop_capture();
+                }
                 // A second chance to create the tray, should the first
                 // window event not have reached the app.
                 self.ensure_tray();
@@ -1120,6 +1194,18 @@ impl App {
             Message::Settings(message) => self.on_settings(message),
             Message::Call(message) => self.on_call(message),
             Message::Audio(message) => self.on_audio(message),
+            Message::Ptt(PttMessage::Update(update)) => {
+                self.ptt.update(update);
+                Task::none()
+            }
+            Message::Ptt(PttMessage::WindowKey(key)) => {
+                // While the card waits for a new key, the old one does not
+                // press; its release still lets go.
+                if !self.audio_ui.capturing || !key.pressed {
+                    self.ptt.window_key(key);
+                }
+                Task::none()
+            }
             Message::Spaces(SpacesMessage::Select(space)) => self.select_space(space),
             Message::Threads(message) => self.on_threads(message),
             Message::Shortcut { shortcut, captured } => self.on_shortcut(shortcut, captured),
@@ -2518,16 +2604,32 @@ impl App {
         Subscription::batch([
             bridge::events_subscription(self.events.clone()),
             window::close_requests().map(|_| Message::CloseRequested),
-            iced::event::listen_with(|event, status, _id| match event {
-                iced::Event::Window(window::Event::Focused) => Some(Message::WindowFocus(true)),
-                iced::Event::Window(window::Event::Unfocused) => Some(Message::WindowFocus(false)),
-                other => upload::event_message(&other).or_else(|| {
-                    keys::event_message(&other, status == iced::event::Status::Captured)
-                }),
-            }),
+            // While the Voice & audio card waits for the push-to-talk key,
+            // keys go to it and no shortcut (Esc included) is made of them:
+            // one listener, so the two never race.
+            if self.audio_ui.capturing {
+                iced::event::listen_with(|event, _status, _id| match event {
+                    iced::Event::Window(window::Event::Focused) => Some(Message::WindowFocus(true)),
+                    iced::Event::Window(window::Event::Unfocused) => {
+                        Some(Message::WindowFocus(false))
+                    }
+                    other => crate::audio_settings::capture_message(&other),
+                })
+            } else {
+                iced::event::listen_with(|event, status, _id| match event {
+                    iced::Event::Window(window::Event::Focused) => Some(Message::WindowFocus(true)),
+                    iced::Event::Window(window::Event::Unfocused) => {
+                        Some(Message::WindowFocus(false))
+                    }
+                    other => upload::event_message(&other).or_else(|| {
+                        keys::event_message(&other, status == iced::event::Status::Captured)
+                    }),
+                })
+            },
             system::theme_changes().map(Message::ThemeMode),
             window::open_events().map(Message::WindowOpened),
             tray::subscription(),
+            self.ptt.subscription(),
         ])
     }
 

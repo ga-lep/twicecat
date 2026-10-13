@@ -419,6 +419,10 @@ impl App {
             suggestions_open: self.composer.suggestions.is_open(),
         };
         let spent = std::mem::take(&mut self.escape_spent);
+        // The Voice & audio card is waiting for the push-to-talk key.
+        if self.audio_ui.capturing {
+            return Task::none();
+        }
         if !accepts(shortcut, context) {
             return Task::none();
         }

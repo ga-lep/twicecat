@@ -1,0 +1,8 @@
+Plan: drafted 2026-10-13 for ga-lep/twicecat#15; questions Q1-Q6 answered and plan approved by the human 2026-10-13 (Q2: both push-to-talk and toggle-to-talk, chosen in the GUI; saved in the core's input mode)
+Task 1: complete (toggle-to-talk in InputMode::PushToTalk, /gate toggle in the CLI)
+Task 2: complete (ptt model, forwarding thread, window key, dependency check)
+Task 3: complete (crates/app/tests/ptt.rs: release tail with the real core and virtual audio; 10 runs clean; mutation caught)
+Task 4: complete (Talking section: mode, level, key capture, gamepad menu, release delay, sources; call bar line; Settings line)
+Task 5: complete (desktop entry, window app ID, docs/building.md)
+Review: an independent read-only review of main..HEAD found 3 defects and 1 likely race, all fixed and folded into their commits (--fixup, rebase --autosquash: clean, final tree identical, app lib tests run again on the rewritten commits): the update stream taken at boot was empty (high), a release while waiting for a new key was dropped (medium), the ptt tree check matched whole names only (low), a stopped service's late event could toggle on (race)
+Task 6: complete (wrap-up; gate ok: 1730 passed)

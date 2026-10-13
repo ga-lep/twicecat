@@ -19,6 +19,7 @@ use crate::screens::room_list_pane::LOCK_MARK;
 use crate::state::{App, Message};
 use crate::theme;
 use crate::verification::elide_middle;
+use twicecat_core::api::InputMode;
 
 /// Width of the ring drawn around a speaking person's picture.
 const SPEAKING_RING: f32 = 2.0;
@@ -128,6 +129,29 @@ pub fn ring_layer<'a>(base: Element<'a, Message>, app: &'a App) -> Element<'a, M
 }
 
 /// The call bar, or an empty slot without a call or a notice.
+/// The call bar's push-to-talk line, and whether it says "talking": only in
+/// push-to-talk or toggle-to-talk.
+pub fn talk_line(app: &App) -> Option<(String, bool)> {
+    let settings = app.calls.settings.as_ref()?;
+    let InputMode::PushToTalk { toggle, .. } = settings.input_mode else {
+        return None;
+    };
+    if app.ptt.talking {
+        return Some(("Talking".to_owned(), true));
+    }
+    let bindings = &settings.push_to_talk;
+    let verb = if toggle { "press" } else { "hold" };
+    let line = match (bindings.key.as_deref(), bindings.gamepad_button.is_some()) {
+        (Some(key), _) => format!(
+            "Not talking: {verb} {}",
+            crate::audio_settings::key_label(key)
+        ),
+        (None, true) => format!("Not talking: {verb} the gamepad button"),
+        (None, false) => "Not talking: no key or button is set (Audio\u{2026})".to_owned(),
+    };
+    Some((line, false))
+}
+
 pub fn bar(app: &App) -> Element<'_, Message> {
     let calls = &app.calls;
     let mut lines: Vec<Element<'_, Message>> = Vec::new();
@@ -169,6 +193,20 @@ pub fn bar(app: &App) -> Element<'_, Message> {
         );
         if let Some(line) = declined_line(current) {
             lines.push(text(line).size(12).style(muted_style).into());
+        }
+        if let Some((line, talking)) = talk_line(app) {
+            lines.push(
+                text(line)
+                    .size(12)
+                    .style(move |t: &iced::Theme| {
+                        if talking {
+                            text::primary(t)
+                        } else {
+                            muted_style(t)
+                        }
+                    })
+                    .into(),
+            );
         }
         let (mute, deafen) = mute_labels(current.muted, current.deafened);
         let control = |label: &'static str, message: CallMessage, active: bool| {
