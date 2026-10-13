@@ -728,6 +728,22 @@ fn main_dm() -> App {
     app
 }
 
+/// The direct message of `main-dm` with `peer` as the other person and
+/// `trust` as the core's word on them.
+#[allow(dead_code)] // each integration test uses its own part of the fixture
+pub fn dm_with_peer(peer: &str, trust: UserTrust) -> App {
+    let mut app = main_no_room();
+    let id = UserId::from(peer.to_owned());
+    for summary in &mut app.rooms {
+        if summary.id == room("alice") {
+            summary.dm_peer = Some(id.clone());
+        }
+    }
+    press(&mut app, Message::SelectRoom(room("alice")));
+    feed(&mut app, CoreEvent::UserTrust { user_id: id, trust });
+    app
+}
+
 fn main_invite() -> App {
     let mut app = main_no_room();
     press(&mut app, Message::SelectRoom(room("book-club")));

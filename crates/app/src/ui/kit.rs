@@ -6,6 +6,8 @@
 //! follow the theme, and the tests check their contrast in both palettes.
 
 use iced::widget::button::{Button, Status};
+use iced::widget::pick_list;
+use iced::widget::text::{IntoFragment, Wrapping};
 use iced::widget::tooltip::Position;
 use iced::widget::{Column, button, column, container, image, opaque, row, rule, text, tooltip};
 use iced::{Background, Border, Color, Element, Fill, Theme, border};
@@ -45,7 +47,8 @@ impl Severity {
         }
     }
 
-    fn color(self, theme: &Theme) -> Color {
+    /// The colour that stands for the severity: a banner's outline, a status dot.
+    pub fn color(self, theme: &Theme) -> Color {
         let palette = theme.palette();
         match self {
             Self::Info => palette.primary,
@@ -183,39 +186,54 @@ pub fn active_icon_style(theme: &Theme, status: Status) -> button::Style {
 
 // ---- buttons -------------------------------------------------------------
 
+/// A button's words stay on one line: a squeezed header clips them instead
+/// of wrapping, which would cut the second line off.
 fn labelled<'a, M: Clone + 'a>(
-    label: &'a str,
+    label: impl IntoFragment<'a>,
     on_press: Option<M>,
     style: fn(&Theme, Status) -> button::Style,
 ) -> Button<'a, M> {
-    button(text(label))
+    button(text(label).wrapping(Wrapping::None))
         .padding([tokens::S, tokens::M])
         .on_press_maybe(on_press)
         .style(style)
 }
 
 /// The main action of a screen; disabled when `on_press` is `None`.
-pub fn primary_button<'a, M: Clone + 'a>(label: &'a str, on_press: Option<M>) -> Button<'a, M> {
+pub fn primary_button<'a, M: Clone + 'a>(
+    label: impl IntoFragment<'a>,
+    on_press: Option<M>,
+) -> Button<'a, M> {
     labelled(label, on_press, primary_style)
 }
 
 /// A normal action; disabled when `on_press` is `None`.
-pub fn secondary_button<'a, M: Clone + 'a>(label: &'a str, on_press: Option<M>) -> Button<'a, M> {
+pub fn secondary_button<'a, M: Clone + 'a>(
+    label: impl IntoFragment<'a>,
+    on_press: Option<M>,
+) -> Button<'a, M> {
     labelled(label, on_press, secondary_style)
 }
 
 /// A quiet action; disabled when `on_press` is `None`.
-pub fn ghost_button<'a, M: Clone + 'a>(label: &'a str, on_press: Option<M>) -> Button<'a, M> {
+pub fn ghost_button<'a, M: Clone + 'a>(
+    label: impl IntoFragment<'a>,
+    on_press: Option<M>,
+) -> Button<'a, M> {
     labelled(label, on_press, ghost_style)
 }
 
 /// An action that cannot be undone; disabled when `on_press` is `None`.
-pub fn danger_button<'a, M: Clone + 'a>(label: &'a str, on_press: Option<M>) -> Button<'a, M> {
+pub fn danger_button<'a, M: Clone + 'a>(
+    label: impl IntoFragment<'a>,
+    on_press: Option<M>,
+) -> Button<'a, M> {
     labelled(label, on_press, danger_style)
 }
 
-fn with_tooltip<'a, M: Clone + 'a>(button: Button<'a, M>, label: &'a str) -> Element<'a, M> {
-    tooltip(button, text(label).size(tokens::CAPTION), Position::Bottom)
+/// `content` with `label` in a card that shows when it is pointed at.
+pub fn tip<'a, M: 'a>(content: impl Into<Element<'a, M>>, label: &'a str) -> Element<'a, M> {
+    tooltip(content, text(label).size(tokens::CAPTION), Position::Bottom)
         .gap(tokens::XS)
         .padding(tokens::S)
         .style(card_style)
@@ -229,24 +247,25 @@ pub fn icon_button<'a, M: Clone + 'a>(icon: Icon, on_press: M) -> Element<'a, M>
         .padding(tokens::S)
         .on_press(on_press)
         .style(icon_style);
-    with_tooltip(button, icon.label())
+    tip(button, icon.label())
 }
 
 /// An icon button with an on and an off state, such as mute or deafen. On
 /// shows by colour (selection fill and outline) and by glyph (a check after
-/// the icon), so it does not rely on colour alone.
+/// the icon), so it does not rely on colour alone. Its widget tree is the
+/// same in both states.
 pub fn toggle_icon_button<'a, M: Clone + 'a>(
     icon: Icon,
     active: bool,
     on_press: M,
 ) -> Element<'a, M> {
-    let content: Element<'a, M> = if active {
-        row![icons::icon(icon), icons::icon(Icon::Check)]
-            .spacing(tokens::XS)
-            .into()
-    } else {
-        icons::icon(icon)
-    };
+    // The check is always there, drawn clear while the toggle is off: the
+    // widget tree and the button's width do not change with the state.
+    let mark = container(icons::icon(Icon::Check)).style(move |_: &Theme| container::Style {
+        text_color: (!active).then_some(Color::TRANSPARENT),
+        ..container::Style::default()
+    });
+    let content: Element<'a, M> = row![icons::icon(icon), mark].spacing(tokens::XS).into();
     let button = button(content)
         .padding(tokens::S)
         .on_press(on_press)
@@ -255,7 +274,33 @@ pub fn toggle_icon_button<'a, M: Clone + 'a>(
         } else {
             icon_style
         });
-    with_tooltip(button, icon.label())
+    tip(button, icon.label())
+}
+
+/// A drop-down's closed box: the raised colour with the normal text colour
+/// for the choice and for a placeholder that names the account.
+pub fn menu_style(theme: &Theme, status: pick_list::Status) -> pick_list::Style {
+    let sem = theme::semantic(theme);
+    let text_color = theme.palette().text;
+    let hovered = matches!(
+        status,
+        pick_list::Status::Hovered | pick_list::Status::Opened { .. }
+    );
+    pick_list::Style {
+        text_color,
+        placeholder_color: text_color,
+        handle_color: text_color,
+        background: Background::Color(if hovered {
+            sem.selection
+        } else {
+            sem.surface_raised
+        }),
+        border: Border {
+            color: sem.border,
+            width: 1.0,
+            ..shape()
+        },
+    }
 }
 
 // ---- text ----------------------------------------------------------------
@@ -296,6 +341,22 @@ fn panel_style(theme: &Theme) -> container::Style {
     }
 }
 
+/// The spaces sidebar's background.
+pub fn sidebar_style(theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(theme::semantic(theme).sidebar)),
+        ..container::Style::default()
+    }
+}
+
+/// The background of a side panel, such as the thread panel.
+pub fn surface_style(theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(theme::semantic(theme).surface)),
+        ..container::Style::default()
+    }
+}
+
 fn backdrop_style(_theme: &Theme) -> container::Style {
     container::Style {
         background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.6))),
@@ -309,6 +370,30 @@ fn tag_style(theme: &Theme) -> container::Style {
         text_color: Some(theme.palette().text),
         border: border::rounded(tokens::SMALL),
         ..container::Style::default()
+    }
+}
+
+/// The style of a [`severity_tag`]: the severity's colour for the text (nudged
+/// toward black or white where the palette's colour is under 4.5:1) and a
+/// 1px outline, on the raised surface (the soft red for danger).
+pub fn severity_tag_style(severity: Severity) -> impl Fn(&Theme) -> container::Style {
+    move |theme| {
+        let sem = theme::semantic(theme);
+        let background = match severity {
+            Severity::Danger => sem.danger_soft,
+            _ => sem.surface_raised,
+        };
+        let color = severity.color(theme);
+        container::Style {
+            background: Some(Background::Color(background)),
+            text_color: Some(theme::readable_on(color, background)),
+            border: Border {
+                color,
+                width: 1.0,
+                radius: border::rounded(tokens::SMALL).radius,
+            },
+            ..container::Style::default()
+        }
     }
 }
 
@@ -380,6 +465,15 @@ pub fn tag<'a, M: 'a>(label: &'a str) -> Element<'a, M> {
         .into()
 }
 
+/// A [`tag`] whose colour says how serious it is, for the trust of a person.
+/// The words say the same, so the colour is never the only sign.
+pub fn severity_tag<'a, M: 'a>(severity: Severity, label: &'a str) -> Element<'a, M> {
+    container(text(label).size(tokens::CAPTION))
+        .padding([1.0, tokens::S])
+        .style(severity_tag_style(severity))
+        .into()
+}
+
 /// The text of a count badge: the number, or 99+ above 99.
 pub fn badge_text(count: u64) -> String {
     if count > 99 {
@@ -435,6 +529,18 @@ pub fn field<'a, M: 'a>(label: &'a str, input: impl Into<Element<'a, M>>) -> Ele
 /// A thin line across the available width.
 pub fn divider<'a, M: 'a>() -> Element<'a, M> {
     rule::horizontal(1)
+        .style(|theme: &Theme| rule::Style {
+            color: theme::semantic(theme).border,
+            radius: 0.0.into(),
+            fill_mode: rule::FillMode::Full,
+            snap: true,
+        })
+        .into()
+}
+
+/// A thin line down the available height, between two panes.
+pub fn vertical_divider<'a, M: 'a>() -> Element<'a, M> {
+    rule::vertical(1)
         .style(|theme: &Theme| rule::Style {
             color: theme::semantic(theme).border,
             radius: 0.0.into(),
@@ -607,6 +713,69 @@ mod tests {
         }
     }
 
+    fn all_themes() -> Vec<(String, Theme)> {
+        let mut out = Vec::new();
+        for family in crate::theme::Family::ALL {
+            for dark in [false, true] {
+                let name = format!("{} {}", family.label(), if dark { "dark" } else { "light" });
+                out.push((name, crate::theme::theme_for_family(family, dark)));
+            }
+        }
+        assert_eq!(out.len(), 8);
+        out
+    }
+
+    #[test]
+    fn a_severity_tag_is_readable_and_in_its_severity_colour_in_all_eight_palettes() {
+        for (name, theme) in all_themes() {
+            for severity in SEVERITIES {
+                let style = severity_tag_style(severity)(&theme);
+                let Some(Background::Color(bg)) = style.background else {
+                    panic!("{name} {severity:?}: no background");
+                };
+                let text = style.text_color.expect("the tag sets its text colour");
+                assert!(
+                    contrast(text, bg) >= 4.5,
+                    "{name} {severity:?}: text {} < 4.5",
+                    contrast(text, bg)
+                );
+                assert_eq!(style.border.width, 1.0, "{name} {severity:?}");
+                assert!(
+                    contrast(style.border.color, bg) >= 3.0,
+                    "{name} {severity:?}: border"
+                );
+            }
+            let danger = severity_tag_style(Severity::Danger)(&theme);
+            assert_eq!(
+                danger.text_color,
+                Some(crate::theme::readable_on(
+                    theme.palette().danger,
+                    crate::theme::semantic(&theme).danger_soft
+                )),
+                "{name}"
+            );
+            assert_eq!(danger.border.color, theme.palette().danger, "{name}");
+        }
+    }
+
+    #[test]
+    fn the_severity_colours_differ_so_trust_states_do_not_look_alike() {
+        for (name, theme) in all_themes() {
+            let styles: Vec<_> = [Severity::Success, Severity::Info, Severity::Danger]
+                .into_iter()
+                .map(|s| {
+                    let st = severity_tag_style(s)(&theme);
+                    (st.text_color, st.border.color)
+                })
+                .collect();
+            for (i, a) in styles.iter().enumerate() {
+                for b in &styles[i + 1..] {
+                    assert_ne!(a, b, "{name}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn severities_have_distinct_marks_and_the_banner_text_is_readable() {
         let marks: std::collections::HashSet<_> =
@@ -657,8 +826,56 @@ mod tests {
             divider(),
             speaking_ring(iced::widget::text("a"), true),
             page_nav(&["One", "Two"], 1, |_| Msg),
+            vertical_divider(),
+            tag("Voice"),
+            primary_button(String::from("Join call (3)"), Some(Msg)).into(),
         ];
-        assert_eq!(built.len(), 18);
+        assert_eq!(built.len(), 21);
+    }
+
+    #[test]
+    fn the_menu_box_is_readable_in_every_state() {
+        for (name, theme) in themes() {
+            for status in [
+                pick_list::Status::Active,
+                pick_list::Status::Hovered,
+                pick_list::Status::Opened { is_hovered: false },
+            ] {
+                let style = menu_style(&theme, status);
+                let Background::Color(bg) = style.background else {
+                    panic!("{name}: no background");
+                };
+                assert!(contrast(style.text_color, bg) >= 4.5, "{name} {status:?}");
+                assert!(
+                    contrast(style.placeholder_color, bg) >= 4.5,
+                    "{name} {status:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_pane_backgrounds_are_the_sidebar_and_surface_colours() {
+        for (name, theme) in themes() {
+            let sem = crate::theme::semantic(&theme);
+            assert_eq!(
+                sidebar_style(&theme).background,
+                Some(Background::Color(sem.sidebar)),
+                "{name}"
+            );
+            assert_eq!(
+                surface_style(&theme).background,
+                Some(Background::Color(sem.surface)),
+                "{name}"
+            );
+            for style in [sidebar_style(&theme), surface_style(&theme)] {
+                let Some(Background::Color(bg)) = style.background else {
+                    panic!("{name}: no background");
+                };
+                assert!(contrast(theme.palette().text, bg) >= 4.5, "{name}");
+                assert!(contrast(sem.muted, bg) >= 4.5, "{name} muted");
+            }
+        }
     }
 
     #[test]

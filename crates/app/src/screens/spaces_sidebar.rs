@@ -6,7 +6,7 @@
 //! the widget tree. A space only filters the room list; the sidebar says
 //! nothing about who may see or join a room.
 
-use iced::widget::{Column, button, container, image, scrollable, space, text, tooltip};
+use iced::widget::{Column, button, container, image, row, scrollable, space, text, tooltip};
 use iced::{Background, Color, Element, border};
 use twicecat_core::api::{RoomId, SpaceView};
 
@@ -15,6 +15,9 @@ use crate::spaces::{Entry, SpacesMessage};
 use crate::state::{App, Message};
 use crate::text_safety::{MAX_NAME_CHARS, name_or_placeholder};
 use crate::theme;
+use crate::ui::icons::Icon;
+use crate::ui::kit;
+use crate::ui::tokens;
 
 /// Width of the sidebar, in pixels.
 pub const SIDEBAR_WIDTH: f32 = 64.0;
@@ -36,10 +39,15 @@ pub fn view(app: &App) -> Element<'_, Message> {
     for entry in app.spaces.entries(selected) {
         buttons = buttons.push(space_button(entry, selected, &app.avatars));
     }
-    container(scrollable(buttons))
-        .width(SIDEBAR_WIDTH)
-        .height(iced::Fill)
-        .into()
+    row![
+        container(scrollable(buttons))
+            .width(SIDEBAR_WIDTH)
+            .height(iced::Fill)
+            .style(kit::sidebar_style),
+        kit::vertical_divider(),
+    ]
+    .height(iced::Fill)
+    .into()
 }
 
 /// The label of a space for its tooltip: one line, capped, a placeholder
@@ -51,7 +59,7 @@ pub fn space_name(space: &SpaceView) -> String {
 fn home_button<'a>(selected: bool) -> Element<'a, Message> {
     tip(
         icon_button(
-            round("\u{2302}".to_owned(), None, selected),
+            round(Icon::Home.glyph().to_owned(), None, selected),
             SpacesMessage::Select(None),
         ),
         "Home".to_owned(),
@@ -128,9 +136,9 @@ fn round<'a>(label: String, fill: Option<Color>, selected: bool) -> Element<'a, 
 fn tip<'a>(content: impl Into<Element<'a, Message>>, name: String) -> Element<'a, Message> {
     tooltip(
         content,
-        container(text(name).size(13))
-            .padding(6)
-            .style(container::bordered_box),
+        container(text(name).size(tokens::CAPTION))
+            .padding(tokens::S)
+            .style(kit::card_style),
         tooltip::Position::Right,
     )
     .into()
