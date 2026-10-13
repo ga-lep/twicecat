@@ -55,6 +55,7 @@ jobs:
       - run: scripts/check-app-deps.sh
       - run: scripts/check-app-deps.sh livekit
       - run: scripts/check-core-api.sh
+      - run: scripts/check-font-assets.sh
       - run: scripts/check-no-webrtc-download.sh
       # Every test file with ignored tests runs in exactly one integration shard.
       - run: scripts/integration-shards.sh --check

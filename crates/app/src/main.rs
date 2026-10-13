@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use twicecat_app::settings::DiskSettings;
 use twicecat_app::state::App;
+use twicecat_app::ui;
 use twicecat_app::{Bridge, Startup, TITLE};
 use twicecat_core::api::AudioBackend;
 use twicecat_core::logging;
@@ -133,17 +134,21 @@ fn run(options: Options) -> Result<(), String> {
 
     // The app (and with it the bridge and the core's runtime) is dropped when
     // `run` returns, before the temporary directory is removed.
-    let result = iced::application(
+    let application = iced::application(
         App::booter(startup, ui_settings, settings_store),
         App::update,
         App::view,
-    )
-    .title(TITLE)
-    .subscription(App::subscription)
-    .theme(App::theme)
-    .window(window_settings())
-    .exit_on_close_request(false)
-    .run();
+    );
+    let result = ui::fonts::ALL
+        .into_iter()
+        .fold(application, |application, face| application.font(face))
+        .default_font(ui::fonts::BODY)
+        .title(TITLE)
+        .subscription(App::subscription)
+        .theme(App::theme)
+        .window(window_settings())
+        .exit_on_close_request(false)
+        .run();
     if let Some(dir) = cleanup {
         // Best effort: nothing useful to do if it fails.
         let _ = std::fs::remove_dir_all(dir);
