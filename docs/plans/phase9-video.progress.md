@@ -10,3 +10,6 @@ Task 3: started
 Task 3: built (probe, video_probe example, scripts/measure-encoders.sh; measured on the human's machine)
   notes: [nvenc] 12 sessions, Vulkan->CUDA interop ok, H.264 4K60 at 307 fps, AV1 488 fps; [intel] ANV Vulkan encode hidden (ANV_DEBUG=video-encode), CQP only, level 5.1; VA-API 145 fps CBR +0.7%; [nvidia-vulkan] FFmpeg h264_vulkan: High only, deadlocks at the second IDR; [q6] to be revisited with the human
 Task 3: complete (Q6 revisited with the human 2026-10-13 and kept: Vulkan Video only for Intel/AMD/pre-Ada NVIDIA, software otherwise, no VA-API)
+Task 4: started
+Task 4: complete (commit "feat(video): convert, scale and encode H.264 with Vulkan", gate ok: 1748 tests; hardware suite 6 passed, also under the validation layer)
+  notes: [accepted] p99 7.9-12 ms (plan 8) and 540p15 +19% (plan 15%) on the RTX 5080's Vulkan path, accepted by the human 2026-10-13 for Task 14; [nvidia] rate control needs VkVideoEncodeH264RateControlLayerInfoKHR; LOW_LATENCY faster than ULTRA_LOW_LATENCY; Baseline works; [intel] readback memory must be the cached type; [dma-buf] dGPU VRAM buffers lose the iGPU device

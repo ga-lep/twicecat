@@ -1,6 +1,7 @@
-//! Twicecat video: frames, colour conversion, the test pattern, the quality
-//! ladder and H.264 bitstream helpers; later capture and the hardware
-//! encoders (plan docs/plans/phase9-video.md). Knows nothing about Matrix,
+//! Twicecat video: frames, colour conversion (CPU and Vulkan compute), the
+//! test pattern, the quality ladder, H.264 bitstream helpers and the GPU
+//! probe; later capture (plan docs/plans/phase9-video.md). Encoding is
+//! LiveKit's (plan amendment 2026-10-14). Knows nothing about Matrix,
 //! LiveKit or the UI; the core adapts between this crate and the call.
 //!
 //! Frames, window titles, device serials and encoded bytes are never
@@ -9,6 +10,7 @@
 pub mod annexb;
 pub mod convert;
 mod frame;
+pub mod gpu;
 pub mod ladder;
 pub mod probe;
 pub mod test_pattern;

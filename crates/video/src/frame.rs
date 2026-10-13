@@ -44,7 +44,7 @@ impl PixelFormat {
 
     /// The smallest stride (bytes per row) and the number of rows of plane
     /// `index` for a `width` × `height` frame.
-    fn plane_shape(self, index: usize, width: u32, height: u32) -> (usize, usize) {
+    pub(crate) fn plane_shape(self, index: usize, width: u32, height: u32) -> (usize, usize) {
         let (w, h) = (width as usize, height as usize);
         match (self, index) {
             (Self::Nv12 | Self::I420, 0) => (w, h),

@@ -8509,6 +8509,7 @@ version = "0.1.0"
 dependencies = [
  "ash",
  "libloading 0.8.9",
+ "naga",
  "thiserror 2.0.21",
  "yuvutils-rs",
 ]
