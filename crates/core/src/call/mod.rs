@@ -47,6 +47,7 @@ use tokio::task::JoinHandle;
 use self::cleaning::Cleaning;
 pub(crate) use self::cleaning::announcement;
 use self::e2ee::KeyPlanner;
+pub(crate) use self::e2ee::SECRET_LOG_TARGETS;
 pub(crate) use self::media::MediaNotice;
 use self::media::{ConnectionShared, Publish, SfuConnection, SharedFlags};
 use self::membership::MEMBERSHIP_EXPIRES;

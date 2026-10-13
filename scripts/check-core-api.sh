@@ -52,7 +52,7 @@ fi
 
 # lib.rs may declare only these public modules. The engine is private and
 # exported item by item, so no SDK type can leak through a module path.
-# `logging` exposes DEFAULT_FILTER, LogInitError and init (tracing-subscriber
+# `logging` exposes DEFAULT_FILTER, LogInitError, filter and init (tracing-subscriber
 # setup, no SDK types) for the CLI and the app.
 allowed='(api|paths|secrets|logging)'
 rc=0

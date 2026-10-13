@@ -20,7 +20,7 @@ set -euo pipefail
 
 SHARD_1="twicecat-core:media twicecat-core:notifications twicecat-core:timeline_live twicecat-core:timeline_items twicecat-core:timeline_actions twicecat-core:oauth twicecat-core:rtc_stack"
 SHARD_2="twicecat-core:e2ee_verification twicecat-app:bridge twicecat-core:e2ee_devices twicecat-core:call_media twicecat-core:room_list twicecat-core:login"
-SHARD_3="twicecat-core:avatars twicecat-core:e2ee_identity twicecat-core:e2ee_rooms twicecat-core:lib twicecat-core:timeline twicecat-core:call_ringing"
+SHARD_3="twicecat-core:avatars twicecat-core:e2ee_identity twicecat-core:e2ee_rooms twicecat-core:lib twicecat-core:timeline twicecat-core:call_ringing twicecat-core:call_log_hygiene"
 SHARD_4="twicecat-core:rooms twicecat-core:e2ee_recovery twicecat-core:call_signalling twicecat-core:log_hygiene twicecat-core:threads twicecat-core:cli twicecat-app:calls"
 # Their ignored tests are all keyring/hardware_ ones (skipped) or none runs.
 NOT_SHARDED="twicecat-core:livekit_link twicecat-core:call_settings twicecat-core:gpu_enhancement twicecat-core:login_policy"
