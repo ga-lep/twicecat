@@ -171,9 +171,14 @@ pub(super) fn describe(s: &AudioSettings, devices: &AudioDevices) -> Vec<String>
         InputMode::VoiceActivity { threshold_db, .. } => {
             format!("voice activity above {threshold_db} dB")
         }
-        InputMode::PushToTalk { release_delay_ms } => {
-            format!("push-to-talk, {release_delay_ms} ms release")
-        }
+        InputMode::PushToTalk {
+            release_delay_ms,
+            toggle: false,
+        } => format!("push-to-talk, {release_delay_ms} ms release"),
+        InputMode::PushToTalk {
+            release_delay_ms,
+            toggle: true,
+        } => format!("toggle-to-talk, {release_delay_ms} ms release"),
     };
     let cleaning = &s.remote_cleaning;
     let others = if cleaning.enabled {

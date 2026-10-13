@@ -2313,3 +2313,17 @@ Plan approved by the human 2026-10-12 (Q1-Q8 answered: the core plays the ringto
 - [x] 10a. Shared cache key for the shards (ci-speed.10). The 4 shards use one rust-cache `shared-key` and only `main` saves it. A separate `integration-build` job was tried and dropped: rust-cache does not keep workspace crates, so each shard recompiled core and its tests (3 to 4 min) anyway. The stack start-up overlap and the per-shard saving write-up of Task 10 are still open.
   - Checks run: the workflow parses as YAML (`actionlint` is not installed, so it was not run). No Rust code changed.
   - [ ] HUMAN (ci-speed.10): read the CI run: the shards' rust-cache step shows "Cache restored from key …" once `main` has saved one, and the slowest shard's duration.
+
+## Phase 6 push-to-talk steps (plan docs/plans/phase6-push-to-talk.md, ga-lep/twicecat#15; branch 15-featapp-wire-push-to-talk-into-the-app)
+Plan approved by the human 2026-10-13 (Q1-Q6 answered: the service runs only in push-to-talk or toggle mode while a call, the mic test or the Voice & audio card needs it; push-to-talk and toggle-to-talk both offered in the GUI, the choice saved in the core's input mode; the gamepad button from a menu; the app depends on twicecat-ptt directly; a desktop entry with the portal's app ID).
+- [x] 24. Toggle-to-talk in the core's input mode (phase6.24)
+- [ ] 25. The push-to-talk service in the app (phase6.25)
+- [ ] 26. The release tail end to end (phase6.26)
+- [ ] 27. The Talking section of the Voice & audio card (phase6.27)
+- [ ] 28. The desktop entry (phase6.28)
+- [ ] 29. Wrap-up (phase6.29)
+
+### Step 24: toggle-to-talk in the core (phase6.24)
+- **Core:** `InputMode::PushToTalk { release_delay_ms, toggle }`. `toggle` is `#[serde(default)]`, so files written before it read as push-to-talk. The gate ignores it: the app turns presses into on and off and still sends `Command::PushToTalk` (plan Q2). `validated` keeps it.
+- **CLI:** `/gate toggle [ms]` beside `/gate ptt [ms]`; without a number both keep the current release delay (200 ms coming from voice activity). `/audio` says "toggle-to-talk, N ms release". `/ptt` is unchanged: a terminal sees no releases, so it already toggles.
+- **Tests:** `toggle_to_talk_round_trips` (serde shape), `settings_without_bindings_still_load` (an old file is push-to-talk), `validated_clamps_every_field` and the stack-free `update_is_validated_saved_and_survives_a_restart` keep `toggle`, `settings_map_onto_the_chain` (the gate is the same with `toggle`), and the CLI's parse, settings and display cases.

@@ -746,6 +746,7 @@ mod tests {
         AudioSettings {
             input_mode: InputMode::PushToTalk {
                 release_delay_ms: 300,
+                toggle: false,
             },
             push_to_talk: PushToTalkBindings {
                 key: Some("ctrl+shift+KeyT".into()),

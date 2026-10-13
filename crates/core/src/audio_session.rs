@@ -53,7 +53,9 @@ pub(crate) fn chain_settings(settings: &AudioSettings) -> ChainSettings {
                 automatic,
                 threshold_db,
             },
-            InputMode::PushToTalk { release_delay_ms } => GateMode::PushToTalk {
+            InputMode::PushToTalk {
+                release_delay_ms, ..
+            } => GateMode::PushToTalk {
                 release_ms: release_delay_ms,
             },
         },
@@ -524,6 +526,7 @@ mod tests {
             },
             input_mode: InputMode::PushToTalk {
                 release_delay_ms: 300,
+                toggle: true,
             },
             input_gain_db: 4.0,
             ..AudioSettings::default()
@@ -531,6 +534,7 @@ mod tests {
         let chain = chain_settings(&settings);
         assert!(!chain.echo_cancellation && chain.high_pass && !chain.auto_gain);
         assert_eq!(chain.noise, NoiseMode::WebRtc(AudioNsLevel::High));
+        // Toggling is the app's: the gate follows presses either way.
         assert_eq!(chain.gate, GateMode::PushToTalk { release_ms: 300 });
         assert_eq!(chain.input_gain_db, 4.0);
     }

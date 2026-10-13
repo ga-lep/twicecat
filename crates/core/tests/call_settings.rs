@@ -46,6 +46,7 @@ async fn update_is_validated_saved_and_survives_a_restart() {
     let wanted = AudioSettings {
         input_mode: InputMode::PushToTalk {
             release_delay_ms: 99_999,
+            toggle: true,
         },
         voice_bitrate_kbps: 96,
         push_to_talk: PushToTalkBindings {
@@ -60,7 +61,8 @@ async fn update_is_validated_saved_and_survives_a_restart() {
     assert_eq!(
         echoed.input_mode,
         InputMode::PushToTalk {
-            release_delay_ms: 2000
+            release_delay_ms: 2000,
+            toggle: true,
         }
     );
     send(&handle, Command::Shutdown).await;

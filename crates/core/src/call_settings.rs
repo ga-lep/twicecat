@@ -105,6 +105,7 @@ mod tests {
         let mut settings = AudioSettings {
             input_mode: InputMode::PushToTalk {
                 release_delay_ms: 250,
+                toggle: true,
             },
             ..AudioSettings::default()
         };

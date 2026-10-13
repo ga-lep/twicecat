@@ -109,9 +109,10 @@ AUDIO SETTINGS (saved; take effect at the next call or mic test):
                           the microphone (Linux with PipeWire, Windows)
     /agc [on|off|<dB>]    Automatic gain; a number sets the most it may boost
                           (1 to 50 dB, 30 by default) and turns it on
-    /gate auto|<dB>|ptt [ms]
+    /gate auto|<dB>|ptt|toggle [ms]
                           Voice activity (automatic or above a level in dBFS),
-                          or push-to-talk with a release tail in ms
+                          push-to-talk, or toggle-to-talk (in the app a press
+                          starts and the next stops), with a release tail in ms
     /mictest [loopback|stop]
                           Test the microphone: levels every second, and with
                           loopback hear yourself

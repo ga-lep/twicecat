@@ -327,10 +327,17 @@ pub enum InputMode {
         /// Gate threshold in dBFS when not automatic (-100..=0).
         threshold_db: f32,
     },
-    /// Transmit only while the push-to-talk key is held.
+    /// Transmit only while the push-to-talk key is held, or with `toggle`
+    /// from one press to the next.
     PushToTalk {
         /// Keep transmitting this long after release, in ms (0..=2000).
         release_delay_ms: u32,
+        /// Toggle-to-talk: a press starts transmitting and the next press
+        /// stops. The app turns presses into on and off; the gate still
+        /// follows `Command::PushToTalk`. Missing from files written before
+        /// it existed, which read as `false`.
+        #[serde(default)]
+        toggle: bool,
     },
 }
 
@@ -479,7 +486,9 @@ impl AudioSettings {
             InputMode::VoiceActivity { threshold_db, .. } => {
                 *threshold_db = clamp_f32(*threshold_db, limits::VAD_THRESHOLD_DB, -50.0);
             }
-            InputMode::PushToTalk { release_delay_ms } => {
+            InputMode::PushToTalk {
+                release_delay_ms, ..
+            } => {
                 *release_delay_ms = (*release_delay_ms).min(limits::PTT_RELEASE_DELAY_MS);
             }
         }
@@ -598,6 +607,7 @@ mod tests {
             },
             input_mode: InputMode::PushToTalk {
                 release_delay_ms: 60_000,
+                toggle: true,
             },
             processing: AudioProcessing {
                 noise_suppression: NoiseSuppression::DeepFilter {
@@ -630,7 +640,8 @@ mod tests {
         assert_eq!(
             s.input_mode,
             InputMode::PushToTalk {
-                release_delay_ms: 2000
+                release_delay_ms: 2000,
+                toggle: true,
             }
         );
         assert_eq!(
@@ -685,6 +696,28 @@ mod tests {
         let old = serde_json::json!({ "input_mode": { "kind": "push_to_talk", "release_delay_ms": 200 } });
         let s: AudioSettings = serde_json::from_value(old).unwrap();
         assert_eq!(s.push_to_talk, PushToTalkBindings::default());
+        assert_eq!(
+            s.input_mode,
+            InputMode::PushToTalk {
+                release_delay_ms: 200,
+                toggle: false,
+            },
+            "written before toggle-to-talk: push-to-talk"
+        );
+    }
+
+    #[test]
+    fn toggle_to_talk_round_trips() {
+        let mode = InputMode::PushToTalk {
+            release_delay_ms: 150,
+            toggle: true,
+        };
+        let json = serde_json::to_value(mode).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({ "kind": "push_to_talk", "release_delay_ms": 150, "toggle": true })
+        );
+        assert_eq!(serde_json::from_value::<InputMode>(json).unwrap(), mode);
     }
 
     #[test]

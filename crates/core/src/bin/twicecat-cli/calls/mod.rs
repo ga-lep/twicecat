@@ -227,17 +227,15 @@ impl Calls {
                         automatic: false,
                         threshold_db,
                     },
-                    (GateArg::Ptt(Some(release_delay_ms)), _) => {
-                        InputMode::PushToTalk { release_delay_ms }
-                    }
-                    (GateArg::Ptt(None), InputMode::PushToTalk { release_delay_ms }) => {
-                        InputMode::PushToTalk { release_delay_ms }
-                    }
-                    (GateArg::Ptt(None), InputMode::VoiceActivity { .. }) => {
-                        InputMode::PushToTalk {
-                            release_delay_ms: DEFAULT_RELEASE_MS,
-                        }
-                    }
+                    (GateArg::Ptt { release, toggle }, now) => InputMode::PushToTalk {
+                        release_delay_ms: release.unwrap_or(match now {
+                            InputMode::PushToTalk {
+                                release_delay_ms, ..
+                            } => release_delay_ms,
+                            InputMode::VoiceActivity { .. } => DEFAULT_RELEASE_MS,
+                        }),
+                        toggle,
+                    },
                 };
             }),
             CallCmd::Vol { who, percent } => match self.user_of(&who) {
@@ -575,11 +573,19 @@ mod tests {
         let mut calls = loaded();
         let reply = calls.command(CallCmd::Aec(None), &[], None);
         assert!(!update(&reply).processing.echo_cancellation, "toggled");
-        let reply = calls.command(CallCmd::Gate(GateArg::Ptt(None)), &[], None);
+        let reply = calls.command(
+            CallCmd::Gate(GateArg::Ptt {
+                release: None,
+                toggle: false,
+            }),
+            &[],
+            None,
+        );
         assert_eq!(
             update(&reply).input_mode,
             InputMode::PushToTalk {
-                release_delay_ms: DEFAULT_RELEASE_MS
+                release_delay_ms: DEFAULT_RELEASE_MS,
+                toggle: false,
             }
         );
         let echoed = calls.event(CoreEvent::AudioSettings(update(&reply).clone()), &[]);
@@ -588,6 +594,21 @@ mod tests {
                 .iter()
                 .any(|l| l.contains("push-to-talk, 200 ms release")),
             "{echoed:?}"
+        );
+        let reply = calls.command(
+            CallCmd::Gate(GateArg::Ptt {
+                release: None,
+                toggle: true,
+            }),
+            &[],
+            None,
+        );
+        let echoed = calls.event(CoreEvent::AudioSettings(update(&reply).clone()), &[]);
+        assert!(
+            echoed
+                .iter()
+                .any(|l| l.contains("toggle-to-talk, 200 ms release")),
+            "the delay is kept: {echoed:?}"
         );
         // An echo nobody asked for is not printed.
         let quiet = calls.event(CoreEvent::AudioSettings(AudioSettings::default()), &[]);
@@ -747,6 +768,7 @@ mod tests {
         let ptt = AudioSettings {
             input_mode: InputMode::PushToTalk {
                 release_delay_ms: 100,
+                toggle: false,
             },
             ..AudioSettings::default()
         };
@@ -821,9 +843,10 @@ mod tests {
         use twicecat_core::api::{NoiseSuppression, SkipCleaned};
         let ptt = InputMode::PushToTalk {
             release_delay_ms: 300,
+            toggle: false,
         };
         type Check = fn(&AudioSettings) -> bool;
-        let cases: [(CallCmd, Check); 15] = [
+        let cases: [(CallCmd, Check); 16] = [
             (CallCmd::Ringtone(None), |s| !s.ringtone),
             (CallCmd::Ringtone(Some(true)), |s| s.ringtone),
             (CallCmd::Ns(NoiseSuppression::Off), |s| {
@@ -850,12 +873,32 @@ mod tests {
                         threshold_db: -40.0,
                     }
             }),
-            (CallCmd::Gate(GateArg::Ptt(None)), |s| {
-                s.input_mode
-                    == InputMode::PushToTalk {
-                        release_delay_ms: 300,
-                    }
-            }),
+            (
+                CallCmd::Gate(GateArg::Ptt {
+                    release: None,
+                    toggle: false,
+                }),
+                |s| {
+                    s.input_mode
+                        == InputMode::PushToTalk {
+                            release_delay_ms: 300,
+                            toggle: false,
+                        }
+                },
+            ),
+            (
+                CallCmd::Gate(GateArg::Ptt {
+                    release: Some(150),
+                    toggle: true,
+                }),
+                |s| {
+                    s.input_mode
+                        == InputMode::PushToTalk {
+                            release_delay_ms: 150,
+                            toggle: true,
+                        }
+                },
+            ),
             (CallCmd::Clean(CleanArg::Switch(None)), |s| {
                 s.remote_cleaning.enabled
             }),
