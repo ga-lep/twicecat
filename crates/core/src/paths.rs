@@ -3,10 +3,60 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::api::{ThemeChoice, UiSettings};
+use crate::api::{DensityChoice, PaletteChoice, RoomListChoice, ThemeChoice, UiSettings};
 
 /// Largest settings file read (64 KiB); anything bigger is treated as corrupt.
 const MAX_SETTINGS_BYTES: u64 = 64 * 1024;
+
+/// Builds the settings from a parsed file, field by field: a missing field or
+/// one with an unknown value takes that field's default.
+fn settings_from_map(map: &serde_json::Map<String, serde_json::Value>) -> UiSettings {
+    let text = |key: &str| map.get(key).and_then(serde_json::Value::as_str);
+    let flag = |key: &str, default: bool| {
+        map.get(key)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(default)
+    };
+    let defaults = UiSettings::default();
+    UiSettings {
+        theme: match text("theme") {
+            Some("System") => ThemeChoice::System,
+            Some("Light") => ThemeChoice::Light,
+            Some("Dark") => ThemeChoice::Dark,
+            _ => defaults.theme,
+        },
+        desktop_notifications: flag("desktop_notifications", defaults.desktop_notifications),
+        show_message_content: flag("show_message_content", defaults.show_message_content),
+        tray_badge: flag("tray_badge", defaults.tray_badge),
+        palette: match text("palette") {
+            Some("Twicecat") => Some(PaletteChoice::Twicecat),
+            Some("Frost") => Some(PaletteChoice::Frost),
+            Some("Ember") => Some(PaletteChoice::Ember),
+            Some("HighContrast") => Some(PaletteChoice::HighContrast),
+            _ => None,
+        },
+        density: match text("density") {
+            Some("Compact") => DensityChoice::Compact,
+            Some("Comfortable") => DensityChoice::Comfortable,
+            _ => defaults.density,
+        },
+        room_list: match text("room_list") {
+            Some("Rail") => RoomListChoice::Rail,
+            Some("Expanded") => RoomListChoice::Expanded,
+            _ => defaults.room_list,
+        },
+        text_scale_percent: map
+            .get("text_scale_percent")
+            .and_then(serde_json::Value::as_u64)
+            .map_or(defaults.text_scale_percent, clamp_text_scale),
+    }
+}
+
+/// Clamps a text scale to 80-200 % and rounds it to a step of 10.
+fn clamp_text_scale(raw: u64) -> u16 {
+    let stepped = raw.saturating_add(5) / 10 * 10;
+    u16::try_from(stepped.clamp(80, 200)).expect("clamped to at most 200")
+}
 
 /// Errors from building paths.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -182,9 +232,9 @@ impl DataPaths {
         let Some(bytes) = read_capped_regular_file(&path) else {
             return UiSettings::default();
         };
-        match serde_json::from_slice(&bytes) {
-            Ok(settings) => settings,
-            Err(_) => {
+        match serde_json::from_slice::<serde_json::Value>(&bytes) {
+            Ok(serde_json::Value::Object(map)) => settings_from_map(&map),
+            _ => {
                 // Best effort: if the rename fails the defaults still apply.
                 let _ = std::fs::rename(&path, self.root.join("settings.json.bad"));
                 UiSettings::default()
@@ -205,13 +255,33 @@ impl DataPaths {
             ThemeChoice::Light => "Light",
             ThemeChoice::Dark => "Dark",
         };
-        let json = serde_json::json!({
+        let mut json = serde_json::json!({
             "theme": theme,
             "desktop_notifications": settings.desktop_notifications,
             "show_message_content": settings.show_message_content,
             "tray_badge": settings.tray_badge,
-        })
-        .to_string();
+            "density": match settings.density {
+                DensityChoice::Comfortable => "Comfortable",
+                DensityChoice::Compact => "Compact",
+            },
+            "room_list": match settings.room_list {
+                RoomListChoice::Expanded => "Expanded",
+                RoomListChoice::Rail => "Rail",
+            },
+            "text_scale_percent": settings.text_scale_percent,
+        });
+        // No key while `None`, so a later change of the app's default reaches
+        // this user.
+        if let (Some(palette), Some(map)) = (settings.palette, json.as_object_mut()) {
+            let name = match palette {
+                PaletteChoice::Twicecat => "Twicecat",
+                PaletteChoice::Frost => "Frost",
+                PaletteChoice::Ember => "Ember",
+                PaletteChoice::HighContrast => "HighContrast",
+            };
+            map.insert("palette".into(), name.into());
+        }
+        let json = json.to_string();
         let tmp = self.root.join("settings.json.tmp");
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create(true).truncate(true);
@@ -537,6 +607,7 @@ mod tests {
             desktop_notifications: false,
             show_message_content: false,
             tray_badge: false,
+            ..UiSettings::default()
         };
         p.write_settings(&s).unwrap();
         assert_eq!(p.read_settings(), s);
@@ -581,6 +652,98 @@ mod tests {
         assert!(p.settings_file().exists());
     }
 
+    fn read_text(p: &DataPaths, text: &str) -> UiSettings {
+        std::fs::create_dir_all(p.root()).unwrap();
+        std::fs::write(p.settings_file(), text).unwrap();
+        p.read_settings()
+    }
+
+    #[test]
+    fn an_old_file_reads_with_the_appearance_defaults() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = DataPaths::at(tmp.path().join("root"));
+        let s = read_text(&p, r#"{"theme":"Dark"}"#);
+        assert_eq!(s.theme, ThemeChoice::Dark);
+        assert_eq!(s.palette, None);
+        assert_eq!(s.density, DensityChoice::Comfortable);
+        assert_eq!(s.room_list, RoomListChoice::Expanded);
+        assert_eq!(s.text_scale_percent, 100);
+    }
+
+    #[test]
+    fn an_unknown_appearance_value_falls_back_per_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = DataPaths::at(tmp.path().join("root"));
+        let s = read_text(
+            &p,
+            r#"{"palette":"Nope","theme":"Dark","density":"Huge","room_list":7,"text_scale_percent":"x","tray_badge":false}"#,
+        );
+        assert_eq!(s.theme, ThemeChoice::Dark);
+        assert_eq!(s.palette, None);
+        assert_eq!(s.density, DensityChoice::Comfortable);
+        assert_eq!(s.room_list, RoomListChoice::Expanded);
+        assert_eq!(s.text_scale_percent, 100);
+        assert!(!s.tray_badge);
+        assert!(p.settings_file().exists());
+        assert!(!p.root().join("settings.json.bad").exists());
+    }
+
+    #[test]
+    fn text_scale_is_clamped_and_stepped_when_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = DataPaths::at(tmp.path().join("root"));
+        for (raw, want) in [
+            (0u32, 80u16),
+            (79, 80),
+            (85, 90),
+            (200, 200),
+            (250, 200),
+            (u32::from(u16::MAX), 200),
+        ] {
+            let s = read_text(&p, &format!(r#"{{"text_scale_percent":{raw}}}"#));
+            assert_eq!(s.text_scale_percent, want, "{raw}");
+        }
+    }
+
+    #[test]
+    fn a_palette_of_none_leaves_no_key_in_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = DataPaths::at(tmp.path().join("root"));
+        p.write_settings(&UiSettings::default()).unwrap();
+        let text = std::fs::read_to_string(p.settings_file()).unwrap();
+        assert!(!text.contains("palette"), "{text}");
+    }
+
+    #[test]
+    fn every_appearance_value_round_trips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = DataPaths::at(tmp.path().join("root"));
+        let palettes = [
+            None,
+            Some(PaletteChoice::Twicecat),
+            Some(PaletteChoice::Frost),
+            Some(PaletteChoice::Ember),
+            Some(PaletteChoice::HighContrast),
+        ];
+        for palette in palettes {
+            for density in [DensityChoice::Comfortable, DensityChoice::Compact] {
+                for room_list in [RoomListChoice::Expanded, RoomListChoice::Rail] {
+                    for text_scale_percent in [80, 100, 130, 200] {
+                        let s = UiSettings {
+                            palette,
+                            density,
+                            room_list,
+                            text_scale_percent,
+                            ..UiSettings::default()
+                        };
+                        p.write_settings(&s).unwrap();
+                        assert_eq!(p.read_settings(), s);
+                    }
+                }
+            }
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn settings_file_is_private() {
@@ -614,6 +777,7 @@ mod tests {
                     desktop_notifications: bits & 1 != 0,
                     show_message_content: bits & 2 != 0,
                     tray_badge: bits & 4 != 0,
+                    ..UiSettings::default()
                 };
                 p.write_settings(&s).unwrap();
                 assert_eq!(p.read_settings(), s);

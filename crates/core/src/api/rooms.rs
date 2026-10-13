@@ -360,16 +360,56 @@ pub enum ThemeChoice {
     Dark,
 }
 
+/// The colour set the user picked. `None` in [`UiSettings::palette`] means
+/// "the app's default".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaletteChoice {
+    /// The Twicecat colours.
+    Twicecat,
+    /// The Frost colours.
+    Frost,
+    /// The Ember colours.
+    Ember,
+    /// The high-contrast colours.
+    HighContrast,
+}
+
+/// How much room the lists and messages take.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DensityChoice {
+    /// Roomy spacing.
+    #[default]
+    Comfortable,
+    /// Tighter spacing.
+    Compact,
+}
+
+/// How the room list is shown.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RoomListChoice {
+    /// Names and details.
+    #[default]
+    Expanded,
+    /// Avatars only.
+    Rail,
+}
+
 /// Settings kept on this device only. No secrets, no content.
 ///
+/// The appearance fields default to "no visible change": no palette (the
+/// app's default), comfortable density, an expanded room list and 100 % text.
+///
 /// ```
-/// use twicecat_core::api::{ThemeChoice, UiSettings};
+/// use twicecat_core::api::{DensityChoice, RoomListChoice, ThemeChoice, UiSettings};
 /// let s = UiSettings::default();
 /// assert_eq!(s.theme, ThemeChoice::System);
 /// assert!(s.desktop_notifications && s.show_message_content && s.tray_badge);
+/// assert_eq!(s.palette, None);
+/// assert_eq!(s.density, DensityChoice::Comfortable);
+/// assert_eq!(s.room_list, RoomListChoice::Expanded);
+/// assert_eq!(s.text_scale_percent, 100);
 /// ```
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
-#[serde(default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UiSettings {
     /// Theme override.
     pub theme: ThemeChoice,
@@ -379,6 +419,14 @@ pub struct UiSettings {
     pub show_message_content: bool,
     /// Show the unread badge on the tray icon.
     pub tray_badge: bool,
+    /// The colour set; `None` is the app's default.
+    pub palette: Option<PaletteChoice>,
+    /// Spacing density.
+    pub density: DensityChoice,
+    /// Expanded or collapsed room list.
+    pub room_list: RoomListChoice,
+    /// Text scale in percent (80 to 200, in steps of 10).
+    pub text_scale_percent: u16,
 }
 
 impl Default for UiSettings {
@@ -388,6 +436,10 @@ impl Default for UiSettings {
             desktop_notifications: true,
             show_message_content: true,
             tray_badge: true,
+            palette: None,
+            density: DensityChoice::Comfortable,
+            room_list: RoomListChoice::Expanded,
+            text_scale_percent: 100,
         }
     }
 }
