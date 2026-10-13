@@ -76,3 +76,37 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.matrixmultiply]
 opt-level = 3
+# The headless UI gallery (crates/app/tests/ui_gallery.rs) shapes text and
+# rasterizes screens in tests: unoptimized, it takes minutes.
+[profile.dev.package.tiny-skia]
+opt-level = 3
+[profile.dev.package.tiny-skia-path]
+opt-level = 3
+[profile.dev.package.iced_tiny_skia]
+opt-level = 3
+[profile.dev.package.iced_graphics]
+opt-level = 3
+[profile.dev.package.cosmic-text]
+opt-level = 3
+[profile.dev.package.swash]
+opt-level = 3
+[profile.dev.package.skrifa]
+opt-level = 3
+[profile.dev.package.read-fonts]
+opt-level = 3
+[profile.dev.package.harfrust]
+opt-level = 3
+[profile.dev.package.ttf-parser]
+opt-level = 3
+[profile.dev.package.fontdb]
+opt-level = 3
+[profile.dev.package.png]
+opt-level = 3
+[profile.dev.package.fdeflate]
+opt-level = 3
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+[profile.dev.package.crc32fast]
+opt-level = 3
+[profile.dev.package.image]
+opt-level = 3

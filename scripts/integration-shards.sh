@@ -23,8 +23,9 @@ SHARD_1="twicecat-app:bridge twicecat-core:call_signalling twicecat-core:e2ee_ve
 SHARD_2="twicecat-core:call_video twicecat-core:cli twicecat-core:e2ee_devices twicecat-core:e2ee_recovery twicecat-core:log_hygiene twicecat-core:oauth twicecat-core:timeline"
 SHARD_3="twicecat-core:call_ringing twicecat-app:calls twicecat-core:login twicecat-core:media twicecat-core:notifications twicecat-core:rooms twicecat-core:rtc_stack"
 SHARD_4="twicecat-core:avatars twicecat-core:call_log_hygiene twicecat-core:call_media twicecat-core:e2ee_identity twicecat-core:e2ee_rooms twicecat-core:room_list twicecat-core:threads twicecat-core:timeline_items"
-# Their ignored tests are all keyring/hardware_ ones (skipped) or none runs.
-NOT_SHARDED="twicecat-core:livekit_link twicecat-core:call_settings twicecat-core:gpu_enhancement twicecat-core:login_policy twicecat-core:call_video_fallback"
+# Their ignored tests are all keyring/hardware_ ones (skipped) or none runs;
+# ui_gallery's one writes PNGs for review and needs no homeserver.
+NOT_SHARDED="twicecat-core:livekit_link twicecat-core:call_settings twicecat-core:gpu_enhancement twicecat-core:login_policy twicecat-core:call_video_fallback twicecat-app:ui_gallery"
 
 shard_entries() {
     case $1 in
