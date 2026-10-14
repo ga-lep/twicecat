@@ -148,6 +148,7 @@ pub(super) enum Command {
     CleanerAttenuation(f32),
     CleaningSlots(usize),
     RemoveSource(SourceId),
+    Cue(&'static [f32], u16),
 }
 
 /// Levels and counters shared with [`VoiceControl`].
@@ -358,6 +359,17 @@ impl VoiceControl {
     /// count.
     pub fn set_cleaning_slots(&mut self, slots: usize) -> bool {
         self.send(Command::CleaningSlots(slots))
+    }
+
+    /// Plays `samples` (48 kHz mono) once, at `volume_percent`, in the
+    /// call's playback: added to the remote voices, scaled by the master
+    /// volume, and so part of the echo canceller's reference. It is never
+    /// part of [`Outgoing`], and it plays muted and deafened too. A cue
+    /// already playing is replaced. Returns false if the queue is full.
+    ///
+    /// The samples are `'static` so the processing thread never frees them.
+    pub fn play_cue(&mut self, samples: &'static [f32], volume_percent: u16) -> bool {
+        self.send(Command::Cue(samples, volume_percent))
     }
 
     /// Removes a source (its [`SourceInput`] may be dropped too).

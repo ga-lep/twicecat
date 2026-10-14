@@ -490,3 +490,170 @@ fn the_echo_reference_is_what_is_played() {
     assert!(erle >= 20.0, "ERLE {erle:.1} dB");
     assert!(control.stats().chain.delay_ms.is_some());
 }
+
+/// A cue that lives for the rest of the test run (cues are `'static`).
+fn leak(samples: Vec<f32>) -> &'static [f32] {
+    Box::leak(samples.into_boxed_slice())
+}
+
+/// 2.5 frames of a small rising ramp.
+fn ramp() -> &'static [f32] {
+    leak((0..FRAME_LEN * 5 / 2).map(|i| i as f32 * 1e-4).collect())
+}
+
+#[test]
+fn cue_is_added_to_the_remote_mix_in_order_across_frames() {
+    let (mut engine, mut control, _out) = VoiceEngine::new(plain());
+    let (_, mut a) = control.add_source(100).unwrap();
+    let cue = ramp();
+    assert!(control.play_cue(cue, 100));
+    for frame in 0..4 {
+        a.push(&[0.1; FRAME_LEN]);
+        let played = run(&mut engine, &SILENCE);
+        for (j, p) in played.iter().enumerate() {
+            let i = frame * FRAME_LEN + j;
+            let want = 0.1 + cue.get(i).copied().unwrap_or(0.0);
+            assert!((p - want).abs() < 1e-6, "sample {i}: {p} != {want}");
+        }
+    }
+}
+
+#[test]
+fn cue_is_followed_by_silence() {
+    let (mut engine, mut control, _out) = VoiceEngine::new(plain());
+    let cue = leak(vec![0.2; 10]);
+    control.play_cue(cue, 100);
+    let played = run(&mut engine, &SILENCE);
+    assert_eq!(&played[..10], &[0.2; 10]);
+    assert!(played[10..].iter().all(|s| *s == 0.0));
+    assert_eq!(run(&mut engine, &SILENCE), SILENCE);
+}
+
+#[test]
+fn cue_is_scaled_by_its_volume_and_the_master_volume() {
+    let (mut engine, mut control, _out) = VoiceEngine::new(plain());
+    let cue = ramp();
+    control.set_master_volume(50);
+    control.play_cue(cue, 50);
+    let played = run(&mut engine, &SILENCE);
+    for (p, c) in played.iter().zip(cue) {
+        assert!((p - 0.25 * c).abs() < 1e-6, "{p} vs {c}");
+    }
+}
+
+#[test]
+fn cue_plays_deafened_while_the_voices_do_not() {
+    let (mut engine, mut control, _out) = VoiceEngine::new(plain());
+    let (_, mut a) = control.add_source(100).unwrap();
+    let cue = ramp();
+    control.set_deafened(true);
+    control.set_master_volume(50);
+    control.play_cue(cue, 100);
+    a.push(&[0.5; FRAME_LEN * 2]);
+    for frame in 0..2 {
+        let played = run(&mut engine, &SILENCE);
+        for (j, p) in played.iter().enumerate() {
+            let want = cue[frame * FRAME_LEN + j] * 0.5;
+            assert!((p - want).abs() < 1e-6, "frame {frame} sample {j}: {p}");
+        }
+    }
+}
+
+#[test]
+fn non_finite_remote_samples_never_reach_the_speaker() {
+    for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        for deafened in [false, true] {
+            let (mut engine, mut control, _out) = VoiceEngine::new(plain());
+            let (_, mut a) = control.add_source(100).unwrap();
+            control.set_deafened(deafened);
+            a.push(&[bad; FRAME_LEN]);
+            let played = run(&mut engine, &SILENCE);
+            if deafened {
+                assert_eq!(played, SILENCE, "deafened, {bad}");
+            }
+            assert!(
+                played.iter().all(|p| p.is_finite()),
+                "deafened {deafened}, {bad}: not finite"
+            );
+        }
+    }
+}
+
+#[test]
+fn cue_volume_is_capped_at_100_percent() {
+    let frames = |percent| {
+        let (mut engine, mut control, _out) = VoiceEngine::new(plain());
+        control.play_cue(ramp(), percent);
+        (0..3)
+            .map(|_| run(&mut engine, &SILENCE))
+            .collect::<Vec<_>>()
+    };
+    assert!(frames(200) == frames(100), "200 % must play as 100 %");
+}
+
+#[test]
+fn cue_is_in_the_echo_reference_deafened_or_not() {
+    for deafened in [false, true] {
+        let (mut engine, mut control, _out) = VoiceEngine::new(ChainSettings {
+            echo_cancellation: true,
+            ..plain()
+        });
+        let (_, mut a) = control.add_source(100).unwrap();
+        control.set_deafened(deafened);
+        control.set_master_volume(80);
+        control.play_cue(ramp(), 100);
+        for _ in 0..3 {
+            a.push(&[0.3; FRAME_LEN]);
+            let played = run(&mut engine, &SILENCE);
+            assert_ne!(played, SILENCE);
+            assert_eq!(engine.rendered, played, "deafened: {deafened}");
+        }
+    }
+}
+
+#[test]
+fn cue_never_reaches_the_outgoing_stream() {
+    let (mut engine, mut control, mut out) = VoiceEngine::new(plain());
+    control.play_cue(ramp(), 100);
+    let mut sent = [1.0; FRAME_LEN];
+    for frame in 0..4 {
+        let played = run(&mut engine, &SILENCE);
+        assert_eq!(
+            played != SILENCE,
+            frame < 3,
+            "the cue plays in frame {frame}"
+        );
+        assert!(out.pop_frame(&mut sent));
+        assert_eq!(sent, SILENCE, "the cue leaked into the microphone");
+    }
+}
+
+#[test]
+fn cue_ignores_mute_and_push_to_talk() {
+    let cue = ramp();
+    let mut reference = Vec::new();
+    for (muted, ptt) in [(false, false), (true, false), (false, true), (true, true)] {
+        let (mut engine, mut control, _out) = VoiceEngine::new(plain());
+        control.set_muted(muted);
+        control.push_to_talk(ptt);
+        control.play_cue(cue, 100);
+        let frames: Vec<Frame> = (0..3).map(|_| run(&mut engine, &SILENCE)).collect();
+        assert_ne!(frames[0], SILENCE);
+        if reference.is_empty() {
+            reference = frames;
+        } else {
+            assert_eq!(frames, reference, "muted {muted}, push-to-talk {ptt}");
+        }
+    }
+}
+
+#[test]
+fn cue_restarts_without_mixing_the_first() {
+    let (mut engine, mut control, _out) = VoiceEngine::new(plain());
+    control.play_cue(leak(vec![0.3; 100]), 100);
+    run(&mut engine, &SILENCE);
+    control.play_cue(leak(vec![0.1; 20]), 50);
+    let played = run(&mut engine, &SILENCE);
+    assert!(played[..20].iter().all(|s| (s - 0.05).abs() < 1e-6));
+    assert!(played[20..].iter().all(|s| *s == 0.0));
+}
