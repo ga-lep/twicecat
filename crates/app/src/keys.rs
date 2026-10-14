@@ -1063,4 +1063,74 @@ mod tests {
             assert!(event_message(&release_event(key.clone()), false).is_none());
         }
     }
+
+    /// The key labels the keyboard map of `docs/accessibility.md` lists: the
+    /// first cell of every table row, split at " / ", without a trailing
+    /// "(...)" note.
+    fn documented_labels(doc: &str) -> Vec<String> {
+        let mut labels = Vec::new();
+        for line in doc.lines().filter(|l| l.starts_with('|')) {
+            let cell = line.trim_matches('|').split('|').next().unwrap_or("");
+            let cell = cell.split(" (").next().unwrap_or("");
+            labels.extend(cell.split(" / ").map(|k| k.trim().to_owned()));
+        }
+        labels
+    }
+
+    /// Every `SHORTCUTS` label that the document's table does not list.
+    fn undocumented(doc: &str) -> Vec<&'static str> {
+        let listed = documented_labels(doc);
+        SHORTCUTS
+            .iter()
+            .map(|row| row.keys)
+            .filter(|keys| !listed.iter().any(|l| l == keys))
+            .collect()
+    }
+
+    fn accessibility_doc() -> String {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/accessibility.md");
+        std::fs::read_to_string(path).expect("docs/accessibility.md is readable")
+    }
+
+    #[test]
+    fn accessibility_doc_lists_every_shortcut() {
+        let missing = undocumented(&accessibility_doc());
+        assert!(
+            missing.is_empty(),
+            "docs/accessibility.md does not list: {missing:?}"
+        );
+    }
+
+    /// The check itself fails when a row is taken out of the document.
+    #[test]
+    fn the_accessibility_check_notices_a_removed_row() {
+        let doc = accessibility_doc();
+        for row in SHORTCUTS {
+            let mutated: String = doc
+                .lines()
+                .map(|line| {
+                    let first = line.trim_matches('|').split('|').next().unwrap_or("");
+                    let listed = line.starts_with('|')
+                        && first
+                            .split(" (")
+                            .next()
+                            .unwrap_or("")
+                            .split(" / ")
+                            .any(|k| k.trim() == row.keys);
+                    if listed {
+                        // Drop the label but keep the line, as a rename would.
+                        line.replace(row.keys, "?")
+                    } else {
+                        line.to_owned()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                undocumented(&mutated).contains(&row.keys),
+                "removing {} went unnoticed",
+                row.keys
+            );
+        }
+    }
 }
