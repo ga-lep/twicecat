@@ -1,3 +1,4 @@
 Plan: drafted 2026-10-14 on feat/phase7-packaging (from origin/main 072206e), with the build measurements (CPU levels, LTO, GPU build, GPU pack sizes); answered and approved by the human 2026-10-14: Q2 (a), Q3 (b), Q5 MSI, Q6 Windows unsigned for now, Q7 (check and link on Windows/macOS; package manager and cargo-packager-updater on Linux), Q8 (a), Q9 (a), the rest as recommended; Q13 (apt, dnf, AUR) answered 2026-10-14: nfpm, GitHub Pages, no older distributions, AUR twicecat-bin
 Task 1: complete (gate ok: 1735 passed; v4 refusal verified on Linux, Windows check assembled and inspected, not run)
 Task 2: complete (gate ok: 1735 passed; measure-builds.sh reproduces the plan's numbers; v4 built via --config and --target; actionlint and shellcheck clean via Docker)
+Task 3: complete (gate ok: 1738 passed; bundled models found from a fake prefix with an empty HOME; mutation caught)

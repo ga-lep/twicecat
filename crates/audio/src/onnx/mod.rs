@@ -164,19 +164,28 @@ fn library_name() -> &'static str {
 
 /// Where the runtime's library is: `TWICECAT_ONNXRUNTIME_DIR`, else the
 /// fetched GPU build (CUDA 13, then 12) if present, else the DirectML build
-/// (Windows, `scripts/build-onnxruntime-directml.sh`), else the CPU build.
+/// (Windows, `scripts/build-onnxruntime-directml.sh`), else the CPU build;
+/// first in the user cache, then in the package (which bundles the CPU build
+/// on Linux, Phase 7 plan Q3).
 pub fn default_runtime_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("TWICECAT_ONNXRUNTIME_DIR") {
         return Some(PathBuf::from(dir));
     }
-    let base = crate::paths::cache_dir()?
-        .join("onnxruntime")
-        .join(ONNXRUNTIME_VERSION);
-    let platform = platform()?;
-    ["-gpu_cuda13", "-gpu_cuda12", "-directml", ""]
-        .iter()
-        .map(|flavour| base.join(format!("{platform}{flavour}")).join("lib"))
+    runtime_candidates(&crate::paths::roots(), platform()?)
+        .into_iter()
         .find(|dir| dir.join(library_name()).exists())
+}
+
+/// The runtime directories looked at, in order: each root, each flavour.
+fn runtime_candidates(roots: &[PathBuf], platform: &str) -> Vec<PathBuf> {
+    roots
+        .iter()
+        .flat_map(|root| {
+            let base = root.join("onnxruntime").join(ONNXRUNTIME_VERSION);
+            ["-gpu_cuda13", "-gpu_cuda12", "-directml", ""]
+                .map(|flavour| base.join(format!("{platform}{flavour}")).join("lib"))
+        })
+        .collect()
 }
 
 /// The loaded runtime (once per process).
@@ -399,5 +408,31 @@ impl OnnxSession {
             out.push((shape, data.to_vec()));
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_fetched_gpu_build_in_the_cache_comes_before_the_bundled_cpu_build() {
+        let roots = [PathBuf::from("/cache"), PathBuf::from("/pkg")];
+        let dirs = runtime_candidates(&roots, "linux-x64");
+        let at = |dir: &str| PathBuf::from(dir);
+        assert_eq!(
+            dirs,
+            [
+                at("/cache/onnxruntime/1.28.3/linux-x64-gpu_cuda13/lib"),
+                at("/cache/onnxruntime/1.28.3/linux-x64-gpu_cuda12/lib"),
+                at("/cache/onnxruntime/1.28.3/linux-x64-directml/lib"),
+                at("/cache/onnxruntime/1.28.3/linux-x64/lib"),
+                at("/pkg/onnxruntime/1.28.3/linux-x64-gpu_cuda13/lib"),
+                at("/pkg/onnxruntime/1.28.3/linux-x64-gpu_cuda12/lib"),
+                at("/pkg/onnxruntime/1.28.3/linux-x64-directml/lib"),
+                at("/pkg/onnxruntime/1.28.3/linux-x64/lib"),
+            ]
+        );
+        assert_eq!(ONNXRUNTIME_VERSION, "1.28.3", "update the paths above");
     }
 }
