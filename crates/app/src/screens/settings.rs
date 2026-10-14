@@ -1,35 +1,69 @@
-//! The Settings screen (plan Q17, Task 15): profile, notifications,
-//! appearance, keyboard shortcuts, Voice & audio (with push-to-talk) and a
-//! link to Sessions.
+//! The Settings screen (plan Q17, Task 15; as pages in UI/UX rework Task 14):
+//! a modal above the main view with a list of pages at its left and one page
+//! at its right. Always a stack of two (the base first), so opening it keeps
+//! the timeline's scroll offset and the composer's state. Views only read the
+//! app state; every change goes through `App::update`.
 //!
-//! A card over a dimmed window, in a layer that is always a stack of two (the
-//! base first), so opening it keeps the timeline's scroll offset and the
-//! composer's state. Views only read the app state; every change goes through
-//! `App::update`.
+//! The pages are Profile, Appearance, Notifications, Voice & audio,
+//! Keyboard, Sessions and About. Voice & audio and Sessions each hold a line
+//! and the button that opens their own screen (the card and the Sessions
+//! screen are unchanged). Settings opens on Profile, also with Ctrl+,.
+//!
+//! Tab: this iced only gives text fields the focus (buttons never take it),
+//! so Tab walks the text fields of the page on show, in tree order; the list
+//! of pages is reached with the pointer.
 
+use iced::widget::text::Wrapping;
 use iced::widget::{
-    Column, Row, button, checkbox, column, container, pick_list, radio, row, scrollable, space,
-    stack, text, text_input,
+    Column, Row, checkbox, column, container, pick_list, radio, row, scrollable, space, stack,
+    text, text_input,
 };
-use iced::{Background, Border, Element, Fill};
+use iced::{Background, Border, Element, Fill, Length};
 use twicecat_core::api::ThemeChoice;
 
 use crate::settings::{
-    DEFAULT_TEXT_SCALE, DRAG_AND_DROP_NOTE, DefaultChoice, DensityOption, KEYWORD_INPUT_ID,
-    MAX_TEXT_SCALE, MIN_TEXT_SCALE, NAME_INPUT_ID, RoomListOption, SettingsMessage,
-    VOICE_AUDIO_LINE, Zoom,
+    DEFAULT_TEXT_SCALE, DRAG_AND_DROP_NOTE, DefaultChoice, DensityOption, INTER_ATTRIBUTION,
+    INTER_NOTICES, KEYWORD_INPUT_ID, MAX_TEXT_SCALE, MIN_TEXT_SCALE, NAME_INPUT_ID, RoomListOption,
+    SESSIONS_LINE, SettingsMessage, SettingsPage, VOICE_AUDIO_LINE, Zoom,
 };
 use crate::state::{App, Message};
 use crate::theme::{self, Family};
+use crate::ui::fonts;
 use crate::ui::icons::{Icon, icon};
-use crate::ui::kit::{self, modal, muted, secondary_button};
+use crate::ui::kit::{self, Severity, banner, modal, muted, primary_button, secondary_button};
 use crate::ui::tokens;
 
 /// Width of the card.
-const CARD_WIDTH: f32 = 640.0;
+const CARD_WIDTH: f32 = 760.0;
+/// Height of the card, with its padding.
+const CARD_HEIGHT: f32 = 620.0;
+/// The least height of the card's content, in a small window.
+const MIN_CARD_HEIGHT: f32 = 240.0;
+/// The padding `kit::modal` puts around the card's content.
+const CARD_PADDING: f32 = 20.0;
+/// Width of the list of pages.
+pub const NAV_WIDTH: f32 = 168.0;
+/// Width of the keys column of the shortcut list.
+const KEYS_WIDTH: f32 = 160.0;
+/// How text wraps on this card: a break inside a word when it has none, so a
+/// long keyword is wrapped and its end is never cut off.
+const WRAP: Wrapping = Wrapping::WordOrGlyph;
 
 fn msg(message: SettingsMessage) -> Message {
     Message::Settings(message)
+}
+
+/// Text that wraps on this card's rules.
+fn words<'a>(label: impl text::IntoFragment<'a>) -> text::Text<'a> {
+    text(label).wrapping(WRAP)
+}
+
+fn heading<'a>(label: impl text::IntoFragment<'a>) -> Element<'a, Message> {
+    words(label).size(tokens::TITLE).into()
+}
+
+fn note<'a>(label: impl text::IntoFragment<'a>) -> Element<'a, Message> {
+    words(label).size(tokens::BODY).style(muted).into()
 }
 
 /// The base with the Settings screen on top when it is open: always a stack
@@ -43,55 +77,70 @@ pub fn layer<'a>(base: Element<'a, Message>, app: &'a App) -> Element<'a, Messag
     stack([base, top]).into()
 }
 
-fn heading(label: &str) -> Element<'_, Message> {
-    text(label).size(18).into()
-}
-
-fn note(label: &str) -> Element<'_, Message> {
-    text(label).size(13).style(muted).into()
-}
-
+/// The card, 620 high or as high as the window leaves room for.
 fn view(app: &App) -> Element<'_, Message> {
-    let header = row![
-        text("Settings").size(24),
-        space().width(Fill),
-        button(text("Close"))
-            .on_press(msg(SettingsMessage::Close))
-            .style(button::secondary),
-    ]
-    .align_y(iced::Center);
-    let mut body = Column::new().spacing(14).push(header);
-    if let Some(error) = app.settings_ui.error {
-        body = body.push(text(error.text()).size(13).style(text::danger));
-    }
-    body = body
-        .push(profile_section(app))
-        .push(notifications_section(app))
-        .push(appearance_section(app))
-        .push(shortcuts_section())
-        .push(
-            column![
-                heading("Voice & audio"),
-                note(VOICE_AUDIO_LINE),
-                button(text("Voice & audio\u{2026}"))
-                    .on_press(msg(SettingsMessage::OpenVoiceAudio))
-                    .style(button::secondary),
-            ]
-            .spacing(6),
-        )
-        .push(
-            column![
-                heading("Sessions"),
-                button(text("Manage sessions\u{2026}"))
-                    .on_press(msg(SettingsMessage::OpenSessions))
-                    .style(button::secondary),
-            ]
-            .spacing(6),
-        );
-    modal(container(scrollable(body)).max_height(620.0), CARD_WIDTH)
+    iced::widget::responsive(move |size| card(app, size.height)).into()
 }
 
-fn profile_section(app: &App) -> Element<'_, Message> {
+fn card(app: &App, window_height: f32) -> Element<'_, Message> {
+    let header = row![
+        words("Settings").size(tokens::HEADLINE).width(Fill),
+        secondary_button("Close", Some(msg(SettingsMessage::Close))),
+    ]
+    .spacing(tokens::M)
+    .align_y(iced::Center);
+    // The line about the last failure: on every page, in a slot that is
+    // always there (empty when there is nothing to say).
+    let mut notice = Column::new();
+    if let Some(error) = app.settings_ui.error {
+        notice = notice.push(banner(Severity::Danger, error.text()));
+    }
+    let labels = SettingsPage::ALL.map(SettingsPage::label);
+    let nav = kit::page_nav(&labels, app.settings_ui.page.index(), |index| {
+        msg(SettingsMessage::Page(
+            SettingsPage::ALL.get(index).copied().unwrap_or_default(),
+        ))
+    });
+    // The scrollbar takes room of its own (it does not float over the page),
+    // so a button or a label at the page's right edge is never under it.
+    let page = scrollable(page_view(app)).spacing(tokens::S).width(Fill);
+    let body = row![
+        container(nav).width(Length::Fixed(NAV_WIDTH)),
+        kit::vertical_divider(),
+        page,
+    ]
+    .spacing(tokens::L)
+    .height(Fill);
+    let content = column![column![header, notice].spacing(tokens::S), body].spacing(tokens::L);
+    let height = (window_height - 2.0 * CARD_PADDING - 2.0 * tokens::L)
+        .clamp(MIN_CARD_HEIGHT, CARD_HEIGHT - 2.0 * CARD_PADDING);
+    modal(container(content).height(Length::Fixed(height)), CARD_WIDTH)
+}
+
+fn page_view(app: &App) -> Element<'_, Message> {
+    match app.settings_ui.page {
+        SettingsPage::Profile => profile_page(app),
+        SettingsPage::Appearance => appearance_page(app),
+        SettingsPage::Notifications => notifications_page(app),
+        SettingsPage::VoiceAudio => voice_audio_page(),
+        SettingsPage::Keyboard => keyboard_page(),
+        SettingsPage::Sessions => sessions_page(),
+        SettingsPage::About => about_page(),
+    }
+}
+
+/// A page: its title, then its parts.
+fn page_of<'a>(title: &'static str, parts: Vec<Element<'a, Message>>) -> Element<'a, Message> {
+    column![
+        heading(title),
+        Column::from_vec(parts).spacing(tokens::S).width(Fill)
+    ]
+    .spacing(tokens::M)
+    .width(Fill)
+    .into()
+}
+
+fn profile_page(app: &App) -> Element<'_, Message> {
     let ui = &app.settings_ui;
     let can_save = ui.name_edited && !ui.profile_pending;
     let name = row![
@@ -99,34 +148,38 @@ fn profile_section(app: &App) -> Element<'_, Message> {
             .id(NAME_INPUT_ID)
             .on_input(|s| msg(SettingsMessage::NameInput(s.into())))
             .on_submit_maybe(can_save.then(|| msg(SettingsMessage::SaveName)))
-            .padding(6),
-        button(text("Save")).on_press_maybe(can_save.then(|| msg(SettingsMessage::SaveName))),
+            .padding(tokens::S),
+        primary_button("Save", can_save.then(|| msg(SettingsMessage::SaveName))),
     ]
-    .spacing(8);
+    .spacing(tokens::S)
+    .align_y(iced::Center);
     let has_avatar = ui.profile.as_ref().is_some_and(|p| p.has_avatar);
     let idle = !ui.avatar_busy && !ui.profile_pending;
-    let picture = row![
-        text(if has_avatar {
+    // The words on a row of their own, the buttons below them.
+    let picture = column![
+        words(if has_avatar {
             "Picture: set"
         } else {
             "Picture: none"
-        })
-        .size(14),
-        space().width(Fill),
-        button(text(if ui.avatar_busy {
-            "Working\u{2026}"
-        } else {
-            "Change picture\u{2026}"
-        }))
-        .on_press_maybe(idle.then(|| msg(SettingsMessage::ChooseAvatar)))
-        .style(button::secondary),
-        button(text("Remove picture"))
-            .on_press_maybe((idle && has_avatar).then(|| msg(SettingsMessage::RemoveAvatar)))
-            .style(button::secondary),
+        }),
+        row![
+            secondary_button(
+                if ui.avatar_busy {
+                    "Working\u{2026}"
+                } else {
+                    "Change picture\u{2026}"
+                },
+                idle.then(|| msg(SettingsMessage::ChooseAvatar)),
+            ),
+            secondary_button(
+                "Remove picture",
+                (idle && has_avatar).then(|| msg(SettingsMessage::RemoveAvatar)),
+            ),
+        ]
+        .spacing(tokens::M),
     ]
-    .spacing(8)
-    .align_y(iced::Center);
-    column![heading("Profile"), name, picture].spacing(8).into()
+    .spacing(tokens::S);
+    page_of("Profile", vec![name.into(), picture.into()])
 }
 
 fn default_menu<'a>(app: &'a App, label: &'static str, one_to_one: bool) -> Element<'a, Message> {
@@ -135,7 +188,7 @@ fn default_menu<'a>(app: &'a App, label: &'static str, one_to_one: bool) -> Elem
         .shown_default(app.notification_settings.as_ref(), one_to_one)
         .map(DefaultChoice::from_mode);
     row![
-        text(label).width(Fill),
+        words(label).width(Fill),
         kit::menu(
             pick_list(DefaultChoice::ALL, shown, move |choice: DefaultChoice| {
                 msg(SettingsMessage::DefaultMode {
@@ -146,22 +199,22 @@ fn default_menu<'a>(app: &'a App, label: &'static str, one_to_one: bool) -> Elem
             .placeholder("Loading\u{2026}")
         ),
     ]
-    .spacing(8)
+    .spacing(tokens::S)
     .align_y(iced::Center)
     .into()
 }
 
-fn notifications_section(app: &App) -> Element<'_, Message> {
-    let mut keywords = Column::new().spacing(4);
+fn notifications_page(app: &App) -> Element<'_, Message> {
+    let mut keywords = Column::new().spacing(tokens::XS);
     for (shown, keyword) in app.keyword_rows() {
+        // The keyword wraps inside the room the button leaves: the button is
+        // laid out first, so the words never run under it.
         keywords = keywords.push(
             row![
-                text(shown).width(Fill),
-                button(text("Remove"))
-                    .on_press(msg(SettingsMessage::RemoveKeyword(keyword)))
-                    .style(button::secondary),
+                words(shown).width(Fill),
+                secondary_button("Remove", Some(msg(SettingsMessage::RemoveKeyword(keyword)))),
             ]
-            .spacing(8)
+            .spacing(tokens::S)
             .align_y(iced::Center),
         );
     }
@@ -172,49 +225,71 @@ fn notifications_section(app: &App) -> Element<'_, Message> {
             .id(KEYWORD_INPUT_ID)
             .on_input(|s| msg(SettingsMessage::KeywordInput(s.into())))
             .on_submit(msg(SettingsMessage::AddKeyword))
-            .padding(6),
-        button(text("Add")).on_press_maybe(typed.then(|| msg(SettingsMessage::AddKeyword))),
+            .padding(tokens::S),
+        secondary_button("Add", typed.then(|| msg(SettingsMessage::AddKeyword))),
     ]
-    .spacing(8);
+    .spacing(tokens::S);
     let local = &app.ui_settings;
-    column![
-        heading("Notifications"),
-        default_menu(app, "Group rooms", false),
-        default_menu(app, "Direct messages", true),
-        text("Keywords").size(14),
-        keywords,
-        add,
-        note("A message with one of these words notifies you."),
-        checkbox(local.desktop_notifications)
-            .label("Desktop notifications")
-            .on_toggle(|on| msg(SettingsMessage::DesktopNotifications(on))),
-        checkbox(local.show_message_content)
-            .label("Show message content in notifications")
-            .on_toggle(|on| msg(SettingsMessage::ShowMessageContent(on))),
-        checkbox(local.tray_badge)
-            .label("Show the unread count on the tray icon")
-            .on_toggle(|on| msg(SettingsMessage::TrayBadge(on))),
-        note("The three options above apply to this device only."),
-    ]
-    .spacing(8)
-    .into()
+    let toggle = |label: &'static str, on: bool, change: fn(bool) -> SettingsMessage| {
+        checkbox(on)
+            .label(label)
+            .text_wrapping(WRAP)
+            .on_toggle(move |on| msg(change(on)))
+    };
+    page_of(
+        "Notifications",
+        vec![
+            default_menu(app, "Group rooms", false),
+            default_menu(app, "Direct messages", true),
+            words("Keywords").size(tokens::BODY).into(),
+            keywords.into(),
+            add.into(),
+            note("A message with one of these words notifies you."),
+            toggle(
+                "Desktop notifications",
+                local.desktop_notifications,
+                SettingsMessage::DesktopNotifications,
+            )
+            .into(),
+            toggle(
+                "Show message content in notifications",
+                local.show_message_content,
+                SettingsMessage::ShowMessageContent,
+            )
+            .into(),
+            toggle(
+                "Show the unread count on the tray icon",
+                local.tray_badge,
+                SettingsMessage::TrayBadge,
+            )
+            .into(),
+            note("The three options above apply to this device only."),
+        ],
+    )
 }
 
-fn appearance_section(app: &App) -> Element<'_, Message> {
+fn appearance_page(app: &App) -> Element<'_, Message> {
     let current = Some(app.ui_settings.theme);
     let choice = |label: &'static str, value: ThemeChoice| {
         radio(label, value, current, |c| msg(SettingsMessage::Theme(c)))
+            .text_wrapping(WRAP)
+            .into()
     };
     let dark = app.current_theme().extended_palette().is_dark;
     let chosen = theme::resolve_family(app.ui_settings.palette);
-    let mut swatches = Row::new().spacing(tokens::S);
-    for family in Family::ALL {
-        swatches = swatches.push(swatch(family, dark, family == chosen));
+    // Two by two: four side by side would not fit the page.
+    let mut swatches = Column::new().spacing(tokens::S);
+    for pair in Family::ALL.chunks(2) {
+        let mut line = Row::new().spacing(tokens::S);
+        for family in pair {
+            line = line.push(swatch(*family, dark, *family == chosen));
+        }
+        swatches = swatches.push(line);
     }
     let on_default = app.ui_settings.palette.is_none();
     let scale = app.ui_settings.text_scale_percent;
     let zoom = row![
-        text("Text size").width(Fill),
+        words("Text size").width(Fill),
         secondary_button(
             "Smaller",
             (scale > MIN_TEXT_SCALE).then(|| msg(SettingsMessage::Zoom(Zoom::Out))),
@@ -231,42 +306,46 @@ fn appearance_section(app: &App) -> Element<'_, Message> {
     ]
     .spacing(tokens::S)
     .align_y(iced::Center);
-    column![
-        heading("Appearance"),
-        choice("Follow the system", ThemeChoice::System),
-        choice("Light", ThemeChoice::Light),
-        choice("Dark", ThemeChoice::Dark),
-        text("Colours").size(14),
-        swatches,
-        secondary_button(
-            "Use the default",
-            (!on_default).then(|| msg(SettingsMessage::Palette(None))),
-        ),
-        row![
-            text("Density").width(Fill),
-            kit::menu(pick_list(
-                DensityOption::ALL,
-                Some(DensityOption(app.ui_settings.density)),
-                |o: DensityOption| msg(SettingsMessage::Density(o.0)),
-            )),
-        ]
-        .spacing(tokens::S)
-        .align_y(iced::Center),
-        row![
-            text("Room list").width(Fill),
-            kit::menu(pick_list(
-                RoomListOption::ALL,
-                Some(RoomListOption(app.ui_settings.room_list)),
-                |o: RoomListOption| msg(SettingsMessage::RoomList(o.0)),
-            )),
-        ]
-        .spacing(tokens::S)
-        .align_y(iced::Center),
-        zoom,
-        note("Ctrl+= and Ctrl+- change the text size, Ctrl+0 resets it."),
-    ]
-    .spacing(6)
-    .into()
+    let menu_row = |label: &'static str, menu: Element<'static, Message>| {
+        row![words(label).width(Fill), menu]
+            .spacing(tokens::S)
+            .align_y(iced::Center)
+    };
+    page_of(
+        "Appearance",
+        vec![
+            choice("Follow the system", ThemeChoice::System),
+            choice("Light", ThemeChoice::Light),
+            choice("Dark", ThemeChoice::Dark),
+            words("Colours").size(tokens::BODY).into(),
+            swatches.into(),
+            secondary_button(
+                "Use the default",
+                (!on_default).then(|| msg(SettingsMessage::Palette(None))),
+            )
+            .into(),
+            menu_row(
+                "Density",
+                kit::menu(pick_list(
+                    DensityOption::ALL,
+                    Some(DensityOption(app.ui_settings.density)),
+                    |o: DensityOption| msg(SettingsMessage::Density(o.0)),
+                )),
+            )
+            .into(),
+            menu_row(
+                "Room list",
+                kit::menu(pick_list(
+                    RoomListOption::ALL,
+                    Some(RoomListOption(app.ui_settings.room_list)),
+                    |o: RoomListOption| msg(SettingsMessage::RoomList(o.0)),
+                )),
+            )
+            .into(),
+            zoom.into(),
+            note("Ctrl+= and Ctrl+- change the text size, Ctrl+0 resets it."),
+        ],
+    )
 }
 
 /// One colour set as a button: samples of its accent, surface and text, the
@@ -294,18 +373,19 @@ fn swatch<'a>(family: Family, dark: bool, selected: bool) -> Element<'a, Message
     if selected {
         title = title.push(icon::<Message>(Icon::Check));
     }
-    title = title.push(text(name).size(tokens::CAPTION));
+    title = title.push(words(name).size(tokens::CAPTION));
     let samples = row![
         sample(colours.primary),
         sample(sem.surface),
         sample(colours.text)
     ]
     .spacing(tokens::XS);
-    button(column![samples, title].spacing(tokens::XS))
+    iced::widget::button(column![samples, title].spacing(tokens::XS))
         .padding(tokens::S)
+        .width(Fill)
         .on_press(msg(SettingsMessage::Palette(Some(family.choice()))))
         .style(move |theme: &iced::Theme, status| {
-            let mut style = button::secondary(theme, status);
+            let mut style = iced::widget::button::secondary(theme, status);
             style.background = Some(Background::Color(colours.background));
             style.text_color = colours.text;
             style.border = Border {
@@ -322,23 +402,63 @@ fn swatch<'a>(family: Family, dark: bool, selected: bool) -> Element<'a, Message
         .into()
 }
 
-fn shortcuts_section<'a>() -> Element<'a, Message> {
-    let mut list = Column::new().spacing(4);
+fn voice_audio_page<'a>() -> Element<'a, Message> {
+    page_of(
+        "Voice & audio",
+        vec![
+            note(VOICE_AUDIO_LINE),
+            secondary_button(
+                "Voice & audio\u{2026}",
+                Some(msg(SettingsMessage::OpenVoiceAudio)),
+            )
+            .into(),
+        ],
+    )
+}
+
+fn keyboard_page<'a>() -> Element<'a, Message> {
+    let mut list = Column::new().spacing(tokens::XS);
     for shortcut in crate::keys::SHORTCUTS {
         list = list.push(
             row![
-                text(shortcut.keys).width(160).font(iced::Font::MONOSPACE),
-                text(shortcut.action),
+                text(shortcut.keys)
+                    .width(Length::Fixed(KEYS_WIDTH))
+                    .font(fonts::MONO),
+                words(shortcut.action).width(Fill),
             ]
-            .spacing(8),
+            .spacing(tokens::S),
         );
     }
-    column![
-        heading("Keyboard shortcuts"),
-        list,
-        note("On macOS, Ctrl is Cmd."),
-        note(DRAG_AND_DROP_NOTE),
-    ]
-    .spacing(6)
-    .into()
+    page_of(
+        "Keyboard",
+        vec![list.into(), note("On macOS, Ctrl is Cmd.")],
+    )
+}
+
+fn sessions_page<'a>() -> Element<'a, Message> {
+    page_of(
+        "Sessions",
+        vec![
+            note(SESSIONS_LINE),
+            secondary_button(
+                "Manage sessions\u{2026}",
+                Some(msg(SettingsMessage::OpenSessions)),
+            )
+            .into(),
+        ],
+    )
+}
+
+fn about_page<'a>() -> Element<'a, Message> {
+    page_of(
+        "About",
+        vec![
+            words(format!("Twicecat {}", env!("CARGO_PKG_VERSION")))
+                .size(tokens::BODY_LARGE)
+                .into(),
+            note(DRAG_AND_DROP_NOTE),
+            words(INTER_ATTRIBUTION).size(tokens::BODY).into(),
+            note(INTER_NOTICES),
+        ],
+    )
 }
