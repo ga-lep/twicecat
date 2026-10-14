@@ -7,6 +7,7 @@
 
 pub mod calls;
 pub mod stack_env;
+pub mod video;
 
 use std::collections::HashMap;
 use std::path::Path;

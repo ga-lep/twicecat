@@ -559,6 +559,11 @@ pub struct VideoTrackStats {
     pub limitation: QualityLimitation,
     /// Pictures that froze (a pause over 250 ms) since the track started.
     pub freezes: u32,
+    /// The encoder (sent) or decoder (received) as the WebRTC stack names it
+    /// (`NVIDIA H264 Encoder`, `libvpx`, `dav1d`, …), once known.
+    pub implementation: Option<String>,
+    /// That encoder or decoder runs in hardware.
+    pub hardware: bool,
 }
 
 /// Video statistics, about once a second during a call with video.

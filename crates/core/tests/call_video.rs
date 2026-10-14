@@ -5,260 +5,26 @@
 //! video track from another device of a member shows as that device's, a
 //! stranger's does not; leaving ends the feeds.
 //!
+//! The hardware path (Task 6): on a machine with LiveKit's NVENC, H.264 in
+//! three layers up to 4K30 and 1440p60 (`hardware_`, human-run).
+//!
 //! Uses alice and carol; bob stays untouched. `TWICECAT_VIDEO_SECONDS`
 //! shortens the 30 s watch (the plan's bar is for 30 s).
 
 mod common;
 
-use std::collections::{BTreeSet, HashMap};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::calls::{add_member_device, allow_calls, sfu_room};
+use common::video::{
+    Seen, drain, ended, join, logged_in, statistics, track_where, until_unlisted, watch,
+    watch_period,
+};
 use common::{
-    DEFAULT_TIMEOUT, TestEnv, create_encrypted_room, create_room, expect_event, raw_login, silence,
-    start_core_with_video, unique_room_name, wait_for_room,
+    TestEnv, create_encrypted_room, create_room, expect_event, raw_login, unique_room_name,
+    wait_for_room,
 };
-use twicecat_core::CoreHandle;
-use twicecat_core::api::{
-    CallIntent, CallState, Command, CoreEvent, LocalVideo, Password, RoomId, SyncState,
-    VideoBackend, VideoDirection, VideoFeed, VideoFrame, VideoKind, VideoPixelFormat, VideoQuality,
-    VideoTrackId, VideoTrackStats, VideoTrackView,
-};
-use twicecat_core::secrets::InMemorySecretStore;
-use twicecat_video::test_pattern::read_stamp;
-use twicecat_video::{ColorSpace, CpuFrame, PixelFormat, Plane};
-
-async fn logged_in(dir: &std::path::Path, n: u8) -> CoreHandle {
-    let mut core = start_core_with_video(
-        dir,
-        Arc::new(InMemorySecretStore::new()),
-        silence(),
-        None,
-        VideoBackend::TestPattern,
-    );
-    let env = TestEnv::load();
-    core.commands
-        .send(Command::LoginPassword {
-            username: env.user(n).to_owned(),
-            password: Password::from(env.password(n)),
-            server: None,
-        })
-        .await
-        .unwrap();
-    expect_event(&mut core, |e| matches!(e, CoreEvent::LoggedIn { .. })).await;
-    expect_event(&mut core, |e| {
-        matches!(e, CoreEvent::SyncState(SyncState::Running))
-    })
-    .await;
-    core
-}
-
-async fn join(core: &mut CoreHandle, room_id: &str, encrypted: bool) {
-    core.commands
-        .send(Command::JoinCall {
-            room_id: RoomId::from(room_id),
-            intent: CallIntent::Video,
-        })
-        .await
-        .unwrap();
-    let state = expect_event(core, |e| {
-        matches!(
-            e,
-            CoreEvent::CallState(CallState::Connected { .. } | CallState::Left { .. })
-        )
-    })
-    .await;
-    assert!(
-        matches!(state, CoreEvent::CallState(CallState::Connected { encrypted: e, .. }) if e == encrypted),
-        "{state:?}"
-    );
-}
-
-/// The video tracks and feeds a core reported.
-#[derive(Default)]
-struct Seen {
-    tracks: Vec<VideoTrackView>,
-    feeds: HashMap<VideoTrackId, VideoFeed>,
-    /// Every track ever listed.
-    ever: Vec<VideoTrackView>,
-}
-
-impl Seen {
-    fn take(&mut self, event: CoreEvent) {
-        match event {
-            CoreEvent::VideoTracks { tracks, .. } => {
-                self.ever.extend(tracks.iter().cloned());
-                self.tracks = tracks;
-            }
-            CoreEvent::VideoFeed { track, feed } => {
-                self.feeds.insert(track, feed);
-            }
-            _ => {}
-        }
-    }
-}
-
-/// Reads `core`'s events until a listed track matches `wanted` and its feed
-/// has come; returns it.
-async fn track_where(
-    core: &mut CoreHandle,
-    seen: &mut Seen,
-    wanted: impl Fn(&VideoTrackView) -> bool,
-) -> (VideoTrackView, VideoFeed) {
-    let wait = async {
-        loop {
-            if let Some(view) = seen.tracks.iter().find(|t| wanted(t)).cloned()
-                && let Some(feed) = seen.feeds.get(&view.id)
-            {
-                return (view, feed.clone());
-            }
-            match core.events.recv().await {
-                Some(event) => seen.take(event),
-                None => panic!("event channel closed"),
-            }
-        }
-    };
-    tokio::time::timeout(DEFAULT_TIMEOUT, wait)
-        .await
-        .expect("timed out waiting for a video track")
-}
-
-/// Reads `core`'s events until no listed track matches `gone`.
-async fn until_unlisted(
-    core: &mut CoreHandle,
-    seen: &mut Seen,
-    gone: impl Fn(&VideoTrackView) -> bool,
-) {
-    let wait = async {
-        while seen.tracks.iter().any(&gone) {
-            match core.events.recv().await {
-                Some(event) => seen.take(event),
-                None => panic!("event channel closed"),
-            }
-        }
-    };
-    tokio::time::timeout(DEFAULT_TIMEOUT, wait)
-        .await
-        .expect("timed out waiting for a video track to go");
-}
-
-/// The feed's frame as the video crate's, for its stamp reader.
-fn cpu_frame(frame: &VideoFrame) -> CpuFrame {
-    let format = match frame.format {
-        VideoPixelFormat::I420 => PixelFormat::I420,
-        VideoPixelFormat::Nv12 => PixelFormat::Nv12,
-    };
-    let planes = frame
-        .planes
-        .iter()
-        .map(|p| Plane {
-            data: p.data.clone(),
-            stride: p.stride,
-        })
-        .collect();
-    CpuFrame::new(
-        format,
-        frame.width,
-        frame.height,
-        planes,
-        ColorSpace::default(),
-        Duration::ZERO,
-    )
-    .expect("a well-formed frame")
-}
-
-/// What a feed delivered while it was watched.
-#[derive(Debug, Default)]
-struct Watched {
-    /// The stamps' counters, in arrival order.
-    counters: Vec<u32>,
-    /// Frames whose stamp did not read.
-    unreadable: usize,
-    sizes: BTreeSet<(u32, u32)>,
-    /// From the first frame to the end of the watch.
-    span: Duration,
-}
-
-/// Takes every frame `feed` delivers for `period` after its first one.
-async fn watch(feed: &mut VideoFeed, period: Duration) -> Watched {
-    let mut out = Watched::default();
-    let first = tokio::time::timeout(DEFAULT_TIMEOUT, feed.changed())
-        .await
-        .expect("a first frame");
-    assert!(first, "the feed ended before its first frame");
-    let start = Instant::now();
-    let end = start + period;
-    loop {
-        if let Some(frame) = feed.latest() {
-            out.sizes.insert((frame.width, frame.height));
-            match read_stamp(&cpu_frame(&frame)) {
-                Some(stamp) => out.counters.push(stamp.counter),
-                None => out.unreadable += 1,
-            }
-        }
-        let left = end.saturating_duration_since(Instant::now());
-        match tokio::time::timeout(left, feed.changed()).await {
-            Ok(true) => {}
-            Ok(false) => panic!("the feed ended while watched"),
-            Err(_) => break,
-        }
-    }
-    out.span = start.elapsed();
-    out
-}
-
-/// Takes `core`'s video statistics until `stop` resolves, keeping the rest.
-async fn statistics(
-    core: &mut CoreHandle,
-    seen: &mut Seen,
-    stop: impl Future<Output = Watched>,
-) -> (Watched, Vec<VideoTrackStats>) {
-    let mut stats = Vec::new();
-    tokio::pin!(stop);
-    loop {
-        tokio::select! {
-            watched = &mut stop => return (watched, stats),
-            event = core.events.recv() => match event {
-                Some(CoreEvent::VideoStats(s)) => stats.extend(s.tracks),
-                Some(event) => seen.take(event),
-                None => panic!("event channel closed"),
-            },
-        }
-    }
-}
-
-/// Drains `core`'s events into `seen` and statistics for `period`.
-async fn drain(core: &mut CoreHandle, seen: &mut Seen, period: Duration) -> Vec<VideoTrackStats> {
-    let mut stats = Vec::new();
-    let _ = tokio::time::timeout(period, async {
-        loop {
-            match core.events.recv().await {
-                Some(CoreEvent::VideoStats(s)) => stats.extend(s.tracks),
-                Some(event) => seen.take(event),
-                None => panic!("event channel closed"),
-            }
-        }
-    })
-    .await;
-    stats
-}
-
-/// Waits until `feed` ends.
-async fn ended(feed: &mut VideoFeed, who: &str) {
-    let wait = async { while feed.changed().await {} };
-    tokio::time::timeout(DEFAULT_TIMEOUT, wait)
-        .await
-        .unwrap_or_else(|_| panic!("{who}'s feed did not end"));
-}
-
-fn watch_period() -> Duration {
-    let seconds = std::env::var("TWICECAT_VIDEO_SECONDS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(30);
-    Duration::from_secs(seconds)
-}
+use twicecat_core::api::{Command, CoreEvent, LocalVideo, VideoDirection, VideoKind, VideoQuality};
 
 #[tokio::test]
 #[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
@@ -283,6 +49,8 @@ async fn a_test_pattern_reaches_the_other_member_in_order_in_an_encrypted_call()
     join(&mut alice, &room_id, true).await;
     join(&mut carol, &room_id, true).await;
 
+    // The software path, also on a machine with a hardware encoder.
+    common::video::prefer_software(&mut alice).await;
     alice
         .commands
         .send(Command::StartCamera {
@@ -343,9 +111,10 @@ async fn a_test_pattern_reaches_the_other_member_in_order_in_an_encrypted_call()
     let distinct = watched.counters.len();
     let fps = distinct as f64 / watched.span.as_secs_f64();
     eprintln!(
-        "carol got {distinct} frames in {:.1} s ({fps:.1} fps), {} unreadable, sizes {:?}",
+        "carol got {distinct} frames in {:.1} s ({fps:.1} fps), {} unreadable, {} repeated at a layer switch, sizes {:?}",
         watched.span.as_secs_f64(),
         watched.unreadable,
+        watched.layer_repeats,
         watched.sizes
     );
     assert!(
@@ -387,10 +156,8 @@ async fn a_test_pattern_reaches_the_other_member_in_order_in_an_encrypted_call()
     )
     .await;
 
-    for core in [&alice, &carol] {
-        core.commands.send(Command::LeaveCall).await.unwrap();
-        core.commands.send(Command::Shutdown).await.unwrap();
-    }
+    common::video::shut_down(alice, "alice").await;
+    common::video::shut_down(carol, "carol").await;
 }
 
 /// Publishes a grey 640 × 360 picture at 15 fps on `room` as `source`, until
@@ -531,6 +298,153 @@ async fn a_video_track_from_another_device_shows_as_that_device() {
 
     let _ = screener.close().await;
     let _ = stranger.close().await;
-    alice.commands.send(Command::LeaveCall).await.unwrap();
-    alice.commands.send(Command::Shutdown).await.unwrap();
+    common::video::shut_down(alice, "alice").await;
+}
+
+/// What one hardware run delivered.
+struct Run {
+    watched: common::video::Watched,
+    fps: f64,
+    sent: twicecat_core::api::VideoTrackStats,
+    received: twicecat_core::api::VideoTrackStats,
+}
+
+/// Alice sends the test pattern as her camera at `quality`; carol views it
+/// at `view` for the watch period. Returns what carol got and both sides'
+/// last statistics. Frames come in order; their stamps are read unless the
+/// view is small (the stamp needs about 360p).
+async fn hardware_run(
+    call: &mut common::video::Call,
+    seen: &mut (Seen, Seen),
+    quality: VideoQuality,
+    view: (u32, u32),
+) -> Run {
+    let env = TestEnv::load();
+    call.alice
+        .commands
+        .send(Command::StartCamera {
+            device: None,
+            quality,
+        })
+        .await
+        .unwrap();
+    let old: Vec<_> = seen.0.tracks.iter().map(|t| t.id.clone()).collect();
+    let (own, _self_view) = track_where(&mut call.alice, &mut seen.0, |t| {
+        t.is_local && !old.contains(&t.id)
+    })
+    .await;
+    let alice_id = env.user_id(1);
+    let old: Vec<_> = seen.1.tracks.iter().map(|t| t.id.clone()).collect();
+    let (theirs, mut feed) = track_where(&mut call.carol, &mut seen.1, |t| {
+        !t.is_local && t.user_id.as_str() == alice_id && !old.contains(&t.id)
+    })
+    .await;
+    call.carol
+        .commands
+        .send(Command::SetVideoView {
+            track: theirs.id.clone(),
+            width: view.0,
+            height: view.1,
+            visible: true,
+        })
+        .await
+        .unwrap();
+    // The SFU moves to the layer asked for within a few frames; the run
+    // counts from then on.
+    let _ = drain(&mut call.carol, &mut seen.1, Duration::from_secs(3)).await;
+    let (watched, carol_stats) = statistics(
+        &mut call.carol,
+        &mut seen.1,
+        watch(&mut feed, watch_period()),
+    )
+    .await;
+    let alice_stats = drain(&mut call.alice, &mut seen.0, Duration::from_secs(2)).await;
+    let fps = watched.counters.len() as f64 / watched.span.as_secs_f64();
+    let received = carol_stats
+        .iter()
+        .rfind(|s| s.track == theirs.id && s.direction == VideoDirection::Received)
+        .cloned()
+        .expect("carol's statistics of alice's camera");
+    let sent = alice_stats
+        .iter()
+        .rfind(|s| s.track == own.id && s.direction == VideoDirection::Sent)
+        .cloned()
+        .expect("alice's statistics of her camera");
+    eprintln!(
+        "{quality:?} viewed at {view:?}: {} frames in {:.1} s ({fps:.1} fps), {} unreadable, \
+         {} repeated at a layer switch, sizes {:?}\n  sent {sent:?}\n  received {received:?}",
+        watched.counters.len(),
+        watched.span.as_secs_f64(),
+        watched.unreadable,
+        watched.layer_repeats,
+        watched.sizes
+    );
+    assert!(
+        watched.counters.windows(2).all(|w| w[0] < w[1]),
+        "frames out of order or repeated"
+    );
+    if view.1 >= 360 {
+        assert_eq!(watched.unreadable, 0, "every frame's stamp reads");
+    }
+    Run {
+        watched,
+        fps,
+        sent,
+        received,
+    }
+}
+
+/// On a machine with LiveKit's NVENC (the human's RTX 5080; plan Phase 9
+/// Task 6): in an encrypted call, alice's test pattern goes out as H.264 in
+/// three layers on NVENC at 4K30, 1440p60 and 1080p60, and reaches carol
+/// in order at full size and rate; a small tile gets a low layer; both
+/// cores stop after the call (the process then exits by itself, which
+/// NVDEC made hang when a decoder outlived the call).
+#[tokio::test]
+#[ignore = "needs NVENC and the local homeserver (human-run)"]
+async fn hardware_nvenc_sends_h264_in_three_layers_in_an_encrypted_call() {
+    use twicecat_core::api::{EncoderBackend, VideoCodec};
+    let mut call = common::video::alice_and_carol_in_a_call(true).await;
+    let found = common::video::encoders(&mut call.alice).await;
+    assert_eq!(
+        found.encoders.first().map(|e| e.backend),
+        Some(EncoderBackend::Nvenc),
+        "needs LiveKit's NVENC (cuda.h at build time, an NVIDIA GPU): {found:?}"
+    );
+    let mut seen = (Seen::default(), Seen::default());
+    let cases = [
+        (VideoQuality::Uhd2160p30, (3840, 2160), 28.0),
+        (VideoQuality::Qhd1440p60, (2560, 1440), 55.0),
+        (VideoQuality::Hd1080p60, (1920, 1080), 55.0),
+    ];
+    for (quality, size, min_fps) in cases {
+        let run = hardware_run(&mut call, &mut seen, quality, size).await;
+        assert!(run.watched.sizes.contains(&size), "{:?}", run.watched.sizes);
+        assert!(run.fps >= min_fps, "{quality:?}: {:.1} fps", run.fps);
+        let encoder = run.sent.implementation.as_deref().unwrap_or_default();
+        assert!(
+            encoder.contains("NVIDIA H264 Encoder") && run.sent.hardware,
+            "{:?}",
+            run.sent
+        );
+        assert!(
+            encoder.matches("NVIDIA H264 Encoder").count() == 3,
+            "three layers: {encoder}"
+        );
+        let track = seen
+            .1
+            .tracks
+            .iter()
+            .find(|t| !t.is_local)
+            .expect("alice's camera");
+        assert_eq!(track.codec, Some(VideoCodec::H264), "{track:?}");
+        eprintln!("  carol decodes with {:?}", run.received.implementation);
+    }
+    // A small tile: the SFU sends a low layer instead (360p for a camera).
+    let run = hardware_run(&mut call, &mut seen, VideoQuality::Hd1080p60, (320, 180)).await;
+    let largest = run.watched.sizes.iter().map(|s| s.1).max().unwrap_or(0);
+    assert!(largest <= 360, "a low layer: {:?}", run.watched.sizes);
+
+    common::video::shut_down(call.alice, "alice").await;
+    common::video::shut_down(call.carol, "carol").await;
 }

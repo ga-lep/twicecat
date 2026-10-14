@@ -213,7 +213,7 @@ Acceptance (stack tests, CI): two CLIs in an **encrypted** room; alice publishes
 Rewritten 2026-10-14 (the Q5 fork and the passthrough are dropped).
 - **Build:** webrtc-sys compiles NVENC/NVDEC when `cuda.h` is found (`W/build.rs:281-313`). A `dev` script fetches the CUDA driver-API header only (no toolkit; NVIDIA's licence for it checked first, it is never shipped), with a pinned version and SHA-256 like `scripts/fetch-cuda-runtime.sh`, and `.cargo/config.toml` points `CUDA_HOME` at it; CI and release builds use it. The binary still starts on machines without NVIDIA (libraries loaded at run time).
 - **Encoder choice:** NVENC with H.264 where the probe finds an NVIDIA GPU on the proprietary driver and `list_available()` lists `Nvenc`; VideoToolbox on macOS; otherwise `Software` with VP8, never `Auto` or `Hardware` (VA-API crash). A setting can force software.
-- **Presets:** explicit `video_encoding` (bitrate and `max_framerate`) per Q12 quality, so 60 fps isn't lost to LiveKit's 30 fps 4K preset; caps per encoder (NVENC 4K30 and 1080p60, measured in the spike; 1440p60 not measured yet and dropped to 1080p60 if NVENC refuses it at level 3.1; software 1080p30); simulcast as LiveKit lays it out.
+- **Presets:** explicit `video_encoding` (bitrate and `max_framerate`) per Q12 quality, so 60 fps isn't lost to LiveKit's 30 fps 4K preset; caps per encoder (NVENC 4K30, 1440p60 and 1080p60; software 1080p30); simulcast as LiveKit lays it out.
 - **Remove Task 4's Vulkan Video encoder** (folded into the Task 4 commit with `--fixup`; the Vulkan device, DMA-BUF import and compute conversion stay, and the Task 4 tests that cover them).
 - **Encoder loss mid-call:** if stats show the encoder fell back or stopped (`encoder_implementation`, frames not encoded), the core republishes on the software path and tells the app once, like the audio GPU fallback in Phase 6.
 - **Clean exit:** `Shutdown` closes every call and waits for LiveKit's teardown before the core reports that it stopped (the NVDEC exit hang).
@@ -221,7 +221,7 @@ Rewritten 2026-10-14 (the Q5 fork and the passthrough are dropped).
 
 Acceptance:
 - CI (no GPU): the software path is unchanged (Task 5 tests); the encoder choice is unit-tested for every probe result; a build with the fetched header compiles NVENC in.
-- Hardware, on the human's machine (ignored tests, `hw-video`): encrypted call, test pattern, H.264 through NVENC with three layers: 4K30 ≥ 28 fps and 1440p60 and 1080p60 ≥ 55 fps delivered over 30 s, in order; a small tile gets a low layer and a full-screen tile the top one; the test process exits by itself after the call ends; shaping alice's uplink to 8 Mbps (a test-only `netem` sidecar with `NET_ADMIN` in `docker-compose.yml`, never `tc` on the host) lowers the top layer without freezes longer than 500 ms.
+- Hardware, on the human's machine (ignored tests, `hw-video`): encrypted call, test pattern, H.264 through NVENC with three layers: 4K30 ≥ 28 fps and 1440p60 and 1080p60 ≥ 55 fps delivered over 30 s, in order; a small tile gets a low layer and a full-screen tile the top one; the test process exits by itself after the call ends; a hardware encoder that fails mid-call falls back to software (forced with `TWICECAT_VIDEO_UNCAPPED=1`, 4K60, which LiveKit's NVENC refuses today). The uplink-shaping check moved to Task 14 (human, 2026-10-14).
 
 ### ~~Task 7: NVENC encoder through CUDA~~ (dropped 2026-10-14)
 LiveKit's NVENC encodes (Task 6). The original text is in git history.
@@ -261,6 +261,7 @@ Acceptance: CI builds and unit tests on both OSes; hardware tests are human item
 ### Task 14: 4K60 acceptance and tuning (phase9.14, `feat(video)` + docs)
 - The full-path hardware suite: encrypted room, 120 s, 4K60 screen share and 4K60 camera (test pattern), measuring delivered fps, freezes, capture-to-feed latency from the embedded timestamps (the last hop to the screen is a human item), encode and decode time, CPU and GPU load, uplink bitrate. Default bitrates and presets tuned from the results.
 - A/V offset: the test pattern flashes white with a 1 kHz tone every 2 s; the receiver measures the offset between the flash in the feed and the tone in the mixed output.
+- Uplink shaping (moved from Task 6 by the human 2026-10-14): a test-only sidecar with `NET_ADMIN` sharing the SFU's network namespace in `docker-compose.yml` (never `tc` on the host; its image asked for first) limits alice's uplink to 8 Mbps; the top layer drops without freezes longer than 500 ms.
 - `packet_buffer_size_video` in `dev/livekit/livekit.yaml` raised to what the measurements need, and the value documented for server admins in `docs/building.md`.
 
 Amended 2026-10-14: the 4K60 gate applies once LiveKit's NVENC can encode 4K60 (the level fix); until then it runs at 4K30 and 1440p60.

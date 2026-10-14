@@ -325,10 +325,11 @@ mod tests {
                     dirs.push(path);
                 } else if path.extension().is_some_and(|e| e == "rs")
                     && path.file_name().is_some_and(|n| n != "session.rs")
-                    // call_settings.rs, call.rs, types.rs, audio.rs and video.rs
-                    // serialize non-secret audio and video settings, room IDs
-                    // and similar public data.
+                    // call_settings.rs, video_settings.rs, call.rs, types.rs,
+                    // audio.rs and video.rs serialize non-secret audio and
+                    // video settings, room IDs and similar public data.
                     && path.file_name().is_some_and(|n| n != "call_settings.rs")
+                    && path.file_name().is_some_and(|n| n != "video_settings.rs")
                     && path.file_name().is_some_and(|n| n != "call.rs")
                     && path.file_name().is_some_and(|n| n != "types.rs")
                     && path.file_name().is_some_and(|n| n != "audio.rs")

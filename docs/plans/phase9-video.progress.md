@@ -16,3 +16,7 @@ Task 4: complete (commit "feat(video): convert, scale and encode H.264 with Vulk
 Task 5: started
 Task 5: complete (commit "feat(core): send and receive video in calls on the software path", gate ok: 1756 tests; ignored suite 140 passed)
   notes: [measured] 720p30 pattern in an encrypted call: 29.3 fps over 30 s, in order, every stamp read; adaptive stream starts at 320x180 until SetVideoView; [api] CoreConfig::video (VideoBackend::TestPattern), SetUserVolume source; [share-audio] the SFU never marks share sound as speaking; [open] received colour space not exposed by libwebrtc (BT.601 assumed), LiveKit's 720p default is 3 Mb/s
+Task 6: started
+Task 6: complete (commit "feat(core): encode video in hardware through LiveKit's encoders", gate ok: 1772 tests; ignored 139 passed, 1 one-off (call_media share sound, passed on rerun); hardware NVENC and fallback passed)
+  notes: [nvenc] 4K30 30.1, 1440p60 60.1, 1080p60 60.0 fps in three layers, NVDEC on the receiver; 4K60 capped (LiveKit's H.264 level 3.1); [abort] frames stop 150 ms before unpublish (SimulcastEncoderAdapter deque abort, upstream draft 6); [exit] NVDEC alive at exit hangs (upstream draft 5); [flake] 720p30 VP8 test misses 28 fps about 1 run in 8, bursts of loss in the first seconds, not the bitrate (A/B 9/10 each), for Task 14; [build] cuda.h from the pinned CUDA runtime wheel, CUDA_HOME=dev/cuda
+Task 7: dropped (human 2026-10-14: LiveKit's NVENC replaces it)

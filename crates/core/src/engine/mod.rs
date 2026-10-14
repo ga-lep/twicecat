@@ -142,6 +142,8 @@ impl Core {
             oauth: None,
             room_list_query: watch::channel(RoomListQuery::default()).0,
             audio_settings: None,
+            video_settings: None,
+            video_encoders: None,
             device_watcher: None,
             audio_session: None,
             call: None,
@@ -533,6 +535,10 @@ struct Engine {
     room_list_query: watch::Sender<RoomListQuery>,
     /// Audio settings, loaded from disk on first use.
     audio_settings: Option<AudioSettings>,
+    /// Video settings, loaded from disk on first use.
+    video_settings: Option<crate::api::VideoSettings>,
+    /// The video encoders LiveKit has here, found on first use.
+    video_encoders: Option<crate::call::VideoEncodersAvailable>,
     /// Hot-plug watcher, started by the first `ListAudioDevices`.
     device_watcher: Option<twicecat_audio::DeviceWatcher>,
     /// Open devices and the voice engine (mic test for now).
@@ -609,7 +615,7 @@ fn audio_devices(list: twicecat_audio::DeviceList) -> AudioDevices {
 }
 
 /// Runs blocking work (keychain, file system) off the async threads.
-async fn blocking<T, F>(f: F) -> Result<T, CoreError>
+pub(super) async fn blocking<T, F>(f: F) -> Result<T, CoreError>
 where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
@@ -1961,6 +1967,7 @@ impl Engine {
                 }))
                 .await;
             }
+            MediaNotice::EncoderLost(kind) => self.video_encoder_lost(kind).await,
         }
     }
 
@@ -3188,6 +3195,8 @@ mod tests {
             oauth: None,
             room_list_query: watch::channel(RoomListQuery::default()).0,
             audio_settings: None,
+            video_settings: None,
+            video_encoders: None,
             device_watcher: None,
             audio_session: None,
             call: None,
@@ -3377,6 +3386,8 @@ mod tests {
             oauth: None,
             room_list_query: watch::channel(RoomListQuery::default()).0,
             audio_settings: None,
+            video_settings: None,
+            video_encoders: None,
             device_watcher: None,
             audio_session: None,
             call: None,

@@ -23,7 +23,7 @@ SHARD_2="twicecat-core:e2ee_verification twicecat-app:bridge twicecat-core:e2ee_
 SHARD_3="twicecat-core:avatars twicecat-core:e2ee_identity twicecat-core:e2ee_rooms twicecat-core:lib twicecat-core:timeline twicecat-core:call_ringing twicecat-core:call_log_hygiene twicecat-core:call_video"
 SHARD_4="twicecat-core:rooms twicecat-core:e2ee_recovery twicecat-core:call_signalling twicecat-core:log_hygiene twicecat-core:threads twicecat-core:cli twicecat-app:calls"
 # Their ignored tests are all keyring/hardware_ ones (skipped) or none runs.
-NOT_SHARDED="twicecat-core:livekit_link twicecat-core:call_settings twicecat-core:gpu_enhancement twicecat-core:login_policy"
+NOT_SHARDED="twicecat-core:livekit_link twicecat-core:call_settings twicecat-core:gpu_enhancement twicecat-core:login_policy twicecat-core:call_video_fallback"
 
 shard_entries() {
     case $1 in

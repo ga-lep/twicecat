@@ -26,7 +26,9 @@ use futures_util::StreamExt as _;
 use livekit::e2ee::E2eeOptions;
 use livekit::e2ee::manager::E2eeManager;
 use livekit::id::ParticipantIdentity;
-use livekit::options::{AudioEncoding, TrackPublishOptions, VideoCodec as LkVideoCodec};
+use livekit::options::{
+    AudioEncoding, TrackPublishOptions, VideoCodec as LkVideoCodec, VideoEncoding, VideoPreset,
+};
 use livekit::prelude::{
     LocalAudioTrack, LocalParticipant, LocalTrack, LocalVideoTrack, Participant, RemoteAudioTrack,
     RemoteParticipant, RemoteTrack, RemoteTrackPublication, Room, RoomEvent, RoomOptions,
@@ -43,11 +45,13 @@ use tokio::task::JoinHandle;
 use twicecat_audio::{FRAME_LEN, Outgoing, SAMPLE_RATE, SILENCE, SourceId};
 
 use super::cleaning::{ANNOUNCE_KEY, Claim, Cleaning};
+use super::encoder::{self, Sending};
 use super::jwt::SfuAccess;
 use super::video::{LocalSend, PatternSender, Videos};
 use super::{UserVolumes, user_volume};
 use crate::api::{
-    CleaningStatus, CoreError, SoundSource, UserId, VideoFeed, VideoKind, VideoTrackId,
+    CleaningStatus, CoreError, EncoderBackend, SoundSource, UserId, VideoCodec, VideoFeed,
+    VideoKind, VideoQuality, VideoTrackId,
 };
 use crate::audio_session::{self, Voice};
 
@@ -97,6 +101,9 @@ pub(crate) enum MediaNotice {
     Reconnected,
     /// The SFU connection is gone for good.
     Disconnected,
+    /// The hardware encoder of our track of this kind stopped, or LiveKit
+    /// replaced it (`video`).
+    EncoderLost(VideoKind),
 }
 
 /// The identities a connection plays; the call updates it as memberships
@@ -258,8 +265,61 @@ impl Players {
 struct SentVideo {
     id: VideoTrackId,
     track: LocalVideoTrack,
-    /// Stops the frames when dropped.
-    _sender: PatternSender,
+    quality: VideoQuality,
+    backend: EncoderBackend,
+    sender: PatternSender,
+}
+
+/// How long the encoder gets to finish the frames it has before our track
+/// stops: a few frames at 30 fps.
+const ENCODER_DRAIN: Duration = Duration::from_millis(150);
+
+impl SentVideo {
+    /// Stops the frames and lets the encoder finish its last ones. LiveKit's
+    /// NVENC encoder aborts the process when a frame it encoded can no
+    /// longer be sent (it returns an error after handing the frame over,
+    /// and libwebrtc's simulcast adapter then pops an empty queue; webrtc-sys
+    /// 0.3.49 `src/nvidia/h264_encoder_impl.cpp:347-352`), which is what
+    /// unpublishing or closing the room while frames still come does.
+    async fn stop_frames(self) -> (VideoTrackId, LocalVideoTrack) {
+        self.sender.stop().await;
+        tokio::time::sleep(ENCODER_DRAIN).await;
+        (self.id, self.track)
+    }
+}
+
+/// LiveKit's publish options for our track of `kind` sent as `sending`:
+/// the encoder named (never LiveKit's `Auto`, see `encoder`), the codec, the
+/// top layer's bitrate and framerate, and our two lower layers in place of
+/// LiveKit's defaults (plan Q12), which it lists low first.
+fn video_options(kind: VideoKind, sending: &Sending) -> TrackPublishOptions {
+    let preset = |l: &twicecat_video::ladder::Layer| {
+        VideoPreset::new(
+            l.width,
+            l.height,
+            u64::from(l.bitrate_bps),
+            f64::from(l.fps),
+        )
+    };
+    let top = sending.layers[0];
+    TrackPublishOptions {
+        source: super::video::source_of(kind),
+        video_codec: match sending.codec {
+            VideoCodec::H264 => LkVideoCodec::H264,
+            VideoCodec::H265 => LkVideoCodec::H265,
+            VideoCodec::Vp9 => LkVideoCodec::VP9,
+            VideoCodec::Av1 => LkVideoCodec::AV1,
+            VideoCodec::Vp8 => LkVideoCodec::VP8,
+        },
+        video_encoder: encoder::livekit_backend(sending.backend),
+        video_encoding: Some(VideoEncoding {
+            max_bitrate: u64::from(top.bitrate_bps),
+            max_framerate: f64::from(top.fps),
+        }),
+        simulcast: sending.layers.len() > 1,
+        simulcast_layers: Some(sending.layers[1..].iter().rev().map(preset).collect()),
+        ..TrackPublishOptions::default()
+    }
 }
 
 /// One SFU connection.
@@ -408,15 +468,17 @@ impl SfuConnection {
         })
     }
 
-    /// Publishes a test pattern as our camera or screen share, `mode` =
-    /// (width, height, fps), encoded by libwebrtc (VP8 with simulcast).
-    /// Replaces the track of that kind we already send.
+    /// Publishes a test pattern as our camera or screen share at
+    /// `quality`, encoded by LiveKit as `sending` says (encoder, codec,
+    /// simulcast layers). Replaces the track of that kind we already send.
     pub(crate) async fn start_pattern(
         &mut self,
         kind: VideoKind,
-        mode: (u32, u32, u32),
+        quality: VideoQuality,
+        sending: &Sending,
     ) -> Result<VideoTrackId, CoreError> {
         self.stop_video(kind).await;
+        let mode = sending.mode();
         let (width, height, fps) = mode;
         let source =
             NativeVideoSource::new(VideoResolution { width, height }, kind == VideoKind::Screen);
@@ -431,15 +493,7 @@ impl SfuConnection {
             .local_participant()
             .publish_track(
                 LocalTrack::Video(track.clone()),
-                TrackPublishOptions {
-                    source: super::video::source_of(kind),
-                    video_codec: LkVideoCodec::VP8,
-                    // LiveKit's layers and bitrates for the size; its
-                    // defaults keep a camera's framerate and a screen's
-                    // resolution under load (plan Q12).
-                    simulcast: true,
-                    ..TrackPublishOptions::default()
-                },
+                video_options(kind, sending),
             )
             .await
             .map_err(|_| CoreError::Call("could not publish the video".into()))?;
@@ -468,6 +522,8 @@ impl SfuConnection {
             LocalSend {
                 kind,
                 track: track.clone(),
+                codec: sending.codec,
+                backend: sending.backend,
                 width,
                 height,
                 fps,
@@ -479,7 +535,9 @@ impl SfuConnection {
             SentVideo {
                 id: id.clone(),
                 track,
-                _sender: sender,
+                quality,
+                backend: sending.backend,
+                sender,
             },
         );
         Ok(id)
@@ -489,10 +547,11 @@ impl SfuConnection {
     pub(crate) async fn stop_video(&mut self, kind: VideoKind) {
         if let Some(sent) = self.videos_sent.remove(&kind) {
             self.videos.remove(&sent.id);
+            let (_, track) = sent.stop_frames().await;
             if self
                 .room
                 .local_participant()
-                .unpublish_track(&sent.track.sid())
+                .unpublish_track(&track.sid())
                 .await
                 .is_err()
             {
@@ -504,6 +563,11 @@ impl SfuConnection {
     /// Our video track of `kind`, while we send one.
     pub(crate) fn video_sent(&self, kind: VideoKind) -> Option<VideoTrackId> {
         self.videos_sent.get(&kind).map(|s| s.id.clone())
+    }
+
+    /// The quality and encoder of our track of `kind`, while we send one.
+    pub(crate) fn video_sending(&self, kind: VideoKind) -> Option<(VideoQuality, EncoderBackend)> {
+        self.videos_sent.get(&kind).map(|s| (s.quality, s.backend))
     }
 
     /// Mutes or unmutes the published track (others see it as muted).
@@ -553,8 +617,10 @@ impl SfuConnection {
             }
         }
         self.flags.changed.notify_one();
-        // Our frames stop with their senders.
-        self.videos_sent.clear();
+        // Our frames stop before the room goes (see `SentVideo`).
+        for (_, sent) in self.videos_sent.drain() {
+            sent.stop_frames().await;
+        }
         self.videos.remove_sfu(&self.key);
         let _ = self.room.close().await;
     }

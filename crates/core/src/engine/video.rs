@@ -1,14 +1,16 @@
-//! The engine's video commands (Phase 9). This task's sending is the
-//! software path with the test pattern as camera and screen
-//! ([`VideoBackend::TestPattern`]); real cameras, screens, the settings and
-//! our encoders answer `NotSupported` until their tasks.
+//! The engine's video commands (Phase 9). We send the test pattern as
+//! camera and screen ([`VideoBackend::TestPattern`]), encoded by the
+//! encoder the settings and this machine give (Task 6); real cameras and
+//! screens answer `NotSupported` until their tasks, as do previews.
 
-use super::Engine;
+use super::{Engine, blocking};
 use crate::api::{
-    Command, CoreError, CoreEvent, LocalVideo, RoomId, ScreenSource, ScreenSourceKind,
-    ScreenSources, TEST_PATTERN_ID, VideoBackend, VideoDevice, VideoDeviceId, VideoDevices,
-    VideoKind, VideoMode, VideoQuality,
+    Command, CoreError, CoreEvent, EncoderBackend, LocalVideo, RoomId, ScreenSource,
+    ScreenSourceKind, ScreenSources, TEST_PATTERN_ID, VideoBackend, VideoDevice, VideoDeviceId,
+    VideoDevices, VideoKind, VideoMode, VideoQuality, VideoSettings,
 };
+use crate::call::VideoEncodersAvailable;
+use crate::video_settings;
 
 /// The test pattern as a camera: every size and rate the qualities name.
 fn pattern_camera() -> VideoDevice {
@@ -102,7 +104,17 @@ impl Engine {
             },
             Command::ListVideoDevices => self.not_supported(feature(VideoKind::Camera)).await,
             Command::ListScreenSources => self.not_supported(feature(VideoKind::Screen)).await,
-            // Plan Tasks 6, 9 and 11.
+            Command::ProbeVideoEncoders => {
+                let in_use = self.video_in_use();
+                let encoders = self.video_encoders().await.encoders(in_use);
+                self.emit(CoreEvent::VideoEncoders(encoders)).await;
+            }
+            Command::GetVideoSettings => {
+                let settings = self.video_settings().await.clone();
+                self.emit(CoreEvent::VideoSettings(settings)).await;
+            }
+            Command::UpdateVideoSettings(settings) => self.store_video_settings(settings).await,
+            // Plan Tasks 9 and 11.
             _ => self.not_supported("video").await,
         }
     }
@@ -127,18 +139,114 @@ impl Engine {
                 .await;
             return;
         }
+        if self.call.is_none() {
+            self.emit(CoreEvent::Error(CoreError::NotInCall)).await;
+            return;
+        }
+        let choice = self.video_settings().await.encoder;
+        let backend = self.video_encoders().await.choose(choice);
+        self.send_video(kind, quality, backend).await;
+    }
+
+    /// Publishes our `kind` at `quality` on `backend`, and says what is sent
+    /// now (and which encoder, when that changed).
+    async fn send_video(
+        &mut self,
+        kind: VideoKind,
+        quality: VideoQuality,
+        backend: EncoderBackend,
+    ) {
+        let before = self.video_in_use();
         let Some(call) = self.call.as_mut() else {
             self.emit(CoreEvent::Error(CoreError::NotInCall)).await;
             return;
         };
-        let mode = crate::call::software_mode(quality);
-        match call.start_pattern(kind, mode).await {
-            Ok(_) => {
-                let local = call.local_video();
-                self.emit(CoreEvent::LocalVideo(local)).await;
-            }
+        let sending = crate::call::sending(backend, kind, quality);
+        let result = call.start_pattern(kind, quality, &sending).await;
+        let local = call.local_video();
+        match result {
+            Ok(_) => self.emit(CoreEvent::LocalVideo(local)).await,
             Err(e) => self.emit(CoreEvent::Error(e)).await,
         }
+        self.report_encoder_change(before).await;
+    }
+
+    /// Our hardware encoder for `kind` stopped or was replaced: the track is
+    /// sent again on the software path, once (plan Task 6).
+    pub(super) async fn video_encoder_lost(&mut self, kind: VideoKind) {
+        let Some((quality, backend)) = self.call.as_ref().and_then(|c| c.video_sending(kind))
+        else {
+            return;
+        };
+        if backend == EncoderBackend::Software {
+            return;
+        }
+        self.send_video(kind, quality, EncoderBackend::Software)
+            .await;
+    }
+
+    /// The encoder our video uses now: the camera's, else the screen's.
+    fn video_in_use(&self) -> Option<EncoderBackend> {
+        let call = self.call.as_ref()?;
+        call.video_sending(VideoKind::Camera)
+            .or_else(|| call.video_sending(VideoKind::Screen))
+            .map(|(_, backend)| backend)
+    }
+
+    /// Tells the front end when the encoder in use is no longer `before`.
+    async fn report_encoder_change(&mut self, before: Option<EncoderBackend>) {
+        let now = self.video_in_use();
+        if now != before {
+            let encoders = self.video_encoders().await.encoders(now);
+            self.emit(CoreEvent::VideoEncoders(encoders)).await;
+        }
+    }
+
+    /// What LiveKit can encode with here, found once (off the engine's
+    /// thread: the probe opens the GPU drivers).
+    async fn video_encoders(&mut self) -> &VideoEncodersAvailable {
+        if self.video_encoders.is_none() {
+            let found = blocking(VideoEncodersAvailable::detect)
+                .await
+                .unwrap_or_default();
+            self.video_encoders = Some(found);
+        }
+        self.video_encoders.as_ref().expect("found above")
+    }
+
+    /// The video settings, loaded from disk on first use. A file that cannot
+    /// be used is reported once and replaced by the defaults in memory.
+    async fn video_settings(&mut self) -> &VideoSettings {
+        if self.video_settings.is_none() {
+            let paths = self.config.data.clone();
+            let loaded = blocking(move || video_settings::load(&paths))
+                .await
+                .unwrap_or_else(|e| video_settings::Loaded {
+                    settings: VideoSettings::default(),
+                    problem: Some(e),
+                });
+            if let Some(problem) = loaded.problem {
+                self.emit(CoreEvent::Error(problem)).await;
+            }
+            self.video_settings = Some(loaded.settings);
+        }
+        self.video_settings.as_ref().expect("loaded above")
+    }
+
+    /// Adopts and saves new settings, and echoes them back. A failed save is
+    /// reported; the settings still apply for this run. Tracks being sent
+    /// keep their encoder until they are started again.
+    async fn store_video_settings(&mut self, settings: VideoSettings) {
+        let paths = self.config.data.clone();
+        let to_save = settings.clone();
+        let saved = blocking(move || video_settings::save(&paths, &to_save))
+            .await
+            .and_then(|r| r);
+        self.video_settings = Some(settings.clone());
+        if let Err(e) = saved {
+            self.emit(CoreEvent::Error(e)).await;
+        }
+        self.emit(CoreEvent::VideoSettings(settings)).await;
     }
 
     async fn stop_video(&mut self, kind: VideoKind) {

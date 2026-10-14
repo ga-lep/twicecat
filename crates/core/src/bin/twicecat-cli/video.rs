@@ -1,17 +1,19 @@
 //! Video commands of `twicecat-cli`: send the core's test pattern as the
 //! camera or a screen share, list the call's video tracks, pick their
-//! layers and print their statistics. A terminal shows no pictures, so
-//! received frames are only counted by the core's statistics.
+//! layers, print their statistics and the encoders this machine has. A
+//! terminal shows no pictures, so received frames are only counted by the
+//! core's statistics.
 
 use twicecat_core::api::{
-    Command, CoreEvent, LocalVideo, VideoDirection, VideoKind, VideoQuality, VideoStats,
-    VideoTrackId, VideoTrackView,
+    Command, CoreEvent, LocalVideo, VideoDirection, VideoEncoders, VideoKind, VideoQuality,
+    VideoStats, VideoTrackId, VideoTrackView,
 };
 
 use super::sanitize;
 
 pub(crate) const USAGE: &str = "/video | /video pattern <720p|1080p|1440p|2160p> <30|60> [screen] \
-     | /video off [screen] | /video view <n> <width>x<height>|hide | /video stats";
+     | /video off [screen] | /video view <n> <width>x<height>|hide | /video stats \
+     | /video encoders";
 
 /// A parsed `/video` command.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,6 +31,8 @@ pub(crate) enum VideoCmd {
     View { n: usize, size: Option<(u32, u32)> },
     /// Print the next statistics.
     Stats,
+    /// List the encoders this machine has.
+    Encoders,
 }
 
 /// The quality of a size and rate, as the core names them.
@@ -57,6 +61,7 @@ pub(crate) fn parse(arg: &str) -> Result<VideoCmd, &'static str> {
     match words.as_slice() {
         [] => Ok(VideoCmd::List),
         ["stats"] => Ok(VideoCmd::Stats),
+        ["encoders"] => Ok(VideoCmd::Encoders),
         ["pattern", res, fps, rest @ ..] if rest.len() <= 1 => Ok(VideoCmd::Pattern {
             kind: kind(rest.first().copied()).ok_or(USAGE)?,
             quality: quality(res, fps).ok_or(USAGE)?,
@@ -173,6 +178,7 @@ impl Video {
                 self.show_stats = true;
                 (Vec::new(), Vec::new())
             }
+            VideoCmd::Encoders => (vec![Command::ProbeVideoEncoders], Vec::new()),
         }
     }
 
@@ -219,6 +225,7 @@ impl Video {
                 self.show_stats = false;
                 self.stats_lines(&stats)
             }
+            CoreEvent::VideoEncoders(encoders) => encoder_lines(&encoders),
             _ => Vec::new(),
         }
     }
@@ -253,10 +260,44 @@ impl Video {
                 } else {
                     line.push_str(&format!(", {} freezes", s.freezes));
                 }
+                if let Some(name) = &s.implementation {
+                    let place = if s.hardware { "hardware" } else { "software" };
+                    line.push_str(&format!(", {} ({place})", sanitize(name)));
+                }
                 line
             })
             .collect()
     }
+}
+
+/// The encoders, best first, and the one in use.
+fn encoder_lines(encoders: &VideoEncoders) -> Vec<String> {
+    let mut lines: Vec<String> = encoders
+        .encoders
+        .iter()
+        .map(|e| {
+            let mut line = format!("[video] encoder {:?}", e.backend);
+            if let Some(gpu) = &e.gpu {
+                line.push_str(&format!(" on {}", sanitize(gpu)));
+            }
+            line.push_str(if e.hardware {
+                " (hardware):"
+            } else {
+                " (software):"
+            });
+            for c in &e.codecs {
+                line.push_str(&format!(
+                    " {:?} {}x{}@{}",
+                    c.codec, c.max_width, c.max_height, c.max_fps
+                ));
+            }
+            line
+        })
+        .collect();
+    if let Some(backend) = encoders.in_use {
+        lines.push(format!("[video] sending with {backend:?}"));
+    }
+    lines
 }
 
 #[cfg(test)]
@@ -313,6 +354,7 @@ mod tests {
         );
         assert_eq!(parse("view 2 big"), Err(USAGE));
         assert_eq!(parse("stats"), Ok(VideoCmd::Stats));
+        assert_eq!(parse("encoders"), Ok(VideoCmd::Encoders));
         assert_eq!(parse("off camera"), Err(USAGE));
     }
 
@@ -363,6 +405,8 @@ mod tests {
                     frame_ms: Some(2.25),
                     limitation: Default::default(),
                     freezes: 0,
+                    implementation: Some("NVIDIA H264 Decoder".into()),
+                    hardware: true,
                 }],
             })
         };
@@ -370,7 +414,10 @@ mod tests {
         video.command(VideoCmd::Stats);
         assert_eq!(
             video.event(stats()),
-            ["[video] ?. received 1280x720 29.5 fps 1500 kb/s, 2.2 ms a frame, 0 freezes"]
+            [
+                "[video] ?. received 1280x720 29.5 fps 1500 kb/s, 2.2 ms a frame, 0 freezes, \
+              NVIDIA H264 Decoder (hardware)"
+            ]
         );
         assert!(video.event(stats()).is_empty());
     }

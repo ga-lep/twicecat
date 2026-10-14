@@ -34,6 +34,7 @@ mod threads;
 mod timeline;
 mod upload;
 mod verification;
+mod video_settings;
 
 pub use cpu_level::require_cpu_level;
 pub use engine::{Core, CoreConfig, CoreHandle, DEFAULT_ROOM_LIST_PAGE_SIZE};

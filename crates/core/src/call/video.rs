@@ -2,11 +2,14 @@
 //! everyone else's on every SFU connection, reported as `VideoTracks` with
 //! a [`VideoFeed`] per track, and their statistics about once a second.
 //!
-//! This task's sending is the software path: raw frames into LiveKit's
-//! video source, encoded by libwebrtc (VP8, simulcast as LiveKit lays it
-//! out, at most 1080p30). The only frames we send so far come from the test
-//! pattern ([`VideoBackend::TestPattern`](crate::api::VideoBackend)); real
-//! capture comes with Tasks 8 and 9, our own encoders with Task 6.
+//! We send raw frames into LiveKit's video source; LiveKit encodes them
+//! with the encoder [`super::encoder`] picks (NVENC or VideoToolbox H.264,
+//! else libwebrtc's VP8) and makes the simulcast layers. The only frames we
+//! send so far come from the test pattern
+//! ([`VideoBackend::TestPattern`](crate::api::VideoBackend)); real capture
+//! comes with Tasks 8 and 9. A hardware encoder that stops, or that LiveKit
+//! replaced, is reported to the engine ([`MediaNotice::EncoderLost`]), which
+//! sends the track again on the software path.
 //!
 //! A remote track is shown only while its sender is an active member of the
 //! call, as for audio (`media`): the call services hand out tokens to any
@@ -36,19 +39,21 @@ use tokio::task::JoinHandle;
 use twicecat_video::CpuFrame;
 use twicecat_video::test_pattern::TestPattern;
 
+use super::encoder;
+use super::media::MediaNotice;
 use super::membership::Membership;
 use crate::api::{
-    CoreEvent, DeviceId, ParticipantId, QualityLimitation, RoomId, UserId, VideoCodec,
-    VideoDirection, VideoFeed, VideoFeedSender, VideoFrame, VideoKind, VideoMatrix,
-    VideoPixelFormat, VideoPlane, VideoQuality, VideoRange, VideoStats, VideoTrackId,
-    VideoTrackStats, VideoTrackView,
+    CoreEvent, DeviceId, EncoderBackend, ParticipantId, QualityLimitation, RoomId, UserId,
+    VideoCodec, VideoDirection, VideoFeed, VideoFeedSender, VideoFrame, VideoKind, VideoMatrix,
+    VideoPixelFormat, VideoPlane, VideoRange, VideoStats, VideoTrackId, VideoTrackStats,
+    VideoTrackView,
 };
 
 /// How often statistics are read and sent.
 const STATS_EVERY: Duration = Duration::from_secs(1);
-/// The software path's largest picture and rate (plan Q3 a).
-const SOFTWARE_MAX: (u32, u32, u32) = (1920, 1080, 30);
-
+/// Reports in a row in which the source delivered frames and a hardware
+/// encoder encoded none, before it counts as lost.
+const STALLED_REPORTS: u8 = 3;
 /// Microseconds on the core's video clock: monotonic, from the first time
 /// anything in this process asks for it. Frame timestamps and the test
 /// pattern's send times use it.
@@ -56,25 +61,6 @@ pub(crate) fn clock_us() -> i64 {
     static EPOCH: OnceLock<Instant> = OnceLock::new();
     let epoch = *EPOCH.get_or_init(Instant::now);
     i64::try_from(epoch.elapsed().as_micros()).unwrap_or(i64::MAX)
-}
-
-/// What we send for one quality on the software path: the size and rate
-/// asked for, capped at 1080p30. `Auto` is the cap.
-pub(crate) fn software_mode(quality: VideoQuality) -> (u32, u32, u32) {
-    let (w, h, fps) = match quality {
-        VideoQuality::Hd720p30 => (1280, 720, 30),
-        VideoQuality::Hd1080p60 => (1920, 1080, 60),
-        VideoQuality::Qhd1440p60 => (2560, 1440, 60),
-        VideoQuality::Uhd2160p30 => (3840, 2160, 30),
-        VideoQuality::Uhd2160p60 => (3840, 2160, 60),
-        VideoQuality::Auto => SOFTWARE_MAX,
-    };
-    let (max_w, max_h, max_fps) = SOFTWARE_MAX;
-    if h > max_h {
-        (max_w, max_h, fps.min(max_fps))
-    } else {
-        (w, h, fps.min(max_fps))
-    }
 }
 
 /// The LiveKit source of a kind of track.
@@ -178,6 +164,8 @@ struct Track {
     /// Copies received frames into the feed.
     reader: Option<JoinHandle<()>>,
     totals: Totals,
+    /// Ours: the hardware encoder we asked LiveKit for, watched.
+    encoder: Option<EncoderWatch>,
 }
 
 impl Drop for Track {
@@ -211,11 +199,18 @@ pub(crate) struct Videos {
     state: Arc<StdMutex<State>>,
     changed: Arc<Notify>,
     own: (String, Member),
+    /// Where a lost encoder is reported.
+    notices: Option<mpsc::Sender<MediaNotice>>,
 }
 
 impl Videos {
-    /// The registry of a call we take part in as `user_id` on `device_id`.
-    pub(crate) fn new(user_id: &str, device_id: &str) -> Self {
+    /// The registry of a call we take part in as `user_id` on `device_id`;
+    /// a hardware encoder that is lost is reported to `notices`.
+    pub(crate) fn new(
+        user_id: &str,
+        device_id: &str,
+        notices: Option<mpsc::Sender<MediaNotice>>,
+    ) -> Self {
         let identity = super::membership::member_id(user_id, device_id);
         let own = Member {
             participant: ParticipantId::from(identity.as_str()),
@@ -229,6 +224,7 @@ impl Videos {
             state: Arc::new(StdMutex::new(state)),
             changed: Arc::new(Notify::new()),
             own: (identity, own),
+            notices,
         }
     }
 
@@ -292,6 +288,7 @@ impl Videos {
             publication: Some(publication),
             reader: Some(reader),
             totals: Totals::default(),
+            encoder: None,
         };
         // A track of the same ID (resubscribed) replaces the old one.
         self.change(|s| {
@@ -309,13 +306,15 @@ impl Videos {
             width: local.width,
             height: local.height,
             fps: Some(local.fps),
-            codec: Some(VideoCodec::Vp8),
+            codec: Some(local.codec),
             muted: false,
             feed: Some(local.feed),
             rtc: Rtc::Local(local.track),
             publication: None,
             reader: None,
             totals: Totals::default(),
+            encoder: (local.backend != EncoderBackend::Software)
+                .then(|| EncoderWatch::new(local.backend)),
         };
         self.change(|s| {
             s.tracks.insert(id, entry);
@@ -483,6 +482,7 @@ impl Videos {
             return None;
         }
         let mut out = Vec::with_capacity(tracks.len());
+        let mut lost = Vec::new();
         for (id, rtc) in tracks {
             let (direction, report) = match &rtc {
                 Rtc::Local(t) => (VideoDirection::Sent, t.get_stats().await),
@@ -496,12 +496,30 @@ impl Videos {
                 VideoDirection::Sent => Reading::sent(&report),
                 VideoDirection::Received => Reading::received(&report),
             };
+            let (implementation, hardware) = implementation(&report, direction);
             let mut state = self.state.lock().expect("videos lock");
             let Some(track) = state.tracks.get_mut(&id) else {
                 continue;
             };
-            out.push(reading.stats(id, direction, &track.totals, now));
+            if let Some(watch) = &mut track.encoder
+                && watch.update(&reading, implementation.as_deref())
+            {
+                lost.push(track.kind);
+            }
+            let mut stats = reading.stats(id, direction, &track.totals, now);
+            stats.implementation = implementation;
+            stats.hardware = hardware;
+            out.push(stats);
             track.totals = reading.totals(now);
+        }
+        if let Some(notices) = &self.notices {
+            for kind in lost {
+                tracing::warn!(
+                    ?kind,
+                    "the hardware video encoder stopped; sending in software"
+                );
+                let _ = notices.send(MediaNotice::EncoderLost(kind)).await;
+            }
         }
         Some(VideoStats { tracks: out })
     }
@@ -518,12 +536,23 @@ struct Reading {
     busy_s: f64,
     limitation: QualityLimitation,
     freezes: u32,
+    /// Sent: some layer is active (dynacast pauses the ones nobody takes).
+    active: bool,
+    /// Sent: frames encoded over every layer.
+    encoded: u64,
+    /// Sent: frames the source delivered.
+    source_frames: u64,
 }
 
 impl Reading {
     fn sent(report: &[RtcStats]) -> Self {
         let mut r = Self::default();
         for stats in report {
+            if let RtcStats::MediaSource(m) = stats
+                && m.source.kind == "video"
+            {
+                r.source_frames = u64::from(m.video.frames);
+            }
             let RtcStats::OutboundRtp(s) = stats else {
                 continue;
             };
@@ -531,6 +560,8 @@ impl Reading {
                 continue;
             }
             r.bytes += s.sent.bytes_sent;
+            r.encoded += u64::from(s.outbound.frames_encoded);
+            r.active |= s.outbound.active;
             // The largest layer that is sent stands for the track.
             if s.outbound.active && s.outbound.frame_height >= r.height {
                 r.width = s.outbound.frame_width;
@@ -617,7 +648,72 @@ impl Reading {
                 VideoDirection::Received => QualityLimitation::None,
             },
             freezes: self.freezes,
+            implementation: None,
+            hardware: false,
         }
+    }
+}
+
+/// The encoder (sent) or decoder (received) a report names, and whether it
+/// runs in hardware: the first video stream that names one.
+fn implementation(report: &[RtcStats], direction: VideoDirection) -> (Option<String>, bool) {
+    for stats in report {
+        let found = match (stats, direction) {
+            (RtcStats::OutboundRtp(s), VideoDirection::Sent) if s.stream.kind == "video" => (
+                s.outbound.encoder_implementation.as_str(),
+                s.outbound.power_efficient_encoder,
+            ),
+            (RtcStats::InboundRtp(s), VideoDirection::Received) if s.stream.kind == "video" => (
+                s.inbound.decoder_implementation.as_str(),
+                s.inbound.power_efficient_decoder,
+            ),
+            _ => continue,
+        };
+        if !found.0.is_empty() {
+            return (Some(found.0.to_owned()), found.1);
+        }
+    }
+    (None, false)
+}
+
+/// Watches one of our tracks sent on a hardware encoder: it is lost when
+/// LiveKit names another encoder (it fell back), or when the source keeps
+/// delivering frames and no active layer encodes any for
+/// [`STALLED_REPORTS`] reports (the encoder failed to start or stopped).
+#[derive(Clone, Copy, Debug)]
+struct EncoderWatch {
+    backend: EncoderBackend,
+    last: Option<(u64, u64)>,
+    stalls: u8,
+    lost: bool,
+}
+
+impl EncoderWatch {
+    fn new(backend: EncoderBackend) -> Self {
+        Self {
+            backend,
+            last: None,
+            stalls: 0,
+            lost: false,
+        }
+    }
+
+    /// Takes a report; true the one time the encoder counts as lost.
+    fn update(&mut self, reading: &Reading, implementation: Option<&str>) -> bool {
+        if self.lost {
+            return false;
+        }
+        let replaced = implementation.is_some_and(|i| !encoder::is_running(self.backend, i));
+        let stalled = match self.last {
+            Some((source, encoded)) => {
+                reading.active && reading.source_frames > source && reading.encoded <= encoded
+            }
+            None => false,
+        };
+        self.last = Some((reading.source_frames, reading.encoded));
+        self.stalls = if stalled { self.stalls + 1 } else { 0 };
+        self.lost = replaced || self.stalls >= STALLED_REPORTS;
+        self.lost
     }
 }
 
@@ -683,6 +779,9 @@ fn to_feed_frame(frame: &BoxVideoFrame) -> VideoFrame {
 pub(crate) struct LocalSend {
     pub kind: VideoKind,
     pub track: LocalVideoTrack,
+    pub codec: VideoCodec,
+    /// Watched when it is a hardware encoder.
+    pub backend: EncoderBackend,
     pub width: u32,
     pub height: u32,
     pub fps: u32,
@@ -691,9 +790,10 @@ pub(crate) struct LocalSend {
 }
 
 /// Sends a test pattern into a LiveKit source from its own thread, until
-/// dropped.
+/// stopped or dropped.
 pub(crate) struct PatternSender {
     stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl PatternSender {
@@ -706,16 +806,28 @@ impl PatternSender {
     ) -> Result<Self, std::io::Error> {
         let stop = Arc::new(AtomicBool::new(false));
         let running = stop.clone();
-        std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name("twicecat-video-pattern".into())
             .spawn(move || send_pattern(&source, &feed, (width, height, fps), &running))?;
-        Ok(Self { stop })
+        Ok(Self {
+            stop,
+            thread: Some(thread),
+        })
+    }
+
+    /// Stops the frames and waits until the last one is handed over (within
+    /// a frame), off the async runtime's threads.
+    pub(crate) async fn stop(mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = tokio::task::spawn_blocking(move || thread.join()).await;
+        }
     }
 }
 
 impl Drop for PatternSender {
     fn drop(&mut self) {
-        // The thread ends within a frame; nothing waits for it.
+        // Without `stop`: the thread ends within a frame; nothing waits.
         self.stop.store(true, Ordering::Relaxed);
     }
 }
@@ -795,13 +907,51 @@ fn to_api_frame(frame: &CpuFrame, timestamp_us: i64) -> VideoFrame {
 mod tests {
     use super::*;
 
+    fn sending(source_frames: u64, encoded: u64) -> Reading {
+        Reading {
+            active: true,
+            source_frames,
+            encoded,
+            ..Reading::default()
+        }
+    }
+
     #[test]
-    fn the_software_path_caps_at_1080p30() {
-        assert_eq!(software_mode(VideoQuality::Hd720p30), (1280, 720, 30));
-        assert_eq!(software_mode(VideoQuality::Hd1080p60), (1920, 1080, 30));
-        assert_eq!(software_mode(VideoQuality::Uhd2160p60), (1920, 1080, 30));
-        assert_eq!(software_mode(VideoQuality::Qhd1440p60), (1920, 1080, 30));
-        assert_eq!(software_mode(VideoQuality::Auto), (1920, 1080, 30));
+    fn a_hardware_encoder_that_encodes_nothing_is_lost_after_three_reports() {
+        let mut watch = EncoderWatch::new(EncoderBackend::Nvenc);
+        assert!(!watch.update(&sending(30, 0), None));
+        assert!(!watch.update(&sending(60, 0), None));
+        assert!(!watch.update(&sending(90, 0), None));
+        assert!(watch.update(&sending(120, 0), None));
+        // Reported once.
+        assert!(!watch.update(&sending(150, 0), None));
+    }
+
+    #[test]
+    fn a_hardware_encoder_that_encodes_or_waits_for_frames_is_kept() {
+        let mut watch = EncoderWatch::new(EncoderBackend::Nvenc);
+        let nvenc = Some("SimulcastEncoderAdapter (NVIDIA H264 Encoder, NVIDIA H264 Encoder)");
+        for i in 1..10 {
+            assert!(!watch.update(&sending(30 * i, 90 * i), nvenc));
+        }
+        // No frames from the source (a stalled camera) is not the encoder's
+        // fault, and neither are layers dynacast paused.
+        for _ in 0..5 {
+            assert!(!watch.update(&sending(270, 810), nvenc));
+        }
+        let paused = Reading {
+            active: false,
+            ..sending(1000, 810)
+        };
+        for _ in 0..5 {
+            assert!(!watch.update(&paused, nvenc));
+        }
+    }
+
+    #[test]
+    fn a_hardware_encoder_libwebrtc_replaced_is_lost_at_once() {
+        let mut watch = EncoderWatch::new(EncoderBackend::Nvenc);
+        assert!(watch.update(&sending(30, 30), Some("libvpx")));
     }
 
     #[test]

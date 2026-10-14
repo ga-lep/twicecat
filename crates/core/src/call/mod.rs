@@ -21,6 +21,7 @@
 
 mod cleaning;
 mod e2ee;
+mod encoder;
 mod jwt;
 mod media;
 pub(crate) mod membership;
@@ -51,6 +52,7 @@ use self::cleaning::Cleaning;
 pub(crate) use self::cleaning::announcement;
 use self::e2ee::KeyPlanner;
 pub(crate) use self::e2ee::SECRET_LOG_TARGETS;
+pub(crate) use self::encoder::{Available as VideoEncodersAvailable, Sending, sending};
 pub(crate) use self::media::MediaNotice;
 use self::media::{ConnectionShared, Publish, SfuConnection, SharedFlags};
 use self::membership::MEMBERSHIP_EXPIRES;
@@ -61,10 +63,9 @@ pub(crate) use self::participants::active_memberships;
 use self::participants::{Ours, watch_participants};
 use self::sfus::{Expected, Remotes, SfuManager, manage_sfus};
 use self::video::Videos;
-pub(crate) use self::video::software_mode;
 use crate::api::{
-    AudioSettings, CallIntent, CoreError, CoreEvent, LocalVideo, RemoteCleaning, RoomId,
-    SoundSource, UserId, VideoKind, VideoTrackId, VoiceCleaning,
+    AudioSettings, CallIntent, CoreError, CoreEvent, EncoderBackend, LocalVideo, RemoteCleaning,
+    RoomId, SoundSource, UserId, VideoKind, VideoQuality, VideoTrackId, VoiceCleaning,
 };
 
 pub(crate) fn now_ms() -> u64 {
@@ -240,7 +241,7 @@ impl CallSession {
         let (notices_all, from_connections) = mpsc::channel(16);
         let own_identity = membership::member_id(&user_id, &device_id);
         let remotes: Remotes = Arc::default();
-        let videos = Videos::new(&user_id, &device_id);
+        let videos = Videos::new(&user_id, &device_id, Some(to_engine.clone()));
         let mut session = Self {
             room_id: room_id.clone(),
             room: room.clone(),
@@ -447,12 +448,18 @@ impl CallSession {
     pub(crate) async fn start_pattern(
         &mut self,
         kind: VideoKind,
-        mode: (u32, u32, u32),
+        quality: VideoQuality,
+        sending: &Sending,
     ) -> Result<VideoTrackId, CoreError> {
         match self.own.as_mut() {
-            Some(own) => own.start_pattern(kind, mode).await,
+            Some(own) => own.start_pattern(kind, quality, sending).await,
             None => Err(CoreError::NotInCall),
         }
+    }
+
+    /// The quality and encoder of our track of `kind`, while we send one.
+    pub(crate) fn video_sending(&self, kind: VideoKind) -> Option<(VideoQuality, EncoderBackend)> {
+        self.own.as_ref().and_then(|own| own.video_sending(kind))
     }
 
     /// Stops sending our camera or screen share.

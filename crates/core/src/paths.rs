@@ -269,11 +269,36 @@ impl DataPaths {
     /// the old or the new file. On Unix the file gets mode 0o600 and the
     /// root 0o700.
     pub fn write_call_settings(&self, bytes: &[u8]) -> std::io::Result<()> {
+        self.write_private("call_settings.json", bytes)
+    }
+
+    /// `<root>/video_settings.json`: camera, qualities, codec and encoder
+    /// choices (plan Phase 9). No secrets.
+    pub fn video_settings_file(&self) -> PathBuf {
+        self.root.join("video_settings.json")
+    }
+
+    /// Reads the video settings file; a missing file is `Ok(None)`.
+    pub fn read_video_settings(&self) -> std::io::Result<Option<Vec<u8>>> {
+        match std::fs::read(self.video_settings_file()) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Replaces the video settings file atomically, as
+    /// [`Self::write_call_settings`] does.
+    pub fn write_video_settings(&self, bytes: &[u8]) -> std::io::Result<()> {
+        self.write_private("video_settings.json", bytes)
+    }
+
+    fn write_private(&self, name: &str, bytes: &[u8]) -> std::io::Result<()> {
         use std::io::Write as _;
 
         create_private_dir_all(&self.root)?;
-        let path = self.call_settings_file();
-        let tmp = self.root.join("call_settings.json.tmp");
+        let path = self.root.join(name);
+        let tmp = self.root.join(format!("{name}.tmp"));
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create(true).truncate(true);
         #[cfg(unix)]
@@ -609,6 +634,21 @@ mod tests {
         );
         assert!(!dir.path().join("root/call_settings.json.tmp").exists());
         assert!(paths.call_settings_file().starts_with(paths.root()));
+    }
+
+    #[test]
+    fn video_settings_round_trip_and_replace() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = DataPaths::at(dir.path().join("root"));
+        assert_eq!(paths.read_video_settings().unwrap(), None);
+        paths.write_video_settings(b"{\"a\":1}").unwrap();
+        paths.write_video_settings(b"{\"a\":2}").unwrap();
+        assert_eq!(
+            paths.read_video_settings().unwrap().as_deref(),
+            Some(&b"{\"a\":2}"[..])
+        );
+        assert!(!dir.path().join("root/video_settings.json.tmp").exists());
+        assert!(paths.read_call_settings().unwrap().is_none());
     }
 
     #[cfg(unix)]

@@ -1,6 +1,7 @@
-//! Audio settings through the core API: defaults, validation, persistence
-//! across restarts, per-user volume, a corrupt file, device listing, and the
-//! call commands that are not available yet. Needs no server or audio device.
+//! Audio and video settings through the core API: defaults, validation,
+//! persistence across restarts, per-user volume, a corrupt file, device
+//! listing, the video encoders, and the call commands that are not
+//! available yet. Needs no server or audio device.
 
 mod common;
 
@@ -9,9 +10,9 @@ use std::sync::Arc;
 use common::{expect_event, silence, start_core, start_core_with_audio, start_core_with_video};
 use twicecat_core::CoreHandle;
 use twicecat_core::api::{
-    AudioSettings, CallIntent, Command, CoreError, CoreEvent, InputMode, PushToTalkBindings,
-    RoomId, SoundSource, TEST_PATTERN_ID, UserId, VideoBackend, VideoQuality, VideoSettings,
-    VideoTrackId,
+    AudioSettings, CallIntent, Command, CoreError, CoreEvent, EncoderBackend, EncoderChoice,
+    InputMode, PushToTalkBindings, RoomId, SoundSource, TEST_PATTERN_ID, UserId, VideoBackend,
+    VideoQuality, VideoSettings, VideoTrackId,
 };
 use twicecat_core::paths::DataPaths;
 use twicecat_core::secrets::InMemorySecretStore;
@@ -198,12 +199,6 @@ async fn video_commands_answer_without_a_call_or_hardware() {
             },
             NotInCall,
         ),
-        (Command::GetVideoSettings, NotSupported("video")),
-        (
-            Command::UpdateVideoSettings(VideoSettings::default()),
-            NotSupported("video"),
-        ),
-        (Command::ProbeVideoEncoders, NotSupported("video")),
         (
             Command::StartCameraPreview {
                 device: None,
@@ -225,6 +220,66 @@ async fn video_commands_answer_without_a_call_or_hardware() {
         };
         assert!(ok, "{name}: {e:?}");
     }
+    send(&handle, Command::Shutdown).await;
+}
+
+async fn video_settings(handle: &mut CoreHandle) -> VideoSettings {
+    match expect_event(handle, |e| matches!(e, CoreEvent::VideoSettings(_))).await {
+        CoreEvent::VideoSettings(s) => s,
+        _ => unreachable!("filtered by the predicate"),
+    }
+}
+
+/// Video settings start at their defaults, are saved, and come back after a
+/// restart; a forced software encoder stays forced.
+#[tokio::test]
+async fn video_settings_persist_across_restarts() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut handle = core(dir.path());
+    send(&handle, Command::GetVideoSettings).await;
+    assert_eq!(video_settings(&mut handle).await, VideoSettings::default());
+    assert!(!DataPaths::at(dir.path()).video_settings_file().exists());
+    let chosen = VideoSettings {
+        encoder: EncoderChoice::Prefer(EncoderBackend::Software),
+        screen_quality: VideoQuality::Uhd2160p30,
+        ..VideoSettings::default()
+    };
+    send(&handle, Command::UpdateVideoSettings(chosen.clone())).await;
+    assert_eq!(video_settings(&mut handle).await, chosen);
+    send(&handle, Command::Shutdown).await;
+    while handle.events.recv().await.is_some() {}
+
+    let mut handle = core(dir.path());
+    send(&handle, Command::GetVideoSettings).await;
+    assert_eq!(video_settings(&mut handle).await, chosen);
+    send(&handle, Command::Shutdown).await;
+}
+
+/// The encoder list always ends with the software path, and names no
+/// encoder in use outside a call.
+#[tokio::test]
+async fn the_encoders_end_with_software() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut handle = core(dir.path());
+    send(&handle, Command::ProbeVideoEncoders).await;
+    let e = expect_event(&mut handle, |e| matches!(e, CoreEvent::VideoEncoders(_))).await;
+    let CoreEvent::VideoEncoders(encoders) = e else {
+        unreachable!("filtered by the predicate")
+    };
+    let last = encoders
+        .encoders
+        .last()
+        .expect("at least the software path");
+    assert_eq!(last.backend, EncoderBackend::Software);
+    assert!(!last.hardware);
+    assert!(
+        encoders
+            .encoders
+            .iter()
+            .all(|e| e.hardware == (e.backend != EncoderBackend::Software)),
+        "{encoders:?}"
+    );
+    assert_eq!(encoders.in_use, None);
     send(&handle, Command::Shutdown).await;
 }
 
