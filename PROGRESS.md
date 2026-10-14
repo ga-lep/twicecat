@@ -1715,6 +1715,13 @@ Phase 2 signed off by the human on 2026-10-02 (merge of PR #3). Every other unti
 - **Phase 9 Task 1** runs `call_log_hygiene` again after the livekit bump. The raw layer's count of key lines shows whether the new libwebrtc still logs keys.
 - **Checks:** the gate was clean (1700 tests, clippy also with `--all-features`); `check-core-api.sh` passes (its comment now lists `filter`); `call_log_hygiene` and `log_hygiene` pass on the local stack.
 
+## Phase 6 / the release-tail test failed on the macOS CI runner (fixed 2026-10-14)
+
+- **Symptom:** PR #23's `test (macos-latest)` job failed in `crates/app/tests/ptt.rs`: `a_release_keeps_transmitting_for_the_delay_then_stops` saw the gate close "3.17472375s after the release" of a 1000 ms tail (the bound is 3 s). The branch does not touch push-to-talk; earlier macOS runs passed.
+- **Cause:** the runner was slow, not the code. The gate counts its tail in 10 ms frames (`crates/audio/src/gate.rs`), and the virtual device is paced by a 10 ms sleep that, when it falls behind, starts again from the clock instead of catching up (`AudioIo::start_virtual`). On a starved CPU the 100 frames of the tail take longer than 1 s on the clock, and the test measured the clock. Reproduced here by running the test at `nice 19` on one CPU beside four busy loops: the old test failed 4 of 4 runs ("closed 4.47s", "4.85s"…).
+- **Fix:** the test measures in audio. Its silent virtual microphone counts the frames it captures, each level remembers the count when it was seen, and the release tail is checked in frames (still on at least 500 ms of audio after the release, off between 0.7 and 3 s of audio). The no-delay test checks its 500 ms the same way. The waits for the levels allow 30 s and 15 s on the clock instead of 10 s and 5 s, and a failure prints both the audio and the clock time.
+- **Checks:** the starved run passed 4 of 4 runs with the new test; the gate was clean (1732 tests, clippy also with `--all-features`); `check-app-deps.sh`, `check-core-api.sh` and `check-no-webrtc-download.sh` pass.
+
 ## Phase 6 / a screen share's sound replaced the sharer's voice (fixed 2026-10-13)
 
 - **Found:** while planning Phase 9 (ga-lep/twicecat#22, "Before this phase").
@@ -2377,7 +2384,7 @@ Plan approved by the human 2026-10-13 (Q1-Q6 answered: the service runs only in 
 
 ### Step 26: the release tail end to end (phase6.26)
 - **`crates/app/tests/ptt.rs` (new), not ignored:** it needs no homeserver. The real `Bridge` and core run with `AudioBackend::Virtual` (silence). The app is put on its main screen with made-up session events, and only audio events are passed to it. A fake service gives the test its sink. Settings go to the core directly; the card and the mic test are opened through `App::update`, which starts the (fake) service.
-  - `a_release_keeps_transmitting_for_the_delay_then_stops`: 1000 ms delay. Closed until pressed; a press reaches the core through the forwarding thread and the mic test's `InputLevel::transmitting` turns on; after the release it is still on at least 500 ms later and off between 0.7 and 3 s.
+  - `a_release_keeps_transmitting_for_the_delay_then_stops`: 1000 ms delay. Closed until pressed; a press reaches the core through the forwarding thread and the mic test's `InputLevel::transmitting` turns on; after the release it is still on at least 500 ms of audio later and off between 0.7 and 3 s of audio (measured in the frames the virtual microphone captured; on the clock it can take longer on a busy runner).
   - `without_a_delay_a_release_stops_at_once_and_voice_activity_ignores_presses`: 0 ms delay closes within 500 ms; in voice activity, with a silent microphone, a press opens nothing for 500 ms.
 - **Runs:** 10 in a row, all passed (about 1.2 s each). Mutation: the forwarding thread always sending `pressed: true` fails both tests; reverted.
 
