@@ -27,6 +27,7 @@ use crate::text_safety::{
     ELLIPSIS, MAX_BODY_CHARS, MAX_NAME_CHARS, multi_line_capped, name_or_placeholder,
 };
 use crate::theme;
+use crate::ui::kit;
 
 /// Spoilers the user revealed, as (item ID, spoiler index).
 pub type Revealed = HashSet<(String, usize)>;
@@ -482,12 +483,17 @@ fn blocks_column<'a>(
             }
             Block::Quote(inner) => {
                 col = col.push(
-                    row![
-                        rule::vertical(3),
-                        blocks_column(inner, ctx, theme, walk, depth + 1)
-                    ]
-                    .spacing(8)
-                    .height(Shrink),
+                    container(
+                        row![
+                            kit::quote_bar(),
+                            blocks_column(inner, ctx, theme, walk, depth + 1)
+                        ]
+                        .spacing(8)
+                        .height(Shrink),
+                    )
+                    .padding([2, 6])
+                    .width(Fill)
+                    .style(kit::quote_surface_style),
                 );
             }
             Block::List {
@@ -521,25 +527,19 @@ fn blocks_column<'a>(
 
 fn code_block<'a>(code: String) -> Element<'a, Message> {
     container(
-        text(code)
-            .font(Font::MONOSPACE)
-            .wrapping(Wrapping::WordOrGlyph)
-            .width(Fill),
+        row![
+            kit::quote_bar(),
+            text(code)
+                .font(Font::MONOSPACE)
+                .wrapping(Wrapping::WordOrGlyph)
+                .width(Fill)
+        ]
+        .spacing(8)
+        .height(Shrink),
     )
     .width(Fill)
     .padding(6)
-    .style(|theme: &Theme| {
-        let palette = theme.extended_palette();
-        container::Style {
-            background: Some(Background::Color(palette.background.weak.color)),
-            border: Border {
-                color: palette.background.strong.color,
-                width: 1.0,
-                radius: 4.0.into(),
-            },
-            ..container::Style::default()
-        }
-    })
+    .style(kit::quote_surface_style)
     .into()
 }
 

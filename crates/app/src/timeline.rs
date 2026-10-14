@@ -20,6 +20,7 @@ use twicecat_core::api::{
 };
 
 use crate::media::{has_caption, media_box};
+use crate::ui::tokens::Density;
 
 /// How far outside the viewport rows are built, in pixels.
 pub const OVERSCAN_PX: f32 = 600.0;
@@ -65,15 +66,26 @@ const MAX_ESTIMATED_LINES: usize = 500;
 
 const LINE_H: f32 = 20.0;
 const HEADER_H: f32 = 22.0;
-/// Space above a row that starts with a header.
-pub const TOP_PAD: f32 = 8.0;
-/// Space above a continuation row.
-pub const CONTINUATION_PAD: f32 = 2.0;
+/// Space above a row that starts with a header, besides the density's
+/// [`Density::timeline_row_pad`].
+const TOP_PAD_BASE: f32 = 4.0;
+
+/// Space above a message row: more above a header row, which starts a new
+/// run of one sender, than above a continuation. Compact trims both through
+/// [`Density::timeline_row_pad`]; the row's structure stays the same.
+pub fn top_pad(continuation: bool, density: Density) -> f32 {
+    let pad = density.timeline_row_pad();
+    if continuation {
+        pad / 2.0
+    } else {
+        TOP_PAD_BASE + pad
+    }
+}
 /// Left margin of the content column (room for the header and avatar).
 pub const INDENT_PX: f32 = 64.0;
 /// Right margin of the content column.
 pub const SIDE_PAD_PX: f32 = 16.0;
-const CHAR_W: f32 = 7.5;
+const CHAR_W: f32 = 8.2;
 const MIN_CHARS_PER_LINE: usize = 8;
 const BLOCK_GAP: f32 = 6.0;
 const REPLY_H: f32 = 44.0;
@@ -198,16 +210,22 @@ pub fn media_height(media: &MediaContent) -> f32 {
 ///
 /// `continuation` rows have no header and less padding. The estimate grows
 /// with the text, and is finite for any `width`.
-pub fn estimate_height(item: &TimelineItem, continuation: bool, width: f32) -> f32 {
-    estimate_unclamped(item, continuation, width).min(MAX_MEASURED_PX)
+pub fn estimate_height(
+    item: &TimelineItem,
+    continuation: bool,
+    width: f32,
+    density: Density,
+) -> f32 {
+    estimate_unclamped(item, continuation, width, density).min(MAX_MEASURED_PX)
 }
 
-fn estimate_unclamped(item: &TimelineItem, continuation: bool, width: f32) -> f32 {
-    let lead = if continuation {
-        CONTINUATION_PAD
-    } else {
-        TOP_PAD + HEADER_H
-    };
+fn estimate_unclamped(
+    item: &TimelineItem,
+    continuation: bool,
+    width: f32,
+    density: Density,
+) -> f32 {
+    let lead = top_pad(continuation, density) + if continuation { 0.0 } else { HEADER_H };
     let receipts = if item.read_by.is_empty() {
         0.0
     } else {
@@ -291,12 +309,13 @@ fn row_height(
     i: usize,
     measured: &HashMap<String, f32>,
     width: f32,
+    density: Density,
 ) -> f32 {
     let item = &items[i];
     measured
         .get(&item.id)
         .copied()
-        .unwrap_or_else(|| estimate_height(item, is_continuation(items, i), width))
+        .unwrap_or_else(|| estimate_height(item, is_continuation(items, i), width, density))
 }
 
 /// Tops of all rows: `prefix[i]` is where item `i` starts, `prefix[n]` is the
@@ -305,12 +324,13 @@ pub fn rebuild_prefix(
     items: &[TimelineItem],
     measured: &HashMap<String, f32>,
     width: f32,
+    density: Density,
 ) -> Vec<f32> {
     let mut prefix = Vec::with_capacity(items.len() + 1);
     let mut top = 0.0;
     prefix.push(top);
     for i in 0..items.len() {
-        top += row_height(items, i, measured, width);
+        top += row_height(items, i, measured, width, density);
         prefix.push(top);
     }
     prefix
@@ -565,6 +585,8 @@ pub struct TimelineView {
     pub viewport_h: f32,
     /// Width of the viewport.
     pub width: f32,
+    /// The density the rows are drawn in, which sets their estimated heights.
+    density: Density,
     /// The top visible item and its position in the viewport; `None` at the
     /// bottom.
     pub anchor: Option<(String, f32)>,
@@ -600,6 +622,7 @@ impl Default for TimelineView {
             offset_from_bottom: 0.0,
             viewport_h: DEFAULT_VIEWPORT_H,
             width: DEFAULT_WIDTH,
+            density: Density::default(),
             anchor: None,
             pagination: PaginationState::Idle,
             last_marked: None,
@@ -632,6 +655,7 @@ impl TimelineView {
         *self = Self {
             viewport_h: self.viewport_h,
             width: self.width,
+            density: self.density,
             ..Self::default()
         };
     }
@@ -858,7 +882,7 @@ impl TimelineView {
             let live: HashSet<&str> = self.items.iter().map(|i| i.id.as_str()).collect();
             self.measured.retain(|id, _| live.contains(id.as_str()));
         }
-        self.prefix = rebuild_prefix(&self.items, &self.measured, self.width);
+        self.prefix = rebuild_prefix(&self.items, &self.measured, self.width, self.density);
         let mut effects = self.settle(&candidates);
         self.drive_jump(&mut effects, true);
         effects
@@ -886,11 +910,26 @@ impl TimelineView {
         self.settle(&candidates)
     }
 
+    /// The density the rows are estimated for.
+    pub fn density(&self) -> Density {
+        self.density
+    }
+
+    /// Sets the density the rows are drawn in. A change drops the measured
+    /// heights (rows change height with it) and keeps the distance from the
+    /// bottom, so the view keeps its place.
+    pub fn set_density(&mut self, density: Density) {
+        if self.density != density {
+            self.density = density;
+            self.reset_measurements();
+        }
+    }
+
     /// Forgets the measured row heights, as when a density switch changes
     /// them. The distance from the bottom stays, so the view keeps its place.
     pub fn reset_measurements(&mut self) {
         self.measured.clear();
-        self.prefix = rebuild_prefix(&self.items, &self.measured, self.width);
+        self.prefix = rebuild_prefix(&self.items, &self.measured, self.width, self.density);
     }
 
     /// The pane scrolled or changed size. A width change beyond one pixel
@@ -904,7 +943,7 @@ impl TimelineView {
         if width_changed {
             self.width = width;
             self.measured.clear();
-            self.prefix = rebuild_prefix(&self.items, &self.measured, self.width);
+            self.prefix = rebuild_prefix(&self.items, &self.measured, self.width, self.density);
         }
         self.offset_from_bottom = finite_or_zero(offset_from_bottom);
         self.anchor = record_anchor(
@@ -1055,15 +1094,15 @@ mod tests {
         );
         for continuation in [false, true] {
             assert_eq!(
-                estimate_height(&plain, continuation, 800.0),
-                estimate_height(&shielded, continuation, 800.0)
+                estimate_height(&plain, continuation, 800.0, Density::Comfortable),
+                estimate_height(&shielded, continuation, 800.0, Density::Comfortable)
             );
         }
         let waiting = utd_placeholder("u", None);
         let reasoned = utd_placeholder("u", Some(UtdReason::SentBeforeWeJoined));
         assert_eq!(
-            estimate_height(&waiting, false, 800.0),
-            estimate_height(&reasoned, false, 800.0)
+            estimate_height(&waiting, false, 800.0, Density::Comfortable),
+            estimate_height(&reasoned, false, 800.0, Density::Comfortable)
         );
     }
 
@@ -1119,13 +1158,19 @@ mod tests {
     #[test]
     fn a_header_makes_a_message_taller_than_a_continuation() {
         let item = msg_with("a", "@a:x", 0, rich(vec![text_block(20)]));
-        assert!(estimate_height(&item, false, 800.0) > estimate_height(&item, true, 800.0));
+        assert!(
+            estimate_height(&item, false, 800.0, Density::Comfortable)
+                > estimate_height(&item, true, 800.0, Density::Comfortable)
+        );
     }
 
     #[test]
     fn narrower_panes_wrap_into_more_lines() {
         let item = msg_with("a", "@a:x", 0, rich(vec![text_block(600)]));
-        assert!(estimate_height(&item, false, 300.0) > estimate_height(&item, false, 1200.0));
+        assert!(
+            estimate_height(&item, false, 300.0, Density::Comfortable)
+                > estimate_height(&item, false, 1200.0, Density::Comfortable)
+        );
     }
 
     #[test]
@@ -1133,7 +1178,7 @@ mod tests {
         let mut last = 0.0_f32;
         for len in (0..3000).step_by(7) {
             let item = msg_with("a", "@a:x", 0, rich(vec![text_block(len)]));
-            let h = estimate_height(&item, false, 640.0);
+            let h = estimate_height(&item, false, 640.0, Density::Comfortable);
             assert!(h >= last, "len {len}: {h} < {last}");
             last = h;
         }
@@ -1148,7 +1193,10 @@ mod tests {
             0,
             rich(vec![text_block(10), text_block(10), text_block(10)]),
         );
-        assert!(estimate_height(&three, false, 800.0) > estimate_height(&one, false, 800.0));
+        assert!(
+            estimate_height(&three, false, 800.0, Density::Comfortable)
+                > estimate_height(&one, false, 800.0, Density::Comfortable)
+        );
         let breaks = msg_with(
             "a",
             "@a:x",
@@ -1165,7 +1213,10 @@ mod tests {
                 },
             ])]),
         );
-        assert!(estimate_height(&breaks, false, 800.0) > estimate_height(&one, false, 800.0));
+        assert!(
+            estimate_height(&breaks, false, 800.0, Density::Comfortable)
+                > estimate_height(&one, false, 800.0, Density::Comfortable)
+        );
     }
 
     #[test]
@@ -1182,9 +1233,9 @@ mod tests {
         }
         let mut read = base.clone();
         read.read_by.push(UserId::from("@b:x"));
-        let h = estimate_height(&base, false, 800.0);
-        assert!(estimate_height(&reacted, false, 800.0) > h);
-        assert!(estimate_height(&read, false, 800.0) > h);
+        let h = estimate_height(&base, false, 800.0, Density::Comfortable);
+        assert!(estimate_height(&reacted, false, 800.0, Density::Comfortable) > h);
+        assert!(estimate_height(&read, false, 800.0, Density::Comfortable) > h);
     }
 
     #[test]
@@ -1200,7 +1251,7 @@ mod tests {
         ];
         for item in &items {
             for width in [f32::NAN, -5.0, 0.0, 1.0, f32::INFINITY, 800.0] {
-                let h = estimate_height(item, false, width);
+                let h = estimate_height(item, false, width, Density::Comfortable);
                 assert!(h.is_finite() && h >= 0.0, "{item:?} at {width}: {h}");
             }
         }
@@ -1266,16 +1317,60 @@ mod tests {
         assert!(!is_continuation(&items, 1));
     }
 
+    #[test]
+    fn compact_trims_only_the_padding_of_a_row_not_its_parts() {
+        let item = msg("a", "@a:x", 0);
+        for continuation in [false, true] {
+            let comfortable = estimate_height(&item, continuation, 800.0, Density::Comfortable);
+            let compact = estimate_height(&item, continuation, 800.0, Density::Compact);
+            let trimmed = top_pad(continuation, Density::Comfortable)
+                - top_pad(continuation, Density::Compact);
+            assert!(trimmed > 0.0, "continuation {continuation}");
+            assert_eq!(comfortable - compact, trimmed);
+        }
+        // Dividers, markers and state lines are the same in both.
+        for kind in [
+            TimelineItemKind::DateDivider { timestamp_ms: 0 },
+            TimelineItemKind::ReadMarker,
+            TimelineItemKind::TimelineStart,
+        ] {
+            let item = TimelineItem::new("x".to_owned(), kind);
+            assert_eq!(
+                estimate_height(&item, false, 800.0, Density::Comfortable),
+                estimate_height(&item, false, 800.0, Density::Compact)
+            );
+        }
+    }
+
+    #[test]
+    fn a_density_change_re_estimates_and_keeps_the_place() {
+        let mut view = TimelineView::default();
+        view.apply_diffs(vec![ListDiff::Reset {
+            values: (0..20).map(|i| msg(&format!("m{i}"), "@a:x", i)).collect(),
+        }]);
+        view.offset_from_bottom = 90.0;
+        let comfortable = *view.prefix.last().expect("a prefix");
+        view.set_density(Density::Compact);
+        assert_eq!(view.density(), Density::Compact);
+        assert!(*view.prefix.last().expect("a prefix") < comfortable);
+        assert_eq!(view.offset_from_bottom, 90.0);
+        view.reset();
+        assert_eq!(view.density(), Density::Compact, "a new room keeps it");
+    }
+
     // ---- rebuild_prefix ---------------------------------------------------
 
     #[test]
     fn the_prefix_has_one_more_entry_than_the_items() {
         let items = [msg("a", "@a:x", 0), divider("d"), msg("b", "@b:x", 0)];
-        let prefix = rebuild_prefix(&items, &HashMap::new(), 800.0);
+        let prefix = rebuild_prefix(&items, &HashMap::new(), 800.0, Density::Comfortable);
         assert_eq!(prefix.len(), 4);
         assert_eq!(prefix[0], 0.0);
         assert!(prefix.windows(2).all(|w| w[1] > w[0]));
-        assert_eq!(rebuild_prefix(&[], &HashMap::new(), 800.0), vec![0.0]);
+        assert_eq!(
+            rebuild_prefix(&[], &HashMap::new(), 800.0, Density::Comfortable),
+            vec![0.0]
+        );
     }
 
     #[test]
@@ -1283,7 +1378,7 @@ mod tests {
         let items = [msg("a", "@a:x", 0), msg("b", "@b:x", 0)];
         let measured = HashMap::from([("a".to_owned(), 100.0), ("b".to_owned(), 50.0)]);
         assert_eq!(
-            rebuild_prefix(&items, &measured, 800.0),
+            rebuild_prefix(&items, &measured, 800.0, Density::Comfortable),
             vec![0.0, 100.0, 150.0]
         );
     }
@@ -1383,7 +1478,7 @@ mod tests {
             .iter()
             .map(|id| ((*id).to_owned(), heights.get(id).copied().unwrap_or(100.0)))
             .collect();
-        let prefix = rebuild_prefix(&items, &measured, 800.0);
+        let prefix = rebuild_prefix(&items, &measured, 800.0, Density::Comfortable);
         (items, prefix)
     }
 
@@ -2044,7 +2139,10 @@ mod tests {
     fn the_estimate_is_capped_however_many_blocks_there_are() {
         let blocks = (0..5_000).map(|_| text_block(10_000)).collect();
         let item = msg_with("a", "@a:x", 0, rich(blocks));
-        assert_eq!(estimate_height(&item, false, 800.0), MAX_MEASURED_PX);
+        assert_eq!(
+            estimate_height(&item, false, 800.0, Density::Comfortable),
+            MAX_MEASURED_PX
+        );
     }
 
     // ---- read receipts (plan Q12) -------------------------------------------
@@ -2302,14 +2400,14 @@ mod tests {
 
     #[test]
     fn a_local_echo_estimate_has_room_for_its_status_line() {
-        let sent = estimate_height(&msg("a", "@a:x", 0), false, 800.0);
-        let sending = estimate_height(&sending_msg("a"), false, 800.0);
+        let sent = estimate_height(&msg("a", "@a:x", 0), false, 800.0, Density::Comfortable);
+        let sending = estimate_height(&sending_msg("a"), false, 800.0, Density::Comfortable);
         assert!(sending > sent);
     }
 
     #[test]
     fn an_edited_message_estimate_has_room_for_its_marker() {
-        let plain = estimate_height(&msg("a", "@a:x", 0), false, 800.0);
+        let plain = estimate_height(&msg("a", "@a:x", 0), false, 800.0, Density::Comfortable);
         let edited = msg_with(
             "a",
             "@a:x",
@@ -2319,6 +2417,6 @@ mod tests {
                 ..MessageDetails::default()
             },
         );
-        assert!(estimate_height(&edited, false, 800.0) > plain);
+        assert!(estimate_height(&edited, false, 800.0, Density::Comfortable) > plain);
     }
 }
