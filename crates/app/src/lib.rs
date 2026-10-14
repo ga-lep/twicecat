@@ -14,6 +14,7 @@ pub mod dates;
 pub mod dialogs;
 pub mod emoji;
 pub mod keys;
+pub mod layout;
 pub mod links;
 pub mod media;
 pub mod notifications;

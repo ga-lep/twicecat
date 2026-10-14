@@ -313,6 +313,8 @@ pub enum Message {
     },
     /// The window gained or lost focus.
     WindowFocus(bool),
+    /// The window was resized to this logical width.
+    WindowResized(f32),
     /// The timer of a delayed read receipt ended.
     ReadDue(RoomId),
     /// **Retry** on a failed local echo.
@@ -467,6 +469,13 @@ pub struct App {
     pub list_offset_y: f32,
     /// Height of the room list viewport, in pixels.
     pub list_viewport_h: f32,
+    /// The window's logical width, from `window::resize_events`.
+    pub window_width: f32,
+    /// The side panel opened last (see [`crate::layout::layout_for`]).
+    pub newest_panel: crate::layout::SidePanel,
+    /// The row height the list was last laid out with, so a change of the
+    /// list as shown keeps the place in it.
+    pub(crate) shown_row_height: f32,
     /// The loaded length for which `LoadMoreRooms` was last sent.
     pub load_more_at: Option<usize>,
     /// Avatar requests and answers of this session (plan Q11).
@@ -630,6 +639,9 @@ impl App {
             search_input: String::new(),
             list_offset_y: 0.0,
             list_viewport_h: room_list::DEFAULT_VIEWPORT_HEIGHT,
+            window_width: crate::layout::DEFAULT_WINDOW_WIDTH,
+            newest_panel: crate::layout::SidePanel::default(),
+            shown_row_height: 0.0,
             load_more_at: None,
             avatars: Avatars::default(),
             selected: None,
@@ -943,7 +955,40 @@ impl App {
                 | Message::Pasted(_)
                 | Message::PasteFallback(_)
         );
+        let thread_before = self.threads.panel.is_some();
+        let call_before = self.calls.panel_shown(self.selected.as_ref());
+        let resized = matches!(message, Message::WindowResized(_));
+        let fills_before = self.pane_layout().panel_fills;
         let task = self.update_inner(message);
+        self.note_panels(thread_before, call_before);
+        // The reaction picker takes the keyboard: it must never stay open in
+        // a pane the user cannot see.
+        if self
+            .actions
+            .picker
+            .as_ref()
+            .is_some_and(|p| !self.pane_shows_item(p.in_thread))
+        {
+            self.actions.picker = None;
+        }
+        // The room pane is shown again: what it could not report while it
+        // was hidden (the receipt for what arrived) is due now.
+        let task = if fills_before && !self.pane_layout().panel_fills {
+            Task::batch([task, self.read_receipt(Instant::now())])
+        } else {
+            task
+        };
+        // The list as shown may have changed (a panel opened in a medium
+        // window): keep the first visible room at the top. A resize only
+        // records the new height: it must not start a task, and the offset
+        // stays what the scrollable really has.
+        let task = if resized {
+            self.shown_row_height = self.room_row_height();
+            task
+        } else {
+            let place = self.keep_list_place(self.shown_row_height);
+            Task::batch([task, place])
+        };
         self.sync_ptt();
         if touches_composer && self.selected.is_some() {
             self.draft_dirty = true;
@@ -1012,6 +1057,13 @@ impl App {
                 self.pick_suggestion_at(Some(index), Instant::now())
             }
             Message::MembersDue => self.members_due_at(Instant::now()),
+            // The room pane behind a panel has no width: what it reports then
+            // is not what the user will see.
+            Message::RowMeasured { .. } | Message::TimelineScrolled(_)
+                if self.pane_layout().panel_fills =>
+            {
+                Task::none()
+            }
             Message::RowMeasured { id, height } => {
                 let effects = self.timeline.row_measured(&id, height);
                 self.timeline_effects(effects)
@@ -1062,6 +1114,10 @@ impl App {
                 if self.actions.hovered.as_deref() == Some(id.as_str()) {
                     self.actions.hovered = None;
                 }
+                Task::none()
+            }
+            Message::WindowResized(width) => {
+                self.window_width = width;
                 Task::none()
             }
             Message::WindowOpened(_) => {
@@ -1119,9 +1175,12 @@ impl App {
                 self.after_edit_left(was_edit)
             }
             Message::PickerOpened(id) => {
-                if self.buttons_for(&id).is_some_and(|b| b.react) {
+                let in_thread = self.is_thread_item(&id);
+                if self.buttons_for(&id).is_some_and(|b| b.react) && self.pane_shows_item(in_thread)
+                {
                     self.actions.picker = Some(Picker {
                         target: id,
+                        in_thread,
                         query: String::new(),
                     });
                     return operation::focus(actions::PICKER_INPUT_ID);
@@ -1214,6 +1273,13 @@ impl App {
             Message::Threads(message) => self.on_threads(message),
             Message::Shortcut { shortcut, captured } => self.on_shortcut(shortcut, captured),
             Message::Switcher(message) => self.on_switcher(message),
+            // Ctrl+U and drops are for the room: with its pane hidden behind
+            // a panel the user would pick files for a room they cannot see.
+            Message::AttachRequested | Message::FileHovered | Message::FileDropped(_)
+                if self.pane_layout().panel_fills =>
+            {
+                Task::none()
+            }
             Message::AttachRequested => {
                 self.uploads_for_room();
                 self.attach_requested()
@@ -1836,10 +1902,34 @@ impl App {
         self.ui_settings.density.into()
     }
 
+    /// What the main window shows at its width.
+    pub fn pane_layout(&self) -> crate::layout::PaneLayout {
+        crate::layout::layout_for(
+            self.window_width,
+            self.ui_settings.room_list,
+            self.threads.panel.is_some(),
+            self.calls.panel_shown(self.selected.as_ref()),
+            self.newest_panel,
+        )
+    }
+
+    /// Remembers which side panel was opened last, given which were open
+    /// before the message. Closing one leaves the other as it was.
+    fn note_panels(&mut self, thread_before: bool, call_before: bool) {
+        let thread = self.threads.panel.is_some();
+        let call = self.calls.panel_shown(self.selected.as_ref());
+        if call && !call_before {
+            self.newest_panel = crate::layout::SidePanel::Call;
+        }
+        if thread && !thread_before {
+            self.newest_panel = crate::layout::SidePanel::Thread;
+        }
+    }
+
     /// The height of a row of the room list as shown now: the density's, or
     /// the rail's fixed one.
     pub fn room_row_height(&self) -> f32 {
-        room_list::list_row_height(self.density(), self.ui_settings.room_list)
+        room_list::list_row_height(self.density(), self.pane_layout().list)
     }
 
     /// What follows every change of the list or of the viewport: paging and
@@ -1987,6 +2077,19 @@ impl App {
             })
     }
 
+    /// Whether the pane that draws an item of the thread panel (`in_thread`)
+    /// or of the room's timeline is on screen: the room pane has no width
+    /// while a panel fills the window, and the thread panel is out of sight
+    /// when the call panel has the turn.
+    fn pane_shows_item(&self, in_thread: bool) -> bool {
+        let layout = self.pane_layout();
+        if in_thread {
+            layout.thread && self.threads.panel.is_some()
+        } else {
+            !layout.panel_fills
+        }
+    }
+
     /// Whether `id` is an item of the thread panel.
     fn is_thread_item(&self, id: &str) -> bool {
         self.threads
@@ -2095,7 +2198,12 @@ impl App {
     /// An emoji was picked: react with it and close the picker.
     fn pick_reaction(&mut self, key: &str) -> Task<Message> {
         match self.actions.picker.take() {
-            Some(picker) => self.toggle_reaction(&picker.target, key),
+            // Defence in depth: `update` closes a hidden picker, so this
+            // only refuses what no one could have seen.
+            Some(picker) if self.pane_shows_item(picker.in_thread) => {
+                self.toggle_reaction(&picker.target, key)
+            }
+            Some(_) => Task::none(),
             None => Task::none(),
         }
     }
@@ -2540,6 +2648,11 @@ impl App {
         let Some(room_id) = self.selected.clone() else {
             return Task::none();
         };
+        // Nothing of a room pane that has no width is seen, so nothing is
+        // marked read; the resize that shows it again asks once more.
+        if self.pane_layout().panel_fills {
+            return Task::none();
+        }
         match self.timeline.read_step(self.window_focused, now) {
             timeline::ReadStep::Idle => Task::none(),
             timeline::ReadStep::Send => self.send(Command::MarkRead {
@@ -2554,9 +2667,12 @@ impl App {
     /// with the window focused. Never a public receipt.
     fn move_read_marker(&mut self) -> Task<Message> {
         match &self.selected {
-            Some(room_id) if self.timeline.bottom_seen => self.send(Command::MoveReadMarker {
-                room_id: room_id.clone(),
-            }),
+            // Not for a pane that was hidden when the room was left: what
+            // arrived meanwhile was not seen.
+            Some(room_id) if self.timeline.bottom_seen && !self.pane_layout().panel_fills => self
+                .send(Command::MoveReadMarker {
+                    room_id: room_id.clone(),
+                }),
             _ => Task::none(),
         }
     }
@@ -2653,6 +2769,7 @@ impl App {
             },
             system::theme_changes().map(Message::ThemeMode),
             window::open_events().map(Message::WindowOpened),
+            window::resize_events().map(|(_, size)| Message::WindowResized(size.width)),
             tray::subscription(),
             self.ptt.subscription(),
         ])
@@ -10066,8 +10183,14 @@ mod tests {
             let slots = |app: &App| {
                 let element = crate::screens::main_view::main_row(app);
                 let tree = Tree::new(element.as_widget());
+                // The room pane is the column `[header, timeline, bars,
+                // editor]`. The header changes
+                // shape with the pane's width (it stacks when narrow), so
+                // what must keep its place is everything under it.
                 let mut room_tags = Vec::new();
-                tags(&tree.children[2], &mut room_tags);
+                for part in &tree.children[2].children[1..] {
+                    tags(part, &mut room_tags);
+                }
                 (tree.children.len(), room_tags)
             };
             let (n_closed, room_closed) = slots(&app);
@@ -11415,6 +11538,422 @@ mod tests {
                 captured: true,
             });
             assert!(app.threads.panel.is_none());
+        }
+    }
+
+    // ---- UI/UX rework Task 8: narrow windows ----
+
+    mod narrow_window {
+        use twicecat_core::api::{CallState, EventId, RoomListChoice};
+
+        use super::*;
+        use crate::keys::Shortcut;
+        use crate::layout::{PaneLayout, SidePanel};
+        use crate::threads::ThreadsMessage;
+
+        fn resize(app: &mut App, width: f32) -> Task<Message> {
+            app.update(Message::WindowResized(width))
+        }
+
+        fn open_thread(app: &mut App) {
+            let _ = app.update(Message::Threads(ThreadsMessage::Open(EventId::from(
+                "$r:x",
+            ))));
+            assert!(app.threads.panel.is_some());
+        }
+
+        fn open_call_panel(app: &mut App) {
+            if app.calls.call.is_none() {
+                let _ = app.update(core(CoreEvent::CallState(CallState::Connected {
+                    room_id: RoomId::from("!a:x"),
+                    encrypted: true,
+                })));
+            }
+            if !app.calls.panel_open {
+                let _ = app.update(Message::Call(crate::calls::CallMessage::TogglePanel));
+            }
+            assert!(app.calls.panel_shown(app.selected.as_ref()));
+        }
+
+        fn key(app: &mut App, shortcut: Shortcut) {
+            let _ = app.update(Message::Shortcut {
+                shortcut,
+                captured: false,
+            });
+        }
+
+        #[test]
+        fn a_resize_records_the_width_and_runs_no_task() {
+            let (mut app, mut rx) = main_app();
+            assert_eq!(app.window_width, crate::layout::DEFAULT_WINDOW_WIDTH);
+            for width in [1500.0, 1000.0, 700.0, 1200.0] {
+                assert_eq!(resize(&mut app, width).units(), 0, "{width}");
+                assert_eq!(app.window_width, width);
+            }
+            assert!(drain(&mut rx).is_empty(), "no command either");
+        }
+
+        fn layout(app: &App) -> PaneLayout {
+            app.pane_layout()
+        }
+
+        #[test]
+        fn crossing_both_thresholds_with_no_panel_changes_only_the_sidebar() {
+            let (mut app, _rx) = main_app();
+            let _ = resize(&mut app, 1280.0);
+            assert!(layout(&app).sidebar);
+            assert_eq!(layout(&app).list, RoomListChoice::Expanded);
+            let _ = resize(&mut app, 900.0);
+            assert!(layout(&app).sidebar);
+            assert_eq!(layout(&app).list, RoomListChoice::Expanded);
+            let _ = resize(&mut app, 700.0);
+            assert!(!layout(&app).sidebar);
+            assert_eq!(layout(&app).list, RoomListChoice::Rail);
+            assert!(!layout(&app).panel_fills, "nothing to fill with");
+            let _ = resize(&mut app, 1280.0);
+            assert!(layout(&app).sidebar);
+            assert_eq!(layout(&app).list, RoomListChoice::Expanded);
+        }
+
+        #[test]
+        fn crossing_both_thresholds_with_the_thread_open() {
+            let (mut app, _rx) = main_app();
+            open_thread(&mut app);
+            let _ = resize(&mut app, 1280.0);
+            let wide = layout(&app);
+            assert!(wide.thread && wide.sidebar && !wide.panel_fills);
+            assert_eq!(wide.list, RoomListChoice::Expanded);
+            let _ = resize(&mut app, 1000.0);
+            assert!(layout(&app).thread);
+            assert_eq!(layout(&app).list, RoomListChoice::Rail);
+            let _ = resize(&mut app, 700.0);
+            let narrow = layout(&app);
+            assert!(narrow.thread && !narrow.sidebar && narrow.panel_fills);
+            assert_eq!(narrow.list, RoomListChoice::Rail);
+        }
+
+        #[test]
+        fn crossing_both_thresholds_with_the_call_panel_open() {
+            let (mut app, _rx) = main_app();
+            open_call_panel(&mut app);
+            let _ = resize(&mut app, 1280.0);
+            assert!(layout(&app).call && !layout(&app).panel_fills);
+            let _ = resize(&mut app, 1000.0);
+            assert!(layout(&app).call);
+            assert_eq!(layout(&app).list, RoomListChoice::Rail);
+            let _ = resize(&mut app, 700.0);
+            assert!(layout(&app).call && layout(&app).panel_fills);
+            assert!(!layout(&app).sidebar);
+        }
+
+        #[test]
+        fn with_both_open_the_last_opened_shows_and_the_other_waits() {
+            let (mut app, _rx) = main_app();
+            open_thread(&mut app);
+            open_call_panel(&mut app);
+            let _ = resize(&mut app, 1280.0);
+            assert!(
+                layout(&app).thread && layout(&app).call,
+                "both are side panes"
+            );
+            for width in [1000.0, 700.0] {
+                let _ = resize(&mut app, width);
+                assert!(layout(&app).call && !layout(&app).thread, "{width}");
+            }
+            // The thread is opened again after the panel: it is the newest.
+            let _ = app.update(Message::Threads(ThreadsMessage::Close));
+            open_thread(&mut app);
+            for width in [1000.0, 700.0] {
+                let _ = resize(&mut app, width);
+                assert!(layout(&app).thread && !layout(&app).call, "{width}");
+            }
+            assert_eq!(app.newest_panel, SidePanel::Thread);
+        }
+
+        #[test]
+        fn the_saved_choice_never_changes_with_the_width_and_nothing_is_saved() {
+            let (mut app, mut rx) = main_app();
+            open_thread(&mut app);
+            let _ = drain(&mut rx);
+            let saved = app.ui_settings;
+            for width in [1280.0, 1000.0, 700.0, 1280.0] {
+                let _ = resize(&mut app, width);
+            }
+            assert_eq!(app.ui_settings, saved);
+            assert!(drain(&mut rx).is_empty());
+        }
+
+        #[test]
+        fn the_rows_follow_the_list_as_shown() {
+            let (mut app, _rx) = main_app();
+            assert_eq!(app.room_row_height(), 64.0);
+            app.list_offset_y = 100.0 * 64.0;
+            // A resize starts no task, so the offset stays what the
+            // scrollable really has; only the height of a row follows.
+            assert_eq!(resize(&mut app, 700.0).units(), 0);
+            assert_eq!(app.room_row_height(), 56.0, "the forced rail's rows");
+            assert_eq!(app.list_offset_y, 100.0 * 64.0);
+            assert_eq!(resize(&mut app, 1280.0).units(), 0);
+            assert_eq!(app.room_row_height(), 64.0);
+        }
+
+        #[test]
+        fn opening_a_panel_in_a_medium_window_keeps_the_place_in_the_list() {
+            let (mut app, _rx) = main_app();
+            let _ = resize(&mut app, 1000.0);
+            app.list_offset_y = 100.0 * 64.0;
+            open_thread(&mut app);
+            assert_eq!(app.room_row_height(), 56.0);
+            assert_eq!(app.list_offset_y, 100.0 * 56.0, "row 100 stays on top");
+            let _ = app.update(Message::Threads(ThreadsMessage::Close));
+            assert!((app.list_offset_y - 100.0 * 64.0).abs() < 0.1);
+        }
+
+        #[test]
+        fn a_room_pane_behind_a_panel_takes_no_measurements() {
+            // With no width the pane's rows would be measured one glyph per
+            // line; the measurements are for the pane the user sees.
+            let (mut app, _rx, _) = media_app(3);
+            let measure = |app: &mut App, height: f32| {
+                let _ = app.update(Message::RowMeasured {
+                    id: "img2".into(),
+                    height,
+                });
+            };
+            let _ = resize(&mut app, 700.0);
+            open_thread(&mut app);
+            assert!(layout(&app).panel_fills);
+            measure(&mut app, 230.0);
+            assert!(app.timeline.measured.is_empty(), "hidden: not recorded");
+            let _ = app.update(Message::Threads(ThreadsMessage::Close));
+            measure(&mut app, 230.0);
+            assert_eq!(app.timeline.measured.get("img2"), Some(&230.0));
+        }
+
+        #[test]
+        fn esc_closes_the_shown_panel_first_and_returns_to_the_room_pane() {
+            let (mut app, _rx) = main_app();
+            open_thread(&mut app);
+            open_call_panel(&mut app);
+            let _ = resize(&mut app, 700.0);
+            assert!(layout(&app).call && layout(&app).panel_fills);
+            key(&mut app, Shortcut::Escape);
+            assert!(!app.calls.panel_shown(app.selected.as_ref()));
+            assert!(app.threads.panel.is_some(), "the waiting thread stays open");
+            let now = layout(&app);
+            assert!(now.thread && now.panel_fills, "the thread takes its turn");
+            key(&mut app, Shortcut::Escape);
+            assert!(app.threads.panel.is_none());
+            assert!(!layout(&app).panel_fills, "the room pane is back");
+        }
+
+        #[test]
+        fn esc_closes_the_thread_first_when_it_is_the_one_shown() {
+            let (mut app, _rx) = main_app();
+            open_call_panel(&mut app);
+            open_thread(&mut app);
+            let _ = resize(&mut app, 700.0);
+            key(&mut app, Shortcut::Escape);
+            assert!(app.threads.panel.is_none());
+            assert!(app.calls.panel_shown(app.selected.as_ref()));
+        }
+
+        // ---- A pane the user cannot see does nothing ----
+
+        const THREAD_ITEM: &str = "thread:$r:x:4";
+
+        fn reactable_thread(app: &mut App) {
+            open_thread(app);
+            let root = EventId::from("$r:x");
+            let _ = app.update(core(CoreEvent::ThreadDiff {
+                room_id: RoomId::from("!a:x"),
+                root,
+                diffs: vec![ListDiff::Append {
+                    values: vec![message_item(THREAD_ITEM, "reply", false, ALL_ACTIONS)],
+                }],
+            }));
+        }
+
+        fn reactions(commands: &[Command]) -> usize {
+            commands
+                .iter()
+                .filter(|c| matches!(c, Command::ToggleReaction { .. }))
+                .count()
+        }
+
+        #[test]
+        fn a_thread_picker_is_drawn_by_the_panel_even_when_it_fills_the_window() {
+            let (mut app, mut rx) = main_app();
+            reactable_thread(&mut app);
+            let _ = resize(&mut app, 700.0);
+            assert!(layout(&app).panel_fills && layout(&app).thread);
+            let _ = drain(&mut rx);
+            let _ = app.update(Message::PickerOpened(THREAD_ITEM.into()));
+            let picker = app.actions.picker.as_ref().expect("shown in the panel");
+            assert!(picker.in_thread, "the thread panel draws it");
+            let _ = app.update(Message::PickerSubmitted);
+            assert_eq!(reactions(&drain(&mut rx)), 1);
+        }
+
+        #[test]
+        fn no_picker_opens_for_a_thread_item_the_call_panel_has_hidden() {
+            let (mut app, mut rx) = main_app();
+            reactable_thread(&mut app);
+            open_call_panel(&mut app);
+            let _ = resize(&mut app, 700.0);
+            assert!(layout(&app).call && !layout(&app).thread);
+            let _ = drain(&mut rx);
+            let _ = app.update(Message::PickerOpened(THREAD_ITEM.into()));
+            let _ = app.update(Message::PickerSubmitted);
+            let sent = drain(&mut rx);
+            assert_eq!(reactions(&sent), 0, "an unseen reaction: {sent:?}");
+            assert!(app.actions.picker.is_none());
+        }
+
+        #[test]
+        fn no_picker_opens_for_a_room_item_while_a_panel_hides_the_room_pane() {
+            let (mut app, mut rx) = main_app();
+            append(&mut app, vec![message_item("m", "hi", false, ALL_ACTIONS)]);
+            open_thread(&mut app);
+            let _ = resize(&mut app, 700.0);
+            let _ = drain(&mut rx);
+            let _ = app.update(Message::PickerOpened("m".into()));
+            let _ = app.update(Message::PickerSubmitted);
+            assert_eq!(reactions(&drain(&mut rx)), 0);
+            assert!(app.actions.picker.is_none());
+        }
+
+        #[test]
+        fn a_thread_picker_works_where_the_panel_is_beside_the_room() {
+            let (mut app, mut rx) = main_app();
+            reactable_thread(&mut app);
+            let _ = resize(&mut app, 1280.0);
+            let _ = drain(&mut rx);
+            let _ = app.update(Message::PickerOpened(THREAD_ITEM.into()));
+            assert!(app.actions.picker.is_some());
+            let _ = app.update(Message::PickerSubmitted);
+            assert_eq!(reactions(&drain(&mut rx)), 1);
+        }
+
+        #[test]
+        fn shrinking_the_window_closes_a_picker_that_would_be_hidden() {
+            // A room item's picker, then the thread panel fills the window.
+            let (mut app, mut rx) = main_app();
+            append(&mut app, vec![message_item("m", "hi", false, ALL_ACTIONS)]);
+            open_thread(&mut app);
+            let _ = resize(&mut app, 1280.0);
+            let _ = app.update(Message::PickerOpened("m".into()));
+            assert!(app.actions.picker.is_some());
+            let _ = resize(&mut app, 700.0);
+            assert!(app.actions.picker.is_none(), "closed with the resize");
+            let _ = drain(&mut rx);
+            let _ = app.update(Message::PickerQuery(MessageText::from("smile")));
+            let _ = app.update(Message::PickerSubmitted);
+            assert_eq!(reactions(&drain(&mut rx)), 0);
+
+            // A thread item's picker, then the call panel takes the turn.
+            let (mut app, mut rx) = main_app();
+            reactable_thread(&mut app);
+            open_call_panel(&mut app);
+            let _ = resize(&mut app, 1280.0);
+            let _ = app.update(Message::PickerOpened(THREAD_ITEM.into()));
+            assert!(app.actions.picker.is_some());
+            let _ = resize(&mut app, 700.0);
+            assert!(!layout(&app).thread);
+            assert!(app.actions.picker.is_none(), "closed with the resize");
+            let _ = drain(&mut rx);
+            let _ = app.update(Message::PickerSubmitted);
+            assert_eq!(reactions(&drain(&mut rx)), 0);
+
+            // A room item's picker in a narrow window, then a thread opens.
+            let (mut app, mut rx) = main_app();
+            append(&mut app, vec![message_item("m", "hi", false, ALL_ACTIONS)]);
+            let _ = resize(&mut app, 700.0);
+            let _ = app.update(Message::PickerOpened("m".into()));
+            assert!(app.actions.picker.is_some(), "the room pane is shown");
+            open_thread(&mut app);
+            assert!(app.actions.picker.is_none(), "the panel now hides it");
+            let _ = drain(&mut rx);
+            let _ = app.update(Message::PickerSubmitted);
+            assert_eq!(reactions(&drain(&mut rx)), 0);
+        }
+
+        #[test]
+        fn a_hidden_room_pane_sends_no_receipt_until_it_is_shown_again() {
+            let (mut app, mut rx) = main_app();
+            open_thread(&mut app);
+            let _ = resize(&mut app, 700.0);
+            let _ = drain(&mut rx);
+            append(&mut app, vec![message_item("a", "hi", false, ALL_ACTIONS)]);
+            let _ = app.update(Message::WindowFocus(false));
+            let _ = app.update(Message::WindowFocus(true));
+            let _ = app.update(Message::ReadDue(RoomId::from("!a:x")));
+            let sent = drain(&mut rx);
+            assert_eq!(marks(&sent), Vec::<bool>::new(), "{sent:?}");
+            assert!(!app.timeline.bottom_seen, "nothing was seen");
+            let _ = resize(&mut app, 1280.0);
+            assert_eq!(marks(&drain(&mut rx)), [false], "once, when shown");
+            let _ = resize(&mut app, 700.0);
+            let _ = resize(&mut app, 1280.0);
+            assert_eq!(marks(&drain(&mut rx)), Vec::<bool>::new(), "same item");
+        }
+
+        #[test]
+        fn closing_the_panel_shows_the_room_pane_and_sends_the_receipt() {
+            let (mut app, mut rx) = main_app();
+            open_thread(&mut app);
+            let _ = resize(&mut app, 700.0);
+            append(&mut app, vec![message_item("a", "hi", false, ALL_ACTIONS)]);
+            let _ = drain(&mut rx);
+            let _ = app.update(Message::Threads(ThreadsMessage::Close));
+            assert_eq!(marks(&drain(&mut rx)), [false]);
+        }
+
+        #[test]
+        fn leaving_a_room_that_was_hidden_moves_no_marker() {
+            let (mut app, mut rx) = main_app();
+            append(&mut app, vec![message_item("a", "hi", false, ALL_ACTIONS)]);
+            open_thread(&mut app);
+            let _ = resize(&mut app, 700.0);
+            let _ = app.update(Message::ReadDue(RoomId::from("!a:x")));
+            let _ = drain(&mut rx);
+            let _ = app.update(Message::SelectRoom(RoomId::from("!b:x")));
+            let sent = drain(&mut rx);
+            assert!(
+                !sent.iter().any(|c| matches!(
+                    c,
+                    Command::MoveReadMarker { .. } | Command::MarkRead { .. }
+                )),
+                "{sent:?}"
+            );
+        }
+
+        #[test]
+        fn ctrl_u_and_drops_are_refused_while_a_panel_hides_the_room() {
+            use crate::dialogs::RecordingDialogs;
+            use crate::upload::UploadPaths;
+            let (mut app, _rx) = main_app();
+            let dialogs = RecordingDialogs::default();
+            app.set_dialogs(Box::new(dialogs.clone()));
+            open_thread(&mut app);
+            let _ = resize(&mut app, 700.0);
+            key(&mut app, Shortcut::Attach);
+            assert_eq!(*dialogs.picked.lock().expect("mutex"), 0, "no file dialog");
+            let _ = app.update(Message::FileHovered);
+            assert!(!app.uploads.hovering);
+            let dropped = UploadPaths(vec![std::path::PathBuf::from("/x/a.txt")]);
+            let _ = app.update(Message::FileDropped(dropped.clone()));
+            assert!(app.uploads.dropped.is_empty());
+            assert!(app.uploads.dialog.is_none());
+            // The thread panel's own Attach is on screen and stays.
+            let _ = app.update(Message::Threads(ThreadsMessage::Attach));
+            assert_eq!(*dialogs.picked.lock().expect("mutex"), 1);
+            // With the room pane back, both work.
+            let _ = app.update(Message::Threads(ThreadsMessage::Close));
+            key(&mut app, Shortcut::Attach);
+            assert_eq!(*dialogs.picked.lock().expect("mutex"), 2);
+            let _ = app.update(Message::FileDropped(dropped));
+            assert!(!app.uploads.dropped.is_empty());
         }
     }
 

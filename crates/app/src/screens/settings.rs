@@ -22,7 +22,7 @@ use crate::settings::{
 use crate::state::{App, Message};
 use crate::theme::{self, Family};
 use crate::ui::icons::{Icon, icon};
-use crate::ui::kit::{modal, muted, secondary_button};
+use crate::ui::kit::{self, modal, muted, secondary_button};
 use crate::ui::tokens;
 
 /// Width of the card.
@@ -136,13 +136,15 @@ fn default_menu<'a>(app: &'a App, label: &'static str, one_to_one: bool) -> Elem
         .map(DefaultChoice::from_mode);
     row![
         text(label).width(Fill),
-        pick_list(DefaultChoice::ALL, shown, move |choice: DefaultChoice| {
-            msg(SettingsMessage::DefaultMode {
-                one_to_one,
-                mode: choice.mode(),
+        kit::menu(
+            pick_list(DefaultChoice::ALL, shown, move |choice: DefaultChoice| {
+                msg(SettingsMessage::DefaultMode {
+                    one_to_one,
+                    mode: choice.mode(),
+                })
             })
-        })
-        .placeholder("Loading\u{2026}"),
+            .placeholder("Loading\u{2026}")
+        ),
     ]
     .spacing(8)
     .align_y(iced::Center)
@@ -242,21 +244,21 @@ fn appearance_section(app: &App) -> Element<'_, Message> {
         ),
         row![
             text("Density").width(Fill),
-            pick_list(
+            kit::menu(pick_list(
                 DensityOption::ALL,
                 Some(DensityOption(app.ui_settings.density)),
                 |o: DensityOption| msg(SettingsMessage::Density(o.0)),
-            ),
+            )),
         ]
         .spacing(tokens::S)
         .align_y(iced::Center),
         row![
             text("Room list").width(Fill),
-            pick_list(
+            kit::menu(pick_list(
                 RoomListOption::ALL,
                 Some(RoomListOption(app.ui_settings.room_list)),
                 |o: RoomListOption| msg(SettingsMessage::RoomList(o.0)),
-            ),
+            )),
         ]
         .spacing(tokens::S)
         .align_y(iced::Center),
