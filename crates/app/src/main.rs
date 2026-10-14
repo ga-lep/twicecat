@@ -162,9 +162,12 @@ fn run(options: Options) -> Result<(), String> {
 /// (`packaging/linux/`), so the compositor and the shortcuts portal tie the
 /// window to it.
 fn window_settings() -> iced::window::Settings {
+    // The width the layout assumes until the first resize event arrives.
+    let size = iced::Size::new(twicecat_app::layout::DEFAULT_WINDOW_WIDTH, 800.0);
     #[cfg(target_os = "linux")]
     {
         iced::window::Settings {
+            size,
             platform_specific: iced::window::settings::PlatformSpecific {
                 application_id: twicecat_ptt::APP_ID.to_owned(),
                 ..Default::default()
@@ -174,7 +177,10 @@ fn window_settings() -> iced::window::Settings {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        iced::window::Settings::default()
+        iced::window::Settings {
+            size,
+            ..Default::default()
+        }
     }
 }
 

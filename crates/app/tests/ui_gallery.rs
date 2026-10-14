@@ -255,6 +255,7 @@ fn every_screen_lays_out_in_every_variant_at_both_sizes() {
         for variant in variants(scenario.room_list) {
             app.set_ui_settings(variant.settings());
             for size in SIZES {
+                app.window_width = size.width;
                 let laid = Laid::new(&app, &renderer, size);
                 let bounds = laid.node.bounds();
                 assert!(
@@ -378,6 +379,7 @@ fn the_room_pane_keeps_its_place_as_panels_bars_and_banners_come_and_go() {
     for (what, step) in steps {
         step(&mut app);
         for size in SIZES {
+            app.window_width = size.width;
             let laid = Laid::new(&app, &renderer, size);
             assert_eq!(
                 room_pane_place(&laid),
@@ -391,8 +393,15 @@ fn the_room_pane_keeps_its_place_as_panels_bars_and_banners_come_and_go() {
     fixture::call_connected(&mut app);
     fixture::call_panel_open(&mut app);
     fixture::banner_on(&mut app);
-    let laid = Laid::new(&app, &renderer, WIDE);
-    assert_eq!(room_pane_place(&laid), (place, shape), "everything open");
+    for size in SIZES {
+        app.window_width = size.width;
+        let laid = Laid::new(&app, &renderer, size);
+        assert_eq!(
+            room_pane_place(&laid),
+            (place.clone(), shape.clone()),
+            "everything open at {size:?}"
+        );
+    }
 }
 
 /// Ctrl + mouse wheel over a closed `pick_list` with nothing selected picks
@@ -530,6 +539,46 @@ fn write_the_gallery() {
         }
         shots.push((scenario.name, files));
     }
+    // Narrow and medium windows (Task 8): the list as a rail, no sidebar, a
+    // panel in the room pane's place.
+    let cases: [(&str, f32, Steps); 5] = [
+        ("main-narrow-room", 720.0, &[]),
+        ("main-narrow-thread", 720.0, &[fixture::thread_open]),
+        (
+            "main-narrow-call",
+            720.0,
+            &[fixture::call_connected, fixture::call_panel_open],
+        ),
+        ("main-medium-thread", 1000.0, &[fixture::thread_open]),
+        (
+            "main-medium-call",
+            1000.0,
+            &[fixture::call_connected, fixture::call_panel_open],
+        ),
+    ];
+    for (name, width, steps) in cases {
+        let size = Size::new(width, 800.0);
+        let mut app = fixture::main_room();
+        app.window_width = width;
+        for step in steps {
+            step(&mut app);
+        }
+        let mut files = Vec::new();
+        for variant in variants(false) {
+            app.set_ui_settings(variant.settings());
+            let renderer = renderer();
+            let mut laid = Laid::new(&app, &renderer, size);
+            laid.settle(&renderer, size);
+            let pixels = laid.pixels(&app, renderer, size);
+            let file = format!("{name}-{}.png", variant.tag());
+            image::RgbaImage::from_raw(width as u32, size.height as u32, pixels)
+                .expect("the screenshot has width x height x 4 bytes")
+                .save(dir.join(&file))
+                .expect("write the PNG");
+            files.push((variant.tag(), file));
+        }
+        shots.push((name, files));
+    }
     std::fs::write(dir.join("index.html"), index_html(&shots)).expect("write index.html");
     println!("gallery written to {}", dir.display());
 }
@@ -601,6 +650,10 @@ fn clicking_the_log_out_button_requests_a_logout() {
     assert_eq!(hits, 1, "no click in the status bar logged out");
 }
 
+/// Tallest the header may be: avatar row, tags, the ID on three lines and one
+/// line of buttons.
+const MAX_HEADER_HEIGHT: f32 = 200.0;
+
 const LONG_PEER: &str =
     "@a-very-long-user-name-that-goes-on-and-on-and-on-and-on-and-on:evil.example.org";
 
@@ -644,15 +697,20 @@ fn a_narrow_header_never_clips_the_trust_tag_or_the_end_of_the_peer_id() {
         // Narrow windows: the room pane is what is left beside the spaces
         // bar and the room list (expanded, or the rail).
         for (list, width) in [
+            (RoomListChoice::Expanded, 1280.0),
+            (RoomListChoice::Expanded, 900.0),
             (RoomListChoice::Expanded, 720.0),
             (RoomListChoice::Expanded, 600.0),
-            (RoomListChoice::Rail, 480.0),
             (RoomListChoice::Rail, 520.0),
+            (RoomListChoice::Rail, 480.0),
+            (RoomListChoice::Rail, 400.0),
+            (RoomListChoice::Rail, 360.0),
         ] {
             let mut settings = variants(false)[0].settings();
             settings.room_list = list;
             app.set_ui_settings(settings);
             let size = Size::new(width, 800.0);
+            app.window_width = width;
             let laid = Laid::new(&app, &renderer, size);
             let header = header_node(&laid);
             let mut out = Vec::new();
@@ -660,6 +718,14 @@ fn a_narrow_header_never_clips_the_trust_tag_or_the_end_of_the_peer_id() {
             assert!(
                 out.is_empty(),
                 "{trust:?} at {width}: header content spills out: {out:?}"
+            );
+            // A header whose title block is squeezed to nothing wraps the
+            // tag and the ID glyph by glyph and grows tall: nobody can read
+            // the trust tag then, even though nothing "spills".
+            let height = header.bounds().height;
+            assert!(
+                height <= MAX_HEADER_HEIGHT,
+                "{trust:?} at {width}: the header is {height} px high"
             );
         }
     }
@@ -703,9 +769,12 @@ fn the_room_list_is_300_wide_or_a_72_px_rail_and_keeps_its_five_slots() {
                     fixture::call_left(&mut app);
                 }
                 for size in SIZES {
+                    app.window_width = size.width;
                     let laid = Laid::new(&app, &renderer, size);
                     let pane = list_pane_node(&laid);
                     let what = format!("{list:?} {} call={in_call} {size:?}", density.1);
+                    // A window under 800 px shows the rail whatever is saved.
+                    let width = if size.width < 800.0 { 72.0 } else { width };
                     assert_eq!(pane.bounds().width, width, "{what}");
                     assert_eq!(list_column(pane).children().len(), 5, "{what}");
                     // Nothing in a slot spills out of the pane; the list's own
@@ -1082,4 +1151,274 @@ fn scrollable_rows(column: &Node, row_height: f32) -> usize {
         .iter()
         .filter(|row| (row.bounds().height - row_height).abs() < 0.5)
         .count()
+}
+
+/// The panes row `[spaces, room list, room pane, thread slot, call slot]`.
+fn panes_row<'n>(laid: &'n Laid<'_>) -> &'n Node {
+    let mut node = &laid.node;
+    loop {
+        let kids = node.children();
+        if kids.len() == 3 && kids[1].children().len() == 5 {
+            return &kids[1];
+        }
+        assert!(!kids.is_empty(), "no main column in the layout");
+        node = &kids[0];
+    }
+}
+
+/// Changes to the app, in order.
+type Steps = &'static [fn(&mut App)];
+
+/// How the side panels are opened in a test.
+type Panels = (&'static str, Steps);
+
+const PANEL_STATES: [Panels; 5] = [
+    ("none", &[]),
+    ("thread", &[fixture::thread_open]),
+    ("call", &[fixture::call_connected, fixture::call_panel_open]),
+    (
+        "thread then call",
+        &[
+            fixture::thread_open,
+            fixture::call_connected,
+            fixture::call_panel_open,
+        ],
+    ),
+    (
+        "call then thread",
+        &[
+            fixture::call_connected,
+            fixture::call_panel_open,
+            fixture::thread_open,
+        ],
+    ),
+];
+
+#[test]
+fn the_slots_follow_the_layout_at_every_width_and_the_room_pane_keeps_its_place() {
+    let renderer = renderer();
+    let mut place = None;
+    for width in [1280.0, 1100.0, 1000.0, 800.0, 720.0, 500.0] {
+        let size = Size::new(width, 800.0);
+        for (what, steps) in PANEL_STATES {
+            for list in [RoomListChoice::Expanded, RoomListChoice::Rail] {
+                let mut app = fixture::main_room();
+                let mut settings = variants(false)[0].settings();
+                settings.room_list = list;
+                app.set_ui_settings(settings);
+                app.window_width = width;
+                for step in steps {
+                    step(&mut app);
+                }
+                let shown = app.pane_layout();
+                let what = format!("{what} {list:?} at {width}");
+                let laid = Laid::new(&app, &renderer, size);
+                let here = room_pane_place(&laid);
+                assert_eq!(
+                    *place.get_or_insert_with(|| here.clone()),
+                    here,
+                    "{what}: the room pane moved in the tree"
+                );
+                let row = panes_row(&laid);
+                let w: Vec<f32> = row.children().iter().map(|n| n.bounds().width).collect();
+                assert_eq!(w.len(), 5, "{what}");
+                assert_eq!(w[0] > 0.0, shown.sidebar, "{what}: sidebar {w:?}");
+                let list_w = if shown.list == RoomListChoice::Rail {
+                    73.0
+                } else {
+                    301.0
+                };
+                assert_eq!(w[1], list_w, "{what}: list {w:?}");
+                assert_eq!(w[3] > 0.0, shown.thread, "{what}: thread {w:?}");
+                assert_eq!(w[4] > 0.0, shown.call, "{what}: call {w:?}");
+                assert_eq!(w[2] == 0.0, shown.panel_fills, "{what}: room pane {w:?}");
+                let sum: f32 = w.iter().sum();
+                assert!(
+                    (sum - width).abs() < 0.5,
+                    "{what}: the slots add up to {sum}, not {width}: {w:?}"
+                );
+                if shown.panel_fills {
+                    let panel = if shown.thread { w[3] } else { w[4] };
+                    assert_eq!(panel, width - w[0] - w[1], "{what}: fills {w:?}");
+                }
+            }
+        }
+    }
+}
+
+/// Ctrl + wheel is the zoom gesture, and a `pick_list` with a value takes it
+/// as "pick the next option": over the header's notification menu that would
+/// silently mute a room. Sweep the top of the window, wide and narrow.
+#[test]
+fn ctrl_wheel_over_the_room_header_never_changes_the_notification_mode() {
+    use iced::keyboard::{self, Modifiers};
+    use iced::{Point, mouse::ScrollDelta};
+    let renderer = renderer();
+    for width in [1280.0, 900.0, 600.0, 400.0] {
+        let size = Size::new(width, 800.0);
+        let mut app = fixture::main_room();
+        app.set_ui_settings(variants(false)[0].settings());
+        app.window_width = width;
+        let mut laid = Laid::new(&app, &renderer, size);
+        laid.settle(&renderer, size);
+        let mut messages: Vec<Message> = Vec::new();
+        let mut deliver = |laid: &mut Laid<'_>, event: Event, at: Point| {
+            let mut shell = Shell::new(&mut messages);
+            laid.element.as_widget_mut().update(
+                &mut laid.tree,
+                &event,
+                Layout::new(&laid.node),
+                mouse::Cursor::Available(at),
+                &renderer,
+                &mut clipboard::Null,
+                &mut shell,
+                &Rectangle::with_size(size),
+            );
+        };
+        let ctrl = Event::Keyboard(keyboard::Event::ModifiersChanged(Modifiers::CTRL));
+        deliver(&mut laid, ctrl, Point::new(1.0, 1.0));
+        for y in (0..200).step_by(4) {
+            for x in (0..width as i32).step_by(6) {
+                let at = Point::new(x as f32, y as f32);
+                for dy in [1.0, -1.0] {
+                    let wheel = Event::Mouse(mouse::Event::WheelScrolled {
+                        delta: ScrollDelta::Lines { x: 0.0, y: dy },
+                    });
+                    deliver(&mut laid, wheel, at);
+                }
+            }
+        }
+        let changes = messages
+            .iter()
+            .filter(|m| matches!(m, Message::RoomModeChosen(_)))
+            .count();
+        assert_eq!(
+            changes, 0,
+            "Ctrl + wheel changed a room's notification mode at {width}"
+        );
+    }
+}
+
+#[test]
+fn a_panel_that_hides_the_room_header_carries_the_trust_tag() {
+    use twicecat_core::api::UserTrust;
+    let renderer = renderer();
+    // `[title, (trust tag), close]` in the header of the thread panel.
+    let head_len = |width: f32| {
+        let mut app = fixture::dm_with_peer(LONG_PEER, UserTrust::IdentityChanged);
+        app.window_width = width;
+        fixture::thread_open(&mut app);
+        let laid = Laid::new(&app, &renderer, Size::new(width, 800.0));
+        let slot = &panes_row(&laid).children()[3];
+        assert!(slot.bounds().width > 0.0, "the thread panel is shown");
+        // Row `[divider, container]`, container -> column `[header, ..]`.
+        slot.children()[1].children()[0].children()[0]
+            .children()
+            .len()
+    };
+    assert_eq!(
+        head_len(1280.0),
+        2,
+        "the room header shows it beside a panel"
+    );
+    assert_eq!(
+        head_len(700.0),
+        3,
+        "the panel shows it when the header is hidden"
+    );
+}
+
+#[test]
+fn a_header_with_a_call_never_spills_or_grows_tall_when_narrow() {
+    let renderer = renderer();
+    for width in [1280.0, 900.0, 600.0, 480.0, 400.0, 360.0] {
+        let size = Size::new(width, 800.0);
+        let mut app = fixture::main_room();
+        app.set_ui_settings(variants(false)[0].settings());
+        app.window_width = width;
+        fixture::call_connected(&mut app);
+        let laid = Laid::new(&app, &renderer, size);
+        let header = header_node(&laid);
+        let mut out = Vec::new();
+        spills(header, iced::Point::ORIGIN, &mut out);
+        assert!(out.is_empty(), "at {width}: header content spills: {out:?}");
+        let height = header.bounds().height;
+        assert!(
+            height <= MAX_HEADER_HEIGHT,
+            "at {width}: the header is {height} px high"
+        );
+    }
+}
+
+/// A closed `pick_list` with a value takes Ctrl + wheel (the zoom gesture) as
+/// "pick the next option". On the voice settings that swaps the microphone
+/// or turns push-to-talk into an open microphone, so no menu may take it:
+/// sweep every screen with a menu.
+#[test]
+fn ctrl_wheel_over_the_menus_of_the_settings_and_call_screens_changes_nothing() {
+    use iced::keyboard::{self, Modifiers};
+    use iced::{Point, mouse::ScrollDelta};
+    let renderer = renderer();
+    let mut apps: Vec<(String, App)> = ["voice-audio", "voice-audio-no-gpu", "settings"]
+        .into_iter()
+        .map(|name| {
+            let scenario = fixture::scenarios()
+                .into_iter()
+                .find(|s| s.name == name)
+                .expect("a scenario of that name");
+            (name.to_owned(), (scenario.build)())
+        })
+        .collect();
+    let mut with_panel = fixture::main_room();
+    fixture::call_connected(&mut with_panel);
+    fixture::call_panel_open(&mut with_panel);
+    apps.push(("call panel".to_owned(), with_panel));
+    for (name, app) in &apps {
+        let mut laid = Laid::new(app, &renderer, WIDE);
+        laid.settle(&renderer, WIDE);
+        let mut messages: Vec<Message> = Vec::new();
+        let mut deliver = |laid: &mut Laid<'_>, event: Event, at: Point| {
+            let mut shell = Shell::new(&mut messages);
+            laid.element.as_widget_mut().update(
+                &mut laid.tree,
+                &event,
+                Layout::new(&laid.node),
+                mouse::Cursor::Available(at),
+                &renderer,
+                &mut clipboard::Null,
+                &mut shell,
+                &Rectangle::with_size(WIDE),
+            );
+        };
+        let ctrl = Event::Keyboard(keyboard::Event::ModifiersChanged(Modifiers::CTRL));
+        deliver(&mut laid, ctrl, Point::new(1.0, 1.0));
+        for y in (0..800).step_by(5) {
+            for x in (0..1280).step_by(8) {
+                let at = Point::new(x as f32, y as f32);
+                for dy in [1.0, -1.0] {
+                    // A scrollable keeps wheel events from what is inside it
+                    // for a while after it scrolled; leaving it ends that.
+                    let left = Event::Mouse(mouse::Event::CursorLeft);
+                    deliver(&mut laid, left, at);
+                    let wheel = Event::Mouse(mouse::Event::WheelScrolled {
+                        delta: ScrollDelta::Lines { x: 0.0, y: dy },
+                    });
+                    deliver(&mut laid, wheel, at);
+                }
+            }
+        }
+        let changed: Vec<String> = messages
+            .iter()
+            .map(|m| format!("{m:?}"))
+            .filter(|m| {
+                ["Audio(", "Settings(", "Call(", "RoomModeChosen"]
+                    .iter()
+                    .any(|p| m.starts_with(p))
+            })
+            .collect();
+        assert!(
+            changed.is_empty(),
+            "Ctrl + wheel changed a setting on {name}: {changed:?}"
+        );
+    }
 }

@@ -847,8 +847,9 @@ impl App {
     /// first visible room at the top by scaling the offset, moves the
     /// scrollable there (it only clamps its own offset), and asks for what
     /// the new window needs (avatars, paging).
-    fn keep_list_place(&mut self, before: f32) -> Task<Message> {
+    pub(crate) fn keep_list_place(&mut self, before: f32) -> Task<Message> {
         let after = self.room_row_height();
+        self.shown_row_height = after;
         if before <= 0.0 || (after - before).abs() < f32::EPSILON {
             return Task::none();
         }

@@ -106,6 +106,8 @@ pub fn key_label(key: &str) -> String {
 pub struct Picker {
     /// `TimelineItem::id` of the message the pick reacts to.
     pub target: String,
+    /// Whether the message is in the thread panel, where the picker is drawn.
+    pub in_thread: bool,
     /// What the user typed in the search field (not logged: `Debug` of
     /// [`ActionState`] hides it).
     pub query: String,
@@ -246,6 +248,7 @@ mod tests {
         let state = ActionState {
             picker: Some(Picker {
                 target: "item".into(),
+                in_thread: false,
                 query: "secret-query-x".into(),
             }),
             ..ActionState::default()

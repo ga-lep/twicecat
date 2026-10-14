@@ -57,6 +57,15 @@ Rules the code follows (all in tests):
   say the same. In the rail the search field is a **Search** button that
   expands the list, and the call bar is a column of icon buttons (the call's
   room, mute, deafen, leave), each with its words in a tooltip.
+- Narrow windows: from 800 to 1100 px the list is shown as the rail while a
+  thread or the participants panel is open; under 800 px the spaces sidebar is
+  not shown, the list is the rail, and an open panel takes the room pane's
+  place (the room pane stays, with no width, and takes no keys). Only one panel
+  shows then: the one opened last; Esc closes the one on screen first and then
+  returns to the room. The saved room list choice is not changed by the width.
+  While a panel fills the window its header repeats the trust tag of a direct
+  message, and the room header stacks its buttons under the name in a narrow
+  pane so nothing is cut off.
 - Ctrl+Shift+M and Ctrl+Shift+D act only during a call, also over a dialog
   (the call goes on behind it); without a call they do nothing.
 - While the Voice & audio card waits for a push-to-talk key (**Set key…**),

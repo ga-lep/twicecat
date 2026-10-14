@@ -531,7 +531,8 @@ impl App {
     /// confirmation, the viewer, the Voice & audio card, Settings, a room
     /// dialog or panel, the
     /// composer's suggestions, reply or edit, then the thread panel, then the
-    /// participants panel.
+    /// participants panel (the one on screen first when the window is too
+    /// narrow for both).
     ///
     /// `from_field` is set when a text field used the key (it dropped its own
     /// focus): the composer, which leaves Esc alone, was not the target then,
@@ -564,10 +565,13 @@ impl App {
         if !from_field && self.composer_has_escape_work() {
             return self.update(Message::ComposerKey(crate::composer::ComposerKey::Escape));
         }
-        if self.threads.panel.is_some() {
+        // The panel on screen first. In a window too narrow for both, the
+        // one that waits is not on screen and keeps its turn.
+        let layout = self.pane_layout();
+        if layout.thread {
             return self.update(Message::Threads(ThreadsMessage::Close));
         }
-        if self.calls.panel_shown(self.selected.as_ref()) {
+        if layout.call {
             return self.update(Message::Call(CallMessage::TogglePanel));
         }
         Task::none()

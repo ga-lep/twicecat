@@ -115,6 +115,8 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           env-vars: CUDA_HOME
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      # Without dev-dependency features: --all-targets unifies them and hides missing normal features.
+      - run: cargo check --workspace --lib --bins --locked
       - run: scripts/check-no-webrtc-download.sh
 
   test:

@@ -8,7 +8,7 @@ use iced::widget::{
     Column, Row, button, column, container, opaque, pick_list, row, space, stack, text,
     text_editor, text_input,
 };
-use iced::{Element, Fill};
+use iced::{Element, Fill, Length};
 use twicecat_core::api::{MessageText, RoomId, SyncState, UserId, UserTrust};
 
 use crate::actions::{self, Picker};
@@ -33,7 +33,7 @@ use crate::theme;
 use crate::ui::icons::{self, Icon};
 use crate::ui::kit::{self, Severity};
 use crate::ui::tokens;
-use crate::verification::elide_middle;
+use crate::verification::{MAX_PEER_USER_ID_CHARS, elide_middle};
 
 /// Width of the left pane.
 pub const LIST_PANE_WIDTH: f32 = 300.0;
@@ -102,6 +102,13 @@ pub fn peer_id_line(peer: &UserId) -> String {
     elide_middle(peer.as_str(), HEADER_PEER_ID_CHARS)
 }
 
+/// The whole ID for the tooltip: one sanitized line (no control or bidi
+/// characters, which could reorder or hide parts of it next to the trust
+/// tag), cut only past the Matrix limit and then in the middle.
+pub fn peer_id_full(peer: &UserId) -> String {
+    elide_middle(peer.as_str(), MAX_PEER_USER_ID_CHARS)
+}
+
 /// Longest topic line in the header, in characters.
 const TOPIC_CHARS: usize = 120;
 
@@ -150,10 +157,87 @@ impl HeaderAction {
     }
 }
 
+/// Room pane width (logical pixels) under which the header stacks: the title
+/// and tags on top, the buttons on their own wrapping line. Above it the
+/// buttons sit at the right of the title.
+const STACKED_HEADER_BELOW: f32 = 760.0;
+
+/// Padding of the room pane on each side.
+const ROOM_PANE_PADDING: f32 = 8.0;
+
+/// The width the room pane has, or would have if no panel filled it, for the
+/// layout shown: the window less the slots beside it. Dividers are 1 px.
+pub fn room_pane_width(app: &App) -> f32 {
+    let layout = app.pane_layout();
+    let mut width = app.window_width;
+    if layout.sidebar && !app.spaces.is_empty() {
+        width -= spaces_sidebar::SIDEBAR_WIDTH + 1.0;
+    }
+    width -= room_list_pane::pane_width(layout.list) + 1.0;
+    if !layout.panel_fills {
+        if layout.thread {
+            width -= crate::threads::PANEL_WIDTH;
+        }
+        if layout.call {
+            width -= crate::calls::PANEL_WIDTH;
+        }
+    }
+    (width - 2.0 * ROOM_PANE_PADDING).max(0.0)
+}
+
+/// The room as a panel header names it: the lock when it is encrypted, then
+/// the cleaned name.
+pub fn context_line(name: &str, encrypted: bool) -> String {
+    let name = display_name(name);
+    if encrypted {
+        format!("{} {name}", room_list_pane::LOCK_MARK)
+    } else {
+        name
+    }
+}
+
+/// The title of a panel header. When the panel fills the window the room
+/// header is out of sight, so the room's name (and its lock) go under the
+/// title; the trust tag of a direct message goes beside it, see
+/// [`trust_strip`].
+pub fn panel_title<'a>(app: &'a App, title: text::Text<'a>, fills: bool) -> Element<'a, Message> {
+    let room = fills
+        .then(|| {
+            app.selected
+                .as_ref()
+                .and_then(|id| app.rooms.iter().find(|room| room.id == *id))
+        })
+        .flatten();
+    match room {
+        Some(room) => column![
+            title,
+            text(context_line(&room.name, room.is_encrypted))
+                .size(tokens::CAPTION)
+                .style(kit::muted)
+        ]
+        .width(Fill)
+        .into(),
+        None => title.width(Fill).into(),
+    }
+}
+
+/// The tag for the other person of a direct message (**Identity changed**,
+/// **Not verified**, ...), when the room has one. The room header shows it;
+/// the panels show it too while they hide the header.
+pub fn trust_strip(app: &App) -> Option<Element<'_, Message>> {
+    let (_, badge) = app
+        .dm_peer_trust()
+        .and_then(|(peer, trust)| trust_badge(trust).map(|badge| (peer, badge)))?;
+    Some(kit::severity_tag(badge.severity(), badge.label()))
+}
+
 /// The room header: the avatar, the name and a line under it, tags for the
-/// lock, Voice and the trust of the other person (with Verify), then the buttons. Always
-/// one row, so the column around it keeps its widget types.
+/// lock, Voice and the trust of the other person (with Verify), then the
+/// buttons. Always one element, so the column around it keeps its widget
+/// types. In a narrow pane the buttons wrap onto their own line under the
+/// tags, so nothing is cut off and the trust tag is always seen.
 fn header<'a>(app: &'a App, title: String) -> Element<'a, Message> {
+    let stacked = room_pane_width(app) < STACKED_HEADER_BELOW;
     let selected = app
         .selected
         .as_ref()
@@ -200,21 +284,27 @@ fn header<'a>(app: &'a App, title: String) -> Element<'a, Message> {
     let mut under = Column::new().spacing(2.0).push(tags);
     match trust {
         // Cut by `elide_middle` to a budget, never by clipping: if the pane
-        // is narrower still, the line wraps so no part of it is lost.
+        // is narrower still, the line wraps so no part of it is lost. The
+        // tooltip has the whole ID.
         Some((peer, _)) => {
-            under = under.push(
+            under = under.push(kit::tip(
                 text(peer_id_line(peer))
                     .size(tokens::CAPTION)
                     .wrapping(Wrapping::WordOrGlyph)
                     .style(kit::muted),
-            );
+                peer_id_full(peer),
+            ));
         }
         None => {
             if let Some(topic) = topic_line(room_topic(app)) {
                 under = under.push(
                     text(topic)
                         .size(tokens::CAPTION)
-                        .wrapping(Wrapping::None)
+                        .wrapping(if stacked {
+                            Wrapping::WordOrGlyph
+                        } else {
+                            Wrapping::None
+                        })
                         .style(kit::muted),
                 );
             }
@@ -223,28 +313,33 @@ fn header<'a>(app: &'a App, title: String) -> Element<'a, Message> {
     let names = Column::from_vec(vec![
         text(title)
             .size(tokens::TITLE)
-            .wrapping(Wrapping::None)
+            .wrapping(if stacked {
+                Wrapping::WordOrGlyph
+            } else {
+                Wrapping::None
+            })
             .into(),
         under.into(),
     ]);
-    line = line.push(container(names).width(Fill).clip(true));
+    line = line.push(container(names).width(Fill).clip(!stacked));
 
+    let mut controls: Vec<Element<'a, Message>> = Vec::new();
     if let Some(room) = selected.filter(|room| !room.is_invite) {
-        line = line.push(notification_menu(app, &room.id));
-        line = line.push(kit::icon_button(
+        controls.push(notification_menu(app, &room.id));
+        controls.push(kit::icon_button(
             Icon::Members,
             HeaderAction::Members.message(),
         ));
-        line = line.push(kit::icon_button(
+        controls.push(kit::icon_button(
             Icon::Settings,
             HeaderAction::Settings.message(),
         ));
         if let Some(call) = app.calls.button(room) {
-            line = line.push(call_button(call));
+            controls.push(call_button(call));
         }
         if app.calls.call_in(&room.id).is_some() {
             // The participants panel (plan Q4).
-            line = line.push(kit::toggle_icon_button(
+            controls.push(kit::toggle_icon_button(
                 Icon::People,
                 app.calls.panel_open,
                 HeaderAction::People.message(),
@@ -252,7 +347,21 @@ fn header<'a>(app: &'a App, title: String) -> Element<'a, Message> {
         }
     }
     if let Some(room) = selected.filter(|room| room.is_invite) {
-        line = line.push(invite_buttons(app, &room.id));
+        controls.push(invite_buttons(app, &room.id));
+    }
+    if stacked {
+        let controls = Row::with_children(controls)
+            .spacing(tokens::S)
+            .align_y(iced::Center)
+            .wrap()
+            .vertical_spacing(tokens::XS);
+        return Column::from_vec(vec![line.into(), controls.into()])
+            .spacing(tokens::XS)
+            .width(Fill)
+            .into();
+    }
+    for control in controls {
+        line = line.push(control);
     }
     line.into()
 }
@@ -302,14 +411,17 @@ fn invite_buttons<'a>(app: &App, room: &RoomId) -> Element<'a, Message> {
 /// Q11. It shows what the user picked at once, since the room list lags
 /// behind a change.
 fn notification_menu<'a>(app: &'a App, room: &RoomId) -> Element<'a, Message> {
-    let menu = pick_list(
-        ModeChoice::ALL,
-        Some(app.room_mode_choice(room)),
-        Message::RoomModeChosen,
-    )
-    .text_size(tokens::CAPTION)
-    .padding([tokens::XS, tokens::S])
-    .style(kit::menu_style);
+    // The menu has a value, so Ctrl + wheel (zoom) must not reach it.
+    let menu = kit::menu(
+        pick_list(
+            ModeChoice::ALL,
+            Some(app.room_mode_choice(room)),
+            Message::RoomModeChosen,
+        )
+        .text_size(tokens::CAPTION)
+        .padding([tokens::XS, tokens::S])
+        .style(kit::menu_style),
+    );
     kit::tip(menu, "Notifications")
 }
 
@@ -326,20 +438,26 @@ pub fn view(app: &App) -> Element<'_, Message> {
     )
 }
 
-/// The panes, always `[spaces sidebar, room list, room pane, thread panel]`:
-/// the sidebar and the panel are empty spaces when they have nothing to show,
-/// so the room pane (timeline scroll, editor focus) keeps its place in the
-/// widget tree when a thread opens or closes. `from_vec` does not look at its
-/// children, so the row is told to fill the window both ways: left at its
-/// default width it shrinks to its content and the room pane loses the free
-/// width.
+/// The panes, always `[spaces sidebar, room list, room pane, thread panel,
+/// call panel]`: a slot with nothing to show is an empty space, so the room
+/// pane (timeline scroll, editor focus) keeps its place in the widget tree
+/// when a panel opens or closes, or the window narrows (see
+/// [`crate::layout::layout_for`]). `from_vec` does not look at its children,
+/// so the row is told to fill the window both ways: left at its default width
+/// it shrinks to its content and the room pane loses the free width.
 pub(crate) fn main_row(app: &App) -> Element<'_, Message> {
+    let layout = app.pane_layout();
+    let sidebar = if layout.sidebar {
+        spaces_sidebar::view(app)
+    } else {
+        space().width(0).into()
+    };
     Row::from_vec(vec![
-        spaces_sidebar::view(app),
+        sidebar,
         list_pane(app),
-        room_pane(app),
-        thread_panel::slot(app),
-        call::panel_slot(app),
+        room_pane(app, layout.panel_fills),
+        thread_panel::slot(app, layout),
+        call::panel_slot(app, layout),
     ])
     .width(Fill)
     .height(Fill)
@@ -385,7 +503,7 @@ fn main_column<'a>(
 }
 
 /// The selected room: name, timeline, composer.
-fn room_pane(app: &App) -> Element<'_, Message> {
+fn room_pane(app: &App, hidden: bool) -> Element<'_, Message> {
     let selected = app
         .selected
         .as_ref()
@@ -398,16 +516,9 @@ fn room_pane(app: &App) -> Element<'_, Message> {
     let theme = app.current_theme();
     let env = rich_env(app, &theme);
     let timeline = container(timeline_pane::view(&app.timeline, env)).height(Fill);
-    // The picker floats over the timeline's bottom right corner.
-    let picker = app.actions.picker.as_ref().map(|picker| {
-        container(opaque(picker_panel(picker)))
-            .width(Fill)
-            .height(Fill)
-            .align_right(Fill)
-            .align_bottom(Fill)
-            .padding(8)
-            .into()
-    });
+    // The picker floats over the bottom right corner of the timeline its
+    // message is in: a thread item's is drawn by the thread panel.
+    let picker = picker_layer(app, false);
     let mut bars: Vec<Element<'_, Message>> = Vec::new();
     if let Some(bar) = &app.link_bar {
         bars.push(link_bar(bar));
@@ -427,7 +538,9 @@ fn room_pane(app: &App) -> Element<'_, Message> {
     if let Some(notice) = &app.actions.notice {
         bars.push(text(notice.text.as_str()).style(text::danger).into());
     }
-    let enabled = selected.is_some();
+    // A composer that is out of sight takes no keys: a hidden editor with
+    // focus would send what is typed while a panel fills the window.
+    let enabled = selected.is_some() && !hidden;
     if let Some(line) = timeline_pane::typing_line(&app.typing) {
         bars.push(
             text(line)
@@ -450,7 +563,14 @@ fn room_pane(app: &App) -> Element<'_, Message> {
         bars,
         editor(app, enabled),
     );
-    container(body).width(Fill).height(Fill).padding(8).into()
+    // Hidden behind a panel (a window under 800 px): the pane keeps its place
+    // in the tree with no width.
+    container(body)
+        .width(if hidden { Length::Fixed(0.0) } else { Fill })
+        .height(Fill)
+        .padding(if hidden { 0.0 } else { ROOM_PANE_PADDING })
+        .clip(hidden)
+        .into()
 }
 
 /// The room pane's column, always `[title, timeline, bars, editor]`. iced
@@ -472,9 +592,29 @@ fn room_column<'a>(
         .into()
 }
 
+/// The reaction picker as a layer over the timeline it belongs to (the
+/// room's, or the thread panel's with `in_thread`), or `None` when it is open
+/// for the other one.
+pub fn picker_layer(app: &App, in_thread: bool) -> Option<Element<'_, Message>> {
+    let picker = app
+        .actions
+        .picker
+        .as_ref()
+        .filter(|picker| picker.in_thread == in_thread)?;
+    Some(
+        container(opaque(picker_panel(picker)))
+            .width(Fill)
+            .height(Fill)
+            .align_right(Fill)
+            .align_bottom(Fill)
+            .padding(8)
+            .into(),
+    )
+}
+
 /// The timeline with the reaction picker as an optional layer: always a
 /// stack with the timeline first, so opening the picker keeps the scroll.
-fn timeline_layer<'a>(
+pub fn timeline_layer<'a>(
     timeline: Element<'a, Message>,
     picker: Option<Element<'a, Message>>,
 ) -> Element<'a, Message> {
@@ -787,17 +927,19 @@ fn status_bar(app: &App) -> Element<'_, Message> {
             text_color: Some(severity.color(theme)),
             ..container::Style::default()
         });
-    let menu = pick_list(AccountAction::ALL, None::<AccountAction>, |action| {
-        action.message()
-    })
-    .placeholder(if account.is_empty() {
-        "Account".to_owned()
-    } else {
-        account
-    })
-    .text_size(tokens::BODY)
-    .padding([tokens::XS, tokens::S])
-    .style(kit::menu_style);
+    let menu = kit::menu(
+        pick_list(AccountAction::ALL, None::<AccountAction>, |action| {
+            action.message()
+        })
+        .placeholder(if account.is_empty() {
+            "Account".to_owned()
+        } else {
+            account
+        })
+        .text_size(tokens::BODY)
+        .padding([tokens::XS, tokens::S])
+        .style(kit::menu_style),
+    );
     column![
         kit::divider(),
         container(
@@ -1022,6 +1164,35 @@ mod tests {
         assert!(line.chars().count() <= HEADER_PEER_ID_CHARS);
         let split = UserId::from("@bo\nb:x");
         assert!(!peer_id_line(&split).contains('\n'));
+    }
+
+    #[test]
+    fn the_tooltip_id_is_cleaned_of_controls_and_bidi_marks() {
+        let hostile = UserId::from("@bo\u{202e}b\nx\u{200b}y:evil.example");
+        let tip = peer_id_full(&hostile);
+        assert!(
+            !tip.chars().any(|c| c.is_control()
+                || matches!(c, '\u{202e}' | '\u{200b}' | '\u{2066}'..='\u{2069}')),
+            "{tip:?}"
+        );
+        assert!(tip.ends_with(":evil.example"), "{tip:?}");
+        let long = UserId::from(format!("@{}:evil.example", "a".repeat(600)));
+        let tip = peer_id_full(&long);
+        assert!(tip.chars().count() <= crate::verification::MAX_PEER_USER_ID_CHARS);
+        assert!(tip.ends_with(":evil.example"));
+        assert_eq!(
+            peer_id_full(&UserId::from("@bob:example.org")),
+            "@bob:example.org"
+        );
+    }
+
+    #[test]
+    fn the_context_line_names_the_room_and_its_lock() {
+        assert_eq!(context_line("Lounge", false), "Lounge");
+        let locked = context_line("Lounge", true);
+        assert!(locked.starts_with(room_list_pane::LOCK_MARK) && locked.ends_with("Lounge"));
+        let hostile = context_line("Lo\u{202e}unge\nx", true);
+        assert!(!hostile.contains('\u{202e}') && !hostile.contains('\n'));
     }
 
     #[test]

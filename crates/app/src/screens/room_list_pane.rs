@@ -350,7 +350,7 @@ fn empty_view(app: &App, rail: bool) -> Element<'_, Message> {
 
 /// The pane: tabs, search, then the list or an empty-state line.
 pub fn view(app: &App) -> Element<'_, Message> {
-    let rail = app.ui_settings.room_list == RoomListChoice::Rail;
+    let rail = app.pane_layout().list == RoomListChoice::Rail;
     let density = app.density();
     let list = if app.rooms.is_empty() {
         empty_view(app, rail)
@@ -373,7 +373,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
         .width(Fill)
         .height(Fill);
     container(slots)
-        .width(Length::Fixed(pane_width(app.ui_settings.room_list)))
+        .width(Length::Fixed(pane_width(app.pane_layout().list)))
         .height(Fill)
         .padding(if rail { tokens::XS } else { tokens::S })
         .into()
@@ -390,7 +390,7 @@ struct RowEnv<'a> {
 /// The scrollable with only the rows near the viewport built.
 fn windowed_list(app: &App) -> Element<'_, Message> {
     let len = app.rooms.len();
-    let rail = app.ui_settings.room_list == RoomListChoice::Rail;
+    let rail = app.pane_layout().list == RoomListChoice::Rail;
     let row_h = app.room_row_height();
     let range = visible_range(
         app.list_offset_y,
