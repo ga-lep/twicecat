@@ -627,6 +627,62 @@ pub fn main_room() -> App {
     app
 }
 
+/// A room list built to crowd its rows: long names and previews (`body`),
+/// big counts, and a room with every tag there is (voice, invite, muted,
+/// ringing, a mention count).
+pub fn crowded_room_list(body: &str) -> App {
+    let mut app = main_room();
+    let mut busy = summary("lounge", &format!("Lounge {body}"));
+    busy.unread_messages = 120;
+    busy.unread_notifications = 120;
+    busy.last_message = Some(preview("bea", "Bea Example", body, 4));
+    let mut everything = summary("everything", &format!("Everything at once {body}"));
+    everything.is_call_room = true;
+    everything.is_invite = true;
+    everything.notification_mode = Some(RoomNotificationModeView::Mute);
+    everything.unread_messages = 120;
+    everything.unread_notifications = 120;
+    everything.highlights = 5;
+    everything.unread_mentions = 5;
+    everything.last_message = Some(preview("cy", "Cy Example", body, 9));
+    let mut ringing = summary("hangout", &format!("Voice hangout {body}"));
+    ringing.is_call_room = true;
+    ringing.unread_messages = 3;
+    ringing.unread_notifications = 3;
+    ringing.last_message = Some(preview("dee", "Dee Example", body, 30));
+    let mut counted = summary("counted", &format!("In a call {body}"));
+    counted.is_call_room = true;
+    counted.is_invite = true;
+    counted.last_message = Some(preview("dee", "Dee Example", body, 31));
+    app.rooms = vec![busy, everything, ringing, counted];
+    feed(
+        &mut app,
+        CoreEvent::IncomingCall {
+            room_id: room("hangout"),
+            caller: user("dee"),
+            intent: CallIntent::Audio,
+            ring: true,
+        },
+    );
+    feed(
+        &mut app,
+        CoreEvent::IncomingCall {
+            room_id: room("everything"),
+            caller: user("cy"),
+            intent: CallIntent::Audio,
+            ring: true,
+        },
+    );
+    feed(
+        &mut app,
+        CoreEvent::ActiveCall {
+            room_id: room("counted"),
+            participants: 12,
+        },
+    );
+    app
+}
+
 /// The room with only the items called `ids` (the timeline pane shows the
 /// newest items; the gallery cannot scroll, so each part of the timeline gets
 /// its own screen).

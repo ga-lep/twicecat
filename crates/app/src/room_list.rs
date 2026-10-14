@@ -6,12 +6,28 @@
 
 use std::ops::Range;
 
-use twicecat_core::api::{ListDiff, RoomId, RoomListTab, RoomSummary};
+use twicecat_core::api::{ListDiff, RoomId, RoomListChoice, RoomListTab, RoomSummary};
 
 use crate::text_safety::{MAX_NAME_CHARS, name_or_placeholder, one_line_capped};
+use crate::ui::tokens::Density;
 
-/// Height of one room row, in logical pixels (plan Q12).
-pub const ROW_HEIGHT: f32 = 64.0;
+/// Height of one room row in the expanded list, in logical pixels (plan Q12):
+/// 64 when comfortable, 44 when compact.
+pub const fn row_height(density: Density) -> f32 {
+    density.room_row_height()
+}
+
+/// Height of one row of the rail, whatever the density.
+pub const RAIL_ROW_HEIGHT: f32 = 56.0;
+
+/// Height of one row of the room list as shown: the density's, or the
+/// rail's fixed one. The windowing helpers take this.
+pub const fn list_row_height(density: Density, list: RoomListChoice) -> f32 {
+    match list {
+        RoomListChoice::Expanded => row_height(density),
+        RoomListChoice::Rail => RAIL_ROW_HEIGHT,
+    }
+}
 
 /// Rows built above and below the visible ones.
 pub const OVERSCAN_ROWS: usize = 10;
@@ -485,7 +501,11 @@ mod tests {
 
     use twicecat_core::api::{RoomListQuery, RoomListTab};
 
-    use super::ROW_HEIGHT;
+    use super::row_height;
+    use crate::ui::tokens::Density;
+
+    /// The Comfortable row, the app's default.
+    const ROW_HEIGHT: f32 = row_height(Density::Comfortable);
 
     fn drain(rx: &mut mpsc::Receiver<Command>) -> Vec<Command> {
         let mut out = Vec::new();
@@ -953,7 +973,7 @@ mod tests {
         let (mut app, rx) = app();
         app.rooms = synthetic_range(0, n);
         app.total_rooms = Some(100_000);
-        app.list_offset_y = 1_970.0 * super::ROW_HEIGHT;
+        app.list_offset_y = 1_970.0 * ROW_HEIGHT;
         (app, rx)
     }
 
@@ -1060,11 +1080,12 @@ mod tests {
 
 #[cfg(test)]
 mod pure_tests {
+    use crate::ui::tokens::Density;
     use twicecat_core::api::{MessagePreview, RoomId, RoomListTab, RoomSummary, UserId};
 
     use super::*;
 
-    const H: f32 = ROW_HEIGHT;
+    const H: f32 = row_height(Density::Comfortable);
 
     fn range(offset: f32, viewport: f32, len: usize) -> std::ops::Range<usize> {
         visible_range(offset, viewport, H, len, 2)
@@ -1274,5 +1295,47 @@ mod pure_tests {
             row_name("\u{3000}\u{200B}"),
             crate::text_safety::NAME_PLACEHOLDER
         );
+    }
+
+    #[test]
+    fn row_heights_follow_the_density_and_the_rail_is_fixed() {
+        use twicecat_core::api::RoomListChoice;
+        assert_eq!(row_height(Density::Comfortable), 64.0);
+        assert_eq!(row_height(Density::Compact), 44.0);
+        assert_eq!(RAIL_ROW_HEIGHT, 56.0);
+        for density in [Density::Comfortable, Density::Compact] {
+            assert_eq!(
+                list_row_height(density, RoomListChoice::Expanded),
+                row_height(density)
+            );
+            assert_eq!(
+                list_row_height(density, RoomListChoice::Rail),
+                RAIL_ROW_HEIGHT,
+                "the rail ignores the density"
+            );
+        }
+    }
+
+    #[test]
+    fn ten_thousand_rooms_build_only_the_visible_rows_in_every_density_and_the_rail() {
+        for h in [
+            row_height(Density::Comfortable),
+            row_height(Density::Compact),
+            RAIL_ROW_HEIGHT,
+        ] {
+            let len = 10_000;
+            let viewport = 800.0;
+            for offset in [0.0, 5_000.0 * h, 9_990.0 * h] {
+                let range = visible_range(offset, viewport, h, len, OVERSCAN_ROWS);
+                let visible = (viewport / h).ceil() as usize + 1;
+                assert!(
+                    range.len() <= visible + 2 * OVERSCAN_ROWS,
+                    "{h}: {range:?} builds too many rows"
+                );
+                let (top, bottom) = spacer_heights(&range, len, h);
+                let total = top + range.len() as f32 * h + bottom;
+                assert!((total - len as f32 * h).abs() < 1.0, "{h}: content height");
+            }
+        }
     }
 }

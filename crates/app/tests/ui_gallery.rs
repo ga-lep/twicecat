@@ -664,3 +664,422 @@ fn a_narrow_header_never_clips_the_trust_tag_or_the_end_of_the_peer_id() {
         }
     }
 }
+
+/// The room list pane's node: the first child of `[room list, divider]`.
+fn list_pane_node<'n>(laid: &'n Laid<'_>) -> &'n Node {
+    let mut node = &laid.node;
+    loop {
+        let kids = node.children();
+        if kids.len() == 3 && kids[1].children().len() == 5 {
+            return &kids[1].children()[1].children()[0];
+        }
+        assert!(!kids.is_empty(), "no main column in the layout");
+        node = &kids[0];
+    }
+}
+
+/// `[actions, tabs, search, list, call bar]`, inside the pane's container.
+fn list_column(pane: &Node) -> &Node {
+    &pane.children()[0]
+}
+
+#[test]
+fn the_room_list_is_300_wide_or_a_72_px_rail_and_keeps_its_five_slots() {
+    let renderer = renderer();
+    let mut app = fixture::main_room();
+    for density in DENSITIES {
+        for (list, width) in [
+            (RoomListChoice::Expanded, 300.0),
+            (RoomListChoice::Rail, 72.0),
+        ] {
+            let mut settings = variants(false)[0].settings();
+            settings.density = density.0;
+            settings.room_list = list;
+            app.set_ui_settings(settings);
+            for in_call in [false, true] {
+                if in_call {
+                    fixture::call_connected(&mut app);
+                } else {
+                    fixture::call_left(&mut app);
+                }
+                for size in SIZES {
+                    let laid = Laid::new(&app, &renderer, size);
+                    let pane = list_pane_node(&laid);
+                    let what = format!("{list:?} {} call={in_call} {size:?}", density.1);
+                    assert_eq!(pane.bounds().width, width, "{what}");
+                    assert_eq!(list_column(pane).children().len(), 5, "{what}");
+                    // Nothing in a slot spills out of the pane; the list's own
+                    // content is taller than its view by design.
+                    let column = list_column(pane);
+                    let mut out = Vec::new();
+                    for (i, slot) in column.children().iter().enumerate() {
+                        let b = slot.bounds();
+                        if b.x + b.width > column.bounds().width + 0.5 {
+                            out.push(b);
+                        }
+                        if i != 3 {
+                            spills(slot, iced::Point::ORIGIN, &mut out);
+                        }
+                    }
+                    assert!(out.is_empty(), "{what}: spills {out:?}");
+                }
+            }
+        }
+    }
+}
+
+// ---- Room list rows: nothing overlaps (UI/UX rework, Task 7 wrap-up) ------
+
+/// The room list's rows in window coordinates, and the width of the
+/// scrollable's content (rows plus the gutter for the scrollbar).
+fn list_rows<'n>(laid: &'n Laid<'_>) -> (Vec<(Rectangle, &'n Node)>, f32) {
+    fn step(at: iced::Point, node: &Node) -> iced::Point {
+        iced::Point::new(at.x + node.bounds().x, at.y + node.bounds().y)
+    }
+    let mut node = &laid.node;
+    let mut at = step(iced::Point::ORIGIN, node);
+    // The main column is `[header, panes row, status bar]`.
+    while !(node.children().len() == 3 && node.children()[1].children().len() == 5) {
+        assert!(!node.children().is_empty(), "no main column in the layout");
+        node = &node.children()[0];
+        at = step(at, node);
+    }
+    // panes row -> room list slot -> pane -> column
+    // `[actions, tabs, search, list, call bar]`.
+    let mut node = &node.children()[1];
+    at = step(at, node);
+    for index in [1, 0, 0] {
+        node = &node.children()[index];
+        at = step(at, node);
+    }
+    let mut content = &node.children()[3];
+    at = step(at, content);
+    while content.children().len() <= 1 {
+        content = &content.children()[0];
+        at = step(at, content);
+    }
+    let width = content.bounds().width;
+    let rows = content
+        .children()
+        .iter()
+        .filter(|row| row.bounds().height > 1.0 && row.bounds().width > 1.0)
+        .map(|row| {
+            let b = row.bounds();
+            (
+                Rectangle::new(iced::Point::new(at.x + b.x, at.y + b.y), b.size()),
+                row,
+            )
+        })
+        .collect();
+    (rows, width)
+}
+
+/// Every node with no children and some area under `node`, in window
+/// coordinates.
+fn painted_leaves(node: &Node, at: iced::Point, out: &mut Vec<Rectangle>) {
+    let b = node.bounds();
+    let here = iced::Point::new(at.x + b.x, at.y + b.y);
+    if node.children().is_empty() {
+        if b.width > 0.0 && b.height > 0.0 {
+            out.push(Rectangle::new(here, b.size()));
+        }
+        return;
+    }
+    for child in node.children() {
+        painted_leaves(child, here, out);
+    }
+}
+
+fn overlap(a: &Rectangle, b: &Rectangle) -> bool {
+    a.intersection(b)
+        .is_some_and(|i| i.width > 0.5 && i.height > 0.5)
+}
+
+fn crowded_variants() -> Vec<(DensityChoice, RoomListChoice)> {
+    vec![
+        (DensityChoice::Comfortable, RoomListChoice::Expanded),
+        (DensityChoice::Compact, RoomListChoice::Expanded),
+        (DensityChoice::Comfortable, RoomListChoice::Rail),
+    ]
+}
+
+#[test]
+fn no_two_things_in_a_room_list_row_overlap_and_none_reaches_the_scrollbar() {
+    use twicecat_app::screens::room_list_pane::SCROLLBAR_GUTTER;
+    let renderer = renderer();
+    let mut app = fixture::crowded_room_list(&"W".repeat(120));
+    for (density, list) in crowded_variants()
+        .into_iter()
+        .filter(|(_, list)| *list == RoomListChoice::Expanded)
+    {
+        let mut settings = variants(false)[0].settings();
+        settings.density = density;
+        settings.room_list = list;
+        app.set_ui_settings(settings);
+        let laid = Laid::new(&app, &renderer, WIDE);
+        let (rows, content_width) = list_rows(&laid);
+        assert!(rows.len() >= 4, "{density:?}: {} rows", rows.len());
+        for (i, (rect, node)) in rows.iter().enumerate() {
+            let mut leaves = Vec::new();
+            painted_leaves(
+                node,
+                iced::Point::new(rect.x - node.bounds().x, rect.y - node.bounds().y),
+                &mut leaves,
+            );
+            let what = format!("{density:?} row {i} at 300 px");
+            assert!(
+                rect.x + rect.width
+                    <= rect.x - node.bounds().x + content_width - SCROLLBAR_GUTTER + 0.5,
+                "{what}: the row reaches into the scrollbar's gutter: {rect:?}, content {content_width}"
+            );
+            for leaf in &leaves {
+                assert!(
+                    leaf.x + leaf.width <= rect.x + rect.width + 0.5
+                        && leaf.y + leaf.height <= rect.y + rect.height + 0.5,
+                    "{what}: {leaf:?} sticks out of the row {rect:?}"
+                );
+            }
+            for (a, first) in leaves.iter().enumerate() {
+                for second in &leaves[a + 1..] {
+                    assert!(
+                        !overlap(first, second),
+                        "{what}: {first:?} overlaps {second:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn rail_marks_and_dots_never_overlap_each_other() {
+    let renderer = renderer();
+    let mut app = fixture::crowded_room_list("a message");
+    for density in DENSITIES {
+        let mut settings = variants(false)[0].settings();
+        settings.density = density.0;
+        settings.room_list = RoomListChoice::Rail;
+        app.set_ui_settings(settings);
+        let laid = Laid::new(&app, &renderer, WIDE);
+        let (rows, _) = list_rows(&laid);
+        assert!(rows.len() >= 4, "{} rows", rows.len());
+        let mut most = 0;
+        for (i, (rect, node)) in rows.iter().enumerate() {
+            let origin = iced::Point::new(rect.x - node.bounds().x, rect.y - node.bounds().y);
+            // The picture is a stack of the avatar and its layers: four
+            // children of one size.
+            let mut stack = None;
+            find_stack(node, origin, &mut stack);
+            let (avatar, layers) = stack.unwrap_or_else(|| panic!("row {i}: no picture"));
+            let mut chips = Vec::new();
+            for layer in layers {
+                small_nodes(layer.0, layer.1, &mut chips);
+            }
+            most = most.max(chips.len());
+            for chip in &chips {
+                assert!(
+                    chip.x >= avatar.x - 0.5
+                        && chip.y >= avatar.y - 0.5
+                        && chip.x + chip.width <= avatar.x + avatar.width + 0.5
+                        && chip.y + chip.height <= avatar.y + avatar.height + 0.5,
+                    "{} row {i}: {chip:?} is not on the avatar {avatar:?}",
+                    density.1
+                );
+            }
+            for (a, first) in chips.iter().enumerate() {
+                for second in &chips[a + 1..] {
+                    assert!(
+                        !overlap(first, second),
+                        "{} row {i}: {first:?} overlaps {second:?}",
+                        density.1
+                    );
+                }
+            }
+        }
+        assert!(most >= 4, "the crowded room shows {most} marks only");
+    }
+}
+
+/// The picture stack of a rail row: the avatar's rectangle and the layers
+/// above it, with their origins.
+type Layers<'n> = (Rectangle, Vec<(&'n Node, iced::Point)>);
+
+fn find_stack<'n>(node: &'n Node, origin: iced::Point, out: &mut Option<Layers<'n>>) {
+    let b = node.bounds();
+    let here = iced::Point::new(origin.x + b.x, origin.y + b.y);
+    let kids = node.children();
+    if kids.len() == 4
+        && kids
+            .iter()
+            .all(|k| k.bounds().size() == kids[0].bounds().size())
+    {
+        let k0 = kids[0].bounds();
+        let avatar = Rectangle::new(iced::Point::new(here.x + k0.x, here.y + k0.y), k0.size());
+        *out = Some((avatar, kids[1..].iter().map(|k| (k, here)).collect()));
+        return;
+    }
+    for child in kids {
+        find_stack(child, here, out);
+    }
+}
+
+/// The outermost nodes at most 16 px each way (the largest a rail chip has been), with some area.
+fn small_nodes(node: &Node, origin: iced::Point, out: &mut Vec<Rectangle>) {
+    let b = node.bounds();
+    let here = iced::Point::new(origin.x + b.x, origin.y + b.y);
+    if b.width > 0.0 && b.height > 0.0 && b.width <= 16.5 && b.height <= 16.5 {
+        out.push(Rectangle::new(here, b.size()));
+        return;
+    }
+    for child in node.children() {
+        small_nodes(child, here, out);
+    }
+}
+
+#[test]
+fn a_long_name_or_preview_is_cut_at_its_slot_and_never_drawn_under_the_tags_or_the_scrollbar() {
+    let pixels = |text: &str, density: DensityChoice| {
+        let renderer = renderer();
+        let mut app = fixture::crowded_room_list(text);
+        let mut settings = variants(false)[0].settings();
+        settings.density = density;
+        app.set_ui_settings(settings);
+        let mut laid = Laid::new(&app, &renderer, WIDE);
+        laid.settle(&renderer, WIDE);
+        let slots = {
+            let (rows, _) = list_rows(&laid);
+            rows.iter()
+                .map(|(rect, node)| {
+                    // [accent bar, button]; the button's child is
+                    // [avatar, body]; the body is [title, preview + tags]
+                    // (Comfortable) or the title row (Compact).
+                    let mut at = iced::Point::new(rect.x, rect.y);
+                    let mut step = |n: &Node| {
+                        at = iced::Point::new(at.x + n.bounds().x, at.y + n.bounds().y);
+                    };
+                    let button = &node.children()[1];
+                    step(button);
+                    let content = &button.children()[0];
+                    step(content);
+                    let body = &content.children()[1];
+                    step(body);
+                    let name_slot = if density == DensityChoice::Comfortable {
+                        &body.children()[0].children()[0]
+                    } else {
+                        &body.children()[0]
+                    };
+                    let preview_slot = (density == DensityChoice::Comfortable)
+                        .then(|| &body.children()[1].children()[0]);
+                    let place = |slot: &Node, extra: iced::Point| {
+                        Rectangle::new(
+                            iced::Point::new(extra.x + slot.bounds().x, extra.y + slot.bounds().y),
+                            slot.bounds().size(),
+                        )
+                    };
+                    let name = if density == DensityChoice::Comfortable {
+                        let title = &body.children()[0];
+                        place(
+                            name_slot,
+                            iced::Point::new(at.x + title.bounds().x, at.y + title.bounds().y),
+                        )
+                    } else {
+                        place(name_slot, at)
+                    };
+                    let preview = preview_slot.map(|p| {
+                        let lower = &body.children()[1];
+                        place(
+                            p,
+                            iced::Point::new(at.x + lower.bounds().x, at.y + lower.bounds().y),
+                        )
+                    });
+                    (*rect, name, preview)
+                })
+                .collect::<Vec<_>>()
+        };
+        let image = laid.pixels(&app, renderer, WIDE);
+        (image, slots)
+    };
+    for density in [DensityChoice::Comfortable, DensityChoice::Compact] {
+        let (wide, slots) = pixels(&"W".repeat(120), density);
+        let (thin, _) = pixels(&"i".repeat(120), density);
+        assert_eq!(wide.len(), thin.len());
+        let mut checked = 0;
+        for (row, name, preview) in &slots {
+            // Right of a slot, to the end of the row (the scrollbar's side
+            // included), only things that do not depend on the text are drawn.
+            let mut regions = vec![name];
+            regions.extend(preview.as_ref());
+            for slot in regions {
+                let left = (slot.x + slot.width).ceil() as usize;
+                let right = (row.x + row.width).ceil() as usize + 14;
+                let (top, bottom) = (slot.y as usize, (slot.y + slot.height) as usize);
+                let mut differing = 0;
+                for y in top..bottom {
+                    for x in left..right.min(WIDE.width as usize) {
+                        let i = (y * WIDE.width as usize + x) * 4;
+                        if wide[i..i + 4] != thin[i..i + 4] {
+                            differing += 1;
+                        }
+                    }
+                }
+                assert_eq!(
+                    differing, 0,
+                    "{density:?}: text drawn right of its slot {slot:?} ({differing} pixels)"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked >= 4, "{density:?}: {checked} slots checked");
+    }
+}
+
+#[test]
+fn ten_thousand_rooms_build_only_the_rows_in_view_for_every_density_and_the_rail() {
+    use twicecat_core::api::{RoomId, RoomSummary};
+    let renderer = renderer();
+    let mut app = fixture::main_room();
+    app.rooms = (0..10_000)
+        .map(|i| {
+            let mut room = RoomSummary::new(
+                RoomId::from(format!("!r{i}:example.org")),
+                format!("Room {i}"),
+            );
+            room.unread_notifications = (i % 4) as u64;
+            room
+        })
+        .collect();
+    app.list_viewport_h = 700.0;
+    let mut built = Vec::new();
+    for (density, list) in [
+        (DensityChoice::Comfortable, RoomListChoice::Expanded),
+        (DensityChoice::Compact, RoomListChoice::Expanded),
+        (DensityChoice::Comfortable, RoomListChoice::Rail),
+    ] {
+        let mut settings = variants(false)[0].settings();
+        settings.density = density;
+        settings.room_list = list;
+        app.set_ui_settings(settings);
+        app.list_offset_y = 4_000.0 * app.room_row_height();
+        let laid = Laid::new(&app, &renderer, WIDE);
+        let pane = list_pane_node(&laid);
+        // The scrollable's content: [top spacer, rows..., bottom spacer].
+        let rows = scrollable_rows(list_column(pane), app.room_row_height());
+        assert!(rows < 100, "{density:?} {list:?}: {rows} rows built");
+        built.push(rows);
+    }
+    assert!(built[1] > built[0], "Compact rows are shorter, so more fit");
+}
+
+/// The number of rows (children one row high) under the list slot's
+/// scrollable; the spacers around them are taller or absent.
+fn scrollable_rows(column: &Node, row_height: f32) -> usize {
+    let mut node = &column.children()[3];
+    // scrollable -> content column
+    while node.children().len() <= 1 {
+        node = &node.children()[0];
+    }
+    node.children()
+        .iter()
+        .filter(|row| (row.bounds().height - row_height).abs() < 0.5)
+        .count()
+}
