@@ -2571,7 +2571,7 @@ Plan approved by the human 2026-10-13: Q6-Q8 as the human chose them (NVENC/NVDE
 - [ ] 8. Linux screen sharing (phase9.8)
 - [ ] 9. Linux camera (phase9.9)
 - [ ] 10. App: video renderer and call stage (phase9.10)
-- [ ] 11. App: controls, pickers, preview, Video settings (phase9.11)
+- [ ] 11. App: controls, pickers, preview, Video settings (phase9.11): amended by the human 2026-10-14, with an Advanced section that tunes as much as LiveKit allows for camera and screen separately (size, frame rate, bitrate, codec, encoder, layers or SVC, behaviour under bandwidth pressure, the camera's capture mode); the core side is in this task too
 - [ ] 12. Windows and macOS (phase9.12)
 - [ ] 13. Steam Frame (phase9.13, conditional)
 - [ ] 14. 4K60 acceptance and tuning (phase9.14)

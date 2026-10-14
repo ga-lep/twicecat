@@ -235,6 +235,7 @@ Acceptance: an ignored test on a headless Wayland compositor if one runs here (e
 
 ### Task 9: Linux camera (phase9.9, `feat(video)` + core)
 - Camera portal and PipeWire; NV12/YUYV/MJPEG; two-in-flight MJPEG decode; hot-plug; preview feed.
+- (Amended by the human 2026-10-14, for Task 11's advanced settings.) Each camera's capture modes (size, frame rate, pixel format) are listed in `VideoDevice.modes`, and the core opens the one the settings name, or the best mode for the send quality when none is named.
 
 Acceptance: unit tests with recorded MJPEG frames (decode rate ≥ 60 fps for 4K with two workers on the human's machine, recorded); a virtual camera (`v4l2loopback` if available, else a PipeWire test source) feeds a call end to end.
 
@@ -244,10 +245,19 @@ Acceptance: unit tests with recorded MJPEG frames (decode rate ≥ 60 fps for 4K
 
 Acceptance: `update` tests for layout, HiDPI sizes and `SetVideoView`; the WGSL conversion tested on a bare wgpu device (iced's re-exported `wgpu`): render a known NV12 frame to a texture, read it back and check pixel colours for BT.709 limited and full range (skipped without an adapter, as on CI).
 
-### Task 11: App: controls, pickers, preview, Video settings (phase9.11, `feat(app)`)
+### Task 11: App: controls, pickers, preview, Video settings (phase9.11, `feat(app)` + core)
 - Camera and Share buttons, Wayland portal flow, X11/Windows picker grid, share-audio checkbox, quality picker (Q12), a "You are sharing" bar with Stop that stays visible above every overlay and a camera-on mark, self-view, Video card (device, quality, codec, encoder status, "Use hardware encoding" (amended 2026-10-14; no iGPU encoder until VA-API is fixed), upload cap), shortcuts (Ctrl+Shift+V camera, Ctrl+Shift+S share), `docs/accessibility.md`.
 
-Acceptance: `update` tests for every control and error path (portal cancelled, device unplugged, encoder lost).
+**Advanced video settings (amended by the human 2026-10-14):** the user can tune as much of the video as LiveKit allows, behind an "Advanced" section of the Video card that is closed by default. Camera and screen share each have their own set; "Reset to automatic" brings back the defaults.
+- **Size and frame rate:** a preset or a custom width × height, and a frame rate (15, 24, 30, 60 or custom), up to what the source and the encoder can do.
+- **Bitrate:** automatic (the ladder, Q12) or a maximum for the top layer in kb/s; the total upload cap stays.
+- **Codec and encoder:** H.264, VP8, VP9 or AV1, then the encoder (automatic, NVENC, VideoToolbox, software), with the encoders this machine has. AV1 says it is not decoded in encrypted calls (#25, draft 3). H.265 stays off (Q4), and VA-API is not offered until it is fixed upstream (#26).
+- **Layers:** simulcast on or off; with it, 1 to 3 layers, each with its size, frame rate and bitrate (automatic from the ladder by default). For VP9 and AV1, an SVC mode (`scalability_mode`, for example `L3T3_KEY`) instead of simulcast.
+- **Under bandwidth pressure:** keep the frame rate, keep the resolution, or balance (`degradation_preference`; the defaults are framerate for a camera and resolution for a screen).
+- **Camera:** the capture mode (size, frame rate, pixel format from the camera's modes, Task 9) apart from what is sent.
+- **Core:** `VideoSettings` gains the per-kind fields (missing fields take their defaults, so older `video_settings.json` files still load). The core checks and clamps them (as `AudioSettings::validated` does), says what it changed, and reports what is actually sent in `LocalVideo` and `VideoStats`. LiveKit API: `TrackPublishOptions` (`livekit-0.9.5/src/room/options.rs:117-153`), `DegradationPreference` (`libwebrtc-0.3.52/src/rtp_parameters.rs:27`). The scope becomes `feat(app)` + core.
+
+Acceptance: `update` tests for every control and error path (portal cancelled, device unplugged, encoder lost); for the advanced settings, a stack test per option shows the change in the receiver's statistics (size, frame rate, bitrate, codec, number of layers), and settings out of range are clamped and reported.
 
 ### Task 12: Windows and macOS (phase9.12, `feat(video)` + core)
 - Windows (amended 2026-10-14): WGC capture with D3D11 import and our compute conversion, software VP8 up to 1080p30 until LiveKit ships a Windows hardware encoder (#1282), Media Foundation camera, WASAPI process-loopback share audio.
