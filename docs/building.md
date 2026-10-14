@@ -42,6 +42,20 @@ In the app, open **Settings → Voice & audio**.
 
 The core prefers TensorRT, then CUDA, DirectML, WebGPU and Core ML, and uses the first that starts.
 
+## Release builds
+
+Releases are built with the `dist` profile: `cargo build --profile dist -p twicecat-app`. It is `release` with fat link-time optimisation over one codegen unit: 1–3 % faster on the voice chain and 22 % smaller once stripped, but 16 minutes instead of 4½ on a 24-core laptop. Use `--release` for everyday work.
+
+The CPU level is set per target in `.cargo/config.toml`. x86_64 Linux and Windows build for x86-64-v3 (AVX2, FMA, BMI2), which saves about 11 % of the voice chain against the x86-64 baseline. The app refuses an older CPU at start with a message instead of crashing: on Linux on stderr, on Windows in a message box. macOS and aarch64 use the target's default. Phase 7's plan (`docs/plans/phase7-packaging.md`) has the measurements behind these choices.
+
+To measure them again, on this machine or another:
+
+```bash
+scripts/measure-builds.sh
+```
+
+It builds each CPU level, prints the size of `twicecat` and times the voice chain per 10 ms on one core of each kind. The defaults are x86-64 and v3, plus v4 where the CPU has AVX-512; on aarch64, generic, Cortex-A76 and the CPU's own. `--variants`, `--profile dist`, `--cores`, `--rounds` and `--frames` change that. Other levels are built with `--target`, so their flags never reach the build scripts, which run on this machine. The "Profile" workflow (Actions tab) runs the same script on GitHub's x86_64 or arm runner.
+
 ## Push-to-talk on Linux
 
 On Wayland the global push-to-talk key goes through the desktop's shortcuts portal (KDE Plasma, and GNOME and Hyprland in recent versions). The portal knows Twicecat by its app ID, `io.github.ga_lep.Twicecat`, and looks for a desktop entry with that name. A build run with `cargo run` has none, so install the one in the repository once:

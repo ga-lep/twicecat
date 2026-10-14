@@ -14,6 +14,16 @@ repository = "https://github.com/ga-lep/twicecat"
 # dependency that is ~1.1 GB per binary (130 GB of target/ after a few
 # rebuilds). Dependencies keep line tables (backtraces and gdb still show
 # functions and lines); our own crates keep full debug info.
+# Release builds for distribution (release CI only; Phase 7 plan Q4): fat LTO
+# over one codegen unit made the voice chain 1-3 % faster and the stripped
+# binary 22 % smaller (170 -> 133 MB) than `release`, for 16 minutes of build
+# instead of 4 1/2 (scripts/measure-builds.sh --profile dist). Unwinding stays
+# on: the PipeWire thread catches panics (crates/audio/src/pw/thread.rs).
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+
 [profile.dev]
 debug = "line-tables-only"
 [profile.dev.package.twicecat-core]
