@@ -1,0 +1,12 @@
+# Packaging tools for scripts/fetch-packaging-tools.sh (Phase 7 plan Q5, Q13):
+# <sha256> <arch> <tool> <url>. Digests are the publishers' own: nfpm's
+# checksums.txt, GitHub's asset digests for appimagetool and the runtime.
+# nfpm 2.47.0 (goreleaser, MIT): the .deb and .rpm.
+0660ca602b2d2d2ae4781a06c692b3eeb9d437ffea05b831d76e41f4a3188783  x86_64  nfpm  https://github.com/goreleaser/nfpm/releases/download/v2.47.0/nfpm_2.47.0_Linux_x86_64.tar.gz
+1c0f5f2999b9a974bfb04fdb0cc3306096de530ac5dbb25d739cc5f5219c919c  aarch64  nfpm  https://github.com/goreleaser/nfpm/releases/download/v2.47.0/nfpm_2.47.0_Linux_arm64.tar.gz
+# appimagetool 1.9.1 (AppImage project, MIT): builds the AppImage from our own AppDir.
+ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0  x86_64  appimagetool  https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage
+f0837e7448a0c1e4e650a93bb3e85802546e60654ef287576f46c71c126a9158  aarch64  appimagetool  https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-aarch64.AppImage
+# The AppImage runtime 20251108 (static, FUSE 3), given to appimagetool so it downloads nothing itself.
+2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d  x86_64  runtime  https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-x86_64
+00cbdfcf917cc6c0ff6d3347d59e0ca1f7f45a6df1a428a0d6d8a78664d87444  aarch64  runtime  https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-aarch64

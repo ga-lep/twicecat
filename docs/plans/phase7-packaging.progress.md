@@ -4,3 +4,4 @@ Task 2: complete (gate ok: 1735 passed; measure-builds.sh reproduces the plan's 
 Task 3: complete (gate ok: 1738 passed; bundled models found from a fake prefix with an empty HOME; mutation caught)
 Task 4: complete (gate ok: 1740 passed; desktop-file-validate and appstreamcli --strict valid; icon mutation caught)
 Task 5: complete (gate ok; notices for 4 targets resolve; unaccepted licence and missing file both fail)
+Task 6: complete (gate ok; tar, deb, rpm, AppImage built in Ubuntu 26.04 and all 4 smoke-tested; wrong dependency caught; MSI and DMG config dry-run only, built in CI)
