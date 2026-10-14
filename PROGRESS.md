@@ -3131,7 +3131,7 @@ Plan approved by the human 2026-10-14. Targets: Linux x86_64 and aarch64 (the St
 - [x] 2. The `dist` profile and `scripts/measure-builds.sh`, Frame tuning on the arm job (phase7.2)
 - [x] 3. Bundled resources: models and the "any GPU" pack (phase7.3)
 - [x] 4. Icon, AppStream metainfo, desktop entry (phase7.4)
-- [ ] 5. Licence notices (phase7.5)
+- [x] 5. Licence notices (phase7.5)
 - [ ] 6. Desktop packages: cargo-packager (MSI, DMG, AppImage) and nfpm (`.deb`, `.rpm`), `.tar.zst` (phase7.6)
 - [ ] 7. Flatpak, x86_64 and aarch64 (phase7.7)
 - [ ] 8. Release workflow (phase7.8)
@@ -3189,3 +3189,14 @@ See the plan's "Human checkpoint"; items move here as tasks finish. Already open
 - **Tests:** app `the_icon_and_the_metainfo_carry_the_app_id` (every PNG size decodes at its size, the SVG and `.ico` exist, the window gets an icon, the metainfo's id, launchable, binary and this version's release; `appstreamcli` run where installed); `the_desktop_entry_carries_the_app_id` checks `Icon=`; tray `the_packaged_icon_draws_the_same_shape_in_the_same_colours`. Mutation: one colour digit changed in the SVG fails the tray test; reverted.
 - **Tools:** shellcheck 0.10.0 (Docker) clean on `make-icons.sh` and `check-version.sh`.
 - **Gate:** fmt, clippy (also `--all-features`), `cargo test --workspace --locked` 1740 passed, 0 failed, 153 ignored; dependency and API checks pass.
+
+## Phase 7 / Task 5 notes
+- **`scripts/third-party-notices.sh <out.html> [--target T] [--onnxruntime DIR] [--webgpu-ep DIR]`** writes one escaped HTML page per build target: an intro (GPL-3.0-or-later, the tagged source URL, the target), the Rust crates from `cargo about generate --format json --frozen --fail -m crates/app/Cargo.toml --features gpu --target T`, then libwebrtc's `LICENSE.md` from `$LK_CUSTOM_WEBRTC` (else `dev/libwebrtc`; the WebRTC licence and its 26 third-party sections), DeepFilterNet's MIT and Apache texts, the Inter typeface's `OFL.txt` (embedded in the binary; added when the branch was rebased on `main`, which brought the font in), and, when given, ONNX Runtime's `LICENSE` and `ThirdPartyNotices.txt` and the WebGPU plugin's (Linux packages, Q3 b). Rendering is ours (Python, `html.escape`), not cargo-about's handlebars, so the non-crate notices share the page.
+- **`about.toml`**: deny.toml's allowed licences and its `ksni` (Unlicense) exception; `webpki-root-certs` left out (in the lock only through build or dev dependencies; cargo-about warned it was never in the app's graph on any target). Private crates, build and dev dependencies are skipped.
+- **`packaging/licenses/DeepFilterNet-LICENSE-{MIT,APACHE}`**: from Rikorose/DeepFilterNet at the pinned commit `978576aa` (v0.5.6), SHA-256 `24e6bb09…065e` and `1eaee808…1aec`. The model archive itself carries only a `SOURCE` note, and MIT needs its copyright line shipped.
+- **Run:** x86_64 Linux: 648 crates, 11 licences (MIT 548, Apache-2.0 52, ISC 24, Unicode-3.0 20, BSD-3 16, MPL-2.0 10, BSD-2 6, Zlib 6, BSL-1.0, CC0-1.0, Unlicense); with the GPU pack 7 other notices, 1.4 MB. Also resolved for aarch64 Linux (647), x86_64 Windows (583) and aarch64 macOS (587) with no error.
+- **Failure checks:** MIT removed from `about.toml` → "failed to satisfy license requirements", exit 1 (restored); `--webgpu-ep /nonexistent` → "missing notice file", exit 1.
+- **Tools:** cargo-about 0.9.2 (`cargo install cargo-about@0.9.2 --locked --features cli`; without `cli` no binary is installed). The ONNX Runtime CPU build and the WebGPU plugin were fetched with the pinned scripts (`scripts/fetch-onnxruntime.sh`, `scripts/fetch-webgpu-ep.sh`). shellcheck 0.10.0 clean.
+- **APIs (rule 2):** `cargo-about-0.9.2/src/licenses/config.rs:287-311` (config keys), `src/cargo-about/generate.rs` (`--format json`, `--frozen`, `--fail`, `--target`, `-m`, `--features`), the JSON fields `overview`, `licenses[].{name,id,first_of_kind,text,used_by[].crate}` read from a run.
+- **Gate:** fmt, clippy (also `--all-features`), `cargo test --workspace --locked` 1740 passed, 0 failed, 153 ignored; dependency and API checks pass (no Rust changed).
+- **Next:** the release workflow (Task 8) runs the script in each packaging job; a CI lint step could run it on every pull request so a new crate with an unaccepted licence is caught before a release (left for Task 8).
