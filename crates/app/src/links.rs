@@ -103,6 +103,12 @@ pub fn check_link_url(url: &str) -> Result<CheckedUrl, LinkRefused> {
     })
 }
 
+/// Longest DNS name, in bytes. A longer host is refused: the bar that asks
+/// before opening could not show its registrable domain.
+pub const MAX_HOST_BYTES: usize = 253;
+/// Longest DNS label, in bytes.
+pub const MAX_LABEL_BYTES: usize = 63;
+
 /// `rest` is what follows `mailto:`. One plain address, headers dropped.
 fn check_mailto(rest: &str) -> Result<CheckedUrl, LinkRefused> {
     let address = rest.split(['?', '#']).next().unwrap_or_default();
@@ -111,7 +117,10 @@ fn check_mailto(rest: &str) -> Result<CheckedUrl, LinkRefused> {
         && local
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b".!#$&'*+/=^_`{|}~-".contains(&b));
-    let domain_ok = domain.split('.').all(is_dns_label_like);
+    let domain_ok = domain.len() <= MAX_HOST_BYTES
+        && domain
+            .split('.')
+            .all(|label| label.len() <= MAX_LABEL_BYTES && is_dns_label_like(label));
     if !local_ok || !domain_ok {
         return Err(LinkRefused::Malformed);
     }
@@ -546,6 +555,30 @@ mod tests {
         assert_eq!(check_link_url(&long), Err(LinkRefused::Malformed));
         let edge = format!("https://example.org/{}", "a".repeat(MAX_URL_BYTES - 20));
         assert!(check_link_url(&edge).is_ok());
+    }
+
+    #[test]
+    fn hosts_past_the_dns_limits_are_refused() {
+        let long = format!("{}.evil.example", "a".repeat(40).repeat(10));
+        assert!(long.len() > 400);
+        let label64 = format!("{}.example", "a".repeat(64));
+        let label63 = format!("{}.example", "a".repeat(63));
+        for host in [&long, &label64] {
+            assert_eq!(
+                check_link_url(&format!("https://{host}/")),
+                Err(LinkRefused::Malformed),
+                "{}",
+                host.len()
+            );
+            assert_eq!(
+                check_link_url(&format!("mailto:a@{host}")),
+                Err(LinkRefused::Malformed),
+                "{}",
+                host.len()
+            );
+        }
+        assert!(check_link_url(&format!("https://{label63}/")).is_ok());
+        assert!(check_link_url(&format!("mailto:a@{label63}")).is_ok());
     }
 
     #[test]

@@ -448,7 +448,8 @@ pub fn room_after(
 
 impl App {
     /// Whether a dialog, card, panel or screen covers the main view, so the
-    /// room shortcuts wait.
+    /// room shortcuts wait and the composer takes no key: Enter must not send
+    /// the draft behind a dialog.
     pub fn any_overlay_open(&self) -> bool {
         self.switcher.open
             || self.calls.card().is_some()
@@ -457,6 +458,10 @@ impl App {
             || self.media.viewer.is_some()
             || self.settings_ui.open
             || self.rooms_ui.overlay_open()
+            || self.sessions.open
+            || self.sessions.logout_warning
+            || self.verification.is_some()
+            || self.security.visible() != crate::security::Visible::Nothing
     }
 
     /// Acts on a shortcut, unless where it was pressed says otherwise.

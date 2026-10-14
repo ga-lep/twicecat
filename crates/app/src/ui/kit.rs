@@ -285,11 +285,27 @@ fn compact<'a, M: Clone + 'a>(
 /// A button that holds one icon. It always has a tooltip with the icon's
 /// words, so no action is a bare symbol.
 pub fn icon_button<'a, M: Clone + 'a>(icon: Icon, on_press: M) -> Element<'a, M> {
+    icon_button_maybe(icon, Some(on_press))
+}
+
+/// [`icon_button`] that is disabled (and takes no press) when `on_press` is
+/// `None`. The widget tree is the same either way.
+pub fn icon_button_maybe<'a, M: Clone + 'a>(icon: Icon, on_press: Option<M>) -> Element<'a, M> {
     let button = button(icons::icon(icon))
         .padding(tokens::S)
-        .on_press(on_press)
+        .on_press_maybe(on_press)
         .style(icon_style);
     tip(button, icon.label())
+}
+
+/// The send button: an icon on the accent colour, disabled when `on_press`
+/// is `None`.
+pub fn send_icon_button<'a, M: Clone + 'a>(on_press: Option<M>) -> Element<'a, M> {
+    let button = button(icons::icon(Icon::Send))
+        .padding(tokens::S)
+        .on_press_maybe(on_press)
+        .style(primary_style);
+    tip(button, Icon::Send.label())
 }
 
 /// An icon button with an on and an off state, such as mute or deafen. On
@@ -634,12 +650,51 @@ pub fn count_badge<'a, M: 'a>(count: u64) -> Element<'a, M> {
         .into()
 }
 
+/// How banner text wraps: a glyph break when a word (a long host) has no
+/// other, so no character is drawn past the bar. Shared with the layout
+/// tests, which measure with it.
+pub(crate) const BANNER_WRAPPING: Wrapping = Wrapping::WordOrGlyph;
+
 /// A message bar: an icon for its severity, then the text.
 pub fn banner<'a, M: 'a>(severity: Severity, message: &'a str) -> Element<'a, M> {
     container(
-        row![icons::icon(severity.icon()), text(message).width(Fill)]
+        row![
+            icons::icon(severity.icon()),
+            text(message).width(Fill).wrapping(BANNER_WRAPPING)
+        ]
+        .spacing(tokens::S)
+        .align_y(iced::Center),
+    )
+    .padding(tokens::M)
+    .width(Fill)
+    .style(banner_style(severity))
+    .into()
+}
+
+/// A [`banner`] with buttons at its end, for a bar that asks something (open
+/// this link, send this as a message). The words and the severity colour are
+/// the same as a plain banner's.
+pub fn banner_with<'a, M: 'a>(
+    severity: Severity,
+    message: impl IntoFragment<'a>,
+    actions: Vec<Element<'a, M>>,
+) -> Element<'a, M> {
+    // The words get the whole width, with the buttons on a row of their own
+    // below: beside the text the buttons would take their width first, and
+    // text drawn past its bounds (a long host has no break point for
+    // `Wrapping::Word`) would run under them, hiding the end of a host. A
+    // glyph break keeps every character inside the bounds.
+    let words = row![
+        icons::icon(severity.icon()),
+        text(message).width(Fill).wrapping(BANNER_WRAPPING)
+    ]
+    .spacing(tokens::S)
+    .align_y(iced::Center);
+    let buttons = row(actions).spacing(tokens::S);
+    container(
+        column![words, buttons]
             .spacing(tokens::S)
-            .align_y(iced::Center),
+            .align_x(iced::Right),
     )
     .padding(tokens::M)
     .width(Fill)

@@ -755,6 +755,21 @@ fn main_reply() -> App {
     app
 }
 
+/// A reply being written, with the emoji suggestions open under `:sm`.
+fn main_reply_suggestions() -> App {
+    use iced::widget::text_editor::{Action, Edit};
+    let mut app = main_reply();
+    for c in ":sm".chars() {
+        press(
+            &mut app,
+            Message::Composer(twicecat_app::composer::EditorAction(Action::Edit(
+                Edit::Insert(c),
+            ))),
+        );
+    }
+    app
+}
+
 fn main_picker() -> App {
     let mut app = main_room();
     press(&mut app, Message::PickerOpened("m6".to_owned()));
@@ -1707,6 +1722,15 @@ pub fn scenarios() -> Vec<Scenario> {
         s("main-reply", true, main_reply, |a| {
             matches!(a.composer.mode, twicecat_app::composer::Mode::Reply(_))
         }),
+        s(
+            "main-reply-suggestions",
+            true,
+            main_reply_suggestions,
+            |a| {
+                matches!(a.composer.mode, twicecat_app::composer::Mode::Reply(_))
+                    && a.composer.suggestions.is_open()
+            },
+        ),
         s("main-picker", true, main_picker, |a| {
             a.actions.picker.is_some()
         }),
