@@ -3092,6 +3092,58 @@ mod settings_pages {
         }
     }
 
+    fn swatch_names(app: &App) -> Vec<String> {
+        let renderer = renderer();
+        let mut laid = Laid::new(app, &renderer, NARROW);
+        texts(&mut laid, &renderer)
+            .into_iter()
+            .map(|(t, _)| t)
+            .filter(|t| {
+                ["Twicecat", "Frost", "Ember", "High contrast"]
+                    .iter()
+                    .any(|l| t.starts_with(l))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_swatch_marked_default_is_frost() {
+        let mut app = page_app("settings-appearance");
+        app.window_width = NARROW.width;
+        let mut settings = app.ui_settings;
+        settings.palette = None;
+        app.set_ui_settings(settings);
+        let names = swatch_names(&app);
+        assert!(names.contains(&"Frost (default)".to_owned()), "{names:?}");
+        assert_eq!(
+            names.iter().filter(|n| n.contains("(default)")).count(),
+            1,
+            "{names:?}"
+        );
+    }
+
+    #[test]
+    fn a_settings_file_with_an_explicit_twicecat_palette_still_shows_twicecat() {
+        let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("ui17-explicit-palette");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let paths = twicecat_core::paths::DataPaths::at(&dir);
+        std::fs::write(paths.settings_file(), r#"{"palette":"Twicecat"}"#).expect("write");
+        let read = paths.read_settings();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(read.palette, Some(PaletteChoice::Twicecat));
+        let mut app = page_app("settings-appearance");
+        app.window_width = NARROW.width;
+        app.set_ui_settings(read);
+        assert_eq!(
+            twicecat_app::theme::resolve_family(read.palette),
+            twicecat_app::theme::Family::Twicecat
+        );
+        let names = swatch_names(&app);
+        assert!(names.contains(&"Twicecat".to_owned()), "{names:?}");
+        assert!(names.contains(&"Frost (default)".to_owned()), "{names:?}");
+    }
+
     #[test]
     fn a_long_keyword_wraps_and_its_end_is_never_cut_off() {
         let renderer = renderer();

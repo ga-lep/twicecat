@@ -200,7 +200,10 @@ the same note under the shortcut list.
   contrast, each with a light and a dark palette (`theme::Family`). Settings,
   Appearance picks the family (four swatches, the one in use is outlined and
   has a check) and the mode (System, Light or Dark). **Use the default** goes
-  back to the app's default set (`theme::DEFAULT_FAMILY`).
+  back to the app's default set (`theme::DEFAULT_FAMILY`), which is **Frost**
+  (the swatch marked "(default)"). People who never picked a set see Frost,
+  including existing users after upgrading from a version whose default was
+  Twicecat; anyone who picked a set, Twicecat included, keeps it.
 - All eight palettes are tested for a contrast of at least 4.5:1 (WCAG AA for
   body text) for text on background, muted text, badge and highlight text,
   text on selection, message highlight, hover, surface, raised surface and
