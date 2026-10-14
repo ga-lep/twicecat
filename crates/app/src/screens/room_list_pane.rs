@@ -1,42 +1,107 @@
 //! The room list pane: tabs, search and the windowed list of rows (plan Q12).
 //!
 //! Only the rows near the viewport are built, between two spacers that keep
-//! the scrollable's content `len * ROW_HEIGHT` tall. Names and previews come
-//! from other people, so they pass through [`crate::text_safety`] first (see
+//! the scrollable's content `len * row height` tall (the row height is the
+//! density's, or the rail's fixed 56 px). Names and previews come from other
+//! people, so they pass through [`crate::text_safety`] first (see
 //! [`row_name`] and [`preview_line`]).
+//!
+//! The pane is either expanded or collapsed to a rail
+//! ([`RoomListChoice`]). The column is always `[actions, tabs, search, list,
+//! call bar]` in both, so the list keeps its place when Ctrl+B switches.
 
+use chrono::{Local, TimeZone};
 use iced::widget::text::Wrapping;
-use iced::widget::{button, column, container, image, row, scrollable, space, text, text_input};
+use iced::widget::tooltip::{Position, Tooltip};
+use iced::widget::{
+    Column, button, column, container, image, row, scrollable, space, stack, text, text_input,
+};
 use iced::{Background, Color, Element, Fill, Length, border};
-use twicecat_core::api::{RoomListTab, RoomNotificationModeView, RoomSummary};
+use twicecat_core::api::{RoomListChoice, RoomListTab, RoomNotificationModeView, RoomSummary};
 
 use crate::avatars::{AvatarState, Avatars, NEUTRAL_INITIALS, initials, placeholder_color};
 use crate::calls::CallPill;
+use crate::dates::{day_label, time_label};
 use crate::notifications::muted_mark;
 use crate::room_list::{
-    Badge, OVERSCAN_ROWS, ROW_HEIGHT, badge_for, empty_label, preview_line, row_name,
-    spacer_heights, visible_range,
+    Badge, OVERSCAN_ROWS, RAIL_ROW_HEIGHT, badge_for, empty_label, preview_line, row_height,
+    row_name, spacer_heights, visible_range,
 };
 use crate::rooms::RoomsMessage;
-use crate::screens::{call, centered_text};
+use crate::screens::{call, main_view};
+use crate::settings::SettingsMessage;
 use crate::state::{App, Message};
 use crate::theme;
-use crate::ui::icons::Icon;
+use crate::ui::icons::{self, Icon};
+use crate::ui::kit;
+use crate::ui::tokens::{self, Density};
+
+/// Width of the collapsed room list, in logical pixels.
+pub const RAIL_WIDTH: f32 = 72.0;
+
+/// The id of the list's scrollable, so a change of row height can move it.
+pub const LIST_SCROLL_ID: &str = "room-list";
+
+/// Room kept free at the right of the list for its scrollbar, so the bar
+/// never covers a count or the end of a preview (the bar is 10 px wide).
+pub const SCROLLBAR_GUTTER: f32 = 12.0;
+
+/// Width of the accent bar at the left of the selected row.
+const ACCENT_BAR: f32 = 3.0;
+
+/// The width of the pane: 300 px expanded, 72 px as the rail.
+pub const fn pane_width(list: RoomListChoice) -> f32 {
+    match list {
+        RoomListChoice::Expanded => main_view::LIST_PANE_WIDTH,
+        RoomListChoice::Rail => RAIL_WIDTH,
+    }
+}
+
+/// Whether a row has a second line with the preview: Compact rows are one
+/// line.
+pub const fn shows_preview(density: Density) -> bool {
+    matches!(density, Density::Comfortable)
+}
 
 /// **New room**, **Direct message** and **Join**, above the tabs.
 fn room_actions<'a>() -> Element<'a, Message> {
     let action = |label: &'static str, message: RoomsMessage| {
-        button(text(label).size(13))
+        button(text(label).size(tokens::CAPTION).wrapping(Wrapping::None))
             .on_press(Message::Rooms(message))
-            .padding([4, 8])
-            .style(button::secondary)
+            .padding([tokens::XS, tokens::S])
+            .style(kit::secondary_style)
     };
     row![
         action("New room", RoomsMessage::OpenCreate),
         action("Direct message", RoomsMessage::OpenDm),
         action("Join", RoomsMessage::OpenJoin),
     ]
-    .spacing(4)
+    .spacing(tokens::XS)
+    .into()
+}
+
+/// The same three actions as icons in a column, for the rail. Each has a
+/// tooltip with its words.
+fn rail_actions<'a>() -> Element<'a, Message> {
+    let action = |icon: Icon, label: &'static str, message: RoomsMessage| {
+        kit::tip(
+            button(icons::icon(icon))
+                .on_press(Message::Rooms(message))
+                .padding(tokens::S)
+                .style(kit::icon_style),
+            label,
+        )
+    };
+    container(
+        column![
+            action(Icon::Plus, "New room", RoomsMessage::OpenCreate),
+            action(Icon::Members, "Direct message", RoomsMessage::OpenDm),
+            action(Icon::ChevronRight, "Join a room", RoomsMessage::OpenJoin),
+        ]
+        .spacing(tokens::XS)
+        .align_x(iced::Center),
+    )
+    .center_x(Fill)
     .into()
 }
 
@@ -50,6 +115,8 @@ pub const TABS: [RoomListTab; 4] = [
 
 /// Side of the round avatar left of each row.
 pub const AVATAR_SLOT: f32 = 40.0;
+/// Side of the round avatar of a Compact row.
+pub const COMPACT_AVATAR_SLOT: f32 = 28.0;
 
 /// The label of a tab.
 pub fn tab_label(tab: RoomListTab) -> &'static str {
@@ -89,61 +156,275 @@ pub fn encrypted_mark(room: &RoomSummary) -> Option<&'static str> {
     room.is_encrypted.then_some(LOCK_MARK)
 }
 
+/// The time shown on a row: the clock for a message of today, else the day
+/// ("Yesterday", a weekday, `2 October`).
+pub fn row_time<Tz: TimeZone>(timestamp_ms: u64, now_ms: u64, tz: &Tz) -> String {
+    let day = day_label(timestamp_ms, now_ms, tz);
+    if day == "Today" {
+        time_label(timestamp_ms, tz)
+    } else {
+        day
+    }
+}
+
+/// What the rail's tooltip says about a room: its name, then the words for
+/// the dots on its avatar (unread, mentions, call) and the muted mark.
+pub fn rail_tip(
+    name: &str,
+    badge: Badge,
+    call: Option<CallPill>,
+    muted: Option<&str>,
+    marks: &[RailMark],
+) -> String {
+    let mut parts = vec![name.to_owned()];
+    match badge {
+        Badge::None => {}
+        Badge::Highlight(1) => parts.push("1 mention".to_owned()),
+        Badge::Highlight(count) => parts.push(format!("{} mentions", count_label(count))),
+        Badge::Count(count) => parts.push(format!("{} unread", count_label(count))),
+        Badge::Dot => parts.push("unread".to_owned()),
+    }
+    if let Some(call) = call {
+        parts.push(if call.ringing { "ringing" } else { "in a call" }.to_owned());
+    }
+    parts.extend(marks.iter().map(|mark| mark.words().to_owned()));
+    parts.extend(muted.map(str::to_owned));
+    parts.join(", ")
+}
+
+/// A mark a rail row draws on its avatar besides the dots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RailMark {
+    /// An invitation to join.
+    Invite,
+    /// A voice room (MSC3417 call room).
+    Voice,
+    /// An encrypted room.
+    Encrypted,
+}
+
+impl RailMark {
+    /// The words of the mark, for the row's tooltip.
+    pub const fn words(self) -> &'static str {
+        match self {
+            Self::Invite => "invite",
+            Self::Voice => "voice room",
+            Self::Encrypted => "encrypted",
+        }
+    }
+
+    /// The icon drawn on the avatar.
+    pub const fn icon(self) -> Icon {
+        match self {
+            Self::Invite => Icon::Plus,
+            Self::Voice => Icon::Call,
+            Self::Encrypted => Icon::Lock,
+        }
+    }
+}
+
+/// The marks of a rail row, Invite first.
+pub fn rail_marks(room: &RoomSummary) -> Vec<RailMark> {
+    let mut marks = Vec::new();
+    if room.is_invite {
+        marks.push(RailMark::Invite);
+    }
+    if room.is_call_room {
+        marks.push(RailMark::Voice);
+    }
+    if encrypted_mark(room).is_some() {
+        marks.push(RailMark::Encrypted);
+    }
+    marks
+}
+
+/// The words of the call pill: the number of devices in the call, or what
+/// the call is when nobody is counted.
+fn call_label(call: CallPill) -> String {
+    if call.count > 0 {
+        call.count.to_string()
+    } else if call.ringing {
+        "Ringing".to_owned()
+    } else {
+        "Call".to_owned()
+    }
+}
+
+/// What an empty list adds to its title.
+fn empty_hint(label: &str) -> &'static str {
+    if label == "No match" {
+        "Try another search"
+    } else {
+        "Rooms you join will appear here"
+    }
+}
+
+/// The tabs as a segmented control: one track, the chosen tab filled and
+/// outlined.
+fn segmented_tabs<'a>(active: RoomListTab) -> Element<'a, Message> {
+    let tabs = row(TABS.into_iter().map(|tab| {
+        button(
+            text(tab_label(tab))
+                .size(tokens::CAPTION)
+                .wrapping(Wrapping::None)
+                .width(Fill)
+                .align_x(iced::Center),
+        )
+        .on_press(Message::TabSelected(tab))
+        .width(Fill)
+        .padding([tokens::XS, tokens::S])
+        .style(if tab == active {
+            kit::active_icon_style
+        } else {
+            kit::ghost_style
+        })
+        .into()
+    }))
+    .spacing(tokens::XS);
+    container(tabs)
+        .padding(tokens::XS)
+        .width(Fill)
+        .style(kit::card_style)
+        .into()
+}
+
+/// The search field with a search icon and, once there is text, a button
+/// that clears it. The clear slot is a space while empty, so the field keeps
+/// its place and its focus.
+fn search_field(app: &App) -> Element<'_, Message> {
+    let clear: Element<'_, Message> = if app.search_input.is_empty() {
+        space().width(0).into()
+    } else {
+        kit::tip(
+            button(icons::icon(Icon::Close))
+                .on_press(Message::SearchChanged(String::new()))
+                .padding(tokens::S)
+                .style(kit::icon_style),
+            "Clear search",
+        )
+    };
+    row![
+        icons::icon(Icon::Search),
+        text_input("Search rooms", &app.search_input)
+            .on_input(Message::SearchChanged)
+            .padding(tokens::S),
+        clear,
+    ]
+    .spacing(tokens::S)
+    .align_y(iced::Center)
+    .into()
+}
+
+/// The rail's search: a button that expands the list, where the field is.
+fn rail_search<'a>() -> Element<'a, Message> {
+    container(kit::tip(
+        button(icons::icon(Icon::Search))
+            .on_press(Message::Settings(SettingsMessage::RoomList(
+                RoomListChoice::Expanded,
+            )))
+            .padding(tokens::S)
+            .style(kit::icon_style),
+        "Search rooms (expands the list)",
+    ))
+    .center_x(Fill)
+    .into()
+}
+
+/// What an empty list says.
+fn empty_view(app: &App, rail: bool) -> Element<'_, Message> {
+    let label = empty_label(app.query.tab, &app.query.search);
+    if rail {
+        // 56 px wide: the title in small type, no hint.
+        return container(
+            text(label)
+                .size(tokens::CAPTION)
+                .style(kit::muted)
+                .align_x(iced::Center),
+        )
+        .center_x(Fill)
+        .padding([tokens::L, 0.0])
+        .into();
+    }
+    kit::empty_state(label, empty_hint(label))
+}
+
 /// The pane: tabs, search, then the list or an empty-state line.
 pub fn view(app: &App) -> Element<'_, Message> {
-    let tabs = row(TABS.into_iter().map(|tab| {
-        let active = tab == app.query.tab;
-        button(text(tab_label(tab)).size(14))
-            .on_press(Message::TabSelected(tab))
-            .padding([4, 10])
-            .style(if active {
-                button::primary
-            } else {
-                button::secondary
-            })
-            .into()
-    }))
-    .spacing(4);
-    let search = text_input("Search rooms", &app.search_input)
-        .on_input(Message::SearchChanged)
-        .padding(8);
+    let rail = app.ui_settings.room_list == RoomListChoice::Rail;
+    let density = app.density();
     let list = if app.rooms.is_empty() {
-        centered_text(empty_label(app.query.tab, &app.query.search))
+        empty_view(app, rail)
     } else {
         windowed_list(app)
     };
+    let tabs: Element<'_, Message>;
+    let (actions, search, dock) = if rail {
+        tabs = space().height(0).into();
+        (rail_actions(), rail_search(), call::rail_dock(app))
+    } else {
+        tabs = segmented_tabs(app.query.tab);
+        (room_actions(), search_field(app), call::bar(app))
+    };
     // The call bar is last, so the list keeps its place when a call starts.
-    container(column![room_actions(), tabs, search, list, call::bar(app)].spacing(8))
-        .width(Length::Fixed(crate::screens::main_view::LIST_PANE_WIDTH))
+    // `from_vec` keeps the empty slots (`push` drops a zero-sized child), so
+    // the five slots stay put between the expanded list and the rail.
+    let slots = Column::from_vec(vec![actions, tabs, search, list, dock])
+        .spacing(density.gap())
+        .width(Fill)
+        .height(Fill);
+    container(slots)
+        .width(Length::Fixed(pane_width(app.ui_settings.room_list)))
         .height(Fill)
-        .padding(8)
+        .padding(if rail { tokens::XS } else { tokens::S })
         .into()
+}
+
+/// What a row needs besides its room.
+struct RowEnv<'a> {
+    avatars: &'a Avatars,
+    density: Density,
+    /// The clock, for the time of the last message.
+    now_ms: u64,
 }
 
 /// The scrollable with only the rows near the viewport built.
 fn windowed_list(app: &App) -> Element<'_, Message> {
     let len = app.rooms.len();
+    let rail = app.ui_settings.room_list == RoomListChoice::Rail;
+    let row_h = app.room_row_height();
     let range = visible_range(
         app.list_offset_y,
         app.list_viewport_h,
-        ROW_HEIGHT,
+        row_h,
         len,
         OVERSCAN_ROWS,
     );
-    let (top, bottom) = spacer_heights(&range, len, ROW_HEIGHT);
+    let (top, bottom) = spacer_heights(&range, len, row_h);
+    let env = RowEnv {
+        avatars: &app.avatars,
+        density: app.density(),
+        now_ms: u64::try_from(Local::now().timestamp_millis()).unwrap_or(0),
+    };
     let rows = app.rooms[range].iter().map(|room| {
-        room_row(
-            room,
-            &app.avatars,
-            app.selected.as_ref() == Some(&room.id),
-            app.effective_room_mode(&room.id),
-            app.calls.pill(&room.id),
-        )
+        let selected = app.selected.as_ref() == Some(&room.id);
+        let mode = app.effective_room_mode(&room.id);
+        let call = app.calls.pill(&room.id);
+        if rail {
+            rail_row(room, env.avatars, selected, mode, call)
+        } else {
+            room_row(room, &env, selected, mode, call)
+        }
     });
+    // Room for the scrollbar, so it never covers a count or a time.
     let content = column![space().height(top)]
         .extend(rows)
-        .push(space().height(bottom));
+        .push(space().height(bottom))
+        .padding(iced::Padding {
+            right: SCROLLBAR_GUTTER,
+            ..iced::Padding::ZERO
+        });
     scrollable(content)
+        .id(LIST_SCROLL_ID)
         .on_scroll(|viewport| Message::RoomListScrolled {
             offset_y: viewport.absolute_offset().y,
             viewport_h: viewport.bounds().height,
@@ -152,75 +433,296 @@ fn windowed_list(app: &App) -> Element<'_, Message> {
         .into()
 }
 
-/// One fixed-height row: avatar, name (and "Voice", "Invite" or "Muted"),
-/// preview, the call pill, the badge. `mode` is the room's notification mode
-/// as the app knows it; `call` the room's call, if any.
+/// The 3 px bar at the left of a row: the accent colour while selected,
+/// clear otherwise, so the row keeps its shape.
+fn accent_bar<'a>(selected: bool) -> Element<'a, Message> {
+    container(space().width(ACCENT_BAR).height(Fill))
+        .style(move |t: &iced::Theme| container::Style {
+            background: selected.then(|| Background::Color(t.palette().primary)),
+            ..container::Style::default()
+        })
+        .into()
+}
+
+/// The style of a row's button: quiet, with the selection colour while the
+/// room is open.
+fn row_style(selected: bool) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
+    move |t, status| {
+        let base = kit::ghost_style(t, status);
+        if selected {
+            button::Style {
+                background: Some(Background::Color(theme::semantic(t).selection)),
+                ..base
+            }
+        } else {
+            base
+        }
+    }
+}
+
+/// One fixed-height row: avatar, name, time, the lock, the preview (not in
+/// Compact), the Voice, Invite and Muted tags, the call pill and the count.
+/// `mode` is the room's notification mode as the app knows it; `call` the
+/// room's call, if any.
 fn room_row<'a>(
+    room: &'a RoomSummary,
+    env: &RowEnv<'_>,
+    selected: bool,
+    mode: Option<RoomNotificationModeView>,
+    call: Option<CallPill>,
+) -> Element<'a, Message> {
+    let comfortable = shows_preview(env.density);
+    let name = row_name(&room.name);
+    let avatar = avatar_view(
+        room,
+        &name,
+        env.avatars,
+        if comfortable {
+            AVATAR_SLOT
+        } else {
+            COMPACT_AVATAR_SLOT
+        },
+    );
+    // Text that does not wrap is drawn past its box, so the box clips it:
+    // the end of a long name never lands under the lock, the time, the tags
+    // or the scrollbar.
+    let mut title = row![
+        container(text(name).size(tokens::BODY).wrapping(Wrapping::None))
+            .width(Fill)
+            .clip(true)
+    ]
+    .spacing(tokens::S)
+    .align_y(iced::Center);
+    if let Some(lock) = encrypted_mark(room) {
+        title = title.push(text(lock).size(tokens::CAPTION));
+    }
+    let mut marks = row![].spacing(tokens::XS).align_y(iced::Center);
+    if room.is_call_room {
+        marks = marks.push(kit::tag(VOICE_TAG));
+    }
+    if room.is_invite {
+        marks = marks.push(kit::tag("Invite"));
+    }
+    if let Some(mark) = muted_mark(mode) {
+        marks = marks.push(kit::tag(mark));
+    }
+    marks = marks
+        .push(call_pill(call))
+        .push(badge_view(badge_for(room), muted_mark(mode).is_some()));
+    let body: Element<'a, Message> = if comfortable {
+        if let Some(last) = &room.last_message {
+            title = title.push(
+                text(row_time(last.timestamp_ms, env.now_ms, &Local))
+                    .size(tokens::CAPTION)
+                    .wrapping(Wrapping::None)
+                    .style(kit::muted),
+            );
+        }
+        let preview = preview_line(room).unwrap_or_default();
+        column![
+            title,
+            row![
+                container(
+                    text(preview)
+                        .size(tokens::CAPTION)
+                        .wrapping(Wrapping::None)
+                        .style(kit::muted)
+                )
+                .width(Fill)
+                .clip(true),
+                marks
+            ]
+            .spacing(tokens::S)
+            .align_y(iced::Center)
+        ]
+        .spacing(2)
+        .width(Fill)
+        .into()
+    } else {
+        title.push(marks).into()
+    };
+    let content = row![avatar, body].spacing(tokens::S).align_y(iced::Center);
+    let height = row_height(env.density);
+    row![
+        accent_bar(selected),
+        button(content)
+            .on_press(Message::SelectRoom(room.id.clone()))
+            .width(Fill)
+            .height(Length::Fixed(height))
+            .padding([tokens::XS, tokens::S])
+            .clip(true)
+            .style(row_style(selected)),
+    ]
+    .height(Length::Fixed(height))
+    .into()
+}
+
+/// One row of the rail: the avatar with an unread dot and, in a call, a
+/// speaker dot, and a tooltip with the room's name and what the dots say.
+fn rail_row<'a>(
     room: &'a RoomSummary,
     avatars: &Avatars,
     selected: bool,
     mode: Option<RoomNotificationModeView>,
     call: Option<CallPill>,
 ) -> Element<'a, Message> {
-    let muted = |t: &iced::Theme| text::Style {
-        color: Some(theme::semantic(t).muted),
-    };
     let name = row_name(&room.name);
-    let avatar = avatar_view(room, &name, avatars);
-    let mut name_line = row![text(name).wrapping(Wrapping::None).width(Fill)]
-        .spacing(6)
-        .align_y(iced::Center);
-    if let Some(lock) = encrypted_mark(room) {
-        name_line = name_line.push(text(lock).size(12));
-    }
-    if room.is_call_room {
-        name_line = name_line.push(tag(VOICE_TAG));
-    }
-    if room.is_invite {
-        name_line = name_line.push(tag("Invite"));
-    }
-    if let Some(mark) = muted_mark(mode) {
-        name_line = name_line.push(tag(mark));
-    }
-    let preview = preview_line(room).unwrap_or_default();
-    let body = column![
-        name_line,
-        text(preview).size(13).wrapping(Wrapping::None).style(muted)
-    ]
-    .spacing(2)
-    .width(Fill);
-    let content = row![
+    let badge = badge_for(room);
+    let marks = rail_marks(room);
+    let words = rail_tip(&name, badge, call, muted_mark(mode), &marks);
+    let avatar = avatar_view(room, &name, avatars, AVATAR_SLOT);
+    let corner = |dot: Element<'a, Message>, top: bool| {
+        let layer = container(dot).width(Fill).height(Fill).align_right(Fill);
+        if top {
+            layer.align_top(Fill)
+        } else {
+            layer.align_bottom(Fill)
+        }
+    };
+    let picture = stack![
         avatar,
-        body,
-        call_pill(call),
-        badge_view(badge_for(room), muted_mark(mode).is_some()),
-    ]
-    .spacing(8)
-    .align_y(iced::Center);
-    button(content)
+        corner(unread_dot(badge, muted_mark(mode).is_some()), true),
+        corner(speaker_dot(call), false),
+        rail_mark_layer(&marks),
+    ];
+    let height = Length::Fixed(RAIL_ROW_HEIGHT);
+    let entry = button(container(picture).center(Fill))
         .on_press(Message::SelectRoom(room.id.clone()))
         .width(Fill)
-        .height(Length::Fixed(ROW_HEIGHT))
-        .padding([4, 8])
-        .clip(true)
-        .style(move |t, status| {
-            let base = button::text(t, status);
-            if selected {
-                button::Style {
-                    background: Some(Background::Color(theme::semantic(t).selection)),
-                    ..base
+        .height(height)
+        .padding(tokens::XS)
+        .style(row_style(selected));
+    row![
+        accent_bar(selected),
+        Tooltip::new(entry, text(words).size(tokens::CAPTION), Position::Right)
+            .gap(tokens::XS)
+            .padding(tokens::S)
+            .style(kit::card_style),
+    ]
+    .height(height)
+    .into()
+}
+
+/// The unread dot on a rail avatar: the highlight colour for mentions, the
+/// badge colour for other unread messages, an outline for a muted room, and
+/// nothing when all is read.
+fn unread_dot<'a>(badge: Badge, muted: bool) -> Element<'a, Message> {
+    let size = 12.0;
+    match badge {
+        Badge::None => space().width(0).into(),
+        badge => container(space().width(size).height(size))
+            .style(move |t: &iced::Theme| {
+                let sem = theme::semantic(t);
+                let (fill, ring) = match badge {
+                    Badge::Highlight(_) => (Some(sem.highlight), t.palette().background),
+                    _ if muted => (None, sem.muted),
+                    _ => (Some(sem.badge), t.palette().background),
+                };
+                container::Style {
+                    background: fill.map(Background::Color),
+                    border: border::rounded(size / 2.0).color(ring).width(2),
+                    ..container::Style::default()
                 }
+            })
+            .into(),
+    }
+}
+
+/// Side of a mark or call chip on a rail avatar. Two chips along the bottom
+/// left and the call chip at the bottom right must fit the 40 px avatar with
+/// room between them: 12 + 1 + 12 and 12 leave 3 px.
+const CHIP: f32 = 12.0;
+
+/// The marks of a rail row on the avatar: Invite at the top left, the voice
+/// and lock marks along the bottom left.
+fn rail_mark_layer<'a>(marks: &[RailMark]) -> Element<'a, Message> {
+    let chip = |mark: RailMark| -> Element<'a, Message> {
+        let invite = mark == RailMark::Invite;
+        container(
+            text(mark.icon().glyph())
+                .size(8)
+                .wrapping(Wrapping::None)
+                .center(),
+        )
+        .width(CHIP)
+        .height(CHIP)
+        .center(CHIP)
+        .style(move |t: &iced::Theme| {
+            let sem = theme::semantic(t);
+            let (fill, on) = if invite {
+                (sem.highlight, sem.highlight_text)
             } else {
-                base
+                (sem.surface_raised, t.palette().text)
+            };
+            container::Style {
+                background: Some(Background::Color(fill)),
+                text_color: Some(on),
+                border: border::rounded(CHIP / 2.0).color(sem.muted).width(1),
+                ..container::Style::default()
             }
         })
         .into()
+    };
+    let top: Element<'a, Message> = if marks.contains(&RailMark::Invite) {
+        chip(RailMark::Invite)
+    } else {
+        space().width(0).into()
+    };
+    let bottom = marks
+        .iter()
+        .filter(|m| **m != RailMark::Invite)
+        .fold(row![].spacing(1), |r, m| r.push(chip(*m)));
+    column![
+        container(top).width(Fill).align_left(Fill),
+        space().height(Fill),
+        container(bottom).width(Fill).align_left(Fill),
+    ]
+    .width(Fill)
+    .height(Fill)
+    .into()
 }
 
-/// The room's avatar: the decoded image once it arrived, otherwise (and when
-/// it is unavailable) a round placeholder with the initials of the already
-/// sanitised `name`.
-fn avatar_view<'a>(room: &RoomSummary, name: &str, avatars: &Avatars) -> Element<'a, Message> {
+/// The speaker dot on a rail avatar while the room has a call: the highlight
+/// colour while it rings, the badge colour otherwise.
+fn speaker_dot<'a>(call: Option<CallPill>) -> Element<'a, Message> {
+    let Some(call) = call else {
+        return space().width(0).into();
+    };
+    container(
+        text(Icon::Speaker.glyph())
+            .size(8)
+            .wrapping(Wrapping::None)
+            .center(),
+    )
+    .width(CHIP)
+    .height(CHIP)
+    .center(CHIP)
+    .style(move |t: &iced::Theme| {
+        let sem = theme::semantic(t);
+        let (fill, on) = if call.ringing {
+            (sem.highlight, sem.highlight_text)
+        } else {
+            (sem.badge, sem.badge_text)
+        };
+        container::Style {
+            background: Some(Background::Color(fill)),
+            text_color: Some(on),
+            border: border::rounded(CHIP / 2.0),
+            ..container::Style::default()
+        }
+    })
+    .into()
+}
+
+/// The room's avatar, `size` wide: the decoded image once it arrived,
+/// otherwise (and when it is unavailable) a round placeholder with the
+/// initials of the already sanitised `name`.
+fn avatar_view<'a>(
+    room: &RoomSummary,
+    name: &str,
+    avatars: &Avatars,
+    size: f32,
+) -> Element<'a, Message> {
     let ready = room
         .avatar
         .as_ref()
@@ -231,9 +733,9 @@ fn avatar_view<'a>(room: &RoomSummary, name: &str, avatars: &Avatars) -> Element
         });
     if let Some(handle) = ready {
         return image(handle.clone())
-            .width(AVATAR_SLOT)
-            .height(AVATAR_SLOT)
-            .border_radius(AVATAR_SLOT / 2.0)
+            .width(size)
+            .height(size)
+            .border_radius(size / 2.0)
             .into();
     }
     let label = initials(name);
@@ -242,43 +744,37 @@ fn avatar_view<'a>(room: &RoomSummary, name: &str, avatars: &Avatars) -> Element
     } else {
         Some(placeholder_color(&room.id))
     };
-    container(text(label).size(16).color(Color::WHITE))
-        .width(AVATAR_SLOT)
-        .height(AVATAR_SLOT)
-        .center_x(AVATAR_SLOT)
-        .center_y(AVATAR_SLOT)
-        .style(move |t| container::Style {
-            background: Some(Background::Color(
-                fill.unwrap_or_else(|| theme::semantic(t).muted),
-            )),
-            border: border::rounded(AVATAR_SLOT / 2.0),
-            ..container::Style::default()
-        })
-        .into()
+    container(
+        text(label)
+            .size(if size > COMPACT_AVATAR_SLOT {
+                tokens::BODY_LARGE
+            } else {
+                tokens::CAPTION
+            })
+            .color(Color::WHITE),
+    )
+    .width(size)
+    .height(size)
+    .center_x(size)
+    .center_y(size)
+    .style(move |t| container::Style {
+        background: Some(Background::Color(
+            fill.unwrap_or_else(|| theme::semantic(t).muted),
+        )),
+        border: border::rounded(size / 2.0),
+        ..container::Style::default()
+    })
+    .into()
 }
 
 /// The call pill: the speaker and how many devices are in the room's call,
-/// in the highlight colour while the room rings, an outline otherwise. An
-/// empty space without a call, so a row keeps its widget types.
+/// in the highlight colour while the room rings. An empty space without a
+/// call, so a row keeps its widget types.
 fn call_pill<'a>(call: Option<CallPill>) -> Element<'a, Message> {
     match call {
         None => space().width(0).into(),
-        Some(call) if call.ringing => pill(call.label(), Tone::Highlight),
-        Some(call) => pill(call.label(), Tone::Muted),
+        Some(call) => kit::icon_tag(Icon::Speaker, call_label(call), call.ringing),
     }
-}
-
-/// A small pill with a label.
-fn tag(label: &str) -> Element<'_, Message> {
-    container(text(label).size(11))
-        .padding([1, 6])
-        .style(|t| container::Style {
-            border: border::rounded(8.0)
-                .color(theme::semantic(t).muted)
-                .width(1),
-            ..container::Style::default()
-        })
-        .into()
 }
 
 /// The badge at the right of a row. A muted room's count is drawn as an
@@ -289,7 +785,7 @@ fn badge_view<'a>(badge: Badge, muted: bool) -> Element<'a, Message> {
         Badge::None => space().width(0).into(),
         Badge::Highlight(count) => pill(count_label(count), Tone::Highlight),
         Badge::Count(count) if muted => pill(count_label(count), Tone::Muted),
-        Badge::Count(count) => pill(count_label(count), Tone::Normal),
+        Badge::Count(count) => kit::count_badge(count),
         Badge::Dot => container(space().width(10).height(10))
             .style(|t| container::Style {
                 background: Some(Background::Color(theme::semantic(t).badge)),
@@ -300,13 +796,11 @@ fn badge_view<'a>(badge: Badge, muted: bool) -> Element<'a, Message> {
     }
 }
 
-/// How a count badge is drawn.
+/// How a count badge is drawn when it is not the plain [`kit::count_badge`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tone {
     /// Mentions.
     Highlight,
-    /// Ordinary unread notifications.
-    Normal,
     /// Unread notifications of a muted room.
     Muted,
 }
@@ -314,27 +808,20 @@ enum Tone {
 /// A rounded badge with a count; the highlight colour for mentions, an
 /// outline for a muted room.
 fn pill<'a>(label: String, tone: Tone) -> Element<'a, Message> {
-    container(text(label).size(12))
-        .padding([1, 7])
+    container(text(label).size(tokens::CAPTION))
+        .padding([1.0, 7.0])
         .style(move |t| {
             let colours = theme::semantic(t);
             match tone {
-                Tone::Highlight | Tone::Normal => {
-                    let (background, foreground) = if tone == Tone::Highlight {
-                        (colours.highlight, colours.highlight_text)
-                    } else {
-                        (colours.badge, colours.badge_text)
-                    };
-                    container::Style {
-                        text_color: Some(foreground),
-                        background: Some(Background::Color(background)),
-                        border: border::rounded(10.0),
-                        ..container::Style::default()
-                    }
-                }
+                Tone::Highlight => container::Style {
+                    text_color: Some(colours.highlight_text),
+                    background: Some(Background::Color(colours.highlight)),
+                    border: border::rounded(tokens::ROUND),
+                    ..container::Style::default()
+                },
                 Tone::Muted => container::Style {
                     text_color: Some(colours.muted),
-                    border: border::rounded(10.0).color(colours.muted).width(1),
+                    border: border::rounded(tokens::ROUND).color(colours.muted).width(1),
                     ..container::Style::default()
                 },
             }
@@ -345,6 +832,14 @@ fn pill<'a>(label: String, tone: Tone) -> Element<'a, Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn env(avatars: &Avatars) -> RowEnv<'_> {
+        RowEnv {
+            avatars,
+            density: Density::Comfortable,
+            now_ms: 0,
+        }
+    }
 
     #[test]
     fn only_a_room_known_to_be_encrypted_has_a_lock() {
@@ -365,12 +860,12 @@ mod tests {
             Some(RoomNotificationModeView::MentionsAndKeywords),
             Some(RoomNotificationModeView::Mute),
         ] {
-            let _: Element<'_, Message> = room_row(&room, &avatars, false, mode, None);
+            let _: Element<'_, Message> = room_row(&room, &env(&avatars), false, mode, None);
         }
         room.highlights = 1;
         let _: Element<'_, Message> = room_row(
             &room,
-            &avatars,
+            &env(&avatars),
             true,
             Some(RoomNotificationModeView::Mute),
             None,
@@ -393,7 +888,7 @@ mod tests {
                 ringing: true,
             }),
         ] {
-            let _: Element<'_, Message> = room_row(&room, &avatars, false, None, call);
+            let _: Element<'_, Message> = room_row(&room, &env(&avatars), false, None, call);
         }
     }
 
@@ -421,13 +916,13 @@ mod tests {
         let mut room = RoomSummary::new(RoomId::from("!r:x"), String::new());
         room.avatar = Some(id.clone());
         // Requested, not answered: placeholder.
-        let _: Element<'_, Message> = avatar_view(&room, "", &avatars);
+        let _: Element<'_, Message> = avatar_view(&room, "", &avatars, AVATAR_SLOT);
         // Unavailable: placeholder.
         avatars.answer(&id, None);
-        let _: Element<'_, Message> = avatar_view(&room, "Room", &avatars);
+        let _: Element<'_, Message> = avatar_view(&room, "Room", &avatars, AVATAR_SLOT);
         // No avatar at all.
         room.avatar = None;
-        let _: Element<'_, Message> = avatar_view(&room, "#x", &avatars);
+        let _: Element<'_, Message> = avatar_view(&room, "#x", &avatars, COMPACT_AVATAR_SLOT);
         // Ready: the image.
         let img = ::image::RgbaImage::from_pixel(2, 2, ::image::Rgba([1, 2, 3, 255]));
         let mut png = std::io::Cursor::new(Vec::new());
@@ -437,6 +932,120 @@ mod tests {
         let _ = avatars.take_unrequested([id2.clone()]);
         avatars.answer(&id2, Some(AvatarImage::from(png.into_inner())));
         room.avatar = Some(id2);
-        let _: Element<'_, Message> = avatar_view(&room, "Room", &avatars);
+        let _: Element<'_, Message> = avatar_view(&room, "Room", &avatars, AVATAR_SLOT);
+    }
+
+    #[test]
+    fn the_pane_is_300_wide_and_the_rail_72() {
+        use twicecat_core::api::RoomListChoice;
+        assert_eq!(pane_width(RoomListChoice::Expanded), 300.0);
+        assert_eq!(pane_width(RoomListChoice::Rail), 72.0);
+    }
+
+    #[test]
+    fn only_comfortable_rows_show_a_preview() {
+        assert!(shows_preview(Density::Comfortable));
+        assert!(!shows_preview(Density::Compact));
+    }
+
+    #[test]
+    fn the_last_message_time_is_the_clock_today_and_the_day_before() {
+        use chrono::{FixedOffset, TimeZone};
+        let tz = FixedOffset::east_opt(0).expect("offset");
+        let at = |d, h, m| {
+            u64::try_from(
+                tz.with_ymd_and_hms(2026, 10, d, h, m, 0)
+                    .single()
+                    .expect("time")
+                    .timestamp_millis(),
+            )
+            .expect("after 1970")
+        };
+        let now = at(14, 12, 0);
+        assert_eq!(row_time(at(14, 9, 5), now, &tz), "09:05");
+        assert_eq!(row_time(at(13, 9, 5), now, &tz), "Yesterday");
+        assert_eq!(row_time(at(2, 9, 5), now, &tz), "2 October");
+    }
+
+    #[test]
+    fn a_rail_tooltip_names_the_room_and_says_what_the_dots_mean() {
+        let call = Some(CallPill {
+            count: 2,
+            ringing: false,
+        });
+        assert_eq!(rail_tip("Ops", Badge::None, None, None, &[]), "Ops");
+        assert_eq!(
+            rail_tip("Ops", Badge::Count(3), None, None, &[]),
+            "Ops, 3 unread"
+        );
+        assert_eq!(
+            rail_tip("Ops", Badge::Highlight(1), call, None, &[]),
+            "Ops, 1 mention, in a call"
+        );
+        assert_eq!(rail_tip("Ops", Badge::Dot, None, None, &[]), "Ops, unread");
+        assert_eq!(
+            rail_tip(
+                "Ops",
+                Badge::Count(120),
+                Some(CallPill {
+                    count: 0,
+                    ringing: true
+                }),
+                Some("Muted"),
+                &[]
+            ),
+            "Ops, 99+ unread, ringing, Muted"
+        );
+    }
+
+    #[test]
+    fn a_rail_row_marks_invites_voice_rooms_and_encryption() {
+        let mut room = RoomSummary::new(twicecat_core::api::RoomId::from("!r:x"), "r".to_owned());
+        assert!(rail_marks(&room).is_empty());
+        room.is_invite = true;
+        room.is_call_room = true;
+        room.is_encrypted = true;
+        let marks = rail_marks(&room);
+        assert_eq!(
+            marks,
+            [RailMark::Invite, RailMark::Voice, RailMark::Encrypted]
+        );
+        assert_eq!(
+            rail_tip("Ops", Badge::None, None, Some("Muted"), &marks),
+            "Ops, invite, voice room, encrypted, Muted"
+        );
+        let _: Element<'_, Message> = rail_mark_layer(&marks);
+    }
+
+    #[test]
+    fn rows_and_rail_rows_build_in_every_density() {
+        let mut room = RoomSummary::new(twicecat_core::api::RoomId::from("!r:x"), "r".to_owned());
+        room.unread_notifications = 3;
+        room.is_call_room = true;
+        room.is_invite = true;
+        room.is_encrypted = true;
+        let avatars = Avatars::default();
+        let call = Some(CallPill {
+            count: 2,
+            ringing: true,
+        });
+        for density in [Density::Comfortable, Density::Compact] {
+            for selected in [false, true] {
+                let _: Element<'_, Message> = room_row(
+                    &room,
+                    &RowEnv {
+                        avatars: &avatars,
+                        density,
+                        now_ms: 0,
+                    },
+                    selected,
+                    Some(RoomNotificationModeView::Mute),
+                    call,
+                );
+            }
+        }
+        for selected in [false, true] {
+            let _: Element<'_, Message> = rail_row(&room, &avatars, selected, None, call);
+        }
     }
 }

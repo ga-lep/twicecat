@@ -647,21 +647,25 @@ impl App {
                 if self.ui_settings.density == choice {
                     return Task::none();
                 }
+                let before = self.room_row_height();
                 self.ui_settings.density = choice;
+                let rows = self.keep_list_place(before);
                 // Rows change height: the measured ones are stale. The place
                 // in the timeline (the offset from the bottom) stays.
                 self.timeline.reset_measurements();
                 if let Some(panel) = self.threads.panel.as_mut() {
                     panel.timeline.reset_measurements();
                 }
-                self.save_local()
+                Task::batch([rows, self.save_local()])
             }
             M::RoomList(choice) => {
                 if self.ui_settings.room_list == choice {
                     return Task::none();
                 }
+                let before = self.room_row_height();
                 self.ui_settings.room_list = choice;
-                self.save_local()
+                let rows = self.keep_list_place(before);
+                Task::batch([rows, self.save_local()])
             }
             M::Zoom(zoom) => {
                 let percent = zoom.apply(self.ui_settings.text_scale_percent);
@@ -837,6 +841,28 @@ impl App {
         }
         *slot = on;
         self.save_local()
+    }
+
+    /// After the room list's row height changed from `before`: keeps the
+    /// first visible room at the top by scaling the offset, moves the
+    /// scrollable there (it only clamps its own offset), and asks for what
+    /// the new window needs (avatars, paging).
+    fn keep_list_place(&mut self, before: f32) -> Task<Message> {
+        let after = self.room_row_height();
+        if before <= 0.0 || (after - before).abs() < f32::EPSILON {
+            return Task::none();
+        }
+        self.list_offset_y *= after / before;
+        Task::batch([
+            iced::widget::operation::scroll_to(
+                crate::screens::room_list_pane::LIST_SCROLL_ID,
+                iced::widget::scrollable::AbsoluteOffset {
+                    x: None,
+                    y: Some(self.list_offset_y),
+                },
+            ),
+            self.after_list_change(),
+        ])
     }
 
     /// The factor the whole window is scaled by (the text scale).

@@ -14,6 +14,7 @@ on macOS.
 | Ctrl+K | Switch room (opens the room switcher) |
 | Alt+Down / Alt+Up | Open the next / previous room in the list |
 | Ctrl+Shift+Down / Ctrl+Shift+Up | Open the next / previous room with unread messages |
+| Ctrl+B | Collapse the room list to a rail, or expand it again (saved) |
 | Ctrl+U | Attach a file to the open room |
 | Ctrl+, | Open Settings |
 | Ctrl+= / Ctrl+- / Ctrl+0 | Make the text larger / smaller / back to 100 % |
@@ -46,6 +47,16 @@ Rules the code follows (all in tests):
 - Closing the switcher with Esc gives the focus back to the composer.
 - Ctrl+K and the room-stepping keys do nothing while another overlay covers
   the main view.
+- Ctrl+B works on the main screen only, and also over a dialog. The choice is
+  the **Room list** setting, so it is saved. The rail keeps every room-list
+  key: Alt+Down / Alt+Up and Ctrl+Shift+Down / Ctrl+Shift+Up step through the
+  same list, and the open room stays marked by a fill and a 3 px bar. Its
+  avatars are buttons in the same Tab order as the rows; each has a tooltip
+  with the room's name and what the dots mean (unread, mentions, in a call,
+  ringing, muted), and a dot is never the only sign, since the tooltip words
+  say the same. In the rail the search field is a **Search** button that
+  expands the list, and the call bar is a column of icon buttons (the call's
+  room, mute, deafen, leave), each with its words in a tooltip.
 - Ctrl+Shift+M and Ctrl+Shift+D act only during a call, also over a dialog
   (the call goes on behind it); without a call they do nothing.
 - While the Voice & audio card waits for a push-to-talk key (**Set key…**),

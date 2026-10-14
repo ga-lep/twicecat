@@ -17,7 +17,12 @@ use crate::screens::main_view::display_name;
 use crate::screens::room_list_pane::LOCK_MARK;
 use crate::state::{App, Message};
 use crate::theme;
-use crate::ui::kit::{PERSON_SLOT, avatar, modal, muted};
+use crate::ui::icons::{Icon, icon};
+use crate::ui::kit::{
+    PERSON_SLOT, Severity, active_icon_style, avatar, card_style, danger_style, icon_style, modal,
+    muted, severity_tag_style, tip,
+};
+use crate::ui::tokens;
 use crate::verification::elide_middle;
 use twicecat_core::api::InputMode;
 
@@ -265,6 +270,236 @@ pub fn bar(app: &App) -> Element<'_, Message> {
         .into()
 }
 
+/// [`tip`] with words that are built, not borrowed.
+fn tip_owned<'a>(content: impl Into<Element<'a, Message>>, label: String) -> Element<'a, Message> {
+    iced::widget::tooltip(
+        content,
+        text(label).size(tokens::CAPTION),
+        iced::widget::tooltip::Position::Bottom,
+    )
+    .gap(tokens::XS)
+    .padding(tokens::S)
+    .style(card_style)
+    .into()
+}
+
+/// How the rail's mic button looks. The four looks differ in icon or fill, so
+/// a live microphone is never only a tooltip away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MicLook {
+    /// Open microphone (voice activity, or push-to-talk is not in use).
+    Plain,
+    /// Muted or deafened.
+    Muted,
+    /// Push-to-talk or toggle-to-talk, not transmitting.
+    Gated,
+    /// Push-to-talk or toggle-to-talk, transmitting.
+    Talking,
+}
+
+impl MicLook {
+    /// The icon on the button: the open mic only while sound can go out.
+    pub const fn icon(self) -> Icon {
+        match self {
+            Self::Plain | Self::Talking => Icon::Mic,
+            Self::Muted | Self::Gated => Icon::MicOff,
+        }
+    }
+}
+
+/// The encryption marker of the call in the rail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DockLock {
+    /// Connected with end-to-end encrypted media.
+    Encrypted,
+    /// Connected without it.
+    Unencrypted,
+}
+
+impl DockLock {
+    /// The severity that colours the marker.
+    pub const fn severity(self) -> Severity {
+        match self {
+            Self::Encrypted => Severity::Success,
+            Self::Unencrypted => Severity::Warning,
+        }
+    }
+
+    /// The marker's glyph.
+    pub const fn icon(self) -> Icon {
+        match self {
+            Self::Encrypted => Icon::Lock,
+            Self::Unencrypted => Icon::Warning,
+        }
+    }
+
+    /// The marker's words, for its tooltip.
+    pub const fn words(self) -> &'static str {
+        match self {
+            Self::Encrypted => "Call is end-to-end encrypted",
+            Self::Unencrypted => "Call is not encrypted",
+        }
+    }
+}
+
+/// What the rail's dock shows about the call, as data so that it can be
+/// tested: everything the expanded [`bar`] says in words is a visible mark
+/// here, with the words in its tooltip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DockCall {
+    /// The call button's icon (a warning while reconnecting).
+    pub phase_icon: Icon,
+    /// The call phase in words.
+    pub phase_words: String,
+    /// The encryption marker, once connected.
+    pub lock: Option<DockLock>,
+    /// The mic button's look.
+    pub mic: MicLook,
+    /// The mic button's tooltip: mute or unmute, and the talk line.
+    pub mic_words: String,
+    /// Who declined the ring.
+    pub declined: Option<String>,
+}
+
+/// The dock's call, if there is one.
+pub fn dock_call(app: &App) -> Option<DockCall> {
+    let current = app.calls.call.as_ref()?;
+    let (mute, _) = mute_labels(current.muted, current.deafened);
+    let reconnecting = matches!(current.phase, crate::calls::CallPhase::Reconnecting { .. });
+    let talk = talk_line(app);
+    let mic = if current.muted || current.deafened {
+        MicLook::Muted
+    } else {
+        match &talk {
+            Some((_, true)) => MicLook::Talking,
+            Some((_, false)) => MicLook::Gated,
+            None => MicLook::Plain,
+        }
+    };
+    let mic_words = match talk {
+        Some((line, _)) => format!("{mute}. {line}"),
+        None => mute.to_owned(),
+    };
+    Some(DockCall {
+        phase_icon: if reconnecting {
+            Icon::Warning
+        } else {
+            Icon::Speaker
+        },
+        phase_words: current.phase.label(),
+        lock: match current.phase {
+            crate::calls::CallPhase::Connected { encrypted: true } => Some(DockLock::Encrypted),
+            crate::calls::CallPhase::Connected { encrypted: false } => Some(DockLock::Unencrypted),
+            _ => None,
+        },
+        mic,
+        mic_words,
+        declined: declined_line(current),
+    })
+}
+
+/// A small coloured mark with its words in a tooltip.
+fn marker<'a>(glyph: &'static str, severity: Severity, words: String) -> Element<'a, Message> {
+    tip_owned(
+        container(text(glyph).size(tokens::CAPTION))
+            .padding([1.0, tokens::S])
+            .style(severity_tag_style(severity)),
+        words,
+    )
+}
+
+/// The call bar for the rail: the same actions as icon buttons in a narrow
+/// column (the call's room, mute, deafen, leave), each with a tooltip, and
+/// the state the bar writes out as visible marks: the encryption lock, the
+/// mic button's look while push-to-talk gates it, who declined, and the
+/// notice with its own close button. An empty space without a call or
+/// notice, like [`bar`].
+pub fn rail_dock(app: &App) -> Element<'_, Message> {
+    let calls = &app.calls;
+    let mut items: Vec<Element<'_, Message>> = Vec::new();
+    if let (Some(current), Some(dock)) = (&calls.call, dock_call(app)) {
+        let (_, deafen) = mute_labels(current.muted, current.deafened);
+        items.push(tip_owned(
+            button(icon(dock.phase_icon))
+                .on_press(call(CallMessage::ShowCall))
+                .padding(tokens::S)
+                .style(icon_style),
+            dock.phase_words.clone(),
+        ));
+        if let Some(lock) = dock.lock {
+            items.push(marker(
+                lock.icon().glyph(),
+                lock.severity(),
+                lock.words().to_owned(),
+            ));
+        }
+        if let Some(declined) = dock.declined.clone() {
+            items.push(marker(Icon::People.glyph(), Severity::Warning, declined));
+        }
+        let mic_style: fn(&iced::Theme, button::Status) -> button::Style = match dock.mic {
+            MicLook::Plain | MicLook::Gated => icon_style,
+            MicLook::Muted => active_icon_style,
+            MicLook::Talking => button::primary,
+        };
+        items.push(tip_owned(
+            button(icon(dock.mic.icon()))
+                .on_press(call(CallMessage::ToggleMute))
+                .padding(tokens::S)
+                .style(mic_style),
+            dock.mic_words.clone(),
+        ));
+        items.push(tip(
+            button(icon(Icon::Deafened))
+                .on_press(call(CallMessage::ToggleDeafen))
+                .padding(tokens::S)
+                .style(if current.deafened {
+                    active_icon_style
+                } else {
+                    icon_style
+                }),
+            deafen,
+        ));
+        items.push(tip(
+            button(icon(Icon::Leave))
+                .on_press_maybe(calls.pending.is_none().then_some(call(CallMessage::Leave)))
+                .padding(tokens::S)
+                .style(danger_style),
+            "Leave the call",
+        ));
+    }
+    if let Some(notice) = &calls.notice {
+        // The warning mark only shows the words; closing is its own button.
+        items.push(marker(
+            Icon::Warning.glyph(),
+            Severity::Danger,
+            notice.clone(),
+        ));
+        items.push(tip(
+            button(icon(Icon::Close))
+                .on_press(call(CallMessage::DismissNotice))
+                .padding(tokens::S)
+                .style(icon_style),
+            "Dismiss the notice",
+        ));
+    }
+    if items.is_empty() {
+        return space().height(0).into();
+    }
+    container(
+        Column::from_vec(items)
+            .spacing(tokens::XS)
+            .align_x(iced::Center),
+    )
+    .padding(tokens::XS)
+    .center_x(Fill)
+    .style(|t: &iced::Theme| container::Style {
+        background: Some(Background::Color(theme::semantic(t).selection)),
+        border: border::rounded(tokens::MEDIUM),
+        ..container::Style::default()
+    })
+    .into()
+}
+
 /// The participants panel beside the call's room, or an empty slot.
 pub fn panel_slot(app: &App) -> Element<'_, Message> {
     if !app.calls.panel_shown(app.selected.as_ref()) {
@@ -453,5 +688,108 @@ mod tests {
             declined_line(&call).as_deref(),
             Some("@u0:x, Bob, @u2:x and 2 more declined")
         );
+    }
+
+    fn app_with_call(
+        phase: crate::calls::CallPhase,
+        input_mode: Option<InputMode>,
+        talking: bool,
+    ) -> App {
+        use crate::bridge::EventsSlot;
+        use crate::state::Startup;
+        use twicecat_core::api::{AudioSettings, RoomId};
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let (_events_tx, events_rx) = tokio::sync::mpsc::channel(1);
+        let (mut app, _boot) = App::new(Startup {
+            sink: Box::new(tx),
+            events: EventsSlot::new(events_rx),
+        });
+        app.calls.call = Some(crate::calls::CurrentCall::new(RoomId::from("!r:x"), phase));
+        if let Some(mode) = input_mode {
+            app.calls.settings = Some(AudioSettings {
+                input_mode: mode,
+                ..AudioSettings::default()
+            });
+        }
+        app.ptt.talking = talking;
+        app
+    }
+
+    fn ptt(toggle: bool) -> InputMode {
+        InputMode::PushToTalk {
+            release_delay_ms: 0,
+            toggle,
+        }
+    }
+
+    const CONNECTED: crate::calls::CallPhase =
+        crate::calls::CallPhase::Connected { encrypted: true };
+
+    #[test]
+    fn the_rail_dock_shows_whether_push_to_talk_is_transmitting() {
+        for toggle in [false, true] {
+            let talking =
+                dock_call(&app_with_call(CONNECTED, Some(ptt(toggle)), true)).expect("a call");
+            let gated =
+                dock_call(&app_with_call(CONNECTED, Some(ptt(toggle)), false)).expect("a call");
+            assert_eq!(talking.mic, MicLook::Talking);
+            assert_eq!(gated.mic, MicLook::Gated);
+            assert_ne!(talking.mic.icon(), gated.mic.icon());
+            assert_ne!(talking, gated);
+            assert!(
+                talking.mic_words.contains("Talking"),
+                "{}",
+                talking.mic_words
+            );
+            assert!(
+                gated.mic_words.contains("Not talking"),
+                "{}",
+                gated.mic_words
+            );
+        }
+        let open = dock_call(&app_with_call(CONNECTED, None, false)).expect("a call");
+        assert_eq!(open.mic, MicLook::Plain);
+        assert_eq!(open.mic.icon(), Icon::Mic);
+        let mut muted = app_with_call(CONNECTED, Some(ptt(false)), true);
+        muted.calls.call.as_mut().expect("call").muted = true;
+        assert_eq!(dock_call(&muted).expect("a call").mic, MicLook::Muted);
+        let _: Element<'_, Message> = rail_dock(&muted);
+    }
+
+    #[test]
+    fn the_rail_dock_marks_encryption_and_the_lack_of_it() {
+        let lock = |phase| {
+            dock_call(&app_with_call(phase, None, false))
+                .expect("a call")
+                .lock
+        };
+        assert_eq!(lock(CONNECTED), Some(DockLock::Encrypted));
+        assert_eq!(
+            lock(crate::calls::CallPhase::Connected { encrypted: false }),
+            Some(DockLock::Unencrypted)
+        );
+        assert_eq!(lock(crate::calls::CallPhase::Joining), None);
+        assert_ne!(DockLock::Encrypted.icon(), DockLock::Unencrypted.icon());
+        assert_ne!(
+            DockLock::Encrypted.severity(),
+            DockLock::Unencrypted.severity()
+        );
+        assert_ne!(DockLock::Encrypted.words(), DockLock::Unencrypted.words());
+    }
+
+    #[test]
+    fn the_rail_dock_shows_who_declined_and_the_notice() {
+        let mut app = app_with_call(CONNECTED, None, false);
+        assert_eq!(dock_call(&app).expect("a call").declined, None);
+        app.calls.call.as_mut().expect("call").declined = vec![UserId::from("@u0:x")];
+        assert_eq!(
+            dock_call(&app).expect("a call").declined.as_deref(),
+            Some("@u0:x declined")
+        );
+        app.calls.notice = Some("The call ended".to_owned());
+        let _: Element<'_, Message> = rail_dock(&app);
+        app.calls.call = None;
+        let _: Element<'_, Message> = rail_dock(&app);
+        assert!(dock_call(&app).is_none());
     }
 }

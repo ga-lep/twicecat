@@ -6,12 +6,28 @@
 
 use std::ops::Range;
 
-use twicecat_core::api::{ListDiff, RoomId, RoomListTab, RoomSummary};
+use twicecat_core::api::{ListDiff, RoomId, RoomListChoice, RoomListTab, RoomSummary};
 
 use crate::text_safety::{MAX_NAME_CHARS, name_or_placeholder, one_line_capped};
+use crate::ui::tokens::Density;
 
-/// Height of one room row, in logical pixels (plan Q12).
-pub const ROW_HEIGHT: f32 = 64.0;
+/// Height of one room row in the expanded list, in logical pixels (plan Q12):
+/// 64 when comfortable, 44 when compact.
+pub const fn row_height(density: Density) -> f32 {
+    density.room_row_height()
+}
+
+/// Height of one row of the rail, whatever the density.
+pub const RAIL_ROW_HEIGHT: f32 = 56.0;
+
+/// Height of one row of the room list as shown: the density's, or the
+/// rail's fixed one. The windowing helpers take this.
+pub const fn list_row_height(density: Density, list: RoomListChoice) -> f32 {
+    match list {
+        RoomListChoice::Expanded => row_height(density),
+        RoomListChoice::Rail => RAIL_ROW_HEIGHT,
+    }
+}
 
 /// Rows built above and below the visible ones.
 pub const OVERSCAN_ROWS: usize = 10;
@@ -485,7 +501,11 @@ mod tests {
 
     use twicecat_core::api::{RoomListQuery, RoomListTab};
 
-    use super::ROW_HEIGHT;
+    use super::row_height;
+    use crate::ui::tokens::Density;
+
+    /// The Comfortable row, the app's default.
+    const ROW_HEIGHT: f32 = row_height(Density::Comfortable);
 
     fn drain(rx: &mut mpsc::Receiver<Command>) -> Vec<Command> {
         let mut out = Vec::new();
@@ -963,7 +983,7 @@ mod tests {
         let (mut app, rx) = app();
         app.rooms = synthetic_range(0, n);
         app.total_rooms = Some(100_000);
-        app.list_offset_y = 1_970.0 * super::ROW_HEIGHT;
+        app.list_offset_y = 1_970.0 * ROW_HEIGHT;
         (app, rx)
     }
 
@@ -1082,6 +1102,268 @@ mod tests {
                 median,
                 expected(name),
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod pure_tests {
+    use crate::ui::tokens::Density;
+    use twicecat_core::api::{MessagePreview, RoomId, RoomListTab, RoomSummary, UserId};
+
+    use super::*;
+
+    const H: f32 = row_height(Density::Comfortable);
+
+    fn range(offset: f32, viewport: f32, len: usize) -> std::ops::Range<usize> {
+        visible_range(offset, viewport, H, len, 2)
+    }
+
+    #[test]
+    fn visible_range_at_the_top_includes_overscan_below_only() {
+        // 10 rows visible, 2 rows of overscan below.
+        assert_eq!(range(0.0, 10.0 * H, 100), 0..12);
+    }
+
+    #[test]
+    fn visible_range_in_the_middle_has_overscan_on_both_sides() {
+        // Rows 20..30 are visible.
+        assert_eq!(range(20.0 * H, 10.0 * H, 100), 18..32);
+        // A partly visible row counts.
+        assert_eq!(range(20.5 * H, 10.0 * H, 100), 18..33);
+    }
+
+    #[test]
+    fn visible_range_at_the_end_stops_at_len() {
+        assert_eq!(range(90.0 * H, 10.0 * H, 100), 88..100);
+    }
+
+    #[test]
+    fn visible_range_of_an_empty_list_is_empty() {
+        assert_eq!(range(0.0, 10.0 * H, 0), 0..0);
+        assert_eq!(range(500.0, 10.0 * H, 0), 0..0);
+    }
+
+    #[test]
+    fn visible_range_with_a_viewport_taller_than_the_list_is_everything() {
+        assert_eq!(range(0.0, 100.0 * H, 5), 0..5);
+    }
+
+    #[test]
+    fn visible_range_clamps_a_stale_offset_to_the_last_rows() {
+        // The list shrank from 1000 to 30 rows under an offset for row 500.
+        let r = range(500.0 * H, 10.0 * H, 30);
+        assert_eq!(r, 18..30);
+        assert!(r.end <= 30);
+    }
+
+    #[test]
+    fn visible_range_survives_degenerate_inputs() {
+        assert_eq!(visible_range(0.0, 100.0, 0.0, 10, 2), 0..0);
+        assert!(visible_range(f32::NAN, f32::NAN, H, 10, 2).end <= 10);
+        let r = visible_range(-50.0, 3.0 * H, H, 10, 0);
+        assert_eq!(r, 0..3);
+        let r = visible_range(f32::INFINITY, 3.0 * H, H, 10, 0);
+        assert!(r.end <= 10 && r.start <= r.end);
+    }
+
+    #[test]
+    fn spacers_keep_the_total_content_height() {
+        let len = 2_000;
+        for offset in [0.0, 37.0, 5_000.0, 1e9] {
+            let r = range(offset, 800.0, len);
+            let (top, bottom) = spacer_heights(&r, len, H);
+            let total = top + r.len() as f32 * H + bottom;
+            assert_eq!(total, len as f32 * H, "offset {offset}");
+        }
+        let (top, bottom) = spacer_heights(&(0..0), 0, H);
+        assert_eq!((top, bottom), (0.0, 0.0));
+    }
+
+    fn summary() -> RoomSummary {
+        RoomSummary::new(RoomId::from("!r:x"), "r".into())
+    }
+
+    #[test]
+    fn badge_none_without_unread() {
+        assert_eq!(badge_for(&summary()), Badge::None);
+    }
+
+    #[test]
+    fn badge_highlight_when_there_are_highlights() {
+        let mut r = summary();
+        r.highlights = 2;
+        assert_eq!(badge_for(&r), Badge::Highlight(2));
+    }
+
+    #[test]
+    fn badge_count_for_notifications() {
+        let mut r = summary();
+        r.unread_notifications = 5;
+        assert_eq!(badge_for(&r), Badge::Count(5));
+    }
+
+    #[test]
+    fn badge_dot_for_unread_messages_or_marked_unread() {
+        let mut r = summary();
+        r.unread_messages = 3;
+        assert_eq!(badge_for(&r), Badge::Dot);
+        let mut r = summary();
+        r.marked_unread = true;
+        assert_eq!(badge_for(&r), Badge::Dot);
+    }
+
+    #[test]
+    fn badge_precedence_highlight_then_count_then_dot() {
+        let mut r = summary();
+        r.unread_messages = 9;
+        r.marked_unread = true;
+        r.unread_notifications = 4;
+        r.highlights = 1;
+        assert_eq!(badge_for(&r), Badge::Highlight(1));
+        r.highlights = 0;
+        assert_eq!(badge_for(&r), Badge::Count(4));
+        r.unread_notifications = 0;
+        assert_eq!(badge_for(&r), Badge::Dot);
+        r.unread_messages = 0;
+        r.marked_unread = false;
+        assert_eq!(badge_for(&r), Badge::None);
+    }
+
+    #[test]
+    fn highlight_does_not_depend_on_unread_mentions_field() {
+        let mut r = summary();
+        r.unread_mentions = 7;
+        assert_eq!(badge_for(&r), Badge::None);
+    }
+
+    #[test]
+    fn load_more_only_near_the_end_and_with_more_rooms_on_the_server() {
+        assert!(should_load_more(950, 1_000, Some(2_000)));
+        assert!(should_load_more(1_000, 1_000, Some(2_000)));
+        assert!(
+            !should_load_more(900, 1_000, Some(2_000)),
+            "far from the end"
+        );
+        assert!(!should_load_more(1_000, 1_000, Some(1_000)), "all loaded");
+        assert!(
+            !should_load_more(1_000, 1_000, Some(10)),
+            "total below loaded"
+        );
+        assert!(!should_load_more(1_000, 1_000, None), "total unknown");
+        assert!(
+            should_load_more(0, 0, Some(5)),
+            "an empty list with more on the server"
+        );
+    }
+
+    fn preview(sender_name: Option<&str>, body: &str, is_own: bool) -> MessagePreview {
+        MessagePreview {
+            sender: UserId::from("@bob:x"),
+            sender_name: sender_name.map(str::to_owned),
+            body: body.to_owned(),
+            timestamp_ms: 0,
+            is_own,
+        }
+    }
+
+    #[test]
+    fn preview_line_uses_the_name_you_or_the_user_id() {
+        let mut r = summary();
+        assert_eq!(preview_line(&r), None);
+        r.last_message = Some(preview(Some("Bob"), "hi", false));
+        assert_eq!(preview_line(&r).as_deref(), Some("Bob: hi"));
+        r.last_message = Some(preview(Some("Bob"), "hi", true));
+        assert_eq!(preview_line(&r).as_deref(), Some("You: hi"));
+        r.last_message = Some(preview(None, "hi", false));
+        assert_eq!(preview_line(&r).as_deref(), Some("@bob:x: hi"));
+    }
+
+    #[test]
+    fn preview_line_sanitises_and_caps_name_and_body() {
+        let mut r = summary();
+        r.last_message = Some(preview(
+            Some("Mal\n\u{202E}lory"),
+            &format!("a\nb\u{200B}{}", "x".repeat(1000)),
+            false,
+        ));
+        let line = preview_line(&r).expect("has a preview");
+        assert!(line.starts_with("Mal\u{23CE}\u{FFFD}lory: a\u{23CE}b"));
+        assert!(!line.contains(['\n', '\u{202E}', '\u{200B}']));
+        assert!(line.chars().count() <= MAX_PREVIEW_NAME_CHARS + 2 + PREVIEW_BODY_CHARS);
+        assert!(line.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn preview_line_caps_a_huge_name() {
+        let mut r = summary();
+        r.last_message = Some(preview(Some(&"n".repeat(5000)), "b", false));
+        let line = preview_line(&r).expect("has a preview");
+        assert!(line.chars().count() <= MAX_PREVIEW_NAME_CHARS + 3);
+    }
+
+    #[test]
+    fn empty_labels() {
+        assert_eq!(empty_label(RoomListTab::All, ""), "No rooms");
+        assert_eq!(empty_label(RoomListTab::People, ""), "No direct messages");
+        assert_eq!(empty_label(RoomListTab::Rooms, ""), "No rooms");
+        assert_eq!(empty_label(RoomListTab::Spaces, ""), "No spaces");
+        for tab in [RoomListTab::All, RoomListTab::People, RoomListTab::Spaces] {
+            assert_eq!(empty_label(tab, "x"), "No match");
+        }
+        assert_eq!(empty_label(RoomListTab::All, "   "), "No rooms");
+    }
+
+    #[test]
+    fn row_names_are_sanitised_and_capped() {
+        assert_eq!(row_name("a\nb"), "a\u{23CE}b");
+        assert_eq!(row_name(&"n".repeat(1000)).chars().count(), 256);
+        assert_eq!(row_name(""), crate::text_safety::NAME_PLACEHOLDER);
+        assert_eq!(
+            row_name("\u{3000}\u{200B}"),
+            crate::text_safety::NAME_PLACEHOLDER
+        );
+    }
+
+    #[test]
+    fn row_heights_follow_the_density_and_the_rail_is_fixed() {
+        use twicecat_core::api::RoomListChoice;
+        assert_eq!(row_height(Density::Comfortable), 64.0);
+        assert_eq!(row_height(Density::Compact), 44.0);
+        assert_eq!(RAIL_ROW_HEIGHT, 56.0);
+        for density in [Density::Comfortable, Density::Compact] {
+            assert_eq!(
+                list_row_height(density, RoomListChoice::Expanded),
+                row_height(density)
+            );
+            assert_eq!(
+                list_row_height(density, RoomListChoice::Rail),
+                RAIL_ROW_HEIGHT,
+                "the rail ignores the density"
+            );
+        }
+    }
+
+    #[test]
+    fn ten_thousand_rooms_build_only_the_visible_rows_in_every_density_and_the_rail() {
+        for h in [
+            row_height(Density::Comfortable),
+            row_height(Density::Compact),
+            RAIL_ROW_HEIGHT,
+        ] {
+            let len = 10_000;
+            let viewport = 800.0;
+            for offset in [0.0, 5_000.0 * h, 9_990.0 * h] {
+                let range = visible_range(offset, viewport, h, len, OVERSCAN_ROWS);
+                let visible = (viewport / h).ceil() as usize + 1;
+                assert!(
+                    range.len() <= visible + 2 * OVERSCAN_ROWS,
+                    "{h}: {range:?} builds too many rows"
+                );
+                let (top, bottom) = spacer_heights(&range, len, h);
+                let total = top + range.len() as f32 * h + bottom;
+                assert!((total - len as f32 * h).abs() < 1.0, "{h}: content height");
+            }
         }
     }
 }
