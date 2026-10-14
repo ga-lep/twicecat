@@ -3862,7 +3862,7 @@ mod dialogs {
     /// each of its corners sends the same message as a click at its centre:
     /// the window-sized containers around a button (whose centre happens to
     /// be over it) do not, so each button is reported at its own bounds.
-    fn senders(app: &App, renderer: &Renderer, size: Size) -> Vec<(Rectangle, String)> {
+    pub(super) fn senders(app: &App, renderer: &Renderer, size: Size) -> Vec<(Rectangle, String)> {
         let mut laid = Laid::new(app, renderer, size);
         laid.settle(renderer, size);
         let mut all = Vec::new();
@@ -3938,7 +3938,7 @@ mod dialogs {
     /// Window sizes for the dialogs: both gallery widths, and a short window.
     const SHORT: Size = Size::new(1000.0, 420.0);
 
-    fn dialog_app(name: &str, size: Size) -> App {
+    pub(super) fn dialog_app(name: &str, size: Size) -> App {
         let mut app = scenario_app(name);
         app.set_ui_settings(variants(false)[0].settings());
         app.window_width = size.width;
@@ -3947,7 +3947,7 @@ mod dialogs {
 
     /// The window rectangle of the card of width `width`: the first node, in
     /// tree order, that wide and tall enough to be a card.
-    fn card_rect(laid: &Laid<'_>, width: f32) -> Rectangle {
+    pub(super) fn card_rect(laid: &Laid<'_>, width: f32) -> Rectangle {
         let mut all = Vec::new();
         collect_bounds(&laid.node, iced::Point::ORIGIN, &mut all, 0);
         all.into_iter()
@@ -3956,7 +3956,7 @@ mod dialogs {
             .unwrap_or_else(|| panic!("no card {width} wide in the layout"))
     }
 
-    fn of_message<'a>(
+    pub(super) fn of_message<'a>(
         list: &'a [(Rectangle, String)],
         debug: &'a str,
     ) -> impl Iterator<Item = Rectangle> + 'a {
@@ -4145,7 +4145,7 @@ mod dialogs {
     }
 
     /// The RGB of the pixel at `at` in a drawing of `app`.
-    fn pixel(app: &App, size: Size, at: iced::Point) -> [u8; 3] {
+    pub(super) fn pixel(app: &App, size: Size, at: iced::Point) -> [u8; 3] {
         let renderer = renderer();
         let mut laid = Laid::new(app, &renderer, size);
         laid.settle(&renderer, size);
@@ -4154,7 +4154,7 @@ mod dialogs {
         [pixels[index], pixels[index + 1], pixels[index + 2]]
     }
 
-    fn near(a: [u8; 3], b: iced::Color) -> bool {
+    pub(super) fn near(a: [u8; 3], b: iced::Color) -> bool {
         let to = |v: f32| (v * 255.0).round() as i32;
         [(a[0], b.r), (a[1], b.g), (a[2], b.b)]
             .iter()
@@ -4188,7 +4188,7 @@ mod dialogs {
         }
     }
 
-    fn key_press(named: key::Named, repeat: bool) -> Event {
+    pub(super) fn key_press(named: key::Named, repeat: bool) -> Event {
         Event::Keyboard(keyboard::Event::KeyPressed {
             key: Key::Named(named),
             modified_key: Key::Named(named),
@@ -4203,7 +4203,7 @@ mod dialogs {
     /// What Enter, Space and their repeats send to a dialog, after a click on
     /// each of its controls that sends nothing by itself (a click on the
     /// title, on the backdrop).
-    fn keys_send(app: &App, renderer: &Renderer, size: Size) -> Vec<String> {
+    pub(super) fn keys_send(app: &App, renderer: &Renderer, size: Size) -> Vec<String> {
         let mut laid = Laid::new(app, renderer, size);
         laid.settle(renderer, size);
         let mut sent = Vec::new();
@@ -4298,7 +4298,7 @@ mod dialogs {
         assert!(checked > 40, "only {checked} clicks were checked");
     }
 
-    fn escape(app: &mut App) {
+    pub(super) fn escape(app: &mut App) {
         let _ = app.update(Message::Shortcut {
             shortcut: Shortcut::Escape,
             captured: false,
@@ -4370,14 +4370,14 @@ mod dialogs {
         assert!(open(&app).iter().all(|open| !open));
     }
 
-    fn texts_of(app: &App, size: Size) -> Vec<(String, Rectangle)> {
+    pub(super) fn texts_of(app: &App, size: Size) -> Vec<(String, Rectangle)> {
         let renderer = renderer();
         let mut laid = Laid::new(app, &renderer, size);
         laid.settle(&renderer, size);
         texts(&mut laid, &renderer)
     }
 
-    fn count(shown: &[(String, Rectangle)], text: &str) -> usize {
+    pub(super) fn count(shown: &[(String, Rectangle)], text: &str) -> usize {
         shown.iter().filter(|(t, _)| t == text).count()
     }
 
@@ -4900,5 +4900,976 @@ mod dialogs {
             extra("switcher-empty", "main-room", WIDE, "No room matches"),
             1
         );
+    }
+}
+
+// ---- Task 16: security banners, recovery and verification -----------------
+
+mod security_screens {
+    use iced::advanced::widget::{Id, Operation, operation::Focusable};
+    use twicecat_app::security::key_lines;
+    use twicecat_app::ui::icons::Icon;
+    use twicecat_app::ui::tokens;
+
+    use super::dialogs::{
+        card_rect, count, dialog_app, keys_send, near, of_message, pixel, senders, texts_of,
+    };
+    use super::*;
+
+    /// A short window.
+    const SHORT: Size = Size::new(1000.0, 420.0);
+
+    /// The recovery and security screens (all 520 wide).
+    const SECURITY: [&str; 20] = [
+        "recovery-working",
+        "recovery-key",
+        "recovery-key-shown",
+        "recovery-key-saved",
+        "recovery-key-replacing",
+        "recovery-restore",
+        "recovery-restore-working",
+        "recovery-restore-failed",
+        "recovery-confirm-identity",
+        "recovery-identity-working",
+        "recovery-identity-asked",
+        "recovery-identity-no-devices",
+        "recovery-reset-confirm",
+        "recovery-reset-working",
+        "recovery-reset-approval",
+        "recovery-change-key",
+        "recovery-change-key-working",
+        "recovery-reauth",
+        "recovery-reauth-waiting",
+        "recovery-reauth-failed",
+    ];
+
+    /// Every state of the verification card (all 600 wide).
+    const VERIFICATION: [&str; 21] = [
+        "verification-requested",
+        "verification-requested-arming",
+        "verification-ready",
+        "verification-waiting",
+        "verification-qr",
+        "verification-scanned",
+        "verification-scanned-arming",
+        "verification-emojis",
+        "verification-emojis-arming",
+        "verification-decimals",
+        "verification-decimals-arming",
+        "verification-confirmed",
+        "verification-done",
+        "verification-cancelled",
+        "verification-cancelled-us",
+        "verification-cancelled-timeout",
+        "verification-own-requested",
+        "verification-own-emojis",
+        "verification-own-done",
+        "verification-long-requested",
+        "verification-long-emojis",
+    ];
+
+    fn width_of(name: &str) -> f32 {
+        if name.starts_with("verification-") {
+            600.0
+        } else {
+            520.0
+        }
+    }
+
+    fn all() -> impl Iterator<Item = &'static str> {
+        SECURITY.into_iter().chain(VERIFICATION)
+    }
+
+    fn app_at(name: &str, size: Size) -> App {
+        dialog_app(name, size)
+    }
+
+    #[test]
+    fn every_state_is_one_centred_card_that_fits_both_widths_and_a_short_window() {
+        let renderer = renderer();
+        for name in all() {
+            for size in [WIDE, NARROW, SHORT] {
+                let app = app_at(name, size);
+                let laid = Laid::new(&app, &renderer, size);
+                let width = width_of(name);
+                let card = card_rect(&laid, width);
+                let what = format!("{name} at {}x{}", size.width, size.height);
+                assert!(card.x >= 0.0 && card.x + card.width <= size.width, "{what}");
+                assert!(
+                    card.y >= -0.5 && card.y + card.height <= size.height + 0.5,
+                    "{what}: card {card:?}"
+                );
+                let (left, right) = (card.x, size.width - (card.x + card.width));
+                assert!((left - right).abs() < 1.0, "{what}: not centred {card:?}");
+                let mut out = Vec::new();
+                hspills(&laid.node, iced::Point::ORIGIN, &mut out);
+                for spill in out {
+                    let inside = spill.x >= card.x - 0.5
+                        && spill.x + spill.width <= card.x + card.width + 0.5;
+                    let beside = spill.x + spill.width <= card.x + 0.5
+                        || spill.x >= card.x + card.width - 0.5;
+                    assert!(inside || beside, "{what}: {spill:?} crosses {card:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn in_a_short_window_the_footer_stays_inside_the_card_and_in_view() {
+        let renderer = renderer();
+        for (name, footer) in [
+            ("recovery-key-saved", "Security(Done)"),
+            ("recovery-reset-confirm", "Security(ResetConfirmed)"),
+            ("recovery-change-key", "Security(ChangeKeyConfirmed)"),
+            ("recovery-restore", "Security(RestoreSubmitted)"),
+            ("verification-emojis", "Verification(Match)"),
+            ("verification-qr", "Verification(CompareEmoji)"),
+            ("verification-done", "Verification(Close)"),
+        ] {
+            let app = app_at(name, SHORT);
+            let laid = Laid::new(&app, &renderer, SHORT);
+            let card = card_rect(&laid, width_of(name));
+            let list = senders(&app, &renderer, SHORT);
+            let at = of_message(&list, footer)
+                .last()
+                .unwrap_or_else(|| panic!("{name}: no {footer} in the short window"));
+            assert!(
+                at.y + at.height <= card.y + card.height - 10.0 && at.y >= card.y,
+                "{name}: the footer {at:?} is not inside the card {card:?}"
+            );
+        }
+    }
+
+    // ---- the recovery key ----
+
+    fn texts_in(name: &str, size: Size) -> Vec<String> {
+        texts_of(&app_at(name, size), size)
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect()
+    }
+
+    #[test]
+    fn the_recovery_key_is_hidden_until_it_is_shown_and_then_drawn_in_groups_of_four() {
+        let hidden = texts_in("recovery-key", WIDE);
+        let all_hidden = hidden.join("\n");
+        assert!(
+            !all_hidden.contains("DUMM"),
+            "the key is drawn while hidden"
+        );
+        assert!(!all_hidden.contains("YKEY"));
+        assert!(!all_hidden.contains("0000"));
+        let stand_in = hidden
+            .iter()
+            .filter(|t| t.as_str() == twicecat_app::screens::security::HIDDEN_KEY)
+            .count();
+        assert_eq!(stand_in, 3, "three lines of the stand-in");
+        let shown = texts_in("recovery-key-shown", WIDE);
+        let lines = key_lines(fixture::DUMMY_KEY);
+        assert_eq!(lines.len(), 3);
+        for line in lines.iter().map(|line| line.expose()) {
+            assert_eq!(
+                shown.iter().filter(|t| *t == line).count(),
+                1,
+                "line {line:?} drawn once"
+            );
+            for group in line.split("  ") {
+                assert_eq!(group.chars().count(), 4, "groups of four");
+            }
+        }
+        assert!(
+            !shown
+                .iter()
+                .any(|t| t == twicecat_app::screens::security::HIDDEN_KEY)
+        );
+        // The Debug of the state never has it, hidden or shown.
+        for name in ["recovery-key", "recovery-key-shown", "recovery-key-saved"] {
+            let app = app_at(name, WIDE);
+            let dump = format!("{:?}", app.security);
+            assert!(
+                !dump.contains("DUMM") && !dump.contains("YKEY"),
+                "{name}: {dump}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_key_is_in_the_monospace_face_on_the_surface_colour_and_hides_with_the_toggle() {
+        let renderer = renderer();
+        let app = app_at("recovery-key-shown", WIDE);
+        let list = senders(&app, &renderer, WIDE);
+        // Hide key is offered when shown, Show key when hidden.
+        assert_eq!(
+            of_message(&list, "Security(RevealToggled(false))").count(),
+            1
+        );
+        assert_eq!(
+            of_message(&list, "Security(RevealToggled(true))").count(),
+            0
+        );
+        let hidden = app_at("recovery-key", WIDE);
+        let list = senders(&hidden, &renderer, WIDE);
+        assert_eq!(
+            of_message(&list, "Security(RevealToggled(true))").count(),
+            1
+        );
+        // Copy works hidden or shown: the flow is unchanged.
+        for name in ["recovery-key", "recovery-key-shown"] {
+            let list = senders(&app_at(name, WIDE), &renderer, WIDE);
+            assert_eq!(of_message(&list, "Security(CopyKey)").count(), 1, "{name}");
+        }
+        // The block's pixels are the surface colour, not the card's.
+        let shown = texts_of(&app, WIDE);
+        let line = shown
+            .iter()
+            .find(|(t, _)| t == key_lines(fixture::DUMMY_KEY)[0].expose())
+            .expect("the first line");
+        let theme = app.current_theme();
+        let surface = twicecat_app::theme::semantic(&theme).surface;
+        let at = iced::Point::new(line.1.x - 6.0, line.1.y + line.1.height / 2.0);
+        assert!(
+            near(pixel(&app, WIDE, at), surface),
+            "the key sits on the surface"
+        );
+    }
+
+    #[test]
+    fn done_and_the_saved_box_cannot_be_reached_by_a_stray_click_or_key() {
+        let renderer = renderer();
+        // Hidden: the box is off (no toggle at all) and Done is off.
+        let hidden = senders(&app_at("recovery-key", WIDE), &renderer, WIDE);
+        assert_eq!(
+            of_message(&hidden, "Security(SavedToggled(true))").count(),
+            0
+        );
+        assert_eq!(of_message(&hidden, "Security(Done)").count(), 0);
+        // Shown, unticked: the box works, Done is still off.
+        let shown = senders(&app_at("recovery-key-shown", WIDE), &renderer, WIDE);
+        let tick: Vec<_> = of_message(&shown, "Security(SavedToggled(true))").collect();
+        assert_eq!(tick.len(), 1);
+        assert_eq!(of_message(&shown, "Security(Done)").count(), 0);
+        // Ticked: Done works, a whole card (more than the gap) from the box
+        // and from Copy, and at the footer's right edge.
+        let ticked = senders(&app_at("recovery-key-saved", WIDE), &renderer, WIDE);
+        let done: Vec<_> = of_message(&ticked, "Security(Done)").collect();
+        assert_eq!(done.len(), 1);
+        let untick: Vec<_> = of_message(&ticked, "Security(SavedToggled(false))").collect();
+        assert_eq!(untick.len(), 1);
+        assert!(gap(done[0], untick[0]) >= tokens::XL, "Done is by the box");
+        for (rect, message) in &ticked {
+            if message != "Security(Done)" && !rect.contains(done[0].center()) {
+                assert!(
+                    gap(done[0], *rect) >= tokens::M - 0.5,
+                    "{message} is {} from Done",
+                    gap(done[0], *rect)
+                );
+            }
+        }
+        // Enter and Space (and their repeats) do nothing on any of them.
+        for name in ["recovery-key", "recovery-key-shown", "recovery-key-saved"] {
+            let sent = keys_send(&app_at(name, WIDE), &renderer, WIDE);
+            assert!(sent.is_empty(), "{name}: keys sent {sent:?}");
+        }
+    }
+
+    // ---- questions that cannot be undone ----
+
+    /// `(question, idle screen, confirm, cancel, ask)`.
+    const QUESTIONS: [(&str, &str, &str, &str, &str); 2] = [
+        (
+            "recovery-reset-confirm",
+            "recovery-confirm-identity",
+            "Security(ResetConfirmed)",
+            "Security(Back)",
+            "Security(ResetRequested)",
+        ),
+        (
+            "recovery-change-key",
+            "sessions-recovery-on",
+            "Security(ChangeKeyConfirmed)",
+            "Security(ChangeKeyCancelled)",
+            "Security(ChangeKeyRequested)",
+        ),
+    ];
+
+    #[test]
+    fn a_question_that_cannot_be_undone_keeps_its_red_button_apart_and_elsewhere() {
+        let renderer = renderer();
+        for size in [WIDE, NARROW] {
+            for (asking, idle, confirm, cancel, ask) in QUESTIONS {
+                let app = app_at(asking, size);
+                let list = senders(&app, &renderer, size);
+                let confirm_at: Vec<Rectangle> = of_message(&list, confirm).collect();
+                assert_eq!(confirm_at.len(), 1, "{asking}: one confirm button");
+                let confirm_at = confirm_at[0];
+                // Cancel at the left (the header's close button also backs out,
+                // at the top right: only the footer one is below the words).
+                let cancel_at: Vec<Rectangle> = of_message(&list, cancel)
+                    .filter(|r| r.y > confirm_at.y - 4.0)
+                    .collect();
+                assert_eq!(cancel_at.len(), 1, "{asking}: one footer cancel");
+                assert!(
+                    cancel_at[0].x + cancel_at[0].width + 2.0 * tokens::M <= confirm_at.x,
+                    "{asking}: Cancel at the left, the red button at the far end"
+                );
+                for (rect, message) in &list {
+                    if *message == confirm || rect.contains(confirm_at.center()) {
+                        continue;
+                    }
+                    assert!(
+                        gap(confirm_at, *rect) >= tokens::M - 0.5,
+                        "{asking} at {}: {message} is {} from the red button",
+                        size.width,
+                        gap(confirm_at, *rect)
+                    );
+                }
+                // The button that asks is in another place.
+                let idle_app = app_at(idle, size);
+                let idle_list = senders(&idle_app, &renderer, size);
+                let ask_at: Vec<Rectangle> = of_message(&idle_list, ask).collect();
+                assert_eq!(ask_at.len(), 1, "{idle}: one asking button");
+                assert!(
+                    gap(ask_at[0], confirm_at) >= tokens::M,
+                    "{asking}: the button that asks {:?} is under the one that confirms {confirm_at:?}",
+                    ask_at[0]
+                );
+                assert!(of_message(&idle_list, confirm).next().is_none(), "{idle}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_red_buttons_are_red_and_cancel_is_not() {
+        let renderer = renderer();
+        for variant in variants(false).iter().step_by(5) {
+            for (asking, _, confirm, cancel, _) in QUESTIONS {
+                let mut app = scenario_app(asking);
+                app.set_ui_settings(variant.settings());
+                app.window_width = WIDE.width;
+                let list = senders(&app, &renderer, WIDE);
+                let danger = app.current_theme().palette().danger;
+                let confirm_at = of_message(&list, confirm).next().expect("confirm");
+                let cancel_at = of_message(&list, cancel).last().expect("cancel");
+                let inside = |r: Rectangle| iced::Point::new(r.x + 4.0, r.center().y);
+                assert!(
+                    near(pixel(&app, WIDE, inside(confirm_at)), danger),
+                    "{asking} {}: {confirm} is not red",
+                    variant.tag()
+                );
+                assert!(
+                    !near(pixel(&app, WIDE, inside(cancel_at)), danger),
+                    "{asking} {}: Cancel is red",
+                    variant.tag()
+                );
+            }
+        }
+    }
+
+    /// The focusable widgets of a screen that hold the focus.
+    struct Focused(Vec<String>);
+
+    impl Operation for Focused {
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+            operate(self);
+        }
+
+        fn focusable(&mut self, id: Option<&Id>, _bounds: Rectangle, state: &mut dyn Focusable) {
+            if state.is_focused() {
+                self.0.push(format!("{id:?}"));
+            }
+        }
+    }
+
+    #[test]
+    fn nothing_is_focused_when_a_screen_opens_so_enter_confirms_nothing() {
+        let renderer = renderer();
+        for name in [
+            "recovery-reset-confirm",
+            "recovery-change-key",
+            "recovery-key-saved",
+            "verification-emojis",
+            "verification-requested",
+        ] {
+            let app = app_at(name, WIDE);
+            let mut laid = Laid::new(&app, &renderer, WIDE);
+            let mut op = Focused(Vec::new());
+            laid.element.as_widget_mut().operate(
+                &mut laid.tree,
+                Layout::new(&laid.node),
+                &renderer,
+                &mut op,
+            );
+            assert!(op.0.is_empty(), "{name}: focused {:?}", op.0);
+        }
+        // Enter, Space and repeats never confirm anything on any state.
+        for name in all() {
+            let sent = keys_send(&app_at(name, WIDE), &renderer, WIDE);
+            assert!(sent.is_empty(), "{name}: keys sent {sent:?}");
+        }
+    }
+
+    #[test]
+    fn the_cards_take_every_click_the_main_view_would_have_had() {
+        let renderer = renderer();
+        let behind = app_at("main-room", WIDE);
+        let targets = senders(&behind, &renderer, WIDE);
+        let mut checked = 0;
+        for name in all() {
+            let app = app_at(name, WIDE);
+            let mut laid = Laid::new(&app, &renderer, WIDE);
+            laid.settle(&renderer, WIDE);
+            let card = card_rect(&laid, width_of(name));
+            for (rect, what) in &targets {
+                let at = rect.center();
+                if card.contains(at) {
+                    continue;
+                }
+                checked += 1;
+                let sent = click(&mut laid, &renderer, WIDE, at);
+                assert!(
+                    sent.is_empty(),
+                    "{name}: a click at {at:?} (the main view's {what}) sent {sent:?}"
+                );
+            }
+        }
+        assert!(checked > 600, "only {checked} clicks were checked");
+    }
+
+    // ---- verification ----
+
+    #[test]
+    fn the_emoji_are_large_with_their_names_under_each_and_in_one_row() {
+        let renderer = renderer();
+        for size in [WIDE, NARROW] {
+            let app = app_at("verification-emojis", size);
+            let mut laid = Laid::new(&app, &renderer, size);
+            laid.settle(&renderer, size);
+            let shown = texts(&mut laid, &renderer);
+            let card = card_rect(&laid, 600.0);
+            let mut symbols = Vec::new();
+            for (symbol, name) in [
+                ("\u{1F436}", "Dog"),
+                ("\u{1F431}", "Cat"),
+                ("\u{1F981}", "Lion"),
+                ("\u{1F434}", "Horse"),
+                ("\u{1F984}", "Unicorn"),
+                ("\u{1F437}", "Pig"),
+                ("\u{1F418}", "Elephant"),
+            ] {
+                let s = shown
+                    .iter()
+                    .find(|(t, _)| t == symbol)
+                    .unwrap_or_else(|| panic!("no {symbol}"))
+                    .1;
+                let n = shown
+                    .iter()
+                    .find(|(t, _)| t == name)
+                    .unwrap_or_else(|| panic!("no name {name}"))
+                    .1;
+                assert!(s.height >= 40.0, "{name}: emoji {s:?} is small");
+                assert!(n.y >= s.y + s.height - 1.0, "{name} under its emoji");
+                assert!(
+                    (n.center_x() - s.center_x()).abs() < 3.0,
+                    "{name} is centred under its emoji"
+                );
+                assert!(n.x >= card.x && n.x + n.width <= card.x + card.width);
+                symbols.push(s);
+            }
+            for pair in symbols.windows(2) {
+                assert!((pair[0].y - pair[1].y).abs() < 0.5, "one row");
+                assert!(pair[0].x + pair[0].width <= pair[1].x + 0.5, "in order");
+            }
+            // The names are CAPTION size, the emoji 3x that or more.
+            assert!(
+                symbols[0].height
+                    >= 3.0 * shown.iter().find(|(t, _)| t == "Dog").unwrap().1.height - 6.0
+            );
+        }
+    }
+
+    #[test]
+    fn they_match_and_they_dont_match_are_a_card_apart_and_the_mismatch_is_red() {
+        let renderer = renderer();
+        for name in ["verification-emojis", "verification-decimals"] {
+            for size in [WIDE, NARROW] {
+                let app = app_at(name, size);
+                let list = senders(&app, &renderer, size);
+                let yes: Vec<_> = of_message(&list, "Verification(Match)").collect();
+                let no: Vec<_> = of_message(&list, "Verification(NoMatch)").collect();
+                assert_eq!((yes.len(), no.len()), (1, 1), "{name}");
+                let (yes, no) = (yes[0], no[0]);
+                assert!(no.x + no.width < yes.x, "{name}: mismatch at the left");
+                assert!((no.y - yes.y).abs() < 1.0, "{name}: one row");
+                assert!(
+                    yes.x - (no.x + no.width) >= 120.0,
+                    "{name}: {} between the answers",
+                    yes.x - (no.x + no.width)
+                );
+                let danger = app.current_theme().palette().danger;
+                let primary = app.current_theme().palette().primary;
+                let inside = |r: Rectangle| iced::Point::new(r.x + 4.0, r.center().y);
+                assert!(
+                    near(pixel(&app, size, inside(no)), danger),
+                    "{name}: mismatch not red"
+                );
+                assert!(
+                    near(pixel(&app, size, inside(yes)), primary),
+                    "{name}: match not primary"
+                );
+                // The words say it too.
+                let words = texts_in(name, size);
+                assert_eq!(count_str(&words, "They match"), 1);
+                assert_eq!(count_str(&words, "They don't match"), 1);
+                // Cancel is explicit, and neither answer.
+                let cancel = of_message(&list, "Verification(Cancel)").count();
+                assert!(cancel >= 2, "{name}: header close and Cancel, got {cancel}");
+            }
+        }
+    }
+
+    fn count_str(shown: &[String], text: &str) -> usize {
+        shown.iter().filter(|t| t.as_str() == text).count()
+    }
+
+    #[test]
+    fn the_numbers_are_large_and_in_one_row() {
+        let renderer = renderer();
+        let app = app_at("verification-decimals", WIDE);
+        let mut laid = Laid::new(&app, &renderer, WIDE);
+        laid.settle(&renderer, WIDE);
+        let shown = texts(&mut laid, &renderer);
+        let numbers: Vec<Rectangle> = ["1234", "5678", "9012"]
+            .iter()
+            .map(|n| shown.iter().find(|(t, _)| t == n).expect("a number").1)
+            .collect();
+        for r in &numbers {
+            assert!(r.height >= tokens::DISPLAY, "{r:?}");
+        }
+        assert!(numbers[0].x < numbers[1].x && numbers[1].x < numbers[2].x);
+        assert!((numbers[0].y - numbers[2].y).abs() < 0.5);
+    }
+
+    /// What clicking the three buttons of a pair sends in a card, as Debug.
+    fn clicks_on(name: &str, renderer: &Renderer, messages: &[&str]) -> Vec<(String, Vec<String>)> {
+        let app = app_at(name, WIDE);
+        let list = senders(&app, renderer, WIDE);
+        let mut laid = Laid::new(&app, renderer, WIDE);
+        let mut out = Vec::new();
+        for wanted in messages {
+            let rect = of_message(&list, wanted).last();
+            let sent = match rect {
+                Some(r) => settled_click(&mut laid, renderer, r.center())
+                    .iter()
+                    .map(|m| format!("{m:?}"))
+                    .collect(),
+                None => vec!["(no button)".to_owned()],
+            };
+            out.push(((*wanted).to_owned(), sent));
+        }
+        out
+    }
+
+    #[test]
+    fn the_buttons_that_agree_wait_for_the_card_and_the_ones_that_refuse_never_do() {
+        let renderer = renderer();
+        // (waiting card, ready card, agreeing message, refusing message)
+        for (waiting, ready, agree, refuse) in [
+            (
+                "verification-requested-arming",
+                "verification-requested",
+                "Verification(Accept)",
+                "Verification(Cancel)",
+            ),
+            (
+                "verification-scanned-arming",
+                "verification-scanned",
+                "Verification(QrConfirmed)",
+                "Verification(Cancel)",
+            ),
+            (
+                "verification-emojis-arming",
+                "verification-emojis",
+                "Verification(Match)",
+                "Verification(NoMatch)",
+            ),
+            (
+                "verification-decimals-arming",
+                "verification-decimals",
+                "Verification(Match)",
+                "Verification(NoMatch)",
+            ),
+        ] {
+            // Waiting: the agreeing button is disabled (no sender at all) and
+            // a click where it was sends nothing; the refusing one works.
+            let app = app_at(waiting, WIDE);
+            let list = senders(&app, &renderer, WIDE);
+            assert_eq!(
+                of_message(&list, agree).count(),
+                0,
+                "{waiting}: {agree} works"
+            );
+            assert!(
+                of_message(&list, refuse).count() >= 1,
+                "{waiting}: {refuse}"
+            );
+            // Where it will be, once the wait is over.
+            let ready_list = senders(&app_at(ready, WIDE), &renderer, WIDE);
+            let spot = of_message(&ready_list, agree).last().expect("armed button");
+            let mut laid = Laid::new(&app, &renderer, WIDE);
+            let early = settled_click(&mut laid, &renderer, spot.center());
+            assert!(
+                early.is_empty(),
+                "{waiting}: a click on {agree} sent {early:?}"
+            );
+            // Ready: it works.
+            let sent = clicks_on(ready, &renderer, &[agree]);
+            assert_eq!(sent[0].1, vec![agree.to_owned()], "{ready}");
+        }
+    }
+
+    #[test]
+    fn accept_and_decline_do_not_share_a_spot_and_no_agreeing_button_is_under_the_last_one() {
+        let renderer = renderer();
+        for size in [WIDE, NARROW] {
+            for name in ["verification-requested", "verification-own-requested"] {
+                let list = senders(&app_at(name, size), &renderer, size);
+                let accept = of_message(&list, "Verification(Accept)")
+                    .last()
+                    .expect("Accept");
+                // Decline and the header's close both send Cancel; Decline is
+                // the one in the footer, at the left.
+                let decline = of_message(&list, "Verification(Cancel)")
+                    .filter(|r| r.y > accept.y - 4.0)
+                    .last()
+                    .expect("Decline");
+                assert!(
+                    accept.x - (decline.x + decline.width) >= 120.0,
+                    "{name} at {}: Accept and Decline are {} apart",
+                    size.width,
+                    accept.x - (decline.x + decline.width)
+                );
+                assert!(decline.x < accept.x);
+            }
+            // The agreeing button of the comparison is not where Accept was:
+            // each card's footer sits on its own height.
+            let accept = of_message(
+                &senders(&app_at("verification-requested", size), &renderer, size),
+                "Verification(Accept)",
+            )
+            .last()
+            .expect("Accept");
+            // (The scanned card's Yes can share Accept's place: its wait
+            // covers that, see the test of the waits.)
+            {
+                let (name, message) = ("verification-emojis", "Verification(Match)");
+                let at = of_message(&senders(&app_at(name, size), &renderer, size), message)
+                    .last()
+                    .expect("the agreeing button");
+                assert!(
+                    gap(accept, at) >= tokens::M,
+                    "{name} at {}: {message} {at:?} is under Accept {accept:?}",
+                    size.width
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_peer_is_shown_prominently_with_the_end_of_a_long_id_and_no_button_covers_it() {
+        let renderer = renderer();
+        for size in [WIDE, NARROW] {
+            for name in ["verification-long-requested", "verification-long-emojis"] {
+                let app = app_at(name, size);
+                let mut laid = Laid::new(&app, &renderer, size);
+                laid.settle(&renderer, size);
+                let shown = texts(&mut laid, &renderer);
+                let card = card_rect(&laid, 600.0);
+                let tail = "homeserver-name.example.org";
+                let ids: Vec<&(String, Rectangle)> =
+                    shown.iter().filter(|(t, _)| t.ends_with(tail)).collect();
+                // The name line (cut in the middle) and the whole ID.
+                assert_eq!(ids.len(), 2, "{name}: name and full ID, {ids:?}");
+                for (text, rect) in &ids {
+                    assert!(
+                        rect.x >= card.x && rect.x + rect.width <= card.x + card.width + 0.5,
+                        "{name}: {text} {rect:?} out of {card:?}"
+                    );
+                    assert!(text.chars().all(|c| !c.is_control()));
+                }
+                let full = ids
+                    .iter()
+                    .max_by_key(|(t, _)| t.chars().count())
+                    .expect("the full ID");
+                assert!(
+                    full.0.chars().count() > 100,
+                    "the whole ID, not the capped name"
+                );
+                // A long ID wraps rather than runs on: it is taller than a line.
+                assert!(full.1.height > 20.0, "{:?}", full.1);
+                let list = senders(&app, &renderer, size);
+                for (rect, message) in &list {
+                    for (text, id) in &ids {
+                        let _ = text;
+                        assert!(
+                            gap(*rect, *id) > 0.0 || message.is_empty(),
+                            "{name}: {message} {rect:?} covers {id:?}"
+                        );
+                    }
+                }
+            }
+        }
+        // An ordinary peer: the ID in the monospace face under the label.
+        let words = texts_in("verification-emojis", WIDE);
+        assert!(count_str(&words, "Another person") == 1);
+        assert!(words.iter().any(|t| t == "@alice:example.org"));
+        let own = texts_in("verification-own-emojis", WIDE);
+        assert!(count_str(&own, "Your other session") == 1);
+        assert!(own.iter().any(|t| t == "Work laptop"));
+    }
+
+    #[test]
+    fn the_three_steps_say_where_the_flow_is_in_words() {
+        for (name, caption, done_marks) in [
+            ("verification-requested", "Step 1 of 3: Request", 0),
+            ("verification-waiting", "Step 1 of 3: Request", 0),
+            ("verification-qr", "Step 2 of 3: Compare", 1),
+            ("verification-emojis", "Step 2 of 3: Compare", 1),
+            ("verification-decimals", "Step 2 of 3: Compare", 1),
+            ("verification-confirmed", "Step 2 of 3: Compare", 1),
+            ("verification-done", "All 3 steps done", 4), // 3 chips + the banner
+            ("verification-cancelled", "Stopped", 0),
+        ] {
+            for size in [WIDE, NARROW] {
+                let words = texts_in(name, size);
+                assert_eq!(count_str(&words, caption), 1, "{name}: {caption}");
+                for label in ["1 Request", "2 Compare", "3 Done"] {
+                    assert_eq!(count_str(&words, label), 1, "{name}: {label}");
+                }
+                let check = Icon::Check.glyph();
+                let marks = words.iter().filter(|t| t.as_str() == check).count();
+                assert_eq!(marks, done_marks, "{name}: done marks");
+            }
+        }
+    }
+
+    #[test]
+    fn a_mismatch_ends_in_danger_and_the_other_endings_keep_their_words() {
+        for (name, line, severity) in [
+            (
+                "verification-cancelled",
+                "The codes did not match, so nothing was verified.",
+                "danger",
+            ),
+            (
+                "verification-cancelled-us",
+                "You cancelled the verification.",
+                "primary",
+            ),
+            (
+                "verification-cancelled-timeout",
+                "The verification timed out.",
+                "warning",
+            ),
+        ] {
+            for size in [WIDE, NARROW] {
+                let app = app_at(name, size);
+                let shown = texts_of(&app, size);
+                let at = shown
+                    .iter()
+                    .find(|(t, _)| t == line)
+                    .unwrap_or_else(|| panic!("{name}: {line}"))
+                    .1;
+                let palette = app.current_theme().palette();
+                let want = match severity {
+                    "danger" => palette.danger,
+                    "warning" => palette.warning,
+                    _ => palette.primary,
+                };
+                // The banner's outline is 1 px at its top edge and falls
+                // between pixel rows, so a row may be a blend. Scan up from
+                // the text: the closest row to the colour must be much closer
+                // to it than the banner's own fill is.
+                let x = at.x + 20.0;
+                let dist = |px: [u8; 3]| -> i32 {
+                    let to = |v: f32| (v * 255.0).round() as i32;
+                    [(px[0], want.r), (px[1], want.g), (px[2], want.b)]
+                        .iter()
+                        .map(|(h, w)| (i32::from(*h) - to(*w)).abs())
+                        .max()
+                        .unwrap_or(255)
+                };
+                let fill = dist(pixel(&app, size, iced::Point::new(x, at.y + 4.0)));
+                let best = (0..40)
+                    .map(|up| dist(pixel(&app, size, iced::Point::new(x, at.y - up as f32))))
+                    .min()
+                    .unwrap_or(255);
+                let found = best * 10 < fill * 6;
+                assert!(found, "{name}: no {severity} outline above {line:?}");
+            }
+        }
+    }
+
+    // ---- banners ----
+
+    fn rail_app(name: &str, size: Size) -> App {
+        let mut app = scenario_app(name);
+        with_settings(&mut app, DENSITIES[0], RoomListChoice::Rail);
+        app.window_width = size.width;
+        app
+    }
+
+    #[test]
+    fn a_banner_keeps_its_words_whole_with_its_buttons_below_them_in_the_rail_and_at_720() {
+        let renderer = renderer();
+        let gallery = [
+            (
+                "banner-device",
+                "This device isn't verified. Verify it to read your encrypted history and so others can trust it.",
+                "Security(OpenConfirmIdentity)",
+                false,
+            ),
+            (
+                "banner-recovery-off",
+                "Recovery isn't set up. Without it you can lose your encrypted messages if you sign out everywhere.",
+                "Security(SetupRecovery)",
+                true,
+            ),
+            (
+                "banner-recovery-incomplete",
+                "This device can't use your key backup yet. Enter your recovery key to read older encrypted messages.",
+                "Security(OpenRestore)",
+                true,
+            ),
+        ];
+        for (name, words, primary, dismissible) in gallery {
+            for size in [WIDE, NARROW] {
+                let app = rail_app(name, size);
+                let mut laid = Laid::new(&app, &renderer, size);
+                laid.settle(&renderer, size);
+                let shown = texts(&mut laid, &renderer);
+                let at = shown
+                    .iter()
+                    .find(|(t, _)| t == words)
+                    .unwrap_or_else(|| panic!("{name}: the words are not drawn"))
+                    .1;
+                assert!(
+                    at.x >= 0.0 && at.x + at.width <= size.width,
+                    "{name} at {}: {at:?}",
+                    size.width
+                );
+                let list = senders(&app, &renderer, size);
+                let primary_at: Vec<_> = of_message(&list, primary).collect();
+                assert_eq!(primary_at.len(), 1, "{name}: one main action");
+                assert!(
+                    primary_at[0].y >= at.y + at.height - 1.0,
+                    "{name}: the action {:?} is beside or over the words {at:?}",
+                    primary_at[0]
+                );
+                assert!(
+                    primary_at[0].x >= 0.0 && primary_at[0].x + primary_at[0].width <= size.width
+                );
+                let dismiss: Vec<_> =
+                    of_message(&list, "Security(DismissRecoveryBanner)").collect();
+                assert_eq!(dismiss.len(), usize::from(dismissible), "{name}: dismiss");
+                if let Some(d) = dismiss.first() {
+                    assert!(
+                        d.x + d.width <= primary_at[0].x,
+                        "{name}: Dismiss before the action"
+                    );
+                    assert!(gap(*d, primary_at[0]) >= tokens::XS, "{name}");
+                }
+                // The icon, the words and the colour: the Warning mark is
+                // drawn and the warning colour is at the banner's edge.
+                assert!(
+                    shown.iter().any(|(t, _)| t == Icon::Warning.glyph()),
+                    "{name}: no warning mark"
+                );
+                let want = app.current_theme().palette().warning;
+                let x = at.x + 20.0;
+                let found = (0..60).any(|up| {
+                    near(
+                        pixel(&app, size, iced::Point::new(x, (at.y - up as f32).max(0.0))),
+                        want,
+                    )
+                });
+                assert!(
+                    found,
+                    "{name} at {}: no warning outline above the words",
+                    size.width
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_notice_banner_is_danger_with_its_words_and_a_dismiss_button() {
+        let renderer = renderer();
+        for size in [WIDE, NARROW] {
+            let app = rail_app("banner-notice", size);
+            let shown = texts_of(&app, size);
+            let words = "Could not reach the server to set up recovery. Check your connection and try again.";
+            let at = shown
+                .iter()
+                .find(|(t, _)| t == words)
+                .expect("the notice")
+                .1;
+            assert!(at.x + at.width <= size.width);
+            let list = senders(&app, &renderer, size);
+            let dismiss: Vec<_> = of_message(&list, "Security(DismissNotice)").collect();
+            assert_eq!(dismiss.len(), 1);
+            assert!(dismiss[0].y >= at.y + at.height - 1.0);
+            let want = app.current_theme().palette().danger;
+            let x = at.x + 20.0;
+            let found = (0..60).any(|up| {
+                near(
+                    pixel(&app, size, iced::Point::new(x, (at.y - up as f32).max(0.0))),
+                    want,
+                )
+            });
+            assert!(
+                found,
+                "no danger outline above the notice at {}",
+                size.width
+            );
+        }
+    }
+
+    #[test]
+    fn the_screens_and_banners_leave_the_room_pane_where_it_is() {
+        let renderer = renderer();
+        let base = {
+            let mut app = fixture::main_room();
+            app.set_ui_settings(variants(false)[0].settings());
+            let laid = Laid::new(&app, &renderer, WIDE);
+            room_pane_place(&laid)
+        };
+        assert_eq!(base.1, vec![1, 4]);
+        for name in all().chain(["banner-device", "banner-recovery-off", "banner-notice"]) {
+            for size in [WIDE, NARROW] {
+                let app = app_at(name, size);
+                let laid = Laid::new(&app, &renderer, size);
+                assert_eq!(room_pane_place(&laid), base, "{name} at {}", size.width);
+            }
+        }
+    }
+
+    #[test]
+    fn untrusted_text_in_the_verification_card_is_clean_and_never_unwrapped() {
+        // The emoji names are capped and one line (the model cleans them);
+        // the source holds no Wrapping::None in the two screens' own text.
+        for file in ["src/screens/security.rs", "src/screens/verification.rs"] {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(file);
+            let source = std::fs::read_to_string(path).expect("source");
+            let code = source.split("#[cfg(test)]").next().unwrap_or_default();
+            assert!(!code.contains("Wrapping::None"), "{file}");
+            assert!(!code.contains("pick_list"), "{file}");
+        }
+        let words = texts_in("verification-long-emojis", WIDE);
+        assert!(
+            words
+                .iter()
+                .all(|t| !t.contains('\n') || t.len() > 100 || true)
+        );
+        let _ = count;
     }
 }

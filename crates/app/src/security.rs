@@ -104,16 +104,32 @@ pub struct RecoverySetup {
     pub saved_ticked: bool,
     /// The key replaces an earlier one (**Change recovery key**).
     pub replaces_old: bool,
+    /// The key is drawn. It starts hidden: it shows only after **Show key**,
+    /// so a screen shared or glanced at does not leak it. **Copy** works
+    /// either way.
+    pub revealed: bool,
+    /// The key as drawn: lines of groups of four, made once here and
+    /// borrowed by every frame (no copy per redraw). Each line is a
+    /// [`RecoveryKey`], so it is zeroized when the screen goes.
+    lines: Vec<RecoveryKey>,
 }
 
 impl RecoverySetup {
     /// A screen for `key`, not ticked.
     pub fn new(key: RecoveryKey, replaces_old: bool) -> Self {
+        let lines = key_lines(key.expose());
         Self {
             key,
             saved_ticked: false,
             replaces_old,
+            revealed: false,
+            lines,
         }
+    }
+
+    /// The lines of the key as drawn (see [`key_lines`]).
+    pub fn lines(&self) -> &[RecoveryKey] {
+        &self.lines
     }
 }
 
@@ -122,6 +138,7 @@ impl fmt::Debug for RecoverySetup {
         f.debug_struct("RecoverySetup")
             .field("saved_ticked", &self.saved_ticked)
             .field("replaces_old", &self.replaces_old)
+            .field("revealed", &self.revealed)
             .finish_non_exhaustive()
     }
 }
@@ -133,6 +150,44 @@ pub fn key_title(setup: &RecoverySetup) -> &'static str {
     } else {
         "Your recovery key"
     }
+}
+
+/// How many characters make a group of the key as drawn.
+pub const KEY_GROUP: usize = 4;
+/// How many groups make a line of the key as drawn.
+pub const KEY_GROUPS_PER_LINE: usize = 4;
+
+/// The key as lines of groups of four (blanks in the key are dropped first),
+/// for reading it off the screen. Nothing is logged here. Each line is a
+/// [`RecoveryKey`] (zeroized when dropped) built in one buffer that is sized
+/// first, so no earlier, shorter copy is left behind by a reallocation, and
+/// no per-group `String` or `Vec<char>` of the key is made. What iced does
+/// with a drawn line is out of reach: its text layout keeps its own copy of
+/// the glyphs while the key is shown (the same residual as the text fields).
+pub fn key_lines(key: &str) -> Vec<RecoveryKey> {
+    // Two blanks between groups, and up to four bytes a character.
+    const LINE_BYTES: usize = (KEY_GROUP * KEY_GROUPS_PER_LINE + 2 * (KEY_GROUPS_PER_LINE - 1)) * 4;
+    let mut lines = Vec::new();
+    let mut line = String::with_capacity(LINE_BYTES);
+    let mut in_line = 0;
+    for c in key.chars().filter(|c| !c.is_whitespace()) {
+        if in_line == KEY_GROUP * KEY_GROUPS_PER_LINE {
+            lines.push(RecoveryKey::from(std::mem::replace(
+                &mut line,
+                String::with_capacity(LINE_BYTES),
+            )));
+            in_line = 0;
+        }
+        if in_line > 0 && in_line % KEY_GROUP == 0 {
+            line.push_str("  ");
+        }
+        line.push(c);
+        in_line += 1;
+    }
+    if in_line > 0 {
+        lines.push(RecoveryKey::from(line));
+    }
+    lines
 }
 
 /// The screen can be left only after the box is ticked.
@@ -340,6 +395,8 @@ pub enum SecurityMessage {
     /// The clipboard's contents (first) read at once because the key (second)
     /// is being dropped; cleared if it still holds that key.
     ClipboardFlushed(Option<RecoveryKey>, RecoveryKey),
+    /// **Show key** or **Hide key** on the key screen.
+    RevealToggled(bool),
     /// "I've saved my recovery key" was toggled.
     SavedToggled(bool),
     /// **Done** on the key screen.
@@ -454,8 +511,19 @@ impl App {
                 };
                 self.exit_if_flushed(clear)
             }
-            M::SavedToggled(ticked) => {
+            M::RevealToggled(shown) => {
                 if let Some(setup) = &mut self.security.setup {
+                    setup.revealed = shown;
+                }
+                Task::none()
+            }
+            M::SavedToggled(ticked) => {
+                // Ticking is for a key that has been shown (the view leaves
+                // the box without a press until then; this is the handler's
+                // own guard). Unticking is always allowed.
+                if let Some(setup) = &mut self.security.setup
+                    && (setup.revealed || !ticked)
+                {
                     setup.saved_ticked = ticked;
                 }
                 Task::none()
@@ -611,6 +679,49 @@ impl App {
                 Task::none()
             }
         }
+    }
+
+    /// Esc over a security screen, if one is drawn: it only ever cancels,
+    /// backs out or is swallowed, never confirms (**Reset identity**,
+    /// **Change key**, **Restore** and **Done** are not reachable by it). The
+    /// key screen and every screen whose work runs swallow the key, so
+    /// nothing under them sees it; the sign-out card under them is untouched.
+    /// `None` when no security screen is drawn.
+    pub(crate) fn security_escape(&mut self) -> Option<Task<Message>> {
+        use SecurityMessage as M;
+        let model = &self.security;
+        let message = match model.visible() {
+            Visible::Nothing => {
+                return (model.busy == Some(Busy::SettingUp)).then(Task::none);
+            }
+            // Leaving would lose the only copy of the key.
+            Visible::Key => return Some(Task::none()),
+            Visible::Reauth => {
+                if model.reauth.as_ref().is_some_and(|prompt| prompt.waiting) {
+                    return Some(Task::none());
+                }
+                M::ReauthCancelled
+            }
+            Visible::Overlay(Overlay::ConfirmIdentity) => {
+                if model.busy.is_some() {
+                    return Some(Task::none());
+                }
+                M::SkipIdentity
+            }
+            Visible::Overlay(Overlay::Restore | Overlay::ChangeKeyConfirm)
+                if model.busy.is_some() =>
+            {
+                return Some(Task::none());
+            }
+            Visible::Overlay(Overlay::Restore) => M::Back,
+            Visible::Overlay(Overlay::ChangeKeyConfirm) => M::ChangeKeyCancelled,
+            Visible::Overlay(Overlay::ResetConfirm) => match (model.busy, model.waiting_approval) {
+                (Some(Busy::Resetting), true) => M::CancelApproval,
+                (Some(_), _) => return Some(Task::none()),
+                (None, _) => M::Back,
+            },
+        };
+        Some(self.update(Message::Security(message)))
     }
 
     /// Drops the key, the inputs and the copy, and checks the clipboard at
@@ -864,6 +975,40 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_key_is_drawn_in_groups_of_four_four_to_a_line() {
+        let lines = key_lines("ABCD EFGH IJKL MNOP QRST UVWX YZ01");
+        let shown: Vec<&str> = lines.iter().map(RecoveryKey::expose).collect();
+        assert_eq!(shown, ["ABCD  EFGH  IJKL  MNOP", "QRST  UVWX  YZ01"]);
+        assert!(key_lines("").is_empty());
+        // Blanks anywhere are dropped; a short last group stays short; wide
+        // characters are not cut.
+        let odd = key_lines("AB  CD\tEFGHIJ\nK\u{e9}\u{4e2d}");
+        let shown: Vec<&str> = odd.iter().map(RecoveryKey::expose).collect();
+        assert_eq!(shown, ["ABCD  EFGH  IJK\u{e9}  \u{4e2d}"].map(|s| s));
+    }
+
+    #[test]
+    fn the_screen_keeps_the_drawn_lines_once_and_its_debug_has_none_of_them() {
+        let setup = RecoverySetup::new(RecoveryKey::from("ABCD EFGH IJKL MNOP QRST"), false);
+        assert_eq!(
+            setup
+                .lines()
+                .iter()
+                .map(RecoveryKey::expose)
+                .collect::<Vec<_>>(),
+            ["ABCD  EFGH  IJKL  MNOP", "QRST"]
+        );
+        assert!(!format!("{setup:?}").contains("ABCD"));
+    }
+
+    #[test]
+    fn a_new_key_screen_starts_hidden_and_its_debug_has_no_key() {
+        let setup = RecoverySetup::new(RecoveryKey::from("dummy-key-text"), false);
+        assert!(!setup.revealed);
+        assert!(!format!("{setup:?}").contains("dummy-key-text"));
+    }
+
     use twicecat_core::api::{
         CrossSigning, DeviceVerification, RecoveryKey, RecoveryStatus, SecurityStatus,
     };

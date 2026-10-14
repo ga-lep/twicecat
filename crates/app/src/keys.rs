@@ -18,6 +18,7 @@ use crate::settings::{SettingsMessage, Zoom};
 use crate::state::{App, Message, Screen};
 use crate::switcher::SwitcherMessage;
 use crate::threads::ThreadsMessage;
+use crate::verification::VerificationMessage;
 
 /// Which modifier is "Command" for the shortcuts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -435,6 +436,12 @@ pub fn event_message(event: &iced::Event, captured: bool) -> Option<Message> {
             if *repeat && matches!(shortcut, Shortcut::AcceptRing | Shortcut::DeclineRing) {
                 return None;
             }
+            // Esc acts once per press: a held key must not peel off one
+            // layer after another, nor cancel a verification request that
+            // arrived under the held key and was never seen.
+            if *repeat && shortcut == Shortcut::Escape {
+                return None;
+            }
             Some(Message::Shortcut { shortcut, captured })
         }
         iced::Event::Keyboard(Event::KeyReleased { key, .. }) => {
@@ -616,6 +623,17 @@ impl App {
         if self.screen == Screen::Main && self.calls.card().is_some() {
             return self.update(Message::Call(CallMessage::HideRing));
         }
+        // The verification card is drawn over everything but the ring card
+        // (also while the main window is still loading). Esc only ever
+        // cancels it: never "They match", never "Accept".
+        if let Some(model) = &self.verification {
+            let message = if model.is_over() {
+                VerificationMessage::Close
+            } else {
+                VerificationMessage::Cancel
+            };
+            return self.update(Message::Verification(message));
+        }
         if self.switcher.open {
             return self.close_switcher();
         }
@@ -642,6 +660,11 @@ impl App {
         // Esc only ever cancels or closes here, never confirms, and the key
         // stops here: nothing behind the card sees it. The warning and the
         // prompt are drawn over the card, the question inside it.
+        // A security screen is drawn over the Sessions card (and hides it),
+        // so it takes the key first.
+        if let Some(task) = self.security_escape() {
+            return task;
+        }
         if let Some(task) = self.sessions_escape() {
             return task;
         }
@@ -963,6 +986,32 @@ mod tests {
             location: iced::keyboard::Location::Standard,
             modifiers: Modifiers::empty(),
         })
+    }
+
+    #[test]
+    fn a_held_escape_acts_once() {
+        let esc = |repeat: bool| {
+            iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                key: Key::Named(iced::keyboard::key::Named::Escape),
+                modified_key: Key::Named(iced::keyboard::key::Named::Escape),
+                physical_key: iced::keyboard::key::Physical::Unidentified(
+                    iced::keyboard::key::NativeCode::Unidentified,
+                ),
+                location: iced::keyboard::Location::Standard,
+                modifiers: Modifiers::empty(),
+                text: None,
+                repeat,
+            })
+        };
+        assert!(matches!(
+            event_message(&esc(false), false),
+            Some(Message::Shortcut {
+                shortcut: Shortcut::Escape,
+                ..
+            })
+        ));
+        assert!(event_message(&esc(true), false).is_none());
+        assert!(event_message(&esc(true), true).is_none());
     }
 
     #[test]

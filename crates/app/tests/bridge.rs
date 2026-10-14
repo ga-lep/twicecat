@@ -327,6 +327,26 @@ fn typing_markdown_and_pressing_enter_shows_a_bold_message_in_the_timeline() {
         );
         next(&mut app, Duration::from_secs(5));
     }
+    // A new device of an account with an identity gets the screen that asks
+    // to confirm it, once the security status arrives, and Enter sends
+    // nothing under it. Wait for the status, then skip the screen.
+    let limit = deadline(60);
+    while app.security.status.device == twicecat_core::api::DeviceVerification::Unknown {
+        assert!(
+            std::time::Instant::now() < limit,
+            "no security status within 60 s"
+        );
+        next(&mut app, Duration::from_secs(5));
+    }
+    if app.security.visible()
+        == twicecat_app::security::Visible::Overlay(
+            twicecat_app::security::Overlay::ConfirmIdentity,
+        )
+    {
+        let _ = app.update(Message::Security(
+            twicecat_app::security::SecurityMessage::SkipIdentity,
+        ));
+    }
 
     // Select a room, type markdown and press Enter, all through `update`.
     let room = app.rooms[0].id.clone();
@@ -340,7 +360,12 @@ fn typing_markdown_and_pressing_enter_shows_a_bold_message_in_the_timeline() {
         .message()
         .expect("Enter sends when no suggestion list is open");
     let _ = app.update(message);
-    assert_eq!(app.composer.text(), "", "the composer resets after sending");
+    assert_eq!(
+        app.composer.text(),
+        "",
+        "the composer resets after sending (security: {:?})",
+        app.security.visible()
+    );
 
     let limit = deadline(30);
     while !timeline_has_bold_message(&app, "hi") {
@@ -478,6 +503,11 @@ fn carol_resets_her_identity_sets_up_recovery_and_logs_out() {
     assert_eq!(app.security.notice, None, "the recovery setup failed");
     let _ = app.update(Message::Security(SecurityMessage::Done));
     assert_eq!(app.security.visible(), Visible::Key, "refused until ticked");
+    // A key that was never shown cannot be ticked as saved.
+    let _ = app.update(Message::Security(SecurityMessage::SavedToggled(true)));
+    let _ = app.update(Message::Security(SecurityMessage::Done));
+    assert_eq!(app.security.visible(), Visible::Key, "refused until shown");
+    let _ = app.update(Message::Security(SecurityMessage::RevealToggled(true)));
     let _ = app.update(Message::Security(SecurityMessage::SavedToggled(true)));
     let _ = app.update(Message::Security(SecurityMessage::Done));
     assert!(app.security.setup.is_none());

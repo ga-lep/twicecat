@@ -3,6 +3,7 @@
 //! Pure: only `App`'s handlers in this file send commands.
 
 use std::fmt;
+use std::time::Duration;
 
 use iced::Task;
 use iced::widget::image::Handle;
@@ -25,6 +26,12 @@ pub const MAX_PEER_NAME_CHARS: usize = 64;
 pub const MAX_PEER_USER_ID_CHARS: usize = 255;
 /// How many characters an emoji description or symbol may show.
 const MAX_SAS_CHARS: usize = 32;
+
+/// How long a card that just asked something ignores the buttons that agree
+/// (**Accept**, **Yes**, **They match**): a click already on its way when the
+/// card came up was meant for what was under it. Buttons that refuse
+/// (**Decline**, **Cancel**, **They don't match**) never wait.
+pub const ARMING: Duration = Duration::from_millis(600);
 
 /// `text` cleaned to one line and, when longer than `max_chars`, cut in the
 /// middle (an ellipsis between the start and the end). The end stays visible:
@@ -125,6 +132,18 @@ impl Phase {
     fn needs_qr(&self) -> bool {
         matches!(self, Self::ShowQr | Self::QrScanned)
     }
+
+    /// The phases whose agreeing button waits for [`ARMING`]: the ones where
+    /// one click grants trust or starts a flow another person asked for.
+    pub fn needs_arming(&self) -> bool {
+        matches!(
+            self,
+            Self::Requested { incoming: true }
+                | Self::QrScanned
+                | Self::Emojis(_)
+                | Self::Decimals(_)
+        )
+    }
 }
 
 /// What the user asked for in the current phase, so a double click sends
@@ -156,6 +175,9 @@ pub struct VerificationModel {
     pub phase: Phase,
     qr: Option<Handle>,
     pub(crate) sent: Option<Sent>,
+    /// The wait of the buttons that agree, while it runs: tells its timer
+    /// from an earlier one's. View state only; nothing of it is sent.
+    waiting: Option<u64>,
     /// A request that came while this finished card was open; it is shown
     /// after **Close** (a click meant for Close must not land on **Accept**).
     queued: Option<Box<VerificationModel>>,
@@ -185,8 +207,20 @@ impl VerificationModel {
             phase: Phase::Requested { incoming: false },
             qr: None,
             sent: None,
+            waiting: None,
             queued: None,
         }
+    }
+
+    /// Whether the buttons that agree work: the wait after the card (or its
+    /// phase) came up is over.
+    pub fn armed(&self) -> bool {
+        self.waiting.is_none()
+    }
+
+    /// The sequence of the wait now running, if one runs.
+    pub fn arming_seq(&self) -> Option<u64> {
+        self.waiting
     }
 
     /// The flow is over (**Close** is all that is left).
@@ -234,7 +268,18 @@ impl VerificationModel {
             self.qr = None;
         }
         self.sent = None;
+        // A new phase never inherits the wait of the one before.
+        self.waiting = None;
         true
+    }
+
+    /// The flow `id` (this one or the one queued behind it).
+    fn flow_mut(&mut self, id: &VerificationId) -> Option<&mut VerificationModel> {
+        if self.id == *id {
+            Some(self)
+        } else {
+            self.queued.as_deref_mut().filter(|q| q.id == *id)
+        }
     }
 }
 
@@ -266,6 +311,8 @@ pub enum VerificationMessage {
     NoMatch,
     /// **Close** a finished flow.
     Close,
+    /// The wait of the card (its sequence) ended. View state only.
+    Armed(u64),
 }
 
 impl App {
@@ -295,10 +342,33 @@ impl App {
         id: &VerificationId,
         phase: VerificationPhase,
     ) -> Task<Message> {
-        if let Some(model) = &mut self.verification {
-            model.on_phase(id, phase);
+        let applied = self
+            .verification
+            .as_mut()
+            .is_some_and(|model| model.on_phase(id, phase));
+        if applied {
+            return self.start_arming(id);
         }
         Task::none()
+    }
+
+    /// Starts the wait of flow `id` when its phase asks for one.
+    fn start_arming(&mut self, id: &VerificationId) -> Task<Message> {
+        let counter = self.verify_arm_counter.wrapping_add(1);
+        let Some(model) = self
+            .verification
+            .as_mut()
+            .and_then(|shown| shown.flow_mut(id))
+            .filter(|model| model.phase.needs_arming())
+        else {
+            return Task::none();
+        };
+        model.waiting = Some(counter);
+        self.verify_arm_counter = counter;
+        self.timer(
+            ARMING,
+            Message::Verification(VerificationMessage::Armed(counter)),
+        )
     }
 
     /// A verification command failed. The core ends a broken flow with a
@@ -326,11 +396,32 @@ impl App {
         let Some(model) = self.verification.as_mut() else {
             return Task::none();
         };
+        if let M::Armed(seq) = message {
+            // The wait of this card, or of the request queued behind it.
+            if model.waiting == Some(seq) {
+                model.waiting = None;
+            }
+            if let Some(queued) = model.queued.as_deref_mut()
+                && queued.waiting == Some(seq)
+            {
+                queued.waiting = None;
+            }
+            return Task::none();
+        }
         if message == M::Close {
             if model.is_over() {
-                // The queued request shows next, unless it already ended.
+                // The queued request shows next, unless it already ended; its
+                // buttons wait again, so a click meant for Close cannot land
+                // on its Accept.
                 self.verification = model.queued.take().filter(|q| !q.is_over()).map(|q| *q);
+                if let Some(next) = self.verification.as_ref().map(|m| m.id.clone()) {
+                    return self.start_arming(&next);
+                }
             }
+            return Task::none();
+        }
+        // The buttons that agree wait for the card to settle.
+        if matches!(message, M::Accept | M::QrConfirmed | M::Match) && !model.armed() {
             return Task::none();
         }
         let id = model.id.clone();
