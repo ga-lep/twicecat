@@ -1,7 +1,11 @@
 # Accessibility
 
-What Twicecat does for keyboard use, contrast and assistive technology in
-Phase 5, and what it does not do yet. Checked against iced 0.14.0 (pinned).
+What Twicecat does for keyboard use, contrast, zoom and assistive technology
+after the UI/UX rework, and what it does not do yet. Checked against iced
+0.14.0 (pinned). The sections are: the keyboard map, Settings and Sessions,
+Calls, Screen readers, Drag and drop on Wayland, Colour sets and contrast,
+Zoom, Icons and tooltips, Narrow windows, How calls show state, Room dialogs,
+and the Known limits of iced 0.14.
 
 ## Keyboard map
 
@@ -38,18 +42,28 @@ Rules the code follows (all in tests):
   is open. The order is the widget tree's order; overlays are layers in a
   fixed stack of two, so opening one never reshuffles the base.
 - Esc closes one layer per press, topmost first, in the order the layers are
-  drawn (a test opens several and checks that each press closes the one on
-  top): the incoming-call card
-  (hidden, and its ringtone silenced; the room keeps ringing), the switcher,
-  the upload
-  confirmation, the viewer, the Voice & audio card, Settings, the logout
-  warning, the Sessions card
-  (its password prompt or sign-out question first), a room dialog, the user
-  card, the room settings (a question about leaving or encryption first) or
-  the member list, then the
-  composer's suggestions or reply/edit, then the thread panel, then the
-  participants panel of a call. A text field
-  that took the Esc to drop its focus does not keep an overlay open.
+  drawn (tests open several and check that each press closes the one on top):
+  1. the incoming-call card (hidden, and its ringtone silenced; the room keeps
+     ringing);
+  2. the verification card (it only cancels or closes, never confirms);
+  3. the switcher;
+  4. the upload confirmation;
+  5. the viewer;
+  6. the Voice & audio card;
+  7. Settings;
+  8. a room dialog, the user card, the room settings (a question about leaving
+     or encryption first) or the member list;
+  9. a security screen (recovery setup, a question about changing the key or
+     resetting the identity);
+  10. the logout warning, then the Sessions card's password prompt, its
+      sign-out question, a rename in progress, then the card itself;
+  11. the composer's suggestions, then its reply or edit mode;
+  12. the thread panel, then the participants panel of a call (the one on
+      screen first when the window is too narrow for both).
+
+  A text field that took the Esc to drop its focus does not keep an overlay
+  open. Esc never confirms anything. Held-down Esc repeats do not decline a
+  queued verification request.
 - Closing the switcher with Esc gives the focus back to the composer.
 - Ctrl+K and the room-stepping keys do nothing while another overlay covers
   the main view.
@@ -57,9 +71,10 @@ Rules the code follows (all in tests):
   the **Room list** setting, so it is saved. The rail keeps every room-list
   key: Alt+Down / Alt+Up and Ctrl+Shift+Down / Ctrl+Shift+Up step through the
   same list, and the open room stays marked by a fill and a 3 px bar. Its
-  avatars are buttons in the same Tab order as the rows; each has a tooltip
-  with the room's name and what the dots mean (unread, mentions, in a call,
-  ringing, muted), and a dot is never the only sign, since the tooltip words
+  avatars are reached by the pointer and by those room-stepping keys and the
+  Ctrl+K switcher; Tab does not visit them, since iced 0.14 buttons take no
+  keyboard focus. Each has a tooltip with the room's name and what the dots
+  mean (unread, mentions, in a call, ringing, muted), and a dot is never the only sign, since the tooltip words
   say the same. In the rail the search field is a **Search** button that
   expands the list, and the call dock is a column of icon buttons (the call's
   room, mute, deafen, leave), each with its words in a tooltip, and visible
@@ -75,6 +90,13 @@ Rules the code follows (all in tests):
   While a panel fills the window its header repeats the trust tag of a direct
   message, and the room header stacks its buttons under the name in a narrow
   pane so nothing is cut off.
+- The ring chords Ctrl+Shift+A and Ctrl+Shift+X do nothing while a focused
+  text field captures the keys: a text field takes Ctrl+Shift+A and
+  Ctrl+Shift+X itself (select all, cut), so move the focus out of the field
+  (click elsewhere or press Esc in it) first. The composer forwards them when
+  it has the focus; other fields (the display name, search, the server field)
+  do not. They also do nothing when no card is showing, during the first
+  0.6 s of a card, and when the key is still held from the previous ring.
 - Ctrl+Shift+M and Ctrl+Shift+D act only during a call, also over a dialog
   (the call goes on behind it); without a call they do nothing.
 - While the Voice & audio card waits for a push-to-talk key (**Set key…**),
@@ -194,7 +216,7 @@ iced 0.14 / winit stack delivers no file-drop events there (works on X11 and
 XWayland). Use **Attach...** or Ctrl+U, or paste with Ctrl+V. Settings shows
 the same note under the shortcut list.
 
-## Colour sets, High contrast and zoom
+## Colour sets and contrast
 
 - There are four colour sets ("families"): Twicecat, Frost, Ember and High
   contrast, each with a light and a dark palette (`theme::Family`). Settings,
@@ -204,26 +226,125 @@ the same note under the shortcut list.
   (the swatch marked "(default)"). People who never picked a set see Frost,
   including existing users after upgrading from a version whose default was
   Twicecat; anyone who picked a set, Twicecat included, keeps it.
-- All eight palettes are tested for a contrast of at least 4.5:1 (WCAG AA for
-  body text) for text on background, muted text, badge and highlight text,
+- Text: all eight palettes are tested for a contrast of at least **4.5:1**
+  (WCAG AA) for text on background, muted text, badge and highlight text,
   text on selection, message highlight, hover, surface, raised surface and
   sidebar, the error text on its soft background, and the primary and focus
-  colours on the background.
+  colours on the background. The tightest pair per palette, as the test
+  computes them:
+
+  | Family | Light | Dark |
+  |--------|-------|------|
+  | Twicecat | 4.67:1 (error text on its soft background) | 4.87:1 (muted text on a highlighted message) |
+  | Frost (default) | 4.69:1 (muted text on the sidebar) | 5.22:1 (muted text on a highlighted message) |
+  | Ember | 4.68:1 (muted text on the sidebar) | 4.64:1 (muted text on a highlighted message) |
+  | High contrast | 7.70:1 (muted text on the sidebar) | 7.07:1 (error text on its soft background) |
+
 - **High contrast** (black on white, white on black, saturated accents) is
-  tested for 7:1 (WCAG AAA) on all of those pairs. Choose it in Settings,
+  tested for **7:1** (WCAG AAA) on all of those pairs. Choose it in Settings,
   Appearance, Colours, with Light or Dark mode.
-- The ring around a person who is talking (`speaking`) reaches 3:1 against the
-  background in all eight palettes (WCAG 1.4.11, non-text contrast).
+- Non-text: the ring around a person who is talking (`speaking`) reaches
+  **3:1** against the background in all eight palettes (WCAG 1.4.11). The
+  tested values are 5.08 (Twicecat light), 6.49 (Twicecat dark), 5.04 (Frost
+  light), 9.57 (Frost dark), 5.02 (Ember light), 8.39 (Ember dark), 7.44
+  (High contrast light) and 16.04 (High contrast dark). Panel borders only
+  have to differ from the background; the words and marks next to them carry
+  the meaning.
 - Sender names take a colour derived from the user ID and are lightened or
   darkened until they reach 4.5:1 on the current background, in all eight.
-- **Zoom** scales the whole window from 80 % to 200 % in steps of 10 %:
-  Ctrl+= makes it larger, Ctrl+- smaller and Ctrl+0 resets to 100 % (Cmd on
-  macOS). Settings, Appearance has the same as **Smaller**, **Larger** and
-  **Reset** buttons. The keys are ignored while the Voice & audio card waits
-  for a push-to-talk key. The choice is kept on this device.
 - Not tested by code (on the human checklist): that the keyboard focus is
   visible on every control in both themes, since it depends on iced's widget
-  styles.
+  styles, and how each set looks in a real window.
+
+## Zoom
+
+**Zoom** scales the whole window from 80 % to 200 % in steps of 10 %: Ctrl+=
+makes it larger, Ctrl+- smaller and Ctrl+0 resets to 100 % (Cmd on macOS).
+Settings, Appearance has the same as **Smaller**, **Larger** and **Reset**
+buttons. The keys are ignored while the Voice & audio card waits for a
+push-to-talk key. The choice is kept on this device (`text_scale_percent` in
+the local settings, read back clamped to 80-200). Ctrl+Shift+= and the numpad
+plus are not bound.
+
+## Icons and tooltips
+
+Icons are Unicode glyphs today. Every icon-only button is an
+`ui::kit::icon_button` and always has a tooltip with words (`Icon::label`):
+Reply, Edit, React, Copy, Thread, Delete, Attach, Emoji, Send, Mute, Deafen,
+Leave and so on. A glyph never stands alone: where the meaning matters the
+words are drawn too (the call dock, tags, banners). All glyphs are defined in
+one module, `crates/app/src/ui/icons.rs`: `Icon::glyph` gives the text and
+`icons::icon` is the single place that turns an `Icon` into a widget. A test
+fails when any other source file writes a pictograph or arrow symbol outside
+comments and tests. A later move to SVG or an icon font therefore changes
+`icons.rs` only (the `glyph` text becomes an image handle or a font code
+point, and `icon` draws that); no screen and no tooltip changes. The glyphs
+rely on the system's fallback fonts for emoji and symbols (Inter has none of
+them); how they look on each OS is on the human checkpoint.
+
+## Narrow windows
+
+The layout follows the window width (`crates/app/src/layout.rs`):
+
+- 1100 px and wider: spaces sidebar, room list (expanded or the rail, as saved
+  with Ctrl+B), room pane and the thread or participants panel side by side.
+- 800 to 1100 px: while a thread or the participants panel is open the room
+  list is drawn as the rail so the room pane keeps its width.
+- Under 800 px: the spaces sidebar is not shown, the list is the rail, and an
+  open panel takes the room pane's place (only one panel, the one opened last;
+  Esc closes the one on screen first and returns to the room). The room pane
+  takes no keys while it is hidden, so typing does nothing there.
+- The room header stacks its buttons under the name in a narrow pane so
+  nothing is cut off; a panel that fills the window repeats the trust tag of a
+  direct message.
+- The saved room list choice is never changed by the width, and the composer
+  keeps its focus through narrowing and widening.
+- Known: a resize that changes which list is shown does not keep the room at
+  the top, and the spaces sidebar is hidden under 800 px with no sign when a
+  space filter is active.
+
+## How calls show state
+
+State is never colour alone:
+
+- Phase: the call dock says it in words ("Connecting", "Voice connected,
+  encrypted", "Reconnecting", "Not encrypted") next to a glyph and a dot
+  colour. In the rail the same words are in a tooltip, and the phase glyph and
+  the lock are always visible.
+- Encryption: the lock glyph (encrypted) or the open lock with the words
+  "Not encrypted" when media is not encrypted.
+- Declined: who declined is written in words in the dock and in the rail (a
+  mark plus the words in its tooltip).
+- Microphone: an open microphone is the microphone glyph; muted or deafened is
+  the crossed microphone and takes precedence; push-to-talk or toggle-to-talk
+  that is not transmitting is the key (or gamepad) glyph on an outlined fill;
+  transmitting is the microphone on the accent fill. The pill says "Talking" or
+  "Not talking: hold F13". Tooltips say Mute / Unmute, Deafen / Undeafen.
+- People: speaking is a ring and the word "Speaking"; muted is a mark and the
+  word "Muted".
+- A ringing call: the ring card with words, the room's call pill, a window
+  attention request and a desktop notification. While the card is arming
+  (about 0.6 s) its buttons are off and the line reads "Answer in a moment…",
+  which also guards against a stray click. The verification buttons (Accept,
+  Yes, They match) arm the same way.
+- Call notices (failures) are a red banner with words; their close button is
+  separate and clicking the words does nothing.
+
+## Known limits of iced 0.14
+
+- Buttons, checkboxes, radio buttons, menus and sliders do not take the
+  keyboard focus, so **Tab visits text fields only**; everything else needs
+  the pointer. The keys that matter most are chords (ring accept and decline,
+  mute, deafen, the switcher) for that reason, and no key presses a button, so
+  Enter cannot confirm a destructive action.
+- A slider answers the arrow keys only while the pointer is over it; **−** and
+  **+** sit beside every slider.
+- No accessibility tree (see Screen readers above).
+- No file-drop events on native Wayland (see Drag and drop on Wayland).
+- A focused text field takes Ctrl+Shift+A and Ctrl+Shift+X (see the keyboard
+  map).
+- The headless gallery renders with tiny-skia and shows no menus or tooltips;
+  the real window uses wgpu. Look in a real window.
 
 ## Room dialogs, members, upload, viewer and switcher
 
