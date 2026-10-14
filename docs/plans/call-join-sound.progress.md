@@ -1,1 +1,4 @@
-Task 1: started
+Task 1: complete (c694875..6d9f68a, gate ok, security PASS (2 Low: NaN while deafened, cue volume >100 - both fixed in-task, not re-audited: small delta + tests + mutation checks), review PASS, evidence PROVEN)
+  evidence: docs/plans/call-join-sound.evidence/task-1.md
+  notes: play_cue + one-shot cue in VoiceEngine::process: playback = ((deafened ? cue : mix + cue) * master).clamp(-1,1), non-finite -> 0; cue in the echo canceller reference, never in Outgoing; volume capped 100%. 8 cue tests red-first on assertions (stub), +2 for the review fixes; 4 mutations fail intended tests (note: the finite guard, not the deafened-input choice, is what the NaN test pins). No allocation counter exists: audio-thread allocation-freedom checked by reading the code. scripts/check-no-webrtc-download.sh must be run with bash. Hearing the cue = human.
+Task 2: started
