@@ -2259,23 +2259,78 @@ fn stopped() -> App {
 
 // ---- Verification ----------------------------------------------------------
 
-fn verification(phase: VerificationPhase) -> App {
+/// A flow with `peer` in `phase`. The wait of the buttons that agree is
+/// still running (a card that has just come up).
+fn flow(peer: VerificationPeer, phase: VerificationPhase) -> App {
     let mut app = main_room();
     let id = VerificationId::from("verification-1");
     feed(
         &mut app,
         CoreEvent::VerificationRequested {
             id: id.clone(),
-            peer: VerificationPeer {
-                user_id: user("alice"),
-                device_id: Some(DeviceId::from("PHONE1")),
-                device_name: Some("Alice's phone".to_owned()),
-                own_account: false,
-            },
+            peer,
         },
     );
     feed(&mut app, CoreEvent::Verification { id, phase });
     app
+}
+
+fn alice() -> VerificationPeer {
+    VerificationPeer {
+        user_id: user("alice"),
+        device_id: Some(DeviceId::from("PHONE1")),
+        device_name: Some("Alice's phone".to_owned()),
+        own_account: false,
+    }
+}
+
+/// The wait is over: the buttons that agree work.
+fn armed(mut app: App) -> App {
+    if let Some(seq) = app.verification.as_ref().and_then(|m| m.arming_seq()) {
+        press(
+            &mut app,
+            Message::Verification(twicecat_app::verification::VerificationMessage::Armed(seq)),
+        );
+    }
+    app
+}
+
+fn verification(phase: VerificationPhase) -> App {
+    armed(flow(alice(), phase))
+}
+
+/// The same card in the first instant, while the buttons that agree wait.
+fn arming(phase: VerificationPhase) -> App {
+    flow(alice(), phase)
+}
+
+fn own_session(phase: VerificationPhase) -> App {
+    armed(flow(
+        VerificationPeer {
+            user_id: user("me"),
+            device_id: Some(DeviceId::from("LAPTOP2")),
+            device_name: Some("Work laptop".to_owned()),
+            own_account: true,
+        },
+        phase,
+    ))
+}
+
+/// A peer whose name and ID are long and hostile-looking.
+fn long_peer(phase: VerificationPhase) -> App {
+    let long = format!(
+        "@{}:a-very-long-homeserver-name.example.org",
+        "very-long-localpart-".repeat(6)
+    );
+    armed(flow(
+        VerificationPeer {
+            user_id: UserId::from(long.as_str()),
+            device_id: None,
+            device_name: None,
+            own_account: false,
+        },
+        phase,
+    ))
 }
 
 fn emojis() -> Box<[SasEmoji; 7]> {
@@ -2338,10 +2393,48 @@ fn verification_cancelled() -> App {
         reason: CancelReason::Mismatch,
     })
 }
+fn verification_cancelled_by_us() -> App {
+    verification(VerificationPhase::Cancelled {
+        reason: CancelReason::ByUs,
+    })
+}
+fn verification_cancelled_timeout() -> App {
+    verification(VerificationPhase::Cancelled {
+        reason: CancelReason::Timeout,
+    })
+}
+fn verification_requested_arming() -> App {
+    arming(VerificationPhase::Requested { incoming: true })
+}
+fn verification_scanned_arming() -> App {
+    arming(VerificationPhase::QrScanned)
+}
+fn verification_emojis_arming() -> App {
+    arming(VerificationPhase::Emojis(emojis()))
+}
+fn verification_decimals_arming() -> App {
+    arming(VerificationPhase::Decimals([1234, 5678, 9012]))
+}
+fn verification_own_requested() -> App {
+    own_session(VerificationPhase::Requested { incoming: true })
+}
+fn verification_own_emojis() -> App {
+    own_session(VerificationPhase::Emojis(emojis()))
+}
+fn verification_own_done() -> App {
+    own_session(VerificationPhase::Done)
+}
+fn verification_long_requested() -> App {
+    long_peer(VerificationPhase::Requested { incoming: true })
+}
+fn verification_long_emojis() -> App {
+    long_peer(VerificationPhase::Emojis(emojis()))
+}
 
 // ---- Recovery and banners --------------------------------------------------
 
-const DUMMY_KEY: &str = "GALL ERYO NLYX NOTA REAL KEYX 0000 1111 2222 3333 4444 5555";
+/// Not a key: it spells out that it is a stand-in.
+pub const DUMMY_KEY: &str = "DUMM YKEY DUMM YKEY DUMM YKEY 0000 0000 0000 0000 0000 0000";
 
 fn status(device: DeviceVerification, recovery: RecoveryStatus) -> SecurityStatus {
     SecurityStatus {
@@ -2377,6 +2470,12 @@ pub fn banner_off(app: &mut App) {
 fn banner_device() -> App {
     let mut app = main_room();
     banner_on(&mut app);
+    // The banner alone: the Confirm-your-identity screen that a fresh login
+    // opens over it is skipped.
+    press(
+        &mut app,
+        Message::Security(twicecat_app::security::SecurityMessage::SkipIdentity),
+    );
     app
 }
 
@@ -2406,7 +2505,10 @@ fn banner_recovery_incomplete() -> App {
 
 fn banner_notice() -> App {
     let mut app = main_room();
-    app.security.notice = Some("Recovery is set up. Keep your key somewhere safe.".to_owned());
+    app.security.notice = Some(
+        "Could not reach the server to set up recovery. Check your connection and try again."
+            .to_owned(),
+    );
     app
 }
 
@@ -2423,6 +2525,105 @@ fn recovery_working() -> App {
 fn recovery_key() -> App {
     let mut app = banner_recovery_off();
     app.security.setup = Some(RecoverySetup::new(RecoveryKey::from(DUMMY_KEY), false));
+    app
+}
+
+fn recovery_key_shown() -> App {
+    let mut app = recovery_key();
+    press(
+        &mut app,
+        Message::Security(twicecat_app::security::SecurityMessage::RevealToggled(true)),
+    );
+    app
+}
+
+fn recovery_key_saved() -> App {
+    let mut app = recovery_key_shown();
+    press(
+        &mut app,
+        Message::Security(twicecat_app::security::SecurityMessage::SavedToggled(true)),
+    );
+    app
+}
+
+fn recovery_key_replacing() -> App {
+    let mut app = banner_recovery_off();
+    app.security.setup = Some(RecoverySetup::new(RecoveryKey::from(DUMMY_KEY), true));
+    app
+}
+
+fn recovery_change_key() -> App {
+    let mut app = banner_recovery_off();
+    feed(
+        &mut app,
+        CoreEvent::Security(status(
+            DeviceVerification::Verified,
+            RecoveryStatus::Enabled,
+        )),
+    );
+    app.security.overlay = Some(Overlay::ChangeKeyConfirm);
+    app
+}
+
+fn recovery_change_key_working() -> App {
+    let mut app = recovery_change_key();
+    app.security.busy = Some(twicecat_app::security::Busy::ChangingKey);
+    app
+}
+
+fn recovery_restore_working() -> App {
+    let mut app = recovery_restore();
+    app.security.busy = Some(twicecat_app::security::Busy::Restoring);
+    app
+}
+
+fn recovery_restore_failed() -> App {
+    let mut app = recovery_restore();
+    app.security.notice = Some("That recovery key was not accepted.".to_owned());
+    app
+}
+
+fn recovery_reset_working() -> App {
+    let mut app = recovery_reset_confirm();
+    app.security.busy = Some(twicecat_app::security::Busy::Resetting);
+    app
+}
+
+fn recovery_reset_approval() -> App {
+    let mut app = recovery_reset_working();
+    app.security.waiting_approval = true;
+    app
+}
+
+fn recovery_identity_working() -> App {
+    let mut app = recovery_confirm_identity();
+    app.security.busy = Some(twicecat_app::security::Busy::Restoring);
+    app
+}
+
+fn recovery_identity_asked() -> App {
+    let mut app = recovery_confirm_identity();
+    app.security.asked_other_device = true;
+    app
+}
+
+fn recovery_identity_no_devices() -> App {
+    let mut app = recovery_confirm_identity();
+    app.security.status.has_devices_to_verify_against = false;
+    app
+}
+
+fn recovery_reauth_waiting() -> App {
+    let mut app = recovery_reauth();
+    if let Some(prompt) = app.security.reauth.as_mut() {
+        prompt.waiting = true;
+    }
+    app
+}
+
+fn recovery_reauth_failed() -> App {
+    let mut app = recovery_reauth();
+    app.security.notice = Some("That password was not accepted.".to_owned());
     app
 }
 
@@ -2934,6 +3135,91 @@ pub fn scenarios() -> Vec<Scenario> {
             verification_cancelled,
             |a| verification_phase_is(a, |p| matches!(p, Phase::Cancelled(_))),
         ),
+        s(
+            "verification-requested-arming",
+            false,
+            verification_requested_arming,
+            |a| a.verification.as_ref().is_some_and(|m| !m.armed()),
+        ),
+        s(
+            "verification-scanned-arming",
+            false,
+            verification_scanned_arming,
+            |a| {
+                verification_phase_is(a, |p| matches!(p, Phase::QrScanned))
+                    && a.verification.as_ref().is_some_and(|m| !m.armed())
+            },
+        ),
+        s(
+            "verification-emojis-arming",
+            false,
+            verification_emojis_arming,
+            |a| {
+                verification_phase_is(a, |p| matches!(p, Phase::Emojis(_)))
+                    && a.verification.as_ref().is_some_and(|m| !m.armed())
+            },
+        ),
+        s(
+            "verification-decimals-arming",
+            false,
+            verification_decimals_arming,
+            |a| {
+                verification_phase_is(a, |p| matches!(p, Phase::Decimals(_)))
+                    && a.verification.as_ref().is_some_and(|m| !m.armed())
+            },
+        ),
+        s(
+            "verification-cancelled-us",
+            false,
+            verification_cancelled_by_us,
+            |a| verification_phase_is(a, |p| matches!(p, Phase::Cancelled(_))),
+        ),
+        s(
+            "verification-cancelled-timeout",
+            false,
+            verification_cancelled_timeout,
+            |a| verification_phase_is(a, |p| matches!(p, Phase::Cancelled(_))),
+        ),
+        s(
+            "verification-own-requested",
+            false,
+            verification_own_requested,
+            |a| a.verification.as_ref().is_some_and(|m| m.own_account),
+        ),
+        s(
+            "verification-own-emojis",
+            false,
+            verification_own_emojis,
+            |a| {
+                a.verification.as_ref().is_some_and(|m| m.own_account)
+                    && verification_phase_is(a, |p| matches!(p, Phase::Emojis(_)))
+            },
+        ),
+        s("verification-own-done", false, verification_own_done, |a| {
+            a.verification.as_ref().is_some_and(|m| m.own_account)
+                && verification_phase_is(a, |p| matches!(p, Phase::Done))
+        }),
+        s(
+            "verification-long-requested",
+            false,
+            verification_long_requested,
+            |a| {
+                a.verification
+                    .as_ref()
+                    .is_some_and(|m| m.user_id.len() > 100)
+            },
+        ),
+        s(
+            "verification-long-emojis",
+            false,
+            verification_long_emojis,
+            |a| {
+                a.verification
+                    .as_ref()
+                    .is_some_and(|m| m.user_id.len() > 100)
+                    && verification_phase_is(a, |p| matches!(p, Phase::Emojis(_)))
+            },
+        ),
         s("banner-device", true, banner_device, |a| {
             a.security.banner() == Some(twicecat_app::security::Banner::DeviceUnverified)
         }),
@@ -2955,6 +3241,87 @@ pub fn scenarios() -> Vec<Scenario> {
         s("recovery-key", false, recovery_key, |a| {
             a.security.setup.is_some()
         }),
+        s("recovery-key-shown", false, recovery_key_shown, |a| {
+            a.security.setup.as_ref().is_some_and(|k| k.revealed)
+        }),
+        s("recovery-key-saved", false, recovery_key_saved, |a| {
+            a.security
+                .setup
+                .as_ref()
+                .is_some_and(|k| k.revealed && k.saved_ticked)
+        }),
+        s(
+            "recovery-key-replacing",
+            false,
+            recovery_key_replacing,
+            |a| a.security.setup.as_ref().is_some_and(|k| k.replaces_old),
+        ),
+        s("recovery-change-key", false, recovery_change_key, |a| {
+            a.security.overlay == Some(Overlay::ChangeKeyConfirm) && a.security.busy.is_none()
+        }),
+        s(
+            "recovery-change-key-working",
+            false,
+            recovery_change_key_working,
+            |a| a.security.busy == Some(twicecat_app::security::Busy::ChangingKey),
+        ),
+        s(
+            "recovery-restore-working",
+            false,
+            recovery_restore_working,
+            |a| a.security.busy == Some(twicecat_app::security::Busy::Restoring),
+        ),
+        s(
+            "recovery-restore-failed",
+            false,
+            recovery_restore_failed,
+            |a| a.security.notice.is_some() && a.security.overlay == Some(Overlay::Restore),
+        ),
+        s(
+            "recovery-reset-working",
+            false,
+            recovery_reset_working,
+            |a| a.security.busy == Some(twicecat_app::security::Busy::Resetting),
+        ),
+        s(
+            "recovery-reset-approval",
+            false,
+            recovery_reset_approval,
+            |a| a.security.waiting_approval,
+        ),
+        s(
+            "recovery-identity-working",
+            false,
+            recovery_identity_working,
+            |a| {
+                a.security.overlay == Some(Overlay::ConfirmIdentity)
+                    && a.security.busy == Some(twicecat_app::security::Busy::Restoring)
+            },
+        ),
+        s(
+            "recovery-identity-asked",
+            false,
+            recovery_identity_asked,
+            |a| a.security.asked_other_device,
+        ),
+        s(
+            "recovery-identity-no-devices",
+            false,
+            recovery_identity_no_devices,
+            |a| !a.security.status.has_devices_to_verify_against,
+        ),
+        s(
+            "recovery-reauth-waiting",
+            false,
+            recovery_reauth_waiting,
+            |a| a.security.reauth.as_ref().is_some_and(|p| p.waiting),
+        ),
+        s(
+            "recovery-reauth-failed",
+            false,
+            recovery_reauth_failed,
+            |a| a.security.reauth.is_some() && a.security.notice.is_some(),
+        ),
         s("recovery-restore", false, recovery_restore, |a| {
             a.security.overlay == Some(Overlay::Restore)
         }),

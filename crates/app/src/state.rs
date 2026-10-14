@@ -596,6 +596,9 @@ pub struct App {
     pub exit_requested: bool,
     /// Clipboard reads sent by `drop_secrets` whose answer is still due.
     pub(crate) flushes_pending: u32,
+    /// Counts the waits of the verification card's agreeing buttons, so a
+    /// timer of an earlier wait (or flow) does nothing.
+    pub(crate) verify_arm_counter: u64,
     /// The core closed while the window was closing; exit waits for the
     /// pending clipboard flushes.
     pub(crate) core_closed: bool,
@@ -707,6 +710,7 @@ impl App {
             ptt: PttModel::default(),
             exit_requested: false,
             flushes_pending: 0,
+            verify_arm_counter: 0,
             core_closed: false,
         };
         let restore = app.send(Command::RestoreSession);
@@ -5001,6 +5005,34 @@ mod tests {
         app.update(Message::Security(message))
     }
 
+    #[test]
+    fn saved_cannot_be_ticked_until_the_key_was_shown_but_can_be_unticked() {
+        // The handler's guard, not only the view's missing press.
+        let (mut app, _rx) = main_app();
+        app.security.setup = Some(crate::security::RecoverySetup::new(
+            RecoveryKey::from("secret-key-x"),
+            false,
+        ));
+        let ready = |app: &App| {
+            app.security
+                .setup
+                .as_ref()
+                .is_some_and(crate::security::can_finish_setup)
+        };
+        let _ = sec(&mut app, SecurityMessage::SavedToggled(true));
+        assert!(!ready(&app), "a hidden key cannot be marked as saved");
+        let _ = sec(&mut app, SecurityMessage::Done);
+        assert!(app.security.setup.is_some(), "and Done does nothing");
+        let _ = sec(&mut app, SecurityMessage::RevealToggled(true));
+        let _ = sec(&mut app, SecurityMessage::SavedToggled(true));
+        assert!(ready(&app), "a shown key can");
+        // Hiding it again keeps the tick; unticking works whatever is shown.
+        let _ = sec(&mut app, SecurityMessage::RevealToggled(false));
+        assert!(ready(&app));
+        let _ = sec(&mut app, SecurityMessage::SavedToggled(false));
+        assert!(!ready(&app));
+    }
+
     fn status(device: DeviceVerification, recovery: RecoveryStatus) -> SecurityStatus {
         SecurityStatus {
             recovery,
@@ -5146,6 +5178,11 @@ mod tests {
         key_ready(&mut app, "secret-key-x");
         let _ = sec(&mut app, SecurityMessage::Done);
         assert_eq!(app.security.visible(), Visible::Key, "refused");
+        // The box is for a key that was shown.
+        let _ = sec(&mut app, SecurityMessage::SavedToggled(true));
+        let _ = sec(&mut app, SecurityMessage::Done);
+        assert_eq!(app.security.visible(), Visible::Key, "still refused");
+        let _ = sec(&mut app, SecurityMessage::RevealToggled(true));
         let _ = sec(&mut app, SecurityMessage::SavedToggled(true));
         let _ = sec(&mut app, SecurityMessage::Done);
         assert!(app.security.setup.is_none());
@@ -5163,6 +5200,7 @@ mod tests {
         // A timer of an older copy does nothing.
         assert_eq!(sec(&mut app, SecurityMessage::ClipboardDue(0)).units(), 0);
         // Done does not forget the copy: it is still checked.
+        let _ = sec(&mut app, SecurityMessage::RevealToggled(true));
         let _ = sec(&mut app, SecurityMessage::SavedToggled(true));
         let _ = sec(&mut app, SecurityMessage::Done);
         assert!(app.security.setup.is_none());
@@ -5623,6 +5661,18 @@ mod tests {
         let _ = app.update(core(CoreEvent::Verification { id: vid(), phase }));
     }
 
+    /// Ends the wait of the card now showing (what its timer does), so the
+    /// buttons that agree work. Panics when no wait runs.
+    fn varm(app: &mut App) {
+        let seq = app
+            .verification
+            .as_ref()
+            .and_then(|m| m.arming_seq())
+            .expect("the card is waiting");
+        let _ = vmsg(app, VM::Armed(seq));
+        assert!(app.verification.as_ref().expect("card").armed());
+    }
+
     fn vqr() -> QrImage {
         QrImage {
             size: 21,
@@ -5707,6 +5757,10 @@ mod tests {
         let shown = app.verification.as_ref().expect("queued request shown");
         assert_eq!(shown.id, flow2);
         assert_eq!(shown.phase.kind(), "requested");
+        // Promoted from the queue, its Accept waits again.
+        let _ = vmsg(&mut app, VM::Accept);
+        assert!(drain(&mut rx).is_empty(), "a click meant for Close");
+        varm(&mut app);
         let _ = vmsg(&mut app, VM::Accept);
         assert!(matches!(only(&mut rx), Command::AcceptVerification { id } if id == flow2));
     }
@@ -5734,6 +5788,7 @@ mod tests {
     fn accept_and_decline_send_one_command_each() {
         let (mut app, mut rx) = verifying(false);
         vphase(&mut app, VP::Requested { incoming: true });
+        varm(&mut app);
         let _ = vmsg(&mut app, VM::Accept);
         let _ = vmsg(&mut app, VM::Accept);
         assert!(matches!(only(&mut rx), Command::AcceptVerification { id } if id == vid()));
@@ -5759,6 +5814,7 @@ mod tests {
         let _ = vmsg(&mut app, VM::CompareEmoji);
         assert!(matches!(only(&mut rx), Command::StartSas { id } if id == vid()));
         vphase(&mut app, VP::QrScanned);
+        varm(&mut app);
         let _ = vmsg(&mut app, VM::QrConfirmed);
         let _ = vmsg(&mut app, VM::QrConfirmed);
         assert!(matches!(only(&mut rx), Command::ConfirmQrScanned { id } if id == vid()));
@@ -5770,6 +5826,7 @@ mod tests {
     fn the_emoji_buttons_send_confirm_and_mismatch() {
         let (mut app, mut rx) = verifying(true);
         vphase(&mut app, VP::Emojis(vemojis()));
+        varm(&mut app);
         let _ = vmsg(&mut app, VM::Match);
         let _ = vmsg(&mut app, VM::Match);
         assert!(matches!(only(&mut rx), Command::ConfirmSas { id } if id == vid()));
@@ -5778,6 +5835,40 @@ mod tests {
         let _ = vmsg(&mut app, VM::NoMatch);
         let _ = vmsg(&mut app, VM::NoMatch);
         assert!(matches!(only(&mut rx), Command::SasMismatch { id } if id == vid()));
+    }
+
+    #[test]
+    fn the_agreeing_buttons_wait_and_a_stale_timer_or_a_new_phase_never_arms_early() {
+        let (mut app, mut rx) = verifying(true);
+        vphase(&mut app, VP::Emojis(vemojis()));
+        let first = app
+            .verification
+            .as_ref()
+            .unwrap()
+            .arming_seq()
+            .expect("waits");
+        let _ = vmsg(&mut app, VM::Match);
+        assert!(drain(&mut rx).is_empty(), "Match waits for the card");
+        // The refusing buttons never wait.
+        let (mut other, mut orx) = verifying(true);
+        vphase(&mut other, VP::Emojis(vemojis()));
+        let _ = vmsg(&mut other, VM::NoMatch);
+        assert!(matches!(only(&mut orx), Command::SasMismatch { .. }));
+        // A new set of emoji starts a new wait; the old timer does nothing.
+        vphase(&mut app, VP::Decimals([1, 2, 3]));
+        let second = app
+            .verification
+            .as_ref()
+            .unwrap()
+            .arming_seq()
+            .expect("waits again");
+        assert_ne!(first, second);
+        let _ = vmsg(&mut app, VM::Armed(first));
+        let _ = vmsg(&mut app, VM::Match);
+        assert!(drain(&mut rx).is_empty(), "a stale timer armed it");
+        let _ = vmsg(&mut app, VM::Armed(second));
+        let _ = vmsg(&mut app, VM::Match);
+        assert!(matches!(only(&mut rx), Command::ConfirmSas { .. }));
     }
 
     #[test]
@@ -7261,6 +7352,7 @@ mod tests {
         assert_eq!(crate::security::key_title(setup), "Your new recovery key");
         let _ = sec(&mut app, SecurityMessage::Done);
         assert_eq!(app.security.visible(), Visible::Key, "Done needs the box");
+        let _ = sec(&mut app, SecurityMessage::RevealToggled(true));
         let _ = sec(&mut app, SecurityMessage::SavedToggled(true));
         let _ = sec(&mut app, SecurityMessage::Done);
         assert_eq!(app.security.visible(), Visible::Nothing);
@@ -12138,6 +12230,23 @@ mod tests {
         }
 
         #[test]
+        fn esc_acts_on_the_layer_drawn_on_top_a_room_dialog_over_a_security_screen() {
+            // view(): room dialogs are drawn over main_view's security layer.
+            let (mut app, _rx) = app4();
+            app.security.overlay = Some(Overlay::ResetConfirm);
+            let _ = app.update(Message::Rooms(R::OpenCreate));
+            let _ = key(&mut app, Shortcut::Escape);
+            assert!(!app.rooms_ui.overlay_open());
+            assert_eq!(
+                app.security.overlay,
+                Some(Overlay::ResetConfirm),
+                "the security screen under the dialog stays"
+            );
+            let _ = key(&mut app, Shortcut::Escape);
+            assert!(app.security.overlay.is_none());
+        }
+
+        #[test]
         fn esc_in_the_rename_field_cancels_the_rename_and_keeps_the_card() {
             let (mut app, mut rx) = sessions_over_app4();
             ses_msg(&mut app, SM::RenameStart(DeviceId::from("PHONE")));
@@ -12155,6 +12264,157 @@ mod tests {
             let (mut app, mut rx) = app4();
             assert_eq!(key(&mut app, Shortcut::Escape).units(), 0);
             assert!(drain(&mut rx).is_empty());
+        }
+
+        // ---- Esc over the verification card and the security screens ----
+
+        /// `app4` with a verification flow (own session) in `phase`.
+        fn verifying4(phase: VP) -> (App, mpsc::Receiver<Command>) {
+            let (mut app, mut rx) = app4();
+            let _ = app.update(core(CoreEvent::VerificationRequested {
+                id: vid(),
+                peer: vpeer(true),
+            }));
+            vphase(&mut app, phase);
+            let _ = drain(&mut rx);
+            (app, rx)
+        }
+
+        #[test]
+        fn esc_on_the_emoji_card_cancels_and_never_confirms_a_match() {
+            let (mut app, mut rx) = verifying4(VP::Emojis(vemojis()));
+            varm(&mut app);
+            let _ = key(&mut app, Shortcut::Escape);
+            let _ = key(&mut app, Shortcut::Escape);
+            let sent = drain(&mut rx);
+            assert!(
+                matches!(sent.as_slice(), [Command::CancelVerification { id }] if *id == vid()),
+                "{sent:?}"
+            );
+            // The core ends the flow; the next Esc closes the ended card.
+            vphase(
+                &mut app,
+                VP::Cancelled {
+                    reason: CancelReason::ByUs,
+                },
+            );
+            let _ = key(&mut app, Shortcut::Escape);
+            assert!(app.verification.is_none());
+            assert!(drain(&mut rx).is_empty());
+        }
+
+        #[test]
+        fn esc_on_the_other_cards_cancels_and_never_accepts_or_confirms() {
+            for phase in [
+                VP::Requested { incoming: true },
+                VP::QrScanned,
+                VP::Decimals([1, 2, 3]),
+                VP::Waiting,
+            ] {
+                let (mut app, mut rx) = verifying4(phase.clone());
+                if app.verification.as_ref().is_some_and(|m| !m.armed()) {
+                    varm(&mut app);
+                }
+                let _ = key(&mut app, Shortcut::Escape);
+                let sent = drain(&mut rx);
+                assert!(
+                    matches!(sent.as_slice(), [Command::CancelVerification { .. }]),
+                    "{phase:?}: {sent:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn esc_on_the_verification_card_closes_nothing_under_it() {
+            let (mut app, mut rx) = verifying4(VP::Emojis(vemojis()));
+            ses_msg(&mut app, SM::Open);
+            let _ = app.update(Message::Rooms(R::OpenCreate));
+            let _ = drain(&mut rx);
+            let _ = key(&mut app, Shortcut::Escape);
+            assert!(app.sessions.open, "the Sessions card stays");
+            assert!(app.rooms_ui.overlay_open(), "the room dialog stays");
+            assert!(matches!(
+                drain(&mut rx).as_slice(),
+                [Command::CancelVerification { .. }]
+            ));
+        }
+
+        #[test]
+        fn esc_over_a_security_screen_does_not_close_the_sessions_card_under_it() {
+            let (mut app, mut rx) = sessions_over_app4();
+            let _ = sec(&mut app, SecurityMessage::OpenRestore);
+            let _ = drain(&mut rx);
+            let _ = key(&mut app, Shortcut::Escape);
+            assert!(app.sessions.open, "the card was not the one drawn on top");
+            assert_eq!(app.security.overlay, None, "the screen backed out");
+            let _ = key(&mut app, Shortcut::Escape);
+            assert!(!app.sessions.open, "now the card closes");
+        }
+
+        #[test]
+        fn esc_backs_out_of_the_questions_and_never_confirms_them() {
+            // Reset: Esc is Back; no reset command.
+            let (mut app, mut rx) = app4();
+            let _ = app.update(core(CoreEvent::Security(status(
+                DeviceVerification::Unverified,
+                RecoveryStatus::Enabled,
+            ))));
+            let _ = sec(&mut app, SecurityMessage::OpenConfirmIdentity);
+            let _ = sec(&mut app, SecurityMessage::ResetRequested);
+            assert_eq!(app.security.overlay, Some(Overlay::ResetConfirm));
+            let _ = drain(&mut rx);
+            let _ = key(&mut app, Shortcut::Escape);
+            assert_eq!(app.security.overlay, Some(Overlay::ConfirmIdentity));
+            assert!(drain(&mut rx).is_empty());
+            // The identity screen: Esc skips for now.
+            let _ = key(&mut app, Shortcut::Escape);
+            assert_eq!(app.security.overlay, None);
+            assert!(app.security.identity_screen_skipped);
+            // Change key: Esc cancels; no command.
+            let (mut app, mut rx) = app4();
+            let _ = app.update(core(CoreEvent::Security(status(
+                DeviceVerification::Verified,
+                RecoveryStatus::Enabled,
+            ))));
+            let _ = sec(&mut app, SecurityMessage::ChangeKeyRequested);
+            assert_eq!(app.security.overlay, Some(Overlay::ChangeKeyConfirm));
+            let _ = drain(&mut rx);
+            let _ = key(&mut app, Shortcut::Escape);
+            assert_eq!(app.security.overlay, None);
+            assert!(drain(&mut rx).is_empty());
+        }
+
+        #[test]
+        fn esc_is_swallowed_by_the_key_screen_and_by_work_that_runs() {
+            let (mut app, mut rx) = sessions_over_app4();
+            app.security.setup = Some(crate::security::RecoverySetup::new(
+                RecoveryKey::from("dummy"),
+                false,
+            ));
+            let _ = drain(&mut rx);
+            let _ = key(&mut app, Shortcut::Escape);
+            assert!(app.security.setup.is_some(), "the key is not dropped");
+            assert!(app.sessions.open, "nothing under it saw the key");
+            app.security.setup = None;
+            // Setting recovery up.
+            app.security.busy = Some(crate::security::Busy::SettingUp);
+            let _ = key(&mut app, Shortcut::Escape);
+            assert!(app.sessions.open);
+            // A running reset keeps its screen.
+            app.security.busy = Some(crate::security::Busy::Resetting);
+            app.security.overlay = Some(Overlay::ResetConfirm);
+            let _ = key(&mut app, Shortcut::Escape);
+            assert_eq!(app.security.overlay, Some(Overlay::ResetConfirm));
+            assert!(drain(&mut rx).is_empty());
+            // A password on its way.
+            app.security.busy = None;
+            app.security.overlay = None;
+            let mut prompt = crate::security::ReauthPrompt::new(ReauthAction::ResetIdentity);
+            prompt.waiting = true;
+            app.security.reauth = Some(prompt);
+            let _ = key(&mut app, Shortcut::Escape);
+            assert!(app.security.reauth.is_some());
+            assert!(app.sessions.open);
         }
 
         #[test]
