@@ -280,7 +280,7 @@ pub enum Family {
 
 /// The family `palette: None` stands for: the one place the app's default
 /// colour set is decided.
-pub const DEFAULT_FAMILY: Family = Family::Twicecat;
+pub const DEFAULT_FAMILY: Family = Family::Frost;
 
 impl Family {
     /// Every family, in the order Settings shows them.
@@ -756,6 +756,8 @@ mod tests {
     #[test]
     fn no_palette_resolves_to_the_default_family() {
         assert_eq!(resolve_family(None), DEFAULT_FAMILY);
+        assert_eq!(resolve_family(None), Family::Frost);
+        assert_eq!(theme_for(Mode::Dark).to_string(), "Frost Dark");
         for family in Family::ALL {
             assert_eq!(resolve_family(Some(family.choice())), family);
             assert_eq!(Family::from_choice(family.choice()), family);
@@ -775,7 +777,7 @@ mod tests {
                     let text = std::fs::read_to_string(&path).expect("readable source");
                     // Skip everything from the tests module on.
                     let code = text.split("#[cfg(test)]").next().unwrap_or("");
-                    if code.contains("Family::Twicecat") {
+                    if code.contains("Family::Frost") {
                         hits.push(path.display().to_string());
                     }
                 }
@@ -786,6 +788,6 @@ mod tests {
             &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
             &mut hits,
         );
-        assert!(hits.is_empty(), "names Family::Twicecat: {hits:?}");
+        assert!(hits.is_empty(), "names Family::Frost: {hits:?}");
     }
 }
