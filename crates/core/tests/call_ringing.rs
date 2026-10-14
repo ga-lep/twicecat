@@ -18,8 +18,8 @@ use common::{
 use serde_json::Value;
 use twicecat_core::CoreHandle;
 use twicecat_core::api::{
-    AUDIO_FRAME_LEN, AudioBackend, CallIntent, CallState, Command, CoreEvent, ListDiff, RoomId,
-    RoomSummary, VirtualAudio,
+    AUDIO_FRAME_LEN, AudioBackend, AudioSettings, CallIntent, CallSounds, CallState, Command,
+    CoreEvent, ListDiff, RoomId, RoomSummary, VirtualAudio,
 };
 use twicecat_core::secrets::InMemorySecretStore;
 
@@ -441,6 +441,20 @@ async fn answering_stops_the_ringtone() {
     let mut carol = carol_with(dir_c.path(), &speaker).await;
     wait_for_room(&mut alice, &room_id).await;
     wait_for_room(&mut carol, &room_id).await;
+    // The call's own join cue is audible on this speaker; this test is
+    // about the ringtone, so call sounds are off.
+    carol
+        .commands
+        .send(Command::UpdateAudioSettings(AudioSettings {
+            call_sounds: CallSounds {
+                enabled: false,
+                ..CallSounds::default()
+            },
+            ..AudioSettings::default()
+        }))
+        .await
+        .unwrap();
+    expect_event(&mut carol, |e| matches!(e, CoreEvent::AudioSettings(_))).await;
 
     join(&mut alice, &room_id).await;
     expect_event(&mut carol, |e| is_ring_in(e, &room_id)).await;

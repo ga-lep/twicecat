@@ -366,6 +366,12 @@ impl AudioSession {
         voice_control(&self.control).set_deafened(deafened);
     }
 
+    /// Plays a call cue once, mixed into the call's playback (also while
+    /// deafened). Returns false when the voice engine's queue is full.
+    pub(crate) fn play_cue(&self, samples: &'static [f32], volume_percent: u16) -> bool {
+        voice_control(&self.control).play_cue(samples, volume_percent)
+    }
+
     /// The control handle, for the media layer's sources.
     pub(crate) fn voice(&self) -> Voice {
         self.control.clone()

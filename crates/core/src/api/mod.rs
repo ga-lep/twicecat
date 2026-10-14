@@ -16,9 +16,9 @@ mod types;
 
 pub use audio::{
     AUDIO_FRAME_LEN, AudioBackend, AudioDevice, AudioDeviceId, AudioDevices, AudioProcessing,
-    AudioSettings, AudioStats, CleaningAnnouncement, EnhancerBackend, GpuBackend, GpuEnhancement,
-    InputLevel, InputMode, NoiseSuppression, NsLevel, PushToTalkBindings, RemoteCleaning,
-    SkipCleaned, VirtualAudio, VoiceCleaning, limits,
+    AudioSettings, AudioStats, CallSounds, CleaningAnnouncement, EnhancerBackend, GpuBackend,
+    GpuEnhancement, InputLevel, InputMode, NoiseSuppression, NsLevel, PushToTalkBindings,
+    RemoteCleaning, SkipCleaned, VirtualAudio, VoiceCleaning, limits,
 };
 pub use call::{
     CallEndReason, CallIntent, CallState, CleaningStatus, Participant, ParticipantId, SkipReason,

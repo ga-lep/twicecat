@@ -20,9 +20,9 @@ use common::{
 use serde_json::Value;
 use twicecat_core::CoreHandle;
 use twicecat_core::api::{
-    AUDIO_FRAME_LEN, AudioBackend, AudioProcessing, AudioSettings, CallIntent, CallState,
-    CleaningStatus, Command, CoreEvent, InputMode, ListDiff, NoiseSuppression, Participant,
-    Password, RoomId, SkipReason, SyncState, UserId, VirtualAudio, VoiceCleaning,
+    AUDIO_FRAME_LEN, AudioBackend, AudioProcessing, AudioSettings, CallIntent, CallSounds,
+    CallState, CleaningStatus, Command, CoreEvent, InputMode, ListDiff, NoiseSuppression,
+    Participant, Password, RoomId, SkipReason, SyncState, UserId, VirtualAudio, VoiceCleaning,
 };
 use twicecat_core::secrets::InMemorySecretStore;
 
@@ -134,6 +134,11 @@ fn tone_settings() -> AudioSettings {
         input_mode: InputMode::VoiceActivity {
             automatic: false,
             threshold_db: -100.0,
+        },
+        // These tests measure levels at the speakers: no join or leave cue.
+        call_sounds: CallSounds {
+            enabled: false,
+            ..CallSounds::default()
         },
         ..AudioSettings::default()
     }
@@ -295,18 +300,7 @@ async fn alices_tone_reaches_carols_speakers_and_mute_stops_it() {
     // A pure tone is "noise" to a denoiser and steady to a gate: send it as is.
     alice
         .commands
-        .send(Command::UpdateAudioSettings(AudioSettings {
-            processing: AudioProcessing {
-                noise_suppression: NoiseSuppression::Off,
-                auto_gain: false,
-                ..AudioProcessing::default()
-            },
-            input_mode: InputMode::VoiceActivity {
-                automatic: false,
-                threshold_db: -100.0,
-            },
-            ..AudioSettings::default()
-        }))
+        .send(Command::UpdateAudioSettings(tone_settings()))
         .await
         .unwrap();
     expect_event(&mut alice, |e| matches!(e, CoreEvent::AudioSettings(_))).await;
@@ -883,6 +877,7 @@ async fn remote_voices_are_cleaned_when_asked() {
     let plain = alice_audio.level(CAROL_HZ, 2.0);
 
     let mut settings = AudioSettings::default();
+    settings.call_sounds.enabled = false;
     settings.remote_cleaning.enabled = true;
     alice
         .commands
@@ -955,6 +950,7 @@ async fn remote_voices_are_cleaned_on_the_gpu() {
     wait_for_room(&mut alice, &room_id).await;
     wait_for_room(&mut carol, &room_id).await;
     let mut gpu = AudioSettings::default();
+    gpu.call_sounds.enabled = false;
     gpu.remote_cleaning.enabled = true;
     gpu.remote_cleaning.gpu = true;
     alice
@@ -1042,6 +1038,7 @@ async fn without_a_gpu_voices_are_cleaned_on_the_cpu() {
     wait_for_room(&mut alice, &room_id).await;
     wait_for_room(&mut carol, &room_id).await;
     let mut gpu = AudioSettings::default();
+    gpu.call_sounds.enabled = false;
     gpu.remote_cleaning.enabled = true;
     gpu.remote_cleaning.gpu = true;
     alice
@@ -1115,6 +1112,7 @@ async fn voices_cleaned_at_their_source_are_left_alone() {
     wait_for_room(&mut alice, &room_id).await;
     wait_for_room(&mut carol, &room_id).await;
     let mut cleaning = AudioSettings::default();
+    cleaning.call_sounds.enabled = false;
     cleaning.remote_cleaning.enabled = true;
     alice
         .commands

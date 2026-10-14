@@ -388,6 +388,45 @@ pub struct AudioSettings {
     /// direct call rings (`CoreEvent::IncomingCall { ring: true }`). Missing
     /// from files written before it existed, which read as `true`.
     pub ringtone: bool,
+    /// The short cues played when you join or leave a call and when others
+    /// join it. Missing from files written before they existed, which read
+    /// as the defaults.
+    pub call_sounds: CallSounds,
+}
+
+/// The cues played in a call, on the call's own output device, mixed into
+/// the call's playback (so the echo canceller hears them as it hears any
+/// remote voice). They play whatever the microphone state: muted,
+/// push-to-talk and deafened do not silence them.
+///
+/// Echo: the cues are never sent to the room, but with "Echo cancellation"
+/// off, speakers (not headphones) let the microphone pick a cue up and send
+/// it, as they would send other people's voices. With echo cancellation on,
+/// a faint trace of the join cue can leak at the very start of a call, before
+/// the canceller has converged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CallSounds {
+    /// Master switch. On its own it gives the cue when this device joins
+    /// (or starts) a call; when off, no cue plays.
+    pub enabled: bool,
+    /// Also play a soft cue when another person joins the call.
+    pub others_joining: bool,
+    /// Also play a cue when you leave the call.
+    pub leaving: bool,
+    /// Cue volume, percent (0..=200), on top of the master volume.
+    pub volume_percent: u16,
+}
+
+impl Default for CallSounds {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            others_joining: true,
+            leaving: true,
+            volume_percent: 60,
+        }
+    }
 }
 
 impl Default for AudioSettings {
@@ -410,6 +449,7 @@ impl Default for AudioSettings {
             user_cleaning: BTreeMap::new(),
             announce_cleaning: CleaningAnnouncement::default(),
             ringtone: true,
+            call_sounds: CallSounds::default(),
         }
     }
 }
@@ -468,6 +508,8 @@ impl AudioSettings {
             defaults.input_gain_db,
         );
         self.output_volume_percent = self.output_volume_percent.min(limits::VOLUME_PERCENT);
+        self.call_sounds.volume_percent =
+            self.call_sounds.volume_percent.min(limits::VOLUME_PERCENT);
         let (lo, hi) = limits::VOICE_BITRATE_KBPS;
         self.voice_bitrate_kbps = self.voice_bitrate_kbps.clamp(lo, hi);
         for volume in self.user_volumes.values_mut() {
@@ -654,6 +696,39 @@ mod tests {
     }
 
     #[test]
+    fn call_sounds_default_to_all_on_at_60_percent() {
+        let sounds = CallSounds::default();
+        assert!(sounds.enabled && sounds.others_joining && sounds.leaving);
+        assert_eq!(sounds.volume_percent, 60);
+        assert_eq!(AudioSettings::default().call_sounds, sounds);
+    }
+
+    #[test]
+    fn call_sounds_missing_or_partial_read_as_the_defaults() {
+        let s: AudioSettings = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(s.call_sounds, CallSounds::default());
+        let s: AudioSettings =
+            serde_json::from_value(serde_json::json!({ "call_sounds": { "leaving": false } }))
+                .unwrap();
+        assert!(!s.call_sounds.leaving);
+        assert!(s.call_sounds.enabled && s.call_sounds.others_joining);
+        assert_eq!(s.call_sounds.volume_percent, 60);
+    }
+
+    #[test]
+    fn the_call_sounds_volume_is_clamped() {
+        let s = AudioSettings {
+            call_sounds: CallSounds {
+                volume_percent: 900,
+                ..CallSounds::default()
+            },
+            ..AudioSettings::default()
+        }
+        .validated();
+        assert_eq!(s.call_sounds.volume_percent, limits::VOLUME_PERCENT);
+    }
+
+    #[test]
     fn deep_filter_settings_saved_before_the_gpu_option_load_on_the_cpu() {
         let old = serde_json::json!({ "processing": { "noise_suppression": {
             "kind": "deep_filter", "attenuation_limit_db": 30.0 } } });
@@ -777,6 +852,12 @@ mod tests {
                 "user_cleaning": {},
                 "announce_cleaning": { "enabled": true, "cleaned_outside": false },
                 "ringtone": true,
+                "call_sounds": {
+                    "enabled": true,
+                    "others_joining": true,
+                    "leaving": true,
+                    "volume_percent": 60
+                },
             })
         );
     }

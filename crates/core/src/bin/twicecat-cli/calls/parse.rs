@@ -45,6 +45,21 @@ pub(crate) enum CallCmd {
     Ringtone(Option<bool>),
     /// Stop the ringtone of the rings sounding now.
     Silence,
+    /// The call sounds.
+    Sounds(SoundsArg),
+}
+
+/// `/sounds` arguments.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SoundsArg {
+    /// The master switch; `None` toggles.
+    Switch(Option<bool>),
+    /// Also when others join.
+    Others(bool),
+    /// Also when I leave.
+    Leave(bool),
+    /// Cue volume, percent.
+    Volume(u16),
 }
 
 /// `/clean` arguments.
@@ -117,6 +132,7 @@ pub(crate) fn parse(name: &str, arg: &str) -> Option<Result<CallCmd, &'static st
         "audio" => none(arg, "/audio").map(|()| CallCmd::Audio),
         "ringtone" => switch(arg, "/ringtone [on|off]").map(CallCmd::Ringtone),
         "silence" => none(arg, "/silence").map(|()| CallCmd::Silence),
+        "sounds" => sounds(arg).map(CallCmd::Sounds),
         "gpu" => none(arg, "/gpu").map(|()| CallCmd::Gpu),
         _ => return None,
     };
@@ -181,6 +197,31 @@ fn noise_suppression(arg: &str) -> Result<NoiseSuppression, &'static str> {
         return Err(USAGE);
     }
     Ok(ns)
+}
+
+fn sounds(arg: &str) -> Result<SoundsArg, &'static str> {
+    const USAGE: &str = "/sounds [on|off|others on|off|leave on|off|<0-200>]";
+    let on_off = |word| match word {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        _ => Err(USAGE),
+    };
+    let mut words = arg.split_whitespace();
+    match (words.next(), words.next(), words.next()) {
+        (None, ..) => Ok(SoundsArg::Switch(None)),
+        (Some("on"), None, _) => Ok(SoundsArg::Switch(Some(true))),
+        (Some("off"), None, _) => Ok(SoundsArg::Switch(Some(false))),
+        (Some("others"), Some(on), None) => on_off(on).map(SoundsArg::Others),
+        (Some("leave"), Some(on), None) => on_off(on).map(SoundsArg::Leave),
+        (Some(percent), None, _) => percent
+            .trim_end_matches('%')
+            .parse()
+            .ok()
+            .filter(|p| *p <= 200)
+            .map(SoundsArg::Volume)
+            .ok_or(USAGE),
+        _ => Err(USAGE),
+    }
 }
 
 fn gate(arg: &str) -> Result<GateArg, &'static str> {
@@ -279,6 +320,39 @@ mod tests {
         assert_eq!(cmd("/ringtone off"), Ok(CallCmd::Ringtone(Some(false))));
         assert_eq!(cmd("/ringtone loud"), Err("/ringtone [on|off]"));
         assert_eq!(cmd("/silence"), Ok(CallCmd::Silence));
+        let usage = "/sounds [on|off|others on|off|leave on|off|<0-200>]";
+        assert_eq!(cmd("/sounds"), Ok(CallCmd::Sounds(SoundsArg::Switch(None))));
+        assert_eq!(
+            cmd("/sounds off"),
+            Ok(CallCmd::Sounds(SoundsArg::Switch(Some(false))))
+        );
+        assert_eq!(
+            cmd("/sounds on"),
+            Ok(CallCmd::Sounds(SoundsArg::Switch(Some(true))))
+        );
+        assert_eq!(
+            cmd("/sounds others off"),
+            Ok(CallCmd::Sounds(SoundsArg::Others(false)))
+        );
+        assert_eq!(
+            cmd("/sounds leave on"),
+            Ok(CallCmd::Sounds(SoundsArg::Leave(true)))
+        );
+        assert_eq!(
+            cmd("/sounds 40"),
+            Ok(CallCmd::Sounds(SoundsArg::Volume(40)))
+        );
+        assert_eq!(
+            cmd("/sounds 200%"),
+            Ok(CallCmd::Sounds(SoundsArg::Volume(200)))
+        );
+        assert_eq!(cmd("/sounds 201"), Err(usage));
+        assert_eq!(cmd("/sounds -5"), Err(usage));
+        assert_eq!(cmd("/sounds loud"), Err(usage));
+        assert_eq!(cmd("/sounds others"), Err(usage));
+        assert_eq!(cmd("/sounds others maybe"), Err(usage));
+        assert_eq!(cmd("/sounds leave on now"), Err(usage));
+        assert_eq!(cmd("/sounds off now"), Err(usage));
         assert_eq!(cmd("/silence now"), Err("/silence"));
         assert_eq!(cmd("/mute"), Ok(CallCmd::Mute(None)));
         assert_eq!(cmd("/deafen off"), Ok(CallCmd::Deafen(Some(false))));

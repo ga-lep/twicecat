@@ -83,7 +83,7 @@ pub(crate) fn save(paths: &DataPaths, settings: &AudioSettings) -> Result<(), Co
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::{InputMode, UserId};
+    use crate::api::{CallSounds, InputMode, UserId};
 
     fn paths() -> (tempfile::TempDir, DataPaths) {
         let dir = tempfile::tempdir().unwrap();
@@ -160,6 +160,46 @@ mod tests {
         };
         save(&paths, &settings).unwrap();
         assert!(!load(&paths).settings.ringtone);
+    }
+
+    #[test]
+    fn a_file_from_before_the_call_sounds_loads_the_defaults() {
+        let (_dir, paths) = paths();
+        paths
+            .write_call_settings(br#"{"version": 1, "settings": {"output_volume_percent": 80}}"#)
+            .unwrap();
+        let loaded = load(&paths);
+        assert!(loaded.problem.is_none());
+        assert_eq!(loaded.settings.call_sounds, CallSounds::default());
+    }
+
+    #[test]
+    fn changed_call_sounds_round_trip() {
+        let (_dir, paths) = paths();
+        let settings = AudioSettings {
+            call_sounds: CallSounds {
+                enabled: false,
+                others_joining: false,
+                leaving: false,
+                volume_percent: 25,
+            },
+            ..AudioSettings::default()
+        };
+        save(&paths, &settings).unwrap();
+        assert_eq!(load(&paths).settings.call_sounds, settings.call_sounds);
+    }
+
+    #[test]
+    fn a_stored_call_sounds_volume_of_900_loads_as_200() {
+        let (_dir, paths) = paths();
+        paths
+            .write_call_settings(
+                br#"{"version": 1, "settings": {"call_sounds": {"volume_percent": 900}}}"#,
+            )
+            .unwrap();
+        let loaded = load(&paths);
+        assert!(loaded.problem.is_none());
+        assert_eq!(loaded.settings.call_sounds.volume_percent, 200);
     }
 
     #[test]

@@ -2,9 +2,9 @@
 //! from the network or the system goes through `sanitize`.
 
 use twicecat_core::api::{
-    AudioDeviceId, AudioDevices, AudioSettings, CleaningStatus, EnhancerBackend, GpuBackend,
-    GpuEnhancement, InputLevel, InputMode, NoiseSuppression, Participant, RoomId, RoomSummary,
-    SkipCleaned, SkipReason,
+    AudioDeviceId, AudioDevices, AudioSettings, CallSounds, CleaningStatus, EnhancerBackend,
+    GpuBackend, GpuEnhancement, InputLevel, InputMode, NoiseSuppression, Participant, RoomId,
+    RoomSummary, SkipCleaned, SkipReason,
 };
 
 use super::super::sanitize;
@@ -237,7 +237,22 @@ pub(super) fn describe(s: &AudioSettings, devices: &AudioDevices) -> Vec<String>
         others,
         announced.to_owned(),
         format!("Ringtone {}.", on_off(s.ringtone)),
+        sounds_line(&s.call_sounds),
     ]
+}
+
+/// The call sounds, in one sentence.
+fn sounds_line(sounds: &CallSounds) -> String {
+    if !sounds.enabled {
+        return "Call sounds off.".to_owned();
+    }
+    let also = match (sounds.others_joining, sounds.leaving) {
+        (true, true) => " (others joining, leaving)",
+        (true, false) => " (others joining)",
+        (false, true) => " (leaving)",
+        (false, false) => " (joining only)",
+    };
+    format!("Call sounds on{also}, {} %.", sounds.volume_percent)
 }
 
 /// The mic test's level line.
@@ -347,6 +362,22 @@ mod tests {
         assert_eq!(lines[0], "Input: Desk mic. Output: gone.");
         assert!(lines[4].contains("on a GPU if one keeps up"), "{lines:?}");
         assert_eq!(lines[5], "Your suppressor is announced to the call.");
+        assert_eq!(lines[7], "Call sounds on (others joining, leaving), 60 %.");
+        s.call_sounds.volume_percent = 40;
+        let lines = describe(&s, &devices);
+        assert_eq!(lines[7], "Call sounds on (others joining, leaving), 40 %.");
+        s.call_sounds.leaving = false;
+        assert_eq!(
+            describe(&s, &devices)[7],
+            "Call sounds on (others joining), 40 %."
+        );
+        s.call_sounds.others_joining = false;
+        assert_eq!(
+            describe(&s, &devices)[7],
+            "Call sounds on (joining only), 40 %."
+        );
+        s.call_sounds.enabled = false;
+        assert_eq!(describe(&s, &devices)[7], "Call sounds off.");
         assert_eq!(
             level_line(InputLevel {
                 rms_db: -20.0,
