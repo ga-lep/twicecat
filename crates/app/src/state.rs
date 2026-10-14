@@ -210,6 +210,8 @@ pub enum Message {
     LoginSubmitted,
     /// The user pressed **Sign in with browser**.
     OAuthRequested,
+    /// The user pressed **Use another server**.
+    ToggleServerField,
     /// The user pressed **Cancel** while waiting for the browser.
     CancelOAuth,
     /// The browser launcher finished.
@@ -1052,6 +1054,14 @@ impl App {
                 self.login.password = password;
                 Task::none()
             }
+            Message::ToggleServerField => {
+                // A field that holds something, or that a notice is about,
+                // stays open; the button then does nothing.
+                if !login::server_held(&self.login.server, self.notice.as_deref()) {
+                    self.login.server_open = !self.login.server_open;
+                }
+                Task::none()
+            }
             Message::LoginSubmitted => self.submit_login(),
             Message::OAuthRequested => self.request_oauth(),
             Message::CancelOAuth => {
@@ -1869,12 +1879,15 @@ impl App {
         if self.screen != Screen::Login || self.login_in_flight {
             return Task::none();
         }
+        if self.refuse_hidden_server() {
+            return Task::none();
+        }
         let username = self.login.username.trim().to_owned();
         if username.is_empty() || self.login.password.expose().is_empty() {
             self.notice = Some("Enter a user name and password.".to_owned());
             return Task::none();
         }
-        let server = Some(self.login.server.trim().to_owned()).filter(|s| !s.is_empty());
+        let server = login::server_to_send(&self.login.server);
         let password = std::mem::replace(&mut self.login.password, Password::from(String::new()));
         self.notice = None;
         self.login_in_flight = true;
@@ -1885,16 +1898,33 @@ impl App {
         })
     }
 
+    /// Sets the notice and returns true when the Server field holds an
+    /// address that is refused: one that hides its real server (userinfo and
+    /// the like), a name with a character that is not allowed, or plain
+    /// `http://` to a host that is not this computer. Nothing is sent for it,
+    /// and the password stays in the form (it has not been moved yet).
+    fn refuse_hidden_server(&mut self) -> bool {
+        match login::server_refusal(&self.login.server) {
+            Some(notice) => {
+                self.notice = Some(notice.to_owned());
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Asks the core for an OAuth login at the server named in the form.
     fn request_oauth(&mut self) -> Task<Message> {
         if self.screen != Screen::Login || self.login_in_flight {
             return Task::none();
         }
-        let server = self.login.server.trim().to_owned();
-        if server.is_empty() {
-            self.notice = Some("Enter a server name to sign in with the browser.".to_owned());
+        if self.refuse_hidden_server() {
             return Task::none();
         }
+        let Some(server) = login::server_to_send(&self.login.server) else {
+            self.notice = Some("Enter a server name to sign in with the browser.".to_owned());
+            return Task::none();
+        };
         self.notice = None;
         self.login_in_flight = true;
         self.browser_opened = None;
@@ -2763,7 +2793,9 @@ impl App {
     /// The window content.
     pub fn view(&self) -> Element<'_, Message> {
         match self.screen {
-            Screen::Starting => screens::centered_text("Starting\u{2026}"),
+            Screen::Starting => {
+                screens::centered_state("Starting\u{2026}", "Looking for your saved session.")
+            }
             Screen::Login => login::view(self),
             Screen::WaitingForBrowser => login::waiting_view(self),
             Screen::Loading => {
@@ -2795,8 +2827,13 @@ impl App {
                 ),
                 self,
             ),
-            Screen::ShuttingDown => screens::centered_text("Closing\u{2026}"),
-            Screen::Disconnected => screens::centered_text("The core stopped"),
+            Screen::ShuttingDown => {
+                screens::centered_state("Closing\u{2026}", "Saving your drafts and settings.")
+            }
+            Screen::Disconnected => screens::centered_state(
+                "The core stopped",
+                "Close the window and start Twicecat again.",
+            ),
         }
     }
 
@@ -3184,6 +3221,63 @@ mod tests {
         let _ = app.update(Message::OAuthRequested);
         let _ = app.update(Message::LoginSubmitted);
         assert!(rx.try_recv().is_err(), "a second request sends nothing");
+    }
+
+    #[test]
+    fn an_address_that_hides_its_server_sends_nothing_and_keeps_the_password() {
+        let hidden = format!("https://matrix.org{}@evil.example", "a".repeat(300));
+        let servers = [hidden.as_str(), "https://matrix.org@evil.example"]
+            .into_iter()
+            .chain(login::tests::LOOKALIKES);
+        for server in servers {
+            let (mut app, mut rx) = login_app();
+            fill(&mut app, server, "alice", "hunter2-x");
+            let _ = app.update(Message::LoginSubmitted);
+            assert!(rx.try_recv().is_err(), "password login sent a command");
+            assert!(!app.login_in_flight);
+            let notice = login::server_refusal(server).expect("refused");
+            assert_eq!(app.notice.as_deref(), Some(notice), "{server:?}");
+            assert_eq!(app.login.password.expose(), "hunter2-x");
+            app.notice = None;
+            let _ = app.update(Message::OAuthRequested);
+            assert!(rx.try_recv().is_err(), "browser login sent a command");
+            assert!(!app.login_in_flight);
+            assert_eq!(app.notice.as_deref(), Some(notice), "{server:?}");
+        }
+    }
+
+    #[test]
+    fn a_refused_but_honest_name_and_plain_http_keep_the_password_and_send_nothing() {
+        for (server, notice) in [
+            ("matrix.org..", login::UNSUPPORTED_SERVER),
+            ("my_synapse", login::UNSUPPORTED_SERVER),
+            ("b\u{fc}cher.de", login::UNSUPPORTED_SERVER),
+            ("http://matrix.org", login::INSECURE_SERVER),
+            ("http://localhost.evil.com", login::INSECURE_SERVER),
+        ] {
+            let (mut app, mut rx) = login_app();
+            fill(&mut app, server, "alice", "hunter2-x");
+            let _ = app.update(Message::LoginSubmitted);
+            assert!(rx.try_recv().is_err(), "{server:?}: a command was sent");
+            assert_eq!(app.notice.as_deref(), Some(notice), "{server:?}");
+            assert_eq!(app.login.password.expose(), "hunter2-x", "{server:?}");
+            assert!(!app.login_in_flight);
+            let _ = app.update(Message::OAuthRequested);
+            assert!(rx.try_recv().is_err(), "{server:?}: browser login sent");
+        }
+    }
+
+    #[test]
+    fn a_trailing_dot_is_dropped_from_what_is_sent() {
+        let (mut app, mut rx) = login_app();
+        fill(&mut app, " matrix.org. ", "alice", "hunter2-x");
+        let _ = app.update(Message::LoginSubmitted);
+        match rx.try_recv() {
+            Ok(Command::LoginPassword { server, .. }) => {
+                assert_eq!(server.as_deref(), Some("matrix.org"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     fn waiting_app(url: &str) -> (App, mpsc::Receiver<Command>, Task<Message>) {

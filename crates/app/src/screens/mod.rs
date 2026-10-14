@@ -23,14 +23,15 @@ pub mod timeline_pane;
 pub mod upload_dialog;
 pub mod verification;
 
-use iced::widget::{container, text};
+use iced::widget::container;
 use iced::{Element, Fill};
 
 use crate::state::Message;
 
-/// A single line of text in the middle of the window.
-pub fn centered_text(label: &str) -> Element<'_, Message> {
-    container(text(label).size(20))
+/// A short title and a hint in the middle of the window (starting, closing
+/// and a stopped core).
+pub fn centered_state<'a>(title: &'a str, hint: &'a str) -> Element<'a, Message> {
+    container(crate::ui::kit::empty_state(title, hint))
         .center_x(Fill)
         .center_y(Fill)
         .into()

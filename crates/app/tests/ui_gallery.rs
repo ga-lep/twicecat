@@ -2423,3 +2423,393 @@ mod audio {
         );
     }
 }
+
+// ---- Task 13: login, browser sign-in and loading ---------------------------
+
+mod login {
+    use iced::advanced::widget::{Id, Operation, operation::Focusable};
+    use iced::keyboard::{self, Key, key};
+    use twicecat_app::screens::login::{
+        CARD_WIDTH, LoginStop, PASSWORD_ID, SERVER_ID, USER_ID, focus_order,
+    };
+
+    use super::*;
+
+    /// The focusable widgets with an id, in tree order, with their bounds.
+    struct Stops(Vec<(String, Rectangle)>);
+
+    impl Operation for Stops {
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+            operate(self);
+        }
+
+        fn focusable(&mut self, id: Option<&Id>, bounds: Rectangle, _state: &mut dyn Focusable) {
+            self.0.push((format!("{id:?}"), bounds));
+        }
+    }
+
+    fn stops(laid: &mut Laid<'_>, renderer: &Renderer) -> Vec<(String, Rectangle)> {
+        let mut op = Stops(Vec::new());
+        laid.element.as_widget_mut().operate(
+            &mut laid.tree,
+            Layout::new(&laid.node),
+            renderer,
+            &mut op,
+        );
+        op.0
+    }
+
+    fn id_of(name: &'static str) -> String {
+        format!("{:?}", Some(Id::new(name)))
+    }
+
+    fn app_of(name: &str, width: f32) -> App {
+        let mut app = scenario_app(name);
+        app.window_width = width;
+        app
+    }
+
+    #[test]
+    fn tab_walks_the_inputs_in_the_order_of_the_focus_function() {
+        let renderer = renderer();
+        for (scenario, open) in [("login", false), ("login-server-open", true)] {
+            let app = app_of(scenario, WIDE.width);
+            let mut laid = Laid::new(&app, &renderer, WIDE);
+            let found = stops(&mut laid, &renderer);
+            let wanted: Vec<String> = focus_order(open)
+                .into_iter()
+                .filter(|stop| stop.is_input())
+                .map(|stop| match stop {
+                    LoginStop::User => id_of(USER_ID),
+                    LoginStop::Password => id_of(PASSWORD_ID),
+                    _ => id_of(SERVER_ID),
+                })
+                .collect();
+            let ids: Vec<&String> = found.iter().map(|(id, _)| id).collect();
+            assert_eq!(ids, wanted.iter().collect::<Vec<_>>(), "{scenario}");
+            let tops: Vec<f32> = found.iter().map(|(_, b)| b.y).collect();
+            assert!(tops.windows(2).all(|w| w[0] < w[1]), "{scenario}: {tops:?}");
+        }
+    }
+
+    #[test]
+    fn the_card_is_420_wide_and_centred_and_nothing_runs_out_of_it() {
+        let renderer = renderer();
+        let names = [
+            "login",
+            "login-server",
+            "login-server-open",
+            "login-server-notice",
+            "login-busy",
+            "login-error",
+            "waiting",
+            "waiting-opening",
+            "waiting-failed",
+            "loading",
+            "loading-reconnecting",
+        ];
+        for name in names {
+            for size in [WIDE, NARROW, Size::new(360.0, 640.0)] {
+                let app = app_of(name, size.width);
+                let laid = Laid::new(&app, &renderer, size);
+                let mut all = Vec::new();
+                collect_bounds(&laid.node, iced::Point::ORIGIN, &mut all, 0);
+                let expect = CARD_WIDTH.min(size.width - 2.0 * 16.0);
+                let card = all
+                    .iter()
+                    .find(|(r, d)| {
+                        *d >= 2 && r.width < size.width - 0.5 && (r.width - expect).abs() < 0.5
+                    })
+                    .unwrap_or_else(|| panic!("{name} at {}: no card of {expect}", size.width))
+                    .0;
+                assert!(
+                    (card.center_x() - size.width / 2.0).abs() < 0.5,
+                    "{name} is centred"
+                );
+                let mut out = Vec::new();
+                spills(&laid.node, iced::Point::ORIGIN, &mut out);
+                assert!(out.is_empty(), "{name} at {}: {out:?}", size.width);
+                assert!(card.y >= 0.0 && card.y + card.height <= size.height + 0.5);
+            }
+        }
+    }
+
+    #[test]
+    fn a_long_server_shows_whole_on_lines_of_its_own_under_the_field() {
+        let renderer = renderer();
+        for size in [WIDE, NARROW, Size::new(360.0, 640.0)] {
+            let app = app_of("login-server", size.width);
+            let mut laid = Laid::new(&app, &renderer, size);
+            let fields = stops(&mut laid, &renderer);
+            let server = fields
+                .iter()
+                .find(|(id, _)| *id == id_of(SERVER_ID))
+                .expect("the server field is open")
+                .1;
+            // The echo is the next text under the field: several lines
+            // tall, inside the card, and starting below the field.
+            let mut all = Vec::new();
+            collect_bounds(&laid.node, iced::Point::ORIGIN, &mut all, 0);
+            let echo = all
+                .iter()
+                .map(|(r, _)| r)
+                .find(|r| {
+                    r.y >= server.y + server.height - 0.5
+                        && r.y < server.y + server.height + 12.0
+                        && r.height > 2.0 * 12.0
+                        && r.width >= server.width - 1.0
+                })
+                .unwrap_or_else(|| panic!("a wrapped echo under the field at {}", size.width));
+            assert!(echo.x >= server.x - 0.5);
+            assert!(echo.x + echo.width <= server.x + server.width + 0.5);
+        }
+    }
+
+    fn enter() -> Event {
+        Event::Keyboard(keyboard::Event::KeyPressed {
+            key: Key::Named(key::Named::Enter),
+            modified_key: Key::Named(key::Named::Enter),
+            physical_key: key::Physical::Code(key::Code::Enter),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        })
+    }
+
+    /// Clicks a field to focus it, presses Enter, and returns what came out
+    /// of the Enter.
+    fn enter_in(app: &App, renderer: &Renderer, which: &'static str) -> Vec<Message> {
+        let mut laid = Laid::new(app, renderer, WIDE);
+        laid.settle(renderer, WIDE);
+        let field = stops(&mut laid, renderer)
+            .into_iter()
+            .find(|(id, _)| *id == id_of(which))
+            .map(|(_, b)| b);
+        let Some(field) = field else {
+            return Vec::new();
+        };
+        let _ = click(&mut laid, renderer, WIDE, field.center());
+        let mut messages: Vec<Message> = Vec::new();
+        let mut shell = Shell::new(&mut messages);
+        laid.element.as_widget_mut().update(
+            &mut laid.tree,
+            &enter(),
+            Layout::new(&laid.node),
+            mouse::Cursor::Available(field.center()),
+            renderer,
+            &mut clipboard::Null,
+            &mut shell,
+            &Rectangle::with_size(WIDE),
+        );
+        messages
+    }
+
+    fn filled() -> App {
+        let mut app = scenario_app("login-server-open");
+        for message in [
+            Message::UsernameChanged("alice".into()),
+            Message::PasswordChanged(twicecat_core::api::Password::from("gallery-filler")),
+        ] {
+            let _ = app.update(message);
+        }
+        app
+    }
+
+    #[test]
+    fn enter_submits_from_every_field_only_when_the_form_is_complete() {
+        let renderer = renderer();
+        let ready = filled();
+        for field in [USER_ID, PASSWORD_ID, SERVER_ID] {
+            let sent = enter_in(&ready, &renderer, field);
+            assert!(
+                sent.iter().any(|m| matches!(m, Message::LoginSubmitted)),
+                "Enter in {field}: {sent:?}"
+            );
+        }
+        // No password, or only blanks as the user: Enter does nothing.
+        let mut no_password = filled();
+        let _ = no_password.update(Message::PasswordChanged(
+            twicecat_core::api::Password::from(String::new()),
+        ));
+        let mut no_user = filled();
+        let _ = no_user.update(Message::UsernameChanged("  ".into()));
+        for app in [&no_password, &no_user] {
+            for field in [USER_ID, PASSWORD_ID, SERVER_ID] {
+                assert!(enter_in(app, &renderer, field).is_empty(), "{field}");
+            }
+        }
+    }
+
+    #[test]
+    fn enter_does_nothing_while_the_server_hides_behind_userinfo() {
+        let renderer = renderer();
+        let mut app = filled();
+        let hidden = format!("https://matrix.org{}@evil.example", "a".repeat(300));
+        let _ = app.update(Message::ServerChanged(hidden));
+        for field in [USER_ID, PASSWORD_ID, SERVER_ID] {
+            let sent = enter_in(&app, &renderer, field);
+            assert!(sent.is_empty(), "Enter in {field}: {sent:?}");
+        }
+    }
+
+    #[test]
+    fn while_signing_in_the_fields_and_every_button_do_nothing() {
+        let renderer = renderer();
+        let mut app = filled();
+        let _ = app.update(Message::LoginSubmitted);
+        assert!(app.login_in_flight);
+        for field in [USER_ID, PASSWORD_ID, SERVER_ID] {
+            assert!(enter_in(&app, &renderer, field).is_empty(), "{field}");
+        }
+        let mut laid = Laid::new(&app, &renderer, WIDE);
+        laid.settle(&renderer, WIDE);
+        let mut all = Vec::new();
+        collect_bounds(&laid.node, iced::Point::ORIGIN, &mut all, 0);
+        for (rect, _) in all.iter().filter(|(r, _)| r.width > 0.0 && r.height > 0.0) {
+            let sent = click(&mut laid, &renderer, WIDE, rect.center());
+            assert!(sent.is_empty(), "a click at {rect:?} sent {sent:?}");
+        }
+    }
+
+    #[test]
+    fn an_idle_card_has_a_log_in_a_browser_and_a_server_button_that_each_send_one_message() {
+        let renderer = renderer();
+        let app = scenario_app("login");
+        let mut seen = [false; 3];
+        let mut laid = Laid::new(&app, &renderer, WIDE);
+        laid.settle(&renderer, WIDE);
+        let mut all = Vec::new();
+        collect_bounds(&laid.node, iced::Point::ORIGIN, &mut all, 0);
+        for (rect, _) in all.iter().filter(|(r, _)| r.width > 0.0 && r.height > 0.0) {
+            for message in click(&mut laid, &renderer, WIDE, rect.center()) {
+                match message {
+                    Message::LoginSubmitted => seen[0] = true,
+                    Message::OAuthRequested => seen[1] = true,
+                    Message::ToggleServerField => seen[2] = true,
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+        }
+        assert_eq!(seen, [true; 3]);
+    }
+
+    #[test]
+    fn the_disclosure_button_is_off_while_the_field_is_held_open() {
+        let renderer = renderer();
+        for name in ["login-server", "login-server-notice"] {
+            let app = scenario_app(name);
+            let mut laid = Laid::new(&app, &renderer, WIDE);
+            laid.settle(&renderer, WIDE);
+            let mut all = Vec::new();
+            collect_bounds(&laid.node, iced::Point::ORIGIN, &mut all, 0);
+            for (rect, _) in all.iter().filter(|(r, _)| r.width > 0.0 && r.height > 0.0) {
+                let sent = click(&mut laid, &renderer, WIDE, rect.center());
+                assert!(
+                    !sent.iter().any(|m| matches!(m, Message::ToggleServerField)),
+                    "{name}: a click at {rect:?} sent {sent:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_disclosure_opens_on_a_click_and_stays_open_for_a_server_or_a_server_notice() {
+        let mut app = scenario_app("login");
+        assert!(!app.login.server_open);
+        let _ = app.update(Message::ToggleServerField);
+        assert!(app.login.server_open);
+        let _ = app.update(Message::ToggleServerField);
+        assert!(!app.login.server_open);
+        // With a server typed, the field stays and the button does nothing.
+        let renderer = renderer();
+        let mut held = scenario_app("login-server");
+        assert!(!held.login.server_open);
+        let _ = held.update(Message::ToggleServerField);
+        assert!(!held.login.server_open);
+        let mut laid = Laid::new(&held, &renderer, WIDE);
+        assert!(
+            stops(&mut laid, &renderer)
+                .iter()
+                .any(|(id, _)| *id == id_of(SERVER_ID))
+        );
+        // The notice about the server opens the empty field on its own.
+        let notice = scenario_app("login-server-notice");
+        let mut laid = Laid::new(&notice, &renderer, WIDE);
+        assert!(
+            stops(&mut laid, &renderer)
+                .iter()
+                .any(|(id, _)| *id == id_of(SERVER_ID))
+        );
+    }
+
+    #[test]
+    fn the_waiting_card_offers_copy_link_only_after_a_failed_launch_and_never_shows_the_url() {
+        let renderer = renderer();
+        let sent = |name: &str| {
+            let app = scenario_app(name);
+            let mut laid = Laid::new(&app, &renderer, WIDE);
+            laid.settle(&renderer, WIDE);
+            let mut all = Vec::new();
+            collect_bounds(&laid.node, iced::Point::ORIGIN, &mut all, 0);
+            let mut out = Vec::new();
+            for (rect, _) in all.iter().filter(|(r, _)| r.width > 0.0 && r.height > 0.0) {
+                out.extend(click(&mut laid, &renderer, WIDE, rect.center()));
+            }
+            out
+        };
+        for name in ["waiting", "waiting-opening"] {
+            let messages = sent(name);
+            assert!(messages.iter().any(|m| matches!(m, Message::CancelOAuth)));
+            assert!(!messages.iter().any(|m| matches!(m, Message::CopyLink)));
+        }
+        let failed = sent("waiting-failed");
+        assert!(failed.iter().any(|m| matches!(m, Message::CancelOAuth)));
+        assert!(failed.iter().any(|m| matches!(m, Message::CopyLink)));
+    }
+
+    /// The smaller of two rectangles: the button, not the row around it.
+    fn smaller(old: Option<Rectangle>, new: Rectangle) -> Option<Rectangle> {
+        match old {
+            Some(old) if old.width * old.height <= new.width * new.height => Some(old),
+            _ => Some(new),
+        }
+    }
+
+    #[test]
+    fn the_waiting_buttons_sit_on_a_row_under_the_words() {
+        let renderer = renderer();
+        for size in [WIDE, Size::new(360.0, 640.0)] {
+            let app = app_of("waiting-failed", size.width);
+            let mut laid = Laid::new(&app, &renderer, size);
+            laid.settle(&renderer, size);
+            let mut all = Vec::new();
+            collect_bounds(&laid.node, iced::Point::ORIGIN, &mut all, 0);
+            let (mut copy, mut cancel) = (None, None);
+            for (rect, _) in all.iter().filter(|(r, _)| r.width > 0.0 && r.height > 0.0) {
+                for message in click(&mut laid, &renderer, size, rect.center()) {
+                    match message {
+                        Message::CopyLink => copy = smaller(copy, *rect),
+                        Message::CancelOAuth => cancel = smaller(cancel, *rect),
+                        _ => {}
+                    }
+                }
+            }
+            let (copy, cancel) = (copy.expect("Copy link"), cancel.expect("Cancel"));
+            assert!(cancel.x >= copy.x + copy.width, "side by side, apart");
+            // Every other node ends above the buttons' row.
+            let row_top = copy.y.min(cancel.y);
+            let text_bottom = all
+                .iter()
+                .map(|(r, _)| r)
+                .filter(|r| r.height > 12.0 && r.height < 120.0 && r.width > copy.width + 20.0)
+                .filter(|r| r.y + r.height <= row_top + 0.5)
+                .count();
+            assert!(
+                text_bottom > 0,
+                "the words end above the buttons at {}",
+                size.width
+            );
+        }
+    }
+}

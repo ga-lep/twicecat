@@ -1596,6 +1596,93 @@ fn waiting() -> App {
     app
 }
 
+const LONG_SERVER: &str =
+    "https://a-very-long-homeserver-name.and-a-longer-subdomain.example.org:8448/end-of-it";
+
+fn typed(user: &str, server: &str) -> App {
+    let mut app = logged_out();
+    press(&mut app, Message::UsernameChanged(user.to_owned()));
+    press(&mut app, Message::ServerChanged(server.to_owned()));
+    app
+}
+
+fn login_server() -> App {
+    typed("@alice:example.org", LONG_SERVER)
+}
+
+fn login_server_open() -> App {
+    let mut app = logged_out();
+    press(&mut app, Message::ToggleServerField);
+    app
+}
+
+fn login_server_notice() -> App {
+    let mut app = logged_out();
+    press(&mut app, Message::OAuthRequested);
+    app
+}
+
+fn login_busy() -> App {
+    let mut app = typed("alice", "matrix.example.org");
+    press(
+        &mut app,
+        Message::PasswordChanged(twicecat_core::api::Password::from("gallery-filler")),
+    );
+    press(&mut app, Message::LoginSubmitted);
+    app
+}
+
+fn waiting_failed() -> App {
+    let mut app = waiting();
+    press(&mut app, Message::BrowserOpened { ok: false });
+    app
+}
+
+fn waiting_opening() -> App {
+    let mut app = logged_out();
+    press(
+        &mut app,
+        Message::ServerChanged("https://matrix.example.org".to_owned()),
+    );
+    press(&mut app, Message::OAuthRequested);
+    feed(
+        &mut app,
+        CoreEvent::OAuthUrl(twicecat_core::api::AuthUrl::from(
+            "https://auth.example.org/authorize?state=gallery",
+        )),
+    );
+    app
+}
+
+fn loading_reconnecting() -> App {
+    let mut app = fresh();
+    feed(
+        &mut app,
+        CoreEvent::LoggedIn {
+            user_id: user("me"),
+            device_id: DeviceId::from("GALLERYDEV"),
+            restored: false,
+        },
+    );
+    feed(
+        &mut app,
+        CoreEvent::SyncState(SyncState::Reconnecting { attempt: 2 }),
+    );
+    app
+}
+
+fn closing() -> App {
+    let mut app = fresh();
+    press(&mut app, Message::CloseRequested);
+    app
+}
+
+fn stopped() -> App {
+    let mut app = fresh();
+    press(&mut app, Message::CoreClosed);
+    app
+}
+
 // ---- Verification ----------------------------------------------------------
 
 fn verification(phase: VerificationPhase) -> App {
@@ -1834,11 +1921,40 @@ pub fn scenarios() -> Vec<Scenario> {
         s("login-error", false, login_error, |a| {
             a.screen == Screen::Login && a.notice.is_some()
         }),
+        s("login-server", false, login_server, |a| {
+            a.screen == Screen::Login && a.login.server.len() > 60
+        }),
+        s("login-server-open", false, login_server_open, |a| {
+            a.screen == Screen::Login && a.login.server_open
+        }),
+        s("login-server-notice", false, login_server_notice, |a| {
+            a.screen == Screen::Login && a.notice.is_some() && a.login.server.is_empty()
+        }),
+        s("login-busy", false, login_busy, |a| {
+            a.screen == Screen::Login && a.login_in_flight
+        }),
         s("waiting", false, waiting, |a| {
             a.screen == Screen::WaitingForBrowser
         }),
+        s("waiting-opening", false, waiting_opening, |a| {
+            a.screen == Screen::WaitingForBrowser && a.browser_opened.is_none()
+        }),
+        s("waiting-failed", false, waiting_failed, |a| {
+            a.screen == Screen::WaitingForBrowser && a.browser_opened == Some(false)
+        }),
         s("loading", false, logged_in_loading, |a| {
             a.screen == Screen::Loading
+        }),
+        s("loading-reconnecting", false, loading_reconnecting, |a| {
+            a.screen == Screen::Loading
+                && matches!(a.sync_state, SyncState::Reconnecting { attempt: 2 })
+        }),
+        s("starting", false, fresh, |a| a.screen == Screen::Starting),
+        s("closing", false, closing, |a| {
+            a.screen == Screen::ShuttingDown
+        }),
+        s("stopped", false, stopped, |a| {
+            a.screen == Screen::Disconnected
         }),
         s("main-no-room", true, main_no_room, |a| {
             in_main(a) && a.selected.is_none() && a.rooms.len() > 10
