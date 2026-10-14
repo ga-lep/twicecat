@@ -97,6 +97,11 @@ pub struct VoiceEngine {
     cleaning_slots: usize,
     /// What a resting cleaner leaves of a quiet voice.
     cleaner_floor: f32,
+    /// The one-shot cue playing (see [`VoiceControl::play_cue`]), the next
+    /// sample to play, and its gain. `'static`: nothing is freed here.
+    cue: &'static [f32],
+    cue_pos: usize,
+    cue_gain: f32,
     muted: bool,
     deafened: bool,
     loopback: bool,
@@ -107,6 +112,9 @@ pub struct VoiceEngine {
     /// What the output device played this frame (all applications), when
     /// the I/O runs an echo reference stream; else the AEC gets our mix.
     played: Option<Frame>,
+    /// The frame handed to the echo canceller last (tests only).
+    #[cfg(test)]
+    rendered: Frame,
     /// Frames between stats refreshes (sonora's stats are not free).
     stats_countdown: u32,
 }
@@ -134,6 +142,9 @@ impl VoiceEngine {
             talking: Vec::with_capacity(16),
             cleaning_slots: CLEANING_SLOTS,
             cleaner_floor: floor_gain(100.0),
+            cue: &[],
+            cue_pos: 0,
+            cue_gain: 0.0,
             muted: false,
             deafened: false,
             loopback: false,
@@ -142,6 +153,8 @@ impl VoiceEngine {
             mic: SILENCE,
             last_mic: SILENCE,
             played: None,
+            #[cfg(test)]
+            rendered: SILENCE,
             stats_countdown: 0,
         };
         let control = VoiceControl {
@@ -221,6 +234,12 @@ impl VoiceEngine {
                     }
                 }
                 Command::CleaningSlots(slots) => self.cleaning_slots = slots,
+                Command::Cue(samples, p) => {
+                    self.cue = samples;
+                    self.cue_pos = 0;
+                    // Never above 100 %, whatever the caller passes.
+                    self.cue_gain = gain_from_percent(p.min(100));
+                }
                 Command::RemoveSource(id) => {
                     if let Some(i) = self.sources.iter().position(|s| s.id == id) {
                         let mut source = self.sources.remove(i);
@@ -249,6 +268,23 @@ impl VoiceEngine {
         if let Some(old) = std::mem::replace(&mut source.cleaner, cleaner) {
             retire(&mut self.retired, old);
         }
+    }
+
+    /// The next 10 ms of the cue, scaled by its gain (zeros when none plays).
+    /// No allocation: it reads a `'static` slice into a stack frame.
+    fn next_cue_frame(&mut self) -> Frame {
+        let mut frame = SILENCE;
+        let rest = self.cue.get(self.cue_pos..).unwrap_or(&[]);
+        let n = rest.len().min(FRAME_LEN);
+        for (f, s) in frame.iter_mut().zip(&rest[..n]) {
+            *f = s * self.cue_gain;
+        }
+        self.cue_pos += n;
+        if n < FRAME_LEN {
+            self.cue = &[];
+            self.cue_pos = 0;
+        }
+        frame
     }
 
     /// Publishes the meters and, about once a second, the echo canceller's
@@ -293,21 +329,30 @@ impl FrameProcessor for VoiceEngine {
                 *m += s;
             }
         }
-        if self.deafened {
-            *playback = SILENCE;
-        } else {
-            for (p, m) in playback.iter_mut().zip(self.mix.iter()) {
-                *p = (m * self.master_gain).clamp(-1.0, 1.0);
-            }
+        // The cue has its own frame so that deafen can silence the voices
+        // and still let it through. Playback is what the echo reference is
+        // taken from, so the cue is in the reference either way.
+        let cue = self.next_cue_frame();
+        // Deafened is exactly the cue: the voices are not multiplied by
+        // zero, so a NaN or inf in the mix cannot get through. `clamp`
+        // passes NaN, so a non-finite sample is zeroed.
+        let deafened = self.deafened;
+        for ((p, m), c) in playback.iter_mut().zip(self.mix.iter()).zip(cue.iter()) {
+            let v = if deafened { *c } else { m + c };
+            let out = (v * self.master_gain).clamp(-1.0, 1.0);
+            *p = if out.is_finite() { out } else { 0.0 };
         }
 
         // The echo reference: what the output device played (a game's sound
         // included) when the I/O captures it, else exactly what we are
         // about to play.
-        match self.played.take() {
-            Some(played) => self.chain.render(&played),
-            None => self.chain.render(playback),
+        let reference = self.played.take();
+        let reference = reference.as_ref().unwrap_or(playback);
+        #[cfg(test)]
+        {
+            self.rendered = *reference;
         }
+        self.chain.render(reference);
 
         self.mic = *capture;
         let result = self.chain.capture(&mut self.mic);
