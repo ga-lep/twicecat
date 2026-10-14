@@ -1831,9 +1831,20 @@ impl App {
         self.send(Command::SetRoomListQuery(query))
     }
 
+    /// The density the app draws in.
+    pub fn density(&self) -> crate::ui::tokens::Density {
+        self.ui_settings.density.into()
+    }
+
+    /// The height of a row of the room list as shown now: the density's, or
+    /// the rail's fixed one.
+    pub fn room_row_height(&self) -> f32 {
+        room_list::list_row_height(self.density(), self.ui_settings.room_list)
+    }
+
     /// What follows every change of the list or of the viewport: paging and
     /// avatar requests.
-    fn after_list_change(&mut self) -> Task<Message> {
+    pub(crate) fn after_list_change(&mut self) -> Task<Message> {
         Task::batch([self.check_paging(), self.request_avatars()])
     }
 
@@ -1846,7 +1857,7 @@ impl App {
         let range = room_list::visible_range(
             self.list_offset_y,
             self.list_viewport_h,
-            room_list::ROW_HEIGHT,
+            self.room_row_height(),
             len,
             room_list::OVERSCAN_ROWS,
         );
@@ -1872,7 +1883,7 @@ impl App {
         let range = room_list::visible_range(
             self.list_offset_y,
             self.list_viewport_h,
-            room_list::ROW_HEIGHT,
+            self.room_row_height(),
             len,
             room_list::OVERSCAN_ROWS,
         );
@@ -10756,6 +10767,75 @@ mod tests {
             assert_eq!(saved.len(), 2, "{saved:?}");
             assert_eq!(saved[1].density, DensityChoice::Compact);
             assert_eq!(saved[1].room_list, RoomListChoice::Rail);
+        }
+
+        fn press(rig: &mut Rig, shortcut: crate::keys::Shortcut) {
+            let _ = rig.app.update(Message::Shortcut {
+                shortcut,
+                captured: false,
+            });
+        }
+
+        #[test]
+        fn ctrl_b_toggles_the_rail_and_saves_each_choice() {
+            use crate::keys::Shortcut;
+            use twicecat_core::api::RoomListChoice;
+            let mut rig = rig();
+            assert_eq!(rig.app.ui_settings.room_list, RoomListChoice::Expanded);
+            press(&mut rig, Shortcut::ToggleRoomList);
+            assert_eq!(rig.app.ui_settings.room_list, RoomListChoice::Rail);
+            press(&mut rig, Shortcut::ToggleRoomList);
+            assert_eq!(rig.app.ui_settings.room_list, RoomListChoice::Expanded);
+            let saved = writes(&rig);
+            assert_eq!(saved.len(), 2, "{saved:?}");
+            assert_eq!(saved[0].room_list, RoomListChoice::Rail);
+            assert_eq!(saved[1].room_list, RoomListChoice::Expanded);
+            // Not on the sign-in screen, where there is no list.
+            rig.app.screen = Screen::Login;
+            press(&mut rig, Shortcut::ToggleRoomList);
+            assert_eq!(rig.app.ui_settings.room_list, RoomListChoice::Expanded);
+        }
+
+        #[test]
+        fn the_room_keys_work_the_same_in_the_rail() {
+            use crate::keys::Shortcut;
+            use twicecat_core::api::RoomListChoice;
+            let mut rig = rig();
+            rig.app.rooms = ["!a:example.org", "!b:example.org", "!c:example.org"]
+                .into_iter()
+                .map(|id| RoomSummary::new(RoomId::from(id), id.to_owned()))
+                .collect();
+            rig.app.rooms[2].unread_messages = 1;
+            for list in [RoomListChoice::Expanded, RoomListChoice::Rail] {
+                rig.app.ui_settings.room_list = list;
+                rig.app.selected = Some(RoomId::from("!a:example.org"));
+                press(&mut rig, Shortcut::NextRoom);
+                assert_eq!(rig.app.selected, Some(RoomId::from("!b:example.org")));
+                press(&mut rig, Shortcut::PreviousRoom);
+                assert_eq!(rig.app.selected, Some(RoomId::from("!a:example.org")));
+                press(&mut rig, Shortcut::NextUnread);
+                assert_eq!(rig.app.selected, Some(RoomId::from("!c:example.org")));
+                press(&mut rig, Shortcut::PreviousUnread);
+                // Only !c is unread: nothing before it to jump to.
+                assert_eq!(rig.app.selected, Some(RoomId::from("!c:example.org")));
+            }
+        }
+
+        #[test]
+        fn a_row_height_change_keeps_the_place_in_the_list() {
+            use twicecat_core::api::{DensityChoice, RoomListChoice};
+            let mut rig = rig();
+            rig.app.list_offset_y = 100.0 * 64.0;
+            st(&mut rig, S::Density(DensityChoice::Compact));
+            assert_eq!(rig.app.list_offset_y, 100.0 * 44.0, "row 100 stays on top");
+            st(&mut rig, S::RoomList(RoomListChoice::Rail));
+            assert_eq!(rig.app.list_offset_y, 100.0 * 56.0);
+            st(&mut rig, S::TrayBadge(false));
+            assert_eq!(
+                rig.app.list_offset_y,
+                100.0 * 56.0,
+                "other settings keep it"
+            );
         }
 
         #[test]

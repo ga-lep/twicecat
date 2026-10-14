@@ -10,7 +10,7 @@ use iced::keyboard::key::Named;
 use iced::keyboard::{Key, Modifiers};
 
 use iced::Task;
-use twicecat_core::api::{RoomId, RoomSummary};
+use twicecat_core::api::{RoomId, RoomListChoice, RoomSummary};
 
 use crate::calls::CallMessage;
 use crate::settings::{SettingsMessage, Zoom};
@@ -47,6 +47,8 @@ pub enum Shortcut {
     Attach,
     /// Open the room switcher.
     Switcher,
+    /// Collapse the room list to a rail, or expand it again.
+    ToggleRoomList,
     /// Open the room below the selected one.
     NextRoom,
     /// Open the room above the selected one.
@@ -149,6 +151,15 @@ pub const SHORTCUTS: &[Binding] = &[
         false,
         false,
         Shortcut::Switcher,
+    ),
+    bound(
+        "Ctrl+B",
+        "Collapse or expand the room list",
+        KeySpec::Char('b'),
+        true,
+        false,
+        false,
+        Shortcut::ToggleRoomList,
     ),
     bound(
         "Alt+Down",
@@ -368,6 +379,7 @@ pub const fn composer_takes(shortcut: Shortcut) -> bool {
         Shortcut::Settings
             | Shortcut::Attach
             | Shortcut::Switcher
+            | Shortcut::ToggleRoomList
             | Shortcut::NextRoom
             | Shortcut::PreviousRoom
             | Shortcut::NextUnread
@@ -470,6 +482,14 @@ impl App {
             Shortcut::Settings => self.update(Message::Settings(SettingsMessage::Open)),
             Shortcut::Attach => self.update(Message::AttachRequested),
             Shortcut::Switcher => self.open_switcher(),
+            Shortcut::ToggleRoomList if self.screen != Screen::Main => Task::none(),
+            Shortcut::ToggleRoomList => {
+                let next = match self.ui_settings.room_list {
+                    RoomListChoice::Expanded => RoomListChoice::Rail,
+                    RoomListChoice::Rail => RoomListChoice::Expanded,
+                };
+                self.update(Message::Settings(SettingsMessage::RoomList(next)))
+            }
             Shortcut::NextRoom => self.step_room(true, false),
             Shortcut::PreviousRoom => self.step_room(false, false),
             Shortcut::NextUnread => self.step_room(true, true),
@@ -584,6 +604,7 @@ mod tests {
             ("K", Shortcut::Switcher),
             ("u", Shortcut::Attach),
             (",", Shortcut::Settings),
+            ("b", Shortcut::ToggleRoomList),
         ];
         for (key, shortcut) in table {
             assert_eq!(shortcut_for(&ch(key), CTRL, Other), Some(shortcut), "{key}");
@@ -691,7 +712,9 @@ mod tests {
 
     #[test]
     fn settings_lists_every_bound_shortcut_and_the_widget_keys() {
-        for want in ["Ctrl+K", "Ctrl+,", "Ctrl+U", "Alt+Down", "Esc", "Enter"] {
+        for want in [
+            "Ctrl+K", "Ctrl+,", "Ctrl+U", "Ctrl+B", "Alt+Down", "Esc", "Enter",
+        ] {
             assert!(SHORTCUTS.iter().any(|row| row.keys == want), "{want}");
         }
     }

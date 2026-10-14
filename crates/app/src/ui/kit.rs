@@ -465,6 +465,39 @@ pub fn tag<'a, M: 'a>(label: &'a str) -> Element<'a, M> {
         .into()
 }
 
+/// The style of an [`icon_tag`]: the tag's, or the highlight colours.
+pub fn icon_tag_style(highlight: bool) -> impl Fn(&Theme) -> container::Style {
+    move |theme| {
+        if highlight {
+            let sem = theme::semantic(theme);
+            container::Style {
+                background: Some(Background::Color(sem.highlight)),
+                text_color: Some(sem.highlight_text),
+                border: border::rounded(tokens::SMALL),
+                ..container::Style::default()
+            }
+        } else {
+            tag_style(theme)
+        }
+    }
+}
+
+/// A [`tag`] that starts with an icon, such as the call pill. With
+/// `highlight` it is drawn in the highlight colours.
+pub fn icon_tag<'a, M: 'a>(icon: Icon, label: String, highlight: bool) -> Element<'a, M> {
+    container(
+        row![
+            text(icon.glyph()).size(tokens::CAPTION),
+            text(label).size(tokens::CAPTION)
+        ]
+        .spacing(tokens::XS)
+        .align_y(iced::Center),
+    )
+    .padding([1.0, tokens::S])
+    .style(icon_tag_style(highlight))
+    .into()
+}
+
 /// A [`tag`] whose colour says how serious it is, for the trust of a person.
 /// The words say the same, so the colour is never the only sign.
 pub fn severity_tag<'a, M: 'a>(severity: Severity, label: &'a str) -> Element<'a, M> {
@@ -723,6 +756,23 @@ mod tests {
         }
         assert_eq!(out.len(), 8);
         out
+    }
+
+    #[test]
+    fn an_icon_tag_is_readable_in_all_eight_palettes_and_highlights_with_the_highlight() {
+        for (name, theme) in all_themes() {
+            for highlight in [false, true] {
+                let style = icon_tag_style(highlight)(&theme);
+                let Some(Background::Color(bg)) = style.background else {
+                    panic!("{name}: no background");
+                };
+                let text = style.text_color.expect("the tag sets its text colour");
+                assert!(contrast(text, bg) >= 4.5, "{name} highlight={highlight}");
+                let sem = crate::theme::semantic(&theme);
+                assert_eq!(bg == sem.highlight, highlight, "{name}");
+            }
+        }
+        let _: Element<'_, ()> = icon_tag(Icon::Speaker, "2".to_owned(), true);
     }
 
     #[test]

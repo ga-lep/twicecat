@@ -45,6 +45,15 @@ pub enum Density {
     Compact,
 }
 
+impl From<twicecat_core::api::DensityChoice> for Density {
+    fn from(choice: twicecat_core::api::DensityChoice) -> Self {
+        match choice {
+            twicecat_core::api::DensityChoice::Comfortable => Self::Comfortable,
+            twicecat_core::api::DensityChoice::Compact => Self::Compact,
+        }
+    }
+}
+
 impl Density {
     /// Padding of panels and bars.
     pub const fn pad(self) -> f32 {
@@ -100,8 +109,12 @@ mod tests {
         assert_eq!(Density::Comfortable.room_row_height(), 64.0);
         assert_eq!(Density::Compact.room_row_height(), 44.0);
         assert_eq!(
-            Density::Comfortable.room_row_height(),
-            crate::room_list::ROW_HEIGHT
+            Density::from(twicecat_core::api::DensityChoice::Compact),
+            Density::Compact
+        );
+        assert_eq!(
+            Density::from(twicecat_core::api::DensityChoice::Comfortable),
+            Density::Comfortable
         );
         assert!(Density::Compact.pad() < Density::Comfortable.pad());
         assert!(Density::Compact.gap() < Density::Comfortable.gap());
