@@ -1621,6 +1621,12 @@ Phase 2 signed off by the human on 2026-10-02 (merge of PR #3). Every other unti
   - It then checks that the count never exceeds the elapsed real time (one frame per 10 ms, plus 2), which shows it runs in real time and not free-running.
 - **Checks:** the test passes, also 30 runs pinned to one busy CPU; the gate was clean.
 
+## Phase 6 / rustls 0.23.45 had four security advisories (fixed 2026-10-14)
+
+- **Found:** cargo-deny in PR #24's lint job (`main` fails it the same way): RUSTSEC-2026-0346 (`Debug` of TLS 1.2/1.3 client session values shows secrets), -0347 (data sent to the outer server after an ECH rejection), -0348 (Brotli certificate decompression can allocate 1 GiB before authentication) and -0349 (an unauthenticated ServerHello can downgrade later connections to classical key exchange). All four are fixed in 0.23.46.
+- **Fix:** `cargo update -p rustls` (0.23.45 → 0.23.46, nothing else moved). `crates/core/Cargo.toml` asks for `rustls = "0.23"`, so no pin changed; only the lockfile did.
+- **Checks:** the gate was clean (1802 tests, clippy also with `--all-features`, `--locked`); `tls_provider` passes; `login` and `call_signalling` pass on the local stack. cargo-deny is not installed here, so the advisories are checked by CI.
+
 ## Phase 6 / joining a call over `wss://` panicked (fixed 2026-10-12)
 
 - **Symptom:** the human joined a call in the app against a real server. The core thread panicked in rustls: "Could not automatically determine the process-level CryptoProvider". The backtrace went through LiveKit's `Room::connect`, then tokio-tungstenite, then `ClientConfig::builder_with_protocol_versions`.
