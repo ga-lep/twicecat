@@ -3124,3 +3124,24 @@ Draft, scope set by the human 2026-10-15. Steps:
 - [ ] Settings, simple and advanced, by eye in light and dark and every colour set: the header switch, each page at both levels, the long advanced Video page scrolling in the 620 px card, a narrow window; the Video page's camera preview with a real webcam (Task 9): it shows the camera mirrored, **Hide my camera** stops it and the webcam's light goes off, unplugging it turns it off with "the camera was disconnected", and the camera list follows cameras plugged in and out.
 - [ ] Voice & audio at the simple level in a real call: the dock's audio button and the push-to-talk pill open the page; microphone test, level meter, "hear myself", noise reduction Off / Standard / Strong really change the sound; switching the advanced switch on and off keeps what was set.
 - [ ] A settings file written before this branch (no `advanced_settings`) starts at the simple level, and the switch survives a restart.
+
+## Phase 7 steps (packaging and release; plan docs/plans/phase7-packaging.md; branch feat/phase7-packaging)
+Plan approved by the human 2026-10-14. Targets: Linux x86_64 and aarch64 (the Steam Frame), Windows x64, macOS arm64; one binary per OS and architecture, always the full (GPU) build, x86-64-v3 on Linux and Windows with a startup CPU check on both; a fat-LTO `dist` profile for releases; the "any GPU" pack (ONNX Runtime CPU, WebGPU plugin, stateful graph) bundled in the Linux packages and the Flatpak; MSI on Windows (unsigned until the human picks a signer); our own Flatpak bundle, not Flathub; updates by an opt-in check and link on Windows and macOS, the package manager on Linux and cargo-packager-updater =0.2.3 in the AppImage; local crash reports; apt and dnf repositories on GitHub Pages (packages by nfpm, signed with a key the human creates) and an AUR `twicecat-bin` (Q13, added 2026-10-14), for distributions as new as Ubuntu 26.04 / Fedora 43, older ones building from source. Measurements (2026-10-14, Core Ultra 9 275HX) are in the plan: v3 saves 11 % of the voice chain against the baseline (11–12 µs per 10 ms, about 0.1 % of a core), `native` and v2 nothing, fat LTO 1–3 % and 22 % of the installed size, the `gpu` feature 0.7 MB.
+- [ ] 1. `--version`, the Windows window, the CPU check on Windows, the tag check (phase7.1)
+- [ ] 2. The `dist` profile and `scripts/measure-builds.sh`, Frame tuning on the arm job (phase7.2)
+- [ ] 3. Bundled resources: models and the "any GPU" pack (phase7.3)
+- [ ] 4. Icon, AppStream metainfo, desktop entry (phase7.4)
+- [ ] 5. Licence notices (phase7.5)
+- [ ] 6. Desktop packages: cargo-packager (MSI, DMG, AppImage) and nfpm (`.deb`, `.rpm`), `.tar.zst` (phase7.6)
+- [ ] 7. Flatpak, x86_64 and aarch64 (phase7.7)
+- [ ] 8. Release workflow (phase7.8)
+- [ ] 9. Updates (phase7.9)
+- [ ] 10. Crash reports (phase7.10)
+- [ ] 11. The sandbox and the Frame, `docs/install.md` (phase7.11)
+- [ ] 12. apt and dnf repositories on GitHub Pages, AUR `twicecat-bin` (phase7.12; added 2026-10-14, plan Q13)
+- [ ] 13. Wrap-up (phase7.13)
+
+## Phase 7 human checkpoint
+See the plan's "Human checkpoint"; items move here as tasks finish. Already open:
+- [ ] Choose the Windows signer (Q6), then add its secrets; add the Apple and AppImage-updater secrets.
+- [ ] The x86-64-v3 against v4 rows on the AMD machine (Galep's Ryzen 7 7800X3D), once Task 2's script exists.
