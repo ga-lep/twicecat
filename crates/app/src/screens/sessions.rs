@@ -1,29 +1,53 @@
-//! The Sessions screen, its password prompt and the logout warning.
+//! The Sessions screen, its password prompt and the logout warning (plan Q13,
+//! Task 13; restyled in UI/UX rework Task 14).
 //!
-//! The screen is a full-window layer over the main view (see
-//! [`crate::screens::main_view::view`]); the prompt and the warning are cards
-//! over it. Views only read the app state: every change goes through
+//! The screen is a modal above the main view (see
+//! [`crate::screens::main_view::view`]); the prompt and the warning are
+//! modals over it. Views only read the app state: every change goes through
 //! `App::update`.
+//!
+//! Session names and IDs come from the server and are untrusted: they pass
+//! through [`crate::sessions`] (cleaned, capped) and are drawn with a break
+//! inside a word when it has none, so no end of an ID is cut off. Every
+//! sign-out keeps its confirmation: the button that asks is a different
+//! button, in a different place, from the one that confirms, and the
+//! destructive buttons sit apart from the others.
 
 use chrono::Local;
+use iced::widget::text::Wrapping;
 use iced::widget::{
-    Column, button, column, container, opaque, row, scrollable, space, stack, text, text_input,
+    Column, Row, column, container, row, scrollable, space, stack, text, text_input,
 };
-use iced::{Element, Fill, Theme};
-use twicecat_core::api::{DeviceSummary, DeviceTrust, Password};
+use iced::{Element, Fill, Length};
+use twicecat_core::api::{DeviceSummary, DeviceTrust, Password, RecoveryStatus};
 
-use crate::screens::security::{card, secondary, wide};
 use crate::security::SecurityModel;
 use crate::sessions::{
     Approval, LOGOUT_WARNING, REAUTH_INPUT_ID, RENAME_INPUT_ID, SessionsMessage, SessionsModel,
-    SignOutAsk, can_verify, device_id_line, device_title, last_active_text, recovery_line,
+    SignOutAsk, can_verify, device_id_line, last_active_text, recovery_line, row_title,
     trust_label,
 };
 use crate::state::{App, Message};
-use crate::theme;
+use crate::ui::fonts;
+use crate::ui::kit::{
+    self, Severity, banner, banner_with, danger_button, empty_state, ghost_button, modal, muted,
+    primary_button, secondary_button, severity_tag,
+};
+use crate::ui::tokens;
 
-/// Width of the Sessions page.
-const PAGE_WIDTH: f32 = 720.0;
+/// Width of the Sessions card.
+pub const CARD_WIDTH: f32 = 760.0;
+/// Height of the Sessions card, with its padding.
+const CARD_HEIGHT: f32 = 620.0;
+/// The least height of the card's content, in a small window.
+const MIN_CARD_HEIGHT: f32 = 240.0;
+/// The padding `kit::modal` puts around the card's content.
+const CARD_PADDING: f32 = 20.0;
+/// Width of the password prompt and the logout warning.
+const PROMPT_WIDTH: f32 = 520.0;
+/// How text wraps here: a break inside a word when it has none, so the end of
+/// a long name or ID is never cut off.
+const WRAP: Wrapping = Wrapping::WordOrGlyph;
 
 /// What the sign-out prompt says.
 pub const REAUTH_TEXT: &str =
@@ -36,13 +60,13 @@ fn msg(message: SessionsMessage) -> Message {
     Message::Sessions(message)
 }
 
-fn muted(label: String) -> Element<'static, Message> {
-    text(label)
-        .size(13)
-        .style(|t: &Theme| text::Style {
-            color: Some(theme::semantic(t).muted),
-        })
-        .into()
+/// Text that wraps on this screen's rules.
+fn words<'a>(label: impl text::IntoFragment<'a>) -> text::Text<'a> {
+    text(label).wrapping(WRAP)
+}
+
+fn caption<'a>(label: impl text::IntoFragment<'a>) -> text::Text<'a> {
+    words(label).size(tokens::CAPTION).style(muted)
 }
 
 /// The layer for the Sessions screen, the password prompt and the logout
@@ -51,7 +75,7 @@ pub fn layer(app: &App) -> Option<Element<'_, Message>> {
     let model = &app.sessions;
     let mut layers: Vec<Element<'_, Message>> = Vec::new();
     if model.open {
-        layers.push(page(model, &app.security));
+        layers.push(iced::widget::responsive(move |size| page(app, size.height)).into());
     }
     if model.open && model.reauth.is_some() {
         layers.push(reauth_card(model));
@@ -66,163 +90,147 @@ pub fn layer(app: &App) -> Option<Element<'_, Message>> {
     }
 }
 
-fn page<'a>(model: &'a SessionsModel, security: &SecurityModel) -> Element<'a, Message> {
+/// The card, 620 high or as high as the window leaves room for.
+fn page(app: &App, window_height: f32) -> Element<'_, Message> {
+    let model = &app.sessions;
     let now = u64::try_from(Local::now().timestamp_millis()).unwrap_or(0);
-    let mut body = Column::new().spacing(12);
-    body = body.push(
-        row![
-            text("Sessions").size(24),
-            space().width(Fill),
-            button(text("Refresh"))
-                .on_press_maybe((!model.loading).then_some(msg(SessionsMessage::Refresh)))
-                .style(button::secondary),
-            button(text("Close"))
-                .on_press(msg(SessionsMessage::Close))
-                .style(button::secondary),
-        ]
-        .spacing(8)
-        .align_y(iced::Center),
-    );
+    let header = row![
+        words("Sessions").size(tokens::HEADLINE).width(Fill),
+        secondary_button(
+            "Refresh",
+            (!model.loading).then_some(msg(SessionsMessage::Refresh)),
+        ),
+        secondary_button("Close", Some(msg(SessionsMessage::Close))),
+    ]
+    .spacing(tokens::M)
+    .align_y(iced::Center);
+    // The bars under the header: a column that is always there and holds
+    // what there is to say (the last failure, an approval, the recovery).
+    let mut bars = Column::new().spacing(tokens::S);
     if let Some(notice) = &model.notice {
-        body = body.push(
-            row![
-                text(notice.as_str()).style(text::danger),
-                space().width(Fill),
-                button(text("\u{2715}"))
-                    .on_press(msg(SessionsMessage::DismissNotice))
-                    .style(button::secondary),
-            ]
-            .spacing(8)
-            .align_y(iced::Center),
-        );
+        bars = bars.push(banner_with(
+            Severity::Danger,
+            notice.as_str(),
+            vec![ghost_button("Dismiss", Some(msg(SessionsMessage::DismissNotice))).into()],
+        ));
     }
     if let Some(approval) = &model.approval {
-        body = body.push(approval_bar(approval));
+        bars = bars.push(approval_bar(approval));
     }
-    if let Some(line) = recovery_bar(security) {
-        body = body.push(line);
+    if let Some(line) = recovery_bar(&app.security) {
+        bars = bars.push(line);
     }
-    let Some(devices) = &model.devices else {
-        let label = if model.loading {
-            "Loading\u{2026}"
-        } else {
-            "The sessions could not be listed."
-        };
-        return page_card(body.push(text(label)).into());
+    let list: Element<'_, Message> = match &model.devices {
+        None => {
+            if model.loading {
+                empty_state("Loading\u{2026}", "Asking the server for your sessions.")
+            } else {
+                empty_state(
+                    "The sessions could not be listed.",
+                    "Press Refresh to try again.",
+                )
+            }
+        }
+        Some(devices) => {
+            let mut rows = Column::new().spacing(tokens::M);
+            for device in devices {
+                rows = rows.push(device_row(model, device, now));
+            }
+            // The scrollbar takes room of its own, so a button at the
+            // right edge of a row is never under it.
+            scrollable(rows)
+                .spacing(tokens::S)
+                .width(Fill)
+                .height(Fill)
+                .into()
+        }
     };
-    let others = devices.iter().filter(|d| !d.current).count();
-    let mut rows = Column::new().spacing(10);
-    for device in devices {
-        rows = rows.push(device_row(model, device, now));
+    // Under the list, apart from the header's buttons: signing out of
+    // everything else. A column that is always there.
+    let mut footer = Column::new().spacing(tokens::S);
+    if model.other_devices().is_some_and(|n| n > 0) {
+        footer = footer.push(sign_out_all(model));
     }
-    body = body.push(scrollable(rows).height(Fill));
-    if others > 0 {
-        body = body.push(sign_out_all(model));
-    }
-    page_card(body.into())
+    let content = column![header, bars, list, footer].spacing(tokens::L);
+    let height = (window_height - 2.0 * CARD_PADDING - 2.0 * tokens::L)
+        .clamp(MIN_CARD_HEIGHT, CARD_HEIGHT - 2.0 * CARD_PADDING);
+    modal(container(content).height(Length::Fixed(height)), CARD_WIDTH)
 }
 
-/// The Recovery line (plan Task 15); its button is off while the core is
-/// busy with a security action.
+/// The Recovery line (plan Task 15): its words and colour say where recovery
+/// stands, and its button, on a row of its own, is off while the core is busy
+/// with a security action.
 fn recovery_bar(security: &SecurityModel) -> Option<Element<'static, Message>> {
     let (label, action) = recovery_line(security.status.recovery)?;
-    let mut bar = row![text(label), space().width(Fill)]
-        .spacing(8)
-        .align_y(iced::Center);
-    if let Some(action) = action {
-        let press = security
-            .busy
-            .is_none()
-            .then(|| Message::Security(action.message()));
-        bar = bar.push(
-            button(text(action.label()))
-                .on_press_maybe(press)
-                .style(button::secondary),
-        );
-    }
-    Some(
-        container(bar)
-            .padding(10)
-            .width(Fill)
-            .style(container::bordered_box)
-            .into(),
-    )
-}
-
-fn page_card(content: Element<'_, Message>) -> Element<'_, Message> {
-    opaque(
-        container(
-            container(content)
-                .padding(24)
-                .max_width(PAGE_WIDTH)
-                .height(Fill)
-                .style(container::bordered_box),
-        )
-        .padding(16)
-        .center_x(Fill)
-        .style(|theme: &Theme| container::Style {
-            background: Some(theme.extended_palette().background.base.color.into()),
-            ..container::Style::default()
-        }),
-    )
+    let severity = match security.status.recovery {
+        RecoveryStatus::Enabled => Severity::Success,
+        _ => Severity::Warning,
+    };
+    let actions: Vec<Element<'static, Message>> = action
+        .map(|action| {
+            let press = security
+                .busy
+                .is_none()
+                .then(|| Message::Security(action.message()));
+            secondary_button(action.label(), press).into()
+        })
+        .into_iter()
+        .collect();
+    Some(banner_with(severity, label, actions))
 }
 
 fn approval_bar(approval: &Approval) -> Element<'_, Message> {
-    container(
-        row![
-            text(format!(
-                "Open {} to approve signing out? Sign in there, then press Refresh.",
-                approval.host
-            )),
-            space().width(Fill),
-            button(text("Open")).on_press(msg(SessionsMessage::ApprovalConfirmed)),
-            button(text("Cancel"))
-                .on_press(msg(SessionsMessage::ApprovalDismissed))
-                .style(button::secondary),
-        ]
-        .spacing(8)
-        .align_y(iced::Center),
+    let text = format!(
+        "Open {} to approve signing out? Sign in there, then press Refresh.",
+        approval.host
+    );
+    banner_with(
+        Severity::Warning,
+        text,
+        vec![
+            ghost_button("Cancel", Some(msg(SessionsMessage::ApprovalDismissed))).into(),
+            primary_button("Open", Some(msg(SessionsMessage::ApprovalConfirmed))).into(),
+        ],
     )
-    .padding(8)
-    .into()
 }
 
 fn sign_out_all(model: &SessionsModel) -> Element<'_, Message> {
     if model.confirm == Some(SignOutAsk::AllOthers) {
-        return confirm_row("Sign out of all other sessions?");
+        return confirm(
+            "Sign out of all other sessions? Each one will have to sign in again.",
+            "Sign out of all",
+        );
     }
     let press = model
         .pending
         .is_none()
         .then_some(msg(SessionsMessage::SignOutAllAsk));
-    button(text("Sign out of all other sessions"))
-        .on_press_maybe(press)
-        .style(button::danger)
-        .into()
+    row![danger_button("Sign out of all other sessions", press)].into()
 }
 
-fn confirm_row(question: &'static str) -> Element<'static, Message> {
-    row![
-        text(question),
-        space().width(Fill),
-        button(text("Sign out"))
-            .on_press(msg(SessionsMessage::SignOutConfirmed))
-            .style(button::danger),
-        button(text("Cancel"))
-            .on_press(msg(SessionsMessage::SignOutCancelled))
-            .style(button::secondary),
+/// The question as a warning, then Cancel at the left and the sign-out far
+/// from it at the right, on a row below the words: the button that asked was
+/// somewhere else, so a second click on it cannot confirm.
+fn confirm(question: &'static str, label: &'static str) -> Element<'static, Message> {
+    column![
+        banner(Severity::Warning, question),
+        row![
+            secondary_button("Cancel", Some(msg(SessionsMessage::SignOutCancelled))),
+            space().width(Fill),
+            danger_button(label, Some(msg(SessionsMessage::SignOutConfirmed))),
+        ]
+        .spacing(tokens::M)
+        .align_y(iced::Center),
     ]
-    .spacing(8)
-    .align_y(iced::Center)
+    .spacing(tokens::S)
     .into()
 }
 
-fn trust_color(trust: DeviceTrust) -> impl Fn(&Theme) -> text::Style {
-    move |t: &Theme| text::Style {
-        color: Some(match trust {
-            DeviceTrust::Verified => t.palette().success,
-            DeviceTrust::Unverified | DeviceTrust::NoKeys => theme::semantic(t).muted,
-        }),
+/// The trust of a session, in words and in the colour of its severity.
+pub fn trust_severity(trust: DeviceTrust) -> Severity {
+    match trust {
+        DeviceTrust::Verified => Severity::Success,
+        DeviceTrust::Unverified | DeviceTrust::NoKeys => Severity::Warning,
     }
 }
 
@@ -232,23 +240,26 @@ fn device_row<'a>(
     now_ms: u64,
 ) -> Element<'a, Message> {
     let id = &device.device_id;
-    let mut head = row![text(device_title(device)).size(17)]
-        .spacing(8)
-        .align_y(iced::Center);
+    let mut tags = Row::new().spacing(tokens::S);
     if device.current {
-        head = head.push(text("This device").size(13).style(text::primary));
+        tags = tags.push(severity_tag(Severity::Info, "This device"));
     }
-    head = head.push(space().width(Fill)).push(
-        text(trust_label(device.trust))
-            .size(13)
-            .style(trust_color(device.trust)),
-    );
+    tags = tags.push(severity_tag(
+        trust_severity(device.trust),
+        trust_label(device.trust),
+    ));
     let mut body = column![
-        head,
-        muted(device_id_line(id)),
-        muted(last_active_text(device.last_seen_ms, now_ms, &Local)),
+        words(row_title(
+            device,
+            model.devices.as_deref().unwrap_or_default()
+        ))
+        .size(tokens::BODY_LARGE)
+        .width(Fill),
+        tags,
+        caption(device_id_line(id)).font(fonts::MONO).width(Fill),
+        caption(last_active_text(device.last_seen_ms, now_ms, &Local)).width(Fill),
     ]
-    .spacing(4);
+    .spacing(tokens::XS);
     if let Some(edit) = model.rename.as_ref().filter(|e| e.device_id == *id) {
         body = body.push(
             row![
@@ -256,47 +267,43 @@ fn device_row<'a>(
                     .id(RENAME_INPUT_ID)
                     .on_input(|s| msg(SessionsMessage::RenameInput(s)))
                     .on_submit(msg(SessionsMessage::RenameSubmitted))
-                    .padding(6),
-                button(text("Save")).on_press(msg(SessionsMessage::RenameSubmitted)),
-                button(text("Cancel"))
-                    .on_press(msg(SessionsMessage::RenameCancelled))
-                    .style(button::secondary),
+                    .padding(tokens::S),
+                primary_button("Save", Some(msg(SessionsMessage::RenameSubmitted))),
+                ghost_button("Cancel", Some(msg(SessionsMessage::RenameCancelled))),
             ]
-            .spacing(8)
+            .spacing(tokens::S)
             .align_y(iced::Center),
         );
     } else if model.confirm == Some(SignOutAsk::One(id.clone())) {
-        body = body.push(confirm_row("Sign out of this session?"));
+        body = body.push(confirm("Sign out of this session?", "Sign out"));
     } else {
-        let mut actions = row![].spacing(8);
+        let mut actions = row![].spacing(tokens::M).align_y(iced::Center);
         if can_verify(device) {
-            actions = actions.push(
-                button(text("Verify").size(14)).on_press(msg(SessionsMessage::Verify(id.clone()))),
-            );
+            actions = actions.push(ghost_button(
+                "Verify",
+                Some(msg(SessionsMessage::Verify(id.clone()))),
+            ));
         }
-        actions = actions.push(
-            button(text("Rename").size(14))
-                .on_press(msg(SessionsMessage::RenameStart(id.clone())))
-                .style(button::secondary),
-        );
+        actions = actions.push(ghost_button(
+            "Rename",
+            Some(msg(SessionsMessage::RenameStart(id.clone()))),
+        ));
         if !device.current {
-            actions = actions.push(
-                button(text("Sign out").size(14))
-                    .on_press_maybe(
-                        model
-                            .pending
-                            .is_none()
-                            .then(|| msg(SessionsMessage::SignOutAsk(id.clone()))),
-                    )
-                    .style(button::danger),
-            );
+            // At the far end, apart from the others by at least the row's gap.
+            actions = actions.push(space().width(Fill)).push(danger_button(
+                "Sign out",
+                model
+                    .pending
+                    .is_none()
+                    .then(|| msg(SessionsMessage::SignOutAsk(id.clone()))),
+            ));
         }
-        body = body.push(actions);
+        body = body.push(column![actions].padding(iced::Padding::ZERO.top(tokens::S)));
     }
     container(body)
-        .padding(10)
+        .padding(tokens::M)
         .width(Fill)
-        .style(container::bordered_box)
+        .style(kit::card_style)
         .into()
 }
 
@@ -306,52 +313,63 @@ fn reauth_card(model: &SessionsModel) -> Element<'_, Message> {
     };
     let submit = (!prompt.waiting && !prompt.password.expose().is_empty())
         .then_some(msg(SessionsMessage::ReauthSubmitted));
-    let mut body = column![text("Enter your password").size(24), text(REAUTH_TEXT)].spacing(12);
+    // The wrong-password line has a slot of its own that is always there.
+    let mut failed = Column::new();
     if prompt.failed {
-        body = body.push(text(WRONG_PASSWORD).style(text::danger));
+        failed = failed.push(banner(Severity::Danger, WRONG_PASSWORD));
     }
-    body = body
-        .push(
-            text_input("Password", prompt.password.expose())
-                .id(REAUTH_INPUT_ID)
-                .secure(true)
-                .on_input_maybe(
-                    (!prompt.waiting).then_some(|s: String| {
-                        msg(SessionsMessage::ReauthInput(Password::from(s)))
-                    }),
-                )
-                .on_submit_maybe(submit.clone())
-                .padding(8),
-        )
-        .push(wide("Continue", submit));
-    if prompt.waiting {
-        body = body.push(text("Signing out\u{2026}"));
+    let status: Element<'_, Message> = if prompt.waiting {
+        words("Signing out\u{2026}").into()
     } else {
-        body = body.push(secondary(
-            "Cancel",
-            Some(msg(SessionsMessage::ReauthCancelled)),
-        ));
-    }
-    card(body.into())
+        space().into()
+    };
+    let body = column![
+        words("Enter your password").size(tokens::HEADLINE),
+        banner(Severity::Warning, REAUTH_TEXT),
+        failed,
+        text_input("Password", prompt.password.expose())
+            .id(REAUTH_INPUT_ID)
+            .secure(true)
+            .on_input_maybe(
+                (!prompt.waiting)
+                    .then_some(|s: String| msg(SessionsMessage::ReauthInput(Password::from(s)))),
+            )
+            .on_submit_maybe(submit.clone())
+            .padding(tokens::S),
+        row![
+            secondary_button(
+                "Cancel",
+                (!prompt.waiting).then_some(msg(SessionsMessage::ReauthCancelled)),
+            ),
+            space().width(Fill),
+            primary_button("Continue", submit),
+        ]
+        .spacing(tokens::M)
+        .align_y(iced::Center),
+        status,
+    ]
+    .spacing(tokens::M);
+    modal(body, PROMPT_WIDTH)
 }
 
 fn logout_card<'a>() -> Element<'a, Message> {
-    card(
-        column![
-            text("Sign out?").size(24),
-            text(LOGOUT_WARNING),
-            wide(
-                "Set up recovery",
-                Some(msg(SessionsMessage::LogoutSetupRecovery))
-            ),
-            button(text("Sign out anyway").center().width(Fill))
-                .on_press(msg(SessionsMessage::LogoutAnyway))
-                .style(button::danger)
-                .width(Fill)
-                .padding(8),
-            secondary("Cancel", Some(msg(SessionsMessage::LogoutCancelled))),
+    let body = column![
+        words("Sign out?").size(tokens::HEADLINE),
+        banner(Severity::Warning, LOGOUT_WARNING),
+        // The way out of the danger first and alone; the sign-out is at the
+        // far end of the row below, away from it.
+        primary_button(
+            "Set up recovery",
+            Some(msg(SessionsMessage::LogoutSetupRecovery))
+        ),
+        row![
+            secondary_button("Cancel", Some(msg(SessionsMessage::LogoutCancelled))),
+            space().width(Fill),
+            danger_button("Sign out anyway", Some(msg(SessionsMessage::LogoutAnyway))),
         ]
-        .spacing(12)
-        .into(),
-    )
+        .spacing(tokens::M)
+        .align_y(iced::Center),
+    ]
+    .spacing(tokens::L);
+    modal(body, PROMPT_WIDTH)
 }

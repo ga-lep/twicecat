@@ -251,6 +251,32 @@ pub fn device_title(device: &DeviceSummary) -> String {
     device_id_line(&device.device_id)
 }
 
+/// The title a row shows. A name that reads like a tag ("Verified", "This
+/// device", ...) or like a device ID of the list is drawn in quotes, so a
+/// session cannot pass for a status or for another session. The ID that
+/// stands in for a missing name is not quoted.
+pub fn row_title(device: &DeviceSummary, all: &[DeviceSummary]) -> String {
+    let title = device_title(device);
+    if title == device_id_line(&device.device_id) {
+        return title;
+    }
+    let lookalike = |other: &str| title.trim().eq_ignore_ascii_case(other.trim());
+    let tag = lookalike("This device")
+        || [
+            DeviceTrust::Verified,
+            DeviceTrust::Unverified,
+            DeviceTrust::NoKeys,
+        ]
+        .into_iter()
+        .any(|trust| lookalike(trust_label(trust)));
+    let id = all.iter().any(|d| lookalike(d.device_id.as_str()));
+    if tag || id {
+        format!("\u{201c}{title}\u{201d}")
+    } else {
+        title
+    }
+}
+
 /// The device ID as a row shows it: one sanitized line, cut in the middle if
 /// at all.
 pub fn device_id_line(id: &DeviceId) -> String {
@@ -713,6 +739,35 @@ mod tests {
                 "{recovery:?} others={others:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_name_that_reads_like_a_tag_or_an_id_is_quoted() {
+        let list = vec![
+            dev("ABCDEF", Some("Laptop"), false, DeviceTrust::Verified),
+            dev("GHIJKL", Some("Verified"), false, DeviceTrust::Unverified),
+            dev(
+                "MNOPQR",
+                Some("this DEVICE"),
+                false,
+                DeviceTrust::Unverified,
+            ),
+            dev("STUVWX", Some("ABCDEF"), false, DeviceTrust::Unverified),
+            dev("YZ0123", Some("Not verified"), false, DeviceTrust::NoKeys),
+            dev("ID4567", None, false, DeviceTrust::NoKeys),
+        ];
+        let titles: Vec<String> = list.iter().map(|d| row_title(d, &list)).collect();
+        assert_eq!(
+            titles,
+            [
+                "Laptop",
+                "\u{201c}Verified\u{201d}",
+                "\u{201c}this DEVICE\u{201d}",
+                "\u{201c}ABCDEF\u{201d}",
+                "\u{201c}Not verified\u{201d}",
+                "ID4567",
+            ]
+        );
     }
 
     #[test]

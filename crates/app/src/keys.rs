@@ -13,6 +13,7 @@ use iced::Task;
 use twicecat_core::api::{RoomId, RoomListChoice, RoomSummary};
 
 use crate::calls::CallMessage;
+use crate::sessions::SessionsMessage;
 use crate::settings::{SettingsMessage, Zoom};
 use crate::state::{App, Message, Screen};
 use crate::switcher::SwitcherMessage;
@@ -632,8 +633,17 @@ impl App {
         if self.settings_ui.open {
             return self.update(Message::Settings(SettingsMessage::Close));
         }
+        // The room dialogs, cards and the member panel are drawn over the
+        // main view's own layers (`App::view`), so they take the key before
+        // the Sessions card under them.
         if self.rooms_ui.overlay_open() {
             return self.update(Message::Rooms(crate::rooms::RoomsMessage::Escape));
+        }
+        // Esc only ever cancels or closes here, never confirms, and the key
+        // stops here: nothing behind the card sees it. The warning and the
+        // prompt are drawn over the card, the question inside it.
+        if let Some(task) = self.sessions_escape() {
+            return task;
         }
         if !from_field && self.composer_has_escape_work() {
             return self.update(Message::ComposerKey(crate::composer::ComposerKey::Escape));
@@ -648,6 +658,32 @@ impl App {
             return self.update(Message::Call(CallMessage::TogglePanel));
         }
         Task::none()
+    }
+
+    /// Esc over the logout warning or the Sessions card: the topmost of the
+    /// warning, the password prompt, the sign-out question and the card goes.
+    /// `None` when none of them is open. While the password is on its way
+    /// the prompt cannot be cancelled, and the key is swallowed.
+    fn sessions_escape(&mut self) -> Option<Task<Message>> {
+        let message = if self.sessions.logout_warning {
+            SessionsMessage::LogoutCancelled
+        } else if !self.sessions.open {
+            return None;
+        } else if let Some(prompt) = &self.sessions.reauth {
+            if prompt.waiting {
+                return Some(Task::none());
+            }
+            SessionsMessage::ReauthCancelled
+        } else if self.sessions.confirm.is_some() {
+            SessionsMessage::SignOutCancelled
+        } else if self.sessions.rename.is_some() {
+            // The rename field (it also drops its focus on Esc): cancel the
+            // edit, keep the card.
+            SessionsMessage::RenameCancelled
+        } else {
+            SessionsMessage::Close
+        };
+        Some(self.update(Message::Sessions(message)))
     }
 
     /// Whether Esc would close the composer's suggestions or leave reply or

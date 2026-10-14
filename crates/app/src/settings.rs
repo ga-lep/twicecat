@@ -43,7 +43,14 @@ pub const MAX_STALE_EVENTS: u8 = 3;
 
 /// The Voice & audio section of Settings.
 pub const VOICE_AUDIO_LINE: &str = "Devices, voice activity or push-to-talk (a key or a gamepad button), microphone processing, volume, the mic test, the ringtone, and cleaning other voices.";
-/// The note under the shortcut list.
+/// The line on the Sessions page of Settings.
+pub const SESSIONS_LINE: &str = "See where you are signed in, which sessions are verified, and sign out of the ones you do not use.";
+/// The typeface line on the About page (SIL OFL 1.1 asks for the notice).
+pub const INTER_ATTRIBUTION: &str =
+    "Inter typeface \u{a9} 2016 The Inter Project Authors, SIL Open Font License 1.1.";
+/// Where the typeface's licence is, shown under [`INTER_ATTRIBUTION`].
+pub const INTER_NOTICES: &str = "The licence text is in OFL.txt in the source (crates/app/assets/fonts/inter) and in THIRD-PARTY-NOTICES.md; see also https://openfontlicense.org";
+/// The note about dropping files, on the About page.
 pub const DRAG_AND_DROP_NOTE: &str = "Dragging files into the window does not work on a native Wayland window (an upstream limit). Use Attach (Ctrl+U) or paste instead.";
 
 /// Why a field is not sent, or a change did not happen. The words are fixed;
@@ -228,6 +235,8 @@ impl fmt::Debug for ProfileSummary {
 pub struct SettingsModel {
     /// The screen is open.
     pub open: bool,
+    /// The page shown.
+    pub page: SettingsPage,
     /// The display name field.
     pub name: MessageText,
     /// The field was edited since the profile last filled it.
@@ -252,6 +261,7 @@ impl Default for SettingsModel {
     fn default() -> Self {
         Self {
             open: false,
+            page: SettingsPage::default(),
             name: MessageText::from(""),
             name_edited: false,
             profile: None,
@@ -270,6 +280,7 @@ impl fmt::Debug for SettingsModel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SettingsModel")
             .field("open", &self.open)
+            .field("page", &self.page)
             .field("name_edited", &self.name_edited)
             .field("profile", &self.profile)
             .field("avatar_busy", &self.avatar_busy)
@@ -452,6 +463,81 @@ impl fmt::Display for RoomListOption {
     }
 }
 
+/// A page of the Settings card. Each section of the old single column is
+/// one page; nothing else about the settings changed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum SettingsPage {
+    /// Display name and picture. Settings opens here (Ctrl+, too).
+    #[default]
+    Profile,
+    /// Theme, colours, density, room list and text size.
+    Appearance,
+    /// Default modes, keywords and the three local toggles.
+    Notifications,
+    /// A line and a button that opens the Voice & audio card.
+    VoiceAudio,
+    /// The shortcut list.
+    Keyboard,
+    /// A button that opens the Sessions screen.
+    Sessions,
+    /// The version, the drag-and-drop note and the font attribution.
+    About,
+}
+
+impl SettingsPage {
+    /// Every page, in the order of the list at the left of the card.
+    pub const ALL: [Self; 7] = [
+        Self::Profile,
+        Self::Appearance,
+        Self::Notifications,
+        Self::VoiceAudio,
+        Self::Keyboard,
+        Self::Sessions,
+        Self::About,
+    ];
+
+    /// The name in the list, and the page's title.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Profile => "Profile",
+            Self::Appearance => "Appearance",
+            Self::Notifications => "Notifications",
+            Self::VoiceAudio => "Voice & audio",
+            Self::Keyboard => "Keyboard",
+            Self::Sessions => "Sessions",
+            Self::About => "About",
+        }
+    }
+
+    /// Where the page is in [`Self::ALL`].
+    pub fn index(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|p| *p == self)
+            .expect("every page is in ALL")
+    }
+
+    /// The messages the page's controls send (by [`SettingsMessage::name`]).
+    pub const fn sends(self) -> &'static [&'static str] {
+        match self {
+            Self::Profile => &["NameInput", "SaveName", "ChooseAvatar", "RemoveAvatar"],
+            Self::Appearance => &["Theme", "Palette", "Density", "RoomList", "Zoom"],
+            Self::Notifications => &[
+                "DefaultMode",
+                "KeywordInput",
+                "AddKeyword",
+                "RemoveKeyword",
+                "DesktopNotifications",
+                "ShowMessageContent",
+                "TrayBadge",
+            ],
+            Self::VoiceAudio => &["OpenVoiceAudio"],
+            Self::Keyboard | Self::About => &[],
+            Self::Sessions => &["OpenSessions"],
+        }
+    }
+}
+
 /// A message of the Settings screen.
 #[derive(Debug, Clone)]
 pub enum SettingsMessage {
@@ -459,6 +545,8 @@ pub enum SettingsMessage {
     Open,
     /// **Close**, Esc.
     Close,
+    /// A page of the list at the left of the card.
+    Page(SettingsPage),
     /// **Manage sessions**.
     OpenSessions,
     /// **Voice & audio** (plan Q5): closes Settings and opens that card.
@@ -506,6 +594,77 @@ pub enum SettingsMessage {
     Zoom(Zoom),
     /// The settings file was written (`true`) or not.
     Saved(bool),
+}
+
+impl SettingsMessage {
+    /// The variant's name. The match is exhaustive on purpose: a new message
+    /// cannot be added without a name, and a test then asks for its page.
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::Open => "Open",
+            Self::Close => "Close",
+            Self::Page(_) => "Page",
+            Self::OpenSessions => "OpenSessions",
+            Self::OpenVoiceAudio => "OpenVoiceAudio",
+            Self::NameInput(_) => "NameInput",
+            Self::SaveName => "SaveName",
+            Self::ChooseAvatar => "ChooseAvatar",
+            Self::AvatarPicked(_) => "AvatarPicked",
+            Self::AvatarReady(_) => "AvatarReady",
+            Self::RemoveAvatar => "RemoveAvatar",
+            Self::DefaultMode { .. } => "DefaultMode",
+            Self::KeywordInput(_) => "KeywordInput",
+            Self::AddKeyword => "AddKeyword",
+            Self::RemoveKeyword(_) => "RemoveKeyword",
+            Self::DesktopNotifications(_) => "DesktopNotifications",
+            Self::ShowMessageContent(_) => "ShowMessageContent",
+            Self::TrayBadge(_) => "TrayBadge",
+            Self::Theme(_) => "Theme",
+            Self::Palette(_) => "Palette",
+            Self::Density(_) => "Density",
+            Self::RoomList(_) => "RoomList",
+            Self::Zoom(_) => "Zoom",
+            Self::Saved(_) => "Saved",
+        }
+    }
+
+    /// The names of every message (kept by hand beside [`Self::name`]; a test
+    /// checks that each belongs to a page, the card or [`Self::NOT_FROM_A_CONTROL`]).
+    pub const ALL_NAMES: [&'static str; 24] = [
+        "Open",
+        "Close",
+        "Page",
+        "OpenSessions",
+        "OpenVoiceAudio",
+        "NameInput",
+        "SaveName",
+        "ChooseAvatar",
+        "AvatarPicked",
+        "AvatarReady",
+        "RemoveAvatar",
+        "DefaultMode",
+        "KeywordInput",
+        "AddKeyword",
+        "RemoveKeyword",
+        "DesktopNotifications",
+        "ShowMessageContent",
+        "TrayBadge",
+        "Theme",
+        "Palette",
+        "Density",
+        "RoomList",
+        "Zoom",
+        "Saved",
+    ];
+
+    /// The messages of the card itself, on every page: its Close button and
+    /// its list of pages.
+    pub const CARD_WIDE: [&'static str; 2] = ["Close", "Page"];
+
+    /// Messages that no control of a page sends: the account area and
+    /// Ctrl+, open the card, a dialog and a task answer, a write ends.
+    pub const NOT_FROM_A_CONTROL: [&'static str; 4] =
+        ["Open", "AvatarPicked", "AvatarReady", "Saved"];
 }
 
 impl App {
@@ -561,6 +720,12 @@ impl App {
             M::Close => {
                 self.settings_ui.open = false;
                 self.settings_ui.error = None;
+                Task::none()
+            }
+            M::Page(page) => {
+                if self.settings_ui.open {
+                    self.settings_ui.page = page;
+                }
                 Task::none()
             }
             M::OpenVoiceAudio => {
@@ -691,6 +856,7 @@ impl App {
         }
         let ui = &mut self.settings_ui;
         ui.open = true;
+        ui.page = SettingsPage::Profile;
         ui.error = None;
         // Keyboard focus moves off the composer, under the screen.
         iced::widget::operation::focus(NAME_INPUT_ID)
