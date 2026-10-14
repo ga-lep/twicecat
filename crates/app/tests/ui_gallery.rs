@@ -300,6 +300,10 @@ fn the_fixture_reaches_every_screen_it_names() {
         "main-call-joining",
         "main-call-connected",
         "main-call-reconnecting",
+        "main-call-unencrypted",
+        "main-call-ptt-muted",
+        "main-call-rows-open",
+        "ring-long-id",
         "ring-dm",
         "ring-group",
         "voice-audio",
@@ -1373,6 +1377,15 @@ fn ctrl_wheel_over_the_menus_of_the_settings_and_call_screens_changes_nothing() 
     fixture::call_connected(&mut with_panel);
     fixture::call_panel_open(&mut with_panel);
     apps.push(("call panel".to_owned(), with_panel));
+    // Open rows show the volume slider and the cleaning menu.
+    apps.push((
+        "call panel, rows open".to_owned(),
+        scenario_app("main-call-rows-open"),
+    ));
+    apps.push((
+        "call dock, push-to-talk".to_owned(),
+        scenario_app("main-call-ptt-idle"),
+    ));
     for (name, app) in &apps {
         let mut laid = Laid::new(app, &renderer, WIDE);
         laid.settle(&renderer, WIDE);
@@ -1420,5 +1433,541 @@ fn ctrl_wheel_over_the_menus_of_the_settings_and_call_screens_changes_nothing() 
             changed.is_empty(),
             "Ctrl + wheel changed a setting on {name}: {changed:?}"
         );
+    }
+}
+
+// ---- Task 11: the call dock, the participants panel and the ring card -----
+
+fn scenario_app(name: &str) -> App {
+    let scenario = fixture::scenarios()
+        .into_iter()
+        .find(|s| s.name == name)
+        .unwrap_or_else(|| panic!("no scenario {name}"));
+    (scenario.build)()
+}
+
+/// The slot after the list: the dock (a column of its blocks).
+fn dock_slot<'n>(laid: &'n Laid<'_>) -> &'n Node {
+    &list_column(list_pane_node(laid)).children()[4]
+}
+
+/// The lines of the dock's card: the dock column's first block is the card's
+/// container, around a column of lines.
+fn dock_lines(dock: &Node) -> &[Node] {
+    dock.children()[0].children()[0].children()
+}
+
+fn with_settings(app: &mut App, density: (DensityChoice, &str), list: RoomListChoice) {
+    let mut settings = variants(false)[0].settings();
+    settings.density = density.0;
+    settings.room_list = list;
+    app.set_ui_settings(settings);
+    app.window_width = WIDE.width;
+}
+
+const CALL_SCENARIOS: [&str; 8] = [
+    "main-call-joining",
+    "main-call-connected",
+    "main-call-reconnecting",
+    "main-call-unencrypted",
+    "main-call-ptt-idle",
+    "main-call-ptt-talking",
+    "main-call-ptt-muted",
+    "main-call-notice",
+];
+
+#[test]
+fn the_expanded_dock_never_spills_and_keeps_leave_apart_at_300_px() {
+    let renderer = renderer();
+    for name in CALL_SCENARIOS {
+        for density in DENSITIES {
+            let mut app = scenario_app(name);
+            with_settings(&mut app, density, RoomListChoice::Expanded);
+            let laid = Laid::new(&app, &renderer, WIDE);
+            let column = list_column(list_pane_node(&laid));
+            let dock = dock_slot(&laid);
+            let what = format!("{name} {}", density.1);
+            assert_eq!(column.bounds().width, 300.0 - 2.0 * tokens_s(), "{what}");
+            assert!(
+                (dock.bounds().width - column.bounds().width).abs() < 0.5,
+                "{what}: the dock is {} wide",
+                dock.bounds().width
+            );
+            let mut out = Vec::new();
+            spills(dock, iced::Point::ORIGIN, &mut out);
+            assert!(out.is_empty(), "{what}: spills {out:?}");
+            if name == "main-call-notice" {
+                // A notice alone: a banner, no call card.
+                assert!(dock.bounds().height > 0.0, "{what}");
+                continue;
+            }
+            let lines = dock_lines(dock);
+            let controls = lines.last().expect("the controls row");
+            // [mic, deafen, audio, spacer, leave]
+            let kids = controls.children();
+            assert_eq!(kids.len(), 5, "{what}");
+            let (audio, leave) = (kids[2].bounds(), kids[4].bounds());
+            assert!(
+                leave.x - (audio.x + audio.width) >= 15.5,
+                "{what}: Leave is {} px from Audio",
+                leave.x - (audio.x + audio.width)
+            );
+            assert!(
+                leave.x + leave.width <= controls.bounds().width + 0.5,
+                "{what}: Leave runs out of the row"
+            );
+            for (i, kid) in kids.iter().enumerate() {
+                assert!(
+                    kid.bounds().x + kid.bounds().width <= controls.bounds().width + 0.5,
+                    "{what}: control {i} is cut off"
+                );
+            }
+            // The Audio button is an icon button, no wider than a normal one.
+            assert!(audio.width <= 48.0, "{what}: Audio is {} wide", audio.width);
+        }
+    }
+}
+
+/// The pane's inner padding, for the arithmetic of the width check.
+fn tokens_s() -> f32 {
+    twicecat_app::ui::tokens::S
+}
+
+#[test]
+fn a_long_room_name_wraps_in_the_dock_instead_of_being_cut() {
+    let renderer = renderer();
+    let mut short = scenario_app("main-call-connected");
+    let mut long = scenario_app("main-call-connected");
+    let name = "W".repeat(150);
+    for room in &mut long.rooms {
+        if room.id.as_str().starts_with("!lounge") {
+            room.name = name.clone();
+        }
+    }
+    let heights: Vec<f32> = [&mut short, &mut long]
+        .into_iter()
+        .map(|app| {
+            with_settings(app, DENSITIES[0], RoomListChoice::Expanded);
+            let laid = Laid::new(app, &renderer, WIDE);
+            let dock = dock_slot(&laid);
+            let mut out = Vec::new();
+            spills(dock, iced::Point::ORIGIN, &mut out);
+            assert!(out.is_empty(), "spills {out:?}");
+            dock.bounds().height
+        })
+        .collect();
+    assert!(
+        heights[1] >= heights[0] + 20.0,
+        "a long unbroken name takes more lines: {heights:?}"
+    );
+}
+
+#[test]
+fn the_dock_slot_keeps_its_place_with_and_without_a_call() {
+    let renderer = renderer();
+    let mut app = scenario_app("main-call-connected");
+    for list in [RoomListChoice::Expanded, RoomListChoice::Rail] {
+        with_settings(&mut app, DENSITIES[0], list);
+        for connected in [true, false] {
+            if connected {
+                fixture::call_connected(&mut app);
+            } else {
+                fixture::call_left(&mut app);
+            }
+            let laid = Laid::new(&app, &renderer, WIDE);
+            let column = list_column(list_pane_node(&laid));
+            assert_eq!(column.children().len(), 5, "{list:?} call={connected}");
+            assert_eq!(
+                dock_slot(&laid).bounds().height > 0.0,
+                connected,
+                "{list:?} call={connected}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_rail_dock_fits_72_px_and_keeps_leave_apart_from_deafen() {
+    let renderer = renderer();
+    for name in CALL_SCENARIOS {
+        for density in DENSITIES {
+            let mut app = scenario_app(name);
+            with_settings(&mut app, density, RoomListChoice::Rail);
+            let laid = Laid::new(&app, &renderer, WIDE);
+            let pane = list_pane_node(&laid);
+            assert_eq!(pane.bounds().width, 72.0);
+            let dock = dock_slot(&laid);
+            let what = format!("{name} {}", density.1);
+            let mut out = Vec::new();
+            spills(dock, iced::Point::ORIGIN, &mut out);
+            assert!(out.is_empty(), "{what}: spills {out:?}");
+            assert!(
+                dock.bounds().width <= list_column(pane).bounds().width + 0.5,
+                "{what}"
+            );
+            if name == "main-call-notice" {
+                continue;
+            }
+            // The card's column: [phase, lock?, declined?, mic, deafen, gap, leave].
+            let items = dock.children()[0].children();
+            let n = items.len();
+            let leave = items[n - 1].bounds();
+            // The control above Leave (skipping the zero-width gap).
+            let above = items[..n - 1]
+                .iter()
+                .rev()
+                .map(Node::bounds)
+                .find(|b| b.width > 0.0)
+                .expect("a control above Leave");
+            assert!(
+                leave.y - (above.y + above.height) >= 12.0,
+                "{what}: Leave is {} px below the control above",
+                leave.y - (above.y + above.height)
+            );
+        }
+    }
+}
+
+/// The panes row of the main view: `[spaces, list, room, thread, call]`.
+fn panes_node<'n>(laid: &'n Laid<'_>) -> &'n Node {
+    let mut node = &laid.node;
+    loop {
+        let kids = node.children();
+        if kids.len() == 3 && kids[1].children().len() == 5 {
+            return &kids[1];
+        }
+        assert!(!kids.is_empty(), "no main column in the layout");
+        node = &kids[0];
+    }
+}
+
+/// Every node under `node` with `count` children, depth first.
+fn nodes_with<'n>(node: &'n Node, count: usize, out: &mut Vec<&'n Node>) {
+    if node.children().len() == count {
+        out.push(node);
+    }
+    for child in node.children() {
+        nodes_with(child, count, out);
+    }
+}
+
+#[test]
+fn the_participants_panel_is_320_wide_and_its_open_rows_have_room_for_the_slider() {
+    let renderer = renderer();
+    for density in DENSITIES {
+        for name in ["main-call-connected", "main-call-rows-open"] {
+            let mut app = scenario_app(name);
+            with_settings(&mut app, density, RoomListChoice::Expanded);
+            let laid = Laid::new(&app, &renderer, WIDE);
+            let slot = &panes_node(&laid).children()[4];
+            let what = format!("{name} {}", density.1);
+            assert_eq!(slot.bounds().width, 320.0, "{what}");
+            let mut out = Vec::new();
+            spills(slot, iced::Point::ORIGIN, &mut out);
+            assert!(out.is_empty(), "{what}: spills {out:?}");
+            // Every row's [picture, details, More]: the words get real room
+            // and are not covered by the button.
+            let mut tops = Vec::new();
+            nodes_with(slot, 3, &mut tops);
+            let tops: Vec<&Node> = tops
+                .into_iter()
+                .filter(|n| {
+                    let first = n.children()[0].bounds();
+                    first.width > 38.0 && first.width < 42.0 && first.height < 44.0
+                })
+                .collect();
+            assert!(!tops.is_empty(), "{what}: no participant row found");
+            for top in &tops {
+                let (picture, details, more) = (
+                    top.children()[0].bounds(),
+                    top.children()[1].bounds(),
+                    top.children()[2].bounds(),
+                );
+                assert!(
+                    details.x >= picture.x + picture.width,
+                    "{what}: details cover the picture"
+                );
+                assert!(
+                    details.x + details.width <= more.x + 0.5,
+                    "{what}: the More button covers the words"
+                );
+                assert!(details.width >= 120.0, "{what}: details {details:?}");
+            }
+            // The volume row: [-, slider, +, percent].
+            let mut sliders = Vec::new();
+            nodes_with(slot, 4, &mut sliders);
+            let sliders: Vec<&&Node> = sliders
+                .iter()
+                .filter(|n| {
+                    let slider = n.children()[1].bounds();
+                    slider.width > 40.0 && n.children()[3].bounds().width == 44.0
+                })
+                .collect();
+            let open = if name == "main-call-rows-open" { 2 } else { 0 };
+            assert_eq!(sliders.len(), open, "{what}: open volume rows");
+            for row in sliders {
+                assert!(
+                    row.children()[1].bounds().width >= 100.0,
+                    "{what}: the slider is {} wide",
+                    row.children()[1].bounds().width
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn the_ring_card_keeps_decline_and_accept_apart_below_the_words() {
+    let renderer = renderer();
+    let mut heights = Vec::new();
+    for name in ["ring-dm", "ring-group", "ring-long-id"] {
+        for size in SIZES {
+            let mut app = scenario_app(name);
+            with_settings(&mut app, DENSITIES[0], RoomListChoice::Expanded);
+            app.window_width = size.width;
+            let laid = Laid::new(&app, &renderer, size);
+            let what = format!("{name} {size:?}");
+            // The root is the stack [base, card layer]; the layer is an
+            // opaque container around the card.
+            let layer = laid.node.children().last().expect("the card layer");
+            let mut out = Vec::new();
+            spills(layer, iced::Point::ORIGIN, &mut out);
+            assert!(out.is_empty(), "{what}: spills {out:?}");
+            let mut pairs = Vec::new();
+            nodes_with(layer, 2, &mut pairs);
+            let buttons: Vec<&&Node> = pairs
+                .iter()
+                .filter(|n| {
+                    let (a, b) = (n.children()[0].bounds(), n.children()[1].bounds());
+                    (a.y - b.y).abs() < 0.5
+                        && (a.width - b.width).abs() < 1.0
+                        && a.width > 100.0
+                        && a.height < 80.0
+                        && a.height > 20.0
+                })
+                .collect();
+            let row = buttons.last().expect("the Decline and Accept row");
+            let (decline, accept) = (row.children()[0].bounds(), row.children()[1].bounds());
+            assert!(
+                accept.x - (decline.x + decline.width) >= 15.5,
+                "{what}: gap {}",
+                accept.x - (decline.x + decline.width)
+            );
+            assert!(decline.x < accept.x, "{what}: Decline comes first");
+            if size == WIDE {
+                heights.push((name, layer.children()[0].bounds().height));
+            }
+        }
+    }
+    // A user ID with no break point wraps by glyph: the card grows instead of
+    // the end of the ID being cut off.
+    let height = |n: &str| heights.iter().find(|(m, _)| *m == n).expect("height").1;
+    // Glyph breaks wrap the one long word over more lines than Word wrapping,
+    // which leaves it running past the edge of the card.
+    assert!(
+        height("ring-long-id") >= height("ring-group") + 45.0,
+        "{heights:?}"
+    );
+}
+
+#[test]
+fn a_ring_answered_keeps_both_buttons_off_and_in_place() {
+    let renderer = renderer();
+    let mut app = scenario_app("ring-dm");
+    with_settings(&mut app, DENSITIES[0], RoomListChoice::Expanded);
+    let before = Laid::new(&app, &renderer, WIDE).node.bounds();
+    for ring in &mut app.calls.rings {
+        ring.answered = true;
+    }
+    let after = Laid::new(&app, &renderer, WIDE).node.bounds();
+    assert_eq!(before, after);
+}
+
+/// The absolute top-left of `target` below `node` (whose own top-left is
+/// `at`), found by identity.
+fn origin_of(node: &Node, target: &Node, at: iced::Point) -> Option<iced::Point> {
+    let b = node.bounds();
+    let here = iced::Point::new(at.x + b.x, at.y + b.y);
+    if std::ptr::eq(node, target) {
+        return Some(here);
+    }
+    node.children()
+        .iter()
+        .find_map(|child| origin_of(child, target, here))
+}
+
+/// The centre of `target` in window coordinates.
+fn centre_of(laid: &Laid<'_>, target: &Node) -> iced::Point {
+    let origin =
+        origin_of(&laid.node, target, iced::Point::ORIGIN).expect("the node is in the tree");
+    let b = target.bounds();
+    iced::Point::new(origin.x + b.width / 2.0, origin.y + b.height / 2.0)
+}
+
+/// [`click`] after the redraw that tells buttons their status.
+fn settled_click(laid: &mut Laid<'_>, renderer: &Renderer, at: iced::Point) -> Vec<Message> {
+    laid.settle(renderer, WIDE);
+    click(laid, renderer, WIDE, at)
+}
+
+/// The ring card's Decline and Accept nodes (the row of two equal halves).
+fn ring_row<'n>(laid: &'n Laid<'_>) -> &'n Node {
+    let layer = laid.node.children().last().expect("the card layer");
+    let mut pairs = Vec::new();
+    nodes_with(layer, 2, &mut pairs);
+    pairs
+        .into_iter()
+        .rfind(|n| {
+            let (a, b) = (n.children()[0].bounds(), n.children()[1].bounds());
+            (a.y - b.y).abs() < 0.5
+                && (a.width - b.width).abs() < 1.0
+                && a.width > 100.0
+                && a.height < 80.0
+                && a.height > 20.0
+        })
+        .expect("the Decline and Accept row")
+}
+
+fn ring_clicks(app: &App, renderer: &Renderer) -> (Vec<Message>, Vec<Message>, Vec<Message>) {
+    let mut laid = Laid::new(app, renderer, WIDE);
+    let row = ring_row(&laid);
+    let (decline, accept) = (
+        centre_of(&laid, &row.children()[0]),
+        centre_of(&laid, &row.children()[1]),
+    );
+    let between = iced::Point::new(WIDE.width / 2.0, accept.y);
+    let a = settled_click(&mut laid, renderer, accept);
+    let d = settled_click(&mut laid, renderer, decline);
+    let m = settled_click(&mut laid, renderer, between);
+    (a, d, m)
+}
+
+#[test]
+fn a_click_on_a_ring_card_that_just_showed_answers_nothing_and_a_later_one_does() {
+    use twicecat_app::calls::CallMessage;
+    let renderer = renderer();
+    let mut app = scenario_app("ring-dm");
+    with_settings(&mut app, DENSITIES[0], RoomListChoice::Expanded);
+    assert!(app.calls.arming(), "the card has just shown");
+    let (accept, decline, centre) = ring_clicks(&app, &renderer);
+    assert!(accept.is_empty(), "Accept while arming: {}", accept.len());
+    assert!(
+        decline.is_empty(),
+        "Decline while arming: {}",
+        decline.len()
+    );
+    assert!(centre.is_empty());
+    // The hint says why the buttons are off.
+    let seq = app.calls.arm_seq();
+    let _ = app.update(Message::RingArmed(seq));
+    assert!(!app.calls.arming());
+    let (accept, decline, centre) = ring_clicks(&app, &renderer);
+    assert!(
+        matches!(accept.as_slice(), [Message::Call(CallMessage::Accept(_))]),
+        "Accept once armed"
+    );
+    assert!(
+        matches!(decline.as_slice(), [Message::Call(CallMessage::Decline(_))]),
+        "Decline once armed"
+    );
+    // The window's centre (where a click in flight lands) is the gap
+    // between the buttons: neither.
+    assert!(centre.is_empty(), "the gap answers nothing");
+}
+
+#[test]
+fn the_ring_card_puts_the_window_centre_in_a_wide_gap_with_accept_on_the_right() {
+    let renderer = renderer();
+    for size in SIZES {
+        for name in ["ring-dm", "ring-group", "ring-long-id"] {
+            let mut app = scenario_app(name);
+            with_settings(&mut app, DENSITIES[0], RoomListChoice::Expanded);
+            app.window_width = size.width;
+            let laid = Laid::new(&app, &renderer, size);
+            let row = ring_row(&laid);
+            let decline = centre_of(&laid, &row.children()[0]);
+            let accept = centre_of(&laid, &row.children()[1]);
+            let (dw, aw) = (
+                row.children()[0].bounds().width,
+                row.children()[1].bounds().width,
+            );
+            let gap_from = decline.x + dw / 2.0;
+            let gap_to = accept.x - aw / 2.0;
+            assert!(gap_to - gap_from >= 16.0, "{name} {size:?}: gap");
+            let centre = size.width / 2.0;
+            assert!(
+                centre > gap_from && centre < gap_to,
+                "{name} {size:?}: the window centre {centre} is in the gap {gap_from}..{gap_to}"
+            );
+            assert!(decline.x < accept.x);
+        }
+    }
+}
+
+#[test]
+fn clicking_the_notice_mark_or_text_never_dismisses_it_but_its_close_button_does() {
+    use twicecat_app::calls::CallMessage;
+    let renderer = renderer();
+    for list in [RoomListChoice::Expanded, RoomListChoice::Rail] {
+        let mut app = scenario_app("main-call-notice");
+        with_settings(&mut app, DENSITIES[0], list);
+        assert!(app.calls.call.is_none() && app.calls.notice.is_some());
+        let mut laid = Laid::new(&app, &renderer, WIDE);
+        let dock = dock_slot(&laid);
+        let (words, close) = match list {
+            // The banner: a container around [row of icon and words, row of
+            // buttons].
+            RoomListChoice::Expanded => {
+                let column = &dock.children()[0].children()[0];
+                (&column.children()[0], &column.children()[1].children()[0])
+            }
+            // The rail: a container around [warning mark, close button].
+            RoomListChoice::Rail => {
+                let column = &dock.children()[0];
+                (&column.children()[0], &column.children()[1])
+            }
+        };
+        let (words_at, close_at) = (centre_of(&laid, words), centre_of(&laid, close));
+        let on_words = settled_click(&mut laid, &renderer, words_at);
+        assert!(
+            on_words.is_empty(),
+            "{list:?}: the notice's mark took a click: {on_words:?}"
+        );
+        let on_close = settled_click(&mut laid, &renderer, close_at);
+        assert!(
+            matches!(
+                on_close.as_slice(),
+                [Message::Call(CallMessage::DismissNotice)]
+            ),
+            "{list:?}: {on_close:?}"
+        );
+    }
+}
+
+#[test]
+fn leave_sends_once_and_is_off_while_a_leave_or_join_waits() {
+    use twicecat_app::calls::{CallMessage, Pending};
+    let renderer = renderer();
+    for (pending, sends) in [(None, true), (Some(Pending::Leave), false)] {
+        let mut app = scenario_app("main-call-connected");
+        with_settings(&mut app, DENSITIES[0], RoomListChoice::Expanded);
+        app.calls.pending = pending.clone();
+        let mut laid = Laid::new(&app, &renderer, WIDE);
+        let leave = dock_lines(dock_slot(&laid))
+            .last()
+            .expect("controls")
+            .children()
+            .last()
+            .expect("Leave");
+        let at = centre_of(&laid, leave);
+        let messages = settled_click(&mut laid, &renderer, at);
+        if sends {
+            assert!(
+                matches!(messages.as_slice(), [Message::Call(CallMessage::Leave)]),
+                "{messages:?}"
+            );
+        } else {
+            assert!(messages.is_empty(), "{pending:?}: {messages:?}");
+        }
     }
 }

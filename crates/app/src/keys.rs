@@ -71,6 +71,11 @@ pub enum Shortcut {
     ToggleMute,
     /// Deafen or undeafen in a call.
     ToggleDeafen,
+    /// Accept the call whose card is on screen: iced 0.14 buttons take no
+    /// keys, so the card's **Accept** needs a chord.
+    AcceptRing,
+    /// Decline the call whose card is on screen.
+    DeclineRing,
     /// Make the text one step larger.
     ZoomIn,
     /// Make the text one step smaller.
@@ -234,6 +239,24 @@ pub const SHORTCUTS: &[Binding] = &[
         Shortcut::ToggleDeafen,
     ),
     bound(
+        "Ctrl+Shift+A",
+        "While a call rings: accept it",
+        KeySpec::Char('a'),
+        true,
+        true,
+        false,
+        Shortcut::AcceptRing,
+    ),
+    bound(
+        "Ctrl+Shift+X",
+        "While a call rings: decline it",
+        KeySpec::Char('x'),
+        true,
+        true,
+        false,
+        Shortcut::DeclineRing,
+    ),
+    bound(
         "Ctrl+=",
         "Make the text larger",
         KeySpec::Char('='),
@@ -386,6 +409,8 @@ pub const fn composer_takes(shortcut: Shortcut) -> bool {
             | Shortcut::PreviousUnread
             | Shortcut::ToggleMute
             | Shortcut::ToggleDeafen
+            | Shortcut::AcceptRing
+            | Shortcut::DeclineRing
             | Shortcut::ZoomIn
             | Shortcut::ZoomOut
             | Shortcut::ZoomReset
@@ -395,16 +420,36 @@ pub const fn composer_takes(shortcut: Shortcut) -> bool {
 /// The message for a window event, if it is a shortcut. `captured` says a
 /// widget used the key already.
 pub fn event_message(event: &iced::Event, captured: bool) -> Option<Message> {
-    let iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
-        modified_key,
-        modifiers,
-        ..
-    }) = event
-    else {
-        return None;
-    };
-    shortcut_for(modified_key, *modifiers, Platform::current())
-        .map(|shortcut| Message::Shortcut { shortcut, captured })
+    use iced::keyboard::Event;
+    match event {
+        iced::Event::Keyboard(Event::KeyPressed {
+            modified_key,
+            modifiers,
+            repeat,
+            ..
+        }) => {
+            let shortcut = shortcut_for(modified_key, *modifiers, Platform::current())?;
+            // Answering a call is never repeated: a held chord must not
+            // answer the next ring that takes the card.
+            if *repeat && matches!(shortcut, Shortcut::AcceptRing | Shortcut::DeclineRing) {
+                return None;
+            }
+            Some(Message::Shortcut { shortcut, captured })
+        }
+        iced::Event::Keyboard(Event::KeyReleased { key, .. }) => {
+            use iced::keyboard::key::Named;
+            let part = match key {
+                Key::Character(c) => c.eq_ignore_ascii_case("a") || c.eq_ignore_ascii_case("x"),
+                Key::Named(named) => matches!(
+                    named,
+                    Named::Control | Named::Shift | Named::Super | Named::Meta
+                ),
+                Key::Unidentified => false,
+            };
+            part.then_some(Message::RingChordReleased)
+        }
+        _ => None,
+    }
 }
 
 /// Whether a room has anything unread, for the next-unread shortcut.
@@ -510,6 +555,29 @@ impl App {
                 if self.screen != Screen::Main || self.calls.call.is_none() =>
             {
                 Task::none()
+            }
+            // Only while the incoming-call card shows and has armed: the same
+            // messages as its buttons (which ignore a second press).
+            Shortcut::AcceptRing | Shortcut::DeclineRing => {
+                // The chord goes down once: its repeats (the composer
+                // forwards them as presses) never answer, not even the
+                // next ring that takes the card.
+                if std::mem::replace(&mut self.calls.chord_held, true) {
+                    return Task::none();
+                }
+                let Some(room) = self
+                    .calls
+                    .live_card()
+                    .filter(|_| self.screen == Screen::Main)
+                    .map(|ring| ring.room_id.clone())
+                else {
+                    return Task::none();
+                };
+                self.update(Message::Call(if shortcut == Shortcut::AcceptRing {
+                    CallMessage::Accept(room)
+                } else {
+                    CallMessage::Decline(room)
+                }))
             }
             Shortcut::ZoomIn => self.update(Message::Settings(SettingsMessage::Zoom(Zoom::In))),
             Shortcut::ZoomOut => self.update(Message::Settings(SettingsMessage::Zoom(Zoom::Out))),
@@ -832,6 +900,82 @@ mod tests {
                     assert_ne!(ta, tb, "{} and {}", a.keys, b.keys);
                 }
             }
+        }
+    }
+
+    fn char_event(c: &str, modifiers: Modifiers, repeat: bool) -> iced::Event {
+        iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: ch(c),
+            modified_key: ch(c),
+            physical_key: iced::keyboard::key::Physical::Unidentified(
+                iced::keyboard::key::NativeCode::Unidentified,
+            ),
+            location: iced::keyboard::Location::Standard,
+            modifiers,
+            text: None,
+            repeat,
+        })
+    }
+
+    fn release_event(key: Key) -> iced::Event {
+        iced::Event::Keyboard(iced::keyboard::Event::KeyReleased {
+            key: key.clone(),
+            modified_key: key,
+            physical_key: iced::keyboard::key::Physical::Unidentified(
+                iced::keyboard::key::NativeCode::Unidentified,
+            ),
+            location: iced::keyboard::Location::Standard,
+            modifiers: Modifiers::empty(),
+        })
+    }
+
+    #[test]
+    fn a_held_ring_chord_repeats_nothing_but_other_shortcuts_still_repeat() {
+        let chord = Modifiers::CTRL | Modifiers::SHIFT;
+        for letter in ["a", "x", "A", "X"] {
+            assert!(
+                matches!(
+                    event_message(&char_event(letter, chord, false), false),
+                    Some(Message::Shortcut { .. })
+                ),
+                "{letter}: the first press"
+            );
+            assert!(
+                event_message(&char_event(letter, chord, true), false).is_none(),
+                "{letter}: an auto-repeat answers nothing"
+            );
+        }
+        assert!(
+            matches!(
+                event_message(&char_event("m", chord, true), false),
+                Some(Message::Shortcut {
+                    shortcut: Shortcut::ToggleMute,
+                    ..
+                })
+            ),
+            "a repeat of another shortcut is unchanged"
+        );
+    }
+
+    #[test]
+    fn letting_go_of_the_chord_is_a_message() {
+        for key in [
+            ch("a"),
+            ch("X"),
+            named(Named::Control),
+            named(Named::Shift),
+            named(Named::Super),
+        ] {
+            assert!(
+                matches!(
+                    event_message(&release_event(key.clone()), false),
+                    Some(Message::RingChordReleased)
+                ),
+                "{key:?}"
+            );
+        }
+        for key in [ch("q"), named(Named::Enter), named(Named::Alt)] {
+            assert!(event_message(&release_event(key.clone()), false).is_none());
         }
     }
 }

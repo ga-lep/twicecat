@@ -313,6 +313,11 @@ pub enum Message {
     },
     /// The window gained or lost focus.
     WindowFocus(bool),
+    /// The wait of a newly shown incoming-call card ended (its sequence).
+    /// View state only: not a call message.
+    RingArmed(u64),
+    /// A key of Ctrl+Shift+A or Ctrl+Shift+X came up.
+    RingChordReleased,
     /// The window was resized to this logical width.
     WindowResized(f32),
     /// The timer of a delayed read receipt ended.
@@ -412,6 +417,10 @@ pub enum Message {
     /// A call control: the header's call button, the call bar, the
     /// participants panel, the incoming-call card, the Voice & audio card.
     Call(CallMessage),
+    /// **More** on a person's row of the participants panel: shows or hides
+    /// the row's volume and cleaning controls. View state only, so it is not
+    /// a [`CallMessage`] (those are the call's own controls).
+    CallRowMore(UserId),
     /// A control of the Settings screen, or Ctrl+,.
     Settings(SettingsMessage),
     /// A control of the Voice & audio card.
@@ -994,6 +1003,15 @@ impl App {
             Task::batch([task, place])
         };
         self.sync_ptt();
+        // A card that just showed, or changed to another ring, waits before
+        // it answers anything.
+        let task = match self.calls.sync_arming() {
+            Some(seq) => Task::batch([
+                task,
+                self.timer(crate::calls::RING_ARMING, Message::RingArmed(seq)),
+            ]),
+            None => task,
+        };
         if touches_composer && self.selected.is_some() {
             self.draft_dirty = true;
             self.draft_seq = self.draft_seq.wrapping_add(1);
@@ -1139,6 +1157,8 @@ impl App {
             Message::Tray(TrayAction::Quit) => self.update_inner(Message::CloseRequested),
             Message::WindowFocus(focused) => {
                 self.window_focused = focused;
+                // A key release may happen where this window does not see it.
+                self.calls.chord_held = false;
                 if !focused {
                     self.ptt.window_unfocused();
                     self.stop_capture();
@@ -1147,6 +1167,14 @@ impl App {
                 // window event not have reached the app.
                 self.ensure_tray();
                 self.read_receipt(Instant::now())
+            }
+            Message::RingArmed(seq) => {
+                self.calls.arm_ended(seq);
+                Task::none()
+            }
+            Message::RingChordReleased => {
+                self.calls.chord_held = false;
+                Task::none()
             }
             Message::ReadDue(room_id) => {
                 if self.selected.as_ref() != Some(&room_id) {
@@ -1261,6 +1289,10 @@ impl App {
             Message::Rooms(message) => self.on_rooms(message),
             Message::Settings(message) => self.on_settings(message),
             Message::Call(message) => self.on_call(message),
+            Message::CallRowMore(user) => {
+                self.calls.toggle_row(&user);
+                Task::none()
+            }
             Message::Audio(message) => self.on_audio(message),
             Message::Ptt(PttMessage::Update(update)) => {
                 self.ptt.update(update);

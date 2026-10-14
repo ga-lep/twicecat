@@ -1044,6 +1044,52 @@ fn main_call_notice() -> App {
     app
 }
 
+fn main_call_unencrypted() -> App {
+    let mut app = main_room();
+    call_events(
+        &mut app,
+        CallState::Connected {
+            room_id: room("lounge"),
+            encrypted: false,
+        },
+    );
+    call_participants(&mut app);
+    call_panel_open(&mut app);
+    app
+}
+
+fn main_call_ptt_muted() -> App {
+    let mut app = main_call_ptt(true);
+    press(&mut app, Message::Call(CallMessage::ToggleMute));
+    app
+}
+
+/// The call panel with two people's controls folded out (volume, cleaning).
+fn main_call_rows_open() -> App {
+    let mut app = main_call_connected();
+    press(&mut app, Message::CallRowMore(user("bea")));
+    press(&mut app, Message::CallRowMore(user("cy")));
+    app
+}
+
+/// A caller whose user ID is one long word: no hyphen, space or dot to break
+/// a line at, so only a glyph break keeps its end inside the card.
+pub const LONG_CALLER: &str = "@aVeryLongCallerNameThatGoesOnAndOnWithoutAnyBreakAtAllNotEvenOneSingleOneHere:farAwayExampleOrg";
+
+fn ring_long_id() -> App {
+    let mut app = main_no_room();
+    feed(
+        &mut app,
+        CoreEvent::IncomingCall {
+            room_id: room("design"),
+            caller: UserId::from(LONG_CALLER),
+            intent: CallIntent::Audio,
+            ring: true,
+        },
+    );
+    app
+}
+
 fn ring_dm() -> App {
     let mut app = main_room();
     feed(
@@ -1767,6 +1813,21 @@ pub fn scenarios() -> Vec<Scenario> {
         }),
         s("main-call-notice", true, main_call_notice, |a| {
             a.calls.notice.is_some()
+        }),
+        s("main-call-unencrypted", true, main_call_unencrypted, |a| {
+            matches!(
+                call_phase(a),
+                Some(twicecat_app::calls::CallPhase::Connected { encrypted: false })
+            )
+        }),
+        s("main-call-ptt-muted", true, main_call_ptt_muted, |a| {
+            a.ptt.talking && a.calls.call.as_ref().is_some_and(|c| c.muted)
+        }),
+        s("main-call-rows-open", true, main_call_rows_open, |a| {
+            a.calls.rows_open.len() == 2
+        }),
+        s("ring-long-id", true, ring_long_id, |a| {
+            a.calls.card().is_some_and(|r| r.caller.as_str().len() > 80)
         }),
         s("ring-dm", true, ring_dm, |a| !a.calls.rings.is_empty()),
         s("ring-group", true, ring_group, |a| {
