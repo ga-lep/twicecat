@@ -1,10 +1,35 @@
-name: Profile (aarch64)
+name: Profile
 
-# On demand only (Actions tab, "Run workflow"): measures the call path per 10 ms
-# frame against the Steam Frame's 5 % CPU budget on an aarch64 Linux runner
-# (phase 6 step 15). It never runs on pushes or pull requests.
+# On demand only (Actions tab, "Run workflow"); it never runs on pushes or pull
+# requests. Two measurements:
+# - call-path: the call path per 10 ms frame against the Steam Frame's 5 % CPU
+#   budget on an aarch64 Linux runner (phase 6 step 15);
+# - builds: what the CPU level and the build profile change (build time, size,
+#   the voice chain), scripts/measure-builds.sh (phase 7 Task 2). On the arm
+#   runner its defaults compare generic aarch64, Cortex-A76 (Armv8.2 with dot
+#   product and FP16, which the Frame runs too) and the runner's own CPU.
 on:
   workflow_dispatch:
+    inputs:
+      measure:
+        description: What to measure
+        type: choice
+        options: [call-path, builds]
+        default: call-path
+      runner:
+        description: Runner for "builds" (call-path always runs on arm)
+        type: choice
+        options: [ubuntu-26.04-arm, ubuntu-26.04]
+        default: ubuntu-26.04-arm
+      variants:
+        description: Variants for "builds", e.g. "generic cortex-a76" (empty for the defaults)
+        type: string
+        default: ""
+      build-profile:
+        description: Cargo profile for "builds"
+        type: choice
+        options: [release, dist]
+        default: release
 
 permissions:
   contents: read
@@ -14,6 +39,7 @@ env:
 
 jobs:
   profile:
+    if: inputs.measure == 'call-path'
     runs-on: ubuntu-26.04-arm
     timeout-minutes: 90
     steps:
@@ -42,6 +68,54 @@ jobs:
         run: scripts/profile-call-path.sh
       # Inspects the build output the profile step just produced; also when
       # the profile step failed, but not when the run was cancelled.
+      - name: No unverified libwebrtc download
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: scripts/check-no-webrtc-download.sh
+
+  builds:
+    if: inputs.measure == 'builds'
+    runs-on: ${{ inputs.runner }}
+    # Each variant is a full release build (about 5 minutes on a desktop, 16
+    # with the dist profile); the arm runner is slower.
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Install Linux build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libdbus-1-dev libssl-dev pkg-config libglib2.0-dev lld libasound2-dev libpipewire-0.3-dev libudev-dev zstd
+      # webrtc-sys needs clang >= 21 on Linux (Chromium libc++); the image has 22.
+      - name: Use clang 22
+        run: |
+          clang++-22 --version
+          { echo CC=clang-22; echo CXX=clang++-22; } >> "$GITHUB_ENV"
+      # webrtc-sys would download libwebrtc unverified; use the pinned SHA-256.
+      - name: Fetch pinned libwebrtc
+        shell: bash
+        run: |
+          dir=$(scripts/fetch-libwebrtc.sh)
+          echo "LK_CUSTOM_WEBRTC=$dir" >> "$GITHUB_ENV"
+      # The registry only: every variant is its own full build.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
+      # Pinned SHA-256; lets the script also measure DeepFilterNet3.
+      - name: Fetch models
+        run: scripts/fetch-models.sh
+      # Appends the tables to the job summary ($GITHUB_STEP_SUMMARY). The
+      # inputs reach the script through the environment, never the command
+      # line; it checks every variant name.
+      - name: Measure the builds
+        env:
+          VARIANTS: ${{ inputs.variants }}
+          BUILD_PROFILE: ${{ inputs.build-profile }}
+        run: |
+          if [ -n "$VARIANTS" ]; then
+            scripts/measure-builds.sh --profile "$BUILD_PROFILE" --variants "$VARIANTS"
+          else
+            scripts/measure-builds.sh --profile "$BUILD_PROFILE"
+          fi
       - name: No unverified libwebrtc download
         if: ${{ !cancelled() }}
         shell: bash
