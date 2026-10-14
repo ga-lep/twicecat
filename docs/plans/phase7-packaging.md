@@ -160,9 +160,9 @@ Step numbers follow Q12 (13 tasks since Q13 added Task 12). Each task lists its 
 
 ### Task 1: `--version`, the Windows window, the CPU check, and a version check in CI (phase7.1, `feat(app)`)
 Files: `crates/app/src/main.rs`, `crates/core/src/bin/twicecat-cli.rs`, `Cargo.toml` (workspace `version`, inherited by the crates), `scripts/check-version.sh` (new), PROGRESS.md, ledger.
-- `twicecat --version` and `twicecat-cli --version` print `twicecat <version>` (from `CARGO_PKG_VERSION`) and exit 0, before the CPU-level check and before logging, so a refused CPU can still say which version it is.
+- `twicecat --version` and `twicecat-cli --version` print `twicecat <version>` (from `CARGO_PKG_VERSION`) and exit 0, before logging. (Done differently from the draft: the CPU check runs before `main`, so `--version` cannot come first; instead the refusal message itself names the version.)
 - `#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]`; with no console, `--help` and `--version` attach to the parent console (`AttachConsole(ATTACH_PARENT_PROCESS)`, `windows` 0.62.2, already in the tree) so they still print from a terminal.
-- Per Q2 (a): `require_cpu_level` also on Windows x86_64 (a `.CRT$XCU` initializer, the same CPUID and XGETBV checks, a message box when there is no console), and a compile error if a build targets AVX-512 while the check covers only v3, so a v4 build cannot pass the check by accident.
+- Per Q2 (a): `require_cpu_level` also on Windows x86_64 (a `.CRT$XCU` initializer, the same CPUID and XGETBV checks, a message box when there is no console), and the check covers the level the build targets: v4's AVX-512 bits and XCR0 state in a build for v4 (done instead of the draft's compile error, which would have blocked the v4 measurement on the AMD machine).
 - `scripts/check-version.sh vX.Y.Z` fails unless the tag equals the workspace version (used by the release workflow).
 - Tests: argument parsing (`--version` alone; with other arguments it is refused); the check script against a matching and a mismatching tag.
 

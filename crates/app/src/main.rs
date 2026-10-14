@@ -1,6 +1,11 @@
 //! Twicecat desktop app entry point: parses the command line, starts the core
 //! on its own runtime and runs the Iced application.
 
+// Release builds on Windows are GUI programs: no console window opens beside
+// the app. `--help`, `--version` and argument errors still reach a terminal
+// that started it (`attach_parent_console`).
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher as _, Hasher as _};
 use std::path::PathBuf;
@@ -37,6 +42,7 @@ OPTIONS:
                           data directory that is deleted on exit. The session
                           is not revoked on the server; revoke it from your
                           account settings.
+    --version             Show the version
     --help                Show this help
 
 The app and twicecat-cli share the same data directory and keychain entry, so a
@@ -55,6 +61,7 @@ struct Options {
 enum Parsed {
     Run(Options),
     Help,
+    Version,
 }
 
 fn parse_args(args: &[String]) -> Result<Parsed, String> {
@@ -63,6 +70,12 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
         homeserver: None,
         ephemeral: false,
     };
+    if args.iter().any(|arg| arg == "--version" || arg == "-V") {
+        return match args {
+            [_] => Ok(Parsed::Version),
+            _ => Err("--version takes no other arguments".to_owned()),
+        };
+    }
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -184,16 +197,49 @@ fn window_settings() -> iced::window::Settings {
     }
 }
 
+/// `twicecat <version>`, as `--version` prints it.
+fn version_line() -> String {
+    format!("twicecat {}", env!("CARGO_PKG_VERSION"))
+}
+
+/// Gives a Windows GUI build the console of the terminal that started it,
+/// so `--help`, `--version` and argument errors are seen. Output already
+/// redirected to a pipe or a file is left as it is; started from the desktop
+/// there is no console, and the text goes nowhere.
+#[cfg(windows)]
+fn attach_parent_console() {
+    use windows::Win32::System::Console::{
+        ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_OUTPUT_HANDLE,
+    };
+    // SAFETY: both calls take plain values and only change this process's
+    // standard handles, before anything else uses them.
+    unsafe {
+        if GetStdHandle(STD_OUTPUT_HANDLE).is_err() {
+            let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn attach_parent_console() {}
+
 fn main() -> ExitCode {
     twicecat_core::require_cpu_level();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let options = match parse_args(&args) {
         Ok(Parsed::Run(options)) => options,
         Ok(Parsed::Help) => {
+            attach_parent_console();
             print!("{HELP}");
             return ExitCode::SUCCESS;
         }
+        Ok(Parsed::Version) => {
+            attach_parent_console();
+            println!("{}", version_line());
+            return ExitCode::SUCCESS;
+        }
         Err(message) => {
+            attach_parent_console();
             eprintln!("twicecat: {message}\nTry --help.");
             return ExitCode::from(2);
         }
@@ -242,6 +288,8 @@ mod tests {
             }))
         );
         assert_eq!(parse_args(&args(&["--help"])), Ok(Parsed::Help));
+        assert_eq!(parse_args(&args(&["--version"])), Ok(Parsed::Version));
+        assert_eq!(parse_args(&args(&["-V"])), Ok(Parsed::Version));
         assert_eq!(parse_args(&args(&[])).map(|p| p == Parsed::Help), Ok(false));
     }
 
@@ -251,6 +299,18 @@ mod tests {
         assert!(parse_args(&args(&["--homeserver"])).is_err());
         assert!(parse_args(&args(&["--ephemeral", "--data-dir", "/d"])).is_err());
         assert!(parse_args(&args(&["--nope"])).is_err());
+        assert!(parse_args(&args(&["--version", "--ephemeral"])).is_err());
+        assert!(parse_args(&args(&["--data-dir", "/d", "--version"])).is_err());
+        assert!(parse_args(&args(&["--help", "--version"])).is_err());
+    }
+
+    #[test]
+    fn version_names_the_workspace_version() {
+        assert_eq!(
+            version_line(),
+            format!("twicecat {}", env!("CARGO_PKG_VERSION"))
+        );
+        assert!(HELP.contains("--version"));
     }
 
     #[test]

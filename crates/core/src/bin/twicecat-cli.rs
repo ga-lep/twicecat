@@ -55,6 +55,7 @@ OPTIONS:
                           (see /video pattern); without it the screen is
                           shared for real (/video share) and so are cameras
                           (/video camera)
+    --version             Show the version
     --help                Show this help
 
 COMMANDS (type them at the prompt):
@@ -186,6 +187,7 @@ struct Options {
 enum Parsed {
     Run(Options),
     Help,
+    Version,
 }
 
 #[derive(Debug, PartialEq)]
@@ -214,6 +216,12 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
         silent_audio: false,
         test_video: false,
     };
+    if args.iter().any(|arg| arg == "--version" || arg == "-V") {
+        return match args {
+            [_] => Ok(Parsed::Version),
+            _ => Err("--version takes no other arguments".to_owned()),
+        };
+    }
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -978,6 +986,10 @@ async fn main() -> ExitCode {
             print!("{HELP}");
             return ExitCode::SUCCESS;
         }
+        Ok(Parsed::Version) => {
+            println!("twicecat-cli {}", env!("CARGO_PKG_VERSION"));
+            return ExitCode::SUCCESS;
+        }
         Err(message) => {
             eprintln!("twicecat-cli: {message}\nTry --help.");
             return ExitCode::from(2);
@@ -1160,6 +1172,10 @@ mod tests {
             }))
         );
         assert_eq!(parse_args(&args(&["--help"])), Ok(Parsed::Help));
+        assert_eq!(parse_args(&args(&["--version"])), Ok(Parsed::Version));
+        assert_eq!(parse_args(&args(&["-V"])), Ok(Parsed::Version));
+        assert!(parse_args(&args(&["--version", "--ephemeral"])).is_err());
+        assert!(HELP.contains("--version"));
     }
 
     #[test]

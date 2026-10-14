@@ -8440,6 +8440,7 @@ dependencies = [
  "twicecat-core",
  "twicecat-perf",
  "twicecat-ptt",
+ "windows 0.62.2",
 ]
 
 [[package]]
