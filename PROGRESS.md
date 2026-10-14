@@ -2542,8 +2542,9 @@ Plan approved by the human 2026-10-13: Q6-Q8 as the human chose them (NVENC/NVDE
     - Test helpers shared by the call tests moved to `crates/core/tests/common/calls.rs` (`allow_calls`, `membership_of`, `sfu_room`, `add_member_device`).
   - **`unsafe`:** none.
   - **Checks:** fmt; clippy, also with `--all-features`; 1756 tests; the four boundary scripts; the ignored suite on the local stack (`scripts/run-integration-tests.sh`, the new video tests included): 140 passed, 0 failed.
-- [ ] 6. Our encoder through the passthrough, with layers (phase9.6)
-- [ ] 7. NVENC encoder through CUDA, NVIDIA Ada and newer (phase9.7)
+- **Plan amended by the human 2026-10-14** (after Task 5 and an encoder spike on the human's laptop, numbers in the plan): LiveKit's own encoders and simulcast, no webrtc-sys fork, no passthrough. NVENC H.264 with three layers on NVIDIA under Linux (4K30 and 1080p60 measured; 4K60 blocked by LiveKit pinning H.264 to level 3.1), software VP8 elsewhere (LiveKit's VA-API segfaults on the Arrow Lake iGPU; Windows has no hardware encoder in LiveKit), VideoToolbox on macOS. Task 4's Vulkan Video encoder is removed in Task 6, Task 7 is dropped, Tasks 6 and 15 are rewritten. Intel/AMD hardware video on Linux and Windows hardware video come later, through upstream fixes (possibly our own PR). `scap`, `xcap` and `nokhwa` were checked and rejected. Five upstream issue drafts are in `upstream-issues.md` (untracked) for the human to post.
+- [ ] 6. Hardware encoding through LiveKit's encoders (phase9.6)
+- [x] ~~7. NVENC encoder through CUDA~~ dropped by the human 2026-10-14: LiveKit's NVENC replaces it (plan amendment)
 - [ ] 8. Linux screen sharing (phase9.8)
 - [ ] 9. Linux camera (phase9.9)
 - [ ] 10. App: video renderer and call stage (phase9.10)
@@ -2551,7 +2552,7 @@ Plan approved by the human 2026-10-13: Q6-Q8 as the human chose them (NVENC/NVDE
 - [ ] 12. Windows and macOS (phase9.12)
 - [ ] 13. Steam Frame (phase9.13, conditional)
 - [ ] 14. 4K60 acceptance and tuning (phase9.14)
-- [ ] 15. Hardware decode (phase9.15)
+- [ ] 15. Hardware decode checks and upstream fixes (phase9.15)
 - [ ] 16. Wrap-up (phase9.16)
 
 ## Phase 9 human checkpoint
