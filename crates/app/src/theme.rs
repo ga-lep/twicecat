@@ -412,7 +412,12 @@ pub const MIN_TEXT_CONTRAST: f32 = 4.5;
 /// it reaches [`MIN_TEXT_CONTRAST`], otherwise mixed toward white (on a dark
 /// background) or black (on a light one) in 5 % steps until it does.
 pub fn readable_on(color: Color, background: Color) -> Color {
-    if contrast(color, background) >= MIN_TEXT_CONTRAST {
+    readable_at(color, background, MIN_TEXT_CONTRAST)
+}
+
+/// Like [`readable_on`], for a contrast of at least `least`.
+pub fn readable_at(color: Color, background: Color, least: f32) -> Color {
+    if contrast(color, background) >= least {
         return color;
     }
     let target = if luminance(background) < 0.18 {
@@ -427,7 +432,7 @@ pub fn readable_on(color: Color, background: Color) -> Color {
             color.g + (target.g - color.g) * t,
             color.b + (target.b - color.b) * t,
         );
-        if contrast(mixed, background) >= MIN_TEXT_CONTRAST {
+        if contrast(mixed, background) >= least {
             return mixed;
         }
     }

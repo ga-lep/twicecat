@@ -12,12 +12,13 @@ use std::cell::Cell;
 
 use chrono::{Local, TimeZone};
 use iced::widget::{
-    Column, Row, button, column, container, image, mouse_area, progress_bar, row, rule, scrollable,
+    Column, Row, button, column, container, image, mouse_area, progress_bar, row, scrollable,
     sensor, space, stack, text, tooltip,
 };
 use iced::{
     Background, Color, ContentFit, Element, Fill, Font, Length, Padding, Shrink, Theme, mouse,
 };
+use iced::{Border, border};
 use twicecat_core::api::{
     Block, EventId, Inline, MediaContent, MediaKind, MessageDetails, MessageKind, MessageText,
     PaginationState, PlaceholderKind, ReactionGroup, ReplyPreview, ReplyState, RichText, RoomId,
@@ -39,9 +40,12 @@ use crate::text_safety::{
 };
 use crate::theme;
 use crate::timeline::{
-    CARD_H, CONTINUATION_PAD, DIVIDER_H, INDENT_PX, MARKER_H, OVERSCAN_PX, SIDE_PAD_PX, START_H,
-    THREAD_ROW_H, TIMELINE_ID, TOP_PAD, TimelineView, is_continuation, spacer_heights,
+    CARD_H, DIVIDER_H, INDENT_PX, MARKER_H, OVERSCAN_PX, SIDE_PAD_PX, START_H, THREAD_ROW_H,
+    TIMELINE_ID, TimelineView, is_continuation, spacer_heights, top_pad,
 };
+use crate::ui::icons::Icon;
+use crate::ui::kit;
+use crate::ui::tokens::{self, Density};
 use crate::upload;
 
 /// How many lines of a body are shown.
@@ -71,6 +75,8 @@ pub struct RichEnv<'a> {
     pub media: &'a MediaModel,
     /// The open room, which keys the media cache.
     pub room: Option<&'a RoomId>,
+    /// The density, which sets the space above and between rows.
+    pub density: Density,
 }
 
 /// What differs between the room's timeline pane and the thread panel's: the
@@ -170,9 +176,9 @@ pub fn view_pane<'a, Tz: TimeZone>(
     // the bare list when idle would reset the scroll offset to the bottom on
     // every pagination.
     let badge: Element<'a, Message> = if timeline.pagination == PaginationState::Loading {
-        container(text("Loading\u{2026}").size(13).style(muted))
+        container(text("Loading\u{2026}").size(tokens::CAPTION).style(muted))
             .center_x(Fill)
-            .padding(4)
+            .padding(tokens::XS)
             .into()
     } else {
         space().into()
@@ -180,15 +186,11 @@ pub fn view_pane<'a, Tz: TimeZone>(
     stack([list.into(), badge]).into()
 }
 
-const BOLD: Font = crate::ui::fonts::BODY_BOLD;
+const SEMIBOLD: Font = crate::ui::fonts::BODY_SEMIBOLD;
 
 const ITALIC: Font = crate::ui::fonts::BODY_ITALIC;
 
-fn muted(theme: &Theme) -> text::Style {
-    text::Style {
-        color: Some(theme::semantic(theme).muted),
-    }
-}
+use kit::muted;
 
 fn accent(theme: &Theme) -> text::Style {
     text::Style {
@@ -285,12 +287,16 @@ fn row_content<'a, Tz: TimeZone>(
                 content = content.push(shield_view(shield));
             }
             if let Some(label) = edited_text(details) {
-                content = content.push(text(label).size(12).style(muted));
+                content = content.push(text(label).size(tokens::CAPTION).style(muted));
             }
             let buttons = pane.limit(actions::action_buttons(details, *is_own));
-            if !pane.thread
-                && let (Some(summary), Some(root)) = (&details.thread, &items[i].event_id)
-            {
+            // The thread to open from the bar: only a message that already
+            // heads one, and only in the room's pane.
+            let thread_root = match (&details.thread, &items[i].event_id) {
+                (Some(_), Some(root)) if !pane.thread => Some(root),
+                _ => None,
+            };
+            if let (Some(summary), Some(root)) = (&details.thread, thread_root) {
                 content = content.push(thread_row(root, summary));
             }
             if !details.reactions.is_empty() {
@@ -308,8 +314,8 @@ fn row_content<'a, Tz: TimeZone>(
                 hovered: bar_visible(env.actions, &items[i].id),
                 flashed: timeline.flash.as_deref() == Some(items[i].id.as_str()),
             };
-            let framed = framed(content.into(), continuation, look);
-            with_actions(&items[i].id, framed, buttons, env.actions)
+            let framed = framed(content.into(), continuation, look, env.density);
+            with_actions(&items[i].id, framed, buttons, thread_root, env.actions)
         }
         TimelineItemKind::Placeholder {
             sender,
@@ -334,7 +340,12 @@ fn row_content<'a, Tz: TimeZone>(
             if let Some(line) = receipts_row(items, i) {
                 content = content.push(line);
             }
-            framed(content.into(), continuation, RowLook::default())
+            framed(
+                content.into(),
+                continuation,
+                RowLook::default(),
+                env.density,
+            )
         }
         TimelineItemKind::State {
             sender,
@@ -343,12 +354,22 @@ fn row_content<'a, Tz: TimeZone>(
             ..
         } => {
             let actor = sender_label(sender_name.as_deref(), false, sender);
-            let mut line = Column::new().width(Fill).push(
-                text(state_text(&actor, change))
-                    .size(13)
-                    .style(muted)
-                    .width(Fill),
-            );
+            let words = text(state_text(&actor, change))
+                .size(tokens::CAPTION + 1.0)
+                .style(muted)
+                .width(Fill);
+            // A call notice starts with the call icon; the words say the
+            // same, so the icon is a cue and not the message.
+            let words: Element<'a, Message> = match state_icon(change) {
+                Some(icon) => row![
+                    text(icon.glyph()).size(tokens::CAPTION + 1.0).style(muted),
+                    words
+                ]
+                .spacing(tokens::XS)
+                .into(),
+                None => words.into(),
+            };
+            let mut line = Column::new().width(Fill).push(words);
             if let Some(receipts) = receipts_row(items, i) {
                 line = line.push(receipts);
             }
@@ -361,19 +382,24 @@ fn row_content<'a, Tz: TimeZone>(
                 })
                 .into()
         }
-        TimelineItemKind::DateDivider { timestamp_ms } => fixed_height(
-            text(day_label(*timestamp_ms, now_ms, tz))
-                .size(13)
-                .style(muted),
-            DIVIDER_H,
-        ),
-        TimelineItemKind::ReadMarker => {
-            fixed_height(text("New messages").size(13).style(accent), MARKER_H)
+        TimelineItemKind::DateDivider { timestamp_ms } => {
+            let label = day_label(*timestamp_ms, now_ms, tz);
+            fixed_height(ruled(kit::tag(label)), DIVIDER_H)
         }
+        TimelineItemKind::ReadMarker => fixed_height(
+            ruled(
+                text("New messages")
+                    .size(tokens::CAPTION + 1.0)
+                    .style(accent)
+                    .into(),
+            ),
+            MARKER_H,
+        ),
         TimelineItemKind::TimelineStart => fixed_height(
             text("This is the start of the conversation")
-                .size(13)
-                .style(muted),
+                .size(tokens::CAPTION + 1.0)
+                .style(muted)
+                .into(),
             START_H,
         ),
         TimelineItemKind::Other => space().height(0).into(),
@@ -384,10 +410,16 @@ fn row_content<'a, Tz: TimeZone>(
 /// opens the thread panel.
 fn thread_row<'a>(root: &EventId, summary: &ThreadSummaryView) -> Element<'a, Message> {
     button(
-        text(crate::threads::summary_text(summary))
-            .size(13)
-            .style(accent)
-            .wrapping(text::Wrapping::None),
+        row![
+            text(Icon::Thread.glyph())
+                .size(tokens::CAPTION + 1.0)
+                .style(accent),
+            text(crate::threads::summary_text(summary))
+                .size(tokens::CAPTION + 1.0)
+                .style(accent)
+                .wrapping(text::Wrapping::None),
+        ]
+        .spacing(tokens::XS),
     )
     .padding([2, 0])
     .height(Length::Fixed(THREAD_ROW_H))
@@ -418,9 +450,9 @@ fn media_view<'a>(id: &str, media: &MediaContent, env: RichEnv<'_>) -> Element<'
 
 /// A note in the middle of an image box.
 fn box_note<'a>(label: &'static str) -> Element<'a, Message> {
-    container(text(label).size(13).style(muted))
+    container(text(label).size(tokens::CAPTION + 1.0).style(muted))
         .center(Fill)
-        .style(container::bordered_box)
+        .style(kit::card_style)
         .into()
 }
 
@@ -453,18 +485,13 @@ fn image_box<'a>(id: &str, media: &MediaContent, thumb: Option<&Thumb>) -> Eleme
 /// type, **Save...** and, after a save of a safe file, **Open**.
 fn file_card<'a>(id: &str, media: &MediaContent, open: bool) -> Element<'a, Message> {
     let detail = format!("{} \u{b7} {}", size_label(media.size), type_label(media));
-    let mut actions = row![
-        button(text("Save\u{2026}").size(13))
-            .on_press(Message::SaveRequested(id.to_owned()))
-            .style(button::secondary)
-    ]
-    .spacing(4);
+    let mut actions = row![small_button(
+        "Save\u{2026}",
+        Message::SaveRequested(id.to_owned())
+    )]
+    .spacing(tokens::XS);
     if open {
-        actions = actions.push(
-            button(text("Open").size(13))
-                .on_press(Message::OpenRequested(id.to_owned()))
-                .style(button::secondary),
-        );
+        actions = actions.push(small_button("Open", Message::OpenRequested(id.to_owned())));
     }
     let label = column![
         text(card_name(&media.filename)).wrapping(text::Wrapping::None),
@@ -476,17 +503,20 @@ fn file_card<'a>(id: &str, media: &MediaContent, open: bool) -> Element<'a, Mess
     .width(Fill);
     container(
         row![
-            text(kind_label(media.kind)).size(13).style(muted).width(44),
+            text(kind_label(media.kind))
+                .size(tokens::CAPTION + 1.0)
+                .style(muted)
+                .width(44),
             label,
             actions
         ]
         .spacing(8)
         .align_y(iced::Center),
     )
-    .padding(8)
+    .padding(tokens::S)
     .width(Length::Fixed(BOX_MAX_W))
     .height(Length::Fixed(CARD_H))
-    .style(container::bordered_box)
+    .style(kit::card_style)
     .into()
 }
 
@@ -510,13 +540,9 @@ fn reactions_row<'a>(
 ) -> Element<'a, Message> {
     let mut chips: Row<'a, Message> = Row::new();
     for group in groups {
-        let mut chip = button(text(chip_label(group)).size(13))
-            .padding([2, 6])
-            .style(if group.own {
-                button::primary
-            } else {
-                button::secondary
-            });
+        let mut chip = button(text(chip_label(group)).size(tokens::CAPTION + 1.0))
+            .padding([2.0, tokens::S])
+            .style(kit::chip_style(group.own));
         if buttons.react {
             chip = chip.on_press(Message::ReactionToggled {
                 item: id.to_owned(),
@@ -526,66 +552,112 @@ fn reactions_row<'a>(
         chips = chips.push(chip);
     }
     if buttons.react {
-        chips = chips.push(
-            button(text("+").size(13))
-                .padding([2, 6])
-                .style(button::secondary)
+        chips = chips.push(kit::tip(
+            button(text("+").size(tokens::CAPTION + 1.0))
+                .padding([2.0, tokens::S])
+                .style(kit::chip_style(false))
                 .on_press(Message::PickerOpened(id.to_owned())),
-        );
+            Icon::React.label(),
+        ));
     }
-    container(chips.spacing(4).wrap().vertical_spacing(4))
-        .padding(Padding {
-            top: 2.0,
-            ..Padding::ZERO
-        })
-        .into()
+    container(
+        chips
+            .spacing(tokens::XS)
+            .wrap()
+            .vertical_spacing(tokens::XS),
+    )
+    .padding(Padding {
+        top: 2.0,
+        ..Padding::ZERO
+    })
+    .into()
 }
 
-/// A small text button of the action bar.
-fn bar_button<'a>(label: &'static str, message: Message) -> Element<'a, Message> {
-    button(text(label).size(13))
-        .padding([2, 6])
-        .style(button::secondary)
+/// A small text button: **Retry**, **Discard**, **Cancel**, **Save...**.
+fn small_button<'a>(label: &'static str, message: Message) -> Element<'a, Message> {
+    button(text(label).size(tokens::CAPTION + 1.0))
+        .padding([2.0, tokens::S])
+        .style(kit::secondary_style)
         .on_press(message)
         .into()
 }
 
+/// The icon buttons of the hover bar of message `id` and what each sends:
+/// Reply, Edit, React, Copy, Thread (only on a message that heads a thread,
+/// whose root is `thread`), then Delete last, set apart by a gap of at least
+/// `tokens::M` and drawn in the danger colour. Delete
+/// only asks: the confirmation row has its own **Delete**.
+pub fn bar_actions(
+    id: &str,
+    buttons: ActionButtons,
+    thread: Option<&EventId>,
+) -> Vec<(Icon, Message)> {
+    let mut actions = Vec::new();
+    if buttons.reply {
+        actions.push((Icon::Reply, Message::ReplyRequested(id.to_owned())));
+    }
+    if buttons.edit {
+        actions.push((Icon::Edit, Message::EditRequested(id.to_owned())));
+    }
+    if buttons.react {
+        actions.push((Icon::React, Message::PickerOpened(id.to_owned())));
+    }
+    if buttons.copy {
+        actions.push((Icon::Copy, Message::CopyRequested(id.to_owned())));
+    }
+    if let Some(root) = thread {
+        actions.push((
+            Icon::Thread,
+            Message::Threads(crate::threads::ThreadsMessage::Open(root.clone())),
+        ));
+    }
+    if buttons.delete {
+        actions.push((Icon::Delete, Message::DeleteRequested(id.to_owned())));
+    }
+    actions
+}
+
 /// The hover bar of message `id`, or the delete question.
-fn action_bar<'a>(id: &str, buttons: ActionButtons, confirming: bool) -> Element<'a, Message> {
-    let mut bar = Row::new().spacing(4).align_y(iced::Center);
+fn action_bar<'a>(
+    id: &str,
+    buttons: ActionButtons,
+    thread: Option<&EventId>,
+    confirming: bool,
+) -> Element<'a, Message> {
+    let mut bar = Row::new().spacing(tokens::XS).align_y(iced::Center);
     if confirming {
         bar = bar
-            .push(text("Delete this message?").size(13))
+            .push(text("Delete this message?").size(tokens::CAPTION + 1.0))
             .push(
-                button(text("Delete").size(13))
-                    .padding([2, 6])
-                    .style(button::danger)
+                button(text("Delete").size(tokens::CAPTION + 1.0))
+                    .padding([2.0, tokens::S])
+                    .style(kit::danger_style)
                     .on_press(Message::DeleteConfirmed),
             )
-            .push(bar_button("Cancel", Message::DeleteCancelled));
+            .push(small_button("Cancel", Message::DeleteCancelled));
     } else {
-        if buttons.reply {
-            bar = bar.push(bar_button("Reply", Message::ReplyRequested(id.to_owned())));
-        }
-        if buttons.edit {
-            bar = bar.push(bar_button("Edit", Message::EditRequested(id.to_owned())));
-        }
-        if buttons.react {
-            bar = bar.push(bar_button("React", Message::PickerOpened(id.to_owned())));
-        }
-        if buttons.copy {
-            bar = bar.push(bar_button("Copy", Message::CopyRequested(id.to_owned())));
-        }
-        if buttons.delete {
-            bar = bar.push(bar_button(
-                "Delete",
-                Message::DeleteRequested(id.to_owned()),
-            ));
+        for (index, (icon, message)) in bar_actions(id, buttons, thread).into_iter().enumerate() {
+            if icon == Icon::Delete {
+                // Delete is set apart so a slip on a neighbour cannot land
+                // on it, and its glyph is in the danger colour.
+                if index > 0 {
+                    bar = bar.push(space().width(tokens::M));
+                }
+                bar = bar.push(kit::compact_danger_icon_button(icon, message));
+            } else {
+                bar = bar.push(kit::compact_icon_button(icon, message));
+            }
         }
     }
     container(bar)
         .padding(2)
-        .style(container::bordered_box)
+        .style(|theme: &Theme| container::Style {
+            border: Border {
+                radius: border::rounded(tokens::MEDIUM).radius,
+                ..kit::card_style(theme).border
+            },
+            ..kit::card_style(theme)
+        })
         .into()
 }
 
@@ -596,11 +668,13 @@ fn with_actions<'a>(
     id: &str,
     row: Element<'a, Message>,
     buttons: ActionButtons,
+    thread: Option<&EventId>,
     state: &ActionState,
 ) -> Element<'a, Message> {
     let confirming = state.confirm_delete.as_deref() == Some(id);
-    let content = if bar_visible(state, id) && (buttons.any() || confirming) {
-        let bar = container(action_bar(id, buttons, confirming))
+    let any = buttons.any() || thread.is_some();
+    let content = if bar_visible(state, id) && (any || confirming) {
+        let bar = container(action_bar(id, buttons, thread, confirming))
             .width(Fill)
             .align_right(Fill)
             .padding(Padding {
@@ -702,22 +776,24 @@ fn echo_row<'a>(
         Echo::Sending if upload.is_some() => {
             let progress = upload.map_or(0.0, upload::fraction);
             row![
-                text(label).size(12).style(muted),
+                text(label).size(tokens::CAPTION).style(muted),
                 progress_bar(0.0..=1.0, progress)
                     .length(Length::Fixed(UPLOAD_BAR_W))
                     .girth(Length::Fixed(6.0)),
-                text(upload_percent(progress)).size(12).style(muted),
-                bar_button("Cancel", Message::DiscardRequested(id.to_owned())),
+                text(upload_percent(progress))
+                    .size(tokens::CAPTION)
+                    .style(muted),
+                small_button("Cancel", Message::DiscardRequested(id.to_owned())),
             ]
             .spacing(8)
             .align_y(iced::Center)
             .into()
         }
-        Echo::Sending => text(label).size(12).style(muted).into(),
+        Echo::Sending => text(label).size(tokens::CAPTION).style(muted).into(),
         Echo::Failed { .. } => row![
             text(label).size(13).style(text::danger),
-            bar_button("Retry", Message::RetryRequested(id.to_owned())),
-            bar_button("Discard", Message::DiscardRequested(id.to_owned())),
+            small_button("Retry", Message::RetryRequested(id.to_owned())),
+            small_button("Discard", Message::DiscardRequested(id.to_owned())),
         ]
         .spacing(8)
         .align_y(iced::Center)
@@ -728,7 +804,13 @@ fn echo_row<'a>(
 /// "Seen by" under item `i`, when other users' receipts point at it.
 fn receipts_row<'a>(items: &[TimelineItem], i: usize) -> Option<Element<'a, Message>> {
     let line = seen_by_line(&items[i].read_by, |user| known_name(&items[..=i], user))?;
-    Some(text(line).size(12).style(muted).width(Fill).into())
+    Some(
+        text(line)
+            .size(tokens::CAPTION)
+            .style(muted)
+            .width(Fill)
+            .into(),
+    )
 }
 
 /// A message body ready to draw: line breaks kept, bidi controls replaced,
@@ -737,16 +819,34 @@ pub fn body_text(body: &str) -> String {
     multi_line_capped(body, MAX_BODY_CHARS, MAX_BODY_LINES)
 }
 
-/// A line of text centred in a row of a fixed height.
-fn fixed_height<'a>(label: iced::widget::Text<'a>, height: f32) -> Element<'a, Message> {
+/// A line centred in a row of a fixed height.
+fn fixed_height<'a>(label: Element<'a, Message>, height: f32) -> Element<'a, Message> {
     container(label).center_x(Fill).center_y(height).into()
+}
+
+/// `label` centred between two rules.
+fn ruled<'a>(label: Element<'a, Message>) -> Element<'a, Message> {
+    row![kit::divider(), label, kit::divider()]
+        .spacing(tokens::S)
+        .align_y(iced::Center)
+        .padding([0.0, tokens::L])
+        .width(Fill)
+        .into()
+}
+
+/// The icon a state line starts with: the call icon on a call notice.
+pub fn state_icon(change: &StateChange) -> Option<Icon> {
+    matches!(change, StateChange::CallStarted | StateChange::LegacyCall).then_some(Icon::Call)
 }
 
 /// The sender and time above a message.
 fn header<'a>(name: String, time: String, shield: Option<Shield>) -> Element<'a, Message> {
-    let mut line = row![text(name).font(BOLD), text(time).size(12).style(muted)]
-        .spacing(8)
-        .align_y(iced::Center);
+    let mut line = row![
+        text(name).font(SEMIBOLD),
+        text(time).size(tokens::CAPTION).style(muted)
+    ]
+    .spacing(tokens::S)
+    .align_y(iced::Center);
     if let Some(shield) = shield {
         line = line.push(shield_view(shield));
     }
@@ -776,9 +876,9 @@ fn shield_view<'a>(shield: Shield) -> Element<'a, Message> {
         });
     tooltip(
         mark,
-        container(text(label).size(12))
+        container(text(label).size(tokens::CAPTION))
             .padding(6)
-            .style(container::bordered_box),
+            .style(kit::card_style),
         tooltip::Position::Top,
     )
     .into()
@@ -834,21 +934,26 @@ pub fn reply_quote_text(reply: &ReplyPreview) -> (String, String) {
     }
 }
 
-/// The quote above a reply. Clicking it jumps to the original.
+/// The quote above a reply, on the quote surface behind the accent bar.
+/// Clicking it jumps to the original.
 fn reply_quote<'a>(reply: &ReplyPreview) -> Element<'a, Message> {
     let (name, line) = reply_quote_text(reply);
     let quote = row![
-        rule::vertical(3),
+        kit::quote_bar(),
         column![
-            text(name).size(12).font(BOLD),
-            text(line).size(13).style(muted),
+            text(name).size(tokens::CAPTION).font(SEMIBOLD),
+            text(line).size(tokens::CAPTION + 1.0).style(muted),
         ]
         .width(Fill),
     ]
-    .spacing(8)
+    .spacing(tokens::S)
     .height(Shrink);
-    let padded = container(quote).padding(Padding {
-        bottom: 4.0,
+    let surface = container(quote)
+        .padding([tokens::XS, tokens::S])
+        .width(Fill)
+        .style(kit::quote_surface_style);
+    let padded = container(surface).padding(Padding {
+        bottom: tokens::XS,
         ..Padding::ZERO
     });
     mouse_area(padded)
@@ -863,13 +968,10 @@ fn framed(
     content: Element<'_, Message>,
     continuation: bool,
     look: RowLook,
+    density: Density,
 ) -> Element<'_, Message> {
     let padded = container(content).width(Fill).padding(Padding {
-        top: if continuation {
-            CONTINUATION_PAD
-        } else {
-            TOP_PAD
-        },
+        top: top_pad(continuation, density),
         right: SIDE_PAD_PX,
         bottom: 0.0,
         left: INDENT_PX,
@@ -1790,6 +1892,7 @@ mod tests {
             members: &[],
             media: &NO_MEDIA,
             room: None,
+            density: Density::Comfortable,
         };
         BUILT_ROWS.with(|built| built.set(0));
         let _ = view_in(&view, 0, &chrono::Utc, env);
@@ -1812,6 +1915,7 @@ mod tests {
             members: &[],
             media: &NO_MEDIA,
             room: None,
+            density: Density::Comfortable,
         };
         let mut view = TimelineView::default();
         let mut tree = Tree::new(view_in(&view, 0, &chrono::Utc, env));
@@ -1882,6 +1986,7 @@ mod tests {
             members: &[],
             media: &NO_MEDIA,
             room: None,
+            density: Density::Comfortable,
         }
     }
 
@@ -2194,5 +2299,94 @@ mod tests {
         }]);
         let (theme, revealed) = (theme(), Revealed::new());
         assert_eq!(built_by_with(&timeline, env(&theme, &revealed)), 4);
+    }
+
+    #[test]
+    fn the_bar_offers_one_icon_per_allowed_action_and_sends_the_same_messages() {
+        let all = ActionButtons {
+            reply: true,
+            edit: true,
+            react: true,
+            copy: true,
+            delete: true,
+        };
+        let root = EventId::from("$root:x");
+        let acts = bar_actions("i1", all, Some(&root));
+        let icons: Vec<Icon> = acts.iter().map(|(icon, _)| *icon).collect();
+        assert_eq!(
+            icons,
+            [
+                Icon::Reply,
+                Icon::Edit,
+                Icon::React,
+                Icon::Copy,
+                Icon::Thread,
+                Icon::Delete
+            ],
+            "delete last (set apart by the bar layout)"
+        );
+        for (icon, message) in acts {
+            match (icon, message) {
+                (Icon::Reply, Message::ReplyRequested(id))
+                | (Icon::Edit, Message::EditRequested(id))
+                | (Icon::React, Message::PickerOpened(id))
+                | (Icon::Copy, Message::CopyRequested(id))
+                | (Icon::Delete, Message::DeleteRequested(id)) => assert_eq!(id, "i1"),
+                (Icon::Thread, Message::Threads(crate::threads::ThreadsMessage::Open(opened))) => {
+                    assert_eq!(opened, root)
+                }
+                (icon, message) => panic!("{icon:?} sends {message:?}"),
+            }
+        }
+        // Delete only asks: the question with its own Delete is the
+        // confirmation, so no hover click removes a message.
+        assert!(
+            bar_actions("i1", all, None)
+                .iter()
+                .all(|(_, m)| !matches!(m, Message::DeleteConfirmed))
+        );
+        let none = ActionButtons::default();
+        assert!(bar_actions("i1", none, None).is_empty());
+        let only_react = ActionButtons {
+            react: true,
+            ..none
+        };
+        assert_eq!(bar_actions("i1", only_react, None).len(), 1);
+    }
+
+    #[test]
+    fn delete_sits_a_full_step_away_from_the_other_bar_icons() {
+        let none = ActionButtons::default();
+        let width = |buttons: ActionButtons, thread: Option<&EventId>| {
+            laid_out(action_bar("i", buttons, thread, false)).width
+        };
+        let copy = ActionButtons { copy: true, ..none };
+        let delete = ActionButtons {
+            delete: true,
+            ..none
+        };
+        let both = ActionButtons {
+            copy: true,
+            delete: true,
+            ..none
+        };
+        let root = EventId::from("$root:x");
+        // What Delete adds next to Copy, less what Thread adds there, less
+        // the two icons' own difference: the extra gap before Delete.
+        let delete_adds = width(both, None) - width(copy, None);
+        let thread_adds = width(copy, Some(&root)) - width(copy, None);
+        let own = width(delete, None) - width(none, Some(&root));
+        let extra = delete_adds - thread_adds - own;
+        assert!(
+            extra >= tokens::M - 0.01,
+            "Delete is only {extra} px further from Copy than Thread is"
+        );
+    }
+
+    #[test]
+    fn a_call_state_line_has_the_call_icon_and_other_state_lines_have_none() {
+        assert_eq!(state_icon(&StateChange::CallStarted), Some(Icon::Call));
+        assert_eq!(state_icon(&StateChange::LegacyCall), Some(Icon::Call));
+        assert_eq!(state_icon(&StateChange::Joined), None);
     }
 }

@@ -206,7 +206,9 @@ impl App {
             return operation::focus(THREAD_INPUT_ID);
         }
         self.drop_thread_uploads();
-        self.threads.panel = Some(ThreadPanel::new(room_id.clone(), root.clone()));
+        let mut panel = ThreadPanel::new(room_id.clone(), root.clone());
+        panel.timeline.set_density(self.density());
+        self.threads.panel = Some(panel);
         Task::batch([
             self.send(Command::OpenThread { room_id, root }),
             operation::focus(THREAD_INPUT_ID),

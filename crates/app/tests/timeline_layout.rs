@@ -93,6 +93,7 @@ fn content_node_with(
         members: &[],
         media,
         room,
+        density: view.density(),
     };
     let mut element = view_in(view, NOW, &Utc, env);
     let mut tree = Tree::new(element.as_widget());
@@ -257,6 +258,7 @@ fn a_thumbnail_arriving_changes_no_laid_out_row_height() {
             &view.items[i],
             twicecat_app::timeline::is_continuation(&view.items, i),
             WIDTH,
+            twicecat_app::ui::tokens::Density::Comfortable,
         );
         assert!(
             (estimate - height).abs() <= 8.0,
@@ -336,4 +338,142 @@ fn upload_progress_changes_no_laid_out_row_height() {
         row_heights(&content_node(&view, &renderer))
     };
     assert!(start[0] > plain[0], "{start:?} vs {plain:?}");
+}
+
+/// Every row the first window lays out is within 25 % of its estimate, for
+/// both densities (Task 9). The estimate is what the scrollbar and the
+/// spacers use before a row is measured, so a restyle that changes row
+/// heights must move the estimate with it.
+#[test]
+fn estimates_stay_within_a_quarter_of_the_laid_out_rows_for_both_densities() {
+    use twicecat_app::timeline::{estimate_height, is_continuation};
+    use twicecat_app::ui::tokens::Density;
+    let renderer = renderer();
+    for density in [Density::Comfortable, Density::Compact] {
+        let mut view = timeline(300);
+        view.set_density(density);
+        let node = content_node(&view, &renderer);
+        let window = view.window();
+        let mut checked = 0;
+        for (i, row) in window.zip(&node.children()[1..]) {
+            let estimate = estimate_height(
+                &view.items[i],
+                is_continuation(&view.items, i),
+                WIDTH,
+                density,
+            );
+            let laid_out = row.bounds().height;
+            assert!(
+                (estimate - laid_out).abs() <= 0.25 * laid_out,
+                "{density:?} row {i}: estimated {estimate}, laid out {laid_out}"
+            );
+            checked += 1;
+        }
+        assert!(checked >= 10, "{density:?}: only {checked} rows checked");
+    }
+}
+
+/// A compact row is shorter than a comfortable one, as laid out.
+#[test]
+fn a_compact_timeline_lays_out_shorter_rows_on_average() {
+    use twicecat_app::ui::tokens::Density;
+    let renderer = renderer();
+    let average = |density| {
+        let mut view = timeline(300);
+        view.set_density(density);
+        let heights = row_heights(&content_node(&view, &renderer));
+        heights.iter().sum::<f32>() / heights.len() as f32
+    };
+    let (comfortable, compact) = (average(Density::Comfortable), average(Density::Compact));
+    assert!(compact < comfortable, "{compact} vs {comfortable}");
+}
+
+/// A message with `decorate` applied to its details.
+fn decorated(id: &str, decorate: impl FnOnce(&mut MessageDetails)) -> TimelineItem {
+    let mut details = MessageDetails::default();
+    decorate(&mut details);
+    TimelineItem::new(
+        id.to_owned(),
+        TimelineItemKind::Message {
+            sender: UserId::from("@a:x"),
+            body: "a short line of text".to_owned(),
+            is_own: false,
+            timestamp_ms: NOW,
+            sent: SendStatus::Sent,
+            details: Box::new(details),
+        },
+    )
+}
+
+/// The parts that restyling changed (replies, reaction chips, the edited
+/// marker, a thread line, a failed send) keep their estimates within 25 %
+/// of the laid out row, in both densities.
+#[test]
+fn decorated_rows_are_estimated_within_a_quarter_in_both_densities() {
+    use twicecat_app::timeline::{estimate_height, is_continuation};
+    use twicecat_app::ui::tokens::Density;
+    use twicecat_core::api::{EventId, ThreadSummaryView};
+    use twicecat_core::api::{ReactionGroup, ReplyPreview, ReplyState, SendFailure};
+    let mut items = vec![
+        decorated("plain", |_| {}),
+        decorated("reply", |d| {
+            d.reply_to = Some(ReplyPreview {
+                event_id: EventId::from("$o:x"),
+                sender: UserId::from("@b:x"),
+                sender_name: Some("Bea".into()),
+                body: "the quoted line".into(),
+                state: ReplyState::Ready,
+            });
+        }),
+        decorated("reactions", |d| {
+            d.reactions = vec![ReactionGroup {
+                key: "+1".into(),
+                count: 2,
+                own: true,
+                senders: Vec::new(),
+            }];
+        }),
+        decorated("edited", |d| d.edited = true),
+        decorated("failed", |d| {
+            d.send_failure = Some(SendFailure { recoverable: true });
+        }),
+        decorated("thread", |d| {
+            d.thread = Some(ThreadSummaryView {
+                replies: 3,
+                latest_sender: None,
+                latest_sender_name: None,
+                latest_preview: None,
+            });
+        }),
+    ];
+    // The failure line shows for a failed send, not for a sent message.
+    if let TimelineItemKind::Message { sent, .. } = &mut items[4].kind {
+        *sent = SendStatus::Failed;
+    }
+    // The thread line needs the root's event ID to open the thread.
+    items[5].event_id = Some(EventId::from("$t:x"));
+    let renderer = renderer();
+    for density in [Density::Comfortable, Density::Compact] {
+        let mut view = TimelineView::default();
+        view.apply_diffs(vec![ListDiff::Reset {
+            values: items.clone(),
+        }]);
+        view.set_density(density);
+        view.scrolled(0.0, HEIGHT, WIDTH);
+        let node = content_node(&view, &renderer);
+        for (i, row) in view.window().zip(&node.children()[1..]) {
+            let estimate = estimate_height(
+                &view.items[i],
+                is_continuation(&view.items, i),
+                WIDTH,
+                density,
+            );
+            let laid_out = row.bounds().height;
+            assert!(
+                (estimate - laid_out).abs() <= 0.25 * laid_out,
+                "{density:?} {}: estimated {estimate}, laid out {laid_out}",
+                view.items[i].id
+            );
+        }
+    }
 }
