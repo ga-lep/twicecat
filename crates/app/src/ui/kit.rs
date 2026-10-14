@@ -199,6 +199,36 @@ pub fn active_icon_style(theme: &Theme, status: Status) -> button::Style {
     }
 }
 
+/// A toggle that is live: no fill, an outline in the success colour (a
+/// microphone that is open). It differs from [`active_icon_style`] (the
+/// selection fill) and from the quiet [`icon_style`].
+pub fn open_icon_style(theme: &Theme, status: Status) -> button::Style {
+    let sem = theme::semantic(theme);
+    let text_color = theme.palette().text;
+    let outline = Border {
+        color: Severity::Success.color(theme),
+        width: 2.0,
+        ..shape()
+    };
+    match status {
+        Status::Active => button::Style {
+            text_color,
+            border: outline,
+            ..button::Style::default()
+        },
+        Status::Hovered => filled(sem.message_hover, text_color, outline),
+        Status::Pressed => filled(sem.selection, text_color, outline),
+        Status::Disabled => button::Style {
+            text_color: sem.muted,
+            border: Border {
+                color: sem.border,
+                ..outline
+            },
+            ..button::Style::default()
+        },
+    }
+}
+
 // ---- buttons -------------------------------------------------------------
 
 /// A button's words stay on one line: a squeezed header clips them instead
@@ -317,6 +347,17 @@ pub fn toggle_icon_button<'a, M: Clone + 'a>(
     active: bool,
     on_press: M,
 ) -> Element<'a, M> {
+    toggle_icon_button_labelled(icon, active, icon.label(), on_press)
+}
+
+/// [`toggle_icon_button`] with its own tooltip words, for a toggle whose
+/// action reads differently from its icon ("Unmute" on a muted microphone).
+pub fn toggle_icon_button_labelled<'a, M: Clone + 'a>(
+    icon: Icon,
+    active: bool,
+    words: impl IntoFragment<'a>,
+    on_press: M,
+) -> Element<'a, M> {
     // The check is always there, drawn clear while the toggle is off: the
     // widget tree and the button's width do not change with the state.
     let mark = container(icons::icon(Icon::Check)).style(move |_: &Theme| container::Style {
@@ -332,7 +373,7 @@ pub fn toggle_icon_button<'a, M: Clone + 'a>(
         } else {
             icon_style
         });
-    tip(button, icon.label())
+    tip(button, words)
 }
 
 /// A drop-down that Ctrl + wheel (the zoom gesture) cannot change. Every
@@ -755,6 +796,17 @@ pub fn avatar<'a, M: 'a>(
     avatar: Option<&AvatarId>,
     avatars: &Avatars,
 ) -> Element<'a, M> {
+    avatar_sized(user, name, avatar, avatars, PERSON_SLOT)
+}
+
+/// [`avatar`] at `size` pixels, such as the large picture of the ring card.
+pub fn avatar_sized<'a, M: 'a>(
+    user: &UserId,
+    name: &str,
+    avatar: Option<&AvatarId>,
+    avatars: &Avatars,
+    size: f32,
+) -> Element<'a, M> {
     let ready = avatar
         .and_then(|id| avatars.state(id))
         .and_then(|state| match state {
@@ -763,26 +815,30 @@ pub fn avatar<'a, M: 'a>(
         });
     if let Some(handle) = ready {
         return image(handle.clone())
-            .width(PERSON_SLOT)
-            .height(PERSON_SLOT)
-            .border_radius(PERSON_SLOT / 2.0)
+            .width(size)
+            .height(size)
+            .border_radius(size / 2.0)
             .into();
     }
     let label = initials(name);
     let fill = (label != NEUTRAL_INITIALS).then(|| placeholder_color(&RoomId::from(user.as_str())));
-    container(text(label).size(14).color(Color::WHITE))
-        .width(PERSON_SLOT)
-        .height(PERSON_SLOT)
-        .center_x(PERSON_SLOT)
-        .center_y(PERSON_SLOT)
-        .style(move |t| container::Style {
-            background: Some(Background::Color(
-                fill.unwrap_or_else(|| theme::semantic(t).muted),
-            )),
-            border: border::rounded(PERSON_SLOT / 2.0),
-            ..container::Style::default()
-        })
-        .into()
+    container(
+        text(label)
+            .size(14.0 * size / PERSON_SLOT)
+            .color(Color::WHITE),
+    )
+    .width(size)
+    .height(size)
+    .center_x(size)
+    .center_y(size)
+    .style(move |t| container::Style {
+        background: Some(Background::Color(
+            fill.unwrap_or_else(|| theme::semantic(t).muted),
+        )),
+        border: border::rounded(size / 2.0),
+        ..container::Style::default()
+    })
+    .into()
 }
 
 /// A ring around `content` (a round [`avatar`]) while the person talks. The

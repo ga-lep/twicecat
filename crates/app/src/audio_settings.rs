@@ -931,6 +931,9 @@ impl App {
                 }
             }),
             M::CaptureKey => {
+                // The dialog takes the keyboard: a ring chord's release may
+                // go unseen, so its latch must not outlive the dialog.
+                self.calls.chord_held = false;
                 self.audio_ui.capturing = true;
                 self.audio_ui.capture_note = None;
                 Task::none()
@@ -969,6 +972,7 @@ impl App {
 
     /// Stops waiting for the push-to-talk key.
     pub(crate) fn stop_capture(&mut self) {
+        self.calls.chord_held = false;
         self.audio_ui.capturing = false;
         self.audio_ui.capture_note = None;
     }
