@@ -10,7 +10,8 @@ use iced::widget::pick_list;
 use iced::widget::text::{IntoFragment, Wrapping};
 use iced::widget::tooltip::Position;
 use iced::widget::{
-    Column, button, column, container, image, opaque, progress_bar, row, rule, text, tooltip,
+    Column, button, column, container, image, opaque, progress_bar, row, rule, scrollable, space,
+    text, tooltip,
 };
 use iced::{Background, Border, Color, Element, Fill, Theme, border};
 use twicecat_core::api::{AvatarId, RoomId, UserId};
@@ -618,6 +619,86 @@ pub fn modal<'a, M: 'a>(content: impl Into<Element<'a, M>>, width: f32) -> Eleme
         .style(backdrop_style),
     )
 }
+
+/// What a dialog's header, footer and spacing take from the height of its
+/// card (the card's own padding included), for [`dialog`]: the room left for
+/// the body is the window's height less this.
+pub const DIALOG_CHROME: f32 = 260.0;
+/// The least height a dialog's body keeps, in a very small window.
+const DIALOG_MIN_BODY: f32 = 120.0;
+
+/// Text that breaks inside a word when it has no other break, so the end of
+/// a long name or ID is never drawn past its box (and under a button).
+pub fn words<'a>(label: impl IntoFragment<'a>) -> text::Text<'a> {
+    text(label).wrapping(BANNER_WRAPPING)
+}
+
+/// The top line of a dialog: its title, then a close button with the words
+/// "Close" in its tooltip. The title wraps rather than runs under the button.
+pub fn dialog_header<'a, M: Clone + 'a>(
+    title: impl IntoFragment<'a>,
+    on_close: M,
+) -> Element<'a, M> {
+    row![
+        words(title).size(tokens::HEADLINE).width(Fill),
+        icon_button(Icon::Close, on_close)
+    ]
+    .spacing(tokens::M)
+    .align_y(iced::Center)
+    .into()
+}
+
+/// The bottom line of a dialog: free room at the left, then `actions` with
+/// the main one last. The gap between two actions is [`tokens::M`], so a
+/// destructive action is never pressed by a slip at its neighbour.
+pub fn dialog_footer<'a, M: 'a>(actions: Vec<Element<'a, M>>) -> Element<'a, M> {
+    row![space().width(Fill)]
+        .extend(actions)
+        .spacing(tokens::M)
+        .align_y(iced::Center)
+        .into()
+}
+
+/// A dialog: `header`, a `body` that scrolls when the window is too short for
+/// it, and a `footer` that stays in view. The scrollbar takes room of its own,
+/// so a button at the body's right edge is never under it. `window_height`
+/// is what the window leaves for the card; the footer slot is always there
+/// (empty without a footer), so the widgets keep their places.
+pub fn dialog<'a, M: 'a>(
+    header: Element<'a, M>,
+    body: Element<'a, M>,
+    footer: Option<Element<'a, M>>,
+    width: f32,
+    window_height: f32,
+) -> Element<'a, M> {
+    let room = (window_height - DIALOG_CHROME).max(DIALOG_MIN_BODY);
+    let body = container(scrollable(body).spacing(tokens::S).width(Fill)).max_height(room);
+    let footer = footer.unwrap_or_else(|| space().into());
+    modal(column![header, body, footer].spacing(tokens::L), width)
+}
+
+/// A card near the top of the window, such as the room switcher; it takes
+/// every click, like [`modal`].
+pub fn palette<'a, M: 'a>(content: impl Into<Element<'a, M>>, width: f32) -> Element<'a, M> {
+    opaque(
+        container(
+            container(content)
+                .padding(tokens::L)
+                .max_width(width)
+                .style(card_style),
+        )
+        .center_x(Fill)
+        .height(Fill)
+        .padding(iced::Padding {
+            top: PALETTE_TOP,
+            ..iced::Padding::ZERO
+        })
+        .style(backdrop_style),
+    )
+}
+
+/// How far from the top of the window a [`palette`] starts.
+pub const PALETTE_TOP: f32 = 72.0;
 
 /// A titled group of controls.
 pub fn section<'a, M: 'a>(title: &'a str, body: impl Into<Element<'a, M>>) -> Element<'a, M> {

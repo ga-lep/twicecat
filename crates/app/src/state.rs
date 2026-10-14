@@ -7800,6 +7800,19 @@ mod tests {
     }
 
     #[test]
+    fn the_open_question_keeps_the_end_of_a_long_file_name() {
+        let (mut app, _rx, _) = file_app();
+        let long = format!("/home/u/{}.pdf.exe", "a".repeat(200));
+        let (question, warning) = saved_and_asked(&mut app, "doc", &long).expect("bar");
+        assert!(
+            question.ends_with(".pdf.exe?"),
+            "the extension is what tells a file from a document: {question}"
+        );
+        assert!(question.contains('\u{2026}'), "cut in the middle");
+        assert!(warning.is_some());
+    }
+
+    #[test]
     fn a_failed_save_shows_a_notice_and_forgets_the_pending_path() {
         let (mut app, _rx, _) = file_app();
         let _ = app.update(picked("doc", Some(&abs("/home/u/mine.pdf"))));
@@ -9526,6 +9539,80 @@ mod tests {
             let ids: Vec<&str> = known.members.iter().map(|m| m.user_id.as_str()).collect();
             assert_eq!(ids, ["@c:x", "@m:x", "@a:x", "@z:x"]);
             assert!(known.truncated);
+        }
+
+        #[test]
+        fn the_member_search_is_view_state_only_capped_and_cleared_when_the_panel_opens() {
+            let (mut app, mut rx, _) = rig();
+            // No panel, no search.
+            rooms(&mut app, R::MemberSearch("zed".to_owned().into()));
+            assert!(app.rooms_ui.member_search.is_empty());
+            rooms(&mut app, R::OpenMembers);
+            let _ = drain(&mut rx);
+            rooms(&mut app, R::MemberSearch("zed".to_owned().into()));
+            assert_eq!(app.rooms_ui.member_search, "zed");
+            assert!(drain(&mut rx).is_empty(), "the search sends nothing");
+            rooms(&mut app, R::MemberSearch("x".repeat(500).into()));
+            assert_eq!(
+                app.rooms_ui.member_search.chars().count(),
+                crate::rooms::MAX_MEMBER_SEARCH_CHARS
+            );
+            // A narrower search starts at the first page again.
+            rooms(&mut app, R::ShowMoreMembers);
+            rooms(&mut app, R::MemberSearch("a".to_owned().into()));
+            let panel = app.rooms_ui.members_panel.as_ref().expect("open");
+            assert_eq!(panel.shown, crate::rooms::MEMBERS_PAGE);
+            // Closing and opening again starts with an empty field.
+            rooms(&mut app, R::CloseMembers);
+            rooms(&mut app, R::OpenMembers);
+            assert!(app.rooms_ui.member_search.is_empty());
+        }
+
+        #[test]
+        fn a_member_search_fetches_the_avatars_of_the_rows_it_brings_into_view() {
+            let (mut app, mut rx, _) = rig();
+            rooms(&mut app, R::OpenMembers);
+            let _ = drain(&mut rx);
+            // More members than a page: the last five are not drawn at first.
+            let page = crate::rooms::MEMBERS_PAGE;
+            let members = (0..page + 5)
+                .map(|i| {
+                    // Sorted by name: the late ones are the last five.
+                    let name = if i < page {
+                        format!("a{i:03}")
+                    } else {
+                        format!("zzz{i}")
+                    };
+                    let mut m = member(&format!("@m{i}:x"), Some(&name), Role::User);
+                    if i >= page {
+                        m.avatar = Some(AvatarId::from(format!("mxc://x/late{i}")));
+                    }
+                    m
+                })
+                .collect();
+            let _ = app.update(core(CoreEvent::RoomMembers {
+                room_id: id("!a:x"),
+                members,
+                truncated: false,
+            }));
+            let first = drain(&mut rx);
+            assert!(
+                !first.iter().any(|c| matches!(c, Command::FetchAvatars(_))),
+                "rows that are not on screen are not fetched: {first:?}"
+            );
+            // Searching for them draws them: their pictures are asked for.
+            rooms(&mut app, R::MemberSearch("zzz".to_owned().into()));
+            let sent = drain(&mut rx);
+            assert!(
+                matches!(
+                    sent.as_slice(),
+                    [Command::FetchAvatars(ids)] if ids.len() == 5
+                ),
+                "{sent:?}"
+            );
+            // The same row again asks for nothing.
+            rooms(&mut app, R::MemberSearch("zzz1".to_owned().into()));
+            assert!(drain(&mut rx).is_empty());
         }
 
         #[test]
@@ -11684,6 +11771,23 @@ mod tests {
             let (mut app, _rx, _) = media_app(1);
             let _ = app.update(Message::MediaClicked("img0".into()));
             assert!(app.media.viewer.is_some());
+            let _ = key(&mut app, Shortcut::Escape);
+            assert!(app.media.viewer.is_none());
+        }
+
+        #[test]
+        fn esc_closes_the_upload_dialog_before_the_viewer_when_both_are_open() {
+            // view(): the upload dialog is drawn over the viewer.
+            let (mut app, _rx, _) = media_app(1);
+            let _ = app.update(Message::MediaClicked("img0".into()));
+            app.uploads.dialog = Some(crate::upload::UploadDialog {
+                room_id: RoomId::from("!a:x"),
+                entries: Vec::new(),
+            });
+            assert!(app.media.viewer.is_some() && app.uploads.dialog.is_some());
+            let _ = key(&mut app, Shortcut::Escape);
+            assert!(app.uploads.dialog.is_none(), "the dialog on top closes");
+            assert!(app.media.viewer.is_some(), "the viewer under it stays");
             let _ = key(&mut app, Shortcut::Escape);
             assert!(app.media.viewer.is_none());
         }

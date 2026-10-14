@@ -37,12 +37,16 @@ Rules the code follows (all in tests):
 - Tab moves the focus only when no widget used the key and no suggestion list
   is open. The order is the widget tree's order; overlays are layers in a
   fixed stack of two, so opening one never reshuffles the base.
-- Esc closes one layer per press, topmost first: the incoming-call card
-  (hidden, and its ringtone silenced; the room keeps ringing), the Voice &
-  audio card, the switcher,
+- Esc closes one layer per press, topmost first, in the order the layers are
+  drawn (a test opens several and checks that each press closes the one on
+  top): the incoming-call card
+  (hidden, and its ringtone silenced; the room keeps ringing), the switcher,
   the upload
-  confirmation, the viewer, Settings, the logout warning, the Sessions card
-  (its password prompt or sign-out question first), a room dialog or panel, then the
+  confirmation, the viewer, the Voice & audio card, Settings, the logout
+  warning, the Sessions card
+  (its password prompt or sign-out question first), a room dialog, the user
+  card, the room settings (a question about leaving or encryption first) or
+  the member list, then the
   composer's suggestions or reply/edit, then the thread panel, then the
   participants panel of a call. A text field
   that took the Esc to drop its focus does not keep an overlay open.
@@ -217,3 +221,47 @@ the same note under the shortcut list.
 - Not tested by code (on the human checklist): that the keyboard focus is
   visible on every control in both themes, since it depends on iced's widget
   styles.
+
+## Room dialogs, members, upload, viewer and switcher
+
+- Every dialog has the same shape: a title with a close button (tooltip
+  "Close") at the top right, a body that scrolls on its own when the window is
+  short (its scrollbar sits beside the content, never over a button), and a
+  footer with the main action last. Esc closes or cancels, never confirms, and
+  the backdrop takes every click, so nothing behind a dialog can be pressed.
+  Clicking outside a dialog does not close it.
+- Anything that cannot be undone (leave a room, turn encryption on) keeps its
+  question. The button that asks is at the left; the red button with words
+  ("Leave", "Enable encryption") that confirms comes up at the right of a
+  card, at least 12 px from **Cancel**, never under the pointer that asked.
+  Enter, Space and key repeat never press them: no button takes the keyboard
+  focus in iced 0.14, and the only fields in these dialogs (name and topic)
+  save that field when Enter is pressed in it, nothing else. Tests send the
+  keys to each dialog and check that no message comes out.
+- The member list (the room header's Members button) has a search field at
+  the top (name or user ID, ignoring case and accents), then sections Admins, Moderators, Members and Invited with
+  their counts. A row has the picture, the name, the user ID and tags in
+  words: the role when the section does not already say it ("Creator",
+  "Admin (75)", "Moderator, invited"), the trust of the person when the core
+  has reported it ("Verified", "Not verified", "Identity changed", in colour
+  and words) and "In the call" while they are in the call. A name that reads
+  like one of those words is drawn in quotes, so it cannot pass for a status.
+  A long user ID is cut in the middle, so the server name stays visible. The
+  list builds 100 rows at a time ("Show more" adds more).
+- The upload confirmation names the room the files go to ("To Lounge", with
+  whether the room is encrypted) and shows each file's picture or kind, name,
+  size and type. **Send** is a separate button from **Cancel**, apart from it,
+  and is off while a file is being read, when no file can be sent, or when the
+  room on screen is not the room the files were picked for (the card says so).
+  A long file name wraps and keeps its extension; a long room name is cut in
+  the middle.
+- The viewer shows the image centred on a dimmed backdrop, with a bar at the
+  bottom: name, type, size and size in pixels, **Save...** and **Close**. Its
+  mouse behaviour is the image widget's, unchanged: the wheel zooms the
+  picture and dragging moves it. Nothing in it plays or loads beyond the
+  decode limits that were there.
+- The switcher (Ctrl+K) is a card near the top of the window with a large
+  field and one-height rows: the room's picture, name, the call pill and the
+  unread badge. Up and Down move the highlight, Enter opens the room, Esc
+  closes it; the hint under the list says so. A long room name is cut in the
+  middle and wraps inside its row.
