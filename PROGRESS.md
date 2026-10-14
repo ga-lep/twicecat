@@ -3130,7 +3130,7 @@ Plan approved by the human 2026-10-14. Targets: Linux x86_64 and aarch64 (the St
 - [x] 1. `--version`, the Windows window, the CPU check on Windows, the tag check (phase7.1)
 - [x] 2. The `dist` profile and `scripts/measure-builds.sh`, Frame tuning on the arm job (phase7.2)
 - [x] 3. Bundled resources: models and the "any GPU" pack (phase7.3)
-- [ ] 4. Icon, AppStream metainfo, desktop entry (phase7.4)
+- [x] 4. Icon, AppStream metainfo, desktop entry (phase7.4)
 - [ ] 5. Licence notices (phase7.5)
 - [ ] 6. Desktop packages: cargo-packager (MSI, DMG, AppImage) and nfpm (`.deb`, `.rpm`), `.tar.zst` (phase7.6)
 - [ ] 7. Flatpak, x86_64 and aarch64 (phase7.7)
@@ -3146,6 +3146,7 @@ See the plan's "Human checkpoint"; items move here as tasks finish. Already open
 - [ ] Choose the Windows signer (Q6), then add its secrets; add the Apple and AppImage-updater secrets.
 - [ ] The x86-64-v3 against v4 rows on the AMD machine (Galep's Ryzen 7 7800X3D), once Task 2's script exists.
 - [ ] (Task 2) Run "Profile" from the Actions tab with measure = builds on `ubuntu-26.04-arm` (generic, Cortex-A76, the runner's own CPU) and once on `ubuntu-26.04` (v4 is included when the runner has AVX-512); read the tables in the job summary. Frame tuning is worth a separate Frame build only if Cortex-A76 or native clearly beats generic on the default chain.
+- [ ] (Task 4) The icon: approve or replace the drawing (`packaging/icons/io.github.ga_lep.Twicecat.svg`, the tray's "T" as a vector; `scripts/make-icons.sh` re-renders everything); the window icon on X11 and Windows; the AppStream text (`packaging/linux/io.github.ga_lep.Twicecat.metainfo.xml`: summary, description, OARS rating, developer name "The Twicecat developers"), and screenshots to add before a store lists it.
 - [ ] (Task 1) Windows: the release `twicecat.exe` opens no console window; `twicecat.exe --version` prints in PowerShell and cmd; on a CPU or VM without AVX2 a message box says why and the app exits.
 
 ## Phase 7 / Task 1 notes
@@ -3178,3 +3179,13 @@ See the plan's "Human checkpoint"; items move here as tasks finish. Already open
 - **Tests:** `paths::tests::the_cache_follows_xdg_then_home_then_the_windows_profile`, `the_resource_dir_follows_each_package_layout` (deb, Flatpak, AppImage, macOS bundle, Windows, a bare name), `the_variable_wins_then_the_first_root_that_has_it_then_the_cache`; `onnx::tests::a_fetched_gpu_build_in_the_cache_comes_before_the_bundled_cpu_build` (feature `onnxruntime`). Mutation: making the lookup ignore whether a path exists fails the third test; reverted.
 - **Gate:** fmt, clippy (also `--all-features`), `cargo test --workspace --locked` 1738 passed, 0 failed, 153 ignored; `cargo test -p twicecat-audio --lib --features onnxruntime` 79 passed; dependency and API checks pass.
 - **Left for Task 6/7:** the packages must put the files in that layout; their smoke tests should also start DeepFilterNet3 from the package (not only `--version`).
+
+## Phase 7 / Task 4 notes
+- **Icon:** `packaging/icons/io.github.ga_lep.Twicecat.svg` is the tray's drawing (`tray.rs`, `icon_rgba`) as a vector on its 64-unit grid: `#2d5be3` rounded square (radius 64/5), white "T". `scripts/make-icons.sh` (rsvg-convert 2.63.2, ImageMagick 7) renders the committed `packaging/icons/hicolor/{16…512}x…/apps/<app id>.png`, `hicolor/scalable/apps/<app id>.svg` (a tree packages copy as is) and `<app id>.ico` (16, 24, 32, 48, 64, 256). The macOS `.icns` is made from the PNGs at packaging time (Task 6).
+- **Window icon:** `window_settings()` sets `icon` on every OS from the 256 px PNG (`include_bytes!`, decoded with the app's `image` crate, `iced::window::icon::from_rgba`; `iced_core-0.14.0/src/window/icon.rs:7`, `settings.rs:87`). iced's own `from_file_data` needs its `image` feature, which the app does not enable. Wayland compositors use the desktop entry's icon instead. The PNG and its decoding live in `ui::app_icon` (moved there out of `main.rs` when the branch was rebased on `main`, 2026-10-16: the UI rework's `ui::fonts` test forbids `include_bytes!` in `main.rs`, so that fonts load only through `ui::fonts::ALL`).
+- **Desktop entry:** gains `Icon=io.github.ga_lep.Twicecat`; `desktop-file-validate` passes.
+- **AppStream:** `packaging/linux/io.github.ga_lep.Twicecat.metainfo.xml` (desktop-application, CC0-1.0 metadata, GPL-3.0-or-later, launchable, `provides/binary`, URLs, categories, keyboard and pointing controls, branding colour, OARS 1.1: social chat and audio intense, social info mild, a 0.1.0 development release). `appstreamcli validate --strict --no-net` (AppStream 1.2.1): valid; the one pedantic note is the uppercase in the app ID, which the portal and keychain already use.
+- **`scripts/check-version.sh`** also requires `<release version="X.Y.Z"` in the metainfo for the tag (v0.1.0 ok; v0.2.0 refused with both errors).
+- **Tests:** app `the_icon_and_the_metainfo_carry_the_app_id` (every PNG size decodes at its size, the SVG and `.ico` exist, the window gets an icon, the metainfo's id, launchable, binary and this version's release; `appstreamcli` run where installed); `the_desktop_entry_carries_the_app_id` checks `Icon=`; tray `the_packaged_icon_draws_the_same_shape_in_the_same_colours`. Mutation: one colour digit changed in the SVG fails the tray test; reverted.
+- **Tools:** shellcheck 0.10.0 (Docker) clean on `make-icons.sh` and `check-version.sh`.
+- **Gate:** fmt, clippy (also `--all-features`), `cargo test --workspace --locked` 1740 passed, 0 failed, 153 ignored; dependency and API checks pass.

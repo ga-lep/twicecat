@@ -409,6 +409,37 @@ mod fake {
 mod tests {
     use super::*;
 
+    /// The packaged icon (`packaging/icons/`) is this drawing as a vector:
+    /// same colours, corner radius and "T" on the 64-unit grid.
+    #[test]
+    fn the_packaged_icon_draws_the_same_shape_in_the_same_colours() {
+        let svg = include_str!("../../../packaging/icons/io.github.ga_lep.Twicecat.svg");
+        let hex = |c: [u8; 4]| format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2]);
+        assert!(svg.contains(&format!("fill=\"{}\"", hex(BACKGROUND))));
+        assert!(svg.contains(&format!("fill=\"{}\"", hex(FOREGROUND))));
+        let size = 64.0_f64;
+        assert!(svg.contains(&format!("rx=\"{}\"", size / 5.0)));
+        // Bar: x 1/4..3/4, y 7/25..2/5; stem: x 9/20..11/20, down to 4/5.
+        let bar = format!(
+            "M{} {}h{}v{}H{}z",
+            size / 4.0,
+            size * 7.0 / 25.0,
+            size / 2.0,
+            size * 2.0 / 5.0 - size * 7.0 / 25.0,
+            size / 4.0
+        );
+        let stem = format!(
+            "M{} {}h{}v{}h-{}z",
+            size * 9.0 / 20.0,
+            size * 2.0 / 5.0,
+            size / 10.0,
+            size * 4.0 / 5.0 - size * 2.0 / 5.0,
+            size / 10.0
+        );
+        assert!(svg.contains(&bar), "{bar}");
+        assert!(svg.contains(&stem), "{stem}");
+    }
+
     fn pixel(rgba: &[u8], size: u32, (x, y): (u32, u32)) -> [u8; 4] {
         let at = ((y * size + x) * 4) as usize;
         rgba[at..at + 4].try_into().expect("four bytes")

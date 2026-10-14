@@ -171,29 +171,22 @@ fn run(options: Options) -> Result<(), String> {
     result.map_err(|error| format!("the window failed: {error}"))
 }
 
-/// The window's settings: on Linux its app ID is the desktop entry's name
-/// (`packaging/linux/`), so the compositor and the shortcuts portal tie the
-/// window to it.
+/// The window's settings: its icon, and on Linux its app ID, the desktop
+/// entry's name (`packaging/linux/`), so the compositor and the shortcuts
+/// portal tie the window to it (Wayland compositors take the icon from the
+/// entry instead).
 fn window_settings() -> iced::window::Settings {
     // The width the layout assumes until the first resize event arrives.
     let size = iced::Size::new(twicecat_app::layout::DEFAULT_WINDOW_WIDTH, 800.0);
-    #[cfg(target_os = "linux")]
-    {
-        iced::window::Settings {
-            size,
-            platform_specific: iced::window::settings::PlatformSpecific {
-                application_id: twicecat_ptt::APP_ID.to_owned(),
-                ..Default::default()
-            },
+    iced::window::Settings {
+        size,
+        icon: ui::app_icon::window_icon(),
+        #[cfg(target_os = "linux")]
+        platform_specific: iced::window::settings::PlatformSpecific {
+            application_id: twicecat_ptt::APP_ID.to_owned(),
             ..Default::default()
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        iced::window::Settings {
-            size,
-            ..Default::default()
-        }
+        },
+        ..Default::default()
     }
 }
 
@@ -335,6 +328,7 @@ mod tests {
             "Name=Twicecat",
             "Exec=twicecat",
             &format!("StartupWMClass={}", twicecat_ptt::APP_ID),
+            &format!("Icon={}", twicecat_ptt::APP_ID),
         ] {
             assert!(lines.contains(&wanted), "missing {wanted}");
         }
@@ -358,6 +352,54 @@ mod tests {
             assert!(
                 out.status.success() && out.stdout.is_empty(),
                 "desktop-file-validate: {}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
+    /// The icon the entry names exists in every size packages install, the
+    /// window gets it, and the AppStream metadata describes the same app
+    /// (validated where `appstreamcli` is installed).
+    #[test]
+    fn the_icon_and_the_metainfo_carry_the_app_id() {
+        let packaging = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging");
+        let id = twicecat_ptt::APP_ID;
+        assert!(
+            packaging
+                .join(format!("icons/hicolor/scalable/apps/{id}.svg"))
+                .is_file()
+        );
+        for size in [16, 24, 32, 48, 64, 128, 256, 512] {
+            let path = packaging.join(format!("icons/hicolor/{size}x{size}/apps/{id}.png"));
+            let image = image::open(&path).expect("the icon decodes");
+            assert_eq!((image.width(), image.height()), (size, size), "{path:?}");
+        }
+        assert!(packaging.join(format!("icons/{id}.ico")).is_file());
+        assert!(window_settings().icon.is_some());
+
+        let path = packaging.join(format!("linux/{id}.metainfo.xml"));
+        let metainfo = std::fs::read_to_string(&path).expect("the metainfo exists");
+        assert!(metainfo.contains(&format!("<id>{id}</id>")));
+        assert!(metainfo.contains(&format!(
+            "<launchable type=\"desktop-id\">{id}.desktop</launchable>"
+        )));
+        assert!(metainfo.contains("<binary>twicecat</binary>"));
+        assert!(
+            metainfo.contains(&format!(
+                "<release version=\"{}\"",
+                env!("CARGO_PKG_VERSION")
+            )),
+            "the metainfo lists this version"
+        );
+        if let Ok(out) = std::process::Command::new("appstreamcli")
+            .args(["validate", "--strict", "--no-net"])
+            .arg(&path)
+            .output()
+        {
+            assert!(
+                out.status.success(),
+                "appstreamcli: {}{}",
                 String::from_utf8_lossy(&out.stdout),
                 String::from_utf8_lossy(&out.stderr)
             );

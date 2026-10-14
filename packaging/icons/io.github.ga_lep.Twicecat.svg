@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Twicecat's icon: the tray's drawing (crates/app/src/tray.rs, icon_rgba) as
+     a vector, on its 64-unit grid. scripts/make-icons.sh renders the PNGs and
+     the .ico from it. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <rect width="64" height="64" rx="12.8" fill="#2d5be3"/>
+  <path fill="#ffffff" d="M16 17.92h32v7.68H16z M28.8 25.6h6.4v25.6h-6.4z"/>
+</svg>

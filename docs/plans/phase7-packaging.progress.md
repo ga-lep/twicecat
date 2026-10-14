@@ -2,3 +2,4 @@ Plan: drafted 2026-10-14 on feat/phase7-packaging (from origin/main 072206e), wi
 Task 1: complete (gate ok: 1735 passed; v4 refusal verified on Linux, Windows check assembled and inspected, not run)
 Task 2: complete (gate ok: 1735 passed; measure-builds.sh reproduces the plan's numbers; v4 built via --config and --target; actionlint and shellcheck clean via Docker)
 Task 3: complete (gate ok: 1738 passed; bundled models found from a fake prefix with an empty HOME; mutation caught)
+Task 4: complete (gate ok: 1740 passed; desktop-file-validate and appstreamcli --strict valid; icon mutation caught)
