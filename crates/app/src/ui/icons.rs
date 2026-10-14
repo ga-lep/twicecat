@@ -13,6 +13,8 @@ use iced::widget::text;
 pub enum Icon {
     /// An encrypted room.
     Lock,
+    /// An open lock: media that is not encrypted.
+    LockOpen,
     /// A call, or a room with a call going.
     Call,
     /// A speaker or the sound level.
@@ -85,8 +87,9 @@ pub enum Icon {
 
 impl Icon {
     /// Every icon, in declaration order.
-    pub const ALL: [Self; 35] = [
+    pub const ALL: [Self; 36] = [
         Self::Lock,
+        Self::LockOpen,
         Self::Call,
         Self::Speaker,
         Self::Muted,
@@ -127,6 +130,7 @@ impl Icon {
     pub const fn glyph(self) -> &'static str {
         match self {
             Self::Lock => "\u{1F512}",
+            Self::LockOpen => "\u{1F513}",
             Self::Call => "\u{1F50A}",
             Self::Speaker => "\u{1F509}",
             Self::Muted => "\u{1F507}",
@@ -168,6 +172,7 @@ impl Icon {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Lock => "Encrypted",
+            Self::LockOpen => "Not encrypted",
             Self::Call => "Call",
             Self::Speaker => "Speaker",
             Self::Muted => "Muted",
@@ -268,7 +273,7 @@ mod tests {
             assert!(!icon.label().trim().is_empty(), "{icon:?}");
             assert!(seen.insert(icon.glyph()), "{icon:?} repeats a glyph");
         }
-        assert_eq!(Icon::ALL.len(), 35);
+        assert_eq!(Icon::ALL.len(), 36);
         assert_eq!(Icon::Home.label(), "Home");
         assert_eq!(Icon::Members.label(), "Members");
     }

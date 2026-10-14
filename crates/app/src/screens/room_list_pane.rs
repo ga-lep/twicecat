@@ -363,7 +363,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
         (rail_actions(), rail_search(), call::rail_dock(app))
     } else {
         tabs = segmented_tabs(app.query.tab);
-        (room_actions(), search_field(app), call::bar(app))
+        (room_actions(), search_field(app), call::dock(app))
     };
     // The call bar is last, so the list keeps its place when a call starts.
     // `from_vec` keeps the empty slots (`push` drops a zero-sized child), so

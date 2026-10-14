@@ -20,6 +20,7 @@ on macOS.
 | Ctrl+= / Ctrl+- / Ctrl+0 | Make the text larger / smaller / back to 100 % |
 | Ctrl+Shift+M | In a call: mute or unmute the microphone |
 | Ctrl+Shift+D | In a call: deafen or undeafen |
+| Ctrl+Shift+A / Ctrl+Shift+X | While a call rings (its card is showing): accept / decline it |
 | Tab / Shift+Tab | Move to the next / previous field |
 | Esc | Close the topmost dialog, panel, Settings or the switcher |
 | Up / Down (switcher open) | Highlight the previous / next room |
@@ -55,8 +56,11 @@ Rules the code follows (all in tests):
   with the room's name and what the dots mean (unread, mentions, in a call,
   ringing, muted), and a dot is never the only sign, since the tooltip words
   say the same. In the rail the search field is a **Search** button that
-  expands the list, and the call bar is a column of icon buttons (the call's
-  room, mute, deafen, leave), each with its words in a tooltip.
+  expands the list, and the call dock is a column of icon buttons (the call's
+  room, mute, deafen, leave), each with its words in a tooltip, and visible
+  marks that need no pointing: the call phase glyph, the encryption lock (or a
+  warning when the call is not encrypted), who declined, and the microphone's
+  state (see Calls).
 - Narrow windows: from 800 to 1100 px the list is shown as the rail while a
   thread or the participants panel is open; under 800 px the spaces sidebar is
   not shown, the list is the rail, and an open panel takes the room pane's
@@ -80,25 +84,40 @@ order, so Tab reaches it:
 
 - the room header's call button (Call, Join call, Join voice, Leave call)
   and, in the call's room, **People** for the participants panel;
-- the call bar at the bottom of the room list: the call's room name (opens
-  it with the panel), **Mute**, **Deafen**, **Leave**, and the cross of a
-  call notice;
-- per person in the participants panel: **−** and **+** (10 % each), the
-  volume slider, and the voice cleaning menu;
+- the call dock at the bottom of the room list: the call's room name (opens
+  it with the panel), **Mute**, **Deafen**, **Audio settings**, **Leave**
+  (off while a join or leave waits), and the close button of a call notice
+  (a separate button: clicking the notice's mark or words does nothing);
+- per person in the participants panel: **More**, which folds out **−** and
+  **+** (10 % each), the volume slider, and the voice cleaning menu;
 - the Voice & audio card (from Settings or the call bar's **Audio…**): menus,
   checkboxes, and for each slider **−** and **+** beside it; Esc closes it.
   Its Talking section sets voice activity, push-to-talk or toggle-to-talk,
   the key (**Set key…**, **Clear**), the gamepad button (a menu, so no pad
   is needed to pick one) and the release delay;
 - the incoming-call card, a modal layer above everything else: **Decline**
-  then **Accept**, and Esc to hide it. While it shows, the room shortcuts
-  wait, as under any dialog.
+  then **Accept**, side by side with a gap, and Esc to hide it. iced 0.14's
+  buttons take no keys, so the card also answers to **Ctrl+Shift+A** (accept)
+  and **Ctrl+Shift+X** (decline), also with the composer focused, only while
+  the card is showing. For about 0.6 s after the card shows (or changes to
+  another ring) the buttons are off, with the words "Answer in a moment", and
+  the keys do nothing; a chord that is still held never answers a second
+  ring: release it and press it again. While it shows, the room shortcuts wait, as under any
+  dialog. The caller's name or user ID is cleaned, cut in the middle past 64
+  characters (the end, the server name, stays) and wraps by glyph, so no
+  character is hidden.
 
 Push-to-talk works from the keyboard alone: the bound key in Twicecat's
 window always talks, also with the composer focused (a key that types text
 also types it, so a function key or a chord is the better choice), and the
-window losing focus lets go. The call bar says "Talking", or which key to
-hold or press, in words.
+window losing focus lets go. The call dock says "Talking", or which key to
+hold or press, in words, and draws the microphone so that it can be read
+without pointing at it: an open microphone (voice activity, or transmitting)
+is the microphone glyph, muted or deafened is the crossed microphone (and
+takes precedence over everything), and push-to-talk or toggle-to-talk that
+is not transmitting is the key (or gamepad) glyph on an outlined fill, so
+"muted" and "waiting for the key" are never the same picture. Transmitting
+has the accent fill.
 
 A ring is not only a sound: the card, the window asking for attention
 (until it is focused, for a direct call), a desktop notification while the

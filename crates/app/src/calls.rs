@@ -3,7 +3,7 @@
 //! and the core's audio settings, devices and meters. Pure: the core's events
 //! change this state, and only `App`'s handlers in this file send commands.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::time::Duration;
 
@@ -294,6 +294,28 @@ pub struct Ring {
     /// Accept or Decline was pressed; its buttons are off until the core
     /// answers (or refuses).
     pub answered: bool,
+    /// Counts the calls that rang this room: a new call in the same room is
+    /// a new ring, whose card arms again.
+    pub epoch: u64,
+}
+
+/// How long a card that just showed (or changed to another ring) ignores
+/// answers: the clicks and keys already on their way when it came up were
+/// meant for what was under it.
+pub const RING_ARMING: Duration = Duration::from_millis(600);
+
+/// The card's arming: which ring it is for and whether the wait is over.
+/// View state only; nothing of it is sent to the core.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RingArm {
+    /// The ring the card shows.
+    pub room_id: RoomId,
+    /// That ring's [`Ring::epoch`].
+    pub epoch: u64,
+    /// Tells this wait's timer from an earlier one's.
+    pub seq: u64,
+    /// The wait is over: the card answers.
+    pub live: bool,
 }
 
 /// One row of the participants panel, ready to draw.
@@ -365,6 +387,20 @@ pub struct CallModel {
     pub volume_drag: Option<(UserId, u16)>,
     /// Counts slider moves, so only the last pause sends.
     pub volume_seq: u64,
+    /// The people whose row in the participants panel shows its volume and
+    /// cleaning controls (the **More** button). View state only: it is not
+    /// sent anywhere and ends with the call.
+    pub rows_open: HashSet<UserId>,
+    /// The arming of the card now showing, if one shows. View state only.
+    pub arm: Option<RingArm>,
+    /// Counts armings, so a timer of an earlier wait does nothing.
+    pub arm_counter: u64,
+    /// Counts incoming calls, for [`Ring::epoch`].
+    pub ring_epoch: u64,
+    /// Ctrl+Shift+A or Ctrl+Shift+X went down and has not come up: its
+    /// auto-repeats answer nothing, whichever card they find. The composer
+    /// forwards repeats the window's key events could tell apart.
+    pub chord_held: bool,
     /// The audio settings as the core last echoed them. Edits are made on a
     /// copy and sent whole.
     pub settings: Option<AudioSettings>,
@@ -461,11 +497,90 @@ impl CallModel {
             .find(|r| r.ring && !r.hidden && self.call_in(&r.room_id).is_none())
     }
 
+    /// Whether the card now showing is still waiting to answer.
+    pub fn arming(&self) -> bool {
+        self.card().is_some() && self.live_card().is_none()
+    }
+
+    /// The card now showing, once its wait is over.
+    pub fn live_card(&self) -> Option<&Ring> {
+        let ring = self.card()?;
+        self.arm
+            .as_ref()
+            .filter(|a| a.live && a.room_id == ring.room_id && a.epoch == ring.epoch)
+            .map(|_| ring)
+    }
+
+    /// The sequence number of the wait now running (what its timer carries).
+    pub fn arm_seq(&self) -> u64 {
+        self.arm.as_ref().map_or(0, |a| a.seq)
+    }
+
+    /// Whether a ring chord is down.
+    pub fn chord_held(&self) -> bool {
+        self.chord_held
+    }
+
+    /// Starts a wait when the card shows a ring it was not waiting for, and
+    /// forgets it when no card shows. Returns the sequence to time, if one
+    /// started.
+    pub fn sync_arming(&mut self) -> Option<u64> {
+        let Some(ring) = self.card() else {
+            self.arm = None;
+            return None;
+        };
+        if self
+            .arm
+            .as_ref()
+            .is_some_and(|a| a.room_id == ring.room_id && a.epoch == ring.epoch)
+        {
+            return None;
+        }
+        let (room_id, epoch) = (ring.room_id.clone(), ring.epoch);
+        self.arm_counter = self.arm_counter.wrapping_add(1);
+        self.arm = Some(RingArm {
+            room_id,
+            epoch,
+            seq: self.arm_counter,
+            live: false,
+        });
+        Some(self.arm_counter)
+    }
+
+    /// The timer of wait `seq` ended: the card answers if it is still the
+    /// one the wait was for.
+    pub fn arm_ended(&mut self, seq: u64) {
+        if let Some(arm) = self.arm.as_mut().filter(|a| a.seq == seq) {
+            arm.live = true;
+        }
+    }
+
     /// The call pill of `room`'s row: when its call has devices or it rings.
     pub fn pill(&self, room: &RoomId) -> Option<CallPill> {
         let count = self.count(room);
         let ringing = self.ring(room).is_some();
         (count > 0 || ringing).then_some(CallPill { count, ringing })
+    }
+
+    /// Whether `user`'s row shows its controls.
+    pub fn row_open(&self, user: &UserId) -> bool {
+        self.rows_open.contains(user)
+    }
+
+    /// **More** on a row: shows or hides its controls. Only someone else in
+    /// the call has controls, so any other user is ignored.
+    pub fn toggle_row(&mut self, user: &UserId) {
+        if self.rows_open.remove(user) {
+            return;
+        }
+        let has_controls = self.call.as_ref().is_some_and(|call| {
+            call.participants
+                .iter()
+                .any(|p| p.user_id == *user && !p.is_local)
+        });
+        if has_controls {
+            self.rows_open.insert(user.clone());
+        }
     }
 
     /// The volume a person's slider shows: the value being moved, else the
@@ -534,6 +649,7 @@ impl CallModel {
                 // join that fails keeps it ringing); its card hides meanwhile.
                 self.notice = None;
                 self.volume_drag = None;
+                self.rows_open.clear();
                 self.call = Some(CurrentCall::new(room_id, CallPhase::Joining));
             }
             CallState::Connected { room_id, encrypted } => {
@@ -561,6 +677,7 @@ impl CallModel {
     fn end_call(&mut self) {
         self.call = None;
         self.volume_drag = None;
+        self.rows_open.clear();
         self.panel_open = false;
     }
 
@@ -583,6 +700,11 @@ impl CallModel {
                     for diff in &diffs {
                         diff.apply(&mut call.participants);
                     }
+                }
+                // Someone who left takes their open row with them.
+                if let Some(call) = self.call.as_ref().filter(|c| c.room_id == room_id) {
+                    self.rows_open
+                        .retain(|u| call.participants.iter().any(|p| p.user_id == *u));
                 }
             }
             CoreEvent::ActiveCall {
@@ -628,6 +750,8 @@ impl CallModel {
             // devices joined before this one.
             return;
         }
+        self.ring_epoch = self.ring_epoch.wrapping_add(1);
+        let epoch = self.ring_epoch;
         if let Some(known) = self.rings.iter_mut().find(|r| r.room_id == room_id) {
             // A new call in the same room: its card shows again.
             *known = Ring {
@@ -636,6 +760,7 @@ impl CallModel {
                 ring,
                 hidden: false,
                 answered: false,
+                epoch,
             };
             return;
         }
@@ -648,6 +773,7 @@ impl CallModel {
             ring,
             hidden: false,
             answered: false,
+            epoch,
         });
     }
 
@@ -688,6 +814,14 @@ fn notice_line(text: &str) -> String {
 }
 
 impl App {
+    /// Whether `room` is the room of the card now showing, once its wait is
+    /// over: the only ring a button or chord may answer.
+    fn is_live_card(&self, room: &RoomId) -> bool {
+        self.calls
+            .live_card()
+            .is_some_and(|ring| ring.room_id == *room)
+    }
+
     /// A call control.
     pub(crate) fn on_call(&mut self, message: CallMessage) -> Task<Message> {
         match message {
@@ -800,7 +934,13 @@ impl App {
                 self.set_user_volume(user_id, next)
             }
             CallMessage::Accept(room_id) => {
-                if self.calls.ring(&room_id).is_none_or(|r| r.answered) {
+                // Only the card on screen, once it has armed: a click aimed
+                // at an earlier card must not answer a new call in the same
+                // room (the view hides the buttons' press while arming; this
+                // is the handler's own guard).
+                if !self.is_live_card(&room_id)
+                    || self.calls.ring(&room_id).is_none_or(|r| r.answered)
+                {
                     return Task::none();
                 }
                 let join = self.on_call(CallMessage::Join(room_id.clone()));
@@ -812,6 +952,9 @@ impl App {
                 join
             }
             CallMessage::Decline(room_id) => {
+                if !self.is_live_card(&room_id) {
+                    return Task::none();
+                }
                 let Some(ring) = self
                     .calls
                     .rings
@@ -1134,6 +1277,16 @@ mod tests {
             intent: CallIntent::Audio,
             ring,
         }));
+    }
+
+    /// The arming timer of the card now showing ends.
+    fn arm(app: &mut App) {
+        let seq = app.calls.arm_seq();
+        let _ = app.update(Message::RingArmed(seq));
+    }
+
+    fn chord_up(app: &mut App) {
+        let _ = app.update(Message::RingChordReleased);
     }
 
     fn names(app: &App) -> Vec<String> {
@@ -2020,6 +2173,232 @@ mod tests {
     }
 
     #[test]
+    fn the_ring_card_is_answered_from_the_keyboard_only_while_it_shows() {
+        let (mut app, mut rx) = main_app();
+        shortcut(&mut app, Shortcut::AcceptRing);
+        shortcut(&mut app, Shortcut::DeclineRing);
+        assert!(drain(&mut rx).is_empty(), "no card, no answer");
+        chord_up(&mut app);
+        incoming(&mut app, "b", "bob", true);
+        arm(&mut app);
+        drain(&mut rx);
+        shortcut(&mut app, Shortcut::DeclineRing);
+        let sent = drain(&mut rx);
+        assert!(
+            matches!(sent.as_slice(), [Command::DeclineCall { room_id }] if *room_id == room("b")),
+            "{sent:?}"
+        );
+        // A second press does nothing, as the button's.
+        chord_up(&mut app);
+        shortcut(&mut app, Shortcut::DeclineRing);
+        assert!(drain(&mut rx).is_empty());
+        let (mut app, mut rx) = main_app();
+        incoming(&mut app, "b", "bob", true);
+        arm(&mut app);
+        drain(&mut rx);
+        shortcut(&mut app, Shortcut::AcceptRing);
+        let sent = drain(&mut rx);
+        assert!(
+            matches!(sent.as_slice(), [Command::JoinCall { room_id, .. }] if *room_id == room("b")),
+            "{sent:?}"
+        );
+        // Esc hid the card: the keys wait with it.
+        let (mut app, mut rx) = main_app();
+        incoming(&mut app, "b", "bob", true);
+        call(&mut app, CallMessage::HideRing);
+        drain(&mut rx);
+        shortcut(&mut app, Shortcut::AcceptRing);
+        assert!(drain(&mut rx).is_empty());
+        assert!(crate::keys::composer_takes(Shortcut::AcceptRing));
+        assert!(crate::keys::composer_takes(Shortcut::DeclineRing));
+    }
+
+    fn card_room(app: &App) -> Option<RoomId> {
+        app.calls.card().map(|r| r.room_id.clone())
+    }
+
+    #[test]
+    fn a_new_card_is_inert_until_its_arming_timer_ends() {
+        let (mut app, mut rx) = main_app();
+        incoming(&mut app, "b", "bob", true);
+        assert!(app.calls.arming(), "just shown");
+        assert!(app.calls.live_card().is_none());
+        drain(&mut rx);
+        shortcut(&mut app, Shortcut::AcceptRing);
+        assert!(drain(&mut rx).is_empty(), "arming: no answer");
+        arm(&mut app);
+        assert!(!app.calls.arming());
+        // The chord of the early press is still down: it never answers.
+        shortcut(&mut app, Shortcut::AcceptRing);
+        assert!(drain(&mut rx).is_empty(), "the held chord stays inert");
+        chord_up(&mut app);
+        shortcut(&mut app, Shortcut::AcceptRing);
+        let sent = drain(&mut rx);
+        assert!(
+            matches!(sent.as_slice(), [Command::JoinCall { room_id, .. }] if *room_id == room("b")),
+            "{sent:?}"
+        );
+    }
+
+    #[test]
+    fn a_stale_arming_timer_does_not_arm_the_card() {
+        let (mut app, mut rx) = main_app();
+        incoming(&mut app, "b", "bob", true);
+        let stale = app.calls.arm_seq();
+        // Esc hides it; a later ring of the same room shows it again.
+        call(&mut app, CallMessage::HideRing);
+        assert!(card_room(&app).is_none());
+        incoming(&mut app, "b", "cy", true);
+        assert_ne!(app.calls.arm_seq(), stale, "arming started again");
+        let _ = app.update(Message::RingArmed(stale));
+        assert!(app.calls.arming(), "the old timer is ignored");
+        drain(&mut rx);
+        shortcut(&mut app, Shortcut::DeclineRing);
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn a_held_chord_that_answers_one_ring_never_answers_the_next() {
+        let (mut app, mut rx) = main_app();
+        incoming(&mut app, "b", "bob", true);
+        incoming(&mut app, "a", "cy", true);
+        arm(&mut app);
+        assert_eq!(card_room(&app), Some(room("b")));
+        drain(&mut rx);
+        // The chord goes down: Accept B. Joining B puts C on the card.
+        shortcut(&mut app, Shortcut::AcceptRing);
+        let sent = drain(&mut rx);
+        assert!(
+            matches!(sent.as_slice(), [Command::JoinCall { room_id, .. }] if *room_id == room("b")),
+            "{sent:?}"
+        );
+        joining(&mut app, "b");
+        drain(&mut rx);
+        assert_eq!(card_room(&app), Some(room("a")), "C shows now");
+        // The auto-repeats (forwarded by the composer, so not told apart)
+        // come while C arms, and after it armed.
+        shortcut(&mut app, Shortcut::AcceptRing);
+        arm(&mut app);
+        for _ in 0..5 {
+            shortcut(&mut app, Shortcut::AcceptRing);
+            shortcut(&mut app, Shortcut::DeclineRing);
+        }
+        assert!(drain(&mut rx).is_empty(), "C was never answered");
+        assert!(!app.calls.ring(&room("a")).expect("C rings").answered);
+        // A fresh press after the keys went up works.
+        chord_up(&mut app);
+        shortcut(&mut app, Shortcut::DeclineRing);
+        let sent = drain(&mut rx);
+        assert!(
+            matches!(sent.as_slice(), [Command::DeclineCall { room_id }] if *room_id == room("a")),
+            "{sent:?}"
+        );
+    }
+
+    #[test]
+    fn arming_starts_again_for_each_ring_the_card_changes_to() {
+        let (mut app, mut rx) = main_app();
+        incoming(&mut app, "b", "bob", true);
+        incoming(&mut app, "a", "cy", true);
+        arm(&mut app);
+        assert!(!app.calls.arming());
+        let first = app.calls.arm_seq();
+        // The card changes to the other ring: arming again.
+        let _ = app.update(core(CoreEvent::RingingStopped { room_id: room("b") }));
+        assert_eq!(card_room(&app), Some(room("a")));
+        assert!(app.calls.arming());
+        assert_ne!(app.calls.arm_seq(), first);
+        drain(&mut rx);
+        chord_up(&mut app);
+        shortcut(&mut app, Shortcut::AcceptRing);
+        assert!(drain(&mut rx).is_empty());
+        arm(&mut app);
+        chord_up(&mut app);
+        shortcut(&mut app, Shortcut::AcceptRing);
+        assert_eq!(drain(&mut rx).len(), 1);
+        // No card, nothing arms or waits.
+        let (mut quiet, _rx) = main_app();
+        assert!(!quiet.calls.arming());
+        arm(&mut quiet);
+        assert!(quiet.calls.live_card().is_none());
+    }
+
+    #[test]
+    fn losing_the_window_lets_go_of_the_held_chord() {
+        let (mut app, mut rx) = main_app();
+        incoming(&mut app, "b", "bob", true);
+        arm(&mut app);
+        drain(&mut rx);
+        shortcut(&mut app, Shortcut::DeclineRing);
+        assert_eq!(drain(&mut rx).len(), 1);
+        assert!(app.calls.chord_held());
+        let _ = app.update(Message::WindowFocus(false));
+        assert!(!app.calls.chord_held(), "a release may never be seen");
+    }
+
+    #[test]
+    fn the_held_chord_is_let_go_when_the_key_capture_dialog_opens_or_closes() {
+        use crate::audio_settings::AudioMessage as A;
+        let (mut app, mut rx) = main_app();
+        incoming(&mut app, "b", "bob", true);
+        arm(&mut app);
+        let _ = app.update(Message::Audio(A::Open));
+        drain(&mut rx);
+        // Down before the dialog opens: its release may go unseen under it.
+        shortcut(&mut app, Shortcut::DeclineRing);
+        assert!(app.calls.chord_held(), "the chord is down");
+        let _ = app.update(Message::Audio(A::CaptureKey));
+        assert!(
+            !app.calls.chord_held(),
+            "the latch ends with the dialog's start"
+        );
+        // And when it closes, whatever was latched meanwhile.
+        app.calls.chord_held = true;
+        let _ = app.update(Message::Audio(A::CancelCapture));
+        assert!(!app.calls.chord_held(), "and with its end");
+    }
+
+    #[test]
+    fn more_expands_and_collapses_a_row_and_a_call_end_folds_them_all() {
+        let (mut app, mut rx) = main_app();
+        joining(&mut app, "a");
+        drain(&mut rx);
+        participants(
+            &mut app,
+            "a",
+            vec![ListDiff::Reset {
+                values: vec![person("a"), person("bob"), person("cy")],
+            }],
+        );
+        assert!(!app.calls.row_open(&user("bob")));
+        let _ = app.update(Message::CallRowMore(user("bob")));
+        assert!(app.calls.row_open(&user("bob")));
+        assert!(!app.calls.row_open(&user("cy")), "rows open one by one");
+        let _ = app.update(Message::CallRowMore(user("cy")));
+        let _ = app.update(Message::CallRowMore(user("bob")));
+        assert!(!app.calls.row_open(&user("bob")));
+        assert!(app.calls.row_open(&user("cy")));
+        // This device has no controls to fold out, and a stranger has none.
+        let _ = app.update(Message::CallRowMore(user("a")));
+        let _ = app.update(Message::CallRowMore(user("zed")));
+        assert_eq!(app.calls.rows_open.len(), 1);
+        // It is view state: nothing is sent to the core.
+        assert!(drain(&mut rx).is_empty());
+        // Someone leaving takes their open row with them.
+        participants(
+            &mut app,
+            "a",
+            vec![ListDiff::Reset {
+                values: vec![person("a"), person("bob")],
+            }],
+        );
+        assert!(app.calls.rows_open.is_empty());
+        let _ = app.update(Message::CallRowMore(user("bob")));
+        state(&mut app, CallState::Idle);
+        assert!(app.calls.rows_open.is_empty());
+    }
+
+    #[test]
     fn joining_asks_for_the_call_rooms_members() {
         let (mut app, mut rx) = main_app();
         joining(&mut app, "a");
@@ -2615,6 +2994,7 @@ mod tests {
     fn accept_joins_once_and_the_card_goes_when_joining() {
         let (mut app, mut rx, _) = ring_app();
         incoming(&mut app, "b", "bob", true);
+        arm(&mut app);
         drain(&mut rx);
         call(&mut app, CallMessage::Accept(room("b")));
         call(&mut app, CallMessage::Accept(room("b")));
@@ -2630,9 +3010,55 @@ mod tests {
     }
 
     #[test]
+    fn a_click_meant_for_an_old_card_answers_nothing_on_a_new_call_in_the_same_room() {
+        let (mut app, mut rx, _) = ring_app();
+        incoming(&mut app, "b", "bob", true);
+        arm(&mut app);
+        // The card was up and armed; its ring ends and the same room calls
+        // again before the click reaches the app.
+        let _ = app.update(core(CoreEvent::RingingStopped { room_id: room("b") }));
+        incoming(&mut app, "b", "bob", true);
+        assert!(app.calls.arming(), "the new card is still waiting");
+        drain(&mut rx);
+        call(&mut app, CallMessage::Accept(room("b")));
+        call(&mut app, CallMessage::Decline(room("b")));
+        assert!(
+            drain(&mut rx).is_empty(),
+            "the old click answered the new call"
+        );
+        assert!(app.calls.card().is_some_and(|r| !r.answered));
+        // Once the new card has armed, the buttons work.
+        arm(&mut app);
+        call(&mut app, CallMessage::Decline(room("b")));
+        assert!(matches!(
+            drain(&mut rx).as_slice(),
+            [Command::DeclineCall { .. }]
+        ));
+    }
+
+    #[test]
+    fn accept_and_decline_for_a_room_other_than_the_live_card_do_nothing() {
+        let (mut app, mut rx, _) = ring_app();
+        incoming(&mut app, "b", "bob", true);
+        incoming(&mut app, "c", "cy", true);
+        arm(&mut app);
+        drain(&mut rx);
+        let live = app.calls.live_card().expect("live").room_id.clone();
+        let other = if live == room("b") {
+            room("c")
+        } else {
+            room("b")
+        };
+        call(&mut app, CallMessage::Accept(other.clone()));
+        call(&mut app, CallMessage::Decline(other));
+        assert!(drain(&mut rx).is_empty(), "only the card on screen answers");
+    }
+
+    #[test]
     fn a_failed_accept_shows_the_card_again() {
         let (mut app, mut rx, _) = ring_app();
         incoming(&mut app, "b", "bob", true);
+        arm(&mut app);
         call(&mut app, CallMessage::Accept(room("b")));
         joining(&mut app, "b");
         assert!(app.calls.card().is_none());
@@ -2646,6 +3072,9 @@ mod tests {
         // The core's ringtone sounds again: the card is back, its buttons on.
         let card = app.calls.card().expect("the card again");
         assert!(!card.answered);
+        // A card that comes back is a card to wait for again.
+        assert!(app.calls.arming());
+        arm(&mut app);
         drain(&mut rx);
         call(&mut app, CallMessage::Decline(room("b")));
         assert!(matches!(
@@ -2658,6 +3087,7 @@ mod tests {
     fn decline_sends_once_and_the_card_goes_when_the_ringing_stops() {
         let (mut app, mut rx, _) = ring_app();
         incoming(&mut app, "b", "bob", true);
+        arm(&mut app);
         drain(&mut rx);
         call(&mut app, CallMessage::Decline(room("b")));
         call(&mut app, CallMessage::Decline(room("b")));
@@ -2675,6 +3105,7 @@ mod tests {
     fn a_ring_in_a_room_hidden_by_the_search_can_be_accepted() {
         let (mut app, mut rx, _) = ring_app();
         incoming(&mut app, "elsewhere", "dan", true);
+        arm(&mut app);
         drain(&mut rx);
         call(&mut app, CallMessage::Accept(room("elsewhere")));
         let sent = drain(&mut rx);
@@ -2698,6 +3129,7 @@ mod tests {
     fn a_refused_answer_can_be_tried_again() {
         let (mut app, mut rx, _) = ring_app();
         incoming(&mut app, "b", "bob", true);
+        arm(&mut app);
         call(&mut app, CallMessage::Decline(room("b")));
         let _ = app.update(core(CoreEvent::Error(CoreError::Call(
             "could not send the decline; the caller keeps ringing".into(),
