@@ -56,6 +56,37 @@ scripts/measure-builds.sh
 
 It builds each CPU level, prints the size of `twicecat` and times the voice chain per 10 ms on one core of each kind. The defaults are x86-64 and v3, plus v4 where the CPU has AVX-512; on aarch64, generic, Cortex-A76 and the CPU's own. `--variants`, `--profile dist`, `--cores`, `--rounds` and `--frames` change that. Other levels are built with `--target`, so their flags never reach the build scripts, which run on this machine. The "Profile" workflow (Actions tab) runs the same script on GitHub's x86_64 or arm runner.
 
+## Packages
+
+`scripts/package.sh` builds the release binary and packages it for the machine it runs on, into `target/package/<triple>/`:
+
+| Machine | Packages | Made by |
+| --- | --- | --- |
+| Linux | `.tar.zst`, `.deb`, `.rpm`, AppImage, plus a symbols archive | nfpm, appimagetool |
+| macOS | `.app` in a DMG | cargo-packager |
+| Windows | MSI | cargo-packager |
+
+Every package carries the full (GPU) build, the DeepFilterNet3 models, `LICENSE` and `THIRD_PARTY_NOTICES.html`. Linux packages also carry the "any GPU" pack: ONNX Runtime's CPU build, its WebGPU plugin and the stateful graph. On Linux these resources go in `<prefix>/lib/twicecat`, beside `<prefix>/bin/twicecat`. They don't go in `<prefix>/share/twicecat`, because that is the app's data directory when the `.tar.zst` is unpacked into `~/.local`. They need:
+
+- the models, ONNX Runtime and the WebGPU plugin, which the script fetches with the pinned fetch scripts;
+- the stateful graph from `scripts/export-deepfilternet.sh`, or `TWICECAT_STATEFUL_MODEL` (checked against its pinned SHA-256);
+- the packaging tools, fetched pinned by `scripts/fetch-packaging-tools.sh`: nfpm, appimagetool and the AppImage runtime (Linux), or `cargo install cargo-packager@0.11.8 --locked` (macOS, Windows);
+- `cargo install cargo-about@0.9.2 --locked --features cli`, for the notices.
+
+Options: `--profile release` (faster, for testing; releases use `dist`), `--formats "tar deb"`, `--no-build`.
+
+Linux packages need the build machine's glibc or newer. Release CI builds them in the Ubuntu 24.04 image in `dev/ubuntu-24.04/Dockerfile` (glibc 2.39), so they run on the Steam Frame, Ubuntu 24.04, Debian 13, and Fedora 43 or newer. A package built on a newer distribution needs that distribution's glibc. `package.sh` stops when the binary needs a newer glibc than the floor `packaging/nfpm.yaml` declares, so build in that image; its header has the commands.
+
+To build for the Steam Frame (aarch64) on an x86_64 machine, use the cross image in `dev/ubuntu-24.04-aarch64-cross/Dockerfile`: it builds the binary in about 5 minutes, and `scripts/package.sh --no-build` packages it on an aarch64 machine.
+
+`scripts/smoke-test-packages.sh target/package/<triple>` then checks each Linux package headless:
+
+- **`.tar.zst` and AppImage:** run here.
+- **`.deb`:** installed with apt in `ubuntu:24.04` and `ubuntu:26.04`.
+- **`.rpm`:** installed with dnf in `fedora:43` and `fedora:44`.
+
+Each must print its version, resolve every library and carry its resources where the app looks for them.
+
 ## Push-to-talk on Linux
 
 On Wayland the global push-to-talk key goes through the desktop's shortcuts portal (KDE Plasma, and GNOME and Hyprland in recent versions). The portal knows Twicecat by its app ID, `io.github.ga_lep.Twicecat`, and looks for a desktop entry with that name. A build run with `cargo run` has none, so install the one in the repository once:
