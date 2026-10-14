@@ -652,9 +652,10 @@ impl App {
                 let rows = self.keep_list_place(before);
                 // Rows change height: the measured ones are stale. The place
                 // in the timeline (the offset from the bottom) stays.
-                self.timeline.reset_measurements();
+                let density = self.density();
+                self.timeline.set_density(density);
                 if let Some(panel) = self.threads.panel.as_mut() {
-                    panel.timeline.reset_measurements();
+                    panel.timeline.set_density(density);
                 }
                 Task::batch([rows, self.save_local()])
             }

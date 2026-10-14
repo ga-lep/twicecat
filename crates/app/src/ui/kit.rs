@@ -167,6 +167,21 @@ pub fn icon_style(theme: &Theme, status: Status) -> button::Style {
     ghost_style(theme, status)
 }
 
+/// A button that holds one icon whose action cannot be undone: the glyph is
+/// in the danger colour (nudged until it reads at 7:1 on what is behind it), the
+/// rest is the quiet icon style.
+pub fn danger_icon_style(theme: &Theme, status: Status) -> button::Style {
+    let mut style = ghost_style(theme, status);
+    if status != Status::Disabled {
+        let behind = match style.background {
+            Some(Background::Color(c)) => c,
+            _ => theme::semantic(theme).surface_raised,
+        };
+        style.text_color = theme::readable_at(theme.palette().danger, behind, 7.0);
+    }
+    style
+}
+
 /// A toggle that is on: the selection colour and the focus colour outline.
 pub fn active_icon_style(theme: &Theme, status: Status) -> button::Style {
     let sem = theme::semantic(theme);
@@ -241,6 +256,30 @@ pub fn tip<'a, M: 'a>(
         .padding(tokens::S)
         .style(card_style)
         .into()
+}
+
+/// Like [`icon_button`], but small: a caption-size glyph in a 4 px frame, for
+/// a bar that floats over a line of text and must not be taller than it.
+pub fn compact_icon_button<'a, M: Clone + 'a>(icon: Icon, on_press: M) -> Element<'a, M> {
+    compact(icon, on_press, icon_style)
+}
+
+/// [`compact_icon_button`] for an action that cannot be undone: the glyph is
+/// in the danger colour (the words stay in the tooltip).
+pub fn compact_danger_icon_button<'a, M: Clone + 'a>(icon: Icon, on_press: M) -> Element<'a, M> {
+    compact(icon, on_press, danger_icon_style)
+}
+
+fn compact<'a, M: Clone + 'a>(
+    icon: Icon,
+    on_press: M,
+    style: fn(&Theme, Status) -> button::Style,
+) -> Element<'a, M> {
+    let button = button(text(icon.glyph()).size(tokens::CAPTION))
+        .padding(tokens::XS)
+        .on_press(on_press)
+        .style(style);
+    tip(button, icon.label())
 }
 
 /// A button that holds one icon. It always has a tooltip with the icon's
@@ -419,6 +458,65 @@ fn badge_style(theme: &Theme) -> container::Style {
     }
 }
 
+/// Width of the bar at the start of a quote, a reply and a code block.
+pub const QUOTE_BAR_WIDTH: f32 = 3.0;
+
+/// The accent bar of a quote: a non-text mark in the accent colour.
+pub fn quote_bar_style(theme: &Theme) -> rule::Style {
+    rule::Style {
+        color: theme.palette().primary,
+        radius: border::rounded(tokens::SMALL).radius,
+        fill_mode: rule::FillMode::Full,
+        snap: true,
+    }
+}
+
+/// The bar at the start of a quote or a reply, [`QUOTE_BAR_WIDTH`] wide.
+pub fn quote_bar<'a, M: 'a>() -> Element<'a, M> {
+    rule::vertical(QUOTE_BAR_WIDTH)
+        .style(quote_bar_style)
+        .into()
+}
+
+/// The surface of a quote, a reply and a code block: the panel colour, with
+/// small rounded corners.
+pub fn quote_surface_style(theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(theme::semantic(theme).surface)),
+        border: border::rounded(tokens::SMALL),
+        ..container::Style::default()
+    }
+}
+
+/// The style of a reaction chip: a pill on the raised surface, outlined in
+/// the accent when `own` (the count includes your reaction). The count is in
+/// the chip's words either way, so the outline is not the only sign.
+pub fn chip_style(own: bool) -> impl Fn(&Theme, Status) -> button::Style {
+    move |theme, status| {
+        let sem = theme::semantic(theme);
+        let text_color = theme.palette().text;
+        let (fill, outline) = if own {
+            (sem.selection, theme.palette().primary)
+        } else {
+            (sem.surface_raised, sem.border)
+        };
+        let background = match status {
+            Status::Hovered => mix(fill, text_color, 0.08),
+            Status::Pressed => mix(fill, text_color, 0.16),
+            Status::Active | Status::Disabled => fill,
+        };
+        filled(
+            background,
+            text_color,
+            Border {
+                color: outline,
+                width: 1.0,
+                radius: border::rounded(tokens::ROUND).radius,
+            },
+        )
+    }
+}
+
 /// The style of a [`banner`] of `severity`.
 pub fn banner_style(severity: Severity) -> impl Fn(&Theme) -> container::Style {
     move |theme| {
@@ -470,7 +568,7 @@ pub fn section<'a, M: 'a>(title: &'a str, body: impl Into<Element<'a, M>>) -> El
 }
 
 /// A short label in a small rounded box, such as the Voice tag.
-pub fn tag<'a, M: 'a>(label: &'a str) -> Element<'a, M> {
+pub fn tag<'a, M: 'a>(label: impl IntoFragment<'a>) -> Element<'a, M> {
     container(text(label).size(tokens::CAPTION))
         .padding([1.0, tokens::S])
         .style(tag_style)
@@ -715,6 +813,34 @@ mod tests {
     }
 
     #[test]
+    fn the_danger_icon_glyph_is_readable_in_all_eight_palettes_and_every_status() {
+        for family in theme::Family::ALL {
+            for dark in [false, true] {
+                let theme = theme::theme_for_family(family, dark);
+                let card = theme::semantic(&theme).surface_raised;
+                for status in STATUSES {
+                    let s = danger_icon_style(&theme, status);
+                    let back = if status == Status::Active {
+                        card
+                    } else {
+                        behind(&s, &theme)
+                    };
+                    let need = match (status, family == theme::Family::HighContrast) {
+                        (Status::Disabled, _) => 3.0,
+                        (_, true) => 7.0,
+                        _ => 4.5,
+                    };
+                    let ratio = contrast(s.text_color, back);
+                    assert!(
+                        ratio >= need,
+                        "{family:?} dark={dark} {status:?}: {ratio} < {need}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn every_button_style_is_readable_in_both_palettes_and_every_status() {
         type StyleFn = fn(&Theme, Status) -> button::Style;
         let styles: [(&str, StyleFn); 6] = [
@@ -943,5 +1069,45 @@ mod tests {
     #[test]
     fn the_person_slot_is_the_old_one() {
         assert_eq!(PERSON_SLOT, 36.0);
+    }
+
+    #[test]
+    fn a_reaction_chip_is_outlined_in_the_accent_only_when_it_is_yours() {
+        for (name, theme) in themes() {
+            for status in STATUSES {
+                let own = chip_style(true)(&theme, status);
+                let other = chip_style(false)(&theme, status);
+                assert_eq!(own.border.color, theme.palette().primary, "{name}");
+                assert!(own.border.width >= 1.0, "{name}: an outline");
+                assert_ne!(other.border.color, theme.palette().primary, "{name}");
+                assert_eq!(own.border.radius, border::rounded(tokens::ROUND).radius);
+                for style in [own, other] {
+                    let ratio = contrast(style.text_color, behind(&style, &theme));
+                    assert!(ratio >= 4.5, "{name} {status:?}: {ratio:.2}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn quotes_sit_on_the_surface_behind_a_three_pixel_accent_bar() {
+        for (name, theme) in themes() {
+            let sem = theme::semantic(&theme);
+            let style = quote_surface_style(&theme);
+            assert_eq!(
+                style.background,
+                Some(Background::Color(sem.surface)),
+                "{name}"
+            );
+            // Text on it is the palette's, which every theme keeps readable
+            // on the surface.
+            assert!(contrast(theme.palette().text, sem.surface) >= 4.5, "{name}");
+            assert!(
+                contrast(sem.muted, sem.surface) >= 4.5,
+                "{name}: muted text"
+            );
+            assert_eq!(quote_bar_style(&theme).color, theme.palette().primary);
+        }
+        assert_eq!(QUOTE_BAR_WIDTH, 3.0);
     }
 }

@@ -736,6 +736,7 @@ impl App {
     /// Replaces the local settings (read from the settings file at boot).
     pub fn set_ui_settings(&mut self, settings: UiSettings) {
         self.ui_settings = settings;
+        self.timeline.set_density(self.density());
     }
 
     /// Replaces where the local settings are written (tests use a fake).
@@ -7338,9 +7339,13 @@ mod tests {
         assert_eq!(app.timeline.measured, before.1);
         // The estimate of an unmeasured row does not read the cache either.
         let item = app.timeline.items[3].clone();
-        let est = timeline::estimate_height(&item, false, 800.0);
+        let est =
+            timeline::estimate_height(&item, false, 800.0, crate::ui::tokens::Density::Comfortable);
         arrive(&mut app, "img3", Some(decoded(8, 6)));
-        assert_eq!(timeline::estimate_height(&item, false, 800.0), est);
+        assert_eq!(
+            timeline::estimate_height(&item, false, 800.0, crate::ui::tokens::Density::Comfortable),
+            est
+        );
     }
 
     #[test]
@@ -10962,6 +10967,21 @@ mod tests {
         }
 
         #[test]
+        fn the_saved_density_reaches_the_timeline_at_start() {
+            use twicecat_core::api::DensityChoice;
+            let mut rig = rig();
+            let settings = UiSettings {
+                density: DensityChoice::Compact,
+                ..UiSettings::default()
+            };
+            rig.app.set_ui_settings(settings);
+            assert_eq!(
+                rig.app.timeline.density(),
+                crate::ui::tokens::Density::Compact
+            );
+        }
+
+        #[test]
         fn a_density_switch_drops_measured_heights_but_keeps_the_place() {
             use twicecat_core::api::DensityChoice;
             let mut rig = rig();
@@ -10970,6 +10990,10 @@ mod tests {
             st(&mut rig, S::Density(DensityChoice::Compact));
             assert!(rig.app.timeline.measured.is_empty());
             assert_eq!(rig.app.timeline.offset_from_bottom, 120.0);
+            assert_eq!(
+                rig.app.timeline.density(),
+                crate::ui::tokens::Density::Compact
+            );
             // Another setting keeps what was measured.
             rig.app.timeline.measured.insert("a".to_owned(), 40.0);
             st(&mut rig, S::TrayBadge(false));
