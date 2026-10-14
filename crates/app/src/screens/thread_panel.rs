@@ -7,11 +7,12 @@
 //! focus.
 
 use chrono::Local;
-use iced::widget::{Column, column, container, row, space, text, text_input};
-use iced::{Element, Fill};
+use iced::widget::{Column, Row, column, container, row, space, text, text_input};
+use iced::{Element, Fill, Length};
 use twicecat_core::api::MessageText;
 
-use crate::screens::main_view::rich_env;
+use crate::layout::PaneLayout;
+use crate::screens::main_view::{self, rich_env};
 use crate::screens::timeline_pane::{self, Pane};
 use crate::state::{App, Message};
 use crate::threads::{PANEL_WIDTH, THREAD_INPUT_ID, ThreadPanel, ThreadsMessage};
@@ -20,28 +21,43 @@ use crate::ui::kit;
 use crate::ui::tokens;
 
 /// The panel, or an empty slot when no thread is open.
-pub fn slot(app: &App) -> Element<'_, Message> {
+pub fn slot(app: &App, layout: PaneLayout) -> Element<'_, Message> {
     match &app.threads.panel {
-        Some(panel) => view(app, panel),
-        None => space().width(0).into(),
+        Some(panel) if layout.thread => view(app, panel, layout.panel_fills),
+        _ => space().width(0).into(),
     }
 }
 
-fn view<'a>(app: &'a App, panel: &'a ThreadPanel) -> Element<'a, Message> {
-    let header = row![
-        text("Thread").size(tokens::TITLE).width(Fill),
-        kit::icon_button(Icon::Close, Message::Threads(ThreadsMessage::Close)),
-    ]
-    .spacing(tokens::S)
-    .align_y(iced::Center);
+/// The panel. With `fills` it takes the room pane's width (a narrow window)
+/// and its header carries the room's name and lock and the trust tag of a
+/// direct message, since the room header is out of sight.
+fn view<'a>(app: &'a App, panel: &'a ThreadPanel, fills: bool) -> Element<'a, Message> {
+    let mut head: Vec<Element<'a, Message>> = vec![main_view::panel_title(
+        app,
+        text("Thread").size(tokens::TITLE),
+        fills,
+    )];
+    if let Some(trust) = fills.then(|| main_view::trust_strip(app)).flatten() {
+        head.push(trust);
+    }
+    head.push(kit::icon_button(
+        Icon::Close,
+        Message::Threads(ThreadsMessage::Close),
+    ));
+    let header = Row::with_children(head)
+        .spacing(tokens::S)
+        .align_y(iced::Center);
     let theme = app.current_theme();
     let now = Local::now().timestamp_millis();
-    let timeline = container(timeline_pane::view_pane(
-        &panel.timeline,
-        u64::try_from(now).unwrap_or(0),
-        &Local,
-        rich_env(app, &theme),
-        Pane::THREAD,
+    let timeline = container(main_view::timeline_layer(
+        timeline_pane::view_pane(
+            &panel.timeline,
+            u64::try_from(now).unwrap_or(0),
+            &Local,
+            rich_env(app, &theme),
+            Pane::THREAD,
+        ),
+        main_view::picker_layer(app, true),
     ))
     .height(Fill);
     let body: Column<'a, Message> =
@@ -57,7 +73,11 @@ fn view<'a>(app: &'a App, panel: &'a ThreadPanel) -> Element<'a, Message> {
             .height(Fill)
             .style(kit::surface_style)
     ]
-    .width(PANEL_WIDTH)
+    .width(if fills {
+        Length::Fill
+    } else {
+        Length::Fixed(PANEL_WIDTH)
+    })
     .height(Fill)
     .into()
 }

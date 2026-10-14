@@ -18,7 +18,7 @@ use crate::audio_settings::{
 };
 use crate::ptt::{BadBinding, SourceState};
 use crate::state::{App, Message};
-use crate::ui::kit::{modal, muted};
+use crate::ui::kit::{self, modal, muted};
 
 /// Width of the card.
 const CARD_WIDTH: f32 = 600.0;
@@ -105,19 +105,21 @@ fn devices_section<'a>(app: &'a App, settings: &'a AudioSettings) -> Element<'a,
         heading("Devices"),
         labelled(
             "Microphone",
-            pick_list(input_menu, Some(input), |c| msg(AudioMessage::InputDevice(
-                c
-            )))
-            .width(Fill)
-            .into()
+            kit::menu(
+                pick_list(input_menu, Some(input), |c| msg(AudioMessage::InputDevice(
+                    c
+                )))
+                .width(Fill)
+            )
         ),
         labelled(
             "Speakers",
-            pick_list(output_menu, Some(output), |c| msg(
-                AudioMessage::OutputDevice(c)
-            ))
-            .width(Fill)
-            .into()
+            kit::menu(
+                pick_list(output_menu, Some(output), |c| msg(
+                    AudioMessage::OutputDevice(c)
+                ))
+                .width(Fill)
+            )
         ),
     ]
     .spacing(8);
@@ -134,13 +136,14 @@ fn processing_section<'a>(app: &'a App, settings: &'a AudioSettings) -> Element<
         heading("Microphone"),
         labelled(
             "Noise suppression",
-            pick_list(
-                NoiseChoice::menu(gpu, &p.noise_suppression),
-                Some(NoiseChoice::of(&p.noise_suppression, gpu)),
-                |c| msg(AudioMessage::Noise(c))
+            kit::menu(
+                pick_list(
+                    NoiseChoice::menu(gpu, &p.noise_suppression),
+                    Some(NoiseChoice::of(&p.noise_suppression, gpu)),
+                    |c| msg(AudioMessage::Noise(c))
+                )
+                .width(Fill)
             )
-            .width(Fill)
-            .into()
         ),
         note(gpu_status(gpu)),
     ]
@@ -149,11 +152,12 @@ fn processing_section<'a>(app: &'a App, settings: &'a AudioSettings) -> Element<
         NoiseSuppression::WebRtc { level } => {
             section = section.push(labelled(
                 "Strength",
-                pick_list(LevelChoice::ALL, Some(LevelChoice(level)), |c| {
-                    msg(AudioMessage::Level(c))
-                })
-                .width(Fill)
-                .into(),
+                kit::menu(
+                    pick_list(LevelChoice::ALL, Some(LevelChoice(level)), |c| {
+                        msg(AudioMessage::Level(c))
+                    })
+                    .width(Fill),
+                ),
             ));
         }
         NoiseSuppression::DeepFilter { .. } => {
@@ -286,13 +290,14 @@ fn talking_section<'a>(app: &'a App, settings: &'a AudioSettings) -> Element<'a,
         heading("Talking"),
         labelled(
             "Send",
-            pick_list(
-                ModeChoice::ALL,
-                Some(ModeChoice::of(&settings.input_mode)),
-                |c| msg(AudioMessage::Mode(c))
+            kit::menu(
+                pick_list(
+                    ModeChoice::ALL,
+                    Some(ModeChoice::of(&settings.input_mode)),
+                    |c| msg(AudioMessage::Mode(c))
+                )
+                .width(Fill)
             )
-            .width(Fill)
-            .into()
         ),
     ]
     .spacing(8);
@@ -394,9 +399,7 @@ fn key_row<'a>(app: &'a App, settings: &'a AudioSettings) -> Element<'a, Message
 
 fn button_menu(settings: &AudioSettings) -> Element<'_, Message> {
     let (menu, chosen) = ButtonChoice::menu(settings.push_to_talk.gamepad_button.as_deref());
-    pick_list(menu, Some(chosen), |c| msg(AudioMessage::Button(c)))
-        .width(Fill)
-        .into()
+    kit::menu(pick_list(menu, Some(chosen), |c| msg(AudioMessage::Button(c))).width(Fill))
 }
 
 fn a_slider<'a>(
@@ -419,10 +422,14 @@ fn a_slider<'a>(
         label,
         row![
             nudge("\u{2212}", false),
-            slider(lo..=hi, value, move |v| msg(AudioMessage::Slide(which, v)))
-                .step(step)
-                .on_release(msg(AudioMessage::SlideReleased))
-                .width(Fill),
+            // Ctrl + wheel is the zoom gesture, which iced's slider takes as
+            // a step: the - and + buttons are the way to nudge it.
+            crate::ui::guard::no_wheel(
+                slider(lo..=hi, value, move |v| msg(AudioMessage::Slide(which, v)))
+                    .step(step)
+                    .on_release(msg(AudioMessage::SlideReleased))
+                    .width(Fill)
+            ),
             nudge("+", true),
             text(value_text(which, value)).width(Length::Fixed(VALUE_WIDTH)),
         ]
@@ -462,12 +469,11 @@ fn levels_section<'a>(ui: &AudioUi, settings: &'a AudioSettings) -> Element<'a, 
         ),
         labelled(
             "Voice quality",
-            pick_list(
+            kit::menu(pick_list(
                 bitrate_menu(settings.voice_bitrate_kbps),
                 Some(crate::audio_settings::Bitrate(settings.voice_bitrate_kbps)),
                 |b| msg(AudioMessage::Bitrate(b))
-            )
-            .into()
+            ))
         ),
         note("Higher sounds better and uses more data; 64 kb/s is near transparent for voice."),
     ]
@@ -546,14 +552,14 @@ fn others_section<'a>(app: &'a App, settings: &'a AudioSettings) -> Element<'a, 
                 Slider::OthersCleaningLimit,
                 "Most removed",
             ))
-            .push(
+            .push(kit::menu(
                 pick_list(
                     SkipChoice::ALL,
                     Some(SkipChoice(cleaning.skip_cleaned)),
                     |c| msg(AudioMessage::Skip(c)),
                 )
                 .width(Fill),
-            );
+            ));
         if let Some(backend) = gpu_used(app.calls.gpu.as_ref()) {
             section = section.push(
                 checkbox(cleaning.gpu)

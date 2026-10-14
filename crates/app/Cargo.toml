@@ -11,7 +11,7 @@ name = "twicecat"
 path = "src/main.rs"
 
 [dependencies]
-iced = { version = "=0.14.0", features = ["image-without-codecs"] }
+iced = { version = "=0.14.0", features = ["image-without-codecs", "advanced"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 emojis = "0.9"

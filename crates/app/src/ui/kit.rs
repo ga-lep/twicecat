@@ -232,7 +232,10 @@ pub fn danger_button<'a, M: Clone + 'a>(
 }
 
 /// `content` with `label` in a card that shows when it is pointed at.
-pub fn tip<'a, M: 'a>(content: impl Into<Element<'a, M>>, label: &'a str) -> Element<'a, M> {
+pub fn tip<'a, M: 'a>(
+    content: impl Into<Element<'a, M>>,
+    label: impl IntoFragment<'a>,
+) -> Element<'a, M> {
     tooltip(content, text(label).size(tokens::CAPTION), Position::Bottom)
         .gap(tokens::XS)
         .padding(tokens::S)
@@ -275,6 +278,15 @@ pub fn toggle_icon_button<'a, M: Clone + 'a>(
             icon_style
         });
     tip(button, icon.label())
+}
+
+/// A drop-down that Ctrl + wheel (the zoom gesture) cannot change. Every
+/// `pick_list` in the app goes through this: iced's closed pick list takes
+/// the wheel as "select the next option", which would swap a device or turn
+/// push-to-talk into an open microphone while the user only zooms. A test
+/// scans the sources for a `pick_list(` that is not wrapped.
+pub fn menu<'a, M: 'a>(list: impl Into<Element<'a, M>>) -> Element<'a, M> {
+    crate::ui::guard::no_wheel(list)
 }
 
 /// A drop-down's closed box: the raised colour with the normal text colour

@@ -6,21 +6,23 @@
 //! call starts or ends.
 
 use iced::widget::{
-    Column, button, column, container, pick_list, row, rule, scrollable, slider, space, stack, text,
+    Column, Row, button, column, container, pick_list, row, rule, scrollable, slider, space, stack,
+    text,
 };
 use iced::{Background, Element, Fill, Length, border};
 
 use crate::calls::{
     CallMessage, CleaningChoice, MAX_VOLUME, MUTED_MARK, PANEL_WIDTH, ParticipantRow,
 };
+use crate::layout::PaneLayout;
 use crate::screens::main_view::display_name;
 use crate::screens::room_list_pane::LOCK_MARK;
 use crate::state::{App, Message};
 use crate::theme;
 use crate::ui::icons::{Icon, icon};
 use crate::ui::kit::{
-    PERSON_SLOT, Severity, active_icon_style, avatar, card_style, danger_style, icon_style, modal,
-    muted, severity_tag_style, tip,
+    self, PERSON_SLOT, Severity, active_icon_style, avatar, card_style, danger_style, icon_style,
+    modal, muted, severity_tag_style, tip,
 };
 use crate::ui::tokens;
 use crate::verification::elide_middle;
@@ -501,21 +503,34 @@ pub fn rail_dock(app: &App) -> Element<'_, Message> {
 }
 
 /// The participants panel beside the call's room, or an empty slot.
-pub fn panel_slot(app: &App) -> Element<'_, Message> {
-    if !app.calls.panel_shown(app.selected.as_ref()) {
+///
+/// With `layout.panel_fills` (a narrow window) it takes the room pane's
+/// width, and its header carries the trust tag of a direct message, since the
+/// room header is out of sight.
+pub fn panel_slot(app: &App, layout: PaneLayout) -> Element<'_, Message> {
+    if !layout.call || !app.calls.panel_shown(app.selected.as_ref()) {
         return space().width(0).into();
     }
     let rows = app.calls.rows();
-    let header = row![
-        text(format!("In the call ({})", rows.len()))
-            .size(18)
-            .width(Fill),
+    let mut head: Vec<Element<'_, Message>> = vec![crate::screens::main_view::panel_title(
+        app,
+        text(format!("In the call ({})", rows.len())).size(18),
+        layout.panel_fills,
+    )];
+    if let Some(trust) = layout
+        .panel_fills
+        .then(|| crate::screens::main_view::trust_strip(app))
+        .flatten()
+    {
+        head.push(trust);
+    }
+    head.push(
         button(text("\u{2715}"))
             .on_press(call(CallMessage::TogglePanel))
-            .style(button::secondary),
-    ]
-    .spacing(8)
-    .align_y(iced::Center);
+            .style(button::secondary)
+            .into(),
+    );
+    let header = Row::with_children(head).spacing(8).align_y(iced::Center);
     let list = Column::with_children(rows.into_iter().map(|r| participant(app, r))).spacing(10);
     let body = column![header, scrollable(list).height(Fill)]
         .spacing(8)
@@ -525,7 +540,11 @@ pub fn panel_slot(app: &App) -> Element<'_, Message> {
         rule::vertical(1),
         container(body).padding(8).width(Fill).height(Fill)
     ]
-    .width(PANEL_WIDTH)
+    .width(if layout.panel_fills {
+        Length::Fill
+    } else {
+        Length::Fixed(PANEL_WIDTH)
+    })
     .height(Fill)
     .into()
 }
@@ -584,17 +603,21 @@ fn participant(app: &App, row_view: ParticipantRow) -> Element<'_, Message> {
                 }))
         };
         let slide_user = row_view.user_id.clone();
-        let volume = slider(0..=MAX_VOLUME, controls.volume, move |percent| {
-            call(CallMessage::Volume {
-                user_id: slide_user.clone(),
-                percent,
+        // Ctrl + wheel is the zoom gesture, which iced's slider takes as a
+        // step: the volume has the - and + buttons instead.
+        let volume = crate::ui::guard::no_wheel(
+            slider(0..=MAX_VOLUME, controls.volume, move |percent| {
+                call(CallMessage::Volume {
+                    user_id: slide_user.clone(),
+                    percent,
+                })
             })
-        })
-        .step(5u16)
-        .shift_step(1u16)
-        .default(100u16)
-        .on_release(call(CallMessage::VolumeReleased))
-        .width(Fill);
+            .step(5u16)
+            .shift_step(1u16)
+            .default(100u16)
+            .on_release(call(CallMessage::VolumeReleased))
+            .width(Fill),
+        );
         details = details.push(
             row![
                 step("\u{2212}", false),
@@ -608,7 +631,7 @@ fn participant(app: &App, row_view: ParticipantRow) -> Element<'_, Message> {
             .align_y(iced::Center),
         );
         let cleaning_user = row_view.user_id.clone();
-        details = details.push(
+        details = details.push(kit::menu(
             pick_list(
                 CleaningChoice::ALL,
                 Some(controls.cleaning),
@@ -621,7 +644,7 @@ fn participant(app: &App, row_view: ParticipantRow) -> Element<'_, Message> {
             )
             .text_size(12)
             .padding([2, 6]),
-        );
+        ));
     }
     row![picture, details]
         .spacing(8)
