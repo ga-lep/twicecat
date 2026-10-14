@@ -1,6 +1,6 @@
 [package]
 name = "twicecat-app"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 repository.workspace = true
 license.workspace = true
@@ -24,6 +24,12 @@ tray-icon = { version = "=0.26.1", default-features = false, features = ["ksni"]
 twicecat-core = { path = "../core" }
 # Push-to-talk sources; no matrix-sdk or media crates (scripts/check-app-deps.sh).
 twicecat-ptt = { path = "../ptt" }
+
+# Windows: `--help` and `--version` attach to the starting terminal's console
+# (release builds have none of their own). The version twicecat-audio and cpal
+# already use.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "=0.62.2", features = ["Win32_System_Console"] }
 
 [features]
 # The full build: speech enhancement on the GPU (DeepFilterNet3 on ONNX
