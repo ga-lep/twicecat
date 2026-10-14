@@ -534,14 +534,15 @@ fn room_pane(app: &App, hidden: bool) -> Element<'_, Message> {
         bars.push(command_bar(name));
     }
     if let Some(error) = &app.send_error {
-        bars.push(text(error.as_str()).style(text::danger).into());
+        bars.push(kit::banner(Severity::Danger, error.as_str()));
     }
     if let Some(notice) = &app.actions.notice {
-        bars.push(text(notice.text.as_str()).style(text::danger).into());
+        bars.push(kit::banner(Severity::Danger, notice.text.as_str()));
     }
     // A composer that is out of sight takes no keys: a hidden editor with
     // focus would send what is typed while a panel fills the window.
-    let enabled = selected.is_some() && !hidden;
+    // The same goes while a dialog, card or screen covers the room.
+    let enabled = selected.is_some() && !hidden && !app.any_overlay_open();
     if let Some(line) = timeline_pane::typing_line(&app.typing) {
         bars.push(
             text(line)
@@ -625,60 +626,180 @@ pub fn timeline_layer<'a>(
 /// Tallest the editor grows before it scrolls, in pixels.
 const EDITOR_MAX_HEIGHT: f32 = 160.0;
 
-/// The composer's text editor. Without a selected room it has no `on_action`,
-/// which disables it.
-fn editor(app: &App, enabled: bool) -> Element<'_, Message> {
-    let open = app.composer.suggestions.is_open();
-    let mut editor = text_editor(app.composer.content())
+/// The placeholder of the editor: "Message" and the room's name, cleaned and
+/// capped (a room name is remote text), or just "Message" without a room.
+pub fn placeholder_text(room_name: Option<&str>) -> String {
+    match room_name {
+        Some(name) => format!("Message {}", display_name(name)),
+        None => "Message".to_owned(),
+    }
+}
+
+/// What the **Send** button sends when pressed: the message Enter sends, and
+/// only when the composer takes input and holds something to send.
+///
+/// While suggestions are open Enter picks the highlighted one, and so does
+/// the button: it never posts the half-typed `:sm` or `@al` as a message.
+pub fn send_press(enabled: bool, blank: bool, suggestions_open: bool) -> Option<Message> {
+    if !enabled || blank {
+        return None;
+    }
+    composer::bind(
+        composer::KeyInput {
+            key: composer::Key::Enter,
+            shift: false,
+        },
+        suggestions_open,
+    )
+    .message()
+}
+
+/// The editor inside the field: no fill and no outline of its own, except the
+/// focus colour while it has the keyboard.
+fn editor_style(theme: &iced::Theme, status: text_editor::Status) -> text_editor::Style {
+    let sem = theme::semantic(theme);
+    let text_color = theme.palette().text;
+    let focused = matches!(status, text_editor::Status::Focused { .. });
+    text_editor::Style {
+        background: iced::Background::Color(iced::Color::TRANSPARENT),
+        border: iced::Border {
+            color: if focused {
+                sem.focus
+            } else {
+                iced::Color::TRANSPARENT
+            },
+            width: if focused { 1.0 } else { 0.0 },
+            radius: tokens::MEDIUM.into(),
+        },
+        placeholder: sem.muted,
+        value: if matches!(status, text_editor::Status::Disabled) {
+            sem.muted
+        } else {
+            text_color
+        },
+        selection: theme.extended_palette().primary.weak.color,
+    }
+}
+
+/// The rounded field around the editor and its buttons.
+fn field_style(theme: &iced::Theme) -> container::Style {
+    let sem = theme::semantic(theme);
+    container::Style {
+        background: Some(iced::Background::Color(sem.surface_raised)),
+        border: iced::Border {
+            color: sem.border,
+            width: 1.0,
+            radius: tokens::LARGE.into(),
+        },
+        ..container::Style::default()
+    }
+}
+
+/// The composer: Attach, the editor, Emoji and Send on a rounded raised
+/// field. Without `enabled` the editor has no `on_action` and the buttons no
+/// press, so a hidden or room-less composer takes no input; the widget tree is
+/// the same either way, so the editor keeps its place and its focus.
+fn composer_field<'a>(
+    content: &'a text_editor::Content,
+    placeholder: String,
+    suggestions_open: bool,
+    enabled: bool,
+    can_send: bool,
+) -> Element<'a, Message> {
+    let mut editor = text_editor(content)
         .id(composer::COMPOSER_ID)
-        .placeholder("Message")
-        .padding(8)
+        .placeholder(placeholder)
+        .padding(tokens::S)
         .max_height(EDITOR_MAX_HEIGHT)
-        .key_binding(move |press| composer::binding(press, open));
+        .style(editor_style)
+        .key_binding(move |press| composer::gated_binding(press, suggestions_open, enabled));
     if enabled {
         editor = editor.on_action(|action| Message::Composer(EditorAction(action)));
     }
-    // The button is always there, so the editor keeps its place in the tree;
-    // without a room it does nothing.
-    let attach = button(text("Attach\u{2026}"))
-        .on_press_maybe(enabled.then_some(Message::AttachRequested))
-        .style(button::secondary);
-    row![attach, editor]
-        .spacing(8)
-        .align_y(iced::Alignment::End)
-        .into()
+    let attach = kit::icon_button_maybe(Icon::Attach, enabled.then_some(Message::AttachRequested));
+    let emoji = kit::icon_button_maybe(Icon::Emoji, enabled.then_some(Message::EmojiRequested));
+    let send = kit::send_icon_button(send_press(enabled, !can_send, suggestions_open));
+    container(
+        row![attach, editor, emoji, send]
+            .spacing(tokens::XS)
+            .align_y(iced::Alignment::End),
+    )
+    .padding(tokens::XS)
+    .width(Fill)
+    .style(field_style)
+    .into()
+}
+
+/// The composer's text editor and its buttons. Without a selected room it is
+/// disabled.
+fn editor(app: &App, enabled: bool) -> Element<'_, Message> {
+    let name = app
+        .selected
+        .as_ref()
+        .and_then(|id| app.rooms.iter().find(|room| room.id == *id))
+        .map(|room| room.name.as_str());
+    let can_send = !app.composer.text().trim().is_empty();
+    composer_field(
+        app.composer.content(),
+        placeholder_text(name),
+        app.composer.suggestions.is_open(),
+        enabled,
+        can_send,
+    )
+}
+
+/// The heading of the bar above the editor and, for a reply, the quote of
+/// the message (sender and one capped line). `None` in the normal mode.
+pub fn mode_parts(app: &App) -> Option<(&'static str, Option<String>)> {
+    match &app.composer.mode {
+        Mode::Normal => None,
+        Mode::Reply(id) => Some((
+            "Replying to",
+            Some(
+                actions::quote_for(&app.timeline.items, id)
+                    .unwrap_or_else(|| "a message".to_owned()),
+            ),
+        )),
+        Mode::Edit(_) => Some(("Editing a message", None)),
+    }
 }
 
 /// The text of the bar above the editor: the quote of the message being
 /// replied to, or a note about the edit. `None` in the normal mode.
 pub fn mode_text(app: &App) -> Option<String> {
-    match &app.composer.mode {
-        Mode::Normal => None,
-        Mode::Reply(id) => Some(format!(
-            "Replying to {}",
-            actions::quote_for(&app.timeline.items, id).unwrap_or_else(|| "a message".to_owned())
-        )),
-        Mode::Edit(_) => Some("Editing a message".to_owned()),
-    }
+    let (heading, quote) = mode_parts(app)?;
+    Some(match quote {
+        Some(quote) => format!("{heading} {quote}"),
+        None => heading.to_owned(),
+    })
 }
 
-/// The reply or edit bar above the editor, with a cross that leaves the mode.
+/// The reply or edit bar above the editor: a card with the heading, the
+/// quote on one line, and a close button that leaves the mode.
 fn mode_bar(app: &App) -> Option<Element<'_, Message>> {
-    let label = mode_text(app)?;
+    let (heading, quote) = mode_parts(app)?;
+    let mut lines = column![text(heading).size(tokens::CAPTION).style(kit::muted)];
+    if let Some(quote) = quote {
+        // Clipped to the bar: an unbroken line must not run under the
+        // close button.
+        lines = lines.push(
+            container(text(quote).wrapping(Wrapping::None))
+                .width(Fill)
+                .clip(true),
+        );
+    }
     Some(
         container(
             row![
-                text(label),
-                space().width(Fill),
-                button(text("\u{2715}"))
-                    .on_press(Message::ModeCancelled)
-                    .style(button::secondary),
+                lines.width(Fill),
+                kit::icon_button(Icon::Close, Message::ModeCancelled)
             ]
-            .spacing(8)
+            .spacing(tokens::S)
             .align_y(iced::Center),
         )
-        .padding(4)
-        .style(container::bordered_box)
+        .padding(tokens::S)
+        .width(Fill)
+        .style(kit::card_style)
         .into(),
     )
 }
@@ -723,14 +844,18 @@ fn picker_panel(picker: &Picker) -> Element<'_, Message> {
 /// The autocomplete rows (members or emojis) above the editor, or `None`
 /// while there is nothing to pick.
 fn suggestion_list(suggestions: &Suggestions) -> Option<Element<'_, Message>> {
-    let rows: Vec<(String, bool)> = match suggestions {
+    // (words that may be clipped, words that never are, selected)
+    let rows: Vec<(String, Option<String>, bool)> = match suggestions {
         Suggestions::Closed => return None,
         Suggestions::Mentions {
             members, selected, ..
         } => members
             .iter()
             .enumerate()
-            .map(|(i, member)| (member_row_label(member), i == *selected))
+            .map(|(i, member)| {
+                let (name, id) = member_row_parts(member);
+                (name, id, i == *selected)
+            })
             .collect(),
         Suggestions::Emoji {
             items, selected, ..
@@ -740,6 +865,7 @@ fn suggestion_list(suggestions: &Suggestions) -> Option<Element<'_, Message>> {
             .map(|(i, item)| {
                 (
                     format!("{} :{}:", item.glyph, item.shortcode),
+                    None,
                     i == *selected,
                 )
             })
@@ -749,29 +875,71 @@ fn suggestion_list(suggestions: &Suggestions) -> Option<Element<'_, Message>> {
         return None;
     }
     let mut list = column![].spacing(2);
-    for (index, (label, selected)) in rows.into_iter().enumerate() {
+    for (index, (label, tail, selected)) in rows.into_iter().enumerate() {
+        // The clipped part gives way to the tail, so the user ID of a member
+        // is always on screen whatever the display name is.
+        let mut line = row![
+            container(text(label).wrapping(Wrapping::None))
+                .width(Fill)
+                .clip(true)
+        ]
+        .spacing(tokens::XS);
+        if let Some(tail) = tail {
+            line = line.push(text(tail).wrapping(SUGGESTION_TAIL_WRAPPING));
+        }
         list = list.push(
-            button(text(label))
+            button(line)
                 .on_press(Message::SuggestionPicked(index))
                 .width(Fill)
-                .style(if selected {
-                    button::primary
-                } else {
-                    button::text
+                .style(move |theme: &iced::Theme, status| {
+                    let mut style = kit::ghost_style(theme, status);
+                    if selected {
+                        style.background =
+                            Some(iced::Background::Color(theme::semantic(theme).selection));
+                    }
+                    style
                 }),
         );
     }
-    Some(container(list).padding(4).into())
+    Some(
+        container(list)
+            .padding(tokens::XS)
+            .width(Fill)
+            .style(kit::card_style)
+            .into(),
+    )
 }
 
-/// One member row: the display name and the user ID, sanitised and capped.
-pub fn member_row_label(member: &twicecat_core::api::Member) -> String {
-    let id = one_line_capped(member.user_id.as_str(), MAX_NAME_CHARS);
+/// How the user ID of a member row is wrapped. Shared with the layout test,
+/// which measures the text the way the widget lays it out.
+pub(crate) const SUGGESTION_TAIL_WRAPPING: Wrapping = Wrapping::WordOrGlyph;
+
+/// Longest display name in a member row of the mention picker. The user ID
+/// is what tells two members apart, so the name gets little room.
+pub const MAX_ROW_NAME_CHARS: usize = 64;
+
+/// One member row as two parts: the display name (or the user ID when there
+/// is none) and, with a name, the user ID in parentheses. The second part is
+/// never clipped, and its length is bounded so that it wraps rather than
+/// runs past the row.
+pub fn member_row_parts(member: &twicecat_core::api::Member) -> (String, Option<String>) {
+    // Cut in the middle, so the leading `@` and the `:server` both show.
+    let id = elide_middle(member.user_id.as_str(), HEADER_PEER_ID_CHARS);
     match member.display_name.as_deref() {
-        Some(name) if !name.trim().is_empty() => {
-            format!("{} ({id})", one_line_capped(name, MAX_NAME_CHARS))
-        }
-        _ => id,
+        Some(name) if !name.trim().is_empty() => (
+            one_line_capped(name, MAX_ROW_NAME_CHARS),
+            Some(format!("({id})")),
+        ),
+        _ => (id, None),
+    }
+}
+
+/// One member row as one line: the display name and the user ID, sanitised
+/// and capped.
+pub fn member_row_label(member: &twicecat_core::api::Member) -> String {
+    match member_row_parts(member) {
+        (name, Some(id)) => format!("{name} {id}"),
+        (id, None) => id,
     }
 }
 
@@ -806,46 +974,43 @@ pub fn command_bar_text(name: &str) -> String {
     )
 }
 
+/// The command bar asks before anything is sent, so it is a warning.
+pub const COMMAND_BAR_SEVERITY: Severity = Severity::Warning;
+
 /// The bar above the composer about an unknown `/command`: send the text as a
 /// message, or go back to editing it.
 fn command_bar(name: &str) -> Element<'_, Message> {
-    let bar_row = row![
-        text(command_bar_text(name)),
-        space().width(Fill),
-        button(text("Send as message")).on_press(Message::CommandSendAnyway),
-        button(text("Cancel"))
-            .on_press(Message::CommandCancelled)
-            .style(button::secondary),
-    ]
-    .spacing(8)
-    .align_y(iced::Center);
-    container(bar_row).padding(4).into()
+    kit::banner_with(
+        COMMAND_BAR_SEVERITY,
+        command_bar_text(name),
+        vec![
+            kit::primary_button("Send as message", Some(Message::CommandSendAnyway)).into(),
+            kit::secondary_button("Cancel", Some(Message::CommandCancelled)).into(),
+        ],
+    )
+}
+
+/// How serious the link bar is: a question about leaving the app is a
+/// warning, a refused or failed link an error.
+pub fn link_bar_severity(bar: &LinkBar) -> Severity {
+    match bar {
+        LinkBar::Confirm(_) => Severity::Warning,
+        LinkBar::Refused | LinkBar::Failed => Severity::Danger,
+    }
 }
 
 /// The bar above the composer about a clicked link.
 fn link_bar(bar: &LinkBar) -> Element<'_, Message> {
-    let mut bar_row = row![text(link_bar_text(bar)), space().width(Fill)]
-        .spacing(8)
-        .align_y(iced::Center);
-    match bar {
-        LinkBar::Confirm(_) => {
-            bar_row = bar_row
-                .push(button(text("Open")).on_press(Message::LinkConfirmed))
-                .push(
-                    button(text("Cancel"))
-                        .on_press(Message::LinkDismissed)
-                        .style(button::secondary),
-                );
-        }
+    let actions: Vec<Element<'_, Message>> = match bar {
+        LinkBar::Confirm(_) => vec![
+            kit::primary_button("Open", Some(Message::LinkConfirmed)).into(),
+            kit::secondary_button("Cancel", Some(Message::LinkDismissed)).into(),
+        ],
         LinkBar::Refused | LinkBar::Failed => {
-            bar_row = bar_row.push(
-                button(text("Dismiss"))
-                    .on_press(Message::LinkDismissed)
-                    .style(button::secondary),
-            );
+            vec![kit::secondary_button("Dismiss", Some(Message::LinkDismissed)).into()]
         }
-    }
-    container(bar_row).padding(4).into()
+    };
+    kit::banner_with(link_bar_severity(bar), link_bar_text(bar), actions)
 }
 
 /// The signed-in user ID for the status bar: one line, capped. It comes from
@@ -1371,6 +1536,97 @@ mod tests {
     }
 
     #[test]
+    fn the_placeholder_names_the_room_cleaned_and_capped() {
+        assert_eq!(placeholder_text(None), "Message");
+        assert_eq!(placeholder_text(Some("Lounge")), "Message Lounge");
+        assert_eq!(
+            placeholder_text(Some("a\nb\u{202E}c")),
+            "Message a\u{23CE}b\u{FFFD}c"
+        );
+        assert_eq!(
+            placeholder_text(Some("   ")),
+            format!("Message {}", crate::text_safety::NAME_PLACEHOLDER)
+        );
+        assert!(placeholder_text(Some(&"n".repeat(1000))).chars().count() < 300);
+    }
+
+    #[test]
+    fn the_send_button_sends_what_enter_sends_and_only_when_it_may() {
+        let enter = composer::bind(
+            composer::KeyInput {
+                key: composer::Key::Enter,
+                shift: false,
+            },
+            false,
+        )
+        .message();
+        assert_eq!(
+            send_press(true, false, false).map(|m| debug(&m)),
+            enter.map(|m| debug(&m))
+        );
+        assert!(send_press(true, true, false).is_none(), "blank text");
+        assert!(
+            send_press(false, false, false).is_none(),
+            "disabled composer"
+        );
+        assert!(send_press(false, true, false).is_none());
+    }
+
+    #[test]
+    fn the_send_button_picks_while_suggestions_are_open() {
+        assert_eq!(
+            send_press(true, false, true).map(|m| debug(&m)),
+            Some(debug(&Message::ComposerKey(composer::ComposerKey::Pick)))
+        );
+        assert!(send_press(false, false, true).is_none());
+        assert!(send_press(true, true, true).is_none());
+    }
+
+    #[test]
+    fn the_composer_field_keeps_its_widget_tree_whatever_is_enabled() {
+        use iced::advanced::widget::Tree;
+        let content = text_editor::Content::new();
+        let build = |open: bool, enabled: bool, can_send: bool| {
+            composer_field(&content, "Message".to_owned(), open, enabled, can_send)
+        };
+        let mut tree = Tree::new(build(false, true, true));
+        let shape = |tree: &Tree| -> Vec<_> { tree.children.iter().map(|c| c.tag).collect() };
+        let before = shape(&tree);
+        for (open, enabled, can_send) in [(true, true, false), (false, false, false)] {
+            tree.diff(build(open, enabled, can_send));
+            assert_eq!(shape(&tree), before);
+        }
+    }
+
+    #[test]
+    fn warnings_and_errors_in_the_bars_keep_a_severity_with_words() {
+        let url = crate::links::check_link_url("https://evil.example/x").expect("valid link");
+        assert_eq!(link_bar_severity(&LinkBar::Confirm(url)), Severity::Warning);
+        assert_eq!(link_bar_severity(&LinkBar::Refused), Severity::Danger);
+        assert_eq!(link_bar_severity(&LinkBar::Failed), Severity::Danger);
+        assert_eq!(COMMAND_BAR_SEVERITY, Severity::Warning);
+    }
+
+    #[test]
+    fn the_mode_bar_has_a_heading_and_a_capped_quote() {
+        use crate::state::Startup;
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let (_etx, erx) = tokio::sync::mpsc::channel(1);
+        let (mut app, _boot) = App::new(Startup {
+            sink: Box::new(tx),
+            events: crate::bridge::EventsSlot::new(erx),
+        });
+        assert_eq!(mode_parts(&app), None);
+        app.composer.mode = Mode::Reply("gone".into());
+        assert_eq!(
+            mode_parts(&app),
+            Some(("Replying to", Some("a message".to_owned())))
+        );
+        app.composer.mode = Mode::Edit("m".into());
+        assert_eq!(mode_parts(&app), Some(("Editing a message", None)));
+    }
+
+    #[test]
     fn the_mode_bar_quotes_the_replied_message() {
         use crate::state::Startup;
         use twicecat_core::api::{
@@ -1402,5 +1658,203 @@ mod tests {
         assert_eq!(mode_text(&app).as_deref(), Some("Replying to a message"));
         app.composer.mode = Mode::Edit("m".into());
         assert_eq!(mode_text(&app).as_deref(), Some("Editing a message"));
+    }
+
+    /// The renderer the layout tests measure with.
+    fn renderer() -> iced::Renderer {
+        use iced::advanced::renderer::Headless;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a current-thread runtime");
+        runtime
+            .block_on(iced::Renderer::new(
+                iced::Font::DEFAULT,
+                iced::Pixels(16.0),
+                Some("tiny-skia"),
+            ))
+            .expect("the headless tiny-skia renderer is not available")
+    }
+
+    /// Lays `element` out in `width` pixels and returns the rectangle of
+    /// every leaf of the layout (text, icons), in the element's coordinates.
+    fn leaves(element: &mut Element<'_, Message>, width: f32) -> Vec<iced::Rectangle> {
+        use iced::advanced::layout::Limits;
+        use iced::advanced::widget::Tree;
+        fn walk(
+            node: &iced::advanced::layout::Node,
+            at: iced::Point,
+            out: &mut Vec<iced::Rectangle>,
+        ) {
+            let bounds = node.bounds();
+            let at = iced::Point::new(at.x + bounds.x, at.y + bounds.y);
+            if node.children().is_empty() {
+                out.push(iced::Rectangle::new(at, bounds.size()));
+            }
+            for child in node.children() {
+                walk(child, at, out);
+            }
+        }
+        let renderer = renderer();
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &Limits::new(iced::Size::ZERO, iced::Size::new(width, 4000.0)),
+        );
+        let mut out = Vec::new();
+        walk(&node, iced::Point::ORIGIN, &mut out);
+        out
+    }
+
+    /// Whether `content`, laid out as the banner text of `bounds`' width,
+    /// has a line longer than that width, which iced would draw past the
+    /// bounds (and under the buttons).
+    fn overflows(content: &str, bounds: iced::Rectangle) -> bool {
+        measured_width(content, bounds.width, kit::BANNER_WRAPPING) > bounds.width + 0.5
+    }
+
+    /// The width of the widest line of `content` laid out in `width` pixels
+    /// with `wrapping`, as iced builds (and draws) the paragraph.
+    fn measured_width(content: &str, width: f32, wrapping: Wrapping) -> f32 {
+        use iced::advanced::text::{Paragraph as _, Renderer as _, Text};
+        type Paragraph = <iced::Renderer as iced::advanced::text::Renderer>::Paragraph;
+        let renderer = renderer();
+        let paragraph = Paragraph::with_text(Text {
+            content,
+            bounds: iced::Size::new(width, f32::INFINITY),
+            size: renderer.default_size(),
+            line_height: iced::widget::text::LineHeight::default(),
+            font: renderer.default_font(),
+            align_x: iced::advanced::text::Alignment::Default,
+            align_y: iced::alignment::Vertical::Top,
+            shaping: iced::widget::text::Shaping::default(),
+            wrapping,
+        });
+        paragraph.min_bounds().width
+    }
+
+    /// The banner text is the widest leaf of a bar.
+    fn widest(leaves: &[iced::Rectangle]) -> iced::Rectangle {
+        leaves
+            .iter()
+            .copied()
+            .max_by(|a, b| a.width.total_cmp(&b.width))
+            .expect("a bar has leaves")
+    }
+
+    fn long_host() -> String {
+        let label = "securesessionverification".repeat(2);
+        // 253 characters: labels of 50 up to the limit, the registrable
+        // domain last.
+        let mut host = String::new();
+        while host.len() + label.len() + 1 < 253 - "evil.example".len() - 1 {
+            host.push_str(&label);
+            host.push('.');
+        }
+        host.push_str("evil.example");
+        host
+    }
+
+    #[test]
+    fn the_link_bar_keeps_the_end_of_a_long_host_inside_its_text() {
+        let host = long_host();
+        assert!(host.len() > 200 && host.len() <= 253, "{}", host.len());
+        let url = crate::links::check_link_url(&format!("https://{host}/")).expect("valid link");
+        let bar = LinkBar::Confirm(url);
+        let text = link_bar_text(&bar);
+        assert!(
+            text.contains("evil.example?"),
+            "the registrable domain is shown"
+        );
+        for width in [800.0, 360.0] {
+            let mut element = link_bar(&bar);
+            let leaves = leaves(&mut element, width);
+            let words = widest(&leaves);
+            assert!(!overflows(&text, words), "width {width}: {words:?}");
+            for button in leaves.iter().filter(|l| **l != words) {
+                assert!(
+                    button.y >= words.y + words.height - 0.5
+                        || button.x + button.width <= words.x + 0.5,
+                    "width {width}: {button:?} lies over the text {words:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_command_bar_keeps_a_long_command_name_inside_its_text() {
+        let name = "c".repeat(MAX_COMMAND_CHARS);
+        let text = command_bar_text(&name);
+        for width in [800.0, 360.0] {
+            let mut element = command_bar(&name);
+            let leaves = leaves(&mut element, width);
+            let words = widest(&leaves);
+            assert!(!overflows(&text, words), "width {width}: {words:?}");
+            for button in leaves.iter().filter(|l| **l != words) {
+                assert!(
+                    button.y >= words.y + words.height - 0.5
+                        || button.x + button.width <= words.x + 0.5,
+                    "width {width}: {button:?} lies over the text {words:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_long_display_name_never_pushes_the_user_id_out_of_its_row() {
+        let member = twicecat_core::api::Member {
+            user_id: UserId::from("@mallory:evil.example"),
+            display_name: Some("A".repeat(256)),
+        };
+        let (name, id) = member_row_parts(&member);
+        assert_eq!(name.chars().count(), MAX_ROW_NAME_CHARS);
+        assert_eq!(id.as_deref(), Some("(@mallory:evil.example)"));
+        let suggestions = Suggestions::Mentions {
+            query: "m".to_owned(),
+            members: vec![member],
+            selected: 0,
+        };
+        for width in [800.0, 360.0] {
+            let mut element = suggestion_list(&suggestions).expect("one row");
+            let leaves = leaves(&mut element, width);
+            let tail = leaves.last().expect("the user ID is the last leaf");
+            assert!(tail.width > 100.0, "the ID has its full width: {tail:?}");
+            assert!(
+                tail.x >= 0.0 && tail.x + tail.width <= width,
+                "width {width}: {tail:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_full_length_user_id_keeps_both_ends_inside_its_row() {
+        let member = twicecat_core::api::Member {
+            user_id: UserId::from(format!("@alice{}:evil.example", "_".repeat(230)).as_str()),
+            display_name: Some("Alice".to_owned()),
+        };
+        let (_, tail_text) = member_row_parts(&member);
+        let tail_text = tail_text.expect("a name gives a tail");
+        assert!(tail_text.starts_with("(@alice"), "{tail_text}");
+        assert!(tail_text.ends_with(":evil.example)"), "{tail_text}");
+        let suggestions = Suggestions::Mentions {
+            query: "a".to_owned(),
+            members: vec![member],
+            selected: 0,
+        };
+        for width in [800.0, 360.0, 300.0] {
+            let mut element = suggestion_list(&suggestions).expect("one row");
+            let leaves = leaves(&mut element, width);
+            let tail = leaves.last().expect("the user ID is the last leaf");
+            assert!(
+                tail.x >= 0.0 && tail.x + tail.width <= width + 0.5,
+                "width {width}: {tail:?}"
+            );
+            let drawn = measured_width(&tail_text, tail.width, SUGGESTION_TAIL_WRAPPING);
+            assert!(
+                drawn <= tail.width + 0.5,
+                "width {width}: {drawn}px drawn in a {}px node",
+                tail.width
+            );
+        }
     }
 }

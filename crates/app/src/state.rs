@@ -362,6 +362,8 @@ pub enum Message {
     },
     /// **Attach** or Ctrl+U: choose files to send.
     AttachRequested,
+    /// The composer's **Emoji** button: start a `:shortcode` at the cursor.
+    EmojiRequested,
     /// The file picker answered; the paths are redacted in `Debug`.
     FilesChosen(UploadPaths),
     /// Files are being dragged over the window.
@@ -953,6 +955,7 @@ impl App {
                 | Message::ReplyRequested(_)
                 | Message::EditRequested(_)
                 | Message::ModeCancelled
+                | Message::EmojiRequested
                 | Message::Pasted(_)
                 | Message::PasteFallback(_)
         );
@@ -1054,6 +1057,7 @@ impl App {
                 self.composer_action_at(action, Instant::now())
             }
             Message::ComposerKey(key) => self.composer_key_at(key, Instant::now()),
+            Message::EmojiRequested => self.emoji_requested(Instant::now()),
             Message::SuggestionPicked(index) => {
                 self.pick_suggestion_at(Some(index), Instant::now())
             }
@@ -1975,6 +1979,24 @@ impl App {
         self.send(Command::LoadMoreRooms)
     }
 
+    /// The **Emoji** button: types the opener of a shortcode and puts the
+    /// focus back in the editor. A composer that is out of sight (no room, or
+    /// a panel fills the window) takes nothing.
+    fn emoji_requested(&mut self, now: Instant) -> Task<Message> {
+        if self.selected.is_none() || self.pane_layout().panel_fills {
+            return Task::none();
+        }
+        let mut tasks = Vec::new();
+        for c in self.composer.emoji_opener().chars() {
+            tasks.push(self.composer_action_at(
+                iced::widget::text_editor::Action::Edit(iced::widget::text_editor::Edit::Insert(c)),
+                now,
+            ));
+        }
+        tasks.push(operation::focus(composer::COMPOSER_ID));
+        Task::batch(tasks)
+    }
+
     /// Applies an editor action to the composer of the open room and sends
     /// what that asks for: typing notices and member searches.
     pub(crate) fn composer_action_at(
@@ -2026,6 +2048,11 @@ impl App {
     }
 
     fn composer_key_at(&mut self, key: ComposerKey, now: Instant) -> Task<Message> {
+        // A dialog, card or screen is over the room: the editor may still
+        // have the keyboard focus, but its keys are not for it.
+        if self.any_overlay_open() {
+            return Task::none();
+        }
         match key {
             ComposerKey::Send => self.submit_composer(),
             ComposerKey::Pick => self.pick_suggestion_at(None, now),
@@ -3316,6 +3343,24 @@ mod tests {
             send_commands(&drain(&mut rx)).is_empty(),
             "blank text sends nothing"
         );
+    }
+
+    #[test]
+    fn the_emoji_button_types_a_colon_and_only_in_a_visible_composer() {
+        let (mut app, mut rx) = main_app();
+        let _ = app.update(Message::EmojiRequested);
+        assert_eq!(app.composer.text(), ":");
+        type_in(&mut app, "sm");
+        assert!(app.composer.suggestions.is_open() || !app.composer.text().is_empty());
+        assert!(
+            send_commands(&drain(&mut rx)).is_empty(),
+            "the button never sends"
+        );
+        let (mut app, _rx) = login_app();
+        logged_in(&mut app);
+        let _ = app.update(core(room_event(&["a"])));
+        let _ = app.update(Message::EmojiRequested);
+        assert_eq!(app.composer.text(), "", "no room, no input");
     }
 
     #[test]
@@ -11471,6 +11516,181 @@ mod tests {
             assert!(app.rooms_ui.overlay_open());
             let _ = key(&mut app, Shortcut::Escape);
             assert!(!app.rooms_ui.overlay_open());
+        }
+
+        // ---- the composer under an overlay ----
+
+        /// One way to put a modal layer over the room, with the app it needs.
+        type Opener = (
+            &'static str,
+            fn() -> (App, mpsc::Receiver<Command>),
+            fn(&mut App),
+            fn(&mut App),
+        );
+
+        fn viewer_app() -> (App, mpsc::Receiver<Command>) {
+            let (app, rx, _) = media_app(1);
+            (app, rx)
+        }
+
+        const OPENERS: [Opener; 11] = [
+            (
+                "create dialog",
+                app4,
+                |app| {
+                    let _ = app.update(Message::Rooms(R::OpenCreate));
+                },
+                |app| {
+                    let _ = app.update(Message::Rooms(R::Escape));
+                },
+            ),
+            (
+                "switcher",
+                app4,
+                |app| {
+                    let _ = key(app, Shortcut::Switcher);
+                },
+                |app| {
+                    let _ = app.update(Message::Switcher(W::Close));
+                },
+            ),
+            (
+                "settings",
+                app4,
+                |app| {
+                    let _ = app.update(Message::Settings(S::Open));
+                },
+                |app| {
+                    let _ = app.update(Message::Settings(S::Close));
+                },
+            ),
+            (
+                "audio card",
+                app4,
+                |app| {
+                    let _ = app.update(Message::Audio(crate::audio_settings::AudioMessage::Open));
+                },
+                |app| {
+                    let _ = app.update(Message::Audio(crate::audio_settings::AudioMessage::Close));
+                },
+            ),
+            (
+                "sessions card",
+                app4,
+                |app| {
+                    let _ = app.update(Message::Sessions(crate::sessions::SessionsMessage::Open));
+                },
+                |app| {
+                    let _ = app.update(Message::Sessions(crate::sessions::SessionsMessage::Close));
+                },
+            ),
+            (
+                "logout warning",
+                app4,
+                |app| {
+                    app.sessions.logout_warning = true;
+                },
+                |app| {
+                    app.sessions.logout_warning = false;
+                },
+            ),
+            (
+                "upload dialog",
+                app4,
+                |app| {
+                    app.uploads.dialog = Some(crate::upload::UploadDialog {
+                        room_id: id("alpha"),
+                        entries: Vec::new(),
+                    });
+                },
+                |app| {
+                    let _ = app.update(Message::UploadCancelled);
+                },
+            ),
+            (
+                "viewer",
+                viewer_app,
+                |app| {
+                    let _ = app.update(Message::MediaClicked("img0".into()));
+                },
+                |app| {
+                    let _ = app.update(Message::ViewerClosed);
+                },
+            ),
+            (
+                "security screen",
+                app4,
+                |app| {
+                    app.security.overlay = Some(Overlay::ResetConfirm);
+                },
+                |app| {
+                    app.security.overlay = None;
+                },
+            ),
+            (
+                "verification card",
+                app4,
+                |app| {
+                    let _ = app.update(core(CoreEvent::VerificationRequested {
+                        id: vid(),
+                        peer: vpeer(true),
+                    }));
+                },
+                |app| {
+                    app.verification = None;
+                },
+            ),
+            (
+                "ring card",
+                app4,
+                |app| {
+                    let _ = app.update(core(CoreEvent::IncomingCall {
+                        room_id: id("beta"),
+                        caller: UserId::from("@bea:x"),
+                        intent: twicecat_core::api::CallIntent::Audio,
+                        ring: true,
+                    }));
+                },
+                |app| {
+                    let _ = app.update(Message::Call(CallMessage::HideRing));
+                },
+            ),
+        ];
+
+        #[test]
+        fn enter_sends_nothing_under_any_overlay_and_sends_again_once_it_is_closed() {
+            for (name, build, open, close) in OPENERS {
+                let (mut app, mut rx) = build();
+                type_in(&mut app, "hello");
+                open(&mut app);
+                assert!(app.any_overlay_open(), "{name}: the overlay is open");
+                let _ = drain(&mut rx);
+                for key in [
+                    ComposerKey::Send,
+                    ComposerKey::Pick,
+                    ComposerKey::Next,
+                    ComposerKey::Previous,
+                    ComposerKey::Escape,
+                ] {
+                    let _ = app.update(Message::ComposerKey(key));
+                }
+                assert!(
+                    send_commands(&drain(&mut rx)).is_empty(),
+                    "{name}: Enter sent the draft under the overlay"
+                );
+                assert_eq!(app.composer.text(), "hello", "{name}: the draft is kept");
+                close(&mut app);
+                assert!(!app.any_overlay_open(), "{name}: it is closed");
+                let _ = drain(&mut rx);
+                let _ = app.update(Message::ComposerKey(ComposerKey::Send));
+                assert!(
+                    matches!(
+                        send_commands(&drain(&mut rx)).as_slice(),
+                        [Command::Send(m)] if m.text.expose() == "hello"
+                    ),
+                    "{name}: sending works again after the overlay"
+                );
+            }
         }
 
         #[test]

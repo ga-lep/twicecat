@@ -161,7 +161,12 @@ pub(crate) fn host_of(authority: &str) -> Result<&str, UrlRefused> {
             return Err(UrlRefused::Malformed);
         }
     }
-    if !host.starts_with('[') && !host.split('.').all(is_dns_label) {
+    if !host.starts_with('[')
+        && (host.len() > crate::links::MAX_HOST_BYTES
+            || !host
+                .split('.')
+                .all(|label| label.len() <= crate::links::MAX_LABEL_BYTES && is_dns_label(label)))
+    {
         return Err(UrlRefused::Malformed);
     }
     Ok(host)
