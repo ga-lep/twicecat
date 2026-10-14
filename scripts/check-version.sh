@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Checks that a release tag names the workspace's version: every crate takes
 # its version from `[workspace.package]`, and the tag must be `v<version>`.
-# The release workflow runs it before building anything.
+# The AppStream metadata must also list that version among its releases, so
+# software centres show what changed. The release workflow runs it before
+# building anything.
 #
 #   scripts/check-version.sh vX.Y.Z
 set -euo pipefail
@@ -25,5 +27,10 @@ while read -r name version; do
         status=1
     fi
 done <<<"$versions"
-[ "$status" -eq 0 ] && echo "ok: $tag matches every crate"
+metainfo=packaging/linux/io.github.ga_lep.Twicecat.metainfo.xml
+if ! grep -q "<release version=\"${tag#v}\"" "$metainfo"; then
+    echo "error: $metainfo has no <release version=\"${tag#v}\"> entry" >&2
+    status=1
+fi
+[ "$status" -eq 0 ] && echo "ok: $tag matches every crate and the metainfo"
 exit "$status"
