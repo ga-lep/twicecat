@@ -16,7 +16,7 @@ use twicecat_app::calls::CallMessage;
 use twicecat_app::rooms::RoomsMessage;
 use twicecat_app::security::{Overlay, ReauthPrompt, RecoverySetup};
 use twicecat_app::sessions::SessionsMessage;
-use twicecat_app::settings::SettingsMessage;
+use twicecat_app::settings::{SettingsMessage, SettingsPage};
 use twicecat_app::switcher::SwitcherMessage;
 use twicecat_app::threads::ThreadsMessage;
 use twicecat_app::upload::{Outcome, Prepared, Refusal, Source, UploadPaths};
@@ -1314,35 +1314,244 @@ fn settings() -> App {
     app
 }
 
-fn sessions() -> App {
+/// Settings on `page`.
+fn settings_page(page: SettingsPage) -> App {
+    let mut app = settings();
+    press(&mut app, Message::Settings(SettingsMessage::Page(page)));
+    app
+}
+
+fn settings_appearance() -> App {
+    settings_page(SettingsPage::Appearance)
+}
+
+fn settings_notifications() -> App {
+    settings_page(SettingsPage::Notifications)
+}
+
+/// Keywords that are long and have no break point, and a save that failed.
+fn settings_notifications_long() -> App {
     let mut app = main_room();
     feed(
         &mut app,
-        CoreEvent::Devices(vec![
-            DeviceSummary {
-                device_id: DeviceId::from("GALLERYDEV"),
-                display_name: Some("Twicecat on this computer".to_owned()),
-                last_seen_ms: Some(now_ms()),
-                current: true,
-                trust: DeviceTrust::Verified,
-            },
-            DeviceSummary {
-                device_id: DeviceId::from("PHONE1"),
-                display_name: Some("Phone".to_owned()),
-                last_seen_ms: Some(now_ms() - 2 * 86_400_000),
-                current: false,
-                trust: DeviceTrust::Unverified,
-            },
-            DeviceSummary {
-                device_id: DeviceId::from("OLDLAPTOP"),
-                display_name: None,
-                last_seen_ms: None,
-                current: false,
-                trust: DeviceTrust::NoKeys,
-            },
-        ]),
+        CoreEvent::NotificationSettings(twicecat_core::api::NotificationSettingsView {
+            group_default: RoomNotificationModeView::Mute,
+            dm_default: RoomNotificationModeView::AllMessages,
+            keywords: vec!["k".repeat(64), "release".to_owned()],
+        }),
     );
+    press(&mut app, Message::Settings(SettingsMessage::Open));
+    press(
+        &mut app,
+        Message::Settings(SettingsMessage::Page(SettingsPage::Notifications)),
+    );
+    press(&mut app, Message::Settings(SettingsMessage::Saved(false)));
+    app
+}
+
+fn settings_voice_audio() -> App {
+    settings_page(SettingsPage::VoiceAudio)
+}
+
+fn settings_keyboard() -> App {
+    settings_page(SettingsPage::Keyboard)
+}
+
+fn settings_sessions() -> App {
+    settings_page(SettingsPage::Sessions)
+}
+
+fn settings_about() -> App {
+    settings_page(SettingsPage::About)
+}
+
+fn device(id: &str, name: Option<&str>, current: bool, trust: DeviceTrust) -> DeviceSummary {
+    DeviceSummary {
+        device_id: DeviceId::from(id),
+        display_name: name.map(str::to_owned),
+        last_seen_ms: if current {
+            Some(now_ms())
+        } else {
+            Some(now_ms() - 2 * 86_400_000)
+        },
+        current,
+        trust,
+    }
+}
+
+fn sessions_with(devices: Vec<DeviceSummary>) -> App {
+    let mut app = main_room();
+    feed(&mut app, CoreEvent::Devices(devices));
     press(&mut app, Message::Sessions(SessionsMessage::Open));
+    // The list the core answers with (the open asked again).
+    app
+}
+
+fn three_devices() -> Vec<DeviceSummary> {
+    vec![
+        device(
+            "GALLERYDEV",
+            Some("Twicecat on this computer"),
+            true,
+            DeviceTrust::Verified,
+        ),
+        device("PHONE1", Some("Phone"), false, DeviceTrust::Unverified),
+        DeviceSummary {
+            last_seen_ms: None,
+            ..device("OLDLAPTOP", None, false, DeviceTrust::NoKeys)
+        },
+    ]
+}
+
+fn sessions() -> App {
+    let mut app = sessions_with(three_devices());
+    feed(&mut app, CoreEvent::Devices(three_devices()));
+    app
+}
+
+fn sessions_confirm_one() -> App {
+    let mut app = sessions();
+    press(
+        &mut app,
+        Message::Sessions(SessionsMessage::SignOutAsk(DeviceId::from("PHONE1"))),
+    );
+    app
+}
+
+fn sessions_confirm_all() -> App {
+    let mut app = sessions();
+    press(&mut app, Message::Sessions(SessionsMessage::SignOutAllAsk));
+    app
+}
+
+fn sessions_rename() -> App {
+    let mut app = sessions();
+    press(
+        &mut app,
+        Message::Sessions(SessionsMessage::RenameStart(DeviceId::from("PHONE1"))),
+    );
+    app
+}
+
+/// Names and IDs a server could send: very long, with no break point, with a
+/// direction override and a line break, and only blanks.
+fn sessions_long_names() -> App {
+    let mut devices = three_devices();
+    devices.push(device(
+        &format!("{}ENDMARK", "D".repeat(92)),
+        Some(&"N".repeat(200)),
+        false,
+        DeviceTrust::Unverified,
+    ));
+    devices.push(device(
+        "EVIL1",
+        Some("Phone\u{202E}gnp.exe\nsecond line"),
+        false,
+        DeviceTrust::Verified,
+    ));
+    devices.push(device("BLANK1", Some("   "), false, DeviceTrust::NoKeys));
+    let mut app = sessions_with(devices.clone());
+    feed(&mut app, CoreEvent::Devices(devices));
+    app
+}
+
+fn sessions_recovery(recovery: RecoveryStatus) -> App {
+    let mut app = sessions();
+    feed(
+        &mut app,
+        CoreEvent::Security(status(DeviceVerification::Verified, recovery)),
+    );
+    app
+}
+
+fn sessions_recovery_off() -> App {
+    sessions_recovery(RecoveryStatus::Disabled)
+}
+
+fn sessions_recovery_on() -> App {
+    sessions_recovery(RecoveryStatus::Enabled)
+}
+
+fn sessions_loading() -> App {
+    let mut app = main_room();
+    press(&mut app, Message::Sessions(SessionsMessage::Open));
+    app
+}
+
+fn sessions_notice() -> App {
+    let mut app = sessions();
+    feed(
+        &mut app,
+        CoreEvent::ActionFailed {
+            room_id: room("lounge"),
+            action: twicecat_core::api::ActionKind::Devices,
+            error: CoreError::Internal("The session could not be renamed.".to_owned()),
+        },
+    );
+    app
+}
+
+/// A sign-out of every other session that the core answered with a password
+/// request.
+fn sessions_signing_out() -> App {
+    let mut app = sessions();
+    press(&mut app, Message::Sessions(SessionsMessage::SignOutAllAsk));
+    press(
+        &mut app,
+        Message::Sessions(SessionsMessage::SignOutConfirmed),
+    );
+    app
+}
+
+fn sessions_reauth() -> App {
+    let mut app = sessions_signing_out();
+    feed(
+        &mut app,
+        CoreEvent::ReauthRequired {
+            action: ReauthAction::DeleteDevices,
+        },
+    );
+    app
+}
+
+fn sessions_reauth_failed() -> App {
+    let mut app = sessions_reauth();
+    if let Some(prompt) = app.sessions.reauth.as_mut() {
+        prompt.failed = true;
+    }
+    app
+}
+
+fn sessions_approval() -> App {
+    let mut app = sessions_signing_out();
+    feed(
+        &mut app,
+        CoreEvent::OpenAccountManagement(twicecat_core::api::AuthUrl::from(
+            "https://account.example.org/sessions?state=dummy".to_owned(),
+        )),
+    );
+    app
+}
+
+fn sessions_logout_warning() -> App {
+    let mut app = main_room();
+    feed(
+        &mut app,
+        CoreEvent::Devices(vec![device(
+            "GALLERYDEV",
+            Some("Twicecat on this computer"),
+            true,
+            DeviceTrust::Verified,
+        )]),
+    );
+    feed(
+        &mut app,
+        CoreEvent::Security(status(
+            DeviceVerification::Verified,
+            RecoveryStatus::Disabled,
+        )),
+    );
+    press(&mut app, Message::LogoutRequested);
     app
 }
 
@@ -2155,8 +2364,81 @@ pub fn scenarios() -> Vec<Scenario> {
             || voice_long_names(AudioPage::Talking),
             |a| a.audio_ui.page == AudioPage::Talking,
         ),
-        s("settings", false, settings, |a| a.settings_ui.open),
-        s("sessions", false, sessions, |a| a.sessions.open),
+        s("settings", false, settings, |a| {
+            a.settings_ui.open && a.settings_ui.page == SettingsPage::Profile
+        }),
+        s("settings-appearance", false, settings_appearance, |a| {
+            a.settings_ui.open && a.settings_ui.page == SettingsPage::Appearance
+        }),
+        s(
+            "settings-notifications",
+            false,
+            settings_notifications,
+            |a| a.settings_ui.open && a.settings_ui.page == SettingsPage::Notifications,
+        ),
+        s(
+            "settings-notifications-long",
+            false,
+            settings_notifications_long,
+            |a| a.settings_ui.error.is_some() && a.settings_ui.page == SettingsPage::Notifications,
+        ),
+        s("settings-voice-audio", false, settings_voice_audio, |a| {
+            a.settings_ui.open && a.settings_ui.page == SettingsPage::VoiceAudio
+        }),
+        s("settings-keyboard", false, settings_keyboard, |a| {
+            a.settings_ui.open && a.settings_ui.page == SettingsPage::Keyboard
+        }),
+        s("settings-sessions", false, settings_sessions, |a| {
+            a.settings_ui.open && a.settings_ui.page == SettingsPage::Sessions
+        }),
+        s("settings-about", false, settings_about, |a| {
+            a.settings_ui.open && a.settings_ui.page == SettingsPage::About
+        }),
+        s("sessions", false, sessions, |a| {
+            a.sessions.open && a.sessions.devices.as_ref().is_some_and(|d| d.len() == 3)
+        }),
+        s("sessions-loading", false, sessions_loading, |a| {
+            a.sessions.open && a.sessions.devices.is_none()
+        }),
+        s("sessions-confirm-one", false, sessions_confirm_one, |a| {
+            a.sessions.confirm.is_some()
+        }),
+        s("sessions-confirm-all", false, sessions_confirm_all, |a| {
+            a.sessions.confirm.is_some()
+        }),
+        s("sessions-rename", false, sessions_rename, |a| {
+            a.sessions.rename.is_some()
+        }),
+        s("sessions-long-names", false, sessions_long_names, |a| {
+            a.sessions.devices.as_ref().is_some_and(|d| d.len() == 6)
+        }),
+        s("sessions-recovery-off", false, sessions_recovery_off, |a| {
+            a.sessions.open && a.security.status.recovery == RecoveryStatus::Disabled
+        }),
+        s("sessions-recovery-on", false, sessions_recovery_on, |a| {
+            a.sessions.open && a.security.status.recovery == RecoveryStatus::Enabled
+        }),
+        s("sessions-notice", false, sessions_notice, |a| {
+            a.sessions.notice.is_some()
+        }),
+        s("sessions-approval", false, sessions_approval, |a| {
+            a.sessions.approval.is_some()
+        }),
+        s("sessions-reauth", false, sessions_reauth, |a| {
+            a.sessions.reauth.is_some()
+        }),
+        s(
+            "sessions-reauth-failed",
+            false,
+            sessions_reauth_failed,
+            |a| a.sessions.reauth.as_ref().is_some_and(|p| p.failed),
+        ),
+        s(
+            "sessions-logout-warning",
+            false,
+            sessions_logout_warning,
+            |a| a.sessions.logout_warning,
+        ),
         s("room-settings", false, room_settings, |a| {
             a.rooms_ui.settings.is_some()
         }),

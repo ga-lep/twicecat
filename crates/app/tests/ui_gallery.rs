@@ -319,7 +319,18 @@ fn the_fixture_reaches_every_screen_it_names() {
         "audio-announce",
         "audio-diagnostics",
         "settings",
+        "settings-appearance",
+        "settings-notifications",
+        "settings-voice-audio",
+        "settings-keyboard",
+        "settings-sessions",
+        "settings-about",
         "sessions",
+        "sessions-confirm-one",
+        "sessions-confirm-all",
+        "sessions-long-names",
+        "sessions-reauth",
+        "sessions-logout-warning",
         "room-settings",
         "members",
         "create-room",
@@ -1387,6 +1398,10 @@ fn ctrl_wheel_over_the_menus_of_the_settings_and_call_screens_changes_nothing() 
         "audio-mic-test",
         "audio-other-voices",
         "settings",
+        "settings-appearance",
+        "settings-notifications",
+        "sessions",
+        "sessions-confirm-all",
     ]
     .into_iter()
     .map(|name| {
@@ -2810,6 +2825,1006 @@ mod login {
                 "the words end above the buttons at {}",
                 size.width
             );
+        }
+    }
+}
+
+// ---- Task 14: Settings and Sessions as pages -----------------------------
+
+/// What the `Operation::text` of every text widget under a screen says, with
+/// the bounds the widget was laid out in.
+struct Texts(Vec<(String, Rectangle)>);
+
+impl iced::advanced::widget::Operation for Texts {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation)) {
+        operate(self);
+    }
+
+    fn text(&mut self, _id: Option<&iced::advanced::widget::Id>, bounds: Rectangle, text: &str) {
+        self.0.push((text.to_owned(), bounds));
+    }
+}
+
+fn texts(laid: &mut Laid<'_>, renderer: &Renderer) -> Vec<(String, Rectangle)> {
+    let mut op = Texts(Vec::new());
+    laid.element.as_widget_mut().operate(
+        &mut laid.tree,
+        Layout::new(&laid.node),
+        renderer,
+        &mut op,
+    );
+    op.0
+}
+
+/// Nodes that run out of their parent's width (a vertical overflow is a
+/// scroll).
+fn hspills(node: &Node, origin: iced::Point, out: &mut Vec<Rectangle>) {
+    let b = node.bounds();
+    let at = iced::Point::new(origin.x + b.x, origin.y + b.y);
+    for child in node.children() {
+        let cb = child.bounds();
+        if cb.x < -0.5 || cb.x + cb.width > b.width + 0.5 {
+            out.push(Rectangle::new(
+                iced::Point::new(at.x + cb.x, at.y + cb.y),
+                cb.size(),
+            ));
+        }
+        hspills(child, at, out);
+    }
+}
+
+/// The nearest ancestor of `body` that is the modal's card:
+/// `[.., card (padding 20), content (fixed height), column, body]`.
+fn card_above<'n>(root: &'n Node, body: &'n Node) -> &'n Node {
+    fn chain<'n>(node: &'n Node, target: &'n Node, path: &mut Vec<&'n Node>) -> bool {
+        path.push(node);
+        if std::ptr::eq(node, target) {
+            return true;
+        }
+        if node.children().iter().any(|c| chain(c, target, path)) {
+            return true;
+        }
+        path.pop();
+        false
+    }
+    let mut path = Vec::new();
+    assert!(chain(root, body, &mut path), "the body is in the tree");
+    path[path.len() - 4]
+}
+
+/// The distance between two rectangles (zero when they touch or overlap).
+fn gap(a: Rectangle, b: Rectangle) -> f32 {
+    let dx = (b.x - (a.x + a.width)).max(a.x - (b.x + b.width)).max(0.0);
+    let dy = (b.y - (a.y + a.height))
+        .max(a.y - (b.y + b.height))
+        .max(0.0);
+    dx.hypot(dy)
+}
+
+/// For every node of the screen the message(s) a click at its centre sends,
+/// as `Debug` text, with the node's window bounds; only nodes that send.
+fn senders(app: &App, renderer: &Renderer, size: Size) -> Vec<(Rectangle, String)> {
+    let mut laid = Laid::new(app, renderer, size);
+    laid.settle(renderer, size);
+    let mut all = Vec::new();
+    collect_bounds(&laid.node, iced::Point::ORIGIN, &mut all, 0);
+    let mut out: Vec<(Rectangle, String)> = Vec::new();
+    for (rect, _) in all {
+        if rect.width <= 0.0 || rect.height <= 0.0 {
+            continue;
+        }
+        for message in click(&mut laid, renderer, size, rect.center()) {
+            let text = format!("{message:?}");
+            // Keep the largest node of each message (the button, not its
+            // text), at each place.
+            match out
+                .iter_mut()
+                .find(|(r, t)| *t == text && gap(*r, rect) == 0.0)
+            {
+                Some(slot) => {
+                    if rect.width * rect.height > slot.0.width * slot.0.height {
+                        slot.0 = rect;
+                    }
+                }
+                None => out.push((rect, text)),
+            }
+        }
+    }
+    out
+}
+
+mod settings_pages {
+    use std::collections::BTreeSet;
+
+    use iced::advanced::widget::{Id, Operation, operation::Focusable};
+    use twicecat_app::screens::settings::NAV_WIDTH;
+    use twicecat_app::settings::{
+        INTER_ATTRIBUTION, INTER_NOTICES, KEYWORD_INPUT_ID, NAME_INPUT_ID, SettingsMessage,
+        SettingsPage,
+    };
+    use twicecat_core::api::{CoreEvent, OwnProfileView};
+
+    use super::*;
+
+    const PAGE_SCENARIOS: [(&str, SettingsPage); 7] = [
+        ("settings", SettingsPage::Profile),
+        ("settings-appearance", SettingsPage::Appearance),
+        ("settings-notifications", SettingsPage::Notifications),
+        ("settings-voice-audio", SettingsPage::VoiceAudio),
+        ("settings-keyboard", SettingsPage::Keyboard),
+        ("settings-sessions", SettingsPage::Sessions),
+        ("settings-about", SettingsPage::About),
+    ];
+
+    fn find_body(node: &Node) -> Option<&Node> {
+        if node.children().len() == 3 && node.children()[0].bounds().width == NAV_WIDTH {
+            return Some(node);
+        }
+        node.children().iter().find_map(find_body)
+    }
+
+    fn page_app(name: &str) -> App {
+        let mut app = scenario_app(name);
+        app.set_ui_settings(variants(false)[0].settings());
+        app.window_width = WIDE.width;
+        app
+    }
+
+    #[test]
+    fn the_card_is_760_by_620_with_the_page_list_at_its_left() {
+        let renderer = renderer();
+        for (name, _) in PAGE_SCENARIOS {
+            for density in DENSITIES {
+                let mut app = page_app(name);
+                with_settings(&mut app, density, RoomListChoice::Expanded);
+                let laid = Laid::new(&app, &renderer, WIDE);
+                let body = find_body(&laid.node).unwrap_or_else(|| panic!("{name}: no body"));
+                let card = card_above(&laid.node, body);
+                let what = format!("{name} {}", density.1);
+                assert_eq!(card.bounds().width, 760.0, "{what}");
+                assert_eq!(card.bounds().height, 620.0, "{what}");
+                let (nav, page) = (body.children()[0].bounds(), body.children()[2].bounds());
+                assert!(nav.x < page.x, "{what}");
+                assert!((nav.y - page.y).abs() < 0.5, "{what}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_small_window_shrinks_the_card_to_fit() {
+        let renderer = renderer();
+        let size = Size::new(1000.0, 420.0);
+        let mut app = page_app("settings-appearance");
+        app.window_width = size.width;
+        let laid = Laid::new(&app, &renderer, size);
+        let body = find_body(&laid.node).expect("the body");
+        let card = card_above(&laid.node, body);
+        assert!(card.bounds().height <= size.height, "{:?}", card.bounds());
+        assert!(card.bounds().height >= 280.0, "{:?}", card.bounds());
+    }
+
+    #[test]
+    fn nothing_runs_out_of_the_card_sideways_in_any_page_at_both_widths() {
+        let renderer = renderer();
+        let names = PAGE_SCENARIOS
+            .map(|(name, _)| name)
+            .into_iter()
+            .chain(["settings-notifications-long"]);
+        for name in names {
+            for size in SIZES {
+                for density in DENSITIES {
+                    let mut app = page_app(name);
+                    with_settings(&mut app, density, RoomListChoice::Expanded);
+                    app.window_width = size.width;
+                    let laid = Laid::new(&app, &renderer, size);
+                    let body = find_body(&laid.node).expect("the body");
+                    let card = card_above(&laid.node, body);
+                    let mut out = Vec::new();
+                    hspills(card, iced::Point::ORIGIN, &mut out);
+                    assert!(
+                        out.is_empty(),
+                        "{name} {} at {}: {out:?}",
+                        density.1,
+                        size.width
+                    );
+                    assert!(card.bounds().width <= size.width, "{name}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_page_never_runs_under_its_scrollbar() {
+        let renderer = renderer();
+        let mut tall = 0;
+        for (name, _) in PAGE_SCENARIOS {
+            for density in DENSITIES {
+                let mut app = page_app(name);
+                with_settings(&mut app, density, RoomListChoice::Expanded);
+                let laid = Laid::new(&app, &renderer, WIDE);
+                let body = find_body(&laid.node).expect("the body");
+                let scroll = &body.children()[2];
+                let content = scroll.children()[0].bounds();
+                if content.height > scroll.bounds().height + 0.5 {
+                    tall += 1;
+                    assert!(
+                        content.x + content.width <= scroll.bounds().width - 10.0 + 0.5,
+                        "{name}: content {content:?} in a scrollable {:?}",
+                        scroll.bounds()
+                    );
+                }
+            }
+        }
+        assert!(tall >= 2, "only {tall} tall pages: the check did not run");
+    }
+
+    #[test]
+    fn the_four_colour_sets_fit_the_page_without_spilling() {
+        // The swatches are two by two: all four are on screen, none past the
+        // page, in the narrowest card.
+        let renderer = renderer();
+        let mut app = page_app("settings-appearance");
+        app.window_width = NARROW.width;
+        let mut laid = Laid::new(&app, &renderer, NARROW);
+        let shown = texts(&mut laid, &renderer);
+        for label in ["Twicecat", "Frost", "Ember", "High contrast"] {
+            assert!(
+                shown.iter().any(|(t, _)| t.starts_with(label)),
+                "no swatch named {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_long_keyword_wraps_and_its_end_is_never_cut_off() {
+        let renderer = renderer();
+        let app = page_app("settings-notifications-long");
+        let mut laid = Laid::new(&app, &renderer, WIDE);
+        let shown = texts(&mut laid, &renderer);
+        let long = "k".repeat(64);
+        let (_, bounds) = shown
+            .iter()
+            .find(|(t, _)| *t == long)
+            .expect("the whole keyword is drawn");
+        // 64 characters with no break point do not fit one line of the
+        // page: the words wrap by glyph (a line of text is about 17 px).
+        assert!(bounds.height > 30.0, "the keyword did not wrap: {bounds:?}");
+        // The keyword is in a row with its Remove button: the words are
+        // laid out in the room the button leaves, so the row cannot cover it.
+        let buttons: Vec<Rectangle> = shown
+            .iter()
+            .filter(|(t, _)| t == "Remove")
+            .map(|(_, b)| *b)
+            .collect();
+        assert!(!buttons.is_empty());
+        for button in buttons {
+            if (button.y - bounds.y).abs() < bounds.height {
+                assert!(
+                    bounds.x + bounds.width <= button.x + 0.5,
+                    "the keyword {bounds:?} runs under Remove {button:?}"
+                );
+            }
+        }
+        // And the failure line has its slot, with its words.
+        assert!(
+            shown
+                .iter()
+                .any(|(t, _)| t == "The settings could not be saved on this device.")
+        );
+    }
+
+    #[test]
+    fn the_about_page_names_the_font_and_where_its_licence_is() {
+        assert!(INTER_ATTRIBUTION.contains("Inter"));
+        assert!(INTER_ATTRIBUTION.contains("2016 The Inter Project Authors"));
+        assert!(INTER_ATTRIBUTION.contains("SIL Open Font License 1.1"));
+        assert!(INTER_NOTICES.contains("OFL.txt"));
+        assert!(INTER_NOTICES.contains("THIRD-PARTY-NOTICES.md"));
+        // The fonts are embedded: the text must not say they have a folder
+        // next to the program.
+        assert!(!INTER_NOTICES.contains("next to"));
+        assert!(INTER_NOTICES.contains("crates/app/assets/fonts/inter"));
+        assert!(INTER_NOTICES.contains("https://openfontlicense.org"));
+        let renderer = renderer();
+        let app = page_app("settings-about");
+        let mut laid = Laid::new(&app, &renderer, WIDE);
+        let shown: Vec<String> = texts(&mut laid, &renderer)
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
+        for wanted in [INTER_ATTRIBUTION, INTER_NOTICES] {
+            assert!(shown.iter().any(|t| t == wanted), "About lacks {wanted:?}");
+        }
+        let version = format!("Twicecat {}", env!("CARGO_PKG_VERSION"));
+        assert!(shown.contains(&version), "no version line");
+        assert!(
+            shown.iter().any(|t| t.contains("native Wayland")),
+            "no drag-and-drop note"
+        );
+        // The fixed THIRD-PARTY-NOTICES.md says the same words.
+        let notices = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../THIRD-PARTY-NOTICES.md"),
+        )
+        .expect("the notices file");
+        assert!(notices.contains("Copyright (c) 2016 The Inter Project Authors"));
+    }
+
+    /// The page on show draws its own title (and the list has its name); the
+    /// other pages have only their name in the list.
+    #[test]
+    fn each_page_shows_its_own_title_and_other_pages_do_not() {
+        let renderer = renderer();
+        for (name, page) in PAGE_SCENARIOS {
+            let app = page_app(name);
+            let mut laid = Laid::new(&app, &renderer, WIDE);
+            let shown = texts(&mut laid, &renderer);
+            for other in SettingsPage::ALL {
+                let count = shown.iter().filter(|(t, _)| t == other.label()).count();
+                let wanted = if other == page { 2 } else { 1 };
+                assert_eq!(count, wanted, "{name}: {}", other.label());
+            }
+        }
+    }
+
+    /// Every message a click at the centre of each node of the card sends.
+    fn clicked(app: &App, renderer: &Renderer) -> Vec<SettingsMessage> {
+        let mut laid = Laid::new(app, renderer, WIDE);
+        laid.settle(renderer, WIDE);
+        let mut all = Vec::new();
+        collect_bounds(&laid.node, iced::Point::ORIGIN, &mut all, 0);
+        let mut sent = Vec::new();
+        for (rect, _) in all {
+            if rect.width <= 0.0 || rect.height <= 0.0 {
+                continue;
+            }
+            for at in [
+                rect.center(),
+                iced::Point::new(rect.x + 4.0, rect.center().y),
+                iced::Point::new(rect.x + rect.width - 4.0, rect.center().y),
+            ] {
+                for message in click(&mut laid, renderer, WIDE, at) {
+                    if let Message::Settings(m) = message {
+                        sent.push(m);
+                    }
+                }
+            }
+        }
+        sent
+    }
+
+    fn feed(app: &mut App, event: CoreEvent) {
+        let _ = app.update(Message::Core(Box::new(event)));
+    }
+
+    #[test]
+    fn each_page_sends_only_its_own_messages_and_together_they_send_them_all() {
+        let renderer = renderer();
+        let mut seen: BTreeSet<&'static str> = BTreeSet::new();
+        let mut apps: Vec<(SettingsPage, String, App)> = PAGE_SCENARIOS
+            .into_iter()
+            .map(|(name, page)| (page, name.to_owned(), page_app(name)))
+            .collect();
+        // Profile with an edited name and a picture set: Save and Remove
+        // picture are on.
+        let mut profile = page_app("settings");
+        feed(
+            &mut profile,
+            CoreEvent::OwnProfile(OwnProfileView {
+                display_name: Some("Me Example".to_owned()),
+                avatar: Some(twicecat_core::api::AvatarId::from("mxc://example.org/a")),
+            }),
+        );
+        let _ = profile.update(Message::Settings(SettingsMessage::NameInput(
+            "Me Edited".to_owned().into(),
+        )));
+        apps.push((SettingsPage::Profile, "profile edited".to_owned(), profile));
+        // Notifications with a typed keyword: Add is on.
+        let mut typed = page_app("settings-notifications");
+        let _ = typed.update(Message::Settings(SettingsMessage::KeywordInput(
+            "word".to_owned().into(),
+        )));
+        apps.push((SettingsPage::Notifications, "typed".to_owned(), typed));
+        // Appearance with a non-default colour set and a larger text: every
+        // button of the row is on.
+        let mut zoomed = page_app("settings-appearance");
+        let _ = zoomed.update(Message::Settings(SettingsMessage::Zoom(
+            twicecat_app::settings::Zoom::In,
+        )));
+        apps.push((SettingsPage::Appearance, "zoomed".to_owned(), zoomed));
+        for (page, name, app) in &apps {
+            for message in clicked(app, &renderer) {
+                let allowed = SettingsMessage::CARD_WIDE.contains(&message.name())
+                    || page.sends().contains(&message.name());
+                assert!(allowed, "{name}: {message:?} is not a message of {page:?}");
+                seen.insert(message.name());
+            }
+        }
+        // Menus open an overlay this harness does not drive; typing makes
+        // the text messages.
+        let unreachable_by_click = [
+            "DefaultMode",
+            "Density",
+            "RoomList",
+            "NameInput",
+            "KeywordInput",
+        ];
+        let mut expected: BTreeSet<&str> = SettingsMessage::CARD_WIDE.into_iter().collect();
+        for page in SettingsPage::ALL {
+            expected.extend(page.sends());
+        }
+        for name in unreachable_by_click {
+            expected.remove(name);
+        }
+        let missing: Vec<&&str> = expected.iter().filter(|n| !seen.contains(**n)).collect();
+        assert!(
+            missing.is_empty(),
+            "no click sent {missing:?}; saw {seen:?}"
+        );
+    }
+
+    /// A page of the list sends the page it names.
+    #[test]
+    fn the_page_list_has_a_button_for_each_page() {
+        let renderer = renderer();
+        let app = page_app("settings");
+        let mut pages = BTreeSet::new();
+        for (_, text) in senders(&app, &renderer, WIDE) {
+            if let Some(rest) = text.strip_prefix("Settings(Page(") {
+                pages.insert(rest.trim_end_matches("))").to_owned());
+            }
+        }
+        let wanted: BTreeSet<String> = SettingsPage::ALL.iter().map(|p| format!("{p:?}")).collect();
+        assert_eq!(pages, wanted);
+    }
+
+    /// Voice & audio and Sessions each have the one button that opens their
+    /// own screen, apart from the Close of the card.
+    #[test]
+    fn the_voice_and_sessions_pages_have_their_one_button() {
+        let renderer = renderer();
+        for (name, wanted) in [
+            ("settings-voice-audio", "Settings(OpenVoiceAudio)"),
+            ("settings-sessions", "Settings(OpenSessions)"),
+        ] {
+            let app = page_app(name);
+            let found: Vec<String> = senders(&app, &renderer, WIDE)
+                .into_iter()
+                .map(|(_, t)| t)
+                .filter(|t| t.starts_with("Settings(Open"))
+                .collect();
+            assert_eq!(found, vec![wanted.to_owned()], "{name}");
+        }
+    }
+
+    struct Stops(Vec<String>);
+
+    impl Operation for Stops {
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+            operate(self);
+        }
+
+        fn focusable(&mut self, id: Option<&Id>, _bounds: Rectangle, _state: &mut dyn Focusable) {
+            self.0.push(format!("{id:?}"));
+        }
+    }
+
+    /// Tab walks the text fields of the page on show (this iced gives
+    /// buttons no focus): the name on Profile, the keyword on Notifications,
+    /// nothing named on the others.
+    #[test]
+    fn tab_stops_are_the_text_fields_of_the_page_on_show() {
+        let renderer = renderer();
+        let id_of = |name: &'static str| format!("{:?}", Some(Id::new(name)));
+        for (name, page) in PAGE_SCENARIOS {
+            let app = page_app(name);
+            let mut laid = Laid::new(&app, &renderer, WIDE);
+            let mut op = Stops(Vec::new());
+            laid.element.as_widget_mut().operate(
+                &mut laid.tree,
+                Layout::new(&laid.node),
+                &renderer,
+                &mut op,
+            );
+            let mine: Vec<&String> = op.0.iter().filter(|id| id.contains("settings-")).collect();
+            let wanted = match page {
+                SettingsPage::Profile => vec![id_of(NAME_INPUT_ID)],
+                SettingsPage::Notifications => vec![id_of(KEYWORD_INPUT_ID)],
+                _ => Vec::new(),
+            };
+            assert_eq!(mine, wanted.iter().collect::<Vec<_>>(), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_notice_slot_is_there_on_every_page_and_takes_no_room_when_empty() {
+        let renderer = renderer();
+        let mut heights = Vec::new();
+        for (name, _) in PAGE_SCENARIOS {
+            let app = page_app(name);
+            let laid = Laid::new(&app, &renderer, WIDE);
+            let body = find_body(&laid.node).expect("the body");
+            let card = card_above(&laid.node, body);
+            // content > column [top [header, notice], body]
+            let top = &card.children()[0].children()[0].children()[0];
+            assert_eq!(top.children().len(), 2, "{name}: header and notice slot");
+            heights.push((top.children()[1].bounds().height, body.bounds().y));
+        }
+        assert!(
+            heights.windows(2).all(|w| (w[0].1 - w[1].1).abs() < 0.5),
+            "{heights:?}"
+        );
+        assert!(heights.iter().all(|(h, _)| *h == 0.0), "{heights:?}");
+        // With a failure the line has room and the body moves down by it.
+        let app = page_app("settings-notifications-long");
+        let laid = Laid::new(&app, &renderer, WIDE);
+        let body = find_body(&laid.node).expect("the body");
+        assert!(body.bounds().y > heights[0].1 + 20.0);
+    }
+}
+
+mod sessions_screen {
+    use iced::advanced::widget::{Id, Operation, operation::Focusable};
+    use twicecat_app::screens::sessions::{CARD_WIDTH, WRONG_PASSWORD, trust_severity};
+    use twicecat_app::sessions::{REAUTH_INPUT_ID, RENAME_INPUT_ID};
+    use twicecat_core::api::DeviceTrust;
+
+    use super::*;
+
+    const SCREENS: [&str; 13] = [
+        "sessions",
+        "sessions-loading",
+        "sessions-confirm-one",
+        "sessions-confirm-all",
+        "sessions-rename",
+        "sessions-long-names",
+        "sessions-recovery-off",
+        "sessions-recovery-on",
+        "sessions-notice",
+        "sessions-approval",
+        "sessions-reauth",
+        "sessions-reauth-failed",
+        "sessions-logout-warning",
+    ];
+
+    /// The first node `width` wide that is a card (not a full-window layer).
+    fn find_card(node: &Node, width: f32) -> Option<&Node> {
+        if (node.bounds().width - width).abs() < 0.5 && node.bounds().height < 700.0 {
+            return Some(node);
+        }
+        node.children().iter().find_map(|c| find_card(c, width))
+    }
+
+    fn app_of(name: &str) -> App {
+        let mut app = scenario_app(name);
+        app.set_ui_settings(variants(false)[0].settings());
+        app.window_width = WIDE.width;
+        app
+    }
+
+    fn card_width_of(name: &str) -> f32 {
+        match name {
+            "sessions-reauth" | "sessions-reauth-failed" | "sessions-logout-warning" => 520.0,
+            _ => CARD_WIDTH,
+        }
+    }
+
+    #[test]
+    fn the_sessions_card_is_760_by_620_and_the_prompts_are_520_wide_and_centred() {
+        let renderer = renderer();
+        for name in SCREENS.into_iter().filter(|n| !n.starts_with("settings")) {
+            let app = app_of(name);
+            let laid = Laid::new(&app, &renderer, WIDE);
+            if name.starts_with("sessions-reauth") || name == "sessions-logout-warning" {
+                // The prompt is the last layer: a card of its own width.
+                let card = find_card(&laid.node, 520.0)
+                    .unwrap_or_else(|| panic!("{name}: no 520 px card"));
+                let mid = card.bounds().x + card.bounds().width / 2.0;
+                assert!((mid - WIDE.width / 2.0).abs() < 1.0, "{name}: not centred");
+            } else {
+                let card = find_card(&laid.node, 760.0)
+                    .unwrap_or_else(|| panic!("{name}: no 760 px card"));
+                assert_eq!(card.bounds().height, 620.0, "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn nothing_runs_out_of_a_card_sideways_at_both_widths_and_densities() {
+        let renderer = renderer();
+        for name in SCREENS {
+            for size in SIZES {
+                for density in DENSITIES {
+                    let mut app = app_of(name);
+                    with_settings(&mut app, density, RoomListChoice::Expanded);
+                    app.window_width = size.width;
+                    let laid = Laid::new(&app, &renderer, size);
+                    let width = card_width_of(name);
+                    let Some(card) = find_card(&laid.node, width.min(size.width)) else {
+                        panic!("{name} at {}: no card", size.width);
+                    };
+                    let mut out = Vec::new();
+                    hspills(card, iced::Point::ORIGIN, &mut out);
+                    assert!(
+                        out.is_empty(),
+                        "{name} {} at {}: {out:?}",
+                        density.1,
+                        size.width
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_small_window_shrinks_the_card_to_fit() {
+        let renderer = renderer();
+        let size = Size::new(1000.0, 420.0);
+        let mut app = app_of("sessions");
+        app.window_width = size.width;
+        let laid = Laid::new(&app, &renderer, size);
+        let card = find_card(&laid.node, 760.0).expect("the card");
+        assert!(card.bounds().height <= size.height, "{:?}", card.bounds());
+        assert!(card.bounds().height >= 280.0, "{:?}", card.bounds());
+    }
+
+    fn shown(name: &str) -> Vec<(String, Rectangle)> {
+        let renderer = renderer();
+        let app = app_of(name);
+        let mut laid = Laid::new(&app, &renderer, WIDE);
+        texts(&mut laid, &renderer)
+    }
+
+    #[test]
+    fn this_session_is_first_and_each_shows_its_trust_in_words() {
+        let list = shown("sessions");
+        let y = |wanted: &str| {
+            list.iter()
+                .find(|(t, _)| t == wanted)
+                .unwrap_or_else(|| panic!("no text {wanted:?}"))
+                .1
+                .y
+        };
+        assert!(y("Twicecat on this computer") < y("Phone"));
+        assert!(
+            y("Phone") < y("OLDLAPTOP"),
+            "an unnamed session shows its ID"
+        );
+        for words in [
+            "This device",
+            "Verified",
+            "Not verified",
+            "No encryption keys",
+        ] {
+            assert!(list.iter().any(|(t, _)| t == words), "no tag {words:?}");
+        }
+        // The tag of this device is on the first row, with its trust.
+        assert!((y("This device") - y("Verified")).abs() < 1.0);
+        // The colour says it too: trusted is not drawn as a warning.
+        assert_eq!(
+            trust_severity(DeviceTrust::Verified),
+            twicecat_app::ui::kit::Severity::Success
+        );
+        assert_eq!(
+            trust_severity(DeviceTrust::Unverified),
+            twicecat_app::ui::kit::Severity::Warning
+        );
+        assert_eq!(
+            trust_severity(DeviceTrust::NoKeys),
+            twicecat_app::ui::kit::Severity::Warning
+        );
+    }
+
+    #[test]
+    fn a_long_name_wraps_and_the_end_of_a_long_id_is_never_clipped() {
+        let list = shown("sessions-long-names");
+        // The name is capped (64 characters) and one line; it wraps inside
+        // its row instead of running off it.
+        let name = list
+            .iter()
+            .find(|(t, _)| t.starts_with("NNNN"))
+            .expect("the long name");
+        assert!(name.0.chars().count() <= 64, "{}", name.0.chars().count());
+        assert!(name.1.height > 30.0, "the name did not wrap: {:?}", name.1);
+        // The ID is cut in the middle; its last characters stay.
+        let id = list
+            .iter()
+            .find(|(t, _)| t.contains("ENDMARK"))
+            .expect("the end of the long ID is drawn");
+        assert!(id.0.ends_with("ENDMARK"), "{}", id.0);
+        assert!(id.0.chars().count() <= 64);
+        // Controls of the server's text: no direction override or line break.
+        for (t, _) in &list {
+            assert!(!t.contains('\u{202E}') && !t.contains('\n'), "{t:?}");
+        }
+        // A name of blanks falls back to the ID.
+        assert!(list.iter().any(|(t, _)| t == "BLANK1"));
+    }
+
+    /// The messages (as text) of every control, with where it sits. A control
+    /// in the scrolling list is cut to the list's window: what the scroll
+    /// clips cannot be clicked, so it does not count as near the footer.
+    fn controls(name: &str) -> Vec<(Rectangle, String)> {
+        let renderer = renderer();
+        let app = app_of(name);
+        let list = senders(&app, &renderer, WIDE);
+        let laid = Laid::new(&app, &renderer, WIDE);
+        let clip = find_card(&laid.node, 760.0).and_then(|card| {
+            // card > content > column [header, bars, list, footer]
+            let column = card.children().first()?.children().first()?;
+            let scroll = column.children().get(2)?;
+            let origin = origin_of(&laid.node, scroll, iced::Point::ORIGIN)?;
+            Some(Rectangle::new(origin, scroll.bounds().size()))
+        });
+        list.into_iter()
+            .map(|(rect, text)| match clip {
+                Some(clip) if clip.contains(rect.center()) => {
+                    (rect.intersection(&clip).unwrap_or(rect), text)
+                }
+                _ => (rect, text),
+            })
+            .collect()
+    }
+
+    fn sends(list: &[(Rectangle, String)], prefix: &str) -> Vec<Rectangle> {
+        list.iter()
+            .filter(|(_, t)| t.starts_with(prefix))
+            .map(|(r, _)| *r)
+            .collect()
+    }
+
+    const DANGEROUS: [&str; 4] = [
+        "Sessions(SignOutAsk(",
+        "Sessions(SignOutAllAsk)",
+        "Sessions(SignOutConfirmed)",
+        "Sessions(LogoutAnyway)",
+    ];
+
+    #[test]
+    fn no_confirmation_can_be_reached_before_it_is_asked() {
+        // Nothing on the plain screen, the warning-less states or the
+        // prompts confirms a sign-out or logs out.
+        for name in [
+            "sessions",
+            "sessions-long-names",
+            "sessions-rename",
+            "sessions-recovery-off",
+        ] {
+            for (_, t) in controls(name) {
+                for confirm in ["SignOutConfirmed", "LogoutAnyway", "ReauthSubmitted"] {
+                    assert!(!t.contains(confirm), "{name}: {t}");
+                }
+            }
+        }
+        // The password's Continue is off while the field is empty.
+        for name in ["sessions-reauth", "sessions-reauth-failed"] {
+            assert!(
+                !controls(name)
+                    .iter()
+                    .any(|(_, t)| t.contains("ReauthSubmitted")),
+                "{name}: Continue is on with no password"
+            );
+        }
+    }
+
+    #[test]
+    fn a_second_click_where_the_sign_out_asked_does_not_confirm_it() {
+        let renderer = renderer();
+        for (plain, asked, prefix) in [
+            ("sessions", "sessions-confirm-one", "Sessions(SignOutAsk("),
+            (
+                "sessions",
+                "sessions-confirm-all",
+                "Sessions(SignOutAllAsk)",
+            ),
+        ] {
+            let before = controls(plain);
+            let asks = sends(&before, prefix);
+            assert!(!asks.is_empty(), "{plain}: no {prefix}");
+            let app = app_of(asked);
+            for ask in asks {
+                let mut laid = Laid::new(&app, &renderer, WIDE);
+                laid.settle(&renderer, WIDE);
+                for at in [
+                    ask.center(),
+                    iced::Point::new(ask.x + 4.0, ask.center().y),
+                    iced::Point::new(ask.x + ask.width - 4.0, ask.center().y),
+                ] {
+                    let sent: Vec<String> = click(&mut laid, &renderer, WIDE, at)
+                        .iter()
+                        .map(|m| format!("{m:?}"))
+                        .collect();
+                    assert!(
+                        !sent.iter().any(|m| m.contains("SignOutConfirmed")),
+                        "{asked}: a click at {at:?} confirms: {sent:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn destructive_buttons_sit_at_least_one_gap_from_every_other_control() {
+        for name in [
+            "sessions",
+            "sessions-confirm-one",
+            "sessions-confirm-all",
+            "sessions-long-names",
+            "sessions-logout-warning",
+            "sessions-recovery-off",
+        ] {
+            let list = controls(name);
+            let danger: Vec<&(Rectangle, String)> = list
+                .iter()
+                .filter(|(_, t)| DANGEROUS.iter().any(|d| t.starts_with(d)))
+                .collect();
+            assert!(!danger.is_empty(), "{name}: no destructive button");
+            for (rect, text) in &danger {
+                for (other, other_text) in &list {
+                    if other_text == text {
+                        continue;
+                    }
+                    let distance = gap(*rect, *other);
+                    assert!(
+                        distance >= 12.0 - 0.5,
+                        "{name}: {text} is {distance} px from {other_text}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn verify_is_offered_only_for_another_unverified_session_and_sign_out_never_for_this_one() {
+        let list = controls("sessions");
+        let all: Vec<&String> = list.iter().map(|(_, t)| t).collect();
+        assert_eq!(all.iter().filter(|t| t.contains("Verify(")).count(), 1);
+        assert!(
+            all.iter()
+                .any(|t| t.contains(r#"Verify(DeviceId("PHONE1"))"#))
+        );
+        assert!(
+            !all.iter()
+                .any(|t| t.contains("SignOutAsk") && t.contains("GALLERYDEV"))
+        );
+        assert_eq!(all.iter().filter(|t| t.contains("SignOutAsk(")).count(), 2);
+        assert_eq!(all.iter().filter(|t| t.contains("RenameStart(")).count(), 3);
+        assert!(all.iter().any(|t| t.contains("SignOutAllAsk")));
+    }
+
+    #[test]
+    fn a_prompt_over_the_page_takes_every_click() {
+        for name in ["sessions-reauth", "sessions-reauth-failed"] {
+            for (_, t) in controls(name) {
+                assert!(
+                    t.contains("ReauthCancelled"),
+                    "{name}: a click got through to the page: {t}"
+                );
+            }
+        }
+        let warning = controls("sessions-logout-warning");
+        let kinds: Vec<&str> = warning.iter().map(|(_, t)| t.as_str()).collect();
+        for wanted in ["LogoutSetupRecovery", "LogoutAnyway", "LogoutCancelled"] {
+            assert!(kinds.iter().any(|t| t.contains(wanted)), "no {wanted}");
+        }
+        // The way out first, the sign-out last.
+        let y = |wanted: &str| {
+            warning
+                .iter()
+                .find(|(_, t)| t.contains(wanted))
+                .expect("the button")
+                .0
+                .y
+        };
+        assert!(y("LogoutSetupRecovery") < y("LogoutAnyway"));
+    }
+
+    #[test]
+    fn the_wrong_password_line_and_the_warning_words_are_there() {
+        let plain = shown("sessions-reauth");
+        let failed = shown("sessions-reauth-failed");
+        assert!(!plain.iter().any(|(t, _)| t == WRONG_PASSWORD));
+        assert!(failed.iter().any(|(t, _)| t == WRONG_PASSWORD));
+        assert!(
+            plain
+                .iter()
+                .any(|(t, _)| t.starts_with("Your homeserver needs your account password"))
+        );
+        let warning = shown("sessions-logout-warning");
+        assert!(
+            warning
+                .iter()
+                .any(|(t, _)| t.starts_with("You'll lose access"))
+        );
+    }
+
+    /// The words of a bar and its buttons: the buttons are on a row of their
+    /// own below the words, so nothing covers the text.
+    #[test]
+    fn bars_keep_their_buttons_below_their_words() {
+        for (name, words, button) in [
+            (
+                "sessions-approval",
+                "account.example.org",
+                "ApprovalConfirmed",
+            ),
+            (
+                "sessions-notice",
+                "The session could not be renamed.",
+                "DismissNotice",
+            ),
+            ("sessions-recovery-off", "Recovery is off.", "SetupRecovery"),
+            (
+                "sessions-recovery-on",
+                "Recovery is on.",
+                "ChangeKeyRequested",
+            ),
+        ] {
+            let texts = shown(name);
+            let at = texts
+                .iter()
+                .find(|(t, _)| t.contains(words))
+                .unwrap_or_else(|| panic!("{name}: no {words:?}"))
+                .1;
+            let buttons = controls(name);
+            let button = buttons
+                .iter()
+                .find(|(_, t)| t.contains(button))
+                .unwrap_or_else(|| panic!("{name}: no {button}"))
+                .0;
+            assert!(
+                button.y >= at.y + at.height - 0.5,
+                "{name}: {button:?} is not below the words {at:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_footer_keeps_its_button_in_the_card_when_the_list_is_long() {
+        let renderer = renderer();
+        let app = app_of("sessions-long-names");
+        let laid = Laid::new(&app, &renderer, WIDE);
+        let card = find_card(&laid.node, 760.0).expect("the card").bounds();
+        let list = controls("sessions-long-names");
+        let all = sends(&list, "Sessions(SignOutAllAsk)");
+        assert_eq!(all.len(), 1);
+        assert!(all[0].y + all[0].height <= card.y + 620.0, "{all:?}");
+    }
+
+    struct Stops(Vec<String>);
+
+    impl Operation for Stops {
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+            operate(self);
+        }
+
+        fn focusable(&mut self, id: Option<&Id>, _bounds: Rectangle, _state: &mut dyn Focusable) {
+            self.0.push(format!("{id:?}"));
+        }
+    }
+
+    #[test]
+    fn the_rename_and_password_fields_are_the_text_stops() {
+        let renderer = renderer();
+        let id_of = |name: &'static str| format!("{:?}", Some(Id::new(name)));
+        for (name, wanted) in [
+            ("sessions", None),
+            ("sessions-rename", Some(id_of(RENAME_INPUT_ID))),
+            ("sessions-reauth", Some(id_of(REAUTH_INPUT_ID))),
+        ] {
+            let app = app_of(name);
+            let mut laid = Laid::new(&app, &renderer, WIDE);
+            let mut op = Stops(Vec::new());
+            laid.element.as_widget_mut().operate(
+                &mut laid.tree,
+                Layout::new(&laid.node),
+                &renderer,
+                &mut op,
+            );
+            let mine: Vec<String> =
+                op.0.into_iter()
+                    .filter(|id| id.contains("sessions-"))
+                    .collect();
+            assert_eq!(mine, wanted.into_iter().collect::<Vec<_>>(), "{name}");
         }
     }
 }

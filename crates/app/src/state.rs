@@ -10581,6 +10581,67 @@ mod tests {
         }
 
         #[test]
+        fn settings_open_on_profile_and_the_page_list_changes_the_page() {
+            use crate::settings::SettingsPage;
+            let mut rig = rig();
+            open(&mut rig);
+            assert_eq!(rig.app.settings_ui.page, SettingsPage::Profile);
+            for page in SettingsPage::ALL {
+                st(&mut rig, S::Page(page));
+                assert_eq!(rig.app.settings_ui.page, page);
+            }
+            // Closing and opening again (Ctrl+, too) starts at Profile.
+            st(&mut rig, S::Page(SettingsPage::About));
+            st(&mut rig, S::Close);
+            open(&mut rig);
+            assert_eq!(rig.app.settings_ui.page, SettingsPage::Profile);
+            assert!(drain(&mut rig.rx).is_empty(), "a page change sends nothing");
+        }
+
+        #[test]
+        fn a_page_change_while_settings_is_shut_does_nothing() {
+            use crate::settings::SettingsPage;
+            let mut rig = rig();
+            st(&mut rig, S::Page(SettingsPage::About));
+            assert_eq!(rig.app.settings_ui.page, SettingsPage::Profile);
+        }
+
+        #[test]
+        fn a_page_change_keeps_the_unsaved_name() {
+            use crate::settings::SettingsPage;
+            let mut rig = rig();
+            open(&mut rig);
+            st(&mut rig, S::NameInput(text("Alicia")));
+            st(&mut rig, S::Page(SettingsPage::Notifications));
+            st(&mut rig, S::Page(SettingsPage::Profile));
+            assert_eq!(rig.app.settings_ui.name.expose(), "Alicia");
+            assert!(rig.app.settings_ui.name_edited);
+        }
+
+        #[test]
+        fn the_pages_and_the_messages_they_send_cover_every_message() {
+            use crate::settings::SettingsPage;
+            // The pages own distinct messages.
+            let mut owned = std::collections::BTreeSet::new();
+            for page in SettingsPage::ALL {
+                for name in page.sends() {
+                    assert!(owned.insert(*name), "{name} is on two pages");
+                }
+            }
+            // Every message is a page's, the card's, or comes from a task or
+            // a key (never from a control of a page).
+            for name in S::ALL_NAMES {
+                let known = owned.contains(name)
+                    || S::CARD_WIDE.contains(&name)
+                    || S::NOT_FROM_A_CONTROL.contains(&name);
+                assert!(known, "{name} belongs to no page");
+            }
+            for name in owned {
+                assert!(S::ALL_NAMES.contains(&name), "{name} is not a message");
+            }
+        }
+
+        #[test]
         fn settings_do_not_open_on_the_login_screen_or_over_another_modal() {
             let (mut app, _rx) = login_app();
             let _ = app.update(Message::Settings(S::Open));
@@ -11828,6 +11889,161 @@ mod tests {
             assert!(app.threads.panel.is_some());
             let _ = key(&mut app, Shortcut::Escape);
             assert!(app.threads.panel.is_none());
+        }
+
+        // ---- Esc and the Sessions card ----
+
+        use crate::sessions::SessionsMessage as SM;
+
+        fn ses_msg(app: &mut App, message: SM) {
+            let _ = app.update(Message::Sessions(message));
+        }
+
+        /// `app4` with the Sessions card open and its devices listed.
+        fn sessions_over_app4() -> (App, mpsc::Receiver<Command>) {
+            let (mut app, mut rx) = app4();
+            ses_msg(&mut app, SM::Open);
+            let _ = app.update(core(CoreEvent::Devices(device_list())));
+            let _ = drain(&mut rx);
+            (app, rx)
+        }
+
+        /// The card with a password prompt open (not waiting).
+        fn prompt_over_app4() -> (App, mpsc::Receiver<Command>) {
+            let (mut app, mut rx) = sessions_over_app4();
+            ses_msg(&mut app, SM::SignOutAsk(DeviceId::from("PHONE")));
+            ses_msg(&mut app, SM::SignOutConfirmed);
+            let _ = drain(&mut rx);
+            let _ = app.update(core(CoreEvent::ReauthRequired {
+                action: ReauthAction::DeleteDevices,
+            }));
+            assert!(app.sessions.reauth.is_some());
+            (app, rx)
+        }
+
+        /// Reply mode, a thread panel and a call panel, all open behind.
+        fn layers_behind(app: &mut App, rx: &mut mpsc::Receiver<Command>) {
+            let _ = app.update(Message::Threads(ThreadsMessage::Open(EventId::from(
+                "$r:x",
+            ))));
+            app.composer.mode = composer::Mode::Reply("x".into());
+            app.calls.panel_open = true;
+            let _ = drain(rx);
+        }
+
+        fn behind_untouched(app: &App) {
+            assert!(matches!(app.composer.mode, composer::Mode::Reply(_)));
+            assert!(app.threads.panel.is_some());
+            assert!(app.calls.panel_open);
+        }
+
+        #[test]
+        fn esc_closes_the_sessions_card() {
+            let (mut app, mut rx) = sessions_over_app4();
+            layers_behind(&mut app, &mut rx);
+            let _ = key(&mut app, Shortcut::Escape);
+            assert!(!app.sessions.open);
+            behind_untouched(&app);
+        }
+
+        #[test]
+        fn esc_cancels_the_sign_out_question_and_keeps_the_card() {
+            let (mut app, mut rx) = sessions_over_app4();
+            layers_behind(&mut app, &mut rx);
+            ses_msg(&mut app, SM::SignOutAsk(DeviceId::from("PHONE")));
+            assert!(app.sessions.confirm.is_some());
+            let _ = key(&mut app, Shortcut::Escape);
+            assert!(app.sessions.confirm.is_none() && app.sessions.open);
+            assert!(app.sessions.pending.is_none());
+            assert!(drain(&mut rx).is_empty(), "Esc never confirms");
+            behind_untouched(&app);
+            let _ = key(&mut app, Shortcut::Escape);
+            assert!(!app.sessions.open, "the next press closes the card");
+        }
+
+        #[test]
+        fn esc_cancels_the_password_prompt_and_forgets_the_password() {
+            let (mut app, mut rx) = prompt_over_app4();
+            layers_behind(&mut app, &mut rx);
+            ses_msg(&mut app, SM::ReauthInput(Password::from("secret-pw-e")));
+            // A press the password field used itself arrives as captured.
+            let _ = app.update(Message::Shortcut {
+                shortcut: Shortcut::Escape,
+                captured: true,
+            });
+            assert!(app.sessions.reauth.is_none() && app.sessions.pending.is_none());
+            assert!(app.sessions.open);
+            assert!(drain(&mut rx).is_empty(), "Esc never submits");
+            assert!(!format!("{app:?}").contains("secret-pw-e"));
+            behind_untouched(&app);
+        }
+
+        #[test]
+        fn esc_while_the_password_is_in_flight_is_swallowed() {
+            let (mut app, mut rx) = prompt_over_app4();
+            layers_behind(&mut app, &mut rx);
+            ses_msg(&mut app, SM::ReauthInput(Password::from("secret-pw-f")));
+            ses_msg(&mut app, SM::ReauthSubmitted);
+            assert!(app.sessions.reauth.as_ref().is_some_and(|p| p.waiting));
+            let _ = drain(&mut rx);
+            let task = key(&mut app, Shortcut::Escape);
+            assert_eq!(task.units(), 0);
+            assert!(app.sessions.reauth.as_ref().is_some_and(|p| p.waiting));
+            assert!(app.sessions.pending.is_some() && app.sessions.open);
+            assert!(drain(&mut rx).is_empty());
+            behind_untouched(&app);
+        }
+
+        #[test]
+        fn esc_cancels_the_logout_warning_and_never_logs_out() {
+            let (mut app, mut rx) = sessions_over_app4();
+            layers_behind(&mut app, &mut rx);
+            app.sessions.logout_warning = true;
+            let _ = key(&mut app, Shortcut::Escape);
+            assert!(!app.sessions.logout_warning);
+            assert!(app.sessions.open, "the card under it stays");
+            assert!(drain(&mut rx).is_empty(), "Esc never logs out");
+            behind_untouched(&app);
+        }
+
+        #[test]
+        fn the_logout_warning_comes_before_the_prompt_and_the_question() {
+            let (mut app, _rx) = prompt_over_app4();
+            app.sessions.logout_warning = true;
+            let _ = key(&mut app, Shortcut::Escape);
+            assert!(!app.sessions.logout_warning && app.sessions.reauth.is_some());
+            let _ = key(&mut app, Shortcut::Escape);
+            assert!(app.sessions.reauth.is_none() && app.sessions.open);
+            let _ = key(&mut app, Shortcut::Escape);
+            assert!(!app.sessions.open);
+        }
+
+        #[test]
+        fn esc_acts_on_the_layer_drawn_on_top_a_room_dialog_over_the_sessions_card() {
+            // view(): room dialogs are drawn over main_view's Sessions
+            // layer, so Esc closes the dialog first.
+            let (mut app, mut rx) = sessions_over_app4();
+            let _ = app.update(Message::Rooms(R::OpenCreate));
+            assert!(app.rooms_ui.overlay_open() && app.sessions.open);
+            let _ = key(&mut app, Shortcut::Escape);
+            assert!(!app.rooms_ui.overlay_open(), "the dialog on top closes");
+            assert!(app.sessions.open, "the card under it stays");
+            let _ = key(&mut app, Shortcut::Escape);
+            assert!(!app.sessions.open);
+            assert!(drain(&mut rx).is_empty());
+        }
+
+        #[test]
+        fn esc_in_the_rename_field_cancels_the_rename_and_keeps_the_card() {
+            let (mut app, mut rx) = sessions_over_app4();
+            ses_msg(&mut app, SM::RenameStart(DeviceId::from("PHONE")));
+            assert!(app.sessions.rename.is_some());
+            let _ = key(&mut app, Shortcut::Escape);
+            assert!(app.sessions.rename.is_none(), "the rename is cancelled");
+            assert!(app.sessions.open, "the card stays");
+            assert!(drain(&mut rx).is_empty(), "nothing is renamed");
+            let _ = key(&mut app, Shortcut::Escape);
+            assert!(!app.sessions.open, "the next press closes the card");
         }
 
         #[test]

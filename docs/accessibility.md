@@ -16,13 +16,13 @@ on macOS.
 | Ctrl+Shift+Down / Ctrl+Shift+Up | Open the next / previous room with unread messages |
 | Ctrl+B | Collapse the room list to a rail, or expand it again (saved) |
 | Ctrl+U | Attach a file to the open room |
-| Ctrl+, | Open Settings |
+| Ctrl+, | Open Settings (always on the Profile page) |
 | Ctrl+= / Ctrl+- / Ctrl+0 | Make the text larger / smaller / back to 100 % |
 | Ctrl+Shift+M | In a call: mute or unmute the microphone |
 | Ctrl+Shift+D | In a call: deafen or undeafen |
 | Ctrl+Shift+A / Ctrl+Shift+X | While a call rings (its card is showing): accept / decline it |
 | Tab / Shift+Tab | Move to the next / previous field |
-| Esc | Close the topmost dialog, panel, Settings or the switcher |
+| Esc | Close the topmost dialog, panel, Settings, the Sessions card or the switcher |
 | Up / Down (switcher open) | Highlight the previous / next room |
 | Enter (switcher open) | Open the highlighted room |
 | Enter / Shift+Enter (composer) | Send / new line |
@@ -41,7 +41,8 @@ Rules the code follows (all in tests):
   (hidden, and its ringtone silenced; the room keeps ringing), the Voice &
   audio card, the switcher,
   the upload
-  confirmation, the viewer, Settings, a room dialog or panel, then the
+  confirmation, the viewer, Settings, the logout warning, the Sessions card
+  (its password prompt or sign-out question first), a room dialog or panel, then the
   composer's suggestions or reply/edit, then the thread panel, then the
   participants panel of a call. A text field
   that took the Esc to drop its focus does not keep an overlay open.
@@ -76,6 +77,43 @@ Rules the code follows (all in tests):
   every key goes to it and no shortcut runs: the next key with its
   modifiers becomes the binding, a modifier alone keeps waiting, and Esc,
   **Cancel**, closing the card or leaving the window stop waiting.
+
+## Settings and Sessions
+
+Settings is a card with a list of pages at its left (Profile, Appearance,
+Notifications, Voice & audio, Keyboard, Sessions, About) and one page at its
+right. Ctrl+, always opens it on Profile, and so does opening it again after
+a close.
+
+- Esc closes Settings, as before (one layer per press).
+- Tab and Shift+Tab walk the text fields of the page on show, in the order of
+  the widget tree: the display name on Profile, the keyword field on
+  Notifications, and no field on the other pages. This iced gives only text
+  fields the keyboard focus; buttons, checkboxes, radio buttons and the list
+  of pages never take it, so they are reached with the pointer. This is a
+  limit of the pinned iced, not a choice; it is on the human checkpoint list.
+  A page change keeps the text typed in the fields of the other pages.
+- The Sessions page of Settings has one button, **Manage sessions...**, which
+  closes Settings and opens the Sessions card. That card closes with its
+  **Close** button or with Esc. Esc closes one thing per press, topmost
+  first: the logout warning, the password prompt, the sign-out question, then
+  the card. It only ever cancels or closes, never confirms a sign-out or a
+  log-out, and while the card or one of its prompts is open it never reaches
+  the room behind it (reply or edit, thread panel, call panel). While the
+  password is on its way to the server the prompt cannot be cancelled, and
+  Esc does nothing. A session named like a tag ("Verified", "This device") or
+  like a device ID is shown in quotes. The rename field and the password prompt
+  are text fields; the prompt takes the focus when it opens.
+- The destructive buttons of Sessions (Sign out, Sign out of all other
+  sessions, Sign out anyway) are red, say what they do in words, sit at least
+  12 px from every other control, and each asks first: the button that asks is
+  not where the one that confirms appears. No key presses a button, so Enter
+  cannot confirm one; Enter in the password field sends it only when the field
+  is not empty.
+- Whether a session is verified is shown in words (**This device**,
+  **Verified**, **Not verified**, **No encryption keys**) and in colour.
+  Session names and IDs come from the server: they are cleaned, capped and
+  wrapped inside the row, and the end of an ID is never cut off.
 
 ## Calls
 
