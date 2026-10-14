@@ -332,12 +332,29 @@ fn the_fixture_reaches_every_screen_it_names() {
         "sessions-reauth",
         "sessions-logout-warning",
         "room-settings",
+        "room-settings-long",
+        "room-leave-confirm",
+        "room-encrypt-confirm",
         "members",
+        "members-call-trust",
+        "members-search",
+        "members-none",
+        "members-loading",
+        "members-many",
+        "user-card",
+        "user-card-long",
         "create-room",
         "join-room",
         "upload",
+        "upload-single",
+        "upload-long",
+        "upload-wrong-room",
         "viewer",
+        "viewer-long",
+        "viewer-loading",
         "switcher",
+        "switcher-empty",
+        "switcher-long",
         "verification-requested",
         "verification-emojis",
         "verification-done",
@@ -3826,5 +3843,1062 @@ mod sessions_screen {
                     .collect();
             assert_eq!(mine, wanted.into_iter().collect::<Vec<_>>(), "{name}");
         }
+    }
+}
+
+// ---- Task 15: room dialogs, members, upload, viewer and switcher ----------
+
+mod dialogs {
+    use iced::keyboard::{self, Key, key};
+    use twicecat_app::keys::Shortcut;
+    use twicecat_app::rooms::RoomsMessage;
+    use twicecat_app::screens::switcher::HINT;
+    use twicecat_app::ui::tokens;
+    use twicecat_core::api::UserTrust;
+
+    use super::*;
+
+    /// Like [`super::senders`], but a node counts only if a click just inside
+    /// each of its corners sends the same message as a click at its centre:
+    /// the window-sized containers around a button (whose centre happens to
+    /// be over it) do not, so each button is reported at its own bounds.
+    fn senders(app: &App, renderer: &Renderer, size: Size) -> Vec<(Rectangle, String)> {
+        let mut laid = Laid::new(app, renderer, size);
+        laid.settle(renderer, size);
+        let mut all = Vec::new();
+        collect_bounds(&laid.node, iced::Point::ORIGIN, &mut all, 0);
+        let mut out: Vec<(Rectangle, String)> = Vec::new();
+        for (rect, _) in all {
+            if rect.width < 8.0 || rect.height < 8.0 {
+                continue;
+            }
+            let probe = |laid: &mut Laid<'_>, at: iced::Point| -> Vec<String> {
+                click(laid, renderer, size, at)
+                    .iter()
+                    .map(|m| format!("{m:?}"))
+                    .collect()
+            };
+            let centre = probe(&mut laid, rect.center());
+            let Some(first) = centre.first().cloned() else {
+                continue;
+            };
+            let inset = 3.0;
+            let corners = [
+                iced::Point::new(rect.x + inset, rect.y + inset),
+                iced::Point::new(rect.x + rect.width - inset, rect.y + inset),
+                iced::Point::new(rect.x + inset, rect.y + rect.height - inset),
+                iced::Point::new(rect.x + rect.width - inset, rect.y + rect.height - inset),
+            ];
+            if corners
+                .into_iter()
+                .any(|at| probe(&mut laid, at).first() != Some(&first))
+            {
+                continue;
+            }
+            match out
+                .iter_mut()
+                .find(|(r, t)| *t == first && super::gap(*r, rect) == 0.0)
+            {
+                Some(slot) => {
+                    if rect.width * rect.height > slot.0.width * slot.0.height {
+                        slot.0 = rect;
+                    }
+                }
+                None => out.push((rect, first)),
+            }
+        }
+        out
+    }
+
+    /// The texts drawn inside the card of width `width`.
+    fn card_texts(name: &str, size: Size, width: f32) -> Vec<(String, Rectangle)> {
+        let renderer = renderer();
+        let app = dialog_app(name, size);
+        let mut laid = Laid::new(&app, &renderer, size);
+        laid.settle(&renderer, size);
+        let card = card_rect(&laid, width);
+        texts(&mut laid, &renderer)
+            .into_iter()
+            .filter(|(_, r)| {
+                r.x >= card.x - 0.5
+                    && r.y >= card.y - 0.5
+                    && r.x + r.width <= card.x + card.width + 0.5
+                    && r.y + r.height <= card.y + card.height + 0.5
+            })
+            .collect()
+    }
+
+    /// How many more times `text` is drawn in `name` than in `base`.
+    fn extra(name: &str, base: &str, size: Size, text: &str) -> isize {
+        let ours = count(&texts_of(&dialog_app(name, size), size), text);
+        let theirs = count(&texts_of(&dialog_app(base, size), size), text);
+        ours as isize - theirs as isize
+    }
+
+    /// Window sizes for the dialogs: both gallery widths, and a short window.
+    const SHORT: Size = Size::new(1000.0, 420.0);
+
+    fn dialog_app(name: &str, size: Size) -> App {
+        let mut app = scenario_app(name);
+        app.set_ui_settings(variants(false)[0].settings());
+        app.window_width = size.width;
+        app
+    }
+
+    /// The window rectangle of the card of width `width`: the first node, in
+    /// tree order, that wide and tall enough to be a card.
+    fn card_rect(laid: &Laid<'_>, width: f32) -> Rectangle {
+        let mut all = Vec::new();
+        collect_bounds(&laid.node, iced::Point::ORIGIN, &mut all, 0);
+        all.into_iter()
+            .map(|(rect, _)| rect)
+            .find(|rect| (rect.width - width).abs() < 0.5 && rect.height > 60.0)
+            .unwrap_or_else(|| panic!("no card {width} wide in the layout"))
+    }
+
+    fn of_message<'a>(
+        list: &'a [(Rectangle, String)],
+        debug: &'a str,
+    ) -> impl Iterator<Item = Rectangle> + 'a {
+        list.iter()
+            .filter(move |(_, m)| m == debug)
+            .map(|(r, _)| *r)
+    }
+
+    /// `(scenario, card width, what the close button in the header sends)`.
+    const CARDS: [(&str, f32, &str); 8] = [
+        ("create-room", 460.0, "Rooms(CloseDialog)"),
+        ("join-room", 460.0, "Rooms(CloseDialog)"),
+        ("start-dm", 460.0, "Rooms(CloseDialog)"),
+        ("user-card", 460.0, "Rooms(CardClose)"),
+        ("room-settings", 520.0, "Rooms(CloseSettings)"),
+        ("members", 520.0, "Rooms(CloseMembers)"),
+        ("upload", 520.0, "UploadCancelled"),
+        ("upload-single", 520.0, "UploadCancelled"),
+    ];
+
+    #[test]
+    fn every_dialog_is_a_card_with_a_close_button_in_its_header() {
+        let renderer = renderer();
+        for (name, width, close) in CARDS {
+            let app = dialog_app(name, WIDE);
+            let mut laid = Laid::new(&app, &renderer, WIDE);
+            laid.settle(&renderer, WIDE);
+            let card = card_rect(&laid, width);
+            let list = senders(&app, &renderer, WIDE);
+            let header = of_message(&list, close)
+                .filter(|r| r.y < card.y + 80.0 && r.x > card.x + card.width / 2.0)
+                .count();
+            assert_eq!(header, 1, "{name}: a close button at the header's right");
+            // The card is centred in the window.
+            let (left, right) = (card.x, WIDE.width - (card.x + card.width));
+            assert!((left - right).abs() < 1.0, "{name}: {card:?}");
+        }
+    }
+
+    #[test]
+    fn no_dialog_runs_out_of_its_card_sideways_and_all_fit_a_short_window() {
+        let renderer = renderer();
+        let names = [
+            "create-room",
+            "join-room",
+            "start-dm",
+            "user-card",
+            "user-card-long",
+            "room-settings",
+            "room-settings-long",
+            "room-leave-confirm",
+            "room-encrypt-confirm",
+            "members",
+            "members-call-trust",
+            "members-many",
+            "members-loading",
+            "members-none",
+            "upload",
+            "upload-single",
+            "upload-long",
+            "upload-wrong-room",
+        ];
+        for name in names {
+            for size in [WIDE, NARROW, SHORT] {
+                let app = dialog_app(name, size);
+                let laid = Laid::new(&app, &renderer, size);
+                let width = match name {
+                    n if n.starts_with("room-") || n.starts_with("members") => 520.0,
+                    n if n.starts_with("upload") => 520.0,
+                    _ => 460.0,
+                };
+                let card = card_rect(&laid, width);
+                let what = format!("{name} at {}x{}", size.width, size.height);
+                assert!(card.x >= 0.0 && card.x + card.width <= size.width, "{what}");
+                assert!(
+                    card.y >= -0.5 && card.y + card.height <= size.height + 0.5,
+                    "{what}: card {card:?} in a window {}",
+                    size.height
+                );
+                // Everything under the card's content stays inside its width.
+                let mut out = Vec::new();
+                hspills(&laid.node, iced::Point::ORIGIN, &mut out);
+                for spill in out {
+                    let inside_card = spill.x >= card.x - 0.5
+                        && spill.x + spill.width <= card.x + card.width + 0.5;
+                    let beside = spill.x + spill.width <= card.x + 0.5
+                        || spill.x >= card.x + card.width - 0.5;
+                    assert!(
+                        inside_card || beside,
+                        "{what}: {spill:?} crosses the card {card:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn in_a_short_window_the_footer_stays_inside_the_card_and_the_body_scrolls() {
+        let renderer = renderer();
+        // The action that lives in each dialog's footer.
+        for (name, width, footer) in [
+            ("create-room", 460.0, "Rooms(CreateSubmit)"),
+            ("room-settings", 520.0, "Rooms(CloseSettings)"),
+            ("room-leave-confirm", 520.0, "Rooms(CloseSettings)"),
+            ("members-many", 520.0, "Rooms(CloseMembers)"),
+            ("upload-single", 520.0, "UploadConfirmed"),
+            ("upload-long", 520.0, "UploadConfirmed"),
+            ("user-card", 460.0, "Rooms(CardMessage)"),
+        ] {
+            let app = dialog_app(name, SHORT);
+            let laid = Laid::new(&app, &renderer, SHORT);
+            let card = card_rect(&laid, width);
+            let list = senders(&app, &renderer, SHORT);
+            let at = of_message(&list, footer)
+                .last()
+                .unwrap_or_else(|| panic!("{name}: no {footer} in the short window"));
+            assert!(
+                at.y + at.height <= card.y + card.height - 10.0,
+                "{name}: the footer {at:?} is not inside the card {card:?}"
+            );
+            assert!(at.y + at.height <= SHORT.height, "{name}: {at:?}");
+        }
+    }
+
+    /// The four question buttons that cannot be undone, with the scenario that
+    /// shows the question and the one that shows the button that asks.
+    const QUESTIONS: [(&str, &str, &str, &str, &str); 2] = [
+        (
+            "room-leave-confirm",
+            "room-settings",
+            "Rooms(LeaveConfirm)",
+            "Rooms(LeaveCancel)",
+            "Rooms(LeaveAsk)",
+        ),
+        (
+            "room-encrypt-confirm",
+            "room-settings",
+            "Rooms(EncryptConfirm)",
+            "Rooms(EncryptCancel)",
+            "Rooms(EncryptAsk)",
+        ),
+    ];
+
+    #[test]
+    fn a_question_that_cannot_be_undone_keeps_its_red_button_apart_and_elsewhere() {
+        let renderer = renderer();
+        for size in [WIDE, NARROW] {
+            for (asking, idle, confirm, cancel, ask) in QUESTIONS {
+                let app = dialog_app(asking, size);
+                let list = senders(&app, &renderer, size);
+                let confirm_at: Vec<Rectangle> = of_message(&list, confirm).collect();
+                assert_eq!(confirm_at.len(), 1, "{asking}: one confirm button");
+                let confirm_at = confirm_at[0];
+                let cancel_at: Vec<Rectangle> = of_message(&list, cancel).collect();
+                assert_eq!(cancel_at.len(), 1, "{asking}: one cancel button");
+                assert!(
+                    cancel_at[0].x + cancel_at[0].width <= confirm_at.x,
+                    "{asking}: Cancel at the left, the red button last"
+                );
+                // At least `M` from every other control, and from Cancel.
+                for (rect, message) in &list {
+                    if *message == confirm || rect.contains(confirm_at.center()) {
+                        continue;
+                    }
+                    assert!(
+                        gap(confirm_at, *rect) >= tokens::M - 0.5,
+                        "{asking} at {}: {message} is {} from the red button",
+                        size.width,
+                        gap(confirm_at, *rect)
+                    );
+                }
+                // The button that asks is in another place.
+                let idle_app = dialog_app(idle, size);
+                let idle_list = senders(&idle_app, &renderer, size);
+                let ask_at: Vec<Rectangle> = of_message(&idle_list, ask).collect();
+                assert_eq!(ask_at.len(), 1, "{idle}: one asking button");
+                assert!(
+                    gap(ask_at[0], confirm_at) >= tokens::M,
+                    "{asking}: the button that asks {:?} is under the one that confirms {confirm_at:?}",
+                    ask_at[0]
+                );
+                // And there is no question button in the idle state.
+                assert!(of_message(&idle_list, confirm).next().is_none(), "{idle}");
+            }
+        }
+    }
+
+    /// The RGB of the pixel at `at` in a drawing of `app`.
+    fn pixel(app: &App, size: Size, at: iced::Point) -> [u8; 3] {
+        let renderer = renderer();
+        let mut laid = Laid::new(app, &renderer, size);
+        laid.settle(&renderer, size);
+        let pixels = laid.pixels(app, self::renderer(), size);
+        let index = ((at.y as usize) * (size.width as usize) + at.x as usize) * 4;
+        [pixels[index], pixels[index + 1], pixels[index + 2]]
+    }
+
+    fn near(a: [u8; 3], b: iced::Color) -> bool {
+        let to = |v: f32| (v * 255.0).round() as i32;
+        [(a[0], b.r), (a[1], b.g), (a[2], b.b)]
+            .iter()
+            .all(|(have, want)| (i32::from(*have) - to(*want)).abs() <= 2)
+    }
+
+    #[test]
+    fn the_buttons_that_confirm_a_question_are_drawn_red_and_the_others_are_not() {
+        let renderer = renderer();
+        for variant in variants(false).iter().step_by(5) {
+            for (asking, _, confirm, cancel, _) in QUESTIONS {
+                let mut app = scenario_app(asking);
+                app.set_ui_settings(variant.settings());
+                app.window_width = WIDE.width;
+                let list = senders(&app, &renderer, WIDE);
+                let danger = app.current_theme().palette().danger;
+                let confirm_at = of_message(&list, confirm).next().expect("confirm");
+                let cancel_at = of_message(&list, cancel).next().expect("cancel");
+                let inside = |r: Rectangle| iced::Point::new(r.x + 4.0, r.center().y);
+                assert!(
+                    near(pixel(&app, WIDE, inside(confirm_at)), danger),
+                    "{asking} {}: {confirm} is not red",
+                    variant.tag()
+                );
+                assert!(
+                    !near(pixel(&app, WIDE, inside(cancel_at)), danger),
+                    "{asking} {}: Cancel is red",
+                    variant.tag()
+                );
+            }
+        }
+    }
+
+    fn key_press(named: key::Named, repeat: bool) -> Event {
+        Event::Keyboard(keyboard::Event::KeyPressed {
+            key: Key::Named(named),
+            modified_key: Key::Named(named),
+            physical_key: key::Physical::Code(key::Code::Enter),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat,
+        })
+    }
+
+    /// What Enter, Space and their repeats send to a dialog, after a click on
+    /// each of its controls that sends nothing by itself (a click on the
+    /// title, on the backdrop).
+    fn keys_send(app: &App, renderer: &Renderer, size: Size) -> Vec<String> {
+        let mut laid = Laid::new(app, renderer, size);
+        laid.settle(renderer, size);
+        let mut sent = Vec::new();
+        for (named, repeat) in [
+            (key::Named::Enter, false),
+            (key::Named::Enter, true),
+            (key::Named::Space, false),
+            (key::Named::Space, true),
+        ] {
+            let mut messages: Vec<Message> = Vec::new();
+            let mut shell = Shell::new(&mut messages);
+            laid.element.as_widget_mut().update(
+                &mut laid.tree,
+                &key_press(named, repeat),
+                Layout::new(&laid.node),
+                mouse::Cursor::Unavailable,
+                renderer,
+                &mut clipboard::Null,
+                &mut shell,
+                &Rectangle::with_size(size),
+            );
+            sent.extend(messages.iter().map(|m| format!("{m:?}")));
+        }
+        sent
+    }
+
+    #[test]
+    fn enter_space_and_their_repeats_commit_nothing_in_a_dialog_that_cannot_be_undone() {
+        let renderer = renderer();
+        for name in [
+            "room-leave-confirm",
+            "room-encrypt-confirm",
+            "room-settings",
+            "upload",
+            "upload-single",
+            "members",
+            "user-card",
+        ] {
+            let app = dialog_app(name, WIDE);
+            let sent = keys_send(&app, &renderer, WIDE);
+            assert!(sent.is_empty(), "{name}: keys sent {sent:?}");
+        }
+    }
+
+    #[test]
+    fn the_backdrop_takes_every_click_the_main_view_would_have_had() {
+        let renderer = renderer();
+        let behind = dialog_app("main-room", WIDE);
+        let targets = senders(&behind, &renderer, WIDE);
+        assert!(targets.len() > 10, "{} controls behind", targets.len());
+        let mut checked = 0;
+        for name in [
+            "create-room",
+            "room-leave-confirm",
+            "room-encrypt-confirm",
+            "members",
+            "user-card",
+            "upload",
+            "upload-single",
+            "viewer",
+            "switcher",
+        ] {
+            let app = dialog_app(name, WIDE);
+            let mut laid = Laid::new(&app, &renderer, WIDE);
+            laid.settle(&renderer, WIDE);
+            for (rect, what) in &targets {
+                let at = rect.center();
+                let sent = click(&mut laid, &renderer, WIDE, at);
+                // A click on the dialog's own controls is its business: only
+                // clicks outside every card are checked, so ask for nothing
+                // from the part of the window the dialog covers with a card.
+                let on_card = {
+                    let mut all = Vec::new();
+                    collect_bounds(&laid.node, iced::Point::ORIGIN, &mut all, 0);
+                    all.iter().any(|(r, depth)| {
+                        *depth > 0
+                            && r.width < WIDE.width - 1.0
+                            && r.width > 400.0
+                            && r.contains(at)
+                    })
+                };
+                if on_card {
+                    continue;
+                }
+                checked += 1;
+                assert!(
+                    sent.is_empty(),
+                    "{name}: a click at {at:?} (the main view's {what}) sent {sent:?}"
+                );
+            }
+        }
+        assert!(checked > 40, "only {checked} clicks were checked");
+    }
+
+    fn escape(app: &mut App) {
+        let _ = app.update(Message::Shortcut {
+            shortcut: Shortcut::Escape,
+            captured: false,
+        });
+    }
+
+    #[test]
+    fn escape_closes_the_layer_that_is_drawn_on_top_and_only_that_one() {
+        // The layers, bottom to top: the room dialogs and panels, Settings,
+        // Voice & audio, the viewer, the upload confirmation, the switcher.
+        let mut app = scenario_app("viewer");
+        let _ = app.update(Message::Rooms(RoomsMessage::OpenSettings));
+        let _ = app.update(Message::Rooms(RoomsMessage::LeaveAsk));
+        let _ = app.update(Message::FilesChosen(twicecat_app::upload::UploadPaths(
+            vec!["/gallery/photo.png".into()],
+        )));
+        app.switcher.open = true;
+        let open = |app: &App| {
+            [
+                app.rooms_ui.settings.is_some(),
+                app.settings_ui.open,
+                app.audio_ui.open,
+                app.media.viewer.is_some(),
+                app.uploads.dialog.is_some(),
+                app.switcher.open,
+            ]
+        };
+        assert_eq!(
+            open(&app),
+            [true, false, false, true, true, true],
+            "the setup opened the layers"
+        );
+        let mut order = Vec::new();
+        for _ in 0..8 {
+            let before = open(&app);
+            let ask = app
+                .rooms_ui
+                .settings
+                .as_ref()
+                .is_some_and(|panel| panel.leave_ask);
+            escape(&mut app);
+            let after = open(&app);
+            let closed: Vec<usize> = (0..before.len())
+                .filter(|&i| before[i] && !after[i])
+                .collect();
+            let asked_less = ask
+                && app
+                    .rooms_ui
+                    .settings
+                    .as_ref()
+                    .is_some_and(|panel| !panel.leave_ask);
+            if closed.is_empty() && !asked_less {
+                break;
+            }
+            // The topmost layer that was open; a question inside the panel
+            // is cancelled before the panel closes.
+            let top = before.iter().rposition(|open| *open).expect("a layer");
+            assert!(
+                closed == [top] || (asked_less && top == 0 && closed.is_empty()),
+                "closed {closed:?} (question cancelled: {asked_less}) while {top} was on top"
+            );
+            order.push(top);
+        }
+        assert_eq!(
+            order,
+            [5, 4, 3, 0, 0],
+            "switcher, upload, viewer, question, panel"
+        );
+        assert!(open(&app).iter().all(|open| !open));
+    }
+
+    fn texts_of(app: &App, size: Size) -> Vec<(String, Rectangle)> {
+        let renderer = renderer();
+        let mut laid = Laid::new(app, &renderer, size);
+        laid.settle(&renderer, size);
+        texts(&mut laid, &renderer)
+    }
+
+    fn count(shown: &[(String, Rectangle)], text: &str) -> usize {
+        shown.iter().filter(|(t, _)| t == text).count()
+    }
+
+    #[test]
+    fn members_are_in_sections_with_counts_in_the_order_admins_moderators_members_invited() {
+        let app = dialog_app("members-call-trust", WIDE);
+        let shown = texts_of(&app, WIDE);
+        let y = |title: &str| {
+            shown
+                .iter()
+                .find(|(t, _)| t == title)
+                .unwrap_or_else(|| panic!("no section {title}"))
+                .1
+                .y
+        };
+        let (admins, mods, members, invited) = (
+            y("Admins (2)"),
+            y("Moderators (1)"),
+            y("Members (4)"),
+            y("Invited (1)"),
+        );
+        assert!(admins < mods && mods < members && members < invited);
+        // The title counts everyone.
+        assert!(shown.iter().any(|(t, _)| t == "Members (8)"), "title");
+    }
+
+    #[test]
+    fn the_call_and_trust_tags_say_it_in_words_and_a_name_cannot_pass_for_a_tag() {
+        let tagged = |text: &str| extra("members-call-trust", "main-call-connected", WIDE, text);
+        // Bea, Cy, Dee (invited) and Me are in the call.
+        assert_eq!(tagged("In the call"), 4);
+        assert_eq!(tagged("Verified"), 1, "only the real tag says it");
+        assert_eq!(tagged("Not verified"), 2);
+        assert_eq!(tagged("Identity changed"), 1);
+        let app = dialog_app("members-call-trust", WIDE);
+        let shown = texts_of(&app, WIDE);
+        // The members named like a tag are quoted.
+        assert_eq!(count(&shown, "\u{201c}Verified\u{201d}"), 1);
+        assert_eq!(count(&shown, "\u{201c}Admin (75)\u{201d}"), 1);
+        // The creator's tag, the moderator's invitation: more than the section.
+        assert_eq!(count(&shown, "Creator"), 1);
+        assert_eq!(count(&shown, "Moderator, invited"), 1);
+        // A person the core has not reported has no trust tag at all.
+        let app = dialog_app("members", WIDE);
+        let shown = texts_of(&app, WIDE);
+        for tag in [
+            "Verified",
+            "Not verified",
+            "Identity changed",
+            "In the call",
+        ] {
+            assert_eq!(count(&shown, tag), 0, "{tag}");
+        }
+    }
+
+    #[test]
+    fn the_search_narrows_the_list_and_an_empty_result_says_so() {
+        let found = |text: &str| extra("members-search", "main-room", WIDE, text);
+        assert_eq!(found("Moderators (1)"), 1);
+        assert_eq!(found("Admins (2)"), 0);
+        assert_eq!(found("Alice Example"), 1);
+        assert_eq!(found("Cy Example"), 0);
+        assert_eq!(
+            extra("members-none", "main-room", WIDE, "No member matches"),
+            1
+        );
+        let loading = extra(
+            "members-loading",
+            "main-room",
+            WIDE,
+            "Loading members\u{2026}",
+        );
+        assert_eq!(loading, 1);
+    }
+
+    #[test]
+    fn a_big_room_builds_one_page_of_rows_and_offers_more() {
+        let app = dialog_app("members-many", WIDE);
+        let shown = texts_of(&app, WIDE);
+        let rows = shown
+            .iter()
+            .filter(|(t, _)| t.starts_with("Person 0"))
+            .count();
+        assert_eq!(rows, 100, "one page of rows is built");
+        let more: Vec<_> = shown.iter().filter(|(t, _)| t == "Show more").collect();
+        assert_eq!(more.len(), 1, "{more:?}");
+        assert_eq!(
+            count(&shown, "Members (450)"),
+            2,
+            "the title and the section"
+        );
+        // Show more adds a page and the button stays while there are more.
+        let mut app = app;
+        let _ = app.update(Message::Rooms(RoomsMessage::ShowMoreMembers));
+        let shown = texts_of(&app, WIDE);
+        let rows = shown
+            .iter()
+            .filter(|(t, _)| t.starts_with("Person 0"))
+            .count();
+        assert_eq!(rows, 300);
+    }
+
+    #[test]
+    fn a_long_user_id_keeps_its_server_and_sits_clear_of_the_tags_and_the_scrollbar() {
+        let renderer = renderer();
+        for size in SIZES {
+            let app = dialog_app("members-call-trust", size);
+            let mut laid = Laid::new(&app, &renderer, size);
+            laid.settle(&renderer, size);
+            let card = card_rect(&laid, 520.0);
+            let shown = texts(&mut laid, &renderer);
+            let (id, at) = shown
+                .iter()
+                .find(|(t, _)| t.ends_with("long-server.example.org"))
+                .expect("the end of the ID is drawn");
+            assert!(
+                at.x + at.width <= card.x + card.width - 20.0,
+                "{at:?} {card:?}"
+            );
+            // No other text is drawn over it.
+            for (other, rect) in &shown {
+                if other != id && rect.intersects(at) && rect.width > 0.0 {
+                    assert!(
+                        rect.height == 0.0 || !overlaps(rect, at),
+                        "{other:?} {rect:?} covers the ID {at:?}"
+                    );
+                }
+            }
+        }
+        // Tall list: the content stops short of the scrollbar.
+        let app = dialog_app("members-many", WIDE);
+        let laid = Laid::new(&app, &renderer, WIDE);
+        let card = card_rect(&laid, 520.0);
+        let mut all = Vec::new();
+        collect_bounds(&laid.node, iced::Point::ORIGIN, &mut all, 0);
+        let scroll = all
+            .iter()
+            .map(|(r, _)| *r)
+            .filter(|r| r.x >= card.x && r.x + r.width <= card.x + card.width + 0.5)
+            .find(|r| r.height > 200.0 && r.width > 400.0 && r.width < card.width)
+            .expect("the list's scrollable");
+        let content = all
+            .iter()
+            .map(|(r, _)| *r)
+            .filter(|r| r.height > scroll.height && r.x == scroll.x)
+            .map(|r| r.width)
+            .fold(f32::MAX, f32::min);
+        assert!(
+            content <= scroll.width - 10.0 + 0.5,
+            "{content} in {scroll:?}"
+        );
+    }
+
+    /// Whether two rectangles share area (not just an edge).
+    fn overlaps(a: &Rectangle, b: &Rectangle) -> bool {
+        a.x < b.x + b.width - 0.5
+            && b.x < a.x + a.width - 0.5
+            && a.y < b.y + b.height - 0.5
+            && b.y < a.y + a.height - 0.5
+    }
+
+    #[test]
+    fn invite_is_the_last_action_and_cancel_is_always_a_click_away() {
+        let renderer = renderer();
+        let app = dialog_app("members", WIDE);
+        let list = senders(&app, &renderer, WIDE);
+        let invite = of_message(&list, "Rooms(InviteSubmit)").next();
+        // The scenario has no room details yet: Invite is off, and so sends
+        // nothing; the close button works.
+        assert!(invite.is_none(), "{invite:?}");
+        assert!(of_message(&list, "Rooms(CloseMembers)").next().is_some());
+        assert_eq!(extra("members", "main-room", WIDE, "Invite"), 1);
+    }
+
+    #[test]
+    fn the_form_footers_keep_cancel_and_the_main_action_apart_and_cancel_always_works() {
+        let renderer = renderer();
+        for (name, submit, cancel) in [
+            ("create-room", "Rooms(CreateSubmit)", "Rooms(CloseDialog)"),
+            ("join-room", "Rooms(JoinSubmit)", "Rooms(CloseDialog)"),
+            ("start-dm", "Rooms(DmSubmit)", "Rooms(CloseDialog)"),
+            ("upload-single", "UploadConfirmed", "UploadCancelled"),
+        ] {
+            let app = dialog_app(name, WIDE);
+            let list = senders(&app, &renderer, WIDE);
+            let main = of_message(&list, submit).last().expect(name);
+            // Cancel appears twice (header and footer); the footer's is the
+            // lower one.
+            let footer = of_message(&list, cancel)
+                .max_by(|a, b| a.y.total_cmp(&b.y))
+                .expect(name);
+            assert!(
+                footer.x + footer.width <= main.x,
+                "{name}: Cancel then the main action"
+            );
+            assert!(
+                gap(footer, main) >= tokens::M - 0.5,
+                "{name}: {}",
+                gap(footer, main)
+            );
+            assert!((footer.y - main.y).abs() < 1.0, "{name}: one row");
+        }
+    }
+
+    #[test]
+    fn the_create_form_works_only_when_idle_and_toggling_public_moves_no_field() {
+        let renderer = renderer();
+        let mut app = dialog_app("create-room", WIDE);
+        let fields = |app: &App| {
+            let mut laid = Laid::new(app, &renderer, WIDE);
+            let all = texts(&mut laid, &renderer);
+            // The body column holds the same number of slots either way.
+            let card = card_rect(&laid, 460.0);
+            let mut nodes = Vec::new();
+            collect_bounds(&laid.node, iced::Point::ORIGIN, &mut nodes, 0);
+            let slots = nodes
+                .iter()
+                .filter(|(r, _)| (r.width - (card.width - 40.0)).abs() < 14.0)
+                .count();
+            (all.len(), slots)
+        };
+        let before = fields(&app);
+        let _ = app.update(Message::Rooms(RoomsMessage::CreatePublic(true)));
+        let after = fields(&app);
+        assert!(after.0 > before.0, "the address field appears");
+        let _ = app.update(Message::Rooms(RoomsMessage::CreatePublic(false)));
+        assert_eq!(fields(&app), before);
+        // Busy: Create is off, Cancel stays.
+        let busy = scenario_app("create-room");
+        let mut busy = busy;
+        let _ = busy.update(Message::Rooms(RoomsMessage::CreateSubmit));
+        let list = senders(&busy, &renderer, WIDE);
+        assert!(of_message(&list, "Rooms(CreateSubmit)").next().is_none());
+        assert!(of_message(&list, "Rooms(CloseDialog)").next().is_some());
+    }
+
+    #[test]
+    fn a_long_id_on_the_user_card_wraps_keeps_its_end_and_leaves_the_button_below() {
+        let renderer = renderer();
+        for size in SIZES {
+            let app = dialog_app("user-card-long", size);
+            let mut laid = Laid::new(&app, &renderer, size);
+            laid.settle(&renderer, size);
+            let card = card_rect(&laid, 460.0);
+            let shown = texts(&mut laid, &renderer);
+            let (_, id) = shown
+                .iter()
+                .find(|(t, _)| t.ends_with("long-server.example.org"))
+                .expect("the whole ID, with its server");
+            assert!(id.height > 30.0, "the ID wraps: {id:?}");
+            assert!(id.x + id.width <= card.x + card.width - 20.0 + 0.5);
+            let list = senders(&app, &renderer, size);
+            let message = of_message(&list, "Rooms(CardMessage)")
+                .next()
+                .expect("Message");
+            assert!(
+                message.y >= id.y + id.height,
+                "Message {message:?} below {id:?}"
+            );
+        }
+        // A known person has the trust tag, in words.
+        let shown = texts_of(&dialog_app("user-card", WIDE), WIDE);
+        assert_eq!(count(&shown, "Not verified"), 1);
+        let _ = UserTrust::Verified;
+    }
+
+    #[test]
+    fn a_long_address_and_topic_wrap_and_the_panel_names_its_room() {
+        let renderer = renderer();
+        for size in SIZES {
+            let app = dialog_app("room-settings-long", size);
+            let mut laid = Laid::new(&app, &renderer, size);
+            laid.settle(&renderer, size);
+            let card = card_rect(&laid, 520.0);
+            let shown = texts(&mut laid, &renderer);
+            let (_, address) = shown
+                .iter()
+                .find(|(t, _)| t.starts_with("Address: ") && t.ends_with("long-server.example.org"))
+                .expect("the address ends with its server");
+            assert!(address.height > 30.0, "{address:?}");
+            assert!(address.x + address.width <= card.x + card.width - 20.0 + 0.5);
+            assert!(shown.iter().any(|(t, _)| t == "Lounge"), "the room's name");
+        }
+    }
+
+    #[test]
+    fn the_room_settings_scroll_in_a_short_window_with_the_footer_in_view() {
+        let renderer = renderer();
+        let app = dialog_app("room-leave-confirm", SHORT);
+        let mut laid = Laid::new(&app, &renderer, SHORT);
+        laid.settle(&renderer, SHORT);
+        let shown = texts(&mut laid, &renderer);
+        let close = shown
+            .iter()
+            .filter(|(t, _)| t == "Close")
+            .map(|(_, r)| r.y + r.height)
+            .fold(0.0_f32, f32::max);
+        assert!(close <= SHORT.height, "the footer is at {close}");
+    }
+
+    #[test]
+    fn the_upload_card_names_its_room_and_shows_size_and_type_and_send_is_its_own_button() {
+        let renderer = renderer();
+        for size in SIZES {
+            let card = card_texts("upload-single", size, 520.0);
+            let up = |text: &str| count(&card, text);
+            assert_eq!(up("Lounge"), 1, "the room the files go to");
+            assert_eq!(up("To"), 1);
+            assert_eq!(up("Encrypted"), 1);
+            assert_eq!(up("photo.png"), 1);
+            assert_eq!(up("180.0 KB \u{b7} image/png"), 1);
+            assert_eq!(up("Send 1 file"), 1);
+            assert_eq!(up("Send"), 1);
+            let app = dialog_app("upload-single", size);
+            let list = senders(&app, &renderer, size);
+            assert_eq!(of_message(&list, "UploadConfirmed").count(), 1);
+        }
+        // Files still being read: Send is off, Cancel and the close work.
+        let app = dialog_app("upload", WIDE);
+        let list = senders(&app, &renderer, WIDE);
+        assert_eq!(of_message(&list, "UploadConfirmed").count(), 0);
+        assert_eq!(of_message(&list, "UploadCancelled").count(), 2);
+    }
+
+    #[test]
+    fn files_picked_for_another_room_cannot_be_sent_and_say_so() {
+        let renderer = renderer();
+        let app = dialog_app("upload-wrong-room", WIDE);
+        let list = senders(&app, &renderer, WIDE);
+        assert_eq!(of_message(&list, "UploadConfirmed").count(), 0);
+        assert_eq!(of_message(&list, "UploadCancelled").count(), 2);
+        let shown = texts_of(&app, WIDE);
+        assert!(
+            shown
+                .iter()
+                .any(|(t, _)| t.starts_with("These files were picked")),
+            "the card says why"
+        );
+        // It names the room the files were picked for ("Lounge"), not the
+        // one on screen.
+        let card = card_texts("upload-wrong-room", WIDE, 520.0);
+        assert_eq!(count(&card, "Lounge"), 1);
+    }
+
+    #[test]
+    fn a_long_file_name_and_room_name_wrap_keep_their_ends_and_leave_the_buttons_alone() {
+        let renderer = renderer();
+        for size in SIZES {
+            let app = dialog_app("upload-long", size);
+            let mut laid = Laid::new(&app, &renderer, size);
+            laid.settle(&renderer, size);
+            let card = card_rect(&laid, 520.0);
+            let shown = texts(&mut laid, &renderer);
+            let (_, file) = shown
+                .iter()
+                .find(|(t, _)| t.ends_with(".tar.gz"))
+                .expect("the extension of the file name is drawn");
+            assert!(file.height > 30.0, "wrapped: {file:?}");
+            assert!(file.x + file.width <= card.x + card.width - 20.0 + 0.5);
+            let (_, room) = shown
+                .iter()
+                .find(|(t, _)| t.ends_with(" lounge"))
+                .expect("the end of the room name is drawn");
+            assert!(room.x + room.width <= card.x + card.width - 20.0 + 0.5);
+            let list = senders(&app, &renderer, size);
+            for (rect, what) in &list {
+                for text in [file, room] {
+                    assert!(
+                        !overlaps(rect, text),
+                        "{what} at {rect:?} covers text {text:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_viewer_has_a_bar_at_the_bottom_with_name_size_save_and_close() {
+        let renderer = renderer();
+        for size in SIZES {
+            let app = dialog_app("viewer", size);
+            let shown = texts_of(&app, size);
+            let (_, name) = shown
+                .iter()
+                .find(|(t, _)| t == "holiday.png")
+                .expect("the file name");
+            assert!(
+                name.y > size.height * 0.75,
+                "the bar is at the bottom: {name:?}"
+            );
+            assert_eq!(
+                count(&shown, "image/png \u{b7} 180.0 KB \u{b7} 320 \u{d7} 240 px"),
+                1
+            );
+            let list = senders(&app, &renderer, size);
+            let save = of_message(&list, "SaveRequested(\"img0\")")
+                .next()
+                .expect("Save");
+            let close = of_message(&list, "ViewerClosed").next().expect("Close");
+            assert!(save.x + save.width <= close.x, "Save then Close");
+            assert!(gap(save, close) >= tokens::M - 0.5);
+            assert!((save.y - close.y).abs() < 1.0, "one row");
+            assert!(save.y > size.height * 0.75);
+        }
+    }
+
+    #[test]
+    fn a_long_file_name_in_the_viewer_keeps_its_extension_and_stays_clear_of_save() {
+        let renderer = renderer();
+        for size in SIZES {
+            let app = dialog_app("viewer-long", size);
+            let shown = texts_of(&app, size);
+            let (_, name) = shown
+                .iter()
+                .find(|(t, _)| t.ends_with(".png") && t.len() > 60)
+                .expect("the end of the name");
+            if size.width < 800.0 {
+                assert!(name.height > 30.0, "wrapped in a narrow window: {name:?}");
+            }
+            let list = senders(&app, &renderer, size);
+            let save = of_message(&list, "SaveRequested(\"img0\")")
+                .next()
+                .expect("Save");
+            assert!(
+                name.x + name.width <= save.x + 0.5,
+                "{name:?} under {save:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_viewer_still_loads_and_closes_before_the_image_is_there() {
+        let renderer = renderer();
+        let app = dialog_app("viewer-loading", WIDE);
+        assert_eq!(
+            extra("viewer-loading", "main-room", WIDE, "Loading\u{2026}"),
+            1
+        );
+        let list = senders(&app, &renderer, WIDE);
+        assert_eq!(of_message(&list, "ViewerClosed").count(), 1);
+    }
+
+    #[test]
+    fn the_switcher_is_a_card_near_the_top_with_one_height_rows() {
+        let renderer = renderer();
+        for size in SIZES {
+            for name in ["switcher", "switcher-long"] {
+                let app = dialog_app(name, size);
+                let laid = Laid::new(&app, &renderer, size);
+                let card = card_rect(&laid, 560.0);
+                assert!(
+                    (card.y - 72.0).abs() < 0.5,
+                    "{name}: the card starts {} from the top",
+                    card.y
+                );
+                let list = senders(&app, &renderer, size);
+                let rows: Vec<Rectangle> = list
+                    .iter()
+                    .filter(|(_, m)| m.starts_with("Switcher(Pick("))
+                    .map(|(r, _)| *r)
+                    // The last row can be cut by the list's edge.
+                    .filter(|r| r.width > 500.0)
+                    .collect();
+                assert!(rows.len() >= 3, "{name}: {} rows", rows.len());
+                for row in &rows {
+                    assert_eq!(
+                        row.height, 48.0,
+                        "{name}: every row is one height: {rows:?}"
+                    );
+                    assert!(row.x >= card.x && row.x + row.width <= card.x + card.width);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_switcher_row_has_the_name_the_unread_badge_and_the_call_pill_and_keeps_the_end_of_a_name()
+    {
+        let renderer = renderer();
+        let app = dialog_app("switcher-long", WIDE);
+        let mut laid = Laid::new(&app, &renderer, WIDE);
+        laid.settle(&renderer, WIDE);
+        let card = card_rect(&laid, 560.0);
+        let shown: Vec<_> = texts(&mut laid, &renderer)
+            .into_iter()
+            .filter(|(_, r)| card.contains(r.center()))
+            .collect();
+        let (_, long) = shown
+            .iter()
+            .find(|(t, _)| t.ends_with(" end"))
+            .expect("the end of the long name");
+        let (_, pill) = shown
+            .iter()
+            .find(|(t, r)| t == "3" && r.y > 100.0)
+            .expect("a count");
+        let _ = pill;
+        // The design room: 300 letters cut in the middle, the call pill.
+        let cut = shown
+            .iter()
+            .find(|(t, _)| t.starts_with("DDD") && t.contains('\u{2026}'))
+            .expect("the cut name");
+        assert!(cut.0.chars().count() <= 60);
+        assert!(cut.1.height < 45.0, "two lines at most: {:?}", cut.1);
+        assert!(long.height < 45.0);
+        // No text sits on another in a row (rows below the list's edge are
+        // scrolled out of view).
+        let edge = shown
+            .iter()
+            .find(|(t, _)| t == HINT)
+            .map(|(_, r)| r.y)
+            .expect("the hint");
+        for (a, ra) in shown.iter().filter(|(_, r)| r.y < edge) {
+            for (b, rb) in shown.iter().filter(|(_, r)| r.y < edge) {
+                if a != b && ra.y > 100.0 && overlaps(ra, rb) && ra.width > 0.0 && rb.width > 0.0 {
+                    panic!("{a:?} {ra:?} overlaps {b:?} {rb:?}");
+                }
+            }
+        }
+        assert_eq!(
+            extra("switcher-empty", "main-room", WIDE, "No room matches"),
+            1
+        );
     }
 }

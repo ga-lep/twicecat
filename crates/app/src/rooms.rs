@@ -263,10 +263,129 @@ pub fn member_lines(member: &RoomMemberView) -> (String, String) {
         .as_deref()
         .filter(|n| !n.trim().is_empty())
     {
-        Some(name) => name_or_placeholder(name, MAX_MEMBER_CHARS),
+        // A display name can be huge (and is searched on every key): only
+        // the head of it is ever cleaned. Four times the cap leaves room for
+        // the characters the cleaning drops.
+        Some(name) => {
+            let head: String = name.chars().take(MAX_MEMBER_CHARS * 4).collect();
+            name_or_placeholder(&head, MAX_MEMBER_CHARS)
+        }
         None => id.clone(),
     };
     (name, id)
+}
+
+/// The groups of the member panel, in the order they are drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemberSection {
+    /// The creator and everyone at level 100 or more.
+    Admins,
+    /// Level 50 or more.
+    Moderators,
+    /// Everyone else who has joined.
+    Members,
+    /// Invited and not yet joined, whatever their level.
+    Invited,
+}
+
+impl MemberSection {
+    /// Every section, in the order they are drawn.
+    pub const ALL: [Self; 4] = [Self::Admins, Self::Moderators, Self::Members, Self::Invited];
+
+    /// The section's title.
+    pub const fn title(self) -> &'static str {
+        match self {
+            Self::Admins => "Admins",
+            Self::Moderators => "Moderators",
+            Self::Members => "Members",
+            Self::Invited => "Invited",
+        }
+    }
+
+    /// The section a member is listed in, from the core's `role` and
+    /// `membership` (not from the number).
+    pub const fn of(member: &RoomMemberView) -> Self {
+        match (member.membership, member.role) {
+            (MembershipView::Invited, _) => Self::Invited,
+            (MembershipView::Joined, Role::Creator | Role::Admin) => Self::Admins,
+            (MembershipView::Joined, Role::Moderator) => Self::Moderators,
+            (MembershipView::Joined, Role::User) => Self::Members,
+        }
+    }
+}
+
+/// One section of a [`MemberPage`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberGroup {
+    /// Which section.
+    pub section: MemberSection,
+    /// How many members the section holds for the search (more than
+    /// `indices` when the page is cut).
+    pub total: usize,
+    /// Indices into the member list of the rows to draw.
+    pub indices: Vec<usize>,
+}
+
+/// The rows of the member panel: sections in order, each with the members
+/// the search matches, cut to `shown` rows in all.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MemberPage {
+    /// The sections that have a match.
+    pub groups: Vec<MemberGroup>,
+    /// How many members the search matches in all.
+    pub matched: usize,
+}
+
+impl MemberPage {
+    /// Indices of every row drawn, in order.
+    pub fn shown_indices(&self) -> impl Iterator<Item = usize> + '_ {
+        self.groups.iter().flat_map(|g| g.indices.iter().copied())
+    }
+}
+
+/// Whether `member` matches the folded `query`: part of the cleaned name or
+/// of the user ID, ignoring case and accents.
+fn member_matches(member: &RoomMemberView, query: &str) -> bool {
+    let (name, _) = member_lines(member);
+    // The whole user ID is searched, not the cut one a row draws.
+    crate::switcher::fold(&name).contains(query)
+        || crate::switcher::fold(member.user_id.as_str()).contains(query)
+}
+
+/// Sorts `members` into sections for the panel. A blank `query` matches
+/// everyone; the creator comes before the other admins; otherwise the core's
+/// order stays. At most `shown` rows are listed; only those cost anything to
+/// draw.
+pub fn member_page(members: &[RoomMemberView], query: &str, shown: usize) -> MemberPage {
+    let query = crate::switcher::fold(query.trim());
+    let mut found: [Vec<usize>; 4] = Default::default();
+    let mut matched = 0;
+    for (at, member) in members.iter().enumerate() {
+        if !query.is_empty() && !member_matches(member, &query) {
+            continue;
+        }
+        matched += 1;
+        found[MemberSection::of(member) as usize].push(at);
+    }
+    // Stable: the creator first, the others as the core listed them.
+    found[MemberSection::Admins as usize]
+        .sort_by_key(|&at| !matches!(members[at].role, Role::Creator));
+    let mut left = shown;
+    let mut groups = Vec::new();
+    for (section, indices) in MemberSection::ALL.into_iter().zip(found) {
+        if indices.is_empty() {
+            continue;
+        }
+        let total = indices.len();
+        let take = total.min(left);
+        left -= take;
+        groups.push(MemberGroup {
+            section,
+            total,
+            indices: indices.into_iter().take(take).collect(),
+        });
+    }
+    MemberPage { groups, matched }
 }
 
 /// What leaving a room costs; each field is a line of the confirmation.
@@ -513,6 +632,8 @@ impl fmt::Debug for SettingsPanel {
 
 /// Members shown at first, and added by each **Show more**.
 pub const MEMBERS_PAGE: usize = 100;
+/// Longest search the member panel takes, in characters.
+pub const MAX_MEMBER_SEARCH_CHARS: usize = 64;
 
 /// The member list panel.
 #[derive(Clone)]
@@ -604,6 +725,10 @@ pub struct RoomsModel {
     pub known: Option<KnownMembers>,
     /// The room whose members were asked for (once per room selection).
     pub members_requested: Option<RoomId>,
+    /// What the member panel's search field holds. View state only: it
+    /// narrows the list on screen and is sent nowhere. Cleared when the panel
+    /// opens.
+    pub member_search: String,
     /// The user card.
     pub card: Option<UserCard>,
     /// The bar asking to join a room.
@@ -623,6 +748,7 @@ impl fmt::Debug for RoomsModel {
             .field("members_panel", &self.members_panel)
             .field("details", &self.details.is_some())
             .field("known", &self.known)
+            .field("member_search", &self.member_search.chars().count())
             .field("card", &self.card.is_some())
             .field("join_bar", &self.join_bar)
             .field("select_when_listed", &self.select_when_listed.is_some())
@@ -730,6 +856,8 @@ pub enum RoomsMessage {
     OpenMembers,
     /// The member panel was closed.
     CloseMembers,
+    /// The member panel's search field changed.
+    MemberSearch(MessageText),
     /// The invite field changed.
     InviteInput(MessageText),
     /// **Invite**.
@@ -865,6 +993,23 @@ impl App {
                 self.rooms_ui.members_panel = None;
                 if self.rooms_ui.settings.is_none() {
                     self.rooms_ui.details = None;
+                }
+                Task::none()
+            }
+            R::MemberSearch(text) => {
+                if self.rooms_ui.members_panel.is_some() {
+                    self.rooms_ui.member_search = text
+                        .expose()
+                        .chars()
+                        .take(MAX_MEMBER_SEARCH_CHARS)
+                        .collect();
+                    // The first page of the new list, so a narrower search is
+                    // not drawn from the middle of an earlier page.
+                    if let Some(panel) = &mut self.rooms_ui.members_panel {
+                        panel.shown = MEMBERS_PAGE;
+                    }
+                    // The rows the search brings into view need their pictures.
+                    return self.fetch_member_avatars();
                 }
                 Task::none()
             }
@@ -1219,6 +1364,7 @@ impl App {
         {
             self.rooms_ui.details = None;
         }
+        self.rooms_ui.member_search.clear();
         self.rooms_ui.members_panel = Some(MembersPanel {
             room: room.clone(),
             invite: String::new(),
@@ -1408,11 +1554,15 @@ impl App {
             .as_ref()
             .map_or(0, |panel| panel.shown);
         let card = self.rooms_ui.card.as_ref().map(|card| &card.user);
+        // The rows on screen are the sections of the search, not the first
+        // `shown` members of the core's list.
+        let page = member_page(&known.members, &self.rooms_ui.member_search, shown);
+        let on_screen: HashSet<usize> = page.shown_indices().collect();
         let wanted: Vec<_> = known
             .members
             .iter()
             .enumerate()
-            .filter(|(i, m)| *i < shown || card == Some(&m.user_id))
+            .filter(|(i, m)| on_screen.contains(i) || card == Some(&m.user_id))
             .filter_map(|(_, m)| m.avatar.clone())
             .collect();
         let ids = self.avatars.take_unrequested(wanted);
@@ -1882,6 +2032,78 @@ mod tests {
         member(id, None, role, MembershipView::Joined)
     }
 
+    fn listed(id: &str, name: &str, role: Role, state: MembershipView) -> RoomMemberView {
+        member(id, Some(name), role, state)
+    }
+
+    #[test]
+    fn members_sort_into_sections_by_role_and_membership_creator_first() {
+        use MembershipView::{Invited, Joined};
+        let all = [
+            listed("@u:x", "U", Role::User, Joined),
+            listed("@a:x", "A", Role::Admin, Joined),
+            listed("@m:x", "M", Role::Moderator, Joined),
+            listed("@c:x", "C", Role::Creator, Joined),
+            listed("@i:x", "I", Role::Moderator, Invited),
+            listed("@j:x", "J", Role::User, Invited),
+        ];
+        let page = member_page(&all, "", 100);
+        let shape: Vec<(MemberSection, Vec<usize>)> = page
+            .groups
+            .iter()
+            .map(|g| (g.section, g.indices.clone()))
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                (MemberSection::Admins, vec![3, 1]),
+                (MemberSection::Moderators, vec![2]),
+                (MemberSection::Members, vec![0]),
+                (MemberSection::Invited, vec![4, 5]),
+            ]
+        );
+        assert_eq!(page.matched, 6);
+        assert_eq!(
+            MemberSection::ALL.map(MemberSection::title),
+            ["Admins", "Moderators", "Members", "Invited"]
+        );
+    }
+
+    #[test]
+    fn the_member_search_matches_a_name_or_an_id_ignoring_case_and_accents() {
+        use MembershipView::Joined;
+        let all = [
+            listed("@a:x", "\u{c9}lodie", Role::User, Joined),
+            listed("@bob:example.org", "Bob", Role::User, Joined),
+            listed("@c:x", "Cy", Role::Admin, Joined),
+        ];
+        let found =
+            |query: &str| -> Vec<usize> { member_page(&all, query, 100).shown_indices().collect() };
+        assert_eq!(found("elodie"), [0]);
+        assert_eq!(found("ELO"), [0]);
+        assert_eq!(found("EXAMPLE.org"), [1], "part of an ID");
+        assert_eq!(found("  cy "), [2], "the query is trimmed");
+        assert!(found("nobody").is_empty());
+        assert_eq!(found("").len(), 3);
+        assert_eq!(member_page(&all, "nobody", 100).matched, 0);
+    }
+
+    #[test]
+    fn a_page_cuts_across_sections_in_order_and_still_counts_every_match() {
+        use MembershipView::Joined;
+        let mut all: Vec<RoomMemberView> = (0..300)
+            .map(|i| listed(&format!("@u{i}:x"), &format!("U{i}"), Role::User, Joined))
+            .collect();
+        all.push(listed("@boss:x", "Boss", Role::Admin, Joined));
+        let page = member_page(&all, "", 100);
+        assert_eq!(page.matched, 301);
+        assert_eq!(page.shown_indices().count(), 100);
+        assert_eq!(page.groups[0].section, MemberSection::Admins);
+        assert_eq!(page.groups[0].indices, [300], "the admin is listed first");
+        assert_eq!(page.groups[1].total, 300);
+        assert_eq!(page.groups[1].indices.len(), 99);
+    }
+
     fn details(encrypted: bool) -> RoomDetailsView {
         RoomDetailsView {
             room_id: RoomId::from("!r:x"),
@@ -2222,5 +2444,28 @@ mod tests {
             member_lines(&nameless),
             ("@n:x".to_owned(), "@n:x".to_owned())
         );
+    }
+
+    #[test]
+    fn only_the_head_of_a_huge_display_name_is_cleaned_and_searched() {
+        // A name of a few million characters costs one cut, not one full
+        // cleaning per member per key.
+        let huge = format!("Alice{}", "x".repeat(3_000_000));
+        let m = member("@a:x", Some(&huge), Role::User, MembershipView::Joined);
+        let started = std::time::Instant::now();
+        let (name, _) = member_lines(&m);
+        assert!(name.chars().count() <= MAX_MEMBER_CHARS, "{}", name.len());
+        assert!(name.starts_with("Alice"));
+        for _ in 0..50 {
+            let page = member_page(std::slice::from_ref(&m), "alice", 100);
+            assert_eq!(page.matched, 1);
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "searching a huge name took {:?}",
+            started.elapsed()
+        );
+        // The search reads the head, as the row draws it.
+        assert_eq!(member_page(std::slice::from_ref(&m), "zzz", 100).matched, 0);
     }
 }
