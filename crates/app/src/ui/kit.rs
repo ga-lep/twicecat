@@ -9,7 +9,9 @@ use iced::widget::button::{Button, Status};
 use iced::widget::pick_list;
 use iced::widget::text::{IntoFragment, Wrapping};
 use iced::widget::tooltip::Position;
-use iced::widget::{Column, button, column, container, image, opaque, row, rule, text, tooltip};
+use iced::widget::{
+    Column, button, column, container, image, opaque, progress_bar, row, rule, text, tooltip,
+};
 use iced::{Background, Border, Color, Element, Fill, Theme, border};
 use twicecat_core::api::{AvatarId, RoomId, UserId};
 
@@ -649,6 +651,104 @@ pub fn icon_tag_style(highlight: bool) -> impl Fn(&Theme) -> container::Style {
     }
 }
 
+/// The style of an [`outline_tag`]: no fill, a 1px outline.
+fn outline_tag_style(theme: &Theme) -> container::Style {
+    container::Style {
+        border: Border {
+            color: theme::semantic(theme).border,
+            width: 1.0,
+            ..border::rounded(tokens::SMALL)
+        },
+        ..container::Style::default()
+    }
+}
+
+/// A [`tag`] that is muted: no fill and muted words, for what is there but
+/// not in use (the other graphics backends that were found).
+pub fn outline_tag<'a, M: 'a>(label: impl IntoFragment<'a>) -> Element<'a, M> {
+    container(
+        text(label)
+            .size(tokens::CAPTION)
+            .style(muted)
+            .wrapping(BANNER_WRAPPING),
+    )
+    .padding([1.0, tokens::S])
+    .style(outline_tag_style)
+    .into()
+}
+
+/// The style of a [`focus_surface`]: the selection fill with the focus colour
+/// as a 2px outline.
+pub fn focus_surface_style(theme: &Theme) -> container::Style {
+    let sem = theme::semantic(theme);
+    container::Style {
+        background: Some(Background::Color(sem.selection)),
+        text_color: Some(theme.palette().text),
+        border: Border {
+            color: sem.focus,
+            width: 2.0,
+            ..shape()
+        },
+        ..container::Style::default()
+    }
+}
+
+/// The same box as a [`focus_surface`] while nothing waits: same padding and
+/// outline width, so the box does not change size when it starts waiting.
+fn idle_surface_style(_theme: &Theme) -> container::Style {
+    container::Style {
+        border: Border {
+            color: Color::TRANSPARENT,
+            width: 2.0,
+            ..shape()
+        },
+        ..container::Style::default()
+    }
+}
+
+/// A box that says "this is waiting for you", such as the key capture: the
+/// focus surface while `waiting`, else the same box without the fill and the
+/// outline, so that it keeps its size.
+pub fn focus_surface<'a, M: 'a>(
+    content: impl Into<Element<'a, M>>,
+    waiting: bool,
+) -> Element<'a, M> {
+    container(content)
+        .padding(tokens::M)
+        .width(Fill)
+        .style(if waiting {
+            focus_surface_style
+        } else {
+            idle_surface_style
+        })
+        .into()
+}
+
+/// The style of a [`meter_bar`] in the colour of `zone`.
+pub fn meter_bar_style(zone: Severity) -> impl Fn(&Theme) -> progress_bar::Style {
+    move |theme| {
+        let sem = theme::semantic(theme);
+        progress_bar::Style {
+            background: Background::Color(sem.surface),
+            bar: Background::Color(zone.color(theme)),
+            border: Border {
+                color: sem.border,
+                width: 1.0,
+                ..border::rounded(tokens::SMALL)
+            },
+        }
+    }
+}
+
+/// A level meter: `fill` from 0 to 1, in the colour of `zone`. The words
+/// beside it say the same.
+pub fn meter_bar<'a, M: 'a>(fill: f32, zone: Severity) -> Element<'a, M> {
+    progress_bar(0.0..=1.0, fill.clamp(0.0, 1.0))
+        .girth(tokens::M)
+        .style(meter_bar_style(zone))
+        .into()
+}
+
 /// A [`tag`] that starts with an icon, such as the call pill. With
 /// `highlight` it is drawn in the highlight colours.
 pub fn icon_tag<'a, M: 'a>(icon: Icon, label: String, highlight: bool) -> Element<'a, M> {
@@ -697,7 +797,7 @@ pub fn count_badge<'a, M: 'a>(count: u64) -> Element<'a, M> {
 pub(crate) const BANNER_WRAPPING: Wrapping = Wrapping::WordOrGlyph;
 
 /// A message bar: an icon for its severity, then the text.
-pub fn banner<'a, M: 'a>(severity: Severity, message: &'a str) -> Element<'a, M> {
+pub fn banner<'a, M: 'a>(severity: Severity, message: impl IntoFragment<'a>) -> Element<'a, M> {
     container(
         row![
             icons::icon(severity.icon()),
@@ -971,6 +1071,69 @@ mod tests {
                     assert!(
                         ratio >= need,
                         "{theme_name} {name} {status:?}: {ratio} < {need}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_focus_surface_and_the_outline_tag_are_readable_in_all_eight_palettes() {
+        for family in theme::Family::ALL {
+            for dark in [false, true] {
+                let theme = theme::theme_for_family(family, dark);
+                let sem = theme::semantic(&theme);
+                let need = if family == theme::Family::HighContrast {
+                    7.0
+                } else {
+                    4.5
+                };
+                let style = focus_surface_style(&theme);
+                let Some(Background::Color(back)) = style.background else {
+                    panic!("a fill");
+                };
+                let text = style.text_color.expect("a text colour");
+                assert!(
+                    contrast(text, back) >= need,
+                    "{family:?} dark={dark}: text on the focus surface"
+                );
+                // The outline is a non-text mark (WCAG 1.4.11).
+                assert!(
+                    contrast(style.border.color, back) >= 3.0
+                        && contrast(style.border.color, sem.surface_raised) >= 3.0,
+                    "{family:?} dark={dark}: the focus outline"
+                );
+                assert!(
+                    contrast(sem.muted, sem.surface_raised) >= need,
+                    "{family:?} dark={dark}: muted words on the card"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_meter_zones_are_visible_on_the_card_in_all_eight_palettes() {
+        for family in theme::Family::ALL {
+            for dark in [false, true] {
+                let theme = theme::theme_for_family(family, dark);
+                let sem = theme::semantic(&theme);
+                for zone in [Severity::Success, Severity::Warning, Severity::Danger] {
+                    let style = meter_bar_style(zone)(&theme);
+                    let Background::Color(bar) = style.bar else {
+                        panic!("a colour");
+                    };
+                    let Background::Color(track) = style.background else {
+                        panic!("a colour");
+                    };
+                    // A non-text mark: the bar against its track (WCAG 1.4.11).
+                    assert!(
+                        contrast(bar, track) >= 3.0,
+                        "{family:?} dark={dark} {zone:?}: bar on track {}",
+                        contrast(bar, track)
+                    );
+                    assert!(
+                        contrast(style.border.color, sem.surface_raised) >= 1.2,
+                        "{family:?} dark={dark}: the track has an outline"
                     );
                 }
             }
