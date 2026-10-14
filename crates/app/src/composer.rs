@@ -154,6 +154,23 @@ fn shortcut(press: &KeyPress) -> Option<Message> {
         .then_some(Message::PasteRequested)
 }
 
+/// [`binding`] for an editor that may be inert: a dialog, card or screen is
+/// over the room, or no room is open. An inert editor passes only the app's
+/// shortcuts (Esc and the chords, which close or switch layers); Enter, Tab,
+/// Up, Down and Paste are not sent on to the app.
+pub fn gated_binding(
+    press: KeyPress,
+    suggestions_open: bool,
+    enabled: bool,
+) -> Option<Binding<Message>> {
+    let binding = binding(press, suggestions_open);
+    if enabled {
+        binding
+    } else {
+        binding.filter(|b| matches!(b, Binding::Custom(Message::Shortcut { .. })))
+    }
+}
+
 /// The adapter for `text_editor::key_binding`.
 pub fn binding(press: KeyPress, suggestions_open: bool) -> Option<Binding<Message>> {
     if !matches!(press.status, Status::Focused { .. }) {
@@ -533,6 +550,21 @@ impl Composer {
             text.push_str(&line.text);
         }
         text
+    }
+
+    /// What the **Emoji** button types at the cursor: `:` where a shortcode
+    /// can start (the field start, after a blank), else a space and `:`.
+    /// The suggestion list then opens as soon as two letters follow.
+    pub fn emoji_opener(&self) -> &'static str {
+        let position = self.content.cursor().position;
+        let before = self
+            .content
+            .line(position.line)
+            .and_then(|line| line.text.get(..position.column).map(str::to_owned));
+        match before.and_then(|b| b.chars().next_back()) {
+            Some(c) if !c.is_whitespace() => " :",
+            _ => ":",
+        }
     }
 
     /// Whether the buffer holds nothing at all.
@@ -1240,6 +1272,36 @@ mod tests {
     }
 
     #[test]
+    fn an_inert_editor_passes_only_shortcuts() {
+        use keyboard::Modifiers as M;
+        let named = keyboard::Key::Named;
+        let enter = || focused(named(key::Named::Enter), M::empty());
+        let tab = || focused(named(key::Named::Tab), M::empty());
+        let up = || focused(named(key::Named::ArrowUp), M::empty());
+        let esc = || focused(named(key::Named::Escape), M::empty());
+        let paste = || focused(keyboard::Key::Character("v".into()), M::COMMAND);
+        for open in [false, true] {
+            for press in [enter(), tab(), up(), esc(), paste()] {
+                assert!(
+                    gated_binding(press, open, false).is_none(),
+                    "an inert editor sends nothing on to the app"
+                );
+            }
+        }
+        // The chords stay: they are how a layer is closed or switched.
+        let chord = focused(keyboard::Key::Character(",".into()), M::COMMAND);
+        assert!(matches!(
+            gated_binding(chord, false, false),
+            Some(Binding::Custom(Message::Shortcut { .. }))
+        ));
+        // Enabled: the same as `binding`.
+        assert!(matches!(
+            gated_binding(enter(), false, true),
+            Some(Binding::Custom(Message::ComposerKey(ComposerKey::Send)))
+        ));
+    }
+
+    #[test]
     fn ctrl_v_and_ctrl_u_are_the_apps_paste_and_attach() {
         let press = |ch: &str, modifiers: keyboard::Modifiers| KeyPress {
             key: keyboard::Key::Character(ch.into()),
@@ -1929,5 +1991,18 @@ mod tests {
         c.begin_edit("c".into(), "three");
         assert!(c.cancel_mode());
         assert_eq!(c.text(), "", "clear() forgot the earlier draft");
+    }
+
+    #[test]
+    fn the_emoji_button_opens_a_shortcode_where_one_can_start() {
+        let mut composer = Composer::new();
+        assert_eq!(composer.emoji_opener(), ":", "empty field");
+        let now = Instant::now();
+        for c in "hi".chars() {
+            composer.apply(Action::Edit(Edit::Insert(c)), now);
+        }
+        assert_eq!(composer.emoji_opener(), " :", "after a word");
+        composer.apply(Action::Edit(Edit::Insert(' ')), now);
+        assert_eq!(composer.emoji_opener(), ":", "after a space");
     }
 }
