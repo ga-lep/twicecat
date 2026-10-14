@@ -26,6 +26,7 @@ use twicecat_ptt::{GamepadButton, KeyBinding};
 
 use crate::state::{App, Message};
 use crate::text_safety::{MAX_NAME_CHARS, name_or_placeholder};
+use crate::ui::kit::Severity;
 
 /// A slider moved by the wheel or the keys has no release: its value is
 /// sent after this pause, as for the participants' volumes.
@@ -65,6 +66,16 @@ pub enum Slider {
 }
 
 impl Slider {
+    /// The page of the card that shows this slider.
+    pub const fn page(self) -> AudioPage {
+        match self {
+            Self::InputGain | Self::MasterVolume => AudioPage::Levels,
+            Self::MicCleaningLimit | Self::AutoGainMax | Self::Threshold => AudioPage::Microphone,
+            Self::OthersCleaningLimit => AudioPage::OtherVoices,
+            Self::ReleaseDelay => AudioPage::Talking,
+        }
+    }
+
     /// The slider's value in `settings`.
     pub fn value(self, settings: &AudioSettings) -> f32 {
         match self {
@@ -621,12 +632,68 @@ pub fn backend_label(backend: EnhancerBackend) -> String {
     match backend {
         EnhancerBackend::Cpu => "Running on the CPU.".to_owned(),
         EnhancerBackend::Gpu { backend } => format!("Running on the GPU ({}).", gpu_name(backend)),
-        EnhancerBackend::CpuAfterGpuError => "Running on the CPU: the GPU failed.".to_owned(),
-        EnhancerBackend::CpuAfterGpuTooSlow => {
-            "Running on the CPU for now: the GPU fell behind (a game may be using it). \
-             It is tried again in a while."
-                .to_owned()
-        }
+        EnhancerBackend::CpuAfterGpuError => GPU_FAILED.to_owned(),
+        EnhancerBackend::CpuAfterGpuTooSlow => GPU_TOO_SLOW.to_owned(),
+    }
+}
+
+/// Said when the GPU failed and cleaning moved to the CPU.
+const GPU_FAILED: &str = "Running on the CPU: the GPU failed.";
+/// Said when the GPU fell behind and cleaning moved to the CPU.
+const GPU_TOO_SLOW: &str = "Running on the CPU for now: the GPU fell behind (a game may be using it). It is tried again in a while.";
+
+/// What the GPU block of the Microphone page shows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GpuView {
+    /// The probe has not answered.
+    Looking,
+    /// The light build has no GPU support at all.
+    NotInBuild,
+    /// The full build found no GPU it can use.
+    NoneFound,
+    /// At least one backend started.
+    Found {
+        /// The backend that runs, or that starts first when none runs yet.
+        in_use: GpuBackend,
+        /// DeepFilterNet3 runs on it now.
+        running: bool,
+        /// The other backends that started here.
+        others: Vec<GpuBackend>,
+        /// Why cleaning moved to the CPU, when it did.
+        fallback: Option<&'static str>,
+    },
+}
+
+/// The GPU block's state, from the probe.
+pub fn gpu_view(gpu: Option<&GpuEnhancement>) -> GpuView {
+    let Some(found) = gpu else {
+        return GpuView::Looking;
+    };
+    let Some(first) = found.available.first().copied() else {
+        return if cfg!(feature = "gpu") {
+            GpuView::NoneFound
+        } else {
+            GpuView::NotInBuild
+        };
+    };
+    let (in_use, running) = match found.running {
+        Some(EnhancerBackend::Gpu { backend }) => (backend, true),
+        _ => (first, false),
+    };
+    GpuView::Found {
+        in_use,
+        running,
+        others: found
+            .available
+            .iter()
+            .copied()
+            .filter(|b| *b != in_use)
+            .collect(),
+        fallback: match found.running {
+            Some(EnhancerBackend::CpuAfterGpuError) => Some(GPU_FAILED),
+            Some(EnhancerBackend::CpuAfterGpuTooSlow) => Some(GPU_TOO_SLOW),
+            _ => None,
+        },
     }
 }
 
@@ -695,6 +762,156 @@ pub fn meter(level: InputLevel) -> (f32, String) {
     )
 }
 
+/// The meter's colour zone for a level in dBFS: good up to -12, loud above
+/// that, clipping above -3.
+pub fn meter_zone(db: f32) -> Severity {
+    if db.is_nan() || db <= -12.0 {
+        Severity::Success
+    } else if db <= -3.0 {
+        Severity::Warning
+    } else {
+        Severity::Danger
+    }
+}
+
+/// The meter zone in words, so the colour is never the only sign.
+pub const fn zone_words(zone: Severity) -> &'static str {
+    match zone {
+        Severity::Success => "Level is good.",
+        Severity::Warning => "Level is loud.",
+        Severity::Danger | Severity::Info => "Level is too loud: clipping.",
+    }
+}
+
+/// What the card says about when the microphone sends and whether it is open
+/// right now. Shown on every page in words.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MicStatus {
+    /// Warning while sound can leave the microphone, Info while it cannot.
+    pub severity: Severity,
+    /// The send mode and the state of the microphone.
+    pub words: String,
+}
+
+/// Most characters of the key's name in the status words: a stranger-made
+/// binding must not fill the card's top lines.
+const MAX_STATUS_KEY_CHARS: usize = 40;
+
+/// The key or button push-to-talk uses, in words, capped.
+fn trigger_words(settings: &AudioSettings) -> String {
+    let bindings = &settings.push_to_talk;
+    match (bindings.key.as_deref(), bindings.gamepad_button.is_some()) {
+        (Some(key), _) => {
+            crate::text_safety::one_line_capped(&key_label(key), MAX_STATUS_KEY_CHARS)
+        }
+        (None, true) => "the gamepad button".to_owned(),
+        (None, false) => "a key (none is set)".to_owned(),
+    }
+}
+
+/// The send mode and whether the microphone is open, in words; `None` until
+/// the settings are here.
+pub fn mic_status(app: &App) -> Option<MicStatus> {
+    let settings = app.calls.settings.as_ref()?;
+    let trigger = trigger_words(settings);
+    let (mode, gated) = match settings.input_mode {
+        InputMode::VoiceActivity { .. } => (
+            "Send mode: Voice activity (your voice is sent whenever you speak).".to_owned(),
+            false,
+        ),
+        InputMode::PushToTalk { toggle: false, .. } => (
+            format!("Send mode: Push-to-talk (hold {trigger} to talk)."),
+            true,
+        ),
+        InputMode::PushToTalk { toggle: true, .. } => (
+            format!("Send mode: Toggle-to-talk (press {trigger} to start and again to stop)."),
+            true,
+        ),
+    };
+    let (open, mic) = if let Some(loopback) = app.audio_ui.mic_test {
+        let hear = if loopback { " You hear yourself." } else { "" };
+        (
+            true,
+            format!("Microphone: open for the mic test, nothing is sent.{hear}"),
+        )
+    } else if let Some(call) = app.calls.call.as_ref() {
+        if call.deafened {
+            (false, "Microphone: closed, you are deafened.".to_owned())
+        } else if call.muted {
+            (false, "Microphone: closed, you are muted.".to_owned())
+        } else if !gated {
+            (
+                true,
+                "Microphone: open, sending whenever you speak.".to_owned(),
+            )
+        } else if app.ptt.talking {
+            (true, "Microphone: open, you are sending.".to_owned())
+        } else {
+            // The core keeps sending for the release delay after the key
+            // goes up, so "closed" must say so.
+            let delay = match settings.input_mode {
+                InputMode::PushToTalk {
+                    release_delay_ms, ..
+                } => release_delay_ms,
+                InputMode::VoiceActivity { .. } => 0,
+            };
+            (
+                false,
+                format!(
+                    "Microphone: closed until you use {trigger} \
+                     (keeps sending {delay} ms after you let go)."
+                ),
+            )
+        }
+    } else {
+        (
+            false,
+            "Microphone: closed, it opens in a call or the mic test.".to_owned(),
+        )
+    };
+    Some(MicStatus {
+        severity: if open {
+            Severity::Warning
+        } else {
+            Severity::Info
+        },
+        words: format!("{mode} {mic}"),
+    })
+}
+
+/// The banner's words while the settings are not here yet: the mic state the
+/// call already knows (muted, deafened) after "Loading".
+pub fn unloaded_mic_words(app: &App) -> String {
+    let state = match app.calls.call.as_ref() {
+        Some(call) if call.deafened => " Microphone: closed, you are deafened.",
+        Some(call) if call.muted => " Microphone: closed, you are muted.",
+        _ => "",
+    };
+    format!("Loading the audio settings\u{2026}{state}")
+}
+
+/// Each diagnostics line as its label and value, split at the first colon.
+pub fn diagnostic_rows(lines: &[String]) -> Vec<(&str, &str)> {
+    lines
+        .iter()
+        .map(|line| match line.split_once(": ") {
+            Some((label, value)) => (label, value),
+            None => (line.as_str(), ""),
+        })
+        .collect()
+}
+
+/// The words of a danger line when audio was dropped: `None` while nothing was.
+pub fn dropout_words(stats: &AudioStats) -> Option<String> {
+    (stats.capture_overruns > 0 || stats.playback_underruns > 0).then(|| {
+        format!(
+            "Audio was dropped: {} capture overruns, {} playback underruns. \
+             The computer could not keep up with the sound.",
+            stats.capture_overruns, stats.playback_underruns
+        )
+    })
+}
+
 /// The diagnostics lines of the latest statistics.
 pub fn diagnostics(stats: &AudioStats) -> Vec<String> {
     let mut lines = Vec::new();
@@ -725,12 +942,124 @@ pub fn diagnostics(stats: &AudioStats) -> Vec<String> {
     lines
 }
 
+/// A page of the Voice & audio card. Each section of the old single column
+/// is one page; nothing else about the settings changed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum AudioPage {
+    /// Microphone and speakers.
+    #[default]
+    Devices,
+    /// When the microphone sends: the mode, the key, the gamepad button.
+    Talking,
+    /// Processing, the voice activity gate and the GPU.
+    Microphone,
+    /// Gain, volume, voice quality and the live meter.
+    Levels,
+    /// The mic test.
+    MicTest,
+    /// The ringtone.
+    Ringtone,
+    /// Cleaning other people's voices.
+    OtherVoices,
+    /// Telling others about our microphone's cleaning.
+    Announce,
+    /// The audio numbers.
+    Diagnostics,
+}
+
+impl AudioPage {
+    /// Every page, in the order of the list at the left of the card.
+    pub const ALL: [Self; 9] = [
+        Self::Devices,
+        Self::Talking,
+        Self::Microphone,
+        Self::Levels,
+        Self::MicTest,
+        Self::Ringtone,
+        Self::OtherVoices,
+        Self::Announce,
+        Self::Diagnostics,
+    ];
+
+    /// The name in the list, and the page's title.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Devices => "Devices",
+            Self::Talking => "Talking",
+            Self::Microphone => "Microphone",
+            Self::Levels => "Levels",
+            Self::MicTest => "Mic test",
+            Self::Ringtone => "Ringtone",
+            Self::OtherVoices => "Other voices",
+            Self::Announce => "Announce",
+            Self::Diagnostics => "Diagnostics",
+        }
+    }
+
+    /// Where the page is in [`Self::ALL`].
+    pub fn index(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|p| *p == self)
+            .expect("every page is in ALL")
+    }
+
+    /// The messages the page's controls send (by [`AudioMessage::name`]).
+    /// The sliders' four messages are on every page that has a slider.
+    pub const fn sends(self) -> &'static [&'static str] {
+        match self {
+            Self::Devices => &["InputDevice", "OutputDevice"],
+            Self::Talking => &[
+                "Mode",
+                "CaptureKey",
+                "CancelCapture",
+                "Captured",
+                "ClearKey",
+                "Button",
+                "Slide",
+                "SlideReleased",
+                "Step",
+                "SlideDue",
+            ],
+            Self::Microphone => &[
+                "Noise",
+                "Level",
+                "EchoCancellation",
+                "CancelSystemAudio",
+                "AutoGain",
+                "HighPass",
+                "AutoThreshold",
+                "Slide",
+                "SlideReleased",
+                "Step",
+                "SlideDue",
+            ],
+            Self::Levels => &["Bitrate", "Slide", "SlideReleased", "Step", "SlideDue"],
+            Self::MicTest => &["MicTest", "Loopback"],
+            Self::Ringtone => &["Ringtone"],
+            Self::OtherVoices => &[
+                "CleanOthers",
+                "Skip",
+                "CleanOthersGpu",
+                "Slide",
+                "SlideReleased",
+                "Step",
+                "SlideDue",
+            ],
+            Self::Announce => &["Announce", "CleanedOutside"],
+            Self::Diagnostics => &["Diagnostics"],
+        }
+    }
+}
+
 /// The card's own state; the settings, devices and meters are the call
 /// model's.
 #[derive(Debug, Default)]
 pub struct AudioUi {
     /// The card is open.
     pub open: bool,
+    /// The page shown.
+    pub page: AudioPage,
     /// The mic test this card started: `Some(loopback)` while it runs.
     pub mic_test: Option<bool>,
     /// "Hear myself" for the mic test.
@@ -771,8 +1100,13 @@ impl AudioUi {
 /// A control of the Voice & audio card.
 #[derive(Clone, Debug, PartialEq)]
 pub enum AudioMessage {
-    /// Open the card (Settings, the call bar).
+    /// Open the card on Devices (Settings, the call bar).
     Open,
+    /// Open the card on a page (the call bar's push-to-talk line opens
+    /// Talking).
+    OpenAt(AudioPage),
+    /// A page of the list at the left of the card.
+    Page(AudioPage),
     /// **Close**, Esc.
     Close,
     /// The microphone menu.
@@ -835,21 +1169,81 @@ pub enum AudioMessage {
     Button(ButtonChoice),
 }
 
+impl AudioMessage {
+    /// The messages that belong to the card and no page.
+    pub const CARD_WIDE: [&'static str; 4] = ["Open", "OpenAt", "Page", "Close"];
+
+    /// The variant's name. The match is exhaustive on purpose: a new message
+    /// cannot be added without a name, and a test then asks for its page.
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::Open => "Open",
+            Self::OpenAt(_) => "OpenAt",
+            Self::Page(_) => "Page",
+            Self::Close => "Close",
+            Self::InputDevice(_) => "InputDevice",
+            Self::OutputDevice(_) => "OutputDevice",
+            Self::Noise(_) => "Noise",
+            Self::Level(_) => "Level",
+            Self::EchoCancellation(_) => "EchoCancellation",
+            Self::CancelSystemAudio(_) => "CancelSystemAudio",
+            Self::AutoGain(_) => "AutoGain",
+            Self::HighPass(_) => "HighPass",
+            Self::Slide(..) => "Slide",
+            Self::SlideReleased => "SlideReleased",
+            Self::Step(..) => "Step",
+            Self::SlideDue(_) => "SlideDue",
+            Self::Bitrate(_) => "Bitrate",
+            Self::MicTest => "MicTest",
+            Self::Loopback(_) => "Loopback",
+            Self::Ringtone(_) => "Ringtone",
+            Self::CleanOthers(_) => "CleanOthers",
+            Self::Skip(_) => "Skip",
+            Self::CleanOthersGpu(_) => "CleanOthersGpu",
+            Self::Announce(_) => "Announce",
+            Self::CleanedOutside(_) => "CleanedOutside",
+            Self::Diagnostics => "Diagnostics",
+            Self::Mode(_) => "Mode",
+            Self::AutoThreshold(_) => "AutoThreshold",
+            Self::CaptureKey => "CaptureKey",
+            Self::CancelCapture => "CancelCapture",
+            Self::Captured(_) => "Captured",
+            Self::ClearKey => "ClearKey",
+            Self::Button(_) => "Button",
+        }
+    }
+
+    /// The one page whose control sends this message, when that is fixed by
+    /// the message (a slider's release or pause is any slider's: `None`, as
+    /// for the messages of the card itself).
+    pub fn page(&self) -> Option<AudioPage> {
+        match self {
+            Self::Slide(slider, _) | Self::Step(slider, _) => Some(slider.page()),
+            Self::SlideReleased | Self::SlideDue(_) => None,
+            Self::Open | Self::OpenAt(_) | Self::Page(_) | Self::Close => None,
+            _ => AudioPage::ALL
+                .into_iter()
+                .find(|page| page.sends().contains(&self.name())),
+        }
+    }
+}
+
 impl App {
     /// A control of the Voice & audio card.
     pub(crate) fn on_audio(&mut self, message: AudioMessage) -> Task<Message> {
         use AudioMessage as M;
-        if !self.audio_ui.open && message != M::Open {
+        if !self.audio_ui.open && !matches!(message, M::Open | M::OpenAt(_)) {
             return Task::none();
         }
         match message {
-            M::Open => {
-                self.audio_ui.open = true;
-                Task::batch([
-                    self.send(Command::GetAudioSettings),
-                    self.send(Command::ListAudioDevices),
-                    self.send(Command::ProbeGpuEnhancement),
-                ])
+            M::Open => self.open_audio_card(AudioPage::Devices),
+            M::OpenAt(page) => self.open_audio_card(page),
+            M::Page(page) => {
+                // A key pressed on another page would become the binding
+                // unseen.
+                self.stop_capture();
+                self.audio_ui.page = page;
+                Task::none()
             }
             M::Close => self.close_audio_card(),
             M::InputDevice(choice) => self.edit_audio(|s| s.input_device = choice.id),
@@ -924,7 +1318,11 @@ impl App {
                 self.audio_ui.diagnostics = !self.audio_ui.diagnostics;
                 Task::none()
             }
-            M::Mode(choice) => self.edit_audio(|s| s.input_mode = choice.setting(&s.input_mode)),
+            M::Mode(choice) => {
+                // A key press after a mode change must not bind unseen.
+                self.stop_capture();
+                self.edit_audio(|s| s.input_mode = choice.setting(&s.input_mode))
+            }
             M::AutoThreshold(on) => self.edit_audio(|s| {
                 if let InputMode::VoiceActivity { automatic, .. } = &mut s.input_mode {
                     *automatic = on;
@@ -968,6 +1366,18 @@ impl App {
                 };
             }),
         }
+    }
+
+    /// Opens the card on `page` and asks the core for what it shows.
+    fn open_audio_card(&mut self, page: AudioPage) -> Task<Message> {
+        self.stop_capture();
+        self.audio_ui.open = true;
+        self.audio_ui.page = page;
+        Task::batch([
+            self.send(Command::GetAudioSettings),
+            self.send(Command::ListAudioDevices),
+            self.send(Command::ProbeGpuEnhancement),
+        ])
     }
 
     /// Stops waiting for the push-to-talk key.
@@ -2194,6 +2604,374 @@ mod tests {
                 trigger: "shift+control+KeyT".into(),
             })));
             assert_eq!(app.ptt.sources.len(), 1);
+        }
+    }
+
+    /// The card as pages (UI/UX rework, Task 12).
+    mod pages {
+        use super::*;
+        use crate::ui::kit::Severity;
+
+        #[test]
+        fn the_card_opens_on_devices_and_from_the_talk_line_on_talking() {
+            let (mut app, mut rx) = card();
+            assert_eq!(app.audio_ui.page, AudioPage::Devices);
+            let _ = app.update(audio(AudioMessage::Page(AudioPage::Levels)));
+            assert_eq!(app.audio_ui.page, AudioPage::Levels);
+            // A page change asks the core for nothing.
+            assert!(drain(&mut rx).is_empty());
+            let _ = app.update(audio(AudioMessage::Close));
+            let _ = app.update(audio(AudioMessage::Open));
+            assert_eq!(app.audio_ui.page, AudioPage::Devices, "Open shows Devices");
+            let _ = app.update(audio(AudioMessage::Close));
+            drain(&mut rx);
+            let _ = app.update(audio(AudioMessage::OpenAt(AudioPage::Talking)));
+            assert!(app.audio_ui.open);
+            assert_eq!(app.audio_ui.page, AudioPage::Talking);
+            // The same three requests as Open.
+            assert!(matches!(
+                drain(&mut rx).as_slice(),
+                [
+                    Command::GetAudioSettings,
+                    Command::ListAudioDevices,
+                    Command::ProbeGpuEnhancement
+                ]
+            ));
+        }
+
+        #[test]
+        fn pages_do_nothing_while_the_card_is_closed() {
+            let (mut app, _rx) = card();
+            let _ = app.update(audio(AudioMessage::Close));
+            let _ = app.update(audio(AudioMessage::Page(AudioPage::Levels)));
+            assert_eq!(app.audio_ui.page, AudioPage::Devices);
+        }
+
+        #[test]
+        fn leaving_the_talking_page_stops_waiting_for_a_key() {
+            // A key pressed on another page must never become the binding
+            // without being seen.
+            let (mut app, mut rx) = card();
+            let _ = app.update(audio(AudioMessage::Page(AudioPage::Talking)));
+            let _ = app.update(audio(AudioMessage::CaptureKey));
+            assert!(app.audio_ui.capturing);
+            let _ = app.update(audio(AudioMessage::Page(AudioPage::Microphone)));
+            assert!(!app.audio_ui.capturing);
+            let _ = app.update(audio(AudioMessage::CaptureKey));
+            let _ = app.update(audio(AudioMessage::OpenAt(AudioPage::Levels)));
+            assert!(!app.audio_ui.capturing);
+            assert!(drain(&mut rx).len() <= 3, "no settings were sent");
+        }
+
+        #[test]
+        fn every_page_builds_in_every_state() {
+            let (mut app, _rx) = card();
+            for page in AudioPage::ALL {
+                let _ = app.update(audio(AudioMessage::Page(page)));
+                let _ = app.view();
+                app.audio_ui.diagnostics = true;
+                let _ = app.view();
+                app.audio_ui.capturing = true;
+                let _ = app.view();
+                app.audio_ui.capturing = false;
+                app.calls.settings = None;
+                let _ = app.view();
+            }
+        }
+
+        #[test]
+        fn every_message_belongs_to_a_page_and_the_pages_cover_them_all() {
+            use std::collections::BTreeSet;
+            let samples = sample_messages();
+            let names: BTreeSet<&str> = samples.iter().map(AudioMessage::name).collect();
+            assert_eq!(names.len(), samples.len(), "one sample per message");
+            let mut claimed: BTreeSet<&str> = AudioMessage::CARD_WIDE.iter().copied().collect();
+            for page in AudioPage::ALL {
+                assert!(!page.sends().is_empty(), "{page:?} sends something");
+                claimed.extend(page.sends());
+            }
+            assert_eq!(claimed, names, "every message is sent from some page");
+            // The page of a sample is one of the pages that claim its name.
+            for sample in &samples {
+                if let Some(page) = sample.page() {
+                    assert!(
+                        page.sends().contains(&sample.name()),
+                        "{sample:?} is not in the table of {page:?}"
+                    );
+                }
+            }
+            // Each slider lives on exactly the page that shows it.
+            for slider in [
+                Slider::InputGain,
+                Slider::MasterVolume,
+                Slider::MicCleaningLimit,
+                Slider::OthersCleaningLimit,
+                Slider::AutoGainMax,
+                Slider::Threshold,
+                Slider::ReleaseDelay,
+            ] {
+                assert!(
+                    slider.page().sends().contains(&"Slide"),
+                    "{slider:?} moves on {:?}",
+                    slider.page()
+                );
+            }
+        }
+
+        fn sample_messages() -> Vec<AudioMessage> {
+            let key = CapturedKey {
+                code: Code::KeyT,
+                modifiers: Modifiers::empty(),
+            };
+            vec![
+                AudioMessage::Open,
+                AudioMessage::OpenAt(AudioPage::Talking),
+                AudioMessage::Page(AudioPage::Levels),
+                AudioMessage::Close,
+                AudioMessage::InputDevice(DeviceChoice {
+                    id: None,
+                    label: String::new(),
+                }),
+                AudioMessage::OutputDevice(DeviceChoice {
+                    id: None,
+                    label: String::new(),
+                }),
+                AudioMessage::Noise(NoiseChoice::Off),
+                AudioMessage::Level(LevelChoice::ALL[0]),
+                AudioMessage::EchoCancellation(true),
+                AudioMessage::CancelSystemAudio(true),
+                AudioMessage::AutoGain(true),
+                AudioMessage::HighPass(true),
+                AudioMessage::Slide(Slider::InputGain, 0.0),
+                AudioMessage::SlideReleased,
+                AudioMessage::Step(Slider::InputGain, true),
+                AudioMessage::SlideDue(1),
+                AudioMessage::Bitrate(Bitrate(64)),
+                AudioMessage::MicTest,
+                AudioMessage::Loopback(true),
+                AudioMessage::Ringtone(true),
+                AudioMessage::CleanOthers(true),
+                AudioMessage::Skip(SkipChoice::ALL[0]),
+                AudioMessage::CleanOthersGpu(true),
+                AudioMessage::Announce(true),
+                AudioMessage::CleanedOutside(true),
+                AudioMessage::Diagnostics,
+                AudioMessage::Mode(ModeChoice::ALL[0]),
+                AudioMessage::AutoThreshold(true),
+                AudioMessage::CaptureKey,
+                AudioMessage::CancelCapture,
+                AudioMessage::Captured(key),
+                AudioMessage::ClearKey,
+                AudioMessage::Button(ButtonChoice::None),
+            ]
+        }
+
+        #[test]
+        fn the_card_says_the_send_mode_and_whether_the_microphone_is_open() {
+            let (mut app, _rx) = card();
+            // Push-to-talk, no call, no test: closed, in words.
+            let status = mic_status(&app).expect("settings are loaded");
+            assert_eq!(status.severity, Severity::Info);
+            assert!(status.words.contains("Push-to-talk"), "{}", status.words);
+            assert!(status.words.contains("Ctrl+Shift+T"), "{}", status.words);
+            assert!(status.words.contains("closed"), "{}", status.words);
+            // The mic test opens it, and the words say so.
+            let _ = app.update(audio(AudioMessage::MicTest));
+            let status = mic_status(&app).expect("settings are loaded");
+            assert_eq!(status.severity, Severity::Warning);
+            assert!(status.words.contains("open"), "{}", status.words);
+            assert!(status.words.contains("mic test"), "{}", status.words);
+            let _ = app.update(audio(AudioMessage::Loopback(true)));
+            let status = mic_status(&app).expect("settings are loaded");
+            assert!(status.words.contains("hear yourself"), "{}", status.words);
+            let _ = app.update(audio(AudioMessage::MicTest));
+            // Voice activity in a call: open.
+            let mut voice = stored();
+            voice.input_mode = InputMode::VoiceActivity {
+                automatic: true,
+                threshold_db: -50.0,
+            };
+            let _ = app.update(core(CoreEvent::AudioSettings(voice)));
+            let _ = app.update(core(CoreEvent::CallState(CallState::Joining {
+                room_id: RoomId::from("!a:x"),
+            })));
+            let status = mic_status(&app).expect("settings are loaded");
+            assert_eq!(status.severity, Severity::Warning);
+            assert!(status.words.contains("Voice activity"), "{}", status.words);
+            assert!(status.words.contains("open"), "{}", status.words);
+            // Push-to-talk in a call: closed until the key, open while talking.
+            let _ = app.update(core(CoreEvent::AudioSettings(stored())));
+            let status = mic_status(&app).expect("settings are loaded");
+            assert_eq!(status.severity, Severity::Info);
+            assert!(status.words.contains("closed"), "{}", status.words);
+            app.ptt.talking = true;
+            let status = mic_status(&app).expect("settings are loaded");
+            assert_eq!(status.severity, Severity::Warning);
+            assert!(status.words.contains("sending"), "{}", status.words);
+            // Settings not here yet: nothing to say.
+            app.calls.settings = None;
+            assert!(mic_status(&app).is_none());
+        }
+
+        #[test]
+        fn the_closed_words_mention_the_release_delay() {
+            let (mut app, _rx) = card();
+            let _ = app.update(core(CoreEvent::CallState(CallState::Joining {
+                room_id: RoomId::from("!a:x"),
+            })));
+            let status = mic_status(&app).expect("settings are loaded");
+            assert_eq!(status.severity, Severity::Info);
+            assert!(status.words.contains("Ctrl+Shift+T"), "{}", status.words);
+            assert!(status.words.contains("300 ms"), "{}", status.words);
+            assert!(
+                status.words.contains("after you let go"),
+                "{}",
+                status.words
+            );
+        }
+
+        #[test]
+        fn changing_the_send_mode_stops_waiting_for_a_key() {
+            let (mut app, _rx) = card();
+            let _ = app.update(audio(AudioMessage::Page(AudioPage::Talking)));
+            let _ = app.update(audio(AudioMessage::CaptureKey));
+            assert!(app.audio_ui.capturing);
+            let _ = app.update(audio(AudioMessage::Mode(ModeChoice::VoiceActivity)));
+            assert!(!app.audio_ui.capturing);
+            assert!(app.audio_ui.capture_note.is_none());
+        }
+
+        #[test]
+        fn before_the_settings_arrive_the_call_state_is_still_said() {
+            let (mut app, _rx) = card();
+            app.calls.settings = None;
+            assert!(unloaded_mic_words(&app).contains("Loading"));
+            let _ = app.update(core(CoreEvent::CallState(CallState::Joining {
+                room_id: RoomId::from("!a:x"),
+            })));
+            app.calls.call.as_mut().expect("a call").muted = true;
+            let words = unloaded_mic_words(&app);
+            assert!(
+                words.contains("Loading") && words.contains("muted"),
+                "{words}"
+            );
+            app.calls.call.as_mut().expect("a call").deafened = true;
+            assert!(unloaded_mic_words(&app).contains("deafened"));
+        }
+
+        #[test]
+        fn a_long_key_name_is_capped_in_the_status_words() {
+            let (mut app, _rx) = card();
+            let mut settings = stored();
+            settings.push_to_talk.key = Some("W".repeat(500));
+            let _ = app.update(core(CoreEvent::AudioSettings(settings)));
+            let status = mic_status(&app).expect("settings are loaded");
+            assert!(status.words.chars().count() < 300, "{}", status.words);
+            assert!(!status.words.contains('\n'));
+        }
+
+        #[test]
+        fn muted_in_a_call_reads_closed_whatever_the_mode() {
+            let (mut app, _rx) = card();
+            let _ = app.update(core(CoreEvent::CallState(CallState::Joining {
+                room_id: RoomId::from("!a:x"),
+            })));
+            app.calls.call.as_mut().expect("a call").muted = true;
+            let status = mic_status(&app).expect("settings are loaded");
+            assert_eq!(status.severity, Severity::Info);
+            assert!(status.words.contains("muted"), "{}", status.words);
+        }
+
+        #[test]
+        fn meter_zones_follow_minus_12_and_minus_3() {
+            assert_eq!(meter_zone(-60.0), Severity::Success);
+            assert_eq!(meter_zone(-12.0), Severity::Success);
+            assert_eq!(meter_zone(-11.9), Severity::Warning);
+            assert_eq!(meter_zone(-3.0), Severity::Warning);
+            assert_eq!(meter_zone(-2.9), Severity::Danger);
+            assert_eq!(meter_zone(0.0), Severity::Danger);
+            assert_eq!(meter_zone(f32::NAN), Severity::Success);
+            assert!(zone_words(Severity::Success).contains("good"));
+            assert!(zone_words(Severity::Warning).contains("loud"));
+            assert!(zone_words(Severity::Danger).contains("clipping"));
+        }
+
+        #[test]
+        fn the_gpu_block_reads_the_probe() {
+            assert_eq!(gpu_view(None), GpuView::Looking);
+            let none = if cfg!(feature = "gpu") {
+                GpuView::NoneFound
+            } else {
+                GpuView::NotInBuild
+            };
+            assert_eq!(gpu_view(Some(&found(Vec::new()))), none);
+            let two = GpuEnhancement {
+                available: vec![GpuBackend::TensorRt, GpuBackend::Cuda],
+                running: Some(EnhancerBackend::Gpu {
+                    backend: GpuBackend::Cuda,
+                }),
+            };
+            assert_eq!(
+                gpu_view(Some(&two)),
+                GpuView::Found {
+                    in_use: GpuBackend::Cuda,
+                    running: true,
+                    others: vec![GpuBackend::TensorRt],
+                    fallback: None,
+                }
+            );
+            // Idle: the first backend is the one that would start.
+            let idle = found(vec![GpuBackend::TensorRt, GpuBackend::Cuda]);
+            assert_eq!(
+                gpu_view(Some(&idle)),
+                GpuView::Found {
+                    in_use: GpuBackend::TensorRt,
+                    running: false,
+                    others: vec![GpuBackend::Cuda],
+                    fallback: None,
+                }
+            );
+            for (running, words) in [
+                (EnhancerBackend::CpuAfterGpuError, "failed"),
+                (EnhancerBackend::CpuAfterGpuTooSlow, "fell behind"),
+            ] {
+                let moved = GpuEnhancement {
+                    available: vec![GpuBackend::Cuda],
+                    running: Some(running),
+                };
+                let GpuView::Found { fallback, .. } = gpu_view(Some(&moved)) else {
+                    panic!("a GPU is found");
+                };
+                assert!(fallback.expect("a warning").contains(words));
+            }
+        }
+
+        #[test]
+        fn diagnostics_split_into_label_and_value() {
+            let lines = diagnostics(&AudioStats {
+                echo_delay_ms: Some(42),
+                processing_us: 800,
+                ..AudioStats::default()
+            });
+            let rows = diagnostic_rows(&lines);
+            assert_eq!(rows.len(), lines.len());
+            assert_eq!(rows[0], ("Echo delay", "42 ms"));
+            assert_eq!(rows[1], ("Processing", "800 \u{b5}s per 10 ms"));
+            // A line without a colon is all label.
+            assert_eq!(diagnostic_rows(&["odd".to_owned()]), vec![("odd", "")]);
+        }
+
+        #[test]
+        fn dropouts_are_a_danger_line_with_words() {
+            let calm = AudioStats::default();
+            assert!(dropout_words(&calm).is_none());
+            let bad = AudioStats {
+                capture_overruns: 2,
+                playback_underruns: 3,
+                ..AudioStats::default()
+            };
+            let words = dropout_words(&bad).expect("dropouts");
+            assert!(words.contains('2') && words.contains('3'), "{words}");
         }
     }
 }

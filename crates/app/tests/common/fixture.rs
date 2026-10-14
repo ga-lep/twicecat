@@ -11,7 +11,7 @@
 use std::time::Duration;
 
 use iced::Task;
-use twicecat_app::audio_settings::AudioMessage;
+use twicecat_app::audio_settings::{AudioMessage, AudioPage};
 use twicecat_app::calls::CallMessage;
 use twicecat_app::rooms::RoomsMessage;
 use twicecat_app::security::{Overlay, ReauthPrompt, RecoverySetup};
@@ -28,10 +28,10 @@ use twicecat_core::api::{
     CallState, CancelReason, CleaningStatus, Command, CoreError, CoreEvent, CrossSigning, DeviceId,
     DeviceSummary, DeviceTrust, DeviceVerification, EnhancerBackend, EventId, GpuBackend,
     GpuEnhancement, Inline, InputLevel, InputMode, ItemActions, ListDiff, MediaContent, MediaKind,
-    MembershipView, MentionTarget, MessageDetails, MessageKind, MessagePreview, PaginationState,
-    Participant, ParticipantId, PlaceholderKind, PowerLevelView, QrImage, ReactionGroup,
-    ReauthAction, RecoveryKey, RecoveryProgress, RecoveryStatus, ReplyPreview, ReplyState,
-    RichText, Role, RoomDetailsView, RoomId, RoomMemberView, RoomNotificationModeView,
+    MembershipView, MentionTarget, MessageDetails, MessageKind, MessagePreview, NoiseSuppression,
+    PaginationState, Participant, ParticipantId, PlaceholderKind, PowerLevelView, QrImage,
+    ReactionGroup, ReauthAction, RecoveryKey, RecoveryProgress, RecoveryStatus, ReplyPreview,
+    ReplyState, RichText, Role, RoomDetailsView, RoomId, RoomMemberView, RoomNotificationModeView,
     RoomPermissions, RoomSummary, SasEmoji, SecurityStatus, SendFailure, SendStatus, Shield,
     ShieldCode, SpaceView, StateChange, SyncState, TextStyle, ThreadSummaryView, TimelineItem,
     TimelineItemKind, TypingUser, UploadProgress, UserId, UserTrust, UtdReason, VerificationId,
@@ -1138,12 +1138,25 @@ fn devices() -> AudioDevices {
     }
 }
 
-fn voice_audio_with(gpu: Option<GpuEnhancement>) -> App {
-    let mut app = main_call_connected();
-    feed(&mut app, CoreEvent::AudioDevices(devices()));
+/// The Voice & audio card on `page`, in a call (the call model has the
+/// numbers) or not, with the probe's answer `gpu`.
+fn voice_page_with(
+    page: AudioPage,
+    in_call: bool,
+    gpu: Option<GpuEnhancement>,
+    tweak: impl FnOnce(&mut AudioSettings, &mut AudioDevices),
+) -> App {
+    let mut app = if in_call {
+        main_call_connected()
+    } else {
+        main_room()
+    };
+    let mut devices = devices();
     let mut settings = ptt_settings(Some("F13"));
     settings.input_device = Some(AudioDeviceId::from("in-usb"));
     settings.output_device = Some(AudioDeviceId::from("out-usb"));
+    tweak(&mut settings, &mut devices);
+    feed(&mut app, CoreEvent::AudioDevices(devices));
     feed(&mut app, CoreEvent::AudioSettings(settings));
     feed(
         &mut app,
@@ -1170,34 +1183,112 @@ fn voice_audio_with(gpu: Option<GpuEnhancement>) -> App {
     if let Some(gpu) = gpu {
         feed(&mut app, CoreEvent::GpuEnhancement(gpu));
     }
-    press(&mut app, Message::Audio(AudioMessage::Open));
+    press(&mut app, Message::Audio(AudioMessage::OpenAt(page)));
     app
 }
 
-fn voice_audio() -> App {
-    voice_audio_with(Some(GpuEnhancement {
+fn gpu_found() -> Option<GpuEnhancement> {
+    Some(GpuEnhancement {
         available: vec![GpuBackend::TensorRt, GpuBackend::Cuda],
         running: Some(EnhancerBackend::Gpu {
             backend: GpuBackend::TensorRt,
         }),
-    }))
+    })
 }
 
-fn voice_audio_no_gpu() -> App {
-    voice_audio_with(Some(GpuEnhancement {
+fn voice_page(page: AudioPage) -> App {
+    voice_page_with(page, true, gpu_found(), |_, _| {})
+}
+
+fn voice_microphone(gpu: Option<GpuEnhancement>) -> App {
+    voice_page_with(AudioPage::Microphone, true, gpu, |settings, _| {
+        settings.processing.noise_suppression = NoiseSuppression::DeepFilter {
+            attenuation_limit_db: 60.0,
+            gpu: true,
+        };
+    })
+}
+
+fn voice_gpu_none() -> App {
+    voice_microphone(Some(GpuEnhancement {
         available: Vec::new(),
         running: None,
     }))
 }
 
-fn voice_audio_looking() -> App {
-    voice_audio_with(None)
+fn voice_gpu_fallback() -> App {
+    voice_microphone(Some(GpuEnhancement {
+        available: vec![GpuBackend::TensorRt, GpuBackend::Cuda],
+        running: Some(EnhancerBackend::CpuAfterGpuTooSlow),
+    }))
 }
 
-fn voice_audio_diagnostics() -> App {
-    let mut app = voice_audio();
+fn voice_talking_capturing() -> App {
+    let mut app = voice_page(AudioPage::Talking);
+    press(&mut app, Message::Audio(AudioMessage::CaptureKey));
+    app
+}
+
+fn voice_talking_voice_activity() -> App {
+    voice_page_with(AudioPage::Talking, true, gpu_found(), |settings, _| {
+        settings.input_mode = InputMode::VoiceActivity {
+            automatic: false,
+            threshold_db: -40.0,
+        };
+    })
+}
+
+fn voice_mic_test() -> App {
+    let mut app = voice_page_with(AudioPage::MicTest, false, gpu_found(), |_, _| {});
+    press(&mut app, Message::Audio(AudioMessage::MicTest));
+    app
+}
+
+fn voice_levels_loud() -> App {
+    let mut app = voice_page(AudioPage::Levels);
+    feed(
+        &mut app,
+        CoreEvent::InputLevel(InputLevel {
+            rms_db: -2.0,
+            peak_db: -0.5,
+            transmitting: true,
+        }),
+    );
+    app
+}
+
+fn voice_others() -> App {
+    voice_page_with(AudioPage::OtherVoices, true, gpu_found(), |settings, _| {
+        settings.remote_cleaning.enabled = true;
+    })
+}
+
+fn voice_diagnostics() -> App {
+    let mut app = voice_page(AudioPage::Diagnostics);
     press(&mut app, Message::Audio(AudioMessage::Diagnostics));
     app
+}
+
+fn voice_diagnostics_dropouts() -> App {
+    let mut app = voice_diagnostics();
+    feed(
+        &mut app,
+        CoreEvent::AudioStats(AudioStats {
+            capture_overruns: 3,
+            playback_underruns: 5,
+            ..AudioStats::default()
+        }),
+    );
+    app
+}
+
+/// Device names and a key as long as the core lets a stranger make them.
+fn voice_long_names(page: AudioPage) -> App {
+    voice_page_with(page, true, gpu_found(), |settings, devices| {
+        devices.inputs[0].name = "M".repeat(300);
+        devices.outputs[0].name = format!("{} {}", "Speakers".repeat(40), "END");
+        settings.push_to_talk.key = Some("W".repeat(300));
+    })
 }
 
 // ---- Settings, sessions and the dialogs ------------------------------------
@@ -1833,24 +1924,120 @@ pub fn scenarios() -> Vec<Scenario> {
         s("ring-group", true, ring_group, |a| {
             !a.calls.rings.is_empty()
         }),
-        s("voice-audio", false, voice_audio, |a| {
-            a.audio_ui.open
-                && a.calls
-                    .gpu
-                    .as_ref()
-                    .is_some_and(|g| !g.available.is_empty())
-        }),
-        s("voice-audio-no-gpu", false, voice_audio_no_gpu, |a| {
-            a.audio_ui.open && a.calls.gpu.as_ref().is_some_and(|g| g.available.is_empty())
-        }),
-        s("voice-audio-looking", false, voice_audio_looking, |a| {
-            a.audio_ui.open && a.calls.gpu.is_none()
+        s(
+            "audio-devices",
+            false,
+            || voice_page(AudioPage::Devices),
+            |a| a.audio_ui.open && a.audio_ui.page == AudioPage::Devices,
+        ),
+        s(
+            "audio-talking",
+            false,
+            || voice_page(AudioPage::Talking),
+            |a| a.audio_ui.page == AudioPage::Talking && !a.audio_ui.capturing,
+        ),
+        s(
+            "audio-talking-capturing",
+            false,
+            voice_talking_capturing,
+            |a| a.audio_ui.page == AudioPage::Talking && a.audio_ui.capturing,
+        ),
+        s(
+            "audio-talking-voice-activity",
+            false,
+            voice_talking_voice_activity,
+            |a| a.audio_ui.page == AudioPage::Talking,
+        ),
+        s(
+            "audio-microphone-gpu-found",
+            false,
+            || voice_microphone(gpu_found()),
+            |a| {
+                a.audio_ui.page == AudioPage::Microphone
+                    && a.calls
+                        .gpu
+                        .as_ref()
+                        .is_some_and(|g| !g.available.is_empty())
+            },
+        ),
+        s("audio-microphone-gpu-none", false, voice_gpu_none, |a| {
+            a.audio_ui.page == AudioPage::Microphone
+                && a.calls.gpu.as_ref().is_some_and(|g| g.available.is_empty())
         }),
         s(
-            "voice-audio-diagnostics",
+            "audio-microphone-gpu-looking",
             false,
-            voice_audio_diagnostics,
-            |a| a.audio_ui.open && a.audio_ui.diagnostics,
+            || voice_microphone(None),
+            |a| a.audio_ui.page == AudioPage::Microphone && a.calls.gpu.is_none(),
+        ),
+        s(
+            "audio-microphone-gpu-fallback",
+            false,
+            voice_gpu_fallback,
+            |a| {
+                a.audio_ui.page == AudioPage::Microphone
+                    && a.calls
+                        .gpu
+                        .as_ref()
+                        .is_some_and(|g| g.running == Some(EnhancerBackend::CpuAfterGpuTooSlow))
+            },
+        ),
+        s(
+            "audio-levels",
+            false,
+            || voice_page(AudioPage::Levels),
+            |a| a.audio_ui.page == AudioPage::Levels,
+        ),
+        s("audio-levels-loud", false, voice_levels_loud, |a| {
+            a.audio_ui.page == AudioPage::Levels && a.calls.level.is_some_and(|l| l.rms_db > -3.0)
+        }),
+        s("audio-mic-test", false, voice_mic_test, |a| {
+            a.audio_ui.page == AudioPage::MicTest && a.audio_ui.mic_test.is_some()
+        }),
+        s(
+            "audio-ringtone",
+            false,
+            || voice_page(AudioPage::Ringtone),
+            |a| a.audio_ui.page == AudioPage::Ringtone,
+        ),
+        s("audio-other-voices", false, voice_others, |a| {
+            a.audio_ui.page == AudioPage::OtherVoices
+                && a.calls
+                    .settings
+                    .as_ref()
+                    .is_some_and(|s| s.remote_cleaning.enabled)
+        }),
+        s(
+            "audio-announce",
+            false,
+            || voice_page(AudioPage::Announce),
+            |a| a.audio_ui.page == AudioPage::Announce,
+        ),
+        s("audio-diagnostics", false, voice_diagnostics, |a| {
+            a.audio_ui.page == AudioPage::Diagnostics && a.audio_ui.diagnostics
+        }),
+        s(
+            "audio-diagnostics-dropouts",
+            false,
+            voice_diagnostics_dropouts,
+            |a| {
+                a.audio_ui.diagnostics
+                    && a.calls
+                        .stats
+                        .is_some_and(|s| s.capture_overruns > 0 && s.playback_underruns > 0)
+            },
+        ),
+        s(
+            "audio-devices-long-names",
+            false,
+            || voice_long_names(AudioPage::Devices),
+            |a| a.audio_ui.page == AudioPage::Devices,
+        ),
+        s(
+            "audio-talking-long-key",
+            false,
+            || voice_long_names(AudioPage::Talking),
+            |a| a.audio_ui.page == AudioPage::Talking,
         ),
         s("settings", false, settings, |a| a.settings_ui.open),
         s("sessions", false, sessions, |a| a.sessions.open),

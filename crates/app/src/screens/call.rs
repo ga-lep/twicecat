@@ -502,6 +502,25 @@ fn pill_style(look: MicLook) -> impl Fn(&Theme) -> container::Style {
     }
 }
 
+/// [`pill_style`] for the pill as a button: the same look in every status,
+/// with the outline in the focus colour while pointed at or pressed.
+fn pill_button_style(look: MicLook) -> impl Fn(&Theme, Status) -> button::Style {
+    move |t, status| {
+        let base = pill_style(look)(t);
+        let mut border = base.border;
+        if matches!(status, Status::Hovered | Status::Pressed) {
+            border.color = theme::semantic(t).focus;
+            border.width = 2.0;
+        }
+        button::Style {
+            background: base.background,
+            text_color: base.text_color.unwrap_or(t.palette().text),
+            border,
+            ..button::Style::default()
+        }
+    }
+}
+
 /// The text style of the call's own tint: the severity colour on the dock.
 fn phase_dot<'a>(severity: Severity) -> Element<'a, Message> {
     text(Icon::Dot.glyph())
@@ -579,8 +598,11 @@ pub fn dock(app: &App) -> Element<'_, Message> {
             );
         }
         if let Some((look, words)) = dock.talk.clone() {
+            // The pill is a button: it opens the Talking page of the audio
+            // card, where the key is set. It is laid out as the container
+            // it was.
             lines.push(
-                container(
+                button(
                     row![
                         text(look.icon().glyph()).size(tokens::CAPTION),
                         text(words).size(tokens::CAPTION).width(Fill).wrapping(WRAP)
@@ -588,9 +610,12 @@ pub fn dock(app: &App) -> Element<'_, Message> {
                     .spacing(tokens::XS)
                     .align_y(iced::Center),
                 )
+                .on_press(Message::Audio(crate::audio_settings::AudioMessage::OpenAt(
+                    crate::audio_settings::AudioPage::Talking,
+                )))
                 .padding([tokens::XS, tokens::M])
                 .width(Fill)
-                .style(pill_style(look))
+                .style(pill_button_style(look))
                 .into(),
             );
         }

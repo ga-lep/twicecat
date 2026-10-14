@@ -306,7 +306,18 @@ fn the_fixture_reaches_every_screen_it_names() {
         "ring-long-id",
         "ring-dm",
         "ring-group",
-        "voice-audio",
+        "audio-devices",
+        "audio-talking",
+        "audio-talking-capturing",
+        "audio-microphone-gpu-found",
+        "audio-microphone-gpu-none",
+        "audio-microphone-gpu-looking",
+        "audio-levels",
+        "audio-mic-test",
+        "audio-ringtone",
+        "audio-other-voices",
+        "audio-announce",
+        "audio-diagnostics",
         "settings",
         "sessions",
         "room-settings",
@@ -523,8 +534,11 @@ fn write_the_gallery() {
     let dir = gallery_dir();
     std::fs::create_dir_all(&dir).expect("create the gallery directory");
     let scenarios = fixture::scenarios();
+    // `TWICECAT_GALLERY_ONLY=audio-` draws only the screens whose names start
+    // with it (and not the narrow cases), for a quick look at one area.
+    let only = std::env::var("TWICECAT_GALLERY_ONLY").unwrap_or_default();
     let mut shots: Vec<(&str, Vec<(String, String)>)> = Vec::new();
-    for scenario in &scenarios {
+    for scenario in scenarios.iter().filter(|s| s.name.starts_with(&only)) {
         let mut app = (scenario.build)();
         let mut files = Vec::new();
         for variant in variants(scenario.room_list) {
@@ -560,7 +574,7 @@ fn write_the_gallery() {
             &[fixture::call_connected, fixture::call_panel_open],
         ),
     ];
-    for (name, width, steps) in cases {
+    for (name, width, steps) in cases.into_iter().filter(|_| only.is_empty()) {
         let size = Size::new(width, 800.0);
         let mut app = fixture::main_room();
         app.window_width = width;
@@ -1363,16 +1377,26 @@ fn ctrl_wheel_over_the_menus_of_the_settings_and_call_screens_changes_nothing() 
     use iced::keyboard::{self, Modifiers};
     use iced::{Point, mouse::ScrollDelta};
     let renderer = renderer();
-    let mut apps: Vec<(String, App)> = ["voice-audio", "voice-audio-no-gpu", "settings"]
-        .into_iter()
-        .map(|name| {
-            let scenario = fixture::scenarios()
-                .into_iter()
-                .find(|s| s.name == name)
-                .expect("a scenario of that name");
-            (name.to_owned(), (scenario.build)())
-        })
-        .collect();
+    let mut apps: Vec<(String, App)> = [
+        "audio-devices",
+        "audio-talking",
+        "audio-talking-capturing",
+        "audio-talking-voice-activity",
+        "audio-microphone-gpu-found",
+        "audio-levels",
+        "audio-mic-test",
+        "audio-other-voices",
+        "settings",
+    ]
+    .into_iter()
+    .map(|name| {
+        let scenario = fixture::scenarios()
+            .into_iter()
+            .find(|s| s.name == name)
+            .expect("a scenario of that name");
+        (name.to_owned(), (scenario.build)())
+    })
+    .collect();
     let mut with_panel = fixture::main_room();
     fixture::call_connected(&mut with_panel);
     fixture::call_panel_open(&mut with_panel);
@@ -1969,5 +1993,433 @@ fn leave_sends_once_and_is_off_while_a_leave_or_join_waits() {
         } else {
             assert!(messages.is_empty(), "{pending:?}: {messages:?}");
         }
+    }
+}
+
+// ---- Task 12: the Voice & audio card as pages --------------------------------
+
+mod audio {
+    use super::*;
+    use twicecat_app::audio_settings::{AudioMessage, AudioPage};
+    use twicecat_app::screens::audio_settings::NAV_WIDTH;
+    use twicecat_core::api::{AudioSettings, CoreEvent, InputMode};
+
+    /// The first node with a child of exactly `width` (the page list).
+    fn find_body(node: &Node) -> Option<&Node> {
+        if node.children().len() == 3 && node.children()[0].bounds().width == NAV_WIDTH {
+            return Some(node);
+        }
+        node.children().iter().find_map(find_body)
+    }
+
+    /// The card: the nearest ancestor of the body that is the modal's card.
+    fn card_of<'n>(root: &'n Node, body: &'n Node) -> &'n Node {
+        fn chain<'n>(node: &'n Node, target: &'n Node, path: &mut Vec<&'n Node>) -> bool {
+            path.push(node);
+            if std::ptr::eq(node, target) {
+                return true;
+            }
+            if node.children().iter().any(|c| chain(c, target, path)) {
+                return true;
+            }
+            path.pop();
+            false
+        }
+        let mut path = Vec::new();
+        assert!(chain(root, body, &mut path), "the body is in the tree");
+        // [.., card (padding 20), content (fixed height), column, body]
+        path[path.len() - 4]
+    }
+
+    fn set_settings(app: &mut App, change: impl FnOnce(&mut AudioSettings)) {
+        let mut settings = app.calls.settings.clone().expect("settings");
+        change(&mut settings);
+        let _ = app.update(Message::Core(Box::new(CoreEvent::AudioSettings(settings))));
+    }
+
+    fn page_app(name: &str) -> App {
+        let mut app = scenario_app(name);
+        app.set_ui_settings(variants(false)[0].settings());
+        app.window_width = WIDE.width;
+        app
+    }
+
+    /// Nodes that run out of their parent's width (a vertical overflow is a
+    /// scroll).
+    fn hspills(node: &Node, origin: iced::Point, out: &mut Vec<Rectangle>) {
+        let b = node.bounds();
+        let at = iced::Point::new(origin.x + b.x, origin.y + b.y);
+        for child in node.children() {
+            let cb = child.bounds();
+            if cb.x < -0.5 || cb.x + cb.width > b.width + 0.5 {
+                out.push(Rectangle::new(
+                    iced::Point::new(at.x + cb.x, at.y + cb.y),
+                    cb.size(),
+                ));
+            }
+            hspills(child, at, out);
+        }
+    }
+
+    const PAGE_SCENARIOS: [&str; 16] = [
+        "audio-devices",
+        "audio-talking",
+        "audio-talking-capturing",
+        "audio-talking-voice-activity",
+        "audio-microphone-gpu-found",
+        "audio-microphone-gpu-none",
+        "audio-microphone-gpu-looking",
+        "audio-microphone-gpu-fallback",
+        "audio-levels",
+        "audio-levels-loud",
+        "audio-mic-test",
+        "audio-ringtone",
+        "audio-other-voices",
+        "audio-announce",
+        "audio-diagnostics",
+        "audio-diagnostics-dropouts",
+    ];
+
+    #[test]
+    fn the_card_is_760_by_640_with_the_page_list_at_its_left() {
+        let renderer = renderer();
+        for name in PAGE_SCENARIOS {
+            for density in DENSITIES {
+                let mut app = page_app(name);
+                with_settings(&mut app, density, RoomListChoice::Expanded);
+                let laid = Laid::new(&app, &renderer, WIDE);
+                let body = find_body(&laid.node).unwrap_or_else(|| panic!("{name}: no body"));
+                let card = card_of(&laid.node, body);
+                let what = format!("{name} {}", density.1);
+                assert_eq!(card.bounds().width, 760.0, "{what}");
+                assert_eq!(card.bounds().height, 640.0, "{what}");
+                // The list is at the left, the page at the right, in one row.
+                let (nav, page) = (body.children()[0].bounds(), body.children()[2].bounds());
+                assert!(nav.x < page.x, "{what}");
+                assert!((nav.y - page.y).abs() < 0.5, "{what}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_small_window_shrinks_the_card_to_fit() {
+        let renderer = renderer();
+        let size = Size::new(1000.0, 420.0);
+        let mut app = page_app("audio-talking");
+        app.window_width = size.width;
+        let laid = Laid::new(&app, &renderer, size);
+        let body = find_body(&laid.node).expect("the body");
+        let card = card_of(&laid.node, body);
+        assert!(card.bounds().height <= size.height, "{:?}", card.bounds());
+        assert!(card.bounds().height >= 280.0, "{:?}", card.bounds());
+    }
+
+    #[test]
+    fn nothing_runs_out_of_the_card_sideways_in_any_page_at_both_widths() {
+        let renderer = renderer();
+        for name in PAGE_SCENARIOS
+            .into_iter()
+            .chain(["audio-devices-long-names", "audio-talking-long-key"])
+        {
+            for size in SIZES {
+                for density in DENSITIES {
+                    let mut app = page_app(name);
+                    with_settings(&mut app, density, RoomListChoice::Expanded);
+                    app.window_width = size.width;
+                    let laid = Laid::new(&app, &renderer, size);
+                    let body = find_body(&laid.node).expect("the body");
+                    let card = card_of(&laid.node, body);
+                    let mut out = Vec::new();
+                    hspills(card, iced::Point::ORIGIN, &mut out);
+                    assert!(
+                        out.is_empty(),
+                        "{name} {} at {}: {out:?}",
+                        density.1,
+                        size.width
+                    );
+                    assert!(
+                        card.bounds().width <= size.width,
+                        "{name}: the card is wider than the window"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_page_never_runs_under_its_scrollbar() {
+        let renderer = renderer();
+        let mut tall = 0;
+        for name in PAGE_SCENARIOS {
+            for density in DENSITIES {
+                let mut app = page_app(name);
+                with_settings(&mut app, density, RoomListChoice::Expanded);
+                let laid = Laid::new(&app, &renderer, WIDE);
+                let body = find_body(&laid.node).expect("the body");
+                let scroll = &body.children()[2];
+                let content = scroll.children()[0].bounds();
+                // A page that fits has no scrollbar. One that does not has
+                // iced's 10 px scrollbar beside it, in room of its own.
+                if content.height > scroll.bounds().height + 0.5 {
+                    tall += 1;
+                    assert!(
+                        content.x + content.width <= scroll.bounds().width - 10.0 + 0.5,
+                        "{name}: content {content:?} in a scrollable {:?}",
+                        scroll.bounds()
+                    );
+                }
+            }
+        }
+        assert!(tall >= 4, "only {tall} tall pages: the check did not run");
+    }
+
+    #[test]
+    fn the_key_row_keeps_its_size_and_its_buttons_apart_from_the_words() {
+        let renderer = renderer();
+        let measure = |name: &str| {
+            let app = page_app(name);
+            let laid = Laid::new(&app, &renderer, WIDE);
+            let body = find_body(&laid.node).expect("the body");
+            let page = &body.children()[2].children()[0];
+            // The page column: [heading, send, note, key column, ...]
+            let key = &page.children()[3];
+            let row = key.children()[0].children()[1].children()[0].clone();
+            (key.bounds(), row.children().len(), row)
+        };
+        let (idle, idle_kids, idle_row) = measure("audio-talking");
+        let (waiting, waiting_kids, waiting_row) = measure("audio-talking-capturing");
+        // [box, Set key / Cancel, Clear]: the same three widgets.
+        assert_eq!(idle_kids, 3);
+        assert_eq!(waiting_kids, 3);
+        for row in [&idle_row, &waiting_row] {
+            let kids = row.children();
+            for pair in kids.windows(2) {
+                let (a, b) = (pair[0].bounds(), pair[1].bounds());
+                assert!(
+                    a.x + a.width + 7.5 <= b.x,
+                    "words and buttons overlap or touch: {a:?} {b:?}"
+                );
+            }
+            let last = kids[2].bounds();
+            assert!(last.x + last.width <= row.bounds().width + 0.5);
+        }
+        // The box is the same height with and without the capture, so
+        // nothing jumps when it starts (its width is what the buttons leave);
+        // the hint slot adds a line below.
+        let (a, b) = (
+            idle_row.children()[0].bounds(),
+            waiting_row.children()[0].bounds(),
+        );
+        assert!((a.height - b.height).abs() < 0.5, "box {a:?} then {b:?}");
+        assert!(waiting.height > idle.height, "the hint appears");
+    }
+
+    /// Every message a click at the centre of each node of the card sends,
+    /// first with the page at the top, then scrolled to its end.
+    fn clicked(app: &App, renderer: &Renderer) -> Vec<AudioMessage> {
+        let mut laid = Laid::new(app, renderer, WIDE);
+        laid.settle(renderer, WIDE);
+        let (points, bottom, scroll_at) = {
+            let body = find_body(&laid.node).expect("the body");
+            let card = card_of(&laid.node, body);
+            let origin = origin_of(&laid.node, card, iced::Point::ORIGIN).expect("card origin");
+            let origin = iced::Point::new(origin.x - card.bounds().x, origin.y - card.bounds().y);
+            let mut all = Vec::new();
+            collect_bounds(card, origin, &mut all, 0);
+            let scroll = &body.children()[2];
+            let scroll_origin = origin_of(&laid.node, scroll, iced::Point::ORIGIN).expect("origin");
+            let view = Rectangle::new(scroll_origin, scroll.bounds().size());
+            let hidden = (scroll.children()[0].bounds().height - view.height).max(0.0);
+            let mut inside = Vec::new();
+            collect_bounds(&scroll.children()[0], scroll_origin, &mut inside, 0);
+            // Nodes of the page, as they sit when scrolled to the end.
+            let bottom: Vec<Rectangle> = inside
+                .into_iter()
+                .map(|(r, _)| Rectangle {
+                    y: r.y - hidden,
+                    ..r
+                })
+                .filter(|r| r.y + r.height > view.y && r.y < view.y + view.height)
+                .collect();
+            let points: Vec<Rectangle> = all.into_iter().map(|(r, _)| r).collect();
+            (points, bottom, view.center())
+        };
+        let mut sent = Vec::new();
+        let mut sweep = |laid: &mut Laid<'_>, rects: &[Rectangle]| {
+            for rect in rects {
+                if rect.width <= 0.0 || rect.height <= 0.0 {
+                    continue;
+                }
+                for at in [
+                    rect.center(),
+                    iced::Point::new(rect.x + 4.0, rect.center().y),
+                    iced::Point::new(rect.x + rect.width - 4.0, rect.center().y),
+                ] {
+                    for message in click(laid, renderer, WIDE, at) {
+                        if let Message::Audio(m) = message {
+                            sent.push(m);
+                        }
+                    }
+                }
+            }
+        };
+        sweep(&mut laid, &points);
+        let wheel = Event::Mouse(mouse::Event::WheelScrolled {
+            delta: mouse::ScrollDelta::Pixels {
+                x: 0.0,
+                y: -10_000.0,
+            },
+        });
+        let mut ignored: Vec<Message> = Vec::new();
+        let mut shell = Shell::new(&mut ignored);
+        laid.element.as_widget_mut().update(
+            &mut laid.tree,
+            &wheel,
+            Layout::new(&laid.node),
+            mouse::Cursor::Available(scroll_at),
+            renderer,
+            &mut clipboard::Null,
+            &mut shell,
+            &Rectangle::with_size(WIDE),
+        );
+        sweep(&mut laid, &bottom);
+        sent
+    }
+
+    /// The pages and the messages their controls send are the same as the
+    /// table of `AudioPage::sends`, and the pages together send every message
+    /// that a click can send (the menus open an overlay this harness does not
+    /// drive, and a captured key comes from a key press).
+    #[test]
+    fn each_page_sends_only_its_own_messages_and_together_they_send_them_all() {
+        use std::collections::BTreeSet;
+        let renderer = renderer();
+        let mut seen: BTreeSet<&'static str> = BTreeSet::new();
+        // One app per page, plus the states that show the other controls.
+        let mut apps: Vec<(AudioPage, String, App)> = Vec::new();
+        for (page, name) in [
+            (AudioPage::Devices, "audio-devices"),
+            (AudioPage::Talking, "audio-talking"),
+            (AudioPage::Talking, "audio-talking-capturing"),
+            (AudioPage::Talking, "audio-talking-voice-activity"),
+            (AudioPage::Microphone, "audio-microphone-gpu-found"),
+            (AudioPage::Levels, "audio-levels"),
+            (AudioPage::MicTest, "audio-mic-test"),
+            (AudioPage::Ringtone, "audio-ringtone"),
+            (AudioPage::OtherVoices, "audio-other-voices"),
+            (AudioPage::Announce, "audio-announce"),
+            (AudioPage::Diagnostics, "audio-diagnostics"),
+        ] {
+            apps.push((page, name.to_owned(), page_app(name)));
+        }
+        let mut gate = page_app("audio-microphone-gpu-found");
+        set_settings(&mut gate, |s| {
+            s.input_mode = InputMode::VoiceActivity {
+                automatic: false,
+                threshold_db: -40.0,
+            };
+            s.processing.echo_cancellation = true;
+            s.processing.auto_gain = false;
+        });
+        apps.push((AudioPage::Microphone, "gate".to_owned(), gate));
+        let mut announce = page_app("audio-announce");
+        set_settings(&mut announce, |s| s.announce_cleaning.enabled = true);
+        apps.push((AudioPage::Announce, "announce on".to_owned(), announce));
+        let mut quiet_mic = page_app("audio-mic-test");
+        let _ = quiet_mic.update(Message::Audio(AudioMessage::MicTest));
+        apps.push((AudioPage::MicTest, "test off".to_owned(), quiet_mic));
+        for (page, name, app) in &apps {
+            for message in clicked(app, &renderer) {
+                let allowed = AudioMessage::CARD_WIDE.contains(&message.name())
+                    || page.sends().contains(&message.name());
+                assert!(allowed, "{name}: {message:?} is not a message of {page:?}");
+                if let Some(owner) = message.page() {
+                    assert_eq!(owner, *page, "{name}: {message:?}");
+                }
+                seen.insert(message.name());
+            }
+        }
+        let unreachable_by_click = [
+            // Menus: their choices come from the overlay.
+            "InputDevice",
+            "OutputDevice",
+            "Noise",
+            "Level",
+            "Bitrate",
+            "Skip",
+            "Mode",
+            "Button",
+            // A key press, and a timer.
+            "Captured",
+            "SlideDue",
+            // Only the talk line opens a page directly.
+            "OpenAt",
+            "Open",
+        ];
+        let mut expected: BTreeSet<&str> = AudioMessage::CARD_WIDE.into_iter().collect();
+        for page in AudioPage::ALL {
+            expected.extend(page.sends());
+        }
+        for name in unreachable_by_click {
+            expected.remove(name);
+        }
+        let missing: Vec<&&str> = expected.iter().filter(|n| !seen.contains(**n)).collect();
+        assert!(
+            missing.is_empty(),
+            "no click sent {missing:?}; saw {seen:?}"
+        );
+    }
+
+    #[test]
+    fn the_talk_line_in_the_dock_opens_the_talking_page() {
+        let renderer = renderer();
+        let mut app = scenario_app("main-call-ptt-idle");
+        with_settings(&mut app, DENSITIES[0], RoomListChoice::Expanded);
+        let mut laid = Laid::new(&app, &renderer, WIDE);
+        laid.settle(&renderer, WIDE);
+        let (lines, audio) = {
+            let dock = dock_slot(&laid);
+            let lines: Vec<iced::Point> = dock_lines(dock)
+                .iter()
+                .map(|line| centre_of(&laid, line))
+                .collect();
+            let controls = dock_lines(dock).last().expect("controls");
+            (lines, centre_of(&laid, &controls.children()[2]))
+        };
+        let mut hit = false;
+        for at in lines {
+            hit |= click(&mut laid, &renderer, WIDE, at)
+                .iter()
+                .any(|m| matches!(m, Message::Audio(AudioMessage::OpenAt(AudioPage::Talking))));
+        }
+        assert!(hit, "no line of the dock opens the Talking page");
+        // The audio button still opens Devices.
+        let sent = click(&mut laid, &renderer, WIDE, audio);
+        assert!(
+            sent.iter()
+                .any(|m| matches!(m, Message::Audio(AudioMessage::Open))),
+            "{sent:?}"
+        );
+    }
+
+    #[test]
+    fn the_status_lines_stay_when_the_page_changes_and_a_notice_has_its_slot() {
+        let renderer = renderer();
+        let mut heights = Vec::new();
+        for name in ["audio-devices", "audio-levels", "audio-diagnostics"] {
+            let app = page_app(name);
+            let laid = Laid::new(&app, &renderer, WIDE);
+            let body = find_body(&laid.node).expect("the body");
+            let card = card_of(&laid.node, body);
+            // [card padding] content > column [top, body]; the top is
+            // [header, status, notice slot].
+            let top = &card.children()[0].children()[0].children()[0];
+            assert_eq!(top.children().len(), 3, "{name}: header, status, notice");
+            heights.push(top.bounds().height);
+        }
+        assert!(
+            heights.windows(2).all(|w| (w[0] - w[1]).abs() < 0.5),
+            "{heights:?}"
+        );
     }
 }
