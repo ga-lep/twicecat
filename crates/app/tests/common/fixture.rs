@@ -1633,6 +1633,233 @@ fn members() -> App {
     app
 }
 
+/// The members of `members`, plus a few made to be confusing: a name that
+/// reads like a trust tag, one like a role, and a long ID.
+fn rich_members() -> Vec<RoomMemberView> {
+    let member =
+        |id: UserId, name: Option<&str>, role: Role, level: i64, membership| RoomMemberView {
+            user_id: id,
+            display_name: name.map(str::to_owned),
+            avatar: None,
+            power: if matches!(role, Role::Creator) {
+                PowerLevelView::Creator
+            } else {
+                PowerLevelView::Level(level)
+            },
+            role,
+            membership,
+        };
+    vec![
+        member(
+            user("bea"),
+            Some("Bea Example"),
+            Role::Creator,
+            100,
+            MembershipView::Joined,
+        ),
+        member(
+            user("cy"),
+            Some("Cy Example"),
+            Role::Admin,
+            100,
+            MembershipView::Joined,
+        ),
+        member(
+            user("alice"),
+            Some("Alice Example"),
+            Role::Moderator,
+            50,
+            MembershipView::Joined,
+        ),
+        member(
+            UserId::from("@mallory:evil.example.org"),
+            Some("Verified"),
+            Role::User,
+            0,
+            MembershipView::Joined,
+        ),
+        member(
+            UserId::from("@mallory2:evil.example.org"),
+            Some("Admin (75)"),
+            Role::User,
+            0,
+            MembershipView::Joined,
+        ),
+        member(
+            user("me"),
+            Some("Me Example"),
+            Role::User,
+            0,
+            MembershipView::Joined,
+        ),
+        member(
+            user("dee"),
+            Some("Dee Example"),
+            Role::Moderator,
+            50,
+            MembershipView::Invited,
+        ),
+        member(
+            UserId::from(format!(
+                "@{}:long-server.example.org",
+                "very-long-user-name-".repeat(6)
+            )),
+            None,
+            Role::User,
+            0,
+            MembershipView::Joined,
+        ),
+    ]
+}
+
+fn members_open(list: Vec<RoomMemberView>) -> App {
+    let mut app = main_room();
+    press(&mut app, Message::Rooms(RoomsMessage::OpenMembers));
+    feed(
+        &mut app,
+        CoreEvent::RoomMembers {
+            room_id: room("lounge"),
+            members: list,
+            truncated: false,
+        },
+    );
+    app
+}
+
+/// The members in a call, with trust for some of them.
+fn members_call_trust() -> App {
+    let mut app = members_open(rich_members());
+    call_events(
+        &mut app,
+        CallState::Connected {
+            room_id: room("lounge"),
+            encrypted: true,
+        },
+    );
+    call_participants(&mut app);
+    for (name, trust) in [
+        ("bea", UserTrust::Verified),
+        ("cy", UserTrust::Unverified),
+        ("alice", UserTrust::IdentityChanged),
+    ] {
+        feed(
+            &mut app,
+            CoreEvent::UserTrust {
+                user_id: user(name),
+                trust,
+            },
+        );
+    }
+    feed(
+        &mut app,
+        CoreEvent::UserTrust {
+            user_id: UserId::from("@mallory:evil.example.org"),
+            trust: UserTrust::Unverified,
+        },
+    );
+    app
+}
+
+fn members_search() -> App {
+    let mut app = members_open(rich_members());
+    press(
+        &mut app,
+        Message::Rooms(RoomsMessage::MemberSearch("alice".to_owned().into())),
+    );
+    app
+}
+
+fn members_none() -> App {
+    let mut app = members_open(rich_members());
+    press(
+        &mut app,
+        Message::Rooms(RoomsMessage::MemberSearch("zzzz".to_owned().into())),
+    );
+    app
+}
+
+fn members_loading() -> App {
+    let mut app = main_room();
+    press(&mut app, Message::Rooms(RoomsMessage::OpenMembers));
+    app
+}
+
+/// Hundreds of members: only the first page is built.
+fn members_many() -> App {
+    let list = (0..450)
+        .map(|i| RoomMemberView {
+            user_id: UserId::from(format!("@person{i:04}:example.org")),
+            display_name: Some(format!("Person {i:04}")),
+            avatar: None,
+            power: PowerLevelView::Level(0),
+            role: Role::User,
+            membership: MembershipView::Joined,
+        })
+        .collect();
+    members_open(list)
+}
+
+fn room_settings_long() -> App {
+    let mut app = room_settings();
+    feed(
+        &mut app,
+        CoreEvent::RoomDetails(RoomDetailsView {
+            room_id: room("lounge"),
+            name: "Lounge".to_owned(),
+            topic: Some("T".repeat(300)),
+            avatar: None,
+            is_encrypted: false,
+            alias: Some(format!("#{}:long-server.example.org", "alias-".repeat(30))),
+            permissions: RoomPermissions {
+                can_set_name: true,
+                can_set_topic: true,
+                can_set_avatar: true,
+                can_enable_encryption: true,
+                can_invite: true,
+            },
+        }),
+    );
+    app
+}
+
+fn room_encrypt_confirm() -> App {
+    let mut app = room_settings();
+    press(&mut app, Message::Rooms(RoomsMessage::EncryptAsk));
+    app
+}
+
+fn user_card() -> App {
+    let mut app = members_open(rich_members());
+    press(&mut app, Message::Rooms(RoomsMessage::CloseMembers));
+    press(
+        &mut app,
+        Message::LinkClicked(twicecat_app::rich_text::LinkTarget::User(user("alice"))),
+    );
+    feed(
+        &mut app,
+        CoreEvent::UserTrust {
+            user_id: user("alice"),
+            trust: UserTrust::Unverified,
+        },
+    );
+    app
+}
+
+fn user_card_long() -> App {
+    let mut app = members_open(rich_members());
+    press(&mut app, Message::Rooms(RoomsMessage::CloseMembers));
+    press(
+        &mut app,
+        Message::LinkClicked(twicecat_app::rich_text::LinkTarget::User(UserId::from(
+            format!(
+                "@{}:long-server.example.org",
+                "very-long-user-name-".repeat(6)
+            ),
+        ))),
+    );
+    app
+}
+
 fn create_room() -> App {
     let mut app = main_room();
     press(&mut app, Message::Rooms(RoomsMessage::OpenCreate));
@@ -1724,6 +1951,108 @@ fn upload() -> App {
     app
 }
 
+/// One ready file in the confirmation.
+fn upload_single() -> App {
+    let mut app = main_room();
+    press(
+        &mut app,
+        Message::FilesChosen(UploadPaths(vec!["/gallery/photo.png".into()])),
+    );
+    let id = app
+        .uploads
+        .dialog
+        .as_ref()
+        .and_then(|dialog| dialog.entries.first().map(|entry| entry.id))
+        .expect("the confirmation has a line");
+    press(
+        &mut app,
+        Message::UploadPrepared {
+            entry: id,
+            outcome: Box::new(Outcome::Ready(Box::new(Prepared {
+                name: "photo.png".to_owned(),
+                size: 180_000,
+                source: Source::Path("/gallery/photo.png".into()),
+                mime: "image/png",
+                kind: MediaKind::Image,
+                width: None,
+                height: None,
+                thumbnail: None,
+                preview: None,
+            }))),
+        },
+    );
+    app
+}
+
+/// A long file name, a long room name and a room the list lacks.
+fn upload_long() -> App {
+    let mut app = main_room();
+    for summary in &mut app.rooms {
+        if summary.id == room("lounge") {
+            summary.name = format!("{} lounge", "Extremely long room name ".repeat(12));
+        }
+    }
+    let name = format!(
+        "{}.tar.gz",
+        "a-very-long-file-name-without-a-space-".repeat(8)
+    );
+    let path = format!("/gallery/{name}");
+    press(
+        &mut app,
+        Message::FilesChosen(UploadPaths(vec![path.clone().into()])),
+    );
+    let id = app
+        .uploads
+        .dialog
+        .as_ref()
+        .and_then(|dialog| dialog.entries.first().map(|entry| entry.id))
+        .expect("the confirmation has a line");
+    press(
+        &mut app,
+        Message::UploadPrepared {
+            entry: id,
+            outcome: Box::new(Outcome::Ready(Box::new(Prepared {
+                name,
+                size: 25_000_000,
+                source: Source::Path(path.into()),
+                mime: "application/gzip",
+                kind: MediaKind::File,
+                width: None,
+                height: None,
+                thumbnail: None,
+                preview: None,
+            }))),
+        },
+    );
+    app
+}
+
+/// The room on screen changed after the files were picked.
+fn upload_wrong_room() -> App {
+    let mut app = upload_single();
+    app.selected = Some(room("design"));
+    app
+}
+
+/// A long file name (no space in it) and a long declared type.
+fn viewer_long() -> App {
+    let mut app = viewer();
+    for item in &mut app.timeline.items {
+        if let TimelineItemKind::Message { details, .. } = &mut item.kind
+            && let Some(media) = details.media.as_deref_mut()
+        {
+            media.filename = format!("{}.png", "holiday-photo-from-a-very-long-trip-".repeat(8));
+        }
+    }
+    app
+}
+
+fn viewer_loading() -> App {
+    let mut app = main_room();
+    press(&mut app, Message::MediaClicked("img0".to_owned()));
+    app
+}
+
 fn viewer() -> App {
     let mut app = main_room();
     press(&mut app, Message::MediaClicked("img0".to_owned()));
@@ -1774,6 +2103,43 @@ fn switcher() -> App {
     press(
         &mut app,
         Message::Switcher(SwitcherMessage::Input("e".to_owned())),
+    );
+    app
+}
+
+fn switcher_empty() -> App {
+    let mut app = switcher();
+    press(
+        &mut app,
+        Message::Switcher(SwitcherMessage::Input("zzzzzz".to_owned())),
+    );
+    app
+}
+
+/// Long room names, a call, and the unread badges of the list.
+fn switcher_long() -> App {
+    let mut app = main_room();
+    for summary in &mut app.rooms {
+        if summary.id == room("design") {
+            summary.name = "D".repeat(300);
+        }
+        if summary.id == room("lounge") {
+            summary.name = format!("{} end", "word ".repeat(40));
+        }
+    }
+    feed(
+        &mut app,
+        CoreEvent::ActiveCall {
+            room_id: room("design"),
+            participants: 3,
+        },
+    );
+    press(
+        &mut app,
+        Message::Shortcut {
+            shortcut: twicecat_app::keys::Shortcut::Switcher,
+            captured: false,
+        },
     );
     app
 }
@@ -2449,6 +2815,34 @@ pub fn scenarios() -> Vec<Scenario> {
         s("members", false, members, |a| {
             a.rooms_ui.members_panel.is_some()
         }),
+        s("members-call-trust", false, members_call_trust, |a| {
+            a.rooms_ui.members_panel.is_some() && a.calls.call.is_some() && a.user_trust.len() >= 4
+        }),
+        s("members-search", false, members_search, |a| {
+            a.rooms_ui.member_search == "alice"
+        }),
+        s("members-none", false, members_none, |a| {
+            a.rooms_ui.member_search == "zzzz"
+        }),
+        s("members-loading", false, members_loading, |a| {
+            a.rooms_ui.members_panel.is_some() && a.rooms_ui.known.is_none()
+        }),
+        s("members-many", false, members_many, |a| {
+            a.rooms_ui
+                .known
+                .as_ref()
+                .is_some_and(|k| k.members.len() == 450)
+        }),
+        s("room-settings-long", false, room_settings_long, |a| {
+            a.rooms_ui.settings.is_some()
+        }),
+        s("room-encrypt-confirm", false, room_encrypt_confirm, |a| {
+            a.rooms_ui.settings.as_ref().is_some_and(|p| p.encrypt_ask)
+        }),
+        s("user-card", false, user_card, |a| a.rooms_ui.card.is_some()),
+        s("user-card-long", false, user_card_long, |a| {
+            a.rooms_ui.card.is_some()
+        }),
         s("create-room", false, create_room, |a| {
             a.rooms_ui.dialog.is_some()
         }),
@@ -2462,6 +2856,33 @@ pub fn scenarios() -> Vec<Scenario> {
                 .as_ref()
                 .is_some_and(|d| d.sendable() == 2 && d.loading())
         }),
+        s("upload-single", false, upload_single, |a| {
+            a.uploads
+                .dialog
+                .as_ref()
+                .is_some_and(|d| d.sendable() == 1 && !d.loading())
+        }),
+        s("upload-long", false, upload_long, |a| {
+            a.uploads.dialog.as_ref().is_some_and(|d| d.can_send())
+        }),
+        s("upload-wrong-room", false, upload_wrong_room, |a| {
+            a.uploads
+                .dialog
+                .as_ref()
+                .is_some_and(|d| Some(&d.room_id) != a.selected.as_ref())
+        }),
+        s("viewer-long", false, viewer_long, |a| {
+            a.media
+                .viewer
+                .as_ref()
+                .is_some_and(|v| v.decoded().is_some())
+        }),
+        s("viewer-loading", false, viewer_loading, |a| {
+            a.media
+                .viewer
+                .as_ref()
+                .is_some_and(|v| v.decoded().is_none())
+        }),
         s("viewer", false, viewer, |a| {
             a.media
                 .viewer
@@ -2469,6 +2890,12 @@ pub fn scenarios() -> Vec<Scenario> {
                 .is_some_and(|v| v.decoded().is_some())
         }),
         s("switcher", false, switcher, |a| a.switcher.open),
+        s("switcher-empty", false, switcher_empty, |a| {
+            a.switcher.open && a.switcher.results(&a.rooms).is_empty()
+        }),
+        s("switcher-long", false, switcher_long, |a| {
+            a.switcher.open && a.calls.count(&room("design")) == 3
+        }),
         s(
             "verification-requested",
             false,

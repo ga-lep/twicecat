@@ -579,7 +579,7 @@ impl MediaModel {
             .unwrap_or_default();
         self.open_bar = Some(OpenBar {
             key: key.clone(),
-            name: card_name(&shown),
+            name: file_title(&shown),
             may_run_code: may_run_code(filename) || may_run_code(&shown),
             path,
         });
@@ -601,6 +601,13 @@ impl MediaModel {
 /// A file name for display: sanitised by `text_safety` and capped.
 pub fn card_name(filename: &str) -> String {
     text_safety::name_or_placeholder(filename, MAX_NAME_CHARS)
+}
+
+/// A file name for a dialog (the upload confirmation, the viewer's bar):
+/// sanitised, and when longer than [`MAX_NAME_CHARS`] cut in the middle, so the
+/// end of the name (its extension) is always shown. [`card_name`] cuts the end.
+pub fn file_title(filename: &str) -> String {
+    crate::verification::elide_middle(filename, MAX_NAME_CHARS)
 }
 
 /// The word for a kind of media.
@@ -847,6 +854,19 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn a_file_title_keeps_the_end_of_a_long_name_and_cleans_it() {
+        let long = format!("{}.tar.gz", "a".repeat(300));
+        let shown = file_title(&long);
+        assert_eq!(shown.chars().count(), MAX_NAME_CHARS);
+        assert!(shown.ends_with(".tar.gz"), "{shown}");
+        assert!(shown.starts_with('a'));
+        assert_eq!(file_title("photo.png"), "photo.png");
+        assert!(!file_title("a\u{202e}b").contains('\u{202e}'));
+        // card_name cuts the end; the dialogs do not use it for this reason.
+        assert!(!card_name(&long).ends_with(".tar.gz"));
+    }
 
     fn encode(width: u32, height: u32, format: ImageFormat) -> Vec<u8> {
         let img = RgbaImage::from_pixel(width, height, Rgba([10, 200, 30, 255]));

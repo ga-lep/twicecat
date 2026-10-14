@@ -1,16 +1,18 @@
-//! The room dialogs (plan Q13, Q14, Task 12): **New room**, **Direct
-//! message**, **Join a room**, the user card of a clicked pill, and the
-//! layer that holds them with the room settings and member panels.
+//! The room dialogs (plan Q13, Q14, Task 12; restyled in UI/UX rework
+//! Task 15): **New room**, **Direct message**, **Join a room**, the user card
+//! of a clicked pill, and the layer that holds them with the room settings and
+//! member panels.
 //!
-//! The layer is always a stack of two (the base first), so opening a dialog
+//! Every dialog is a [`kit::dialog`]: a header with a close button, a body that
+//! scrolls when the window is short, and a footer whose last action is the main
+//! one. The layer is always a stack of two (the base first), so opening a dialog
 //! keeps the timeline's scroll offset and the composer's focus. Names, IDs
 //! and topics are other people's text; the model keeps them raw and every
-//! draw goes through [`crate::text_safety`].
+//! draw goes through [`crate::text_safety`], with a break inside a word when it
+//! has none, so the end of an ID is never cut off.
 
-use iced::widget::{
-    Column, button, checkbox, column, container, row, space, stack, text, text_input,
-};
-use iced::{Element, Fill, Length};
+use iced::widget::{Column, checkbox, column, responsive, row, space, stack, text_input};
+use iced::{Element, Fill};
 use twicecat_core::api::MessageText;
 
 use crate::rooms::{
@@ -19,7 +21,11 @@ use crate::rooms::{
 use crate::screens::{members, room_settings};
 use crate::state::{App, Message};
 use crate::text_safety::{name_or_placeholder, one_line_capped};
-use crate::ui::kit::{self, modal, muted};
+use crate::ui::kit::{
+    self, Severity, banner, banner_with, dialog, dialog_footer, dialog_header, field, muted,
+    primary_button, secondary_button, words,
+};
+use crate::ui::tokens;
 use crate::verification::elide_middle;
 
 /// Widget ID of the new room's name field.
@@ -44,111 +50,196 @@ pub fn layer<'a>(base: Element<'a, Message>, app: &'a App) -> Element<'a, Messag
     stack([base, top(app).unwrap_or_else(|| space().into())]).into()
 }
 
-/// The topmost screen of the room features, if any. The order is the one Esc
-/// closes in.
-fn top(app: &App) -> Option<Element<'_, Message>> {
-    let ui = &app.rooms_ui;
-    if let Some(dialog) = &ui.dialog {
-        return Some(match dialog {
-            Dialog::Create(dialog) => create_dialog(dialog),
-            Dialog::Dm(dialog) => dm_dialog(dialog),
-            Dialog::Join(dialog) => join_dialog(dialog),
-        });
-    }
-    if let Some(card) = &ui.card {
-        return Some(user_card(app, card));
-    }
-    if ui.settings.is_some() {
-        return room_settings::view(app);
-    }
-    if ui.members_panel.is_some() {
-        return members::view(app);
-    }
-    None
+/// What the room layer draws, topmost first. The order is the one Esc closes
+/// in (`App::escape` in `rooms.rs`): a screen is closed only when nothing
+/// above it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Top {
+    /// **New room**, **Direct message** or **Join a room**.
+    Dialog,
+    /// The user card.
+    Card,
+    /// The room settings.
+    Settings,
+    /// The member list.
+    Members,
 }
 
-/// A line of text under a form, in the danger colour.
+/// The screen of the room features that is drawn on top, if any.
+pub fn topmost(ui: &crate::rooms::RoomsModel) -> Option<Top> {
+    if ui.dialog.is_some() {
+        Some(Top::Dialog)
+    } else if ui.card.is_some() {
+        Some(Top::Card)
+    } else if ui.settings.is_some() {
+        Some(Top::Settings)
+    } else if ui.members_panel.is_some() {
+        Some(Top::Members)
+    } else {
+        None
+    }
+}
+
+/// The topmost screen of the room features, if any.
+fn top(app: &App) -> Option<Element<'_, Message>> {
+    let ui = &app.rooms_ui;
+    match (topmost(ui)?, &ui.dialog, &ui.card) {
+        (Top::Dialog, Some(Dialog::Create(dialog)), _) => {
+            Some(responsive(move |size| create_dialog(dialog, size.height)).into())
+        }
+        (Top::Dialog, Some(Dialog::Dm(dialog)), _) => {
+            Some(responsive(move |size| dm_dialog(dialog, size.height)).into())
+        }
+        (Top::Dialog, Some(Dialog::Join(dialog)), _) => {
+            Some(responsive(move |size| join_dialog(dialog, size.height)).into())
+        }
+        (Top::Card, _, Some(card)) => {
+            Some(responsive(move |size| user_card(app, card, size.height)).into())
+        }
+        (Top::Settings, ..) => room_settings::view(app),
+        (Top::Members, ..) => members::view(app),
+        _ => None,
+    }
+}
+
+/// A line under a form: the last failure in a bar of its own, or nothing (a
+/// slot that is always there).
 pub(crate) fn error_line<'a>(line: Option<&'static str>) -> Element<'a, Message> {
     match line {
-        Some(line) => text(line).size(13).style(text::danger).into(),
+        Some(line) => banner(Severity::Danger, line),
         None => space().into(),
     }
 }
 
-fn buttons<'a>(
+/// The footer of a form: **Cancel**, then the main action, which reads
+/// "Working..." and does nothing while it waits.
+fn footer<'a>(
     cancel: RoomsMessage,
     cancel_label: &'a str,
     submit: Option<(&'a str, Message)>,
 ) -> Element<'a, Message> {
-    let mut line = row![space().width(Fill)].spacing(8);
-    line = line.push(
-        button(text(cancel_label))
-            .on_press(msg(cancel))
-            .style(button::secondary),
-    );
-    if let Some((label, message)) = submit {
-        line = line.push(button(text(label)).on_press(message));
-    } else {
-        line = line.push(button(text("Working\u{2026}")));
-    }
-    line.into()
+    let cancel = secondary_button(cancel_label, Some(msg(cancel)));
+    let main = match submit {
+        Some((label, message)) => primary_button(label, Some(message)),
+        None => primary_button("Working\u{2026}", None),
+    };
+    dialog_footer(vec![cancel.into(), main.into()])
 }
 
-fn create_dialog(dialog: &CreateDialog) -> Element<'_, Message> {
+fn input<'a>(
+    placeholder: &'a str,
+    value: &str,
+    editable: bool,
+    on: fn(MessageText) -> RoomsMessage,
+    submit: RoomsMessage,
+) -> iced::widget::TextInput<'a, Message> {
+    text_input(placeholder, value)
+        .on_input_maybe(editable.then_some(move |s: String| msg(on(MessageText::from(s)))))
+        .on_submit_maybe(editable.then(|| msg(submit)))
+        .padding(tokens::S)
+}
+
+fn create_dialog(dialog: &CreateDialog, window_height: f32) -> Element<'_, Message> {
     let form = &dialog.form;
     let editable = !dialog.busy;
-    let field = |placeholder: &'static str, value: &str, on: fn(MessageText) -> RoomsMessage| {
-        text_input(placeholder, value)
-            .on_input_maybe(editable.then_some(move |s: String| msg(on(MessageText::from(s)))))
-            .on_submit_maybe(editable.then(|| msg(RoomsMessage::CreateSubmit)))
-            .padding(6)
-    };
-    let mut body = Column::new().spacing(10).push(text("New room").size(22));
-    body = body.push(field("Name", &form.name, RoomsMessage::CreateName).id(CREATE_NAME_ID));
-    body = body.push(field(
-        "Topic (optional)",
+    let submit = RoomsMessage::CreateSubmit;
+    let name = input(
+        "Name",
+        &form.name,
+        editable,
+        RoomsMessage::CreateName,
+        submit.clone(),
+    )
+    .id(CREATE_NAME_ID);
+    let topic = input(
+        "Topic",
         &form.topic,
+        editable,
         RoomsMessage::CreateTopic,
-    ));
-    body = body.push(
-        checkbox(form.encrypted)
-            .label("Encrypted")
-            .on_toggle_maybe(editable.then_some(|on| msg(RoomsMessage::CreateEncrypted(on)))),
+        submit.clone(),
     );
-    body = body.push(
-        text(if form.encrypted {
-            "Only the people in the room can read its messages. This cannot be turned off later."
-        } else {
-            "The server can read the messages of an unencrypted room. Encryption can be turned on \
-             later, but never off."
-        })
-        .size(12)
-        .style(muted),
-    );
-    body = body.push(
-        checkbox(form.public)
-            .label("Public (anyone can find and join it)")
-            .on_toggle_maybe(editable.then_some(|on| msg(RoomsMessage::CreatePublic(on)))),
-    );
-    if form.public {
-        body = body.push(field(
-            "Address, for example my-room",
-            &form.alias,
-            RoomsMessage::CreateAlias,
-        ));
-    }
-    body = body.push(field(
-        "Invite people (user IDs, separated by spaces)",
+    // The address field has a slot of its own, there or not, so the fields
+    // under it keep their places (and their focus) when Public is toggled.
+    let alias: Element<'_, Message> = if form.public {
+        field(
+            "Address",
+            input(
+                "my-room",
+                &form.alias,
+                editable,
+                RoomsMessage::CreateAlias,
+                submit.clone(),
+            ),
+        )
+    } else {
+        space().into()
+    };
+    let invitees = input(
+        "@name:server @other:server",
         &form.invitees,
+        editable,
         RoomsMessage::CreateInvitees,
-    ));
-    body = body.push(error_line(dialog.error));
-    body = body.push(buttons(
+        submit,
+    );
+    let body = Column::new()
+        .spacing(tokens::M)
+        .push(field("Name", name))
+        .push(field("Topic (optional)", topic))
+        .push(
+            checkbox(form.encrypted)
+                .label("Encrypted")
+                .on_toggle_maybe(editable.then_some(|on| msg(RoomsMessage::CreateEncrypted(on)))),
+        )
+        .push(
+            words(if form.encrypted {
+                "Only the people in the room can read its messages. This cannot be turned off \
+                 later."
+            } else {
+                "The server can read the messages of an unencrypted room. Encryption can be \
+                 turned on later, but never off."
+            })
+            .size(tokens::CAPTION)
+            .style(muted),
+        )
+        .push(
+            checkbox(form.public)
+                .label("Public (anyone can find and join it)")
+                .on_toggle_maybe(editable.then_some(|on| msg(RoomsMessage::CreatePublic(on)))),
+        )
+        .push(alias)
+        .push(field(
+            "Invite people (user IDs, separated by spaces)",
+            invitees,
+        ))
+        .push(error_line(dialog.error));
+    dialog_of(
+        "New room",
         RoomsMessage::CloseDialog,
-        "Cancel",
-        (!dialog.busy).then(|| ("Create", msg(RoomsMessage::CreateSubmit))),
-    ));
-    modal(body, CARD_WIDTH)
+        body.into(),
+        footer(
+            RoomsMessage::CloseDialog,
+            "Cancel",
+            (!dialog.busy).then(|| ("Create", msg(RoomsMessage::CreateSubmit))),
+        ),
+        window_height,
+    )
+}
+
+/// A dialog of this module's width.
+fn dialog_of<'a>(
+    title: &'a str,
+    close: RoomsMessage,
+    body: Element<'a, Message>,
+    footer: Element<'a, Message>,
+    window_height: f32,
+) -> Element<'a, Message> {
+    dialog(
+        dialog_header(title, msg(close)),
+        body,
+        Some(footer),
+        CARD_WIDTH,
+        window_height,
+    )
 }
 
 /// What differs between the two one-field dialogs.
@@ -162,31 +253,41 @@ struct Field<'a> {
     submit_label: &'a str,
 }
 
-fn one_field<'a>(spec: Field<'a>, dialog: &'a InputDialog) -> Element<'a, Message> {
+fn one_field<'a>(
+    spec: Field<'a>,
+    dialog: &'a InputDialog,
+    window_height: f32,
+) -> Element<'a, Message> {
     let editable = !dialog.busy;
-    let input = spec.input;
-    let submit_msg = msg(spec.submit);
-    let field = text_input(spec.placeholder, &dialog.input)
-        .id(spec.id)
-        .on_input_maybe(editable.then_some(move |s: String| msg(input(MessageText::from(s)))))
-        .on_submit_maybe(editable.then(|| submit_msg.clone()))
-        .padding(6);
+    let submit_msg = msg(spec.submit.clone());
+    let field = input(
+        spec.placeholder,
+        &dialog.input,
+        editable,
+        spec.input,
+        spec.submit,
+    )
+    .id(spec.id);
     let body = column![
-        text(spec.title).size(22),
-        text(spec.note).size(13).style(muted),
+        words(spec.note).size(tokens::BODY).style(muted),
         field,
         error_line(dialog.error),
-        buttons(
+    ]
+    .spacing(tokens::M);
+    dialog_of(
+        spec.title,
+        RoomsMessage::CloseDialog,
+        body.into(),
+        footer(
             RoomsMessage::CloseDialog,
             "Cancel",
             (!dialog.busy).then_some((spec.submit_label, submit_msg)),
         ),
-    ]
-    .spacing(10);
-    modal(body, CARD_WIDTH)
+        window_height,
+    )
 }
 
-fn dm_dialog(dialog: &InputDialog) -> Element<'_, Message> {
+fn dm_dialog(dialog: &InputDialog, window_height: f32) -> Element<'_, Message> {
     one_field(
         Field {
             title: "Direct message",
@@ -199,10 +300,11 @@ fn dm_dialog(dialog: &InputDialog) -> Element<'_, Message> {
             submit_label: "Start",
         },
         dialog,
+        window_height,
     )
 }
 
-fn join_dialog(dialog: &InputDialog) -> Element<'_, Message> {
+fn join_dialog(dialog: &InputDialog, window_height: f32) -> Element<'_, Message> {
     one_field(
         Field {
             title: "Join a room",
@@ -214,6 +316,7 @@ fn join_dialog(dialog: &InputDialog) -> Element<'_, Message> {
             submit_label: "Join",
         },
         dialog,
+        window_height,
     )
 }
 
@@ -231,7 +334,7 @@ pub fn card_lines(app: &App, card: &UserCard) -> (Option<String>, String) {
     (name, one_line_capped(card.user.as_str(), MAX_ID_CHARS))
 }
 
-fn user_card<'a>(app: &'a App, card: &'a UserCard) -> Element<'a, Message> {
+fn user_card<'a>(app: &'a App, card: &'a UserCard, window_height: f32) -> Element<'a, Message> {
     let (name, id) = card_lines(app, card);
     let avatar = app
         .known_members()
@@ -239,52 +342,58 @@ fn user_card<'a>(app: &'a App, card: &'a UserCard) -> Element<'a, Message> {
         .find(|m| m.user_id == card.user)
         .and_then(|m| m.avatar.as_ref());
     let shown_name = name.clone().unwrap_or_else(|| id.clone());
-    let mut who = Column::new().spacing(2).width(Fill);
+    let mut who = Column::new().spacing(tokens::XS).width(Fill);
     if let Some(name) = name {
-        who = who.push(text(name).size(20));
+        // A name that reads like a tag ("Verified") is quoted, so it cannot
+        // pass for the trust tag under it.
+        who = who.push(words(members::shown_name(&name)).size(tokens::TITLE));
     }
-    who = who.push(text(id).size(14).style(muted));
+    who = who.push(words(id).size(tokens::BODY).style(muted));
+    if let Some(tag) = members::trust_tag(app, &card.user) {
+        who = who.push(tag);
+    }
     let message = (!card.busy).then(|| ("Message", msg(RoomsMessage::CardMessage)));
     let body = column![
         row![
-            kit::avatar(&card.user, &shown_name, avatar, &app.avatars),
+            kit::avatar_sized(&card.user, &shown_name, avatar, &app.avatars, 48.0),
             who
         ]
-        .spacing(12)
+        .spacing(tokens::M)
         .align_y(iced::Center),
         error_line(card.error),
-        buttons(RoomsMessage::CardClose, "Close", message),
     ]
-    .spacing(12);
-    modal(body, CARD_WIDTH)
+    .spacing(tokens::M);
+    let main = match message {
+        Some((label, message)) => primary_button(label, Some(message)),
+        None => primary_button("Working\u{2026}", None),
+    };
+    dialog(
+        dialog_header("Person", msg(RoomsMessage::CardClose)),
+        body.into(),
+        Some(dialog_footer(vec![main.into()])),
+        CARD_WIDTH,
+        window_height,
+    )
 }
 
 /// The bar above the composer that asks to join the room of a clicked pill.
+/// The question has the whole width; the buttons are on a row of their own.
 pub fn join_bar(bar: &JoinBar) -> Element<'_, Message> {
     let question = format!("Join {}?", elide_middle(&bar.id, BAR_ID_CHARS));
-    let join =
-        button(text("Join")).on_press_maybe((!bar.busy).then(|| msg(RoomsMessage::JoinBarJoin)));
-    container(
-        row![
-            text(question),
-            space().width(Fill),
-            join,
-            button(text("Cancel"))
-                .on_press(msg(RoomsMessage::JoinBarCancel))
-                .style(button::secondary),
-        ]
-        .spacing(8)
-        .align_y(iced::Center),
+    banner_with(
+        Severity::Info,
+        question,
+        vec![
+            secondary_button("Cancel", Some(msg(RoomsMessage::JoinBarCancel))).into(),
+            primary_button("Join", (!bar.busy).then(|| msg(RoomsMessage::JoinBarJoin))).into(),
+        ],
     )
-    .padding(4)
-    .width(Length::Fill)
-    .into()
 }
 
 #[cfg(test)]
 mod tests {
     use iced::advanced::widget::Tree;
-    use iced::widget::text_editor;
+    use iced::widget::{text, text_editor};
     use twicecat_core::api::{
         MembershipView, PowerLevelView, Role, RoomDetailsView, RoomId, RoomMemberView,
         RoomPermissions, UserId,
@@ -464,6 +573,51 @@ mod tests {
             tree.diff(build(&app, &content));
             assert_eq!(tags(&tree), before, "state {i}");
         }
+    }
+
+    #[test]
+    fn escape_closes_what_is_drawn_on_top_and_a_question_before_its_panel() {
+        let mut app = app();
+        app.selected = Some(room());
+        app.rooms_ui.dialog = Some(Dialog::Dm(InputDialog {
+            input: String::new(),
+            error: None,
+            busy: false,
+        }));
+        app.rooms_ui.card = Some(UserCard {
+            user: UserId::from("@bob:x"),
+            busy: false,
+            error: None,
+        });
+        app.rooms_ui.settings = Some(settings(true, true));
+        let mut order = Vec::new();
+        while let Some(top) = topmost(&app.rooms_ui) {
+            let asking = app
+                .rooms_ui
+                .settings
+                .as_ref()
+                .is_some_and(|panel| panel.encrypt_ask || panel.leave_ask);
+            let _ = app.update(Message::Rooms(RoomsMessage::Escape));
+            let now = topmost(&app.rooms_ui);
+            if top == Top::Settings && asking {
+                // The question is cancelled; the panel stays, and nothing was
+                // confirmed.
+                assert_eq!(now, Some(Top::Settings));
+                let panel = app.rooms_ui.settings.as_ref().expect("still open");
+                assert!(!panel.encrypt_ask && !panel.leave_ask);
+                order.push("question");
+            } else {
+                assert_ne!(now, Some(top), "Esc closed {top:?}");
+                order.push(match top {
+                    Top::Dialog => "dialog",
+                    Top::Card => "card",
+                    Top::Settings => "panel",
+                    Top::Members => "members",
+                });
+            }
+            assert!(order.len() < 10);
+        }
+        assert_eq!(order, ["dialog", "card", "question", "panel"]);
     }
 
     #[test]

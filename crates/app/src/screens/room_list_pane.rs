@@ -770,7 +770,7 @@ fn avatar_view<'a>(
 /// The call pill: the speaker and how many devices are in the room's call,
 /// in the highlight colour while the room rings. An empty space without a
 /// call, so a row keeps its widget types.
-fn call_pill<'a>(call: Option<CallPill>) -> Element<'a, Message> {
+pub(crate) fn call_pill<'a>(call: Option<CallPill>) -> Element<'a, Message> {
     match call {
         None => space().width(0).into(),
         Some(call) => kit::icon_tag(Icon::Speaker, call_label(call), call.ringing),
@@ -780,7 +780,7 @@ fn call_pill<'a>(call: Option<CallPill>) -> Element<'a, Message> {
 /// The badge at the right of a row. A muted room's count is drawn as an
 /// outline in the muted text colour instead of a filled badge; mentions keep
 /// their highlight.
-fn badge_view<'a>(badge: Badge, muted: bool) -> Element<'a, Message> {
+pub(crate) fn badge_view<'a>(badge: Badge, muted: bool) -> Element<'a, Message> {
     match badge {
         Badge::None => space().width(0).into(),
         Badge::Highlight(count) => pill(count_label(count), Tone::Highlight),
