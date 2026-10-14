@@ -43,13 +43,14 @@ pub(crate) const MAX_DB_ERB: f32 = 35.0;
 pub(crate) const MAX_DB_DF: f32 = 35.0;
 
 /// The model directory: `TWICECAT_MODEL_DIR`, else where
-/// `scripts/fetch-models.sh` puts it.
+/// `scripts/fetch-models.sh` puts it, else the package's copy.
 pub fn default_model_dir() -> Option<PathBuf> {
     crate::paths::from_env_or_cache("TWICECAT_MODEL_DIR", "models/deepfilternet3")
 }
 
 /// The stateful graph for the GPU (`scripts/export-deepfilternet.sh`):
-/// `TWICECAT_STATEFUL_MODEL`, else where that script installs it.
+/// `TWICECAT_STATEFUL_MODEL`, else where that script installs it, else the
+/// package's copy (Linux packages bundle it with the "any GPU" pack).
 pub fn default_stateful_model() -> Option<PathBuf> {
     crate::paths::from_env_or_cache(
         "TWICECAT_STATEFUL_MODEL",

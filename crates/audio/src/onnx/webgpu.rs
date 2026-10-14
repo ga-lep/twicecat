@@ -43,7 +43,8 @@ fn library_name() -> &'static str {
 }
 
 /// Where `scripts/fetch-webgpu-ep.sh` put the WebGPU plugin provider, or
-/// `TWICECAT_WEBGPU_EP_DIR`; `None` when neither exists.
+/// `TWICECAT_WEBGPU_EP_DIR`, or the package's copy (bundled on Linux);
+/// `None` when none exists.
 pub fn default_webgpu_dir() -> Option<PathBuf> {
     let relative = format!("onnxruntime/webgpu-ep-{WEBGPU_EP_VERSION}");
     let dir = crate::paths::from_env_or_cache("TWICECAT_WEBGPU_EP_DIR", &relative)?;
