@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use super::call::SoundSource;
 use super::types::{UserId, string_newtype};
 
 /// An attenuation limit that limits nothing (DeepFilterNet removes all it
@@ -376,8 +377,12 @@ pub struct AudioSettings {
     pub output_volume_percent: u16,
     /// Opus bitrate for the microphone track, kbit/s (16..=510).
     pub voice_bitrate_kbps: u16,
-    /// Per-user playback volume, percent (0..=200), kept across calls.
+    /// Per-user playback volume of their voice, percent (0..=200), kept
+    /// across calls.
     pub user_volumes: BTreeMap<UserId, u16>,
+    /// Per-user playback volume of their screen shares' sound, percent
+    /// (0..=200), kept across calls.
+    pub user_share_volumes: BTreeMap<UserId, u16>,
     /// Cleaning other people's voices on this device.
     pub remote_cleaning: RemoteCleaning,
     /// Per-user cleaning choice, kept across calls (absent: automatic).
@@ -406,6 +411,7 @@ impl Default for AudioSettings {
             // Opus voice is near-transparent here; Discord's default is 64.
             voice_bitrate_kbps: 64,
             user_volumes: BTreeMap::new(),
+            user_share_volumes: BTreeMap::new(),
             remote_cleaning: RemoteCleaning::default(),
             user_cleaning: BTreeMap::new(),
             announce_cleaning: CleaningAnnouncement::default(),
@@ -470,11 +476,13 @@ impl AudioSettings {
         self.output_volume_percent = self.output_volume_percent.min(limits::VOLUME_PERCENT);
         let (lo, hi) = limits::VOICE_BITRATE_KBPS;
         self.voice_bitrate_kbps = self.voice_bitrate_kbps.clamp(lo, hi);
-        for volume in self.user_volumes.values_mut() {
-            *volume = (*volume).min(limits::VOLUME_PERCENT);
+        for volumes in [&mut self.user_volumes, &mut self.user_share_volumes] {
+            for volume in volumes.values_mut() {
+                *volume = (*volume).min(limits::VOLUME_PERCENT);
+            }
+            // 100 % is the default; storing it would only grow the file.
+            volumes.retain(|_, v| *v != 100);
         }
-        // 100 % is the default; storing it would only grow the file.
-        self.user_volumes.retain(|_, v| *v != 100);
         self.remote_cleaning.attenuation_limit_db = clamp_f32(
             self.remote_cleaning.attenuation_limit_db,
             limits::DF_ATTENUATION_DB,
@@ -524,9 +532,30 @@ impl AudioSettings {
         self
     }
 
-    /// Playback volume for `user`, percent.
+    /// Playback volume of `user`'s voice, percent.
     pub fn user_volume(&self, user: &UserId) -> u16 {
         self.user_volumes.get(user).copied().unwrap_or(100)
+    }
+
+    /// Playback volume of `user`'s screen-share sound, percent.
+    pub fn user_share_volume(&self, user: &UserId) -> u16 {
+        self.user_share_volumes.get(user).copied().unwrap_or(100)
+    }
+
+    /// The per-user volumes of one of their sounds.
+    pub fn volumes_of(&self, source: SoundSource) -> &BTreeMap<UserId, u16> {
+        match source {
+            SoundSource::Voice => &self.user_volumes,
+            SoundSource::ScreenShare => &self.user_share_volumes,
+        }
+    }
+
+    /// The per-user volumes of one of their sounds, to change.
+    pub fn volumes_of_mut(&mut self, source: SoundSource) -> &mut BTreeMap<UserId, u16> {
+        match source {
+            SoundSource::Voice => &mut self.user_volumes,
+            SoundSource::ScreenShare => &mut self.user_share_volumes,
+        }
     }
 
     /// The cleaning choice for one user.
@@ -594,11 +623,16 @@ mod tests {
         let mut user_cleaning = BTreeMap::new();
         user_cleaning.insert(UserId::from("@noisy:x"), VoiceCleaning::Always);
         user_cleaning.insert(UserId::from("@plain:x"), VoiceCleaning::Automatic);
+        let user_share_volumes = BTreeMap::from([
+            (UserId::from("@game:x"), 300),
+            (UserId::from("@same:x"), 100),
+        ]);
         let s = AudioSettings {
             input_gain_db: -99.0,
             output_volume_percent: 500,
             voice_bitrate_kbps: 2,
             user_volumes,
+            user_share_volumes,
             user_cleaning,
             remote_cleaning: RemoteCleaning {
                 enabled: true,
@@ -627,6 +661,8 @@ mod tests {
         assert_eq!(s.user_volume(&UserId::from("@loud:x")), 200);
         assert!(!s.user_volumes.contains_key(&UserId::from("@same:x")));
         assert_eq!(s.user_volume(&UserId::from("@same:x")), 100);
+        assert_eq!(s.user_share_volume(&UserId::from("@game:x")), 200);
+        assert_eq!(s.user_share_volumes.len(), 1, "100 % is not stored");
         assert_eq!(s.remote_cleaning.attenuation_limit_db, 100.0);
         assert_eq!(
             s.user_cleaning(&UserId::from("@noisy:x")),
@@ -768,6 +804,7 @@ mod tests {
                 "output_volume_percent": 100,
                 "voice_bitrate_kbps": 64,
                 "user_volumes": {},
+                "user_share_volumes": {},
                 "remote_cleaning": {
                     "enabled": false,
                     "attenuation_limit_db": 100.0,

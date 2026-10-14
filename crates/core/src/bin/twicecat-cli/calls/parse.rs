@@ -28,10 +28,12 @@ pub(crate) enum CallCmd {
     /// The most automatic gain may boost, dB; turns it on.
     AgcMax(f32),
     Gate(GateArg),
-    /// Participant index from `/who`, or a user ID.
+    /// Participant index from `/who`, or a user ID; their voice, or with
+    /// `share` their screen share's sound.
     Vol {
         who: String,
         percent: u16,
+        share: bool,
     },
     /// Cleaning other people's voices.
     Clean(CleanArg),
@@ -207,15 +209,18 @@ fn gate(arg: &str) -> Result<GateArg, &'static str> {
 }
 
 fn volume(arg: &str) -> Result<CallCmd, &'static str> {
-    const USAGE: &str = "/vol <n|@user:server> <percent>";
+    const USAGE: &str = "/vol <n|@user:server> <percent> [share]";
     let mut words = arg.split_whitespace();
-    match (words.next(), words.next(), words.next()) {
-        (Some(who), Some(percent), None) => Ok(CallCmd::Vol {
-            who: who.to_owned(),
-            percent: percent.trim_end_matches('%').parse().map_err(|_| USAGE)?,
-        }),
-        _ => Err(USAGE),
-    }
+    let (who, percent, share) = match (words.next(), words.next(), words.next(), words.next()) {
+        (Some(who), Some(percent), None, None) => (who, percent, false),
+        (Some(who), Some(percent), Some("share"), None) => (who, percent, true),
+        _ => return Err(USAGE),
+    };
+    Ok(CallCmd::Vol {
+        who: who.to_owned(),
+        percent: percent.trim_end_matches('%').parse().map_err(|_| USAGE)?,
+        share,
+    })
 }
 
 fn clean(arg: &str) -> Result<CleanArg, &'static str> {
@@ -335,9 +340,19 @@ mod tests {
             cmd("/vol 1 150%"),
             Ok(CallCmd::Vol {
                 who: "1".into(),
-                percent: 150
+                percent: 150,
+                share: false,
             })
         );
+        assert_eq!(
+            cmd("/vol 1 40 share"),
+            Ok(CallCmd::Vol {
+                who: "1".into(),
+                percent: 40,
+                share: true,
+            })
+        );
+        assert!(cmd("/vol 1 40 game").is_err());
         assert_eq!(cmd("/clean"), Ok(CallCmd::Clean(CleanArg::Switch(None))));
         assert_eq!(
             cmd("/clean on"),

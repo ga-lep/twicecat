@@ -41,7 +41,7 @@ use super::{membership, now_ms};
 
 /// Log targets that carry call keys, turned off by [`crate::logging`]
 /// whatever the filter asks. libwebrtc's own log reaches `log` as `debug`
-/// under `libwebrtc`, whatever its severity (libwebrtc 0.3.50
+/// under `libwebrtc`, whatever its severity (libwebrtc 0.3.52
 /// `native/peer_connection_factory.rs:41-43`), and its frame cryptor writes
 /// the secret and the derived key there each time a key is set or
 /// ratcheted (webrtc-sdk/webrtc#308; the strings are in our prebuilt).

@@ -11,6 +11,14 @@ There are two builds of the desktop app. They differ only in where voices are cl
 
 RustRover has a run configuration for each build, shared in `.run/`. They appear in the run menu as **Twicecat full (GPU)** and **Twicecat light (CPU only)**.
 
+## Hardware video encoding (NVIDIA, Linux)
+
+Both builds encode call video with LiveKit's own encoders. On Linux, LiveKit's NVENC encoder and NVDEC decoder are compiled in only when NVIDIA's `cuda.h` is there at build time. Get it once with `scripts/fetch-cuda-headers.sh` (about 2 MB, from NVIDIA's pinned CUDA runtime wheel, under NVIDIA's licence). It is linked into `dev/cuda`, where `.cargo/config.toml` points `CUDA_HOME`. A system CUDA toolkit works too: set `CUDA_HOME` to it.
+
+If you built before fetching the header, run `cargo clean -p webrtc-sys` once. webrtc-sys does not notice the header appearing.
+
+Without the header, or on a machine without an NVIDIA GPU, video is encoded on the CPU (VP8, up to 1080p30). The NVIDIA libraries are loaded at run time, so the same binary runs everywhere.
+
 ## What the full build needs at run time
 
 Nothing GPU-related is linked at build time. The full build loads these files when a call or mic test starts. Each script checks a pinned SHA-256 and unpacks into `~/.cache/twicecat/`.

@@ -6,6 +6,8 @@
 
 #[path = "twicecat-cli/calls/mod.rs"]
 mod calls;
+#[path = "twicecat-cli/video.rs"]
+mod video;
 
 use std::collections::HashSet;
 use std::io::IsTerminal;
@@ -17,7 +19,8 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use twicecat_core::api::{
     AUDIO_FRAME_LEN, AudioBackend, Command, CoreEvent, ListDiff, MessageText, Password, RoomId,
-    RoomSummary, SecurityStatus, SyncState, TimelineItem, TimelineItemKind, VirtualAudio,
+    RoomSummary, SecurityStatus, SyncState, TimelineItem, TimelineItemKind, VideoBackend,
+    VirtualAudio,
 };
 use twicecat_core::logging;
 use twicecat_core::paths::DataPaths;
@@ -31,7 +34,7 @@ twicecat-cli: headless Matrix client on the Twicecat core
 
 USAGE:
     twicecat-cli [--data-dir <path> | --ephemeral] [--homeserver <url>] [--password-stdin]
-                [--silent-audio]
+                [--silent-audio] [--test-video]
 
 OPTIONS:
     --data-dir <path>     Store session data here (default: the OS data directory;
@@ -48,6 +51,9 @@ OPTIONS:
                           only with piped input.
     --silent-audio        Calls send silence and play nothing; the microphone
                           and speakers are never opened (tests, scripts)
+    --test-video          The camera and the screen are a moving test pattern
+                          (see /video pattern); real cameras and screens come
+                          with later versions
     --help                Show this help
 
 COMMANDS (type them at the prompt):
@@ -72,7 +78,9 @@ CALLS (voice, MatrixRTC; joining opens the microphone and speakers):
     /ptt [on|off]         In push-to-talk mode, start or stop transmitting.
                           A terminal cannot see a key being released, so this
                           toggles instead of holding
-    /vol <n|user> <pct>   Playback volume of a participant (0-200 %, kept)
+    /vol <n|user> <pct> [share]
+                          Playback volume of a participant's voice, or of
+                          their screen share's sound (0-200 %, kept)
     /clean [on|off]       Clean the voices you hear with DeepFilterNet3 (up to
                           4 talking at once; about 30 ms later; off by default)
     /clean limit <dB>     Most noise removed from them (0-100)
@@ -90,6 +98,18 @@ CALLS (voice, MatrixRTC; joining opens the microphone and speakers):
     /clean gpu on|off     Clean them on a GPU (needs a gpu-enhancement build;
                           every talker at once, little CPU; the CPU takes
                           over if no GPU keeps up)
+
+VIDEO (in a call; needs --test-video to send):
+    /video                List the call's video tracks
+    /video pattern <res> <fps> [screen]
+                          Send the test pattern as your camera (or a screen
+                          share): 720p 30, 1080p 60, 1440p 60, 2160p 30 or
+                          2160p 60; sent at most at 1080p30 for now
+    /video off [screen]   Stop your camera (or screen share)
+    /video view <n> <w>x<h>|hide
+                          Receive track n for that size on screen, or not at
+                          all (the call server picks the layer)
+    /video stats          Print the next second's video statistics
 
 AUDIO SETTINGS (saved; take effect at the next call or mic test):
     /audio                Show the audio settings
@@ -147,6 +167,7 @@ struct Options {
     ephemeral: bool,
     password_stdin: bool,
     silent_audio: bool,
+    test_video: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -166,6 +187,8 @@ enum Repl {
     Quit,
     /// A call or audio command, or its usage when the arguments are wrong.
     Call(Result<calls::CallCmd, &'static str>),
+    /// A video command, or its usage.
+    Video(Result<video::VideoCmd, &'static str>),
     Unknown(String),
     Text(String),
 }
@@ -177,6 +200,7 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
         ephemeral: false,
         password_stdin: false,
         silent_audio: false,
+        test_video: false,
     };
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -185,6 +209,7 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
             "--ephemeral" => options.ephemeral = true,
             "--password-stdin" => options.password_stdin = true,
             "--silent-audio" => options.silent_audio = true,
+            "--test-video" => options.test_video = true,
             "--data-dir" => {
                 let value = iter.next().ok_or("--data-dir needs a path")?;
                 options.data_dir = Some(value.clone());
@@ -218,6 +243,7 @@ fn parse_repl(line: &str) -> Repl {
         "oauth" if !arg.trim().is_empty() => Repl::OAuth(arg.trim().to_owned()),
         "select" if !arg.trim().is_empty() => Repl::Select(arg.trim().to_owned()),
         "send" if !arg.is_empty() => Repl::Send(arg.to_owned()),
+        "video" => Repl::Video(video::parse(arg)),
         _ => match calls::parse(name, arg) {
             Some(parsed) => Repl::Call(parsed),
             None => Repl::Unknown(format!("/{name}")),
@@ -499,6 +525,7 @@ struct Cli {
     timeline: Vec<TimelineItem>,
     printed: HashSet<String>,
     calls: calls::Calls,
+    video: video::Video,
 }
 
 /// What the loop should do after handling one input.
@@ -686,7 +713,19 @@ impl Cli {
                 }
                 Flow::Continue
             }
-            Repl::Call(Err(usage)) => {
+            Repl::Video(Ok(cmd)) => {
+                let (commands, lines) = self.video.command(cmd);
+                for line in lines {
+                    println!("{line}");
+                }
+                for command in commands {
+                    if matches!(self.send(command).await, Flow::Quit) {
+                        return Flow::Quit;
+                    }
+                }
+                Flow::Continue
+            }
+            Repl::Call(Err(usage)) | Repl::Video(Err(usage)) => {
                 println!("Usage: {usage}");
                 Flow::Continue
             }
@@ -858,6 +897,20 @@ impl Cli {
                     println!("{line}");
                 }
             }
+            // A terminal shows no pictures: feeds are dropped, and the
+            // core's statistics count what arrives.
+            CoreEvent::VideoFeed { .. } | CoreEvent::CameraPreview(_) => {}
+            event @ (CoreEvent::VideoTracks { .. }
+            | CoreEvent::LocalVideo(_)
+            | CoreEvent::VideoStats(_)) => {
+                for line in self.video.event(event) {
+                    println!("{line}");
+                }
+            }
+            CoreEvent::VideoDevices(_)
+            | CoreEvent::ScreenSources(_)
+            | CoreEvent::VideoSettings(_)
+            | CoreEvent::VideoEncoders(_) => {}
         }
     }
 
@@ -958,6 +1011,11 @@ async fn main() -> ExitCode {
                 AudioBackend::System
             },
             call_service_override: None,
+            video: if options.test_video {
+                VideoBackend::TestPattern
+            } else {
+                VideoBackend::System
+            },
         },
         secrets,
     );
@@ -1000,6 +1058,7 @@ async fn main() -> ExitCode {
         timeline: Vec::new(),
         printed: HashSet::new(),
         calls: calls::Calls::default(),
+        video: video::Video::default(),
     };
     cli.run().await;
 
@@ -1042,6 +1101,7 @@ mod tests {
             "--ephemeral",
             "--password-stdin",
             "--silent-audio",
+            "--test-video",
         ]));
         assert_eq!(
             parsed,
@@ -1051,6 +1111,7 @@ mod tests {
                 ephemeral: true,
                 password_stdin: true,
                 silent_audio: true,
+                test_video: true,
             }))
         );
     }
@@ -1066,6 +1127,7 @@ mod tests {
                 ephemeral: false,
                 password_stdin: false,
                 silent_audio: false,
+                test_video: false,
             }))
         );
     }
@@ -1080,6 +1142,7 @@ mod tests {
                 ephemeral: false,
                 password_stdin: false,
                 silent_audio: false,
+                test_video: false,
             }))
         );
         assert_eq!(parse_args(&args(&["--help"])), Ok(Parsed::Help));
@@ -1264,6 +1327,7 @@ mod tests {
             timeline: Vec::new(),
             printed: HashSet::new(),
             calls: calls::Calls::default(),
+            video: video::Video::default(),
         };
         (cli, interrupt_tx)
     }

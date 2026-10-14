@@ -2,6 +2,8 @@
 //!
 //! Only plain API types cross the public boundary. SDK types stay in here.
 
+mod video;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,9 +30,10 @@ use zeroize::Zeroizing;
 
 use crate::api::{
     ActionKind, AudioBackend, AudioDevice, AudioDeviceId, AudioDevices, AudioSettings,
-    CallEndReason, CallState, Command, CoreError, CoreEvent, DeviceId, Draft, ListDiff, MediaSize,
-    Member, MessageText, OutgoingAttachment, OutgoingMessage, PaginationState, Password, RoomId,
-    RoomListQuery, RoomNotificationModeView, TimelineItem, TypingUser, UserId,
+    CallEndReason, CallIntent, CallState, Command, CoreError, CoreEvent, DeviceId, Draft, ListDiff,
+    MediaSize, Member, MessageText, OutgoingAttachment, OutgoingMessage, PaginationState, Password,
+    RoomId, RoomListQuery, RoomNotificationModeView, TimelineItem, TypingUser, UserId,
+    VideoBackend,
 };
 use crate::audio_session::{AudioSession, Mode};
 use crate::avatars::{Avatars, SdkFetcher, answer_unavailable};
@@ -94,6 +97,9 @@ pub struct CoreConfig {
     /// to publish on instead of the homeserver's advertised one: a
     /// self-hosted SFU, or tests. `https`, or `http` on loopback.
     pub call_service_override: Option<String>,
+    /// Cameras and screens for calls (`VideoBackend::System` unless
+    /// testing).
+    pub video: VideoBackend,
 }
 
 /// The channels to talk to a running engine.
@@ -136,6 +142,8 @@ impl Core {
             oauth: None,
             room_list_query: watch::channel(RoomListQuery::default()).0,
             audio_settings: None,
+            video_settings: None,
+            video_encoders: None,
             device_watcher: None,
             audio_session: None,
             call: None,
@@ -527,6 +535,10 @@ struct Engine {
     room_list_query: watch::Sender<RoomListQuery>,
     /// Audio settings, loaded from disk on first use.
     audio_settings: Option<AudioSettings>,
+    /// Video settings, loaded from disk on first use.
+    video_settings: Option<crate::api::VideoSettings>,
+    /// The video encoders LiveKit has here, found on first use.
+    video_encoders: Option<crate::call::VideoEncodersAvailable>,
     /// Hot-plug watcher, started by the first `ListAudioDevices`.
     device_watcher: Option<twicecat_audio::DeviceWatcher>,
     /// Open devices and the voice engine (mic test for now).
@@ -603,7 +615,7 @@ fn audio_devices(list: twicecat_audio::DeviceList) -> AudioDevices {
 }
 
 /// Runs blocking work (keychain, file system) off the async threads.
-async fn blocking<T, F>(f: F) -> Result<T, CoreError>
+pub(super) async fn blocking<T, F>(f: F) -> Result<T, CoreError>
 where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
@@ -1362,14 +1374,24 @@ impl Engine {
             Command::UpdateAudioSettings(settings) => {
                 self.store_audio_settings(settings.validated()).await;
             }
-            Command::SetUserVolume { user_id, percent } => {
+            Command::SetUserVolume {
+                user_id,
+                source,
+                percent,
+            } => {
                 let mut settings = self.audio_settings().await.clone();
-                settings.user_volumes.insert(user_id.clone(), percent);
+                settings
+                    .volumes_of_mut(source)
+                    .insert(user_id.clone(), percent);
                 let settings = settings.validated();
-                let applied = settings.user_volume(&user_id);
+                let applied = settings
+                    .volumes_of(source)
+                    .get(&user_id)
+                    .copied()
+                    .unwrap_or(100);
                 self.store_audio_settings(settings).await;
                 if let Some(call) = &self.call {
-                    call.set_user_volume(&user_id, applied);
+                    call.set_user_volume(&user_id, source, applied);
                 }
             }
             Command::SetUserCleaning { user_id, cleaning } => {
@@ -1378,7 +1400,7 @@ impl Engine {
                 // Stored, echoed and applied to the call like any change.
                 self.store_audio_settings(settings.validated()).await;
             }
-            Command::JoinCall { room_id, intent: _ } => self.join_call(room_id).await,
+            Command::JoinCall { room_id, intent } => self.join_call(room_id, intent).await,
             Command::LeaveCall => {
                 if self.call.is_some() {
                     self.leave_call().await;
@@ -1410,6 +1432,18 @@ impl Engine {
             }
             Command::ListAudioDevices => self.list_audio_devices().await,
             Command::StartMicTest { loopback } => self.start_mic_test(loopback).await,
+            command @ (Command::ListVideoDevices
+            | Command::ListScreenSources
+            | Command::StartCamera { .. }
+            | Command::StopCamera
+            | Command::StartScreenShare { .. }
+            | Command::StopScreenShare
+            | Command::SetVideoView { .. }
+            | Command::GetVideoSettings
+            | Command::UpdateVideoSettings(_)
+            | Command::ProbeVideoEncoders
+            | Command::StartCameraPreview { .. }
+            | Command::StopCameraPreview) => self.video_command(command).await,
             Command::StopMicTest => {
                 if let Some(session) = self.audio_session.take() {
                     session.stop().await;
@@ -1716,7 +1750,7 @@ impl Engine {
         self.audio_settings = Some(settings.clone());
         self.update_ring_gate(self.call.is_some());
         if let Ok(mut shared) = self.user_volumes.write() {
-            shared.clone_from(&settings.user_volumes);
+            *shared = crate::call::volumes_of(&settings);
         }
         if let Some(call) = &self.call {
             call.set_cleaning(&settings);
@@ -1744,7 +1778,7 @@ impl Engine {
     }
 
     /// Joins `room_id`'s call, leaving another call first.
-    async fn join_call(&mut self, room_id: RoomId) {
+    async fn join_call(&mut self, room_id: RoomId, intent: CallIntent) {
         let Some(active) = self.active.as_ref() else {
             self.emit(CoreEvent::Error(CoreError::NotLoggedIn)).await;
             return;
@@ -1767,7 +1801,7 @@ impl Engine {
             self.end_call(true).await;
         }
         // Participants carry the per-user volumes.
-        let volumes = self.audio_settings().await.user_volumes.clone();
+        let volumes = crate::call::volumes_of(self.audio_settings().await);
         if let Ok(mut shared) = self.user_volumes.write() {
             *shared = volumes;
         }
@@ -1783,6 +1817,7 @@ impl Engine {
         match CallSession::join(
             &client,
             room_id.clone(),
+            intent,
             audio,
             self.events.clone(),
             self.user_volumes.clone(),
@@ -1920,7 +1955,9 @@ impl Engine {
                     if let Some(calls) = self.calls() {
                         calls.set_sent(&call.room_id, None);
                     }
+                    let video = (call.has_video(), call.local_video());
                     call.leave().await;
+                    self.video_ended(room_id.clone(), video).await;
                 }
                 self.stop_call_audio().await;
                 self.update_ring_gate(false);
@@ -1930,6 +1967,7 @@ impl Engine {
                 }))
                 .await;
             }
+            MediaNotice::EncoderLost(kind) => self.video_encoder_lost(kind).await,
         }
     }
 
@@ -2002,7 +2040,9 @@ impl Engine {
             if let Some(calls) = self.calls() {
                 calls.set_sent(&room_id, None);
             }
+            let video = (call.has_video(), call.local_video());
             call.leave().await;
+            self.video_ended(room_id.clone(), video).await;
             self.stop_call_audio().await;
             self.update_ring_gate(joining_next);
             self.emit(CoreEvent::CallState(CallState::Left {
@@ -3147,6 +3187,7 @@ mod tests {
                 max_upload_bytes_override: None,
                 audio: AudioBackend::default(),
                 call_service_override: None,
+                video: VideoBackend::System,
             },
             secrets,
             events,
@@ -3154,6 +3195,8 @@ mod tests {
             oauth: None,
             room_list_query: watch::channel(RoomListQuery::default()).0,
             audio_settings: None,
+            video_settings: None,
+            video_encoders: None,
             device_watcher: None,
             audio_session: None,
             call: None,
@@ -3335,6 +3378,7 @@ mod tests {
                 max_upload_bytes_override: None,
                 audio: AudioBackend::default(),
                 call_service_override: None,
+                video: VideoBackend::System,
             },
             secrets: Arc::new(InMemorySecretStore::new()),
             events,
@@ -3342,6 +3386,8 @@ mod tests {
             oauth: None,
             room_list_query: watch::channel(RoomListQuery::default()).0,
             audio_settings: None,
+            video_settings: None,
+            video_encoders: None,
             device_watcher: None,
             audio_session: None,
             call: None,

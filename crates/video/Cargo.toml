@@ -1,0 +1,29 @@
+[package]
+name = "twicecat-video"
+version = "0.1.0"
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+thiserror = "2"
+# CPU colour conversion (pure Rust, SIMD; plan Q11, approved 2026-10-13).
+yuvutils-rs = "=0.8.3"
+# Vulkan compute and DMA-BUF import (plan Task 4/Q11): the version already
+# locked through wgpu, with its default `loaded` feature (the system's
+# loader, opened at run time). Also used by the probe.
+ash = "=0.38.0"
+# NVIDIA's CUDA, NVENC and NVDEC libraries, opened at run time (plan Q11):
+# the version already locked through ash.
+libloading = "=0.8.9"
+
+[build-dependencies]
+# WGSL compute shaders to SPIR-V, validated at build time (plan Q11, approved
+# 2026-10-13): the version already locked through wgpu.
+naga = { version = "=27.0.3", default-features = false, features = ["wgsl-in", "spv-out"] }
+
+[features]
+# Hardware tests (Vulkan device, conversion, DMA-BUF import): they need a
+# GPU and are compiled only with this feature (plan Task 4).
+hw-video = []

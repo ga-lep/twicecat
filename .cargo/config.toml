@@ -5,6 +5,11 @@
 # webrtc.ninja. An LK_CUSTOM_WEBRTC from the environment (CI, Windows) wins.
 [env]
 LK_CUSTOM_WEBRTC = { value = "dev/libwebrtc", relative = true }
+# CUDA's driver API header for LiveKit's NVENC/NVDEC (plan Phase 9 Task 6),
+# linked into dev/cuda by scripts/fetch-cuda-headers.sh; without it webrtc-sys
+# builds without them (software video). A CUDA_HOME from the environment (a
+# system toolkit) wins. See dev/cuda/README.md.
+CUDA_HOME = { value = "dev/cuda", relative = true }
 
 # x86_64 Linux builds for x86-64-v3 (AVX2, FMA, BMI2; Intel since Haswell,
 # 2013, AMD since Excavator, 2015): the voice chain is 17 % cheaper, mostly

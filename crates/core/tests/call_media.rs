@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use common::calls::{add_member_device, allow_calls, membership_of, sfu_room};
 use common::{
     DEFAULT_TIMEOUT, TestEnv, create_encrypted_room, create_room, expect_event, raw_login,
     start_core_with_audio, start_core_with_call_service, unique_room_name, wait_for_room,
@@ -22,7 +23,7 @@ use twicecat_core::CoreHandle;
 use twicecat_core::api::{
     AUDIO_FRAME_LEN, AudioBackend, AudioProcessing, AudioSettings, CallIntent, CallState,
     CleaningStatus, Command, CoreEvent, InputMode, ListDiff, NoiseSuppression, Participant,
-    Password, RoomId, SkipReason, SyncState, UserId, VirtualAudio, VoiceCleaning,
+    Password, RoomId, SkipReason, SoundSource, SyncState, UserId, VirtualAudio, VoiceCleaning,
 };
 use twicecat_core::secrets::InMemorySecretStore;
 
@@ -216,55 +217,11 @@ async fn alice_as_seen_by(core: &mut CoreHandle, alice: &str, done: impl Fn(&Par
         .expect("timed out waiting for alice's participant state");
 }
 
-/// The content of a call membership `user` sent.
-async fn membership_of(reader: &matrix_sdk::Client, room_id: &str, user: &str) -> Option<Value> {
-    use matrix_sdk::ruma::api::client::state::get_state_events;
-    let reply = reader
-        .send(get_state_events::v3::Request::new(
-            room_id.try_into().unwrap(),
-        ))
-        .await
-        .ok()?;
-    reply.room_state.iter().find_map(|raw| {
-        let event: Value = raw.deserialize_as().ok()?;
-        (event["type"] == "org.matrix.msc3401.call.member" && event["sender"] == user)
-            .then(|| event["content"].clone())
-    })
-}
-
 /// The call service `user`'s membership publishes on (`foci_preferred[0]`).
 async fn call_service_of(reader: &matrix_sdk::Client, room_id: &str, user: &str) -> Option<String> {
     membership_of(reader, room_id, user).await?["foci_preferred"][0]["livekit_service_url"]
         .as_str()
         .map(str::to_owned)
-}
-
-/// Lets members at power level 0 publish call memberships (as Element does).
-async fn allow_calls(admin: &matrix_sdk::Client, room_id: &str) {
-    use matrix_sdk::ruma::api::client::state::{get_state_event_for_key, send_state_event};
-    use matrix_sdk::ruma::events::StateEventType;
-    let room: matrix_sdk::ruma::OwnedRoomId = room_id.try_into().unwrap();
-    let reply = admin
-        .send(get_state_event_for_key::v3::Request::new(
-            room.clone(),
-            StateEventType::RoomPowerLevels,
-            String::new(),
-        ))
-        .await
-        .unwrap();
-    let mut levels: Value = serde_json::from_str(reply.event_or_content.get()).unwrap();
-    levels["events"]["org.matrix.msc3401.call.member"] = serde_json::json!(0);
-    admin
-        .send(send_state_event::v3::Request::new_raw(
-            room,
-            StateEventType::RoomPowerLevels,
-            String::new(),
-            matrix_sdk::ruma::serde::Raw::new(&levels)
-                .unwrap()
-                .cast_unchecked(),
-        ))
-        .await
-        .unwrap();
 }
 
 #[tokio::test]
@@ -505,55 +462,6 @@ async fn members_on_different_sfus_hear_each_other() {
     }
 }
 
-/// Joins the call's LiveKit room as `client`'s user with the made-up
-/// `device` (a token from the call service, with or without a call
-/// membership).
-async fn sfu_room(
-    client: &matrix_sdk::Client,
-    room_id: &str,
-    device: &str,
-) -> livekit::prelude::Room {
-    use livekit::prelude::{Room, RoomOptions};
-    use matrix_sdk::ruma::api::client::account::request_openid_token;
-
-    let env = TestEnv::load();
-    let openid = client
-        .send(request_openid_token::v3::Request::new(
-            client.user_id().unwrap().to_owned(),
-        ))
-        .await
-        .unwrap();
-    let body = serde_json::json!({
-        "room": room_id,
-        "openid_token": {
-            "access_token": openid.access_token,
-            "token_type": openid.token_type,
-            "matrix_server_name": openid.matrix_server_name,
-            "expires_in": openid.expires_in.as_secs(),
-        },
-        "device_id": device,
-    });
-    let reply = matrix_sdk::reqwest::Client::new()
-        .post(format!("{}/sfu/get", env.get("LK_JWT_URL")))
-        .header("content-type", "application/json")
-        .body(body.to_string())
-        .send()
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
-    let reply: Value = serde_json::from_str(&reply).unwrap();
-    let (room, _events) = Room::connect(
-        reply["url"].as_str().unwrap(),
-        reply["jwt"].as_str().unwrap(),
-        RoomOptions::default(),
-    )
-    .await
-    .expect("connects to the SFU");
-    room
-}
-
 /// Publishes a `hz` tone on `room` as `source`.
 async fn publish_tone(
     room: &livekit::prelude::Room,
@@ -673,13 +581,12 @@ async fn a_participant_without_a_membership_is_not_played() {
 /// Element Call sends a screen share's sound as a second audio track next
 /// to the microphone: alice plays both, and when carol stops sharing her
 /// voice keeps playing (players were keyed by participant only, so the
-/// share replaced the voice and its end silenced carol).
+/// share replaced the voice and its end silenced carol). The share's sound
+/// alone never shows carol as speaking, and has its own volume.
 #[tokio::test]
 #[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
 async fn a_screen_share_sound_plays_next_to_the_voice() {
     use livekit::prelude::TrackSource;
-    use matrix_sdk::ruma::api::client::state::send_state_event;
-    use matrix_sdk::ruma::events::StateEventType;
     const VOICE_HZ: f32 = 600.0;
     const SHARE_HZ: f32 = 800.0;
     const DEVICE: &str = "SHARER";
@@ -703,26 +610,32 @@ async fn a_screen_share_sound_plays_next_to_the_voice() {
 
     // Carol joins as another client would: alice's membership, as hers.
     let carol_id = env.user_id(3);
-    let mut membership = membership_of(&carol_raw, &room_id, &env.user_id(1))
-        .await
-        .expect("alice's membership");
-    membership["device_id"] = DEVICE.into();
-    membership["membershipID"] = format!("{carol_id}:{DEVICE}").into();
-    carol_raw
-        .send(send_state_event::v3::Request::new_raw(
-            room_id.as_str().try_into().unwrap(),
-            StateEventType::from("org.matrix.msc3401.call.member"),
-            format!("_{carol_id}_{DEVICE}_m.call"),
-            matrix_sdk::ruma::serde::Raw::new(&membership)
-                .unwrap()
-                .cast_unchecked(),
-        ))
-        .await
-        .unwrap();
+    add_member_device(&carol_raw, &room_id, &env.user_id(1), DEVICE).await;
     let sharer = sfu_room(&carol_raw, &room_id, DEVICE).await;
-    publish_tone(&sharer, VOICE_HZ, TrackSource::Microphone).await;
     let share = publish_tone(&sharer, SHARE_HZ, TrackSource::ScreenshareAudio).await;
 
+    // Only the share sounds: heard, and carol is not speaking.
+    let mut spoke = false;
+    let mut list: Vec<Participant> = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = alice.events.recv().await {
+            if let CoreEvent::CallParticipants { diffs, .. } = event {
+                for diff in diffs {
+                    ListDiff::apply(&diff, &mut list);
+                }
+                spoke |= list
+                    .iter()
+                    .any(|p| p.user_id.as_str() == carol_id && p.speaking);
+            }
+        }
+    })
+    .await;
+    let sound = alice_audio.level(SHARE_HZ, 2.0);
+    eprintln!("alice hears carol's share alone {sound:.4} (sent 0.3); speaking shown: {spoke}");
+    assert!(sound > HEARD, "share alone: amplitude {sound:.4}");
+    assert!(!spoke, "a screen share's sound showed carol as speaking");
+
+    publish_tone(&sharer, VOICE_HZ, TrackSource::Microphone).await;
     alice_as_seen_by(&mut alice, &carol_id, |p| p.speaking).await;
     tokio::time::sleep(Duration::from_secs(4)).await;
     let voice = alice_audio.level(VOICE_HZ, 3.0);
@@ -730,6 +643,39 @@ async fn a_screen_share_sound_plays_next_to_the_voice() {
     eprintln!("alice hears carol's voice {voice:.4} and her share {sound:.4} (each sent 0.3)");
     assert!(voice > HEARD, "voice while sharing: amplitude {voice:.4}");
     assert!(sound > HEARD, "share: amplitude {sound:.4}");
+
+    // The share's own volume: off, and the voice stays.
+    alice
+        .commands
+        .send(Command::SetUserVolume {
+            user_id: UserId::from(carol_id.as_str()),
+            source: SoundSource::ScreenShare,
+            percent: 0,
+        })
+        .await
+        .unwrap();
+    alice_as_seen_by(&mut alice, &carol_id, |p| {
+        p.share_volume_percent == 0 && p.volume_percent == 100
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let voice = alice_audio.level(VOICE_HZ, 1.5);
+    let sound = alice_audio.level(SHARE_HZ, 1.5);
+    eprintln!("share at 0 %: voice {voice:.4}, share {sound:.5}");
+    assert!(
+        voice > HEARD,
+        "voice with the share at 0 %: amplitude {voice:.4}"
+    );
+    assert!(sound < 0.01, "share at 0 %: amplitude {sound:.4}");
+    alice
+        .commands
+        .send(Command::SetUserVolume {
+            user_id: UserId::from(carol_id.as_str()),
+            source: SoundSource::ScreenShare,
+            percent: 100,
+        })
+        .await
+        .unwrap();
 
     sharer
         .local_participant()

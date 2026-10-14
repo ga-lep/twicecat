@@ -1197,4 +1197,7 @@ pub enum CoreError {
     /// Another operation of the same kind is already running.
     #[error("busy")]
     Busy,
+    /// This build cannot do that yet (what, in a few words).
+    #[error("not supported yet: {0}")]
+    NotSupported(String),
 }

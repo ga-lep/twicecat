@@ -13,6 +13,7 @@ mod media;
 mod rooms;
 mod security;
 mod types;
+mod video;
 
 pub use audio::{
     AUDIO_FRAME_LEN, AudioBackend, AudioDevice, AudioDeviceId, AudioDevices, AudioProcessing,
@@ -22,6 +23,7 @@ pub use audio::{
 };
 pub use call::{
     CallEndReason, CallIntent, CallState, CleaningStatus, Participant, ParticipantId, SkipReason,
+    SoundSource,
 };
 pub use diff::ListDiff;
 pub use media::{
@@ -46,6 +48,14 @@ pub use types::{
     ReplyPreview, ReplyState, RichText, RoomId, RoomListQuery, RoomListTab, RoomSummary,
     SendFailure, SendStatus, StateChange, SyncState, TextFormat, TextStyle, TimelineItem,
     TimelineItemKind, TypingUser, UserId,
+};
+pub use video::{
+    CodecLimits, EncoderBackend, EncoderChoice, LocalVideo, QualityLimitation, ScreenSource,
+    ScreenSourceId, ScreenSourceKind, ScreenSources, ScreenThumbnail, TEST_PATTERN_ID,
+    VideoBackend, VideoCodec, VideoCodecChoice, VideoDevice, VideoDeviceId, VideoDevices,
+    VideoDirection, VideoEncoderInfo, VideoEncoders, VideoFeed, VideoFeedSender, VideoFrame,
+    VideoKind, VideoMatrix, VideoMode, VideoPixelFormat, VideoPlane, VideoQuality, VideoRange,
+    VideoSettings, VideoStats, VideoTrackId, VideoTrackStats, VideoTrackView,
 };
 
 /// A request from the front end to the engine.
@@ -425,7 +435,7 @@ pub enum Command {
     JoinCall {
         /// Room of the call.
         room_id: RoomId,
-        /// Voice only for now.
+        /// Voice or video; written to our membership and ring.
         intent: CallIntent,
     },
     /// Leave the current call.
@@ -448,10 +458,13 @@ pub enum Command {
         /// Held down.
         pressed: bool,
     },
-    /// Playback volume for one user, percent (0..=200); remembered.
+    /// Playback volume for one user's voice or screen-share sound,
+    /// percent (0..=200); remembered.
     SetUserVolume {
         /// Account.
         user_id: UserId,
+        /// Their voice, or their screen share's sound.
+        source: SoundSource,
         /// Percent; 100 is unchanged.
         percent: u16,
     },
@@ -480,6 +493,67 @@ pub enum Command {
     },
     /// Close the mic test.
     StopMicTest,
+
+    // Video (Phase 9). Until the video tasks land, the ones that need real
+    // cameras, screens, settings or encoders answer
+    // `CoreError::NotSupported`; with `CoreConfig::video` set to
+    // `VideoBackend::TestPattern` the cameras and screens are a test
+    // pattern.
+    /// Re-enumerate cameras; answered by `VideoDevices`.
+    ListVideoDevices,
+    /// List the monitors and windows for our own picker; answered by
+    /// `ScreenSources` (empty with `system_picker` where the system picks).
+    ListScreenSources,
+    /// Turn the camera on in the current call.
+    StartCamera {
+        /// The camera; the one in the settings (or the default) when `None`.
+        device: Option<VideoDeviceId>,
+        /// Quality.
+        quality: VideoQuality,
+    },
+    /// Turn the camera off.
+    StopCamera,
+    /// Share a screen or window in the current call (one share at a time).
+    StartScreenShare {
+        /// From `ListScreenSources`; `None` where the system shows its own
+        /// picker.
+        source: Option<ScreenSourceId>,
+        /// Quality.
+        quality: VideoQuality,
+        /// Send the shared sound too (without our own call's sound).
+        audio: bool,
+    },
+    /// Stop sharing.
+    StopScreenShare,
+    /// How a track is shown, so the call server sends the right layer:
+    /// its size on screen in physical pixels, or hidden.
+    SetVideoView {
+        /// The track.
+        track: VideoTrackId,
+        /// Width on screen, physical pixels.
+        width: u32,
+        /// Height on screen, physical pixels.
+        height: u32,
+        /// Shown at all.
+        visible: bool,
+    },
+    /// Ask for the current video settings; answered by `VideoSettings`.
+    GetVideoSettings,
+    /// Replace the video settings; validated, applied, saved, and echoed as
+    /// `VideoSettings`.
+    UpdateVideoSettings(VideoSettings),
+    /// Find the encoders this machine has; answered by `VideoEncoders`.
+    ProbeVideoEncoders,
+    /// Open a camera without a call, for a preview; answered by
+    /// `CameraPreview`.
+    StartCameraPreview {
+        /// The camera; the one in the settings (or the default) when `None`.
+        device: Option<VideoDeviceId>,
+        /// Quality.
+        quality: VideoQuality,
+    },
+    /// Close the preview.
+    StopCameraPreview,
 }
 
 // Manual impl: message text, reaction keys, reasons and queries are user
@@ -779,9 +853,14 @@ impl fmt::Debug for Command {
                 .debug_struct("PushToTalk")
                 .field("pressed", pressed)
                 .finish(),
-            Self::SetUserVolume { user_id, percent } => f
+            Self::SetUserVolume {
+                user_id,
+                source,
+                percent,
+            } => f
                 .debug_struct("SetUserVolume")
                 .field("user_id", user_id)
+                .field("source", source)
                 .field("percent", percent)
                 .finish(),
             Self::SetUserCleaning { user_id, cleaning } => f
@@ -801,6 +880,49 @@ impl fmt::Debug for Command {
                 .field("loopback", loopback)
                 .finish(),
             Self::StopMicTest => f.write_str("StopMicTest"),
+            Self::ListVideoDevices => f.write_str("ListVideoDevices"),
+            Self::ListScreenSources => f.write_str("ListScreenSources"),
+            Self::StartCamera { device, quality } => f
+                .debug_struct("StartCamera")
+                .field("device", device)
+                .field("quality", quality)
+                .finish(),
+            Self::StopCamera => f.write_str("StopCamera"),
+            Self::StartScreenShare {
+                source,
+                quality,
+                audio,
+            } => f
+                .debug_struct("StartScreenShare")
+                .field("source", source)
+                .field("quality", quality)
+                .field("audio", audio)
+                .finish(),
+            Self::StopScreenShare => f.write_str("StopScreenShare"),
+            Self::SetVideoView {
+                track,
+                width,
+                height,
+                visible,
+            } => f
+                .debug_struct("SetVideoView")
+                .field("track", track)
+                .field("width", width)
+                .field("height", height)
+                .field("visible", visible)
+                .finish(),
+            Self::GetVideoSettings => f.write_str("GetVideoSettings"),
+            Self::UpdateVideoSettings(settings) => f
+                .debug_tuple("UpdateVideoSettings")
+                .field(settings)
+                .finish(),
+            Self::ProbeVideoEncoders => f.write_str("ProbeVideoEncoders"),
+            Self::StartCameraPreview { device, quality } => f
+                .debug_struct("StartCameraPreview")
+                .field("device", device)
+                .field("quality", quality)
+                .finish(),
+            Self::StopCameraPreview => f.write_str("StopCameraPreview"),
         }
     }
 }
@@ -1086,6 +1208,39 @@ pub enum CoreEvent {
     /// GPU speech enhancement: answering `ProbeGpuEnhancement`, and when
     /// where DeepFilterNet3 runs changes.
     GpuEnhancement(GpuEnhancement),
+
+    // Video (Phase 9).
+    /// Cameras, answering `ListVideoDevices` or after a hot-plug.
+    VideoDevices(VideoDevices),
+    /// What can be shared, answering `ListScreenSources`.
+    ScreenSources(ScreenSources),
+    /// The effective video settings.
+    VideoSettings(VideoSettings),
+    /// The video tracks of the current call changed (ours included); the
+    /// whole list.
+    VideoTracks {
+        /// Room of the call.
+        room_id: RoomId,
+        /// Every video track.
+        tracks: Vec<VideoTrackView>,
+    },
+    /// Frames for a track listed in `VideoTracks`; sent once per track. The
+    /// feed ends when the track does.
+    VideoFeed {
+        /// The track.
+        track: VideoTrackId,
+        /// Its frames.
+        feed: VideoFeed,
+    },
+    /// Frames of the camera preview (`StartCameraPreview`).
+    CameraPreview(VideoFeed),
+    /// Our own camera and share in the current call.
+    LocalVideo(LocalVideo),
+    /// The encoders, answering `ProbeVideoEncoders` and when the one in use
+    /// changes.
+    VideoEncoders(VideoEncoders),
+    /// Video statistics (about 1 Hz during a call with video).
+    VideoStats(VideoStats),
 }
 
 #[cfg(test)]

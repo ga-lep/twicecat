@@ -123,6 +123,7 @@ fn run(options: Options) -> Result<(), String> {
         max_upload_bytes_override: None,
         audio: AudioBackend::System,
         call_service_override: None,
+        video: twicecat_core::api::VideoBackend::System,
     };
     let (bridge, events) = Bridge::start(config, secrets)
         .map_err(|error| format!("could not start the core runtime: {error}"))?;

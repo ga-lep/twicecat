@@ -48,7 +48,17 @@ jobs:
         run: |
           dir=$(scripts/fetch-libwebrtc.sh)
           echo "LK_CUSTOM_WEBRTC=$dir" >> "$GITHUB_ENV"
+      # LiveKit's NVENC/NVDEC are compiled only with cuda.h at build time
+      # (plan Phase 9 Task 6); the path is in the cache key because
+      # webrtc-sys's build script does not watch it.
+      - name: Fetch CUDA header
+        shell: bash
+        run: |
+          dir=$(scripts/fetch-cuda-headers.sh)
+          echo "CUDA_HOME=$dir" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
+        with:
+          env-vars: CUDA_HOME
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - uses: EmbarkStudios/cargo-deny-action@v2
@@ -89,7 +99,18 @@ jobs:
         run: |
           dir=$(scripts/fetch-libwebrtc.sh)
           echo "LK_CUSTOM_WEBRTC=$dir" >> "$GITHUB_ENV"
+      # LiveKit's NVENC/NVDEC are compiled only with cuda.h at build time
+      # (plan Phase 9 Task 6); the path is in the cache key because
+      # webrtc-sys's build script does not watch it.
+      - name: Fetch CUDA header
+        if: matrix.os == 'ubuntu-26.04'
+        shell: bash
+        run: |
+          dir=$(scripts/fetch-cuda-headers.sh)
+          echo "CUDA_HOME=$dir" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
+        with:
+          env-vars: CUDA_HOME
       # The lint job already runs clippy on Linux.
       - name: Clippy (non-Linux only)
         if: runner.os != 'Linux'
@@ -129,6 +150,14 @@ jobs:
         run: |
           dir=$(scripts/fetch-libwebrtc.sh)
           echo "LK_CUSTOM_WEBRTC=$dir" >> "$GITHUB_ENV"
+      # LiveKit's NVENC/NVDEC are compiled only with cuda.h at build time
+      # (plan Phase 9 Task 6); the path is in the cache key because
+      # webrtc-sys's build script does not watch it.
+      - name: Fetch CUDA header
+        shell: bash
+        run: |
+          dir=$(scripts/fetch-cuda-headers.sh)
+          echo "CUDA_HOME=$dir" >> "$GITHUB_ENV"
       # One key for all shards: they restore the dependencies built on main.
       # rust-cache never keeps the workspace crates, so each shard compiles
       # twicecat-core and its tests itself. Only main saves the cache.
@@ -136,6 +165,7 @@ jobs:
         with:
           shared-key: integration
           save-if: ${{ github.ref == 'refs/heads/main' }}
+          env-vars: CUDA_HOME
       # The ignored cleaning tests (core lib and call_media) need DeepFilterNet3;
       # the script (pinned SHA-256) fills the default cache dir core reads.
       - name: Fetch models

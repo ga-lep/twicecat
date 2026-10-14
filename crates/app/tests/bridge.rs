@@ -161,6 +161,7 @@ fn login_reaches_main_with_rooms_and_shutdown_closes_the_bridge() {
             max_upload_bytes_override: None,
             audio: Default::default(),
             call_service_override: None,
+            video: twicecat_core::api::VideoBackend::System,
         },
         Arc::new(InMemorySecretStore::new()),
     )
@@ -180,7 +181,7 @@ fn login_reaches_main_with_rooms_and_shutdown_closes_the_bridge() {
         pump.block_on(async {
             match tokio::time::timeout(wait, events.next()).await {
                 Ok(Some(BridgeEvent::Core(event))) => {
-                    let _ = app.update(Message::Core(Box::new(event)));
+                    let _ = app.update(Message::Core(event));
                     true
                 }
                 Ok(Some(BridgeEvent::Closed)) => {
@@ -277,6 +278,7 @@ fn typing_markdown_and_pressing_enter_shows_a_bold_message_in_the_timeline() {
             max_upload_bytes_override: None,
             audio: Default::default(),
             call_service_override: None,
+            video: twicecat_core::api::VideoBackend::System,
         },
         Arc::new(InMemorySecretStore::new()),
     )
@@ -294,7 +296,7 @@ fn typing_markdown_and_pressing_enter_shows_a_bold_message_in_the_timeline() {
         pump.block_on(async {
             match tokio::time::timeout(wait, events.next()).await {
                 Ok(Some(BridgeEvent::Core(event))) => {
-                    let _ = app.update(Message::Core(Box::new(event)));
+                    let _ = app.update(Message::Core(event));
                     true
                 }
                 Ok(Some(BridgeEvent::Closed)) => {
@@ -380,6 +382,7 @@ fn carol_resets_her_identity_sets_up_recovery_and_logs_out() {
             max_upload_bytes_override: None,
             audio: Default::default(),
             call_service_override: None,
+            video: twicecat_core::api::VideoBackend::System,
         },
         Arc::new(InMemorySecretStore::new()),
     )
@@ -397,7 +400,7 @@ fn carol_resets_her_identity_sets_up_recovery_and_logs_out() {
         pump.block_on(async {
             match tokio::time::timeout(wait, events.next()).await {
                 Ok(Some(BridgeEvent::Core(event))) => {
-                    let _ = app.update(Message::Core(Box::new(event)));
+                    let _ = app.update(Message::Core(event));
                 }
                 Ok(Some(BridgeEvent::Closed)) => {
                     let _ = app.update(Message::CoreClosed);

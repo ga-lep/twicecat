@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 
 use twicecat_core::api::{
     AudioDevices, AudioSettings, CallEndReason, CallIntent, CallState, Command, CoreEvent,
-    EnhancerBackend, InputLevel, InputMode, ListDiff, Participant, RoomId, RoomSummary, UserId,
+    EnhancerBackend, InputLevel, InputMode, ListDiff, Participant, RoomId, RoomSummary,
+    SoundSource, UserId,
 };
 
 pub(crate) use self::parse::{CallCmd, CleanArg, GateArg, parse};
@@ -238,14 +239,28 @@ impl Calls {
                     },
                 };
             }),
-            CallCmd::Vol { who, percent } => match self.user_of(&who) {
+            CallCmd::Vol {
+                who,
+                percent,
+                share,
+            } => match self.user_of(&who) {
                 Some(user_id) => Reply::send(
                     Command::SetUserVolume {
                         user_id: user_id.clone(),
+                        source: if share {
+                            SoundSource::ScreenShare
+                        } else {
+                            SoundSource::Voice
+                        },
                         percent,
                     },
                     format!(
-                        "Volume of {} set to {percent} %.",
+                        "{} of {} set to {percent} %.",
+                        if share {
+                            "Screen-share volume"
+                        } else {
+                            "Volume"
+                        },
                         sanitize(user_id.as_str())
                     ),
                 ),
@@ -556,6 +571,7 @@ mod tests {
             muted: false,
             speaking: false,
             volume_percent: 100,
+            share_volume_percent: 100,
             cleaning: CleaningStatus::Off,
         }
     }
@@ -710,6 +726,7 @@ mod tests {
             CallCmd::Vol {
                 who: "1".into(),
                 percent: 50,
+                share: false,
             },
             &rooms,
             None,
@@ -718,6 +735,7 @@ mod tests {
             sent(&vol.commands),
             sent(&[Command::SetUserVolume {
                 user_id: UserId::from("@carol:x"),
+                source: SoundSource::Voice,
                 percent: 50
             }])
         );

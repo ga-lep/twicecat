@@ -6,7 +6,7 @@ downloads LiveKit's prebuilt libwebrtc, checks it against the SHA-256 in
 entries (`include`, `lib`, `webrtc.ninja`, ...) into this directory.
 
 This directory must always exist. webrtc-sys downloads libwebrtc, unverified,
-into `LK_CUSTOM_WEBRTC` whenever that path is missing (webrtc-sys 0.3.47
+into `LK_CUSTOM_WEBRTC` whenever that path is missing (webrtc-sys 0.3.49
 build.rs:112). With the directory present but not fetched, the build fails on
 the missing `webrtc.ninja` instead.
 

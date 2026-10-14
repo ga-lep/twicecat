@@ -1703,6 +1703,16 @@ impl App {
                 self.audio_card_saw(&event);
                 task = self.on_call_event(event);
             }
+            // Video comes to the app with its call stage (Phase 9 Tasks 10 and 11).
+            CoreEvent::VideoDevices(_)
+            | CoreEvent::ScreenSources(_)
+            | CoreEvent::VideoSettings(_)
+            | CoreEvent::VideoTracks { .. }
+            | CoreEvent::VideoFeed { .. }
+            | CoreEvent::CameraPreview(_)
+            | CoreEvent::LocalVideo(_)
+            | CoreEvent::VideoEncoders(_)
+            | CoreEvent::VideoStats(_) => {}
         }
         task
     }
@@ -10138,6 +10148,7 @@ mod tests {
                 muted: !local,
                 speaking: local,
                 volume_percent: 100,
+                share_volume_percent: 100,
                 cleaning: CleaningStatus::Cleaned,
             };
             let _ = app.update(core(CoreEvent::CallParticipants {
