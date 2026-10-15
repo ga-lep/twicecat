@@ -21,21 +21,24 @@ use twicecat_app::switcher::SwitcherMessage;
 use twicecat_app::threads::ThreadsMessage;
 use twicecat_app::upload::{Outcome, Prepared, Refusal, Source, UploadPaths};
 use twicecat_app::verification::Phase;
+use twicecat_app::video::VideoMessage;
 use twicecat_app::{App, Message, Screen, Startup};
 use twicecat_app::{CommandSink, EventsSlot};
 use twicecat_core::api::{
     AudioDevice, AudioDeviceId, AudioDevices, AudioSettings, AudioStats, Block, CallIntent,
     CallState, CancelReason, CleaningStatus, Command, CoreError, CoreEvent, CrossSigning, DeviceId,
     DeviceSummary, DeviceTrust, DeviceVerification, EnhancerBackend, EventId, GpuBackend,
-    GpuEnhancement, Inline, InputLevel, InputMode, ItemActions, ListDiff, MediaContent, MediaKind,
-    MembershipView, MentionTarget, MessageDetails, MessageKind, MessagePreview, NoiseSuppression,
-    PaginationState, Participant, ParticipantId, PlaceholderKind, PowerLevelView, QrImage,
-    ReactionGroup, ReauthAction, RecoveryKey, RecoveryProgress, RecoveryStatus, ReplyPreview,
-    ReplyState, RichText, Role, RoomDetailsView, RoomId, RoomMemberView, RoomNotificationModeView,
-    RoomPermissions, RoomSummary, SasEmoji, SecurityStatus, SendFailure, SendStatus, Shield,
-    ShieldCode, SpaceView, StateChange, SyncState, TextStyle, ThreadSummaryView, TimelineItem,
-    TimelineItemKind, TypingUser, UploadProgress, UserId, UserTrust, UtdReason, VerificationId,
-    VerificationPeer, VerificationPhase,
+    GpuEnhancement, Inline, InputLevel, InputMode, ItemActions, ListDiff, LocalVideo, MediaContent,
+    MediaKind, MembershipView, MentionTarget, MessageDetails, MessageKind, MessagePreview,
+    NoiseSuppression, PaginationState, Participant, ParticipantId, PlaceholderKind, PowerLevelView,
+    QrImage, ReactionGroup, ReauthAction, RecoveryKey, RecoveryProgress, RecoveryStatus,
+    ReplyPreview, ReplyState, RichText, Role, RoomDetailsView, RoomId, RoomMemberView,
+    RoomNotificationModeView, RoomPermissions, RoomSummary, SasEmoji, ScreenSource, ScreenSourceId,
+    ScreenSourceKind, ScreenSources, ScreenThumbnail, SecurityStatus, SendFailure, SendStatus,
+    Shield, ShieldCode, SpaceView, StateChange, SyncState, TextStyle, ThreadSummaryView,
+    TimelineItem, TimelineItemKind, TypingUser, UploadProgress, UserId, UserTrust, UtdReason,
+    VerificationId, VerificationPeer, VerificationPhase, VideoCodec, VideoFeed, VideoFrame,
+    VideoKind, VideoMatrix, VideoPixelFormat, VideoPlane, VideoRange, VideoTrackId, VideoTrackView,
 };
 
 /// Drops every command: the gallery never talks to a core.
@@ -1029,6 +1032,190 @@ fn main_call_ptt_talking() -> App {
 
 fn main_call_ptt_idle() -> App {
     main_call_ptt(false)
+}
+
+// ---- Video in calls -----------------------------------------------------
+
+/// A small NV12 gradient: the gallery cannot draw it (the headless renderer
+/// has no GPU), but a track with a frame is a track with a picture.
+fn video_feed() -> VideoFeed {
+    let (tx, feed) = VideoFeed::channel();
+    let (w, h) = (64usize, 36usize);
+    let luma: Vec<u8> = (0..w * h).map(|i| (16 + (i % w) * 3) as u8).collect();
+    tx.send(VideoFrame {
+        format: VideoPixelFormat::Nv12,
+        width: w as u32,
+        height: h as u32,
+        planes: vec![
+            VideoPlane {
+                data: luma.into(),
+                stride: w,
+            },
+            VideoPlane {
+                data: vec![128; w * h / 2].into(),
+                stride: w,
+            },
+        ],
+        matrix: VideoMatrix::Bt709,
+        range: VideoRange::Limited,
+        timestamp_us: 0,
+    });
+    // The sender goes with the feed's last clone: the track stays live.
+    std::mem::forget(tx);
+    feed
+}
+
+fn video_track(who: &str, kind: VideoKind, local: bool, muted: bool) -> VideoTrackView {
+    VideoTrackView {
+        id: VideoTrackId::from(format!("{who}-{kind:?}")),
+        participant: ParticipantId::from(format!("{who}-participant")),
+        user_id: user(who),
+        device_id: DeviceId::from("GALLERYDEV"),
+        is_local: local,
+        kind,
+        width: 1280,
+        height: 720,
+        fps: Some(30),
+        codec: Some(VideoCodec::H264),
+        muted,
+    }
+}
+
+/// The lounge call with these tracks, each with a picture.
+fn call_with_video(tracks: Vec<VideoTrackView>) -> App {
+    let mut app = main_room();
+    call_connected(&mut app);
+    feed(
+        &mut app,
+        CoreEvent::VideoTracks {
+            room_id: room("lounge"),
+            tracks: tracks.clone(),
+        },
+    );
+    for track in tracks {
+        feed(
+            &mut app,
+            CoreEvent::VideoFeed {
+                track: track.id,
+                feed: video_feed(),
+            },
+        );
+    }
+    app
+}
+
+fn main_call_video() -> App {
+    call_with_video(vec![
+        video_track("me", VideoKind::Camera, true, false),
+        video_track("bea", VideoKind::Camera, false, false),
+        video_track("cy", VideoKind::Camera, false, true),
+    ])
+}
+
+fn main_call_video_share() -> App {
+    call_with_video(vec![
+        video_track("me", VideoKind::Camera, true, false),
+        video_track("bea", VideoKind::Camera, false, false),
+        video_track("dee", VideoKind::Screen, false, false),
+    ])
+}
+
+fn main_call_video_folded() -> App {
+    let mut app = main_call_video();
+    press(&mut app, Message::Video(VideoMessage::ToggleStage));
+    app
+}
+
+fn main_call_sharing() -> App {
+    let mut app = main_call_video();
+    feed(
+        &mut app,
+        CoreEvent::LocalVideo(LocalVideo {
+            camera: Some(VideoTrackId::from("me-Camera")),
+            screen: Some(VideoTrackId::from("me-Screen")),
+            screen_audio: true,
+        }),
+    );
+    app
+}
+
+fn video_fullscreen() -> App {
+    let mut app = main_call_video_share();
+    press(
+        &mut app,
+        Message::Video(VideoMessage::Fullscreen(VideoTrackId::from("dee-Screen"))),
+    );
+    app
+}
+
+fn share_picker() -> App {
+    let mut app = main_call_video();
+    press(&mut app, Message::Video(VideoMessage::ToggleShare));
+    // About the size the picker shows them at: a tiny picture scaled up a lot
+    // is drawn out of place by the software renderer.
+    let thumb = |shade: u8| {
+        let (w, h) = (160usize, 90usize);
+        let rgba: Vec<u8> = (0..w * h)
+            .flat_map(|i| {
+                let edge = i % w < 3 || i % w + 3 >= w || i / w < 3 || i / w + 3 >= h;
+                if edge {
+                    [20, 20, 20, 255]
+                } else {
+                    [shade, (i % w) as u8, 255 - shade, 255]
+                }
+            })
+            .collect();
+        ScreenThumbnail {
+            width: w as u32,
+            height: h as u32,
+            rgba: rgba.into(),
+        }
+    };
+    let source = |id: &str, kind, title: &str, w, h, shade| ScreenSource {
+        id: ScreenSourceId::from(id),
+        kind,
+        title: title.to_owned(),
+        width: w,
+        height: h,
+        thumbnail: Some(thumb(shade)),
+    };
+    feed(
+        &mut app,
+        CoreEvent::ScreenSources(ScreenSources {
+            system_picker: false,
+            sources: vec![
+                source("m1", ScreenSourceKind::Monitor, "Screen 1", 2560, 1440, 60),
+                source("m2", ScreenSourceKind::Monitor, "Screen 2", 1920, 1080, 120),
+                source("w1", ScreenSourceKind::Window, "Notes", 1200, 800, 180),
+                source(
+                    "w2",
+                    ScreenSourceKind::Window,
+                    "A very long window title that must not run out of its card",
+                    900,
+                    700,
+                    220,
+                ),
+            ],
+        }),
+    );
+    press(
+        &mut app,
+        Message::Video(VideoMessage::PickSource(ScreenSourceId::from("m2"))),
+    );
+    app
+}
+
+fn share_picker_system() -> App {
+    let mut app = main_call_video();
+    press(&mut app, Message::Video(VideoMessage::ToggleShare));
+    feed(
+        &mut app,
+        CoreEvent::ScreenSources(ScreenSources {
+            system_picker: true,
+            sources: Vec::new(),
+        }),
+    );
+    app
 }
 
 fn main_call_notice() -> App {
@@ -2809,6 +2996,43 @@ pub fn scenarios() -> Vec<Scenario> {
         }),
         s("main-call-rows-open", true, main_call_rows_open, |a| {
             a.calls.rows_open.len() == 2
+        }),
+        s("main-call-video", true, main_call_video, |a| {
+            a.stage_visible() && a.calls.video.tracks.len() == 3
+        }),
+        s("main-call-video-share", true, main_call_video_share, |a| {
+            a.stage_visible()
+                && a.calls
+                    .video
+                    .tracks
+                    .iter()
+                    .any(|t| t.kind == VideoKind::Screen)
+        }),
+        s(
+            "main-call-video-folded",
+            true,
+            main_call_video_folded,
+            |a| !a.calls.video.stage_open && !a.calls.video.tracks.is_empty(),
+        ),
+        s("main-call-sharing", true, main_call_sharing, |a| {
+            a.calls.video.sharing()
+        }),
+        s("video-fullscreen", true, video_fullscreen, |a| {
+            a.calls.video.fullscreen.is_some()
+        }),
+        s("share-picker", false, share_picker, |a| {
+            a.calls
+                .video
+                .picker
+                .as_ref()
+                .is_some_and(|p| p.selected.is_some() && p.sources.is_some())
+        }),
+        s("share-picker-system", false, share_picker_system, |a| {
+            a.calls
+                .video
+                .picker
+                .as_ref()
+                .is_some_and(|p| p.system_picker)
         }),
         s("ring-long-id", true, ring_long_id, |a| {
             a.calls.card().is_some_and(|r| r.caller.as_str().len() > 80)

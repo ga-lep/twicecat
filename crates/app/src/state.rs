@@ -427,6 +427,11 @@ pub enum Message {
     Settings(SettingsMessage),
     /// A control of the Voice & audio card.
     Audio(crate::audio_settings::AudioMessage),
+    /// A control of the call's video: the stage, the camera, sharing.
+    Video(crate::video::VideoMessage),
+    /// The window's scale factor (physical pixels per logical pixel) from the
+    /// window system.
+    WindowScale(f32),
     /// Push-to-talk: the service's state, and keys in the window.
     Ptt(PttMessage),
     /// A button of the spaces sidebar.
@@ -484,6 +489,9 @@ pub struct App {
     pub list_viewport_h: f32,
     /// The window's logical width, from `window::resize_events`.
     pub window_width: f32,
+    /// Physical pixels per logical pixel, from the window system (the text
+    /// zoom is not part of it). Video is asked for in physical pixels.
+    pub window_scale: f32,
     /// The side panel opened last (see [`crate::layout::layout_for`]).
     pub newest_panel: crate::layout::SidePanel,
     /// The row height the list was last laid out with, so a change of the
@@ -656,6 +664,7 @@ impl App {
             list_offset_y: 0.0,
             list_viewport_h: room_list::DEFAULT_VIEWPORT_HEIGHT,
             window_width: crate::layout::DEFAULT_WINDOW_WIDTH,
+            window_scale: 1.0,
             newest_panel: crate::layout::SidePanel::default(),
             shown_row_height: 0.0,
             load_more_at: None,
@@ -980,6 +989,7 @@ impl App {
         let fills_before = self.pane_layout().panel_fills;
         let task = self.update_inner(message);
         self.note_panels(thread_before, call_before);
+        let task = Task::batch([task, self.video_sync_views()]);
         // The reaction picker takes the keyboard: it must never stay open in
         // a pane the user cannot see.
         if self
@@ -1157,8 +1167,15 @@ impl App {
                 self.window_width = width;
                 Task::none()
             }
-            Message::WindowOpened(_) => {
+            Message::WindowOpened(id) => {
                 self.ensure_tray();
+                window::scale_factor(id).map(Message::WindowScale)
+            }
+            Message::WindowScale(scale) => {
+                // A factor that is not a sane number keeps the last one.
+                if scale.is_finite() && (0.25..=16.0).contains(&scale) {
+                    self.window_scale = scale;
+                }
                 Task::none()
             }
             Message::NotificationShown { room_id, id } => {
@@ -1308,6 +1325,7 @@ impl App {
                 Task::none()
             }
             Message::Audio(message) => self.on_audio(message),
+            Message::Video(message) => self.on_video(message),
             Message::Ptt(PttMessage::Update(update)) => {
                 self.ptt.update(update);
                 Task::none()
@@ -1824,8 +1842,7 @@ impl App {
                 self.audio_card_saw(&event);
                 task = self.on_call_event(event);
             }
-            // Video comes to the app with its call stage (Phase 9 Tasks 10 and 11).
-            CoreEvent::VideoDevices(_)
+            event @ (CoreEvent::VideoDevices(_)
             | CoreEvent::ScreenSources(_)
             | CoreEvent::VideoSettings(_)
             | CoreEvent::VideoTracks { .. }
@@ -1833,7 +1850,7 @@ impl App {
             | CoreEvent::CameraPreview(_)
             | CoreEvent::LocalVideo(_)
             | CoreEvent::VideoEncoders(_)
-            | CoreEvent::VideoStats(_) => {}
+            | CoreEvent::VideoStats(_)) => task = self.on_video_event(event),
         }
         task
     }
@@ -2810,13 +2827,19 @@ impl App {
                 screens::verification::layer(base, self)
             }
             Screen::Main => screens::call::ring_layer(
-                screens::verification::layer(
-                    screens::switcher::layer(
-                        screens::upload_dialog::layer(
-                            screens::media_viewer::layer(
-                                screens::audio_settings::layer(
-                                    screens::settings::layer(
-                                        screens::room_dialogs::layer(main_view::view(self), self),
+                screens::stage::sharing_layer(
+                    screens::verification::layer(
+                        screens::switcher::layer(
+                            screens::upload_dialog::layer(
+                                screens::media_viewer::layer(
+                                    screens::audio_settings::layer(
+                                        screens::settings::layer(
+                                            screens::room_dialogs::layer(
+                                                screens::stage::layers(main_view::view(self), self),
+                                                self,
+                                            ),
+                                            self,
+                                        ),
                                         self,
                                     ),
                                     self,
@@ -2855,6 +2878,9 @@ impl App {
                     iced::Event::Window(window::Event::Unfocused) => {
                         Some(Message::WindowFocus(false))
                     }
+                    iced::Event::Window(window::Event::Rescaled(scale)) => {
+                        Some(Message::WindowScale(scale))
+                    }
                     other => crate::audio_settings::capture_message(&other),
                 })
             } else {
@@ -2862,6 +2888,9 @@ impl App {
                     iced::Event::Window(window::Event::Focused) => Some(Message::WindowFocus(true)),
                     iced::Event::Window(window::Event::Unfocused) => {
                         Some(Message::WindowFocus(false))
+                    }
+                    iced::Event::Window(window::Event::Rescaled(scale)) => {
+                        Some(Message::WindowScale(scale))
                     }
                     other => upload::event_message(&other).or_else(|| {
                         keys::event_message(&other, status == iced::event::Status::Captured)

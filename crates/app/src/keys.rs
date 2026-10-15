@@ -19,6 +19,7 @@ use crate::state::{App, Message, Screen};
 use crate::switcher::SwitcherMessage;
 use crate::threads::ThreadsMessage;
 use crate::verification::VerificationMessage;
+use crate::video::VideoMessage;
 
 /// Which modifier is "Command" for the shortcuts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +74,10 @@ pub enum Shortcut {
     ToggleMute,
     /// Deafen or undeafen in a call.
     ToggleDeafen,
+    /// Turn the camera on or off in a call.
+    ToggleCamera,
+    /// Share your screen in a call, or stop sharing.
+    ToggleShare,
     /// Accept the call whose card is on screen: iced 0.14 buttons take no
     /// keys, so the card's **Accept** needs a chord.
     AcceptRing,
@@ -239,6 +244,24 @@ pub const SHORTCUTS: &[Binding] = &[
         true,
         false,
         Shortcut::ToggleDeafen,
+    ),
+    bound(
+        "Ctrl+Shift+O",
+        "In a call: turn the camera on or off",
+        KeySpec::Char('o'),
+        true,
+        true,
+        false,
+        Shortcut::ToggleCamera,
+    ),
+    bound(
+        "Ctrl+Shift+E",
+        "In a call: share your screen, or stop sharing",
+        KeySpec::Char('e'),
+        true,
+        true,
+        false,
+        Shortcut::ToggleShare,
     ),
     bound(
         "Ctrl+Shift+A",
@@ -411,6 +434,8 @@ pub const fn composer_takes(shortcut: Shortcut) -> bool {
             | Shortcut::PreviousUnread
             | Shortcut::ToggleMute
             | Shortcut::ToggleDeafen
+            | Shortcut::ToggleCamera
+            | Shortcut::ToggleShare
             | Shortcut::AcceptRing
             | Shortcut::DeclineRing
             | Shortcut::ZoomIn
@@ -559,7 +584,10 @@ impl App {
             Shortcut::SwitcherPrevious => self.on_switcher(SwitcherMessage::Previous),
             // Only in a call; they work over dialogs too, as a call goes on
             // behind them.
-            Shortcut::ToggleMute | Shortcut::ToggleDeafen
+            Shortcut::ToggleMute
+            | Shortcut::ToggleDeafen
+            | Shortcut::ToggleCamera
+            | Shortcut::ToggleShare
                 if self.screen != Screen::Main || self.calls.call.is_none() =>
             {
                 Task::none()
@@ -594,6 +622,8 @@ impl App {
             }
             Shortcut::ToggleMute => self.update(Message::Call(CallMessage::ToggleMute)),
             Shortcut::ToggleDeafen => self.update(Message::Call(CallMessage::ToggleDeafen)),
+            Shortcut::ToggleCamera => self.update(Message::Video(VideoMessage::ToggleCamera)),
+            Shortcut::ToggleShare => self.update(Message::Video(VideoMessage::ToggleShare)),
         }
     }
 
@@ -656,6 +686,15 @@ impl App {
         // the Sessions card under them.
         if self.rooms_ui.overlay_open() {
             return self.update(Message::Rooms(crate::rooms::RoomsMessage::Escape));
+        }
+        // The share picker and the full-screen view are drawn over the main
+        // view (and its security screens and Sessions card), under the room
+        // dialogs. Esc only ever closes or cancels them: never starts a share.
+        if self.calls.video.picker.is_some() {
+            return self.update(Message::Video(VideoMessage::CancelShare));
+        }
+        if self.calls.video.fullscreen.is_some() {
+            return self.update(Message::Video(VideoMessage::ExitFullscreen));
         }
         // Esc only ever cancels or closes here, never confirms, and the key
         // stops here: nothing behind the card sees it. The warning and the

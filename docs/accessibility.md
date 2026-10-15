@@ -24,6 +24,8 @@ on macOS.
 | Ctrl+= / Ctrl+- / Ctrl+0 | Make the text larger / smaller / back to 100 % |
 | Ctrl+Shift+M | In a call: mute or unmute the microphone |
 | Ctrl+Shift+D | In a call: deafen or undeafen |
+| Ctrl+Shift+O | In a call: turn the camera on or off |
+| Ctrl+Shift+E | In a call: share your screen, or stop sharing |
 | Ctrl+Shift+A / Ctrl+Shift+X | While a call rings (its card is showing): accept / decline it |
 | Tab / Shift+Tab | Move to the next / previous field |
 | Esc | Close the topmost dialog, panel, Settings, the Sessions card or the switcher |
@@ -53,12 +55,14 @@ Rules the code follows (all in tests):
   7. Settings;
   8. a room dialog, the user card, the room settings (a question about leaving
      or encryption first) or the member list;
-  9. a security screen (recovery setup, a question about changing the key or
+  9. the share picker (it only cancels, never starts a share), then the
+     full-screen view of a video;
+  10. a security screen (recovery setup, a question about changing the key or
      resetting the identity);
-  10. the logout warning, then the Sessions card's password prompt, its
+  11. the logout warning, then the Sessions card's password prompt, its
       sign-out question, a rename in progress, then the card itself;
-  11. the composer's suggestions, then its reply or edit mode;
-  12. the thread panel, then the participants panel of a call (the one on
+  12. the composer's suggestions, then its reply or edit mode;
+  13. the thread panel, then the participants panel of a call (the one on
       screen first when the window is too narrow for both).
 
   A text field that took the Esc to drop its focus does not keep an overlay
@@ -97,8 +101,10 @@ Rules the code follows (all in tests):
   it has the focus; other fields (the display name, search, the server field)
   do not. They also do nothing when no card is showing, during the first
   0.6 s of a card, and when the key is still held from the previous ring.
-- Ctrl+Shift+M and Ctrl+Shift+D act only during a call, also over a dialog
-  (the call goes on behind it); without a call they do nothing.
+- Ctrl+Shift+M, Ctrl+Shift+D, Ctrl+Shift+O and Ctrl+Shift+E act only during
+  a call, also over a dialog (the call goes on behind it); without a call they
+  do nothing. Ctrl+Shift+V is not used for the camera: in the composer it is
+  paste.
 - While the Voice & audio card waits for a push-to-talk key (**Set key…**),
   every key goes to it and no shortcut runs: the next key with its
   modifiers becomes the binding, a modifier alone keeps waiting, and Esc,
@@ -195,6 +201,30 @@ release delay). A slider moved by the wheel or the
 keys, which never reports a release, sends its value after a 400 ms pause.
 Speaking is shown by a ring around the picture and by the word "Speaking",
 muted by a mark and the word "Muted", so neither relies on colour alone.
+
+### Video in calls
+
+- The camera and the share are buttons in the call dock (and the rail's
+  column), and in the stage's header: **Camera** and **Share your screen**.
+  Each shows that it is on by colour and by a check beside the glyph, and
+  its tooltip says what a press does. They answer to Ctrl+Shift+O and
+  Ctrl+Shift+E.
+- The stage is above the timeline of the call's room while someone sends a
+  picture. It has a **Hide** button (the pictures stop being sent to this
+  window while it is hidden), and a line with **Show video** when it is.
+  Each tile writes the person's name, "(you)" for the own camera, "screen" for a
+  share, a mark and the words "Camera off" when the camera is off, and the
+  microphone mark when they are muted. Speaking is a thick ring in the
+  speaking colour around the tile, as for the avatars. A person without a
+  camera shows their avatar. **Pin** keeps a tile in the big place;
+  **Full screen** opens it over the window (Esc, or **Exit full screen**).
+- The share picker lists the screens and windows with a picture, a name and
+  the size in words, or says that the system will ask. **Share** stays off
+  until something is picked. Esc cancels it.
+- While a share goes out, **You are sharing your screen** with **Stop sharing**
+  floats at the top of the window over every dialog and card.
+- Pictures are drawn by the GPU renderer. When only the software renderer
+  runs, the stage says so in words instead of staying black.
 
 ## Screen readers: not supported
 

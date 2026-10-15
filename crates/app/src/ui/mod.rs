@@ -8,3 +8,4 @@ pub mod guard;
 pub mod icons;
 pub mod kit;
 pub mod tokens;
+pub mod video_view;

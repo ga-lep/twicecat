@@ -386,7 +386,7 @@ fn room_pane_place(laid: &Laid<'_>) -> (Vec<usize>, Vec<usize>) {
 }
 
 /// Child counts down the room pane: container, then the column of
-/// `[title, timeline, bars, editor]`.
+/// `[title, stage, timeline, bars, editor]`.
 fn pane_shape(pane: &Node) -> Vec<usize> {
     let column = &pane.children()[0];
     vec![pane.children().len(), column.children().len()]
@@ -406,8 +406,8 @@ fn the_room_pane_keeps_its_place_as_panels_bars_and_banners_come_and_go() {
     };
     assert_eq!(
         shape,
-        vec![1, 4],
-        "container around [title, timeline, bars, editor]"
+        vec![1, 5],
+        "container around [title, stage, timeline, bars, editor]"
     );
     let steps: [Step; 8] = [
         ("thread opens", fixture::thread_open),
@@ -1559,10 +1559,19 @@ fn the_expanded_dock_never_spills_and_keeps_leave_apart_at_300_px() {
             }
             let lines = dock_lines(dock);
             let controls = lines.last().expect("the controls row");
-            // [mic, deafen, audio, spacer, leave]
+            // The row above it: [mic, deafen, camera, share].
+            let toggles = &lines[lines.len() - 2];
+            assert_eq!(toggles.children().len(), 4, "{what}");
+            for (i, kid) in toggles.children().iter().enumerate() {
+                assert!(
+                    kid.bounds().x + kid.bounds().width <= toggles.bounds().width + 0.5,
+                    "{what}: toggle {i} is cut off"
+                );
+            }
+            // [audio, spacer, leave]
             let kids = controls.children();
-            assert_eq!(kids.len(), 5, "{what}");
-            let (audio, leave) = (kids[2].bounds(), kids[4].bounds());
+            assert_eq!(kids.len(), 3, "{what}");
+            let (audio, leave) = (kids[0].bounds(), kids[2].bounds());
             assert!(
                 leave.x - (audio.x + audio.width) >= 15.5,
                 "{what}: Leave is {} px from Audio",
@@ -2416,7 +2425,7 @@ mod audio {
                 .map(|line| centre_of(&laid, line))
                 .collect();
             let controls = dock_lines(dock).last().expect("controls");
-            (lines, centre_of(&laid, &controls.children()[2]))
+            (lines, centre_of(&laid, &controls.children()[0]))
         };
         let mut hit = false;
         for at in lines {
@@ -5895,7 +5904,7 @@ mod security_screens {
             let laid = Laid::new(&app, &renderer, WIDE);
             room_pane_place(&laid)
         };
-        assert_eq!(base.1, vec![1, 4]);
+        assert_eq!(base.1, vec![1, 5]);
         for name in all().chain(["banner-device", "banner-recovery-off", "banner-notice"]) {
             for size in [WIDE, NARROW] {
                 let app = app_at(name, size);
@@ -5923,5 +5932,315 @@ mod security_screens {
                 .all(|t| !t.contains('\n') || t.len() > 100 || true)
         );
         let _ = count;
+    }
+}
+
+// ---- Video in calls: the stage, the picker and the sharing bar -------------
+
+mod video_stage {
+    use super::*;
+    use twicecat_app::video::VideoMessage;
+    use twicecat_core::api::{
+        CoreEvent, ScreenSource, ScreenSourceId, ScreenSourceKind, ScreenSources, VideoTrackId,
+    };
+
+    /// The room pane's column `[title, stage, timeline, bars, editor]`.
+    fn room_column_node<'n>(laid: &'n Laid<'_>) -> &'n Node {
+        let mut node = &laid.node;
+        loop {
+            let kids = node.children();
+            if kids.len() == 3 && kids[1].children().len() == 5 {
+                return &kids[1].children()[2].children()[0];
+            }
+            node = &kids[0];
+        }
+    }
+
+    /// Every message a click at the middle of each node makes.
+    fn clicks_everywhere(laid: &mut Laid<'_>, renderer: &Renderer, size: Size) -> Vec<Message> {
+        laid.settle(renderer, size);
+        let mut all = Vec::new();
+        collect_bounds(&laid.node, iced::Point::ORIGIN, &mut all, 0);
+        let mut messages = Vec::new();
+        for (rect, _) in all.iter().filter(|(r, _)| r.width > 0.0 && r.height > 0.0) {
+            let at = iced::Point::new(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+            messages.extend(click(laid, renderer, size, at));
+        }
+        messages
+    }
+
+    fn video(m: &Message) -> Option<&VideoMessage> {
+        match m {
+            Message::Video(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn the_stage_sits_between_the_title_and_the_timeline_and_leaves_the_timeline_room() {
+        let renderer = renderer();
+        for name in ["main-call-video", "main-call-video-share"] {
+            for width in [1280.0, 1000.0, 900.0] {
+                let mut app = scenario_app(name);
+                with_settings(&mut app, DENSITIES[0], RoomListChoice::Expanded);
+                app.window_width = width;
+                let size = Size::new(width, 800.0);
+                let laid = Laid::new(&app, &renderer, size);
+                let column = room_column_node(&laid);
+                let kids = column.children();
+                let (stage, timeline) = (kids[1].bounds(), kids[2].bounds());
+                let what = format!("{name} at {width}");
+                assert!(
+                    stage.height > 150.0,
+                    "{what}: the stage is {}",
+                    stage.height
+                );
+                assert!(
+                    timeline.height >= 150.0,
+                    "{what}: the timeline is {}",
+                    timeline.height
+                );
+                assert!(
+                    stage.y + stage.height <= timeline.y + 0.5,
+                    "{what}: the stage runs over the timeline"
+                );
+                // Nothing on the stage spills out of its parent.
+                let mut out = Vec::new();
+                spills(&kids[1], iced::Point::ORIGIN, &mut out);
+                assert!(out.is_empty(), "{what}: spills {out:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn without_video_the_stage_takes_no_room() {
+        let renderer = renderer();
+        for name in ["main-call-connected", "main-room", "main-call-video-folded"] {
+            let mut app = scenario_app(name);
+            with_settings(&mut app, DENSITIES[0], RoomListChoice::Expanded);
+            let laid = Laid::new(&app, &renderer, WIDE);
+            let kids = room_column_node(&laid).children();
+            let stage = kids[1].bounds();
+            if name == "main-call-video-folded" {
+                // One line with the buttons that bring it back.
+                assert!(stage.height > 0.0 && stage.height < 80.0, "{stage:?}");
+            } else {
+                assert_eq!(stage.height, 0.0, "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_click_on_a_picture_pins_it_and_the_sharing_bar_stops_the_share() {
+        let renderer = renderer();
+        // The small tiles of the strip have no buttons: only a click on the
+        // picture can pin them.
+        let app = scenario_app("main-call-video-share");
+        let mut laid = Laid::new(&app, &renderer, WIDE);
+        let pinned = clicks_everywhere(&mut laid, &renderer, WIDE);
+        assert!(
+            pinned.iter().any(|m| matches!(
+                video(m),
+                Some(VideoMessage::Pin(t)) if *t == VideoTrackId::from("bea-Camera")
+            )),
+            "no click pins a picture: {pinned:?}"
+        );
+        assert!(
+            pinned.iter().all(|m| !matches!(
+                video(m),
+                Some(VideoMessage::StopShare | VideoMessage::StartShare)
+            )),
+            "{pinned:?}"
+        );
+        let sharing = scenario_app("main-call-sharing");
+        let mut laid = Laid::new(&sharing, &renderer, WIDE);
+        let sent = clicks_everywhere(&mut laid, &renderer, WIDE);
+        assert!(
+            sent.iter()
+                .any(|m| matches!(video(m), Some(VideoMessage::StopShare))),
+            "no click stops the share: {sent:?}"
+        );
+    }
+
+    #[test]
+    fn the_sharing_bar_stays_in_the_window_at_every_width() {
+        let renderer = renderer();
+        for width in [1280.0, 900.0, 720.0, 520.0] {
+            let mut app = scenario_app("main-call-sharing");
+            with_settings(&mut app, DENSITIES[0], RoomListChoice::Expanded);
+            app.window_width = width;
+            let size = Size::new(width, 800.0);
+            let mut laid = Laid::new(&app, &renderer, size);
+            let sent = clicks_everywhere(&mut laid, &renderer, size);
+            assert!(
+                sent.iter()
+                    .any(|m| matches!(video(m), Some(VideoMessage::StopShare))),
+                "Stop sharing cannot be reached at {width}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_picker_starts_a_share_only_once_something_is_picked() {
+        let renderer = renderer();
+        let monitor = |id: &str| ScreenSource {
+            id: ScreenSourceId::from(id),
+            kind: ScreenSourceKind::Monitor,
+            title: id.to_owned(),
+            width: 1920,
+            height: 1080,
+            thumbnail: None,
+        };
+        let mut app = scenario_app("main-call-video");
+        let _ = app.update(Message::Video(VideoMessage::ToggleShare));
+        let _ = app.update(Message::Core(Box::new(CoreEvent::ScreenSources(
+            ScreenSources {
+                system_picker: false,
+                sources: vec![monitor("one"), monitor("two")],
+            },
+        ))));
+        let mut laid = Laid::new(&app, &renderer, WIDE);
+        let sent = clicks_everywhere(&mut laid, &renderer, WIDE);
+        assert!(
+            sent.iter()
+                .all(|m| !matches!(video(m), Some(VideoMessage::StartShare))),
+            "Share started with nothing picked: {sent:?}"
+        );
+        assert!(
+            sent.iter()
+                .any(|m| matches!(video(m), Some(VideoMessage::PickSource(_)))),
+            "no card can be picked: {sent:?}"
+        );
+        assert!(
+            sent.iter()
+                .any(|m| matches!(video(m), Some(VideoMessage::CancelShare))),
+            "no way out: {sent:?}"
+        );
+        // A system picker needs nothing picked.
+        let app = scenario_app("share-picker-system");
+        let mut laid = Laid::new(&app, &renderer, WIDE);
+        let sent = clicks_everywhere(&mut laid, &renderer, WIDE);
+        assert!(
+            sent.iter()
+                .any(|m| matches!(video(m), Some(VideoMessage::StartShare))),
+            "{sent:?}"
+        );
+        // A source picked: Share works.
+        let app = scenario_app("share-picker");
+        let mut laid = Laid::new(&app, &renderer, WIDE);
+        let sent = clicks_everywhere(&mut laid, &renderer, WIDE);
+        assert!(
+            sent.iter()
+                .any(|m| matches!(video(m), Some(VideoMessage::StartShare))),
+            "{sent:?}"
+        );
+    }
+
+    /// Draws the stage with the headless wgpu renderer, where a shader widget
+    /// really runs, and looks at the pixels of the tiles. Skipped where there
+    /// is no adapter (CI).
+    #[test]
+    fn the_gpu_draws_the_pictures_of_the_stage() {
+        use iced::advanced::renderer::Headless as _;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a current-thread runtime");
+        let Some(gpu) = runtime.block_on(Renderer::new(fonts::BODY, Pixels(16.0), Some("wgpu")))
+        else {
+            eprintln!("no wgpu adapter: skipped");
+            return;
+        };
+        if !gpu.name().to_lowercase().contains("wgpu") {
+            eprintln!("renderer {}: skipped", gpu.name());
+            return;
+        }
+        // Fonts for the labels, as the other tests load them.
+        let _ = renderer();
+        let mut app = scenario_app("main-call-video");
+        with_settings(&mut app, DENSITIES[0], RoomListChoice::Expanded);
+        let mut laid = Laid::new(&app, &gpu, WIDE);
+        laid.settle(&gpu, WIDE);
+        let stage = &room_column_node(&laid).children()[1];
+        let origin = origin_of(&laid.node, stage, iced::Point::ORIGIN).expect("the stage");
+        let mut all = Vec::new();
+        collect_bounds(stage, origin, &mut all, 0);
+        // The tiles are the 16:9 boxes at least 100 wide.
+        let mut tiles: Vec<Rectangle> = all
+            .iter()
+            .map(|(r, _)| *r)
+            .filter(|r| r.width > 100.0 && (r.width / r.height - 16.0 / 9.0).abs() < 0.02)
+            .collect();
+        tiles.dedup_by(|a, b| (a.x - b.x).abs() < 1.0 && (a.y - b.y).abs() < 1.0);
+        assert!(tiles.len() >= 3, "found {} tiles", tiles.len());
+        let pixels = laid.pixels(&app, gpu, WIDE);
+        // For a look: `TWICECAT_GALLERY_DIR=... cargo test ... the_gpu_draws`.
+        if std::env::var_os("TWICECAT_GALLERY_DIR").is_some() {
+            let dir = gallery_dir();
+            std::fs::create_dir_all(&dir).expect("create the gallery directory");
+            image::RgbaImage::from_raw(WIDE.width as u32, WIDE.height as u32, pixels.clone())
+                .expect("width x height x 4 bytes")
+                .save(dir.join("gpu-main-call-video.png"))
+                .expect("write the PNG");
+        }
+        let at = |x: f32, y: f32| {
+            let i = (y as usize * WIDE.width as usize + x as usize) * 4;
+            [pixels[i], pixels[i + 1], pixels[i + 2]]
+        };
+        // The gradient frame is neutral grey, from dark to light: two tiles
+        // (our camera and Bea's) show it, so the centre of each is the middle
+        // grey and not black.
+        let grey: Vec<_> = tiles
+            .iter()
+            .map(|r| at(r.x + r.width / 2.0, r.y + r.height / 2.0))
+            // Y = 112 of limited range 16..235 is 112 of 255 on screen: the
+            // picture is drawn as the frame says, not darker or lighter.
+            .filter(|p| p.iter().all(|c| (104..=120).contains(c)))
+            .collect();
+        assert_eq!(
+            grey.len(),
+            2,
+            "the pictures of two tiles are on screen: {:?}",
+            tiles
+                .iter()
+                .map(|r| at(r.x + r.width / 2.0, r.y + r.height / 2.0))
+                .collect::<Vec<_>>()
+        );
+        // The gradient runs from dark (left) to light (right). Bea's picture
+        // is drawn as it is; ours, the camera, is mirrored as in a mirror.
+        let edges = |r: Rectangle| {
+            (
+                at(r.x + 12.0, r.y + r.height / 2.0),
+                at(r.x + r.width - 12.0, r.y + r.height / 2.0),
+            )
+        };
+        let (ours_left, ours_right) = edges(tiles[0]);
+        let (bea_left, bea_right) = edges(tiles[1]);
+        assert!(
+            bea_left[0] < bea_right[0],
+            "left {bea_left:?} right {bea_right:?}"
+        );
+        assert!(
+            ours_left[0] > ours_right[0],
+            "left {ours_left:?} right {ours_right:?}"
+        );
+    }
+
+    #[test]
+    fn the_full_screen_view_covers_the_window_and_has_a_way_out() {
+        let renderer = renderer();
+        let app = scenario_app("video-fullscreen");
+        let mut laid = Laid::new(&app, &renderer, WIDE);
+        let sent = clicks_everywhere(&mut laid, &renderer, WIDE);
+        assert!(
+            sent.iter()
+                .any(|m| matches!(video(m), Some(VideoMessage::ExitFullscreen))),
+            "{sent:?}"
+        );
+        // Under it nothing is reachable: no click on the window makes another
+        // message than the way out.
+        assert!(
+            sent.iter().all(|m| !matches!(m, Message::SelectRoom(_))),
+            "{sent:?}"
+        );
     }
 }
