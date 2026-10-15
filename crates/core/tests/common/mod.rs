@@ -22,8 +22,33 @@ use twicecat_core::paths::DataPaths;
 use twicecat_core::secrets::InMemorySecretStore;
 use twicecat_core::{Core, CoreConfig, CoreHandle};
 
-/// Default wait for an expected event.
-pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default wait for an expected event: 30 s, or `TWICECAT_TEST_TIMEOUT_SECS` when
+/// that is set while the tests are built (CI sets it: a shared 4-core runner runs
+/// Synapse, LiveKit and two debug cores at once and is several times slower than
+/// a laptop). A timeout only ever ends a wait that has failed, so a longer one
+/// costs a passing run nothing (docs/testing.md, rule R2).
+pub const DEFAULT_TIMEOUT: Duration =
+    Duration::from_secs(timeout_secs(option_env!("TWICECAT_TEST_TIMEOUT_SECS"), 30));
+
+/// `text` as seconds, or `default` when it is absent or not a plain number.
+const fn timeout_secs(text: Option<&str>, default: u64) -> u64 {
+    let Some(text) = text else { return default };
+    let bytes = text.as_bytes();
+    if bytes.is_empty() {
+        return default;
+    }
+    let mut seconds = 0_u64;
+    let mut i = 0;
+    while i < bytes.len() {
+        let digit = bytes[i];
+        if !digit.is_ascii_digit() || seconds > u64::MAX / 20 {
+            return default;
+        }
+        seconds = seconds * 10 + (digit - b'0') as u64;
+        i += 1;
+    }
+    if seconds == 0 { default } else { seconds }
+}
 
 /// The stack settings and test accounts: `.env.test`, overridden by
 /// `.env.local`, overridden by environment variables ([`stack_env`]).

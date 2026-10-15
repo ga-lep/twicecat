@@ -165,6 +165,12 @@ jobs:
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-26.04
     timeout-minutes: 45
+    env:
+      # The tests' wait for an expected event (crates/core/tests/common): 90 s
+      # instead of 30 s. A shared 4-core runner runs Synapse, LiveKit and two
+      # debug cores at once; a timeout only ends a wait that has failed, so it
+      # costs a passing run nothing. Read when the tests are built.
+      TWICECAT_TEST_TIMEOUT_SECS: 90
     strategy:
       fail-fast: false
       matrix:
