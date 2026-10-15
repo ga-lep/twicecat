@@ -2747,7 +2747,8 @@ mod tests {
         let (mut app, mut rx) = app_with(1);
         let started = Instant::now();
         let task = app.update(Message::CloseRequested);
-        assert!(started.elapsed() < Duration::from_millis(50));
+        // A full sink must not block (it would hang for ever); 5 s only guards that.
+        assert!(started.elapsed() < Duration::from_secs(5));
         assert!(task.units() > 0, "the fallback task carries the command");
         assert!(matches!(rx.try_recv(), Ok(Command::RestoreSession)));
         assert!(

@@ -15,7 +15,7 @@ Every test has a tier. The tier says what a failure means, where the test runs a
 - **R2. A wall-clock bound in a gate guards against a hang.** It is at least 1 s and at least two orders of magnitude above the typical time. When a hang already blocks the test by itself, there is no bound.
 - **R3. Speed has an expectation, not a threshold.** A `perf_` test records a value with `twicecat_perf::record(name, value, unit, Expect::AtLeast(28.0))`. Outside the expectation the run prints `perf: ... OUTSIDE` and, under GitHub Actions, a `::warning` annotation. The test still passes.
 - **R4. Performance is measured alone.** `scripts/run-perf-tests.sh` runs one `perf_` test at a time. A rate measured in the middle of a parallel run measures the contention, not the code.
-- **R5. A test that has both a behaviour and a speed to check is split.** The behaviour stays a gate. The speed goes to a `perf_` test that reuses the same setup helper.
+- **R5. A test that has both a behaviour and a speed to check is split.** The behaviour stays a gate. The speed goes to a `perf_` test that reuses the same setup helper. A human-run test (tier 5, which nothing gates on) may record inline instead.
 
 ## Naming
 The prefix is the selector, as `hardware_` already is.

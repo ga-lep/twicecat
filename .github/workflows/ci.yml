@@ -115,7 +115,8 @@ jobs:
       - name: Clippy (non-Linux only)
         if: runner.os != 'Linux'
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-      - run: cargo test --workspace --locked
+      # perf_ tests are indicators and run in the perf workflow (docs/testing.md).
+      - run: cargo test --workspace --locked -- --skip perf_
       - name: No unverified libwebrtc download
         shell: bash
         run: scripts/check-no-webrtc-download.sh

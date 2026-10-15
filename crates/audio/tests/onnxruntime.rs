@@ -81,7 +81,11 @@ fn the_pinned_runtime_runs_deepfilternets_encoder() {
         "encoder, one frame: median {median:?}, worst {:?}",
         times.last().unwrap()
     );
-    assert!(median < Duration::from_millis(10));
+    twicecat_perf::record_duration(
+        "audio.onnxruntime.encoder_median_frame",
+        median,
+        Duration::from_millis(10),
+    );
 }
 
 /// One test on the GPU at a time: a CUDA graph capture in one forbids other
@@ -240,7 +244,11 @@ fn deepfilternet_on_the_gpu_sounds_like_on_the_cpu() {
             agreement_db > bar,
             "{candidate:?} output differs: {agreement_db:.1} dB"
         );
-        assert!(median(&gpu_times) < Duration::from_millis(4));
+        twicecat_perf::record_duration(
+            &format!("audio.onnxruntime.{candidate:?}.median_frame"),
+            median(&gpu_times),
+            Duration::from_millis(4),
+        );
         compared += 1;
     }
     if compared == 0 {

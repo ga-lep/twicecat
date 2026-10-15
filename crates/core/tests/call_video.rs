@@ -17,18 +17,45 @@ use std::time::{Duration, Instant};
 
 use common::calls::{add_member_device, allow_calls, sfu_room};
 use common::video::{
-    Seen, drain, ended, join, logged_in, statistics, track_where, until_unlisted, watch,
+    Seen, Watched, drain, ended, join, logged_in, statistics, track_where, until_unlisted, watch,
     watch_period,
 };
 use common::{
     TestEnv, create_encrypted_room, create_room, expect_event, raw_login, unique_room_name,
     wait_for_room,
 };
-use twicecat_core::api::{Command, CoreEvent, LocalVideo, VideoDirection, VideoKind, VideoQuality};
+use twicecat_core::api::{
+    Command, CoreEvent, LocalVideo, VideoDirection, VideoKind, VideoQuality, VideoTrackStats,
+};
+use twicecat_perf::{Expect, record};
 
-#[tokio::test]
-#[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
-async fn a_test_pattern_reaches_the_other_member_in_order_in_an_encrypted_call() {
+/// The camera test pattern's rate. A quiet machine measures 29.6 to 30 fps (on a
+/// laptop and on a CI runner), so a rate more than 1 fps below it is worth a look.
+const NOMINAL_FPS: f64 = 30.0;
+
+/// A feed below this is stalled, which is a bug; between this and the nominal
+/// rate it is slow, which only the `perf_` test reports (docs/testing.md, R1).
+const STREAMING_FLOOR_FPS: f64 = 5.0;
+
+/// What a watched camera call produced: the frames carol's feed delivered, and
+/// the statistics of both ends.
+struct CameraWatch {
+    watched: Watched,
+    received: VideoTrackStats,
+    sent: VideoTrackStats,
+}
+
+impl CameraWatch {
+    /// Frames per second at carol's feed, over the watch.
+    fn delivered_fps(&self) -> f64 {
+        self.watched.counters.len() as f64 / self.watched.span.as_secs_f64()
+    }
+}
+
+/// alice sends the test pattern as her camera in an encrypted call, carol
+/// watches it for `watch_period()`, then both leave. Shared by the behaviour
+/// test and the speed indicator, so each measures the same call.
+async fn watch_a_camera_call() -> CameraWatch {
     let env = TestEnv::load();
     let alice_raw = raw_login(1).await;
     let carol_raw = raw_login(3).await;
@@ -117,33 +144,17 @@ async fn a_test_pattern_reaches_the_other_member_in_order_in_an_encrypted_call()
         watched.layer_repeats,
         watched.sizes
     );
-    assert!(
-        watched.counters.windows(2).all(|w| w[0] < w[1]),
-        "frames out of order or repeated: {:?}",
-        watched.counters.windows(2).find(|w| w[0] >= w[1])
-    );
-    assert_eq!(watched.unreadable, 0, "every frame's stamp reads");
-    assert!(
-        watched.sizes.contains(&(1280, 720)),
-        "the top layer: {:?}",
-        watched.sizes
-    );
-    assert!(fps >= 28.0, "{fps:.1} fps");
-
     let received = carol_stats
         .iter()
         .rfind(|s| s.track == theirs.id && s.direction == VideoDirection::Received)
-        .expect("carol's statistics of alice's camera");
+        .expect("carol's statistics of alice's camera")
+        .clone();
     let sent = alice_stats
         .iter()
         .rfind(|s| s.track == own.id && s.direction == VideoDirection::Sent)
-        .expect("alice's statistics of her camera");
+        .expect("alice's statistics of her camera")
+        .clone();
     eprintln!("received {received:?}\nsent {sent:?}");
-    assert!(
-        received.fps > 20.0 && received.bitrate_kbps > 0,
-        "{received:?}"
-    );
-    assert!(sent.fps > 20.0 && sent.bitrate_kbps > 0, "{sent:?}");
 
     alice.commands.send(Command::LeaveCall).await.unwrap();
     ended(&mut self_view, "alice's self-view").await;
@@ -158,6 +169,70 @@ async fn a_test_pattern_reaches_the_other_member_in_order_in_an_encrypted_call()
 
     common::video::shut_down(alice, "alice").await;
     common::video::shut_down(carol, "carol").await;
+    CameraWatch {
+        watched,
+        received,
+        sent,
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
+async fn a_test_pattern_reaches_the_other_member_in_order_in_an_encrypted_call() {
+    let CameraWatch {
+        watched,
+        received,
+        sent,
+    } = watch_a_camera_call().await;
+    assert!(
+        watched.counters.windows(2).all(|w| w[0] < w[1]),
+        "frames out of order or repeated: {:?}",
+        watched.counters.windows(2).find(|w| w[0] >= w[1])
+    );
+    assert_eq!(watched.unreadable, 0, "every frame's stamp reads");
+    assert!(
+        watched.sizes.contains(&(1280, 720)),
+        "the top layer: {:?}",
+        watched.sizes
+    );
+    // A stalled stream is a bug; a slow one is a number (the `perf_` test below).
+    let fps = watched.counters.len() as f64 / watched.span.as_secs_f64();
+    assert!(fps >= STREAMING_FLOOR_FPS, "the feed stalled: {fps:.1} fps");
+    assert!(received.bitrate_kbps > 0, "{received:?}");
+    assert!(sent.bitrate_kbps > 0, "{sent:?}");
+}
+
+/// How fast the camera test pattern gets through, on a quiet machine: the
+/// frame rate at carol's feed and the rates in both ends' statistics. An
+/// indicator (docs/testing.md): a busy runner lowers it, and nothing is wrong.
+#[tokio::test]
+#[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
+async fn perf_a_camera_reaches_the_viewer_at_the_frame_rate() {
+    let run = watch_a_camera_call().await;
+    record(
+        "call_video.camera.delivered_fps",
+        run.delivered_fps(),
+        "fps",
+        Expect::AtLeast(NOMINAL_FPS - 1.0),
+    );
+    record(
+        "call_video.camera.received_fps",
+        run.received.fps as f64,
+        "fps",
+        Expect::AtLeast(NOMINAL_FPS - 1.0),
+    );
+    record(
+        "call_video.camera.sent_fps",
+        run.sent.fps as f64,
+        "fps",
+        Expect::AtLeast(NOMINAL_FPS - 1.0),
+    );
+    record(
+        "call_video.camera.received_kbps",
+        run.received.bitrate_kbps as f64,
+        "kbps",
+        Expect::Report,
+    );
 }
 
 /// Publishes a grey 640 × 360 picture at 15 fps on `room` as `source`, until
@@ -420,7 +495,17 @@ async fn hardware_nvenc_sends_h264_in_three_layers_in_an_encrypted_call() {
     for (quality, size, min_fps) in cases {
         let run = hardware_run(&mut call, &mut seen, quality, size).await;
         assert!(run.watched.sizes.contains(&size), "{:?}", run.watched.sizes);
-        assert!(run.fps >= min_fps, "{quality:?}: {:.1} fps", run.fps);
+        assert!(
+            run.fps >= STREAMING_FLOOR_FPS,
+            "{quality:?}: the feed stalled at {:.1} fps",
+            run.fps
+        );
+        record(
+            &format!("call_video.hardware.{quality:?}.fps"),
+            run.fps,
+            "fps",
+            Expect::AtLeast(min_fps),
+        );
         let encoder = run.sent.implementation.as_deref().unwrap_or_default();
         assert!(
             encoder.contains("NVIDIA H264 Encoder") && run.sent.hardware,
