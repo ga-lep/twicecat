@@ -41,3 +41,8 @@ The values go to `target/perf/<timestamp>.jsonl`. A new `perf_` test in a file t
 
 ## Where the numbers go
 The `perf` workflow runs on pushes to `main`, on demand and on a pull request with the `perf` label. It uploads `perf.jsonl` and writes the table into the job summary, with the change against the last successful `main` run. It is not a required check. The table renders on the run's **Summary** page (the first entry on the left of the run, above the jobs); the step's log shows the same table as plain text.
+
+## Which legs run when
+- Every push: `changes`, `checks`, `lint`, the Linux `test` legs (x86-64 and aarch64) and the 4 integration shards.
+- Also Windows and macOS: on `main`, on a manual run, and on a pull request that is **ready for review**. A draft pull request skips them; marking it ready starts a full run. They stay required for a merge, because they find real bugs Linux cannot see (a Cmd-versus-Ctrl key test).
+- A pull request that changes only markdown and `docs/` skips `lint`, `test` and the shards.

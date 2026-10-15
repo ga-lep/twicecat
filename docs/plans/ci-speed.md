@@ -1,5 +1,5 @@
 # CI Speed and Test Tiers Plan
-Status: DRAFT (scope set by the human in chat, 2026-10-15: do the CI speed-ups, and separate validation, regression and performance tests, with performance as an indicator, not a gate). The decisions below are proposals until the human confirms them at the Task 1 checkpoint.
+Status: DRAFT (scope set by the human in chat, 2026-10-15: do the CI speed-ups, and separate validation, regression and performance tests, with performance as an indicator, not a gate). Confirmed by the human on 2026-10-15: D6 (Windows and macOS only on ready pull requests) and D7 (no merging of test binaries, Task 8). The other decisions are proposals until the human confirms them at the Task 1 checkpoint.
 
 ## Goal
 Two things, in this order of importance.
@@ -151,15 +151,15 @@ Acceptance criteria:
 - **HUMAN:** the `test` job's build and run step durations on the four OSes against run `38716596416` (Windows 634 s, ubuntu 665 s, arm 747 s, macOS 465 s).
 Evidence: the counts above; **HUMAN:** step durations.
 
-### Task 9: Run `ui_gallery` once, and the draft policy (D6)
+### Task 9: Windows and macOS only on ready pull requests (D6); `ui_gallery` once
 Language: ci
-Files: .github/workflows/ci.yml, crates/app/tests/ui_gallery.rs (only if a check is platform-specific)
+Files: .github/workflows/ci.yml, docs/testing.md; later crates/app/tests/ui_gallery.rs
 Depends on: Task 6
 Acceptance criteria:
-- Checked: which `ui_gallery` checks depend on the platform (fonts, layout). The ones that do stay on every OS. The rest (pixel and structure checks that read only our own renderer output) run on ubuntu only, with the reason written next to the skip.
-- D6, as the human decides: the Windows and macOS legs run on `main` and on non-draft pull requests (`github.event.pull_request.draft == false`), or on every push as today.
-- `actionlint` accepts the workflow.
-Evidence: **HUMAN:** the run's job list for a draft and for a ready pull request.
+- D6, as the human decided (2026-10-15): the `test` matrix comes from the `changes` job. On `main`, on a manual run and on a pull request that is ready for review it is Linux x86-64, Linux aarch64, Windows and macOS; on a draft pull request it is the two Linux legs. `ready_for_review` is a trigger, so marking a pull request ready starts a full run. The Windows and macOS legs stay required for a merge.
+- **Not on `main` yet:** `ui_gallery` (it comes with PR #27). When that branch rebases onto this one: check which of its checks depend on the platform (fonts, layout), keep those on every OS, and run the rest on ubuntu only, with the reason next to the skip.
+- YAML parses; **actionlint is not installed here**.
+Evidence: **HUMAN:** this draft pull request's next run shows two `test` legs; marking it ready shows four.
 
 ### Task 10: After-numbers and the three green runs (checkpoint)
 Language: docs

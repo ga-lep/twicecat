@@ -2601,7 +2601,7 @@ Draft, scope set by the human 2026-10-15. Steps:
 - [x] 6. Each shard builds its own binaries; rebalance
 - [x] 7. Cache the downloads (changed: setup action, pinned cargo-deny, stack overlap)
 - [x] 8. Fewer test binaries linked (merging measured and not done, see the ledger)
-- [ ] 9. `ui_gallery` once, and the draft policy
+- [x] 9. Windows and macOS only on ready PRs (`ui_gallery` half waits for PR #27)
 - [ ] 10. After-numbers and three green runs
 
 ### CI speed human checkpoint
