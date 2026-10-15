@@ -2590,3 +2590,21 @@ Plan approved by the human 2026-10-13: Q6-Q8 as the human chose them (NVENC/NVDE
 - [ ] Windows and macOS: permissions, pickers, capture and encode on real hardware.
 - [ ] An AMD GPU and an NVIDIA GPU before Ada encoding (and, after Task 15, decoding) through Vulkan Video; an NVIDIA GPU on nouveau or NVK falling back as the probe says.
 - [ ] Steam Frame, if Task 13 runs.
+
+## CI speed and test tiers (plan: docs/plans/ci-speed.md, branch `feat/ci-speed`)
+Draft, scope set by the human 2026-10-15. Steps:
+- [x] 1. Plan and ledger (ci-speed.1)
+- [ ] 2. The `twicecat-perf` crate, the report script, `docs/testing.md`
+- [ ] 3. Speed gates become `perf_` indicators; tight guards become hang guards
+- [ ] 4. The `perf` workflow
+- [ ] 5. Pipeline quick wins: cancel, fail fast, save only on main, skip docs-only
+- [ ] 6. Each shard builds its own binaries; rebalance
+- [ ] 7. Cache the downloads
+- [ ] 8. Fewer test binaries
+- [ ] 9. `ui_gallery` once, and the draft policy
+- [ ] 10. After-numbers and three green runs
+
+### CI speed human checkpoint
+- [ ] Confirm the test tiers and D1 to D7 in the plan, and answer D6 (Windows and macOS on every push, or only on `main` and ready pull requests).
+- [ ] Run `perf.yml` once (`gh workflow run perf.yml --ref feat/ci-speed`) and read the summary.
+- [ ] Read the CI step durations after Tasks 5 to 9 and record them in the ledger.
