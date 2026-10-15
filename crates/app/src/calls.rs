@@ -762,6 +762,8 @@ impl CallModel {
             video @ (CoreEvent::VideoDevices(_)
             | CoreEvent::ScreenSources(_)
             | CoreEvent::VideoSettings(_)
+            | CoreEvent::VideoSettingsAdjusted(_)
+            | CoreEvent::VideoSending { .. }
             | CoreEvent::VideoTracks { .. }
             | CoreEvent::VideoFeed { .. }
             | CoreEvent::CameraPreview(_)

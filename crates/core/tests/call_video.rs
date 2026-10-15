@@ -17,15 +17,16 @@ use std::time::{Duration, Instant};
 
 use common::calls::{add_member_device, allow_calls, sfu_room};
 use common::video::{
-    Seen, Watched, drain, ended, join, logged_in, statistics, track_where, until_unlisted, watch,
-    watch_period,
+    Call, Seen, Watched, drain, ended, join, logged_in, statistics, track_where, until_unlisted,
+    watch, watch_period,
 };
 use common::{
     TestEnv, create_encrypted_room, create_room, expect_event, raw_login, unique_room_name,
     wait_for_room,
 };
 use twicecat_core::api::{
-    Command, CoreEvent, LocalVideo, VideoDirection, VideoKind, VideoQuality, VideoTrackStats,
+    Command, CoreEvent, EncoderBackend, EncoderChoice, LocalVideo, VideoCodec, VideoCodecChoice,
+    VideoDirection, VideoKind, VideoQuality, VideoSettings, VideoTrackStats, VideoTuning,
 };
 use twicecat_perf::{Expect, record};
 
@@ -36,6 +37,13 @@ const NOMINAL_FPS: f64 = 30.0;
 /// A feed below this is stalled, which is a bug; between this and the nominal
 /// rate it is slow, which only the `perf_` test reports (docs/testing.md, R1).
 const STREAMING_FLOOR_FPS: f64 = 5.0;
+
+/// The calls here encode video in software on the test machine. Run side by
+/// side they take each other's CPU, and the delivery test, which measures the
+/// frame rate, then sees 26 to 27 fps on a four-core runner instead of 30.
+/// One call at a time; a test that panics does not block the next (tokio's
+/// mutex does not poison).
+static ONE_CALL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// What a watched camera call produced: the frames carol's feed delivered, and
 /// the statistics of both ends.
@@ -56,6 +64,7 @@ impl CameraWatch {
 /// watches it for `watch_period()`, then both leave. Shared by the behaviour
 /// test and the speed indicator, so each measures the same call.
 async fn watch_a_camera_call() -> CameraWatch {
+    let _one_call = ONE_CALL.lock().await;
     let env = TestEnv::load();
     let alice_raw = raw_login(1).await;
     let carol_raw = raw_login(3).await;
@@ -235,6 +244,278 @@ async fn perf_a_camera_reaches_the_viewer_at_the_frame_rate() {
     );
 }
 
+/// One tuned camera: the settings, the picture asked for on carol's side,
+/// and what carol must see.
+struct Round {
+    name: &'static str,
+    tuning: VideoTuning,
+    codec_choice: VideoCodecChoice,
+    /// Width and height carol says her tile has.
+    view: (u32, u32),
+    /// No picture is bigger than this (libwebrtc starts small and grows).
+    at_most: (u32, u32),
+    /// Some picture is at least this tall, when it matters.
+    reaches_height: Option<u32>,
+    /// Carol's received frames per second, from to.
+    fps: (f64, f64),
+    /// The codec of the received track, when it matters.
+    codec: Option<VideoCodec>,
+    /// The most carol's received bitrate may be, kb/s.
+    max_kbps: Option<u32>,
+}
+
+/// The advanced video settings change what the other side receives (plan
+/// Phase 9 Task 11): a custom size and rate, one layer instead of three, a
+/// codec, a bitrate cap, and an SVC stream. Software path, encrypted call.
+#[tokio::test]
+#[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
+async fn tuned_video_changes_what_the_receiver_gets() {
+    let _one_call = ONE_CALL.lock().await;
+    let rounds = [
+        Round {
+            name: "a custom size and rate",
+            tuning: VideoTuning {
+                width: Some(640),
+                height: Some(360),
+                fps: Some(15),
+                ..VideoTuning::default()
+            },
+            codec_choice: VideoCodecChoice::H264,
+            view: (640, 360),
+            at_most: (640, 360),
+            reaches_height: None,
+            fps: (11.0, 18.0),
+            codec: None,
+            max_kbps: None,
+        },
+        Round {
+            name: "one layer",
+            tuning: VideoTuning {
+                layers: Some(1),
+                ..VideoTuning::default()
+            },
+            codec_choice: VideoCodecChoice::H264,
+            // A small tile would be given the 360p layer if there were one.
+            view: (320, 180),
+            at_most: (1280, 720),
+            reaches_height: Some(720),
+            fps: (24.0, 32.0),
+            codec: None,
+            max_kbps: None,
+        },
+        Round {
+            name: "VP9",
+            tuning: VideoTuning {
+                codec: Some(VideoCodec::Vp9),
+                layers: Some(1),
+                ..VideoTuning::default()
+            },
+            codec_choice: VideoCodecChoice::H264,
+            view: (1280, 720),
+            at_most: (1280, 720),
+            reaches_height: None,
+            fps: (20.0, 32.0),
+            codec: Some(VideoCodec::Vp9),
+            max_kbps: None,
+        },
+        Round {
+            name: "a bitrate cap",
+            tuning: VideoTuning {
+                bitrate_kbps: Some(500),
+                layers: Some(1),
+                ..VideoTuning::default()
+            },
+            codec_choice: VideoCodecChoice::H264,
+            view: (1280, 720),
+            at_most: (1280, 720),
+            reaches_height: None,
+            fps: (5.0, 32.0),
+            codec: None,
+            max_kbps: Some(800),
+        },
+    ];
+    let mut call = common::video::alice_and_carol_in_a_call(true).await;
+    let alice_id = TestEnv::load().user_id(1);
+    let mut carol_seen = Seen::default();
+    let mut alice_seen = Seen::default();
+    for round in rounds {
+        let settings = VideoSettings {
+            encoder: EncoderChoice::Prefer(EncoderBackend::Software),
+            codec: round.codec_choice,
+            camera_tuning: round.tuning.clone(),
+            ..VideoSettings::default()
+        };
+        call.alice
+            .commands
+            .send(Command::UpdateVideoSettings(settings))
+            .await
+            .unwrap();
+        expect_event(&mut call.alice, |e| {
+            matches!(e, CoreEvent::VideoSettings(_))
+        })
+        .await;
+        call.alice
+            .commands
+            .send(Command::StartCamera {
+                device: None,
+                quality: VideoQuality::Hd720p30,
+            })
+            .await
+            .unwrap();
+        let local = expect_event(&mut call.alice, |e| {
+            matches!(e, CoreEvent::LocalVideo(_) | CoreEvent::Error(_))
+        })
+        .await;
+        assert!(
+            matches!(
+                &local,
+                CoreEvent::LocalVideo(LocalVideo {
+                    camera: Some(_),
+                    ..
+                })
+            ),
+            "{}: {local:?}",
+            round.name
+        );
+        let (theirs, mut feed) = track_where(&mut call.carol, &mut carol_seen, |t| {
+            !t.is_local && t.user_id.as_str() == alice_id && t.kind == VideoKind::Camera
+        })
+        .await;
+        call.carol
+            .commands
+            .send(Command::SetVideoView {
+                track: theirs.id.clone(),
+                width: round.view.0,
+                height: round.view.1,
+                visible: true,
+            })
+            .await
+            .unwrap();
+        let (watched, stats) = statistics(
+            &mut call.carol,
+            &mut carol_seen,
+            watch(&mut feed, Duration::from_secs(8)),
+        )
+        .await;
+        eprintln!(
+            "{}: sizes {:?}, stats {:?}",
+            round.name,
+            watched.sizes,
+            stats.iter().rfind(|s| s.track == theirs.id)
+        );
+        assert!(
+            watched
+                .sizes
+                .iter()
+                .all(|(w, h)| *w <= round.at_most.0 && *h <= round.at_most.1),
+            "{}: sizes {:?}, none bigger than {:?}",
+            round.name,
+            watched.sizes,
+            round.at_most
+        );
+        if let Some(height) = round.reaches_height {
+            assert!(
+                watched.sizes.iter().any(|(_, h)| *h >= height),
+                "{}: sizes {:?}, one at least {height} tall",
+                round.name,
+                watched.sizes
+            );
+        }
+        let received = stats
+            .iter()
+            .rfind(|s| s.track == theirs.id && s.direction == VideoDirection::Received)
+            .unwrap_or_else(|| panic!("{}: no statistics", round.name));
+        // libwebrtc's own count of frames received in the last second.
+        assert!(
+            (round.fps.0..=round.fps.1).contains(&f64::from(received.fps)),
+            "{}: {:.1} fps, wanted {:?}",
+            round.name,
+            received.fps,
+            round.fps
+        );
+        if let Some(cap) = round.max_kbps {
+            assert!(
+                received.bitrate_kbps <= cap,
+                "{}: {} kb/s over the cap {cap}",
+                round.name,
+                received.bitrate_kbps
+            );
+        }
+        if let Some(codec) = round.codec {
+            let track = carol_seen.tracks.iter().find(|t| t.id == theirs.id);
+            assert_eq!(
+                track.and_then(|t| t.codec),
+                Some(codec),
+                "{}: {track:?}",
+                round.name
+            );
+        }
+        // Next round: the camera off, and its track gone on carol's side.
+        call.alice.commands.send(Command::StopCamera).await.unwrap();
+        until_unlisted(&mut call.carol, &mut carol_seen, |t| t.id == theirs.id).await;
+        let _ = drain(&mut call.alice, &mut alice_seen, Duration::from_millis(300)).await;
+    }
+    let Call { alice, carol, .. } = call;
+    common::video::shut_down(alice, "alice").await;
+    common::video::shut_down(carol, "carol").await;
+}
+
+/// A tuning the encoder cannot do is sent as it can, and alice is told what
+/// differs (`VideoSending`).
+#[tokio::test]
+#[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
+async fn a_tuning_the_encoder_cannot_do_is_adjusted_and_said() {
+    let _one_call = ONE_CALL.lock().await;
+    let mut call = common::video::alice_and_carol_in_a_call(true).await;
+    let settings = VideoSettings {
+        encoder: EncoderChoice::Prefer(EncoderBackend::Software),
+        camera_tuning: VideoTuning {
+            width: Some(3840),
+            height: Some(2160),
+            fps: Some(60),
+            ..VideoTuning::default()
+        },
+        ..VideoSettings::default()
+    };
+    call.alice
+        .commands
+        .send(Command::UpdateVideoSettings(settings))
+        .await
+        .unwrap();
+    expect_event(&mut call.alice, |e| {
+        matches!(e, CoreEvent::VideoSettings(_))
+    })
+    .await;
+    call.alice
+        .commands
+        .send(Command::StartCamera {
+            device: None,
+            quality: VideoQuality::Auto,
+        })
+        .await
+        .unwrap();
+    let said = expect_event(&mut call.alice, |e| {
+        matches!(e, CoreEvent::VideoSending { .. } | CoreEvent::Error(_))
+    })
+    .await;
+    match said {
+        CoreEvent::VideoSending { kind, changes } => {
+            assert_eq!(kind, VideoKind::Camera);
+            assert!(
+                changes.iter().any(|c| c.setting == "camera.size"),
+                "{changes:?}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    let mut seen = Seen::default();
+    let (own, _feed) = track_where(&mut call.alice, &mut seen, |t| t.is_local).await;
+    assert_eq!((own.width, own.height), (1920, 1080), "{own:?}");
+    let Call { alice, carol, .. } = call;
+    common::video::shut_down(alice, "alice").await;
+    common::video::shut_down(carol, "carol").await;
+}
+
 /// Publishes a grey 640 × 360 picture at 15 fps on `room` as `source`, until
 /// the room closes.
 async fn publish_picture(
@@ -299,6 +580,7 @@ async fn publish_picture(
 #[tokio::test]
 #[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
 async fn a_video_track_from_another_device_shows_as_that_device() {
+    let _one_call = ONE_CALL.lock().await;
     use livekit::prelude::TrackSource;
     const DEVICE: &str = "SCREENER";
     let env = TestEnv::load();

@@ -26,6 +26,8 @@ pub enum Codec {
     Av1,
     /// VP8, libwebrtc's own encoder on the no-hardware path (Q3).
     Vp8,
+    /// VP9, libwebrtc's libvpx encoder, a choice in the advanced settings.
+    Vp9,
 }
 
 /// One encoded layer: its picture size, framerate and bitrate.
@@ -101,6 +103,9 @@ pub fn bitrate_bps(content: Content, codec: Codec, height: u32, fps: u32) -> u32
         Codec::Av1 => 0.6,
         // libwebrtc's VP8 needs about what H.264 does at these sizes.
         Codec::Vp8 => 1.0,
+        // VP9 needs about 0.7 of that (libvpx's own guidance is 30 to 40 %
+        // under VP8 at the same quality).
+        Codec::Vp9 => 0.7,
     };
     // Rounded to 10 kb/s.
     ((h264 * factor / 10_000.0).round() * 10_000.0) as u32

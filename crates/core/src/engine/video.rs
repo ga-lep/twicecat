@@ -143,7 +143,8 @@ impl Engine {
             self.emit(CoreEvent::Error(CoreError::NotInCall)).await;
             return;
         }
-        let choice = self.video_settings().await.encoder;
+        let settings = self.video_settings().await.clone();
+        let choice = settings.tuning(kind).encoder.unwrap_or(settings.encoder);
         let backend = self.video_encoders().await.choose(choice);
         self.send_video(kind, quality, backend).await;
     }
@@ -157,15 +158,28 @@ impl Engine {
         backend: EncoderBackend,
     ) {
         let before = self.video_in_use();
+        let settings = self.video_settings().await.clone();
         let Some(call) = self.call.as_mut() else {
             self.emit(CoreEvent::Error(CoreError::NotInCall)).await;
             return;
         };
-        let sending = crate::call::sending(backend, kind, quality);
+        let (sending, changes) = crate::call::tuned(
+            backend,
+            kind,
+            quality,
+            settings.tuning(kind),
+            settings.codec,
+        );
         let result = call.start_pattern(kind, quality, &sending).await;
         let local = call.local_video();
         match result {
-            Ok(_) => self.emit(CoreEvent::LocalVideo(local)).await,
+            Ok(_) => {
+                self.emit(CoreEvent::LocalVideo(local)).await;
+                // What is sent is not what the settings say: say so.
+                if !changes.is_empty() {
+                    self.emit(CoreEvent::VideoSending { kind, changes }).await;
+                }
+            }
             Err(e) => self.emit(CoreEvent::Error(e)).await,
         }
         self.report_encoder_change(before).await;
@@ -228,7 +242,12 @@ impl Engine {
             if let Some(problem) = loaded.problem {
                 self.emit(CoreEvent::Error(problem)).await;
             }
-            self.video_settings = Some(loaded.settings);
+            // A file edited by hand may hold values out of bounds.
+            let (settings, changes) = loaded.settings.validated();
+            if !changes.is_empty() {
+                self.emit(CoreEvent::VideoSettingsAdjusted(changes)).await;
+            }
+            self.video_settings = Some(settings);
         }
         self.video_settings.as_ref().expect("loaded above")
     }
@@ -237,6 +256,8 @@ impl Engine {
     /// reported; the settings still apply for this run. Tracks being sent
     /// keep their encoder until they are started again.
     async fn store_video_settings(&mut self, settings: VideoSettings) {
+        // Out-of-bounds values are brought inside them, and said.
+        let (settings, changes) = settings.validated();
         let paths = self.config.data.clone();
         let to_save = settings.clone();
         let saved = blocking(move || video_settings::save(&paths, &to_save))
@@ -247,6 +268,9 @@ impl Engine {
             self.emit(CoreEvent::Error(e)).await;
         }
         self.emit(CoreEvent::VideoSettings(settings)).await;
+        if !changes.is_empty() {
+            self.emit(CoreEvent::VideoSettingsAdjusted(changes)).await;
+        }
     }
 
     async fn stop_video(&mut self, kind: VideoKind) {
