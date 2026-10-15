@@ -265,7 +265,8 @@ mod tests {
         assert!(try_send(&tx, Command::RestoreSession).is_ok());
         let started = Instant::now();
         let pending = try_send(&tx, Command::Shutdown).expect_err("channel is full");
-        assert!(started.elapsed() < Duration::from_millis(50));
+        // A full sink must not block (it would hang for ever); 5 s only guards that.
+        assert!(started.elapsed() < Duration::from_secs(5));
         let first = rx.try_recv().expect("first command");
         assert!(matches!(first, Command::RestoreSession));
         iced::futures::executor::block_on(pending.deliver());

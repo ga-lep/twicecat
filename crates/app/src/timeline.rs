@@ -1903,20 +1903,13 @@ mod tests {
         v[v.len() / 2]
     }
 
+    /// The median time of one `update` with the diffs `prepare` makes, on a
+    /// fresh loaded app each run (the first run is a warm-up).
     fn time_shape(
-        name: &str,
+        name: &'static str,
         scrolled_up: bool,
         prepare: impl Fn() -> Vec<ListDiff<TimelineItem>>,
-    ) {
-        // The plan's 16 ms is the frame budget, checked on a developer's machine
-        // (a 10,000-item reset takes about 5 ms in a debug build on a laptop).
-        // CI runners are shared and slower in debug builds: Windows took a 24 ms
-        // median, and the x86 Linux runner 16.2 ms once while the same build
-        // stays at 4 to 5 ms here, even squeezed onto 2 cores with the rest of
-        // the suite. There (Windows, or `CI` set, as GitHub Actions does) the
-        // bound is looser and still catches an order-of-magnitude regression.
-        let ci = cfg!(windows) || std::env::var_os("CI").is_some();
-        let budget = Duration::from_millis(if ci { 50 } else { 16 });
+    ) -> (&'static str, Duration) {
         let mut runs = Vec::new();
         for run in 0..16 {
             let mut app = loaded_app(scrolled_up);
@@ -1929,61 +1922,98 @@ mod tests {
                 runs.push(elapsed);
             }
         }
-        let m = median(runs);
-        println!("timeline_batches_under_16ms: {name}: median {m:?}");
-        assert!(m < budget, "{name}: median {m:?} is over {budget:?}");
+        (name, median(runs))
     }
 
-    #[test]
-    fn timeline_batches_under_16ms() {
-        time_shape("1 reset of 10,000", false, || {
-            vec![ListDiff::Reset {
-                values: synthetic(10_000),
-            }]
-        });
-        time_shape("2 pagination (20 PushFront + Insert)", false, || {
-            let mut d: Vec<_> = (0..20)
-                .map(|i| ListDiff::PushFront {
-                    value: msg(&format!("old{i}"), "@o:x", 0),
-                })
-                .collect();
-            d.push(ListDiff::Insert {
-                index: 5000,
-                value: msg("ins", "@o:x", 0),
-            });
-            d
-        });
-        time_shape("3 PushBack of 5 while scrolled up", true, || {
-            (0..5)
-                .map(|i| ListDiff::PushBack {
-                    value: msg(&format!("new{i}"), "@n:x", 0),
-                })
-                .collect()
-        });
-        time_shape("4 100 Set + 10 Remove/Insert", false, || {
-            let mut d: Vec<_> = (0..100)
-                .map(|k| ListDiff::Set {
-                    index: 100 + k * 90,
-                    value: changed(100 + k * 90),
-                })
-                .collect();
-            for k in 0..10 {
-                d.push(ListDiff::Remove { index: 7000 + k });
-                d.push(ListDiff::Insert {
-                    index: 7000 + k,
-                    value: msg(&format!("re{k}"), "@r:x", 0),
-                });
-            }
-            d
-        });
-        time_shape("5 Clear then Reset of 10,000", false, || {
-            vec![
-                ListDiff::Clear,
-                ListDiff::Reset {
+    /// The batch shapes of the plan's 16 ms frame budget, each timed.
+    fn time_shapes() -> Vec<(&'static str, Duration)> {
+        vec![
+            time_shape("1 reset of 10,000", false, || {
+                vec![ListDiff::Reset {
                     values: synthetic(10_000),
-                },
-            ]
-        });
+                }]
+            }),
+            time_shape("2 pagination (20 PushFront + Insert)", false, || {
+                let mut d: Vec<_> = (0..20)
+                    .map(|i| ListDiff::PushFront {
+                        value: msg(&format!("old{i}"), "@o:x", 0),
+                    })
+                    .collect();
+                d.push(ListDiff::Insert {
+                    index: 5000,
+                    value: msg("ins", "@o:x", 0),
+                });
+                d
+            }),
+            time_shape("3 PushBack of 5 while scrolled up", true, || {
+                (0..5)
+                    .map(|i| ListDiff::PushBack {
+                        value: msg(&format!("new{i}"), "@n:x", 0),
+                    })
+                    .collect()
+            }),
+            time_shape("4 100 Set + 10 Remove/Insert", false, || {
+                let mut d: Vec<_> = (0..100)
+                    .map(|k| ListDiff::Set {
+                        index: 100 + k * 90,
+                        value: changed(100 + k * 90),
+                    })
+                    .collect();
+                for k in 0..10 {
+                    d.push(ListDiff::Remove { index: 7000 + k });
+                    d.push(ListDiff::Insert {
+                        index: 7000 + k,
+                        value: msg(&format!("re{k}"), "@r:x", 0),
+                    });
+                }
+                d
+            }),
+            time_shape("5 Clear then Reset of 10,000", false, || {
+                vec![
+                    ListDiff::Clear,
+                    ListDiff::Reset {
+                        values: synthetic(10_000),
+                    },
+                ]
+            }),
+        ]
+    }
+
+    /// A batch is nowhere near taking seconds (docs/testing.md, R2): an
+    /// order-of-magnitude regression, such as a quadratic rebuild of the
+    /// whole list, fails here. How fast it is, is `perf_timeline_batches`.
+    #[test]
+    fn timeline_batches_do_not_take_seconds() {
+        for (name, median) in time_shapes() {
+            assert!(median < Duration::from_secs(1), "{name}: median {median:?}");
+        }
+    }
+
+    /// What each batch shape is expected to take: the medians measured on a laptop
+    /// (2.5 to 4 ms in a debug build) and on the CI runners (4 to 7.5 ms), with
+    /// about 1.6 times the worst as the margin. The Phase 3 plan's 16 ms frame
+    /// budget stays the line a user would feel; a value past its expectation is a
+    /// regression well before that.
+    fn expected(name: &str) -> Duration {
+        Duration::from_millis(match name.chars().next() {
+            Some('1' | '5') => 12, // a reset of 10,000 items
+            Some('2') => 9,        // pagination
+            Some('3') => 8,        // a push while scrolled up
+            _ => 10,               // many sets and a few moves
+        })
+    }
+
+    /// A batch of diffs applies within its expectation. An indicator, not a
+    /// gate: a shared runner is slower than a laptop.
+    #[test]
+    fn perf_timeline_batches() {
+        for (name, median) in time_shapes() {
+            twicecat_perf::record_duration(
+                &format!("app.timeline.batch.{name}"),
+                median,
+                expected(name),
+            );
+        }
     }
 
     #[test]

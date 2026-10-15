@@ -23,7 +23,8 @@ if [ "${1:-}" = --shard ]; then
 fi
 
 "$script_dir/prune-test-rooms.sh"
-test_args=(--ignored --skip keyring --skip hardware_ "$@")
+# perf_ tests are indicators and run in the perf workflow (docs/testing.md).
+test_args=(--ignored --skip keyring --skip hardware_ --skip perf_ "$@")
 if [ -z "$shard" ]; then
     exec cargo test -p twicecat-core -p twicecat-app --locked -- "${test_args[@]}"
 fi

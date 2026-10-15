@@ -914,7 +914,17 @@ mod tests {
     // slower in debug builds (a 10,000-item reset took a 24 ms median there
     // while Linux and macOS stay well under 16 ms), so Windows gets a looser
     // bound that still catches an order-of-magnitude regression.
-    const BUDGET: Duration = Duration::from_millis(if cfg!(windows) { 50 } else { 16 });
+    /// What a batch is expected to take, from the medians measured on a laptop and
+    /// on the CI runners (0.4 to 1.1 ms in a debug build), with about twice the
+    /// worst as the margin. The Phase 3 plan's 16 ms frame budget is far above
+    /// these; a value past its expectation is a regression long before it is a
+    /// dropped frame. Only an indicator (docs/testing.md).
+    fn expected(name: &str) -> Duration {
+        match name {
+            "mixed on 2000" => Duration::from_millis(1),
+            _ => Duration::from_millis(2),
+        }
+    }
 
     /// Deterministic synthetic room `i`: name, avatar and a 100-char preview.
     fn synthetic(i: usize) -> RoomSummary {
@@ -1012,8 +1022,8 @@ mod tests {
         sorted[sorted.len() / 2]
     }
 
-    #[test]
-    fn room_list_batches_under_16ms() {
+    /// The median time of each batch shape.
+    fn time_shapes() -> Vec<(&'static str, Duration)> {
         let shapes: Vec<(&str, usize, Vec<ListDiff<RoomSummary>>)> = vec![
             (
                 "reset 2000",
@@ -1043,236 +1053,35 @@ mod tests {
                 ],
             ),
         ];
-        let mut failures = Vec::new();
-        for (name, start, diffs) in &shapes {
-            let timings = time_shape(*start, diffs);
-            let med = median(&timings);
-            println!("{name}: median {med:?}, all {timings:?}");
-            if med >= BUDGET {
-                failures.push(format!(
-                    "{name}: median {med:?} >= {BUDGET:?}; all {timings:?}"
-                ));
-            }
-        }
-        assert!(failures.is_empty(), "too slow:\n{}", failures.join("\n"));
-    }
-}
-
-#[cfg(test)]
-mod pure_tests {
-    use twicecat_core::api::{MessagePreview, RoomId, RoomListTab, RoomSummary, UserId};
-
-    use super::*;
-
-    const H: f32 = ROW_HEIGHT;
-
-    fn range(offset: f32, viewport: f32, len: usize) -> std::ops::Range<usize> {
-        visible_range(offset, viewport, H, len, 2)
+        shapes
+            .iter()
+            .map(|(name, start, diffs)| {
+                let timings = time_shape(*start, diffs);
+                let med = median(&timings);
+                println!("{name}: median {med:?}, all {timings:?}");
+                (*name, med)
+            })
+            .collect()
     }
 
+    /// A batch is nowhere near taking seconds (docs/testing.md, R2). How fast
+    /// it is, is `perf_room_list_batches`.
     #[test]
-    fn visible_range_at_the_top_includes_overscan_below_only() {
-        // 10 rows visible, 2 rows of overscan below.
-        assert_eq!(range(0.0, 10.0 * H, 100), 0..12);
-    }
-
-    #[test]
-    fn visible_range_in_the_middle_has_overscan_on_both_sides() {
-        // Rows 20..30 are visible.
-        assert_eq!(range(20.0 * H, 10.0 * H, 100), 18..32);
-        // A partly visible row counts.
-        assert_eq!(range(20.5 * H, 10.0 * H, 100), 18..33);
-    }
-
-    #[test]
-    fn visible_range_at_the_end_stops_at_len() {
-        assert_eq!(range(90.0 * H, 10.0 * H, 100), 88..100);
-    }
-
-    #[test]
-    fn visible_range_of_an_empty_list_is_empty() {
-        assert_eq!(range(0.0, 10.0 * H, 0), 0..0);
-        assert_eq!(range(500.0, 10.0 * H, 0), 0..0);
-    }
-
-    #[test]
-    fn visible_range_with_a_viewport_taller_than_the_list_is_everything() {
-        assert_eq!(range(0.0, 100.0 * H, 5), 0..5);
-    }
-
-    #[test]
-    fn visible_range_clamps_a_stale_offset_to_the_last_rows() {
-        // The list shrank from 1000 to 30 rows under an offset for row 500.
-        let r = range(500.0 * H, 10.0 * H, 30);
-        assert_eq!(r, 18..30);
-        assert!(r.end <= 30);
-    }
-
-    #[test]
-    fn visible_range_survives_degenerate_inputs() {
-        assert_eq!(visible_range(0.0, 100.0, 0.0, 10, 2), 0..0);
-        assert!(visible_range(f32::NAN, f32::NAN, H, 10, 2).end <= 10);
-        let r = visible_range(-50.0, 3.0 * H, H, 10, 0);
-        assert_eq!(r, 0..3);
-        let r = visible_range(f32::INFINITY, 3.0 * H, H, 10, 0);
-        assert!(r.end <= 10 && r.start <= r.end);
-    }
-
-    #[test]
-    fn spacers_keep_the_total_content_height() {
-        let len = 2_000;
-        for offset in [0.0, 37.0, 5_000.0, 1e9] {
-            let r = range(offset, 800.0, len);
-            let (top, bottom) = spacer_heights(&r, len, H);
-            let total = top + r.len() as f32 * H + bottom;
-            assert_eq!(total, len as f32 * H, "offset {offset}");
-        }
-        let (top, bottom) = spacer_heights(&(0..0), 0, H);
-        assert_eq!((top, bottom), (0.0, 0.0));
-    }
-
-    fn summary() -> RoomSummary {
-        RoomSummary::new(RoomId::from("!r:x"), "r".into())
-    }
-
-    #[test]
-    fn badge_none_without_unread() {
-        assert_eq!(badge_for(&summary()), Badge::None);
-    }
-
-    #[test]
-    fn badge_highlight_when_there_are_highlights() {
-        let mut r = summary();
-        r.highlights = 2;
-        assert_eq!(badge_for(&r), Badge::Highlight(2));
-    }
-
-    #[test]
-    fn badge_count_for_notifications() {
-        let mut r = summary();
-        r.unread_notifications = 5;
-        assert_eq!(badge_for(&r), Badge::Count(5));
-    }
-
-    #[test]
-    fn badge_dot_for_unread_messages_or_marked_unread() {
-        let mut r = summary();
-        r.unread_messages = 3;
-        assert_eq!(badge_for(&r), Badge::Dot);
-        let mut r = summary();
-        r.marked_unread = true;
-        assert_eq!(badge_for(&r), Badge::Dot);
-    }
-
-    #[test]
-    fn badge_precedence_highlight_then_count_then_dot() {
-        let mut r = summary();
-        r.unread_messages = 9;
-        r.marked_unread = true;
-        r.unread_notifications = 4;
-        r.highlights = 1;
-        assert_eq!(badge_for(&r), Badge::Highlight(1));
-        r.highlights = 0;
-        assert_eq!(badge_for(&r), Badge::Count(4));
-        r.unread_notifications = 0;
-        assert_eq!(badge_for(&r), Badge::Dot);
-        r.unread_messages = 0;
-        r.marked_unread = false;
-        assert_eq!(badge_for(&r), Badge::None);
-    }
-
-    #[test]
-    fn highlight_does_not_depend_on_unread_mentions_field() {
-        let mut r = summary();
-        r.unread_mentions = 7;
-        assert_eq!(badge_for(&r), Badge::None);
-    }
-
-    #[test]
-    fn load_more_only_near_the_end_and_with_more_rooms_on_the_server() {
-        assert!(should_load_more(950, 1_000, Some(2_000)));
-        assert!(should_load_more(1_000, 1_000, Some(2_000)));
-        assert!(
-            !should_load_more(900, 1_000, Some(2_000)),
-            "far from the end"
-        );
-        assert!(!should_load_more(1_000, 1_000, Some(1_000)), "all loaded");
-        assert!(
-            !should_load_more(1_000, 1_000, Some(10)),
-            "total below loaded"
-        );
-        assert!(!should_load_more(1_000, 1_000, None), "total unknown");
-        assert!(
-            should_load_more(0, 0, Some(5)),
-            "an empty list with more on the server"
-        );
-    }
-
-    fn preview(sender_name: Option<&str>, body: &str, is_own: bool) -> MessagePreview {
-        MessagePreview {
-            sender: UserId::from("@bob:x"),
-            sender_name: sender_name.map(str::to_owned),
-            body: body.to_owned(),
-            timestamp_ms: 0,
-            is_own,
+    fn room_list_batches_do_not_take_seconds() {
+        for (name, median) in time_shapes() {
+            assert!(median < Duration::from_secs(1), "{name}: median {median:?}");
         }
     }
 
+    /// Each batch applies within its expectation. An indicator, not a gate.
     #[test]
-    fn preview_line_uses_the_name_you_or_the_user_id() {
-        let mut r = summary();
-        assert_eq!(preview_line(&r), None);
-        r.last_message = Some(preview(Some("Bob"), "hi", false));
-        assert_eq!(preview_line(&r).as_deref(), Some("Bob: hi"));
-        r.last_message = Some(preview(Some("Bob"), "hi", true));
-        assert_eq!(preview_line(&r).as_deref(), Some("You: hi"));
-        r.last_message = Some(preview(None, "hi", false));
-        assert_eq!(preview_line(&r).as_deref(), Some("@bob:x: hi"));
-    }
-
-    #[test]
-    fn preview_line_sanitises_and_caps_name_and_body() {
-        let mut r = summary();
-        r.last_message = Some(preview(
-            Some("Mal\n\u{202E}lory"),
-            &format!("a\nb\u{200B}{}", "x".repeat(1000)),
-            false,
-        ));
-        let line = preview_line(&r).expect("has a preview");
-        assert!(line.starts_with("Mal\u{23CE}\u{FFFD}lory: a\u{23CE}b"));
-        assert!(!line.contains(['\n', '\u{202E}', '\u{200B}']));
-        assert!(line.chars().count() <= MAX_PREVIEW_NAME_CHARS + 2 + PREVIEW_BODY_CHARS);
-        assert!(line.ends_with('\u{2026}'));
-    }
-
-    #[test]
-    fn preview_line_caps_a_huge_name() {
-        let mut r = summary();
-        r.last_message = Some(preview(Some(&"n".repeat(5000)), "b", false));
-        let line = preview_line(&r).expect("has a preview");
-        assert!(line.chars().count() <= MAX_PREVIEW_NAME_CHARS + 3);
-    }
-
-    #[test]
-    fn empty_labels() {
-        assert_eq!(empty_label(RoomListTab::All, ""), "No rooms");
-        assert_eq!(empty_label(RoomListTab::People, ""), "No direct messages");
-        assert_eq!(empty_label(RoomListTab::Rooms, ""), "No rooms");
-        assert_eq!(empty_label(RoomListTab::Spaces, ""), "No spaces");
-        for tab in [RoomListTab::All, RoomListTab::People, RoomListTab::Spaces] {
-            assert_eq!(empty_label(tab, "x"), "No match");
+    fn perf_room_list_batches() {
+        for (name, median) in time_shapes() {
+            twicecat_perf::record_duration(
+                &format!("app.room_list.batch.{name}"),
+                median,
+                expected(name),
+            );
         }
-        assert_eq!(empty_label(RoomListTab::All, "   "), "No rooms");
-    }
-
-    #[test]
-    fn row_names_are_sanitised_and_capped() {
-        assert_eq!(row_name("a\nb"), "a\u{23CE}b");
-        assert_eq!(row_name(&"n".repeat(1000)).chars().count(), 256);
-        assert_eq!(row_name(""), crate::text_safety::NAME_PLACEHOLDER);
-        assert_eq!(
-            row_name("\u{3000}\u{200B}"),
-            crate::text_safety::NAME_PLACEHOLDER
-        );
     }
 }

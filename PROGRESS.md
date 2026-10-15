@@ -2595,7 +2595,7 @@ Plan approved by the human 2026-10-13: Q6-Q8 as the human chose them (NVENC/NVDE
 Draft, scope set by the human 2026-10-15. Steps:
 - [x] 1. Plan and ledger (ci-speed.1)
 - [x] 2. The `twicecat-perf` crate, the report script, `docs/testing.md`
-- [ ] 3. Speed gates become `perf_` indicators; tight guards become hang guards
+- [x] 3. Speed gates become `perf_` indicators; tight guards become hang guards
 - [ ] 4. The `perf` workflow
 - [ ] 5. Pipeline quick wins: cancel, fail fast, save only on main, skip docs-only
 - [ ] 6. Each shard builds its own binaries; rebalance

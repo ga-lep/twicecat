@@ -647,9 +647,21 @@ fn on_time_under_load() {
     );
     assert!(frames > 400, "processing stalled: {after:?}");
     assert!(worst_loaded > 0 && worst_loaded <= after.max_wake_us);
+    // Whether a granted real-time thread stays on time is a number, not a gate
+    // (docs/testing.md): it depends on the machine and its scheduler.
     if let Realtime::Granted { .. } = realtime {
-        assert!(late * 100 <= wakes, "{late} of {wakes} wakes over 1 ms");
-        assert_eq!(after.capture_overruns, before.capture_overruns);
+        twicecat_perf::record(
+            "audio.pipewire.realtime_late_wakes_percent",
+            late as f64 * 100.0 / wakes.max(1) as f64,
+            "%",
+            twicecat_perf::Expect::AtMost(1.0),
+        );
+        twicecat_perf::record(
+            "audio.pipewire.realtime_capture_overruns",
+            (after.capture_overruns - before.capture_overruns) as f64,
+            "overruns",
+            twicecat_perf::Expect::AtMost(0.0),
+        );
     }
 }
 
