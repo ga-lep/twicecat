@@ -8437,6 +8437,7 @@ dependencies = [
  "tokio",
  "tray-icon",
  "twicecat-core",
+ "twicecat-perf",
  "twicecat-ptt",
 ]
 
@@ -8459,6 +8460,7 @@ dependencies = [
  "tracing",
  "tract-onnx",
  "tract-pulse",
+ "twicecat-perf",
  "windows 0.62.2",
  "windows-core 0.62.2",
 ]
@@ -8486,10 +8488,15 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "twicecat-audio",
+ "twicecat-perf",
  "twicecat-video",
  "url",
  "zeroize",
 ]
+
+[[package]]
+name = "twicecat-perf"
+version = "0.1.0"
 
 [[package]]
 name = "twicecat-ptt"

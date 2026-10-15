@@ -1,0 +1,12 @@
+[package]
+name = "twicecat-perf"
+version = "0.1.0"
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false
+
+# Only std: the other crates take this as a dev-dependency, so a test of any
+# crate (the app's included) can record a performance indicator without a new
+# external package or a path to the Matrix SDK.
+[dependencies]
