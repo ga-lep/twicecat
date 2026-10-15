@@ -642,6 +642,15 @@ pub fn dock(app: &App) -> Element<'_, Message> {
             row![
                 mic_button(dock.mic, dock.mic_words.clone()),
                 deafen,
+                crate::screens::stage::camera_button(app),
+                crate::screens::stage::share_button(app),
+            ]
+            .spacing(tokens::S)
+            .align_y(iced::Center)
+            .into(),
+        );
+        lines.push(
+            row![
                 audio,
                 space().width(Fill),
                 kit::danger_button(
@@ -738,6 +747,8 @@ pub fn rail_dock(app: &App) -> Element<'_, Message> {
             }),
             dock.deafen_words,
         ));
+        items.push(crate::screens::stage::camera_button(app));
+        items.push(crate::screens::stage::share_button(app));
         // A gap before Leave, so it is not a stray click from Deafen.
         items.push(space().height(tokens::M).into());
         items.push(tip(

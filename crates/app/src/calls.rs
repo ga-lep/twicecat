@@ -15,7 +15,7 @@ use twicecat_core::api::{
 };
 
 use crate::state::{App, Message};
-use crate::text_safety::{MAX_NAME_CHARS, name_or_placeholder, one_line_capped};
+use crate::text_safety::one_line_capped;
 use crate::ui::icons::Icon;
 
 /// How many ringing rooms are kept; the oldest goes first.
@@ -43,6 +43,9 @@ pub const PANEL_WIDTH: f32 = 320.0;
 pub enum CallMessage {
     /// Join (or start) the call of a room: the header's call button.
     Join(RoomId),
+    /// Join (or start) the call of a room as a video call: the camera comes
+    /// on once connected (the header's **Video** button).
+    JoinWithVideo(RoomId),
     /// Leave the current call.
     Leave,
     /// Mute or unmute the microphone (**Mute**, Ctrl+Shift+M). Unmuting
@@ -372,6 +375,9 @@ pub struct CallModel {
     pub call: Option<CurrentCall>,
     /// A join or leave sent and not answered yet.
     pub pending: Option<Pending>,
+    /// The room whose call was joined with **Video**: its camera starts when
+    /// the call connects.
+    pub camera_on_connect: Option<RoomId>,
     /// Devices in each room's call, for the room list; rooms without a call
     /// are not kept.
     pub counts: HashMap<RoomId, u32>,
@@ -412,6 +418,8 @@ pub struct CallModel {
     pub stats: Option<AudioStats>,
     /// Where speech enhancement can run on the GPU, and where it runs.
     pub gpu: Option<GpuEnhancement>,
+    /// The call's video: pictures, our camera and share, the video settings.
+    pub video: crate::video::VideoModel,
 }
 
 // Counts only: no room, user or display name in logs.
@@ -485,6 +493,22 @@ impl CallModel {
         Some(CallButton {
             label,
             press: (!busy).then(|| CallMessage::Join(id.clone())),
+        })
+    }
+
+    /// The header's **Video** button: a call with the camera on, offered where
+    /// **Call** is (a room with no call of ours and no voice room).
+    pub fn video_button(&self, room: &RoomSummary) -> Option<CallButton> {
+        if room.is_space || room.is_invite || room.is_call_room || self.call_in(&room.id).is_some()
+        {
+            return None;
+        }
+        Some(CallButton {
+            label: "Video".to_owned(),
+            press: self
+                .pending
+                .is_none()
+                .then(|| CallMessage::JoinWithVideo(room.id.clone())),
         })
     }
 
@@ -602,12 +626,6 @@ impl CallModel {
             .iter()
             .map(|p| {
                 let member = call.member(&p.user_id);
-                let name = p
-                    .display_name
-                    .as_deref()
-                    .or_else(|| member.and_then(|m| m.display_name.as_deref()))
-                    .filter(|n| !n.trim().is_empty())
-                    .unwrap_or(p.user_id.as_str());
                 let controls = (!p.is_local && !with_controls.contains(&&p.user_id)).then(|| {
                     with_controls.push(&p.user_id);
                     let volume = self
@@ -626,7 +644,7 @@ impl CallModel {
                 });
                 ParticipantRow {
                     user_id: p.user_id.clone(),
-                    name: name_or_placeholder(name, MAX_NAME_CHARS),
+                    name: call.name_of(p),
                     avatar: member.and_then(|m| m.avatar.clone()),
                     is_local: p.is_local,
                     speaking: p.speaking,
@@ -675,6 +693,8 @@ impl CallModel {
     }
 
     fn end_call(&mut self) {
+        self.camera_on_connect = None;
+        self.video.end_call();
         self.call = None;
         self.volume_drag = None;
         self.rows_open.clear();
@@ -739,6 +759,15 @@ impl CallModel {
             CoreEvent::InputLevel(level) => self.level = Some(level),
             CoreEvent::AudioStats(stats) => self.stats = Some(stats),
             CoreEvent::GpuEnhancement(gpu) => self.gpu = Some(gpu),
+            video @ (CoreEvent::VideoDevices(_)
+            | CoreEvent::ScreenSources(_)
+            | CoreEvent::VideoSettings(_)
+            | CoreEvent::VideoTracks { .. }
+            | CoreEvent::VideoFeed { .. }
+            | CoreEvent::CameraPreview(_)
+            | CoreEvent::LocalVideo(_)
+            | CoreEvent::VideoEncoders(_)
+            | CoreEvent::VideoStats(_)) => return self.video.on_event(video),
             _ => return false,
         }
         true
@@ -782,6 +811,8 @@ impl CallModel {
         // A refused leave (`NotInCall`) or join is answered, and so is a
         // refused decline: the card's buttons work again.
         self.pending = None;
+        self.camera_on_connect = None;
+        self.video.on_error(error);
         for ring in &mut self.rings {
             ring.answered = false;
         }
@@ -793,7 +824,10 @@ impl CallModel {
 pub fn is_call_error(error: &CoreError) -> bool {
     matches!(
         error,
-        CoreError::Call(_) | CoreError::Audio(_) | CoreError::NotInCall
+        CoreError::Call(_)
+            | CoreError::Audio(_)
+            | CoreError::NotInCall
+            | CoreError::NotSupported(_)
     )
 }
 
@@ -804,6 +838,9 @@ pub fn error_text(error: &CoreError) -> String {
         CoreError::Call(why) => format!("Call: {why}"),
         CoreError::Audio(why) => format!("Audio: {why}"),
         CoreError::NotInCall => "You are not in a call.".to_owned(),
+        CoreError::NotSupported(what) => {
+            format!("This version of Twicecat cannot use {what} yet.")
+        }
         other => other.to_string(),
     }
 }
@@ -825,6 +862,16 @@ impl App {
     /// A call control.
     pub(crate) fn on_call(&mut self, message: CallMessage) -> Task<Message> {
         match message {
+            CallMessage::JoinWithVideo(room_id) => {
+                let before = self.calls.pending.clone();
+                self.calls.camera_on_connect = Some(room_id.clone());
+                let task = self.on_call(CallMessage::Join(room_id));
+                // Only a join that was really sent asks for the camera.
+                if self.calls.pending == before {
+                    self.calls.camera_on_connect = None;
+                }
+                task
+            }
             CallMessage::Join(room_id) => {
                 // The room list may be filtered (a search, a tab), so a room
                 // missing from it is still joined; the core answers for an
@@ -836,10 +883,12 @@ impl App {
                     return Task::none();
                 }
                 self.calls.pending = Some(Pending::Join(room_id.clone()));
-                self.send(Command::JoinCall {
-                    room_id,
-                    intent: CallIntent::Audio,
-                })
+                let intent = if self.calls.camera_on_connect.as_ref() == Some(&room_id) {
+                    CallIntent::Video
+                } else {
+                    CallIntent::Audio
+                };
+                self.send(Command::JoinCall { room_id, intent })
             }
             CallMessage::Leave => {
                 if self.calls.pending.is_some() || self.calls.call.is_none() {
@@ -1063,6 +1112,14 @@ impl App {
             CoreEvent::CallState(CallState::Joining { room_id }) => Some(room_id.clone()),
             _ => None,
         };
+        let connected = match &event {
+            CoreEvent::CallState(CallState::Connected { room_id, .. })
+                if self.calls.camera_on_connect.as_ref() == Some(room_id) =>
+            {
+                Some(room_id.clone())
+            }
+            _ => None,
+        };
         let participants = matches!(event, CoreEvent::CallParticipants { .. });
         let incoming = match &event {
             CoreEvent::IncomingCall { room_id, .. } if self.calls.ring(room_id).is_none() => {
@@ -1072,6 +1129,11 @@ impl App {
         };
         let handled = self.calls.on_event(event);
         debug_assert!(handled, "on_call_event got another kind of event");
+        if connected.is_some() {
+            // Joined with **Video**: the camera comes on, once.
+            self.calls.camera_on_connect = None;
+            return self.update(Message::Video(crate::video::VideoMessage::ToggleCamera));
+        }
         if let Some(room) = joining {
             // A voice room is the call: its people show at once (plan Q4).
             if self.rooms.iter().any(|r| r.id == room && r.is_call_room) {
@@ -1170,7 +1232,10 @@ impl App {
     /// stored choices.
     pub(crate) fn calls_after_login(&mut self) -> Task<Message> {
         self.calls = CallModel::default();
-        self.send(Command::GetAudioSettings)
+        Task::batch([
+            self.send(Command::GetAudioSettings),
+            self.video_after_login(),
+        ])
     }
 }
 

@@ -17,6 +17,7 @@ pub mod security;
 pub mod sessions;
 pub mod settings;
 pub mod spaces_sidebar;
+pub mod stage;
 pub mod switcher;
 pub mod thread_panel;
 pub mod timeline_pane;

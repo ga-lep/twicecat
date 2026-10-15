@@ -1,0 +1,2 @@
+Step 1: complete (video in the new UI: renderer, stage, full-screen view, picker, sharing bar, buttons, shortcuts; gate ok, no security review run (no new input, no new dependency; titles and thumbnails from the core are cleaned and capped, frames never logged), evidence: PROGRESS.md "Video in the new UI and Settings levels steps")
+  notes: Ctrl+Shift+O and Ctrl+Shift+E instead of Ctrl+Shift+V and S (paste); audio-video delay not built (no per-person latency in the core API); no pop-out window; cargo deny not installed here
