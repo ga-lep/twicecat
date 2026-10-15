@@ -18,3 +18,4 @@ Speed gates that failed without a bug: `call_video` fps (27.1 on CI, 26.3 locall
 
 ## Log
 - Task 1: plan and ledger written. Waiting for the human's confirmation of the tiers and D1 to D7, and an answer to D6.
+- Task 2: done (ci-speed.2). `crates/perf` (`twicecat-perf`, std only, 11 unit tests), `scripts/perf-report.sh` (jq; checked on a sample with a baseline, without one, with a NaN and a repeated name; exit 0 whatever the numbers, 1 for an unreadable file), `docs/testing.md`. Checks: fmt; clippy `--workspace --all-targets --all-features`; `cargo test -p twicecat-perf`; check-app-deps and check-core-api. Not run: `cargo deny` (not installed locally; CI runs it), shellcheck (not installed).

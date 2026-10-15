@@ -51,6 +51,8 @@ livekit = { version = "=0.9.5", default-features = false, features = ["native", 
 gpu-enhancement = ["twicecat-audio/onnxruntime"]
 
 [dev-dependencies]
+# Performance indicators recorded by tests (docs/testing.md); std only.
+twicecat-perf = { path = "../perf" }
 tempfile = "3"
 # Fake banks in the cleaning tests set DeepFilterStatus; test-only, not in normal builds.
 twicecat-audio = { path = "../audio", features = ["test-fakes"] }
