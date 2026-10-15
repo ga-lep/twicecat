@@ -3039,3 +3039,6 @@ Draft, scope set by the human 2026-10-15. Steps:
 - [ ] No GPU: the stage's warning appears (and no crash) with `ICED_BACKEND=tiny-skia`.
 - [ ] Keyboard-only use and tooltips of the new buttons.
 - [ ] Advanced video settings on real hardware: NVENC with a custom size, rate, bitrate, 1 to 3 layers and AV1 (an unencrypted call, and a Twicecat-to-Twicecat one); VP9 SVC (`L3T3_KEY`) and AV1 SVC; `degradation_preference` (a throttled uplink with camera and share set the other way round); software H.264 and AV1 if the libwebrtc build has them (the Video card marks them "not tried").
+- [ ] Settings, simple and advanced, by eye in light and dark and every colour set: the header switch, each page at both levels, the long advanced Video page scrolling in the 620 px card, a narrow window; the Video page's camera preview once the engine supports it (today the call notice says not supported).
+- [ ] Voice & audio at the simple level in a real call: the dock's audio button and the push-to-talk pill open the page; microphone test, level meter, "hear myself", noise reduction Off / Standard / Strong really change the sound; switching the advanced switch on and off keeps what was set.
+- [ ] A settings file written before this branch (no `advanced_settings`) starts at the simple level, and the switch survives a restart.
