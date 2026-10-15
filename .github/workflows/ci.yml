@@ -131,7 +131,13 @@ jobs:
         if: runner.os != 'Linux'
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       # perf_ tests are indicators and run in the perf workflow (docs/testing.md).
-      - run: cargo test --workspace --locked -- --skip perf_
+      # Not the integration test files whose tests are all #[ignore]: they run in
+      # the shards, and each is a 500 MB binary to link here for "0 passed".
+      - name: Unit tests
+        shell: bash
+        run: cargo test --workspace --locked $(scripts/unit-test-targets.sh) -- --skip perf_
+      - name: Doc tests
+        run: cargo test --workspace --locked --doc -- --skip perf_
       - name: No unverified libwebrtc download
         shell: bash
         run: scripts/check-no-webrtc-download.sh

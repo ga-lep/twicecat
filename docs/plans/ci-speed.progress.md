@@ -54,3 +54,29 @@ Speed gates that failed without a bug: `call_video` fps (27.1 on CI, 26.3 locall
   - `scripts/fetch-cargo-deny.sh` and `scripts/checksums/cargo-deny.sha256`: cargo-deny 0.20.2, x86-64 Linux, SHA-256 from GitHub's asset digest (it matched the download). `cargo deny --workspace check` with it: advisories, bans, licenses and sources ok, with the new `twicecat-perf` crate.
   - Shards start `stack.sh up -d` in the background (own session) as the first step and wait for it after the build.
   - **Not verified:** nothing of this has run on CI; actionlint not installed. **HUMAN:** two consecutive runs on the same pins (the first saves the libwebrtc cache on main, the second restores) and the step durations; revert the libwebrtc cache if it is not faster on Windows and macOS.
+- Task 8: done (ci-speed.8), the parts that run locally. The plan's "merge the test files into about 4 binaries" was measured and read, and is not done:
+  - **Link cost** (`cargo build --timings` after touching `crates/core/src/lib.rs`, 24 cores): 31 core test units at 8–20 s each (they run in parallel, so each looks longer), `twicecat-core` lib 5 s; 169 s of system time, the cost of writing ~17 GB of binaries. After Task 6 a shard links 6 to 8 of these, about 20–30 s of CPU on a 4-core runner. Merging them into 3 per shard would save at most 15 s per shard.
+  - **Not safe to share a process:** `log_hygiene` and `call_log_hygiene` install the global tracing subscriber (`try_init`) and scan all of its output for sentinels, so other tests' logs would enter the scan; `tls_provider` installs rustls's process-wide default provider; `call_video_fallback` calls `std::env::set_var`; `common::E2EE_LOCK` and `DM_LOCK` and the `SERIAL`/`CAROL_PROFILE` mutexes are per binary today (merged they would serialise across files); `reset_to_b0` deletes the other devices of an account and resets its identity, and only the 7 files that take `e2ee_serial()` are safe against it, while the files today run one after the other. Merged, libtest would also start running the tests of different files in parallel, which loads the machine and moves the audio-window tests.
+  - **The linker** of the x86 Linux test binaries is already LLD 22 (`readelf -p .comment`). **Debug info:** `--config 'profile.dev.package.twicecat-*.debug="line-tables-only"'` left `login` at 508 413 400 bytes, as before. Neither is changed. (Windows and macOS are not measurable here.)
+  - **What does cost:** 26 of the 36 integration test files have only `#[ignore]` tests, and every OS job links them for "0 passed". `scripts/unit-test-targets.sh` skips them in the `test` job (`--lib --bins --examples --test …`, with `cargo test --doc` apart). Counts, locally: `cargo test --workspace` 1794 passed, 158 ignored; the selected targets plus `--doc` 1794 passed, 19 ignored (the other 139 run in the shards).
+  - **HUMAN:** the `test` job step durations on CI.
+
+## CI measurements, PR #29 (draft), runs `38730680927` (Tasks 1 to 7) and `38733670661` (Task 8 added)
+All jobs green in both, `ci-ok` too; the perf workflow green (run `38730695735`: 15 values, 0 outside; the camera test delivered 29.7 fps on the quiet runner, the CLI 30 fps; its `perf_` step took 1262 s, mostly a cold build).
+
+| Job (seconds) | Before `38716596416` | Run 1 | Run 2 |
+|---|---|---|---|
+| checks (new) / first failure | about 480 (a shard-list error came after clippy) | 26 | 29 |
+| lint | 428 | 387 | 332 |
+| test ubuntu | 722 | 643 | 613 |
+| test ubuntu-arm | 826 | 640 | 540 |
+| test windows | 830 | 942 | 635 |
+| test macOS | 588 | 1401 | 1382 |
+| integration shard 1 / 2 / 3 / 4 | 1212 / 1705 / 1632 / 2026 | 1174 / 856 / 1180 / 745 | 1060 / 1030 / 967 / 976 |
+| slowest job | 2026 (shard 4) | 1401 (macOS) | 1382 (macOS) |
+
+- **Shards:** the slowest went from 2026 s to 1060 s, and the run step no longer compiles (shard 2: run step 921 s to 253 s; shard 4: 1066 s to 250 s). Run-to-run variation of one shard is about 30 % (shard 4: 745 and 976 s), so read these as ranges.
+- **Not comparable for the `test` jobs:** the "before" run restored a cache that PR #27 had saved for itself (every run of a PR saved then); these runs restore only `main`'s, and on macOS `rust-cache` finds none (`No cache found`), so macOS builds cold every time until `main` saves one: clippy 350 s (was 36 s) and the unit tests 973 s. The numbers for Windows, ubuntu and arm are on a cold-ish cache as well. They improve once `main` has run with these keys.
+- **Task 8, same cache state, run 1 to run 2:** Windows 942 to 635 s (unit tests 356 s, doc tests 43 s), arm 640 to 540 s, ubuntu 643 to 613 s, macOS 1401 to 1382 s (macOS is dominated by the cold build, not the links).
+- **libwebrtc cache:** `Cache not found` on both runs, as expected: only `main` saves. Windows `setup-build` took 94 to 99 s, which is the uncached fetch. Whether the cache is faster is read on the first run after `main` has saved it.
+- **Still to read after a merge to main:** warm-cache `test` and `lint` durations; the libwebrtc restore against the 58 s fetch on Windows; the perf workflow's second run with a baseline.

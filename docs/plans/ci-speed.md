@@ -140,17 +140,16 @@ Acceptance criteria:
 - YAML parses; **actionlint is not installed here**.
 Evidence: **HUMAN:** step durations of two consecutive runs on the same pins (the first saves on main, the second restores).
 
-### Task 8: Fewer test binaries (linking is the cost)
-Language: rust
-Files: crates/core/tests/**, scripts/integration-shards.sh, Cargo.toml (profile only), .cargo/config.toml (only after measuring)
+### Task 8: Fewer binaries linked (linking is the cost)
+Language: ci
+Files: scripts/unit-test-targets.sh (new), .github/workflows/ci.yml, docs/plans/ci-speed.progress.md
 Depends on: Task 6
 Acceptance criteria:
-- Measured first, locally, with `cargo build --timings` after a one-line change in `crates/core`: link time per binary, the total, and what each of `debug = line-tables-only` for the workspace crates (in CI only, through an environment variable) and the x86 Linux linker choice (`lld` against the default) changes. Numbers in the ledger. A change with no measurable gain is not made.
-- The core integration tests move from about 26 binaries to one directory per shard (`tests/<shard>/main.rs` with a `mod` per file), starting with the files that already share accounts. The per-binary `e2ee_serial()` mutex keeps its meaning because the files that take it end up in the same binary. A file that cannot share a process stays alone, with the reason written next to it.
-- `integration-shards.sh` follows (entries are the new binaries); `--check` passes; the ignored-test count is unchanged.
-- Each merged binary passes 3 times in a row with the stack, and the full suite twice.
-- **HUMAN:** the build step and the total per shard on CI against Task 6.
-Evidence: the ledger's timings table; `scripts/run-integration-tests.sh` passing 3 times.
+- **Merging test files into fewer binaries is not done** (human to confirm, D7). Measured and read (ledger): a link is 8–20 s of CPU per binary locally; after Task 6 a shard links 6 to 8 of them, so merging would save at most about 15 s per shard; and files cannot share a process safely: `log_hygiene` and `call_log_hygiene` install the global tracing subscriber and scan everything it sees, `tls_provider` installs the process-wide rustls provider, `call_video_fallback` sets an environment variable, `common::E2EE_LOCK`, `DM_LOCK` and per-file mutexes are per binary today, and `reset_to_b0` deletes the other devices of an account, so tests of different files using the same user would interfere (they run one binary after another today). The linker is already LLD on x86 Linux, and the debug-info level of the workspace crates did not change a test binary's size (508 413 400 bytes both ways), so neither is changed.
+- What does cost on every OS job is linking 26 integration test files whose tests are all `#[ignore]` ("0 passed; N ignored", about 500 MB each, 13 GB of writes). `scripts/unit-test-targets.sh` prints `--lib --bins --examples --test …` for the files that have a non-ignored test; the `test` job runs that, and the doc tests apart (`--doc` cannot be combined). A file is skipped only when its `#[ignore]` lines are at least as many as its test attributes.
+- The count of passed tests is the same as `cargo test --workspace` (1794 passed locally, before and after), and the ignored tests that move out are the ones the shards run.
+- **HUMAN:** the `test` job's build and run step durations on the four OSes against run `38716596416` (Windows 634 s, ubuntu 665 s, arm 747 s, macOS 465 s).
+Evidence: the counts above; **HUMAN:** step durations.
 
 ### Task 9: Run `ui_gallery` once, and the draft policy (D6)
 Language: ci
