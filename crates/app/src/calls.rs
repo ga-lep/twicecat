@@ -2409,6 +2409,7 @@ mod tests {
         let (mut app, mut rx) = main_app();
         incoming(&mut app, "b", "bob", true);
         arm(&mut app);
+        app.ui_settings.advanced_settings = true;
         let _ = app.update(Message::Audio(A::Open));
         drain(&mut rx);
         // Down before the dialog opens: its release may go unseen under it.

@@ -26,19 +26,22 @@ use twicecat_app::{App, Message, Screen, Startup};
 use twicecat_app::{CommandSink, EventsSlot};
 use twicecat_core::api::{
     AudioDevice, AudioDeviceId, AudioDevices, AudioSettings, AudioStats, Block, CallIntent,
-    CallState, CancelReason, CleaningStatus, Command, CoreError, CoreEvent, CrossSigning, DeviceId,
-    DeviceSummary, DeviceTrust, DeviceVerification, EnhancerBackend, EventId, GpuBackend,
-    GpuEnhancement, Inline, InputLevel, InputMode, ItemActions, ListDiff, LocalVideo, MediaContent,
-    MediaKind, MembershipView, MentionTarget, MessageDetails, MessageKind, MessagePreview,
-    NoiseSuppression, PaginationState, Participant, ParticipantId, PlaceholderKind, PowerLevelView,
-    QrImage, ReactionGroup, ReauthAction, RecoveryKey, RecoveryProgress, RecoveryStatus,
+    CallState, CancelReason, CleaningStatus, CodecLimits, Command, CoreError, CoreEvent,
+    CrossSigning, DegradationChoice, DeviceId, DeviceSummary, DeviceTrust, DeviceVerification,
+    EncoderBackend, EnhancerBackend, EventId, GpuBackend, GpuEnhancement, Inline, InputLevel,
+    InputMode, ItemActions, LayerTuning, ListDiff, LocalVideo, MediaContent, MediaKind,
+    MembershipView, MentionTarget, MessageDetails, MessageKind, MessagePreview, NoiseSuppression,
+    PaginationState, Participant, ParticipantId, PlaceholderKind, PowerLevelView, QrImage,
+    QualityLimitation, ReactionGroup, ReauthAction, RecoveryKey, RecoveryProgress, RecoveryStatus,
     ReplyPreview, ReplyState, RichText, Role, RoomDetailsView, RoomId, RoomMemberView,
     RoomNotificationModeView, RoomPermissions, RoomSummary, SasEmoji, ScreenSource, ScreenSourceId,
     ScreenSourceKind, ScreenSources, ScreenThumbnail, SecurityStatus, SendFailure, SendStatus,
     Shield, ShieldCode, SpaceView, StateChange, SyncState, TextStyle, ThreadSummaryView,
     TimelineItem, TimelineItemKind, TypingUser, UploadProgress, UserId, UserTrust, UtdReason,
-    VerificationId, VerificationPeer, VerificationPhase, VideoCodec, VideoFeed, VideoFrame,
-    VideoKind, VideoMatrix, VideoPixelFormat, VideoPlane, VideoRange, VideoTrackId, VideoTrackView,
+    VerificationId, VerificationPeer, VerificationPhase, VideoCodec, VideoDevice, VideoDeviceId,
+    VideoDevices, VideoDirection, VideoEncoderInfo, VideoEncoders, VideoFeed, VideoFrame,
+    VideoKind, VideoMatrix, VideoMode, VideoPixelFormat, VideoPlane, VideoRange, VideoSettings,
+    VideoStats, VideoTrackId, VideoTrackStats, VideoTrackView, VideoTuning,
 };
 
 /// Drops every command: the gallery never talks to a core.
@@ -1371,8 +1374,16 @@ fn voice_page_with(
     if let Some(gpu) = gpu {
         feed(&mut app, CoreEvent::GpuEnhancement(gpu));
     }
+    advanced(&mut app, true);
     press(&mut app, Message::Audio(AudioMessage::OpenAt(page)));
     app
+}
+
+/// The Settings switch **Show advanced settings** on or off.
+fn advanced(app: &mut App, on: bool) {
+    let mut settings = app.ui_settings;
+    settings.advanced_settings = on;
+    app.set_ui_settings(settings);
 }
 
 fn gpu_found() -> Option<GpuEnhancement> {
@@ -1537,8 +1548,176 @@ fn settings_notifications_long() -> App {
     app
 }
 
+/// The Voice & audio page: the stored settings and the devices echoed, so
+/// the basics are shown rather than a line saying they are loading.
 fn settings_voice_audio() -> App {
-    settings_page(SettingsPage::VoiceAudio)
+    let mut app = settings();
+    feed(&mut app, CoreEvent::AudioDevices(devices()));
+    let mut stored = ptt_settings(Some("F13"));
+    stored.input_device = Some(AudioDeviceId::from("in-usb"));
+    stored.output_device = Some(AudioDeviceId::from("out-usb"));
+    feed(&mut app, CoreEvent::AudioSettings(stored));
+    press(
+        &mut app,
+        Message::Settings(SettingsMessage::Page(SettingsPage::VoiceAudio)),
+    );
+    app
+}
+
+/// A page, with the Settings switch on.
+fn settings_advanced(build: fn() -> App) -> App {
+    let mut app = build();
+    advanced(&mut app, true);
+    app
+}
+
+fn cameras() -> VideoDevices {
+    let mode = |width, height, fps| VideoMode { width, height, fps };
+    VideoDevices {
+        cameras: vec![
+            VideoDevice {
+                id: VideoDeviceId::from("cam-usb"),
+                name: "USB webcam".to_owned(),
+                is_default: true,
+                modes: vec![
+                    mode(1920, 1080, 30),
+                    mode(1280, 720, 30),
+                    mode(640, 480, 30),
+                ],
+            },
+            VideoDevice {
+                id: VideoDeviceId::from("cam-built-in"),
+                name: "Integrated camera".to_owned(),
+                is_default: false,
+                modes: vec![mode(1280, 720, 30)],
+            },
+        ],
+    }
+}
+
+fn encoders() -> VideoEncoders {
+    let limits = |codec, max_height, tested| CodecLimits {
+        codec,
+        max_width: max_height * 16 / 9,
+        max_height,
+        max_fps: 60,
+        tested,
+    };
+    VideoEncoders {
+        encoders: vec![
+            VideoEncoderInfo {
+                backend: EncoderBackend::Nvenc,
+                gpu: Some("NVIDIA GeForce RTX 4070".to_owned()),
+                hardware: true,
+                codecs: vec![
+                    limits(VideoCodec::H264, 2160, true),
+                    limits(VideoCodec::Av1, 2160, false),
+                ],
+            },
+            VideoEncoderInfo {
+                backend: EncoderBackend::Software,
+                gpu: None,
+                hardware: false,
+                codecs: vec![limits(VideoCodec::Vp8, 1080, true)],
+            },
+        ],
+        in_use: None,
+    }
+}
+
+/// The Video page of Settings, with a camera list and the encoders found.
+fn settings_video() -> App {
+    let mut app = settings();
+    feed(&mut app, CoreEvent::VideoDevices(cameras()));
+    feed(&mut app, CoreEvent::VideoSettings(VideoSettings::default()));
+    feed(&mut app, CoreEvent::VideoEncoders(encoders()));
+    press(
+        &mut app,
+        Message::Settings(SettingsMessage::Page(SettingsPage::Video)),
+    );
+    app
+}
+
+/// The same with the advanced switch on and tuned values in both kinds.
+fn settings_video_advanced() -> App {
+    let mut app = settings_video();
+    advanced(&mut app, true);
+    feed(
+        &mut app,
+        CoreEvent::VideoSettings(VideoSettings {
+            upload_cap_kbps: Some(4000),
+            camera_tuning: VideoTuning {
+                width: Some(1280),
+                height: Some(720),
+                fps: Some(30),
+                bitrate_kbps: Some(1700),
+                layers: Some(3),
+                lower_layers: vec![LayerTuning {
+                    bitrate_kbps: Some(600),
+                    ..LayerTuning::default()
+                }],
+                degradation: Some(DegradationChoice::Balanced),
+                ..VideoTuning::default()
+            },
+            screen_tuning: VideoTuning {
+                codec: Some(VideoCodec::Vp9),
+                scalability_mode: Some("L3T3_KEY".to_owned()),
+                ..VideoTuning::default()
+            },
+            ..VideoSettings::default()
+        }),
+    );
+    app
+}
+
+/// In a call with video, the advanced page also shows what is being sent.
+fn settings_video_advanced_in_call() -> App {
+    let mut app = main_call_video();
+    advanced(&mut app, true);
+    feed(&mut app, CoreEvent::VideoDevices(cameras()));
+    feed(&mut app, CoreEvent::VideoSettings(VideoSettings::default()));
+    let mut found = encoders();
+    found.in_use = Some(EncoderBackend::Nvenc);
+    feed(&mut app, CoreEvent::VideoEncoders(found));
+    feed(
+        &mut app,
+        CoreEvent::VideoStats(VideoStats {
+            tracks: vec![
+                VideoTrackStats {
+                    track: VideoTrackId::from("me-Camera"),
+                    direction: VideoDirection::Sent,
+                    width: 1280,
+                    height: 720,
+                    fps: 29.6,
+                    bitrate_kbps: 1650,
+                    frame_ms: Some(2.4),
+                    limitation: QualityLimitation::Bandwidth,
+                    freezes: 0,
+                    implementation: Some("NVIDIA H264 Encoder".to_owned()),
+                    hardware: true,
+                },
+                VideoTrackStats {
+                    track: VideoTrackId::from("bea-Camera"),
+                    direction: VideoDirection::Received,
+                    width: 640,
+                    height: 360,
+                    fps: 24.0,
+                    bitrate_kbps: 620,
+                    frame_ms: Some(1.1),
+                    limitation: QualityLimitation::None,
+                    freezes: 2,
+                    implementation: Some("libvpx".to_owned()),
+                    hardware: false,
+                },
+            ],
+        }),
+    );
+    press(&mut app, Message::Settings(SettingsMessage::Open));
+    press(
+        &mut app,
+        Message::Settings(SettingsMessage::Page(SettingsPage::Video)),
+    );
+    app
 }
 
 fn settings_keyboard() -> App {
@@ -3177,6 +3356,51 @@ pub fn scenarios() -> Vec<Scenario> {
         s("settings-voice-audio", false, settings_voice_audio, |a| {
             a.settings_ui.open && a.settings_ui.page == SettingsPage::VoiceAudio
         }),
+        s("settings-video", false, settings_video, |a| {
+            a.settings_ui.open && a.settings_ui.page == SettingsPage::Video
+        }),
+        s(
+            "settings-advanced",
+            false,
+            || settings_advanced(settings),
+            |a| a.ui_settings.advanced_settings && a.settings_ui.page == SettingsPage::Profile,
+        ),
+        s(
+            "settings-appearance-advanced",
+            false,
+            || settings_advanced(settings_appearance),
+            |a| a.ui_settings.advanced_settings && a.settings_ui.page == SettingsPage::Appearance,
+        ),
+        s(
+            "settings-notifications-advanced",
+            false,
+            || settings_advanced(settings_notifications),
+            |a| {
+                a.ui_settings.advanced_settings && a.settings_ui.page == SettingsPage::Notifications
+            },
+        ),
+        s(
+            "settings-voice-audio-advanced",
+            false,
+            || settings_advanced(settings_voice_audio),
+            |a| a.ui_settings.advanced_settings && a.settings_ui.page == SettingsPage::VoiceAudio,
+        ),
+        s(
+            "settings-video-advanced",
+            false,
+            settings_video_advanced,
+            |a| a.ui_settings.advanced_settings && a.settings_ui.page == SettingsPage::Video,
+        ),
+        s(
+            "settings-video-advanced-call",
+            false,
+            settings_video_advanced_in_call,
+            |a| {
+                a.ui_settings.advanced_settings
+                    && a.settings_ui.page == SettingsPage::Video
+                    && a.calls.call.is_some()
+            },
+        ),
         s("settings-keyboard", false, settings_keyboard, |a| {
             a.settings_ui.open && a.settings_ui.page == SettingsPage::Keyboard
         }),

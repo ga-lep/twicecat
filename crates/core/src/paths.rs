@@ -49,6 +49,7 @@ fn settings_from_map(map: &serde_json::Map<String, serde_json::Value>) -> UiSett
             .get("text_scale_percent")
             .and_then(serde_json::Value::as_u64)
             .map_or(defaults.text_scale_percent, clamp_text_scale),
+        advanced_settings: flag("advanced_settings", defaults.advanced_settings),
     }
 }
 
@@ -269,6 +270,7 @@ impl DataPaths {
                 RoomListChoice::Rail => "Rail",
             },
             "text_scale_percent": settings.text_scale_percent,
+            "advanced_settings": settings.advanced_settings,
         });
         // No key while `None`, so a later change of the app's default reaches
         // this user.
@@ -668,6 +670,22 @@ mod tests {
         assert_eq!(s.density, DensityChoice::Comfortable);
         assert_eq!(s.room_list, RoomListChoice::Expanded);
         assert_eq!(s.text_scale_percent, 100);
+        // Settings are simple until the person asks for the rest.
+        assert!(!s.advanced_settings);
+    }
+
+    #[test]
+    fn the_advanced_switch_is_kept_and_a_wrong_value_is_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = DataPaths::at(tmp.path().join("root"));
+        p.write_settings(&UiSettings {
+            advanced_settings: true,
+            ..UiSettings::default()
+        })
+        .unwrap();
+        assert!(p.read_settings().advanced_settings);
+        assert!(!read_text(&p, r#"{"advanced_settings":"yes"}"#).advanced_settings);
+        assert!(read_text(&p, r#"{"advanced_settings":true}"#).advanced_settings);
     }
 
     #[test]

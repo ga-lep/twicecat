@@ -558,6 +558,74 @@ pub fn gpu_status(gpu: Option<&GpuEnhancement>) -> String {
     line
 }
 
+/// The noise reduction menu for people who do not want to choose an
+/// algorithm: off, a light one (RNNoise, or WebRTC's when that is set), and
+/// the strong one (DeepFilterNet3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SimpleNoise {
+    /// None.
+    Off,
+    /// Steady noise (a fan, a hum), light on the computer.
+    Standard,
+    /// Also clicks and voices in the background, more work for the computer.
+    Strong,
+}
+
+impl SimpleNoise {
+    /// The menu, in order.
+    pub const ALL: [Self; 3] = [Self::Off, Self::Standard, Self::Strong];
+
+    /// The entry of a setting.
+    pub fn of(ns: &NoiseSuppression) -> Self {
+        match ns {
+            NoiseSuppression::Off => Self::Off,
+            NoiseSuppression::WebRtc { .. } | NoiseSuppression::RnNoise => Self::Standard,
+            NoiseSuppression::DeepFilter { .. } => Self::Strong,
+        }
+    }
+
+    /// The menu entry of the full list that this one stands for, given the
+    /// setting now: one that is already set keeps its own options, and the
+    /// strong choice stays on the GPU when it already runs there.
+    pub fn choice(self, now: &NoiseSuppression, gpu: Option<&GpuEnhancement>) -> NoiseChoice {
+        match self {
+            Self::Off => NoiseChoice::Off,
+            Self::Standard => match now {
+                NoiseSuppression::WebRtc { .. } => NoiseChoice::WebRtc,
+                _ => NoiseChoice::RnNoise,
+            },
+            Self::Strong => match NoiseChoice::of(now, gpu) {
+                gpu_entry @ NoiseChoice::DeepFilterGpu(_) => gpu_entry,
+                _ => NoiseChoice::DeepFilter,
+            },
+        }
+    }
+
+    /// What the entry does, in a line.
+    pub const fn words(self) -> &'static str {
+        match self {
+            Self::Off => "Your voice is sent as the microphone hears it.",
+            Self::Standard => {
+                "Removes steady background noise such as a fan or a hum. Light on your computer."
+            }
+            Self::Strong => {
+                "Also removes keyboard clicks and voices in the background. Uses more of your \
+                 computer."
+            }
+        }
+    }
+}
+
+impl fmt::Display for SimpleNoise {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Off => "Off",
+            Self::Standard => "Standard",
+            Self::Strong => "Strong",
+        })
+    }
+}
+
 /// The WebRTC suppressor's strength menu.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LevelChoice(pub NsLevel);
@@ -1058,6 +1126,10 @@ impl AudioPage {
 pub struct AudioUi {
     /// The card is open.
     pub open: bool,
+    /// The Voice & audio page of Settings is on screen: its controls work
+    /// (and the microphone test they start stops when it goes), without the
+    /// card.
+    pub inline: bool,
     /// The page shown.
     pub page: AudioPage,
     /// The mic test this card started: `Some(loopback)` while it runs.
@@ -1081,6 +1153,12 @@ pub struct AudioUi {
 }
 
 impl AudioUi {
+    /// The audio controls on screen can be used: the card is open, or the
+    /// Settings page that holds the basics is.
+    pub fn live(&self) -> bool {
+        self.open || self.inline
+    }
+
     /// The value a slider shows: the one being moved, else the setting.
     pub fn shown(&self, slider: Slider, settings: &AudioSettings) -> f32 {
         match self.drag {
@@ -1232,12 +1310,12 @@ impl App {
     /// A control of the Voice & audio card.
     pub(crate) fn on_audio(&mut self, message: AudioMessage) -> Task<Message> {
         use AudioMessage as M;
-        if !self.audio_ui.open && !matches!(message, M::Open | M::OpenAt(_)) {
+        if !self.audio_ui.live() && !matches!(message, M::Open | M::OpenAt(_)) {
             return Task::none();
         }
         match message {
-            M::Open => self.open_audio_card(AudioPage::Devices),
-            M::OpenAt(page) => self.open_audio_card(page),
+            M::Open => self.open_audio_controls(AudioPage::Devices),
+            M::OpenAt(page) => self.open_audio_controls(page),
             M::Page(page) => {
                 // A key pressed on another page would become the binding
                 // unseen.
@@ -1368,6 +1446,45 @@ impl App {
         }
     }
 
+    /// Opens what the person asked for: the card where every option is shown,
+    /// or, while Settings are simple, the Voice & audio page of Settings,
+    /// which has the few options that matter.
+    fn open_audio_controls(&mut self, page: AudioPage) -> Task<Message> {
+        if self.ui_settings.advanced_settings {
+            return self.open_audio_card(page);
+        }
+        self.show_settings_page(crate::settings::SettingsPage::VoiceAudio)
+    }
+
+    /// The Voice & audio page of Settings comes on screen or goes: the
+    /// controls it holds start or stop being live, and a mic test it started
+    /// stops with it.
+    pub(crate) fn audio_inline(&mut self, shown: bool) -> Task<Message> {
+        if self.audio_ui.inline == shown {
+            return Task::none();
+        }
+        self.audio_ui.inline = shown;
+        if shown {
+            self.stop_capture();
+            return Task::batch([
+                self.send(Command::GetAudioSettings),
+                self.send(Command::ListAudioDevices),
+                self.send(Command::ProbeGpuEnhancement),
+            ]);
+        }
+        if self.audio_ui.open {
+            return Task::none();
+        }
+        let slider = self.send_slider();
+        let stop = if self.audio_ui.mic_test.take().is_some() {
+            self.send(Command::StopMicTest)
+        } else {
+            Task::none()
+        };
+        self.stop_capture();
+        Task::batch([slider, stop])
+    }
+
     /// Opens the card on `page` and asks the core for what it shows.
     fn open_audio_card(&mut self, page: AudioPage) -> Task<Message> {
         self.stop_capture();
@@ -1431,7 +1548,8 @@ impl App {
     /// Closes the card: a moved slider is sent, and the mic test stops.
     pub(crate) fn close_audio_card(&mut self) -> Task<Message> {
         let slider = self.send_slider();
-        let stop = if self.audio_ui.mic_test.take().is_some() {
+        // The Settings page under the card goes on using the microphone test.
+        let stop = if !self.audio_ui.inline && self.audio_ui.mic_test.take().is_some() {
             self.send(Command::StopMicTest)
         } else {
             Task::none()
@@ -1533,6 +1651,7 @@ mod tests {
         }])));
         assert_eq!(app.screen, Screen::Main);
         let _ = app.update(core(CoreEvent::AudioSettings(stored())));
+        app.ui_settings.advanced_settings = true;
         let _ = app.update(audio(AudioMessage::Open));
         drain(&mut rx);
         (app, rx)

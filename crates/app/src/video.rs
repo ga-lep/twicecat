@@ -187,6 +187,8 @@ pub struct VideoModel {
     pub share_busy: bool,
     /// The window itself is in full-screen mode for the full-screen view.
     pub window_fullscreen: bool,
+    /// The Video page of Settings.
+    pub ui: crate::video_settings::VideoSettingsUi,
     /// Whether a video widget was ever drawn by the wgpu renderer.
     pub gpu: GpuSeen,
 }
@@ -213,6 +215,7 @@ impl Default for VideoModel {
             camera_busy: false,
             share_busy: false,
             window_fullscreen: false,
+            ui: crate::video_settings::VideoSettingsUi::default(),
             gpu: GpuSeen::default(),
         }
     }
@@ -635,6 +638,10 @@ impl VideoModel {
     pub fn on_error(&mut self, _error: &CoreError) {
         self.camera_busy = false;
         self.share_busy = false;
+        // A preview that could not start is not running.
+        if self.preview.is_none() {
+            self.ui.preview = false;
+        }
     }
 
     /// The call ended: its pictures and what was asked go. The settings, the
