@@ -3,7 +3,9 @@ name: CI
 on:
   push:
     branches: [main]
+  # ready_for_review: leaving draft starts the run with Windows and macOS.
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
 
 permissions:
@@ -31,6 +33,7 @@ jobs:
     runs-on: ubuntu-26.04
     outputs:
       code: ${{ steps.diff.outputs.code }}
+      os: ${{ steps.diff.outputs.os }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -41,6 +44,7 @@ jobs:
           EVENT: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          DRAFT: ${{ github.event.pull_request.draft }}
         run: |
           code=true
           if [ "$EVENT" = pull_request ]; then
@@ -52,6 +56,15 @@ jobs:
           fi
           echo "code=$code" >> "$GITHUB_OUTPUT"
           echo "code changed: $code"
+          # The slow legs, Windows and macOS, run on main and on pull requests that
+          # are ready for review; a draft gets the two Linux legs (Linux x86-64 and
+          # aarch64). Marking the pull request ready starts a full run.
+          os='["ubuntu-26.04","ubuntu-26.04-arm","windows-latest","macos-latest"]'
+          if [ "$EVENT" = pull_request ] && [ "$DRAFT" = true ]; then
+            os='["ubuntu-26.04","ubuntu-26.04-arm"]'
+          fi
+          echo "os=$os" >> "$GITHUB_OUTPUT"
+          echo "test legs: $os"
 
   # Everything that needs no build, so a mistake shows in about a minute and not
   # after clippy.
@@ -112,7 +125,9 @@ jobs:
       matrix:
         # Linux runners are 26.04: libwebrtc's hermetic libc++ needs clang >= 21
         # (24.04 has 18). ubuntu-26.04-arm is aarch64 Linux, the Steam Frame target.
-        os: [ubuntu-26.04, ubuntu-26.04-arm, windows-latest, macos-latest]
+        # The list comes from the changes job: Windows and macOS only on main and
+        # on pull requests that are ready for review.
+        os: ${{ fromJSON(needs.changes.outputs.os) }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
