@@ -65,22 +65,44 @@ async fn open_room(core: &mut CoreHandle, room: &str) {
 }
 
 /// Applies timeline diffs of `room_id` to `items`, checking `done` after each
-/// single diff, until it holds. An `ActionFailed` fails the test.
+/// single diff (a state that held between two diffs of a batch counts), until it
+/// held. An `ActionFailed` fails the test.
 async fn apply_until(
     core: &mut CoreHandle,
     room_id: &str,
     items: &mut Vec<TimelineItem>,
     done: impl Fn(&[TimelineItem]) -> bool,
 ) {
+    apply_until_named("the timeline", core, room_id, items, done).await;
+}
+
+async fn apply_until_named(
+    what: &str,
+    core: &mut CoreHandle,
+    room_id: &str,
+    items: &mut Vec<TimelineItem>,
+    done: impl Fn(&[TimelineItem]) -> bool,
+) {
+    // The kinds of diff seen while waiting, for a timeout's message.
+    let mut kinds: Vec<String> = Vec::new();
     let wait = async {
-        while !done(items) {
+        let mut reached = done(items);
+        while !reached {
             match core.events.recv().await {
                 Some(CoreEvent::TimelineDiff { room_id: r, diffs }) if r.as_str() == room_id => {
+                    // Every diff of the batch is applied, also after one that
+                    // reached `done`: the list must stay the SDK's list, and a
+                    // diff dropped here made later waits see a list with an item
+                    // twice (a flake under load, when diffs come in batches).
                     for diff in diffs {
+                        kinds.push(match &diff {
+                            ListDiff::Reset { values } => format!("Reset({})", values.len()),
+                            ListDiff::Clear => "Clear".to_owned(),
+                            ListDiff::Truncate { length } => format!("Truncate({length})"),
+                            other => format!("{other:?}").chars().take(12).collect(),
+                        });
                         ListDiff::apply(&diff, items);
-                        if done(items) {
-                            break;
-                        }
+                        reached |= done(items);
                     }
                 }
                 Some(CoreEvent::ActionFailed { action, error, .. }) => {
@@ -91,9 +113,37 @@ async fn apply_until(
             }
         }
     };
-    tokio::time::timeout(common::DEFAULT_TIMEOUT, wait)
+    if tokio::time::timeout(common::DEFAULT_TIMEOUT, wait)
         .await
-        .expect("timed out waiting for the timeline");
+        .is_err()
+    {
+        // Which items the list holds, not what they say: a list with one item twice
+        // is how a dropped diff showed.
+        let lines: Vec<String> = items
+            .iter()
+            .map(|i| {
+                let kind = match &i.kind {
+                    TimelineItemKind::Message {
+                        details, is_own, ..
+                    } => format!(
+                        "message own={is_own} reactions={:?}",
+                        details
+                            .reactions
+                            .iter()
+                            .map(|g| format!("{:?} x{} own={}", g.key, g.count, g.own))
+                            .collect::<Vec<_>>()
+                    ),
+                    _ => "other".into(),
+                };
+                format!("[{}] {kind}", i.id)
+            })
+            .collect();
+        panic!(
+            "timed out waiting for {what}: diffs seen {kinds:?}; {} items:\n{}",
+            items.len(),
+            lines.join("\n")
+        );
+    }
 }
 
 async fn logout(core: &mut CoreHandle) {
@@ -487,6 +537,42 @@ async fn reply_to_an_unknown_item_or_action_in_another_room_fails() {
 }
 
 /// The message item with this ID, if it is one.
+/// The message with this event ID, wherever the timeline now has it.
+fn message_by_event<'a>(
+    items: &'a [TimelineItem],
+    event: &twicecat_core::api::EventId,
+) -> Option<&'a twicecat_core::api::MessageDetails> {
+    items
+        .iter()
+        .find(|i| i.event_id.as_ref() == Some(event))
+        .and_then(|i| match &i.kind {
+            TimelineItemKind::Message { details, .. } => Some(&**details),
+            _ => None,
+        })
+}
+
+/// The item ID the timeline gives this event now.
+fn item_id_of(items: &[TimelineItem], event: &twicecat_core::api::EventId) -> Option<String> {
+    items
+        .iter()
+        .find(|i| i.event_id.as_ref() == Some(event))
+        .map(|i| i.id.clone())
+}
+
+/// Carol toggles `key` on the message with this event.
+async fn toggle_reaction(p: &mut Pair, event: &twicecat_core::api::EventId, key: &str) {
+    let item_id = item_id_of(&p.carol_items, event).expect("carol has the message");
+    p.carol
+        .commands
+        .send(Command::ToggleReaction {
+            room_id: RoomId::from(p.room.as_str()),
+            item_id,
+            key: key.to_owned(),
+        })
+        .await
+        .unwrap();
+}
+
 fn message_by_id<'a>(
     items: &'a [TimelineItem],
     id: &str,
@@ -636,32 +722,52 @@ async fn redact_turns_the_item_into_a_placeholder() {
 async fn reaction_toggles_on_and_off_for_both_sides() {
     let mut p = pair().await;
     let marker = unique_marker();
-    let (alice_item, carol_item) = send_and_receive(&mut p, &marker).await;
-    let toggle = || Command::ToggleReaction {
-        room_id: RoomId::from(p.room.as_str()),
-        item_id: carol_item.clone(),
-        key: " 👍 ".to_owned(),
-    };
-
-    p.carol.commands.send(toggle()).await.unwrap();
+    let (_, carol_item) = send_and_receive(&mut p, &marker).await;
+    // Found again by its event after every wait: a timeline that is rebuilt
+    // under load (a gap in the sync) gives its items new IDs, and the event's
+    // ID is what stays.
+    let event = p
+        .carol_items
+        .iter()
+        .find(|i| i.id == carol_item)
+        .and_then(|i| i.event_id.clone())
+        .expect("a received message has an event ID");
     let thumbs = |own: bool| move |d: &twicecat_core::api::MessageDetails| matches!(d.reactions.as_slice(), [g] if g.key == "👍" && g.count == 1 && g.own == own);
-    apply_until(&mut p.alice, &p.room, &mut p.alice_items, |items| {
-        message_by_id(items, &alice_item).is_some_and(thumbs(false))
-    })
+
+    toggle_reaction(&mut p, &event, " 👍 ").await;
+    apply_until_named(
+        "alice sees carol's reaction",
+        &mut p.alice,
+        &p.room,
+        &mut p.alice_items,
+        |items| message_by_event(items, &event).is_some_and(thumbs(false)),
+    )
     .await;
-    apply_until(&mut p.carol, &p.room, &mut p.carol_items, |items| {
-        message_by_id(items, &carol_item).is_some_and(thumbs(true))
-    })
+    apply_until_named(
+        "carol sees her own reaction",
+        &mut p.carol,
+        &p.room,
+        &mut p.carol_items,
+        |items| message_by_event(items, &event).is_some_and(thumbs(true)),
+    )
     .await;
 
-    p.carol.commands.send(toggle()).await.unwrap();
-    apply_until(&mut p.alice, &p.room, &mut p.alice_items, |items| {
-        message_by_id(items, &alice_item).is_some_and(|d| d.reactions.is_empty())
-    })
+    toggle_reaction(&mut p, &event, " 👍 ").await;
+    apply_until_named(
+        "alice sees it removed",
+        &mut p.alice,
+        &p.room,
+        &mut p.alice_items,
+        |items| message_by_event(items, &event).is_some_and(|d| d.reactions.is_empty()),
+    )
     .await;
-    apply_until(&mut p.carol, &p.room, &mut p.carol_items, |items| {
-        message_by_id(items, &carol_item).is_some_and(|d| d.reactions.is_empty())
-    })
+    apply_until_named(
+        "carol sees it removed",
+        &mut p.carol,
+        &p.room,
+        &mut p.carol_items,
+        |items| message_by_event(items, &event).is_some_and(|d| d.reactions.is_empty()),
+    )
     .await;
 
     // An empty key is refused.
@@ -669,7 +775,7 @@ async fn reaction_toggles_on_and_off_for_both_sides() {
         .commands
         .send(Command::ToggleReaction {
             room_id: RoomId::from(p.room.as_str()),
-            item_id: carol_item.clone(),
+            item_id: item_id_of(&p.carol_items, &event).expect("the item"),
             key: "  ".to_owned(),
         })
         .await

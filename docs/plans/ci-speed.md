@@ -161,10 +161,21 @@ Acceptance criteria:
 - YAML parses; **actionlint is not installed here**.
 Evidence: **HUMAN:** this draft pull request's next run shows two `test` legs; marking it ready shows four.
 
-### Task 10: After-numbers and the three green runs (checkpoint)
+### Task 10: Fix the flake the first CI runs found
+Language: rust
+Files: crates/core/tests/timeline_actions.rs, crates/core/tests/timeline_live.rs, docs/plans/ci-speed.progress.md
+Depends on: Task 6
+Acceptance criteria:
+- Run `38736783282` failed in shard 1 on `reaction_toggles_on_and_off_for_both_sides` and `typing_notices_reach_the_other_user`. Both had failed before (runs `38722052074`, `38636816641`, `38453477513`), so it is not caused by this branch. Reproduced locally by 30 busy loops on 24 cores: the reaction test failed 6 of 8 runs.
+- Root cause of the reaction test: the test helper `apply_until` stopped applying the diffs of a batch as soon as its condition held (`break`), dropping the rest of the batch, so the mirrored timeline diverged from the SDK's (one item twice, with and without the reaction). Under load diffs arrive in batches. `timeline_actions.rs` and `timeline_live.rs` now apply every diff and remember that the condition held. The reaction test also finds its message by event ID and names each wait, so a timeout says which wait and shows the list. After the fix: 16 of 16 passes under the same load.
+- `typing_notices_reach_the_other_user` did not fail in 8 runs under the same load (8 of 8) and is not changed; it failed in 3 of about 30 CI runs ("carol never saw alice typing" after four attempts of 8 s). Left for the human (AGENTS.md rule 8): it may be a real sync issue with typing notices, not a test one.
+- The gate passes.
+Evidence: the load runs above (ledger).
+
+### Task 11: After-numbers and the three green runs (checkpoint)
 Language: docs
 Files: docs/plans/ci-speed.progress.md, PROGRESS.md
-Depends on: Task 4, Task 6, Task 7, Task 8, Task 9
+Depends on: Task 4, Task 6, Task 7, Task 9, Task 10
 Acceptance criteria:
 - The ledger holds the before and after of every job from `gh run view --json jobs`, the percentage cut, and the run ids of 3 consecutive green runs with no new flake. **HUMAN:** the runs and the reading.
 - The `perf` workflow has run at least once on `main` and its first summary is linked.

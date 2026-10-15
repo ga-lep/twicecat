@@ -2602,7 +2602,8 @@ Draft, scope set by the human 2026-10-15. Steps:
 - [x] 7. Cache the downloads (changed: setup action, pinned cargo-deny, stack overlap)
 - [x] 8. Fewer test binaries linked (merging measured and not done, see the ledger)
 - [x] 9. Windows and macOS only on ready PRs (`ui_gallery` half waits for PR #27)
-- [ ] 10. After-numbers and three green runs
+- [x] 10. Fix the flake the first CI runs found (the timeline test helper dropped diffs)
+- [ ] 11. After-numbers and three green runs
 
 ### CI speed human checkpoint
 - [ ] Confirm the test tiers and D1 to D7 in the plan, and answer D6 (Windows and macOS on every push, or only on `main` and ready pull requests).

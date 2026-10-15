@@ -77,14 +77,15 @@ async fn apply_until(
     done: impl Fn(&[TimelineItem]) -> bool,
 ) {
     let wait = async {
-        while !done(items) {
+        let mut reached = done(items);
+        while !reached {
             match core.events.recv().await {
                 Some(CoreEvent::TimelineDiff { room_id: r, diffs }) if r.as_str() == room_id => {
+                    // Every diff of the batch is applied, also after one that
+                    // reached `done`, so the list stays the SDK's list.
                     for diff in diffs {
                         ListDiff::apply(&diff, items);
-                        if done(items) {
-                            break;
-                        }
+                        reached |= done(items);
                     }
                 }
                 Some(CoreEvent::ActionFailed { action, error, .. }) => {
@@ -309,9 +310,12 @@ async fn typing_notices_reach_the_other_user() {
         typing,
     };
     // Carol's room subscription is applied asynchronously, so a notice sent
-    // right after selecting can pass before she listens: send it again.
+    // right after selecting can pass before she listens: send it again (the server
+    // tells a change, so each try ends with a false before the next true). Four
+    // tries of 8 s at the default timeout, more where CI lengthens it.
     let mut typing_users = None;
-    for _ in 0..4 {
+    let tries = (common::DEFAULT_TIMEOUT.as_secs() / 8).max(4);
+    for _ in 0..tries {
         p.alice.commands.send(set(true)).await.unwrap();
         let wait = async {
             while let Some(event) = p.carol.events.recv().await {
