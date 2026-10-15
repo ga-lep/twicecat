@@ -255,6 +255,74 @@ async fn video_settings_persist_across_restarts() {
     send(&handle, Command::Shutdown).await;
 }
 
+/// Advanced video settings out of bounds are brought inside, saved that way,
+/// echoed, and said in a `VideoSettingsAdjusted` after the echo; settings in
+/// bounds say nothing, and an old file without the new fields still loads.
+#[tokio::test]
+async fn advanced_video_settings_are_validated_and_reported() {
+    use twicecat_core::api::{VideoTuning, video_limits};
+    let dir = tempfile::tempdir().unwrap();
+    let mut handle = core(dir.path());
+    let asked = VideoSettings {
+        screen_tuning: VideoTuning {
+            fps: Some(900),
+            bitrate_kbps: Some(7_000),
+            ..VideoTuning::default()
+        },
+        ..VideoSettings::default()
+    };
+    send(&handle, Command::UpdateVideoSettings(asked)).await;
+    let echoed = video_settings(&mut handle).await;
+    assert_eq!(echoed.screen_tuning.fps, Some(video_limits::FPS.1));
+    assert_eq!(echoed.screen_tuning.bitrate_kbps, Some(7_000));
+    match expect_event(&mut handle, |e| {
+        matches!(e, CoreEvent::VideoSettingsAdjusted(_))
+    })
+    .await
+    {
+        CoreEvent::VideoSettingsAdjusted(changes) => {
+            assert_eq!(changes.len(), 1, "{changes:?}");
+            assert_eq!(changes[0].setting, "screen.fps");
+        }
+        _ => unreachable!("filtered by the predicate"),
+    }
+    // In bounds: no report.
+    send(&handle, Command::UpdateVideoSettings(echoed.clone())).await;
+    assert_eq!(video_settings(&mut handle).await, echoed);
+    send(&handle, Command::GetVideoSettings).await;
+    assert_eq!(video_settings(&mut handle).await, echoed);
+    send(&handle, Command::Shutdown).await;
+    while let Some(event) = handle.events.recv().await {
+        assert!(
+            !matches!(event, CoreEvent::VideoSettingsAdjusted(_)),
+            "nothing was out of bounds the second time"
+        );
+    }
+    // Saved inside the bounds: a restart reads them back as echoed.
+    let mut handle = core(dir.path());
+    send(&handle, Command::GetVideoSettings).await;
+    assert_eq!(video_settings(&mut handle).await, echoed);
+    send(&handle, Command::Shutdown).await;
+}
+
+/// A settings file from before the advanced fields existed loads, with
+/// everything new automatic.
+#[tokio::test]
+async fn an_old_video_settings_file_still_loads() {
+    let dir = tempfile::tempdir().unwrap();
+    DataPaths::at(dir.path())
+        .write_video_settings(
+            br#"{"version": 1, "settings": {"encoder": {"prefer": "software"}, "upload_cap_kbps": 6000}}"#,
+        )
+        .unwrap();
+    let mut handle = core(dir.path());
+    send(&handle, Command::GetVideoSettings).await;
+    let loaded = video_settings(&mut handle).await;
+    assert_eq!(loaded.upload_cap_kbps, Some(6_000));
+    assert!(loaded.camera_tuning.is_automatic() && loaded.screen_tuning.is_automatic());
+    send(&handle, Command::Shutdown).await;
+}
+
 /// The encoder list always ends with the software path, and names no
 /// encoder in use outside a call.
 #[tokio::test]

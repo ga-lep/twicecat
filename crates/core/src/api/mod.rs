@@ -50,12 +50,14 @@ pub use types::{
     TimelineItemKind, TypingUser, UserId,
 };
 pub use video::{
-    CodecLimits, EncoderBackend, EncoderChoice, LocalVideo, QualityLimitation, ScreenSource,
-    ScreenSourceId, ScreenSourceKind, ScreenSources, ScreenThumbnail, TEST_PATTERN_ID,
+    CameraCapture, CameraFormat, CodecLimits, DegradationChoice, EncoderBackend, EncoderChoice,
+    LayerTuning, LocalVideo, QualityLimitation, SCALABILITY_MODES, ScreenSource, ScreenSourceId,
+    ScreenSourceKind, ScreenSources, ScreenThumbnail, TEST_PATTERN_ID, VideoAdjustment,
     VideoBackend, VideoCodec, VideoCodecChoice, VideoDevice, VideoDeviceId, VideoDevices,
     VideoDirection, VideoEncoderInfo, VideoEncoders, VideoFeed, VideoFeedSender, VideoFrame,
     VideoKind, VideoMatrix, VideoMode, VideoPixelFormat, VideoPlane, VideoQuality, VideoRange,
-    VideoSettings, VideoStats, VideoTrackId, VideoTrackStats, VideoTrackView,
+    VideoSettings, VideoStats, VideoTrackId, VideoTrackStats, VideoTrackView, VideoTuning,
+    video_limits,
 };
 
 /// A request from the front end to the engine.
@@ -1216,6 +1218,19 @@ pub enum CoreEvent {
     ScreenSources(ScreenSources),
     /// The effective video settings.
     VideoSettings(VideoSettings),
+    /// What the core changed in video settings it was given (a value out of
+    /// bounds, a pair with half missing), after the `VideoSettings` that
+    /// holds the result. Not sent when nothing changed.
+    VideoSettingsAdjusted(Vec<VideoAdjustment>),
+    /// What our video is really sent as, after a camera or share started: the
+    /// settings asked for more than the encoder takes, or a codec the
+    /// encoder lacks. Not sent when it is as asked.
+    VideoSending {
+        /// Which track.
+        kind: VideoKind,
+        /// What differs from the settings.
+        changes: Vec<VideoAdjustment>,
+    },
     /// The video tracks of the current call changed (ours included); the
     /// whole list.
     VideoTracks {

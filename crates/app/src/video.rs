@@ -16,8 +16,9 @@ use iced::widget::image;
 use iced::{Padding, Rectangle, Size, Task};
 use twicecat_core::api::{
     AvatarId, Command, CoreError, CoreEvent, LocalVideo, ParticipantId, ScreenSourceId,
-    ScreenSourceKind, ScreenSources, UserId, VideoCodec, VideoDevices, VideoEncoders, VideoFeed,
-    VideoKind, VideoQuality, VideoSettings, VideoStats, VideoTrackId, VideoTrackView,
+    ScreenSourceKind, ScreenSources, UserId, VideoAdjustment, VideoCodec, VideoDevices,
+    VideoEncoders, VideoFeed, VideoKind, VideoQuality, VideoSettings, VideoStats, VideoTrackId,
+    VideoTrackView,
 };
 
 use crate::calls::CurrentCall;
@@ -25,6 +26,8 @@ use crate::state::{App, Message};
 use crate::text_safety::{MAX_NAME_CHARS, name_or_placeholder, one_line_capped};
 use crate::ui::video_view::{GpuSeen, Place};
 
+/// Most adjustments kept of one report.
+pub const MAX_ADJUSTMENTS: usize = 32;
 /// Most video tracks kept; the core never sends more than a call can hold.
 pub const MAX_TRACKS: usize = 64;
 /// Most screens and windows kept for the picker.
@@ -152,6 +155,12 @@ pub struct VideoModel {
     pub local: LocalVideo,
     /// The video settings as the core last echoed them.
     pub settings: Option<VideoSettings>,
+    /// What the core changed in the settings it was last given (a value out
+    /// of bounds): said on the Video card until the next change.
+    pub adjusted: Vec<VideoAdjustment>,
+    /// What our camera and share are really sent as when that differs from
+    /// the settings, by kind: the encoder cannot do what was asked.
+    pub sending: HashMap<VideoKind, Vec<VideoAdjustment>>,
     /// The cameras.
     pub devices: Option<VideoDevices>,
     /// The encoders this machine has, and the one in use.
@@ -189,6 +198,8 @@ impl Default for VideoModel {
             feeds: HashMap::new(),
             local: LocalVideo::default(),
             settings: None,
+            adjusted: Vec::new(),
+            sending: HashMap::new(),
             devices: None,
             encoders: None,
             stats: None,
@@ -529,7 +540,18 @@ impl VideoModel {
         match event {
             CoreEvent::VideoDevices(devices) => self.devices = Some(devices),
             CoreEvent::ScreenSources(sources) => self.on_sources(sources),
-            CoreEvent::VideoSettings(settings) => self.settings = Some(settings),
+            CoreEvent::VideoSettings(settings) => {
+                // What was said about the last change is about that change.
+                self.adjusted.clear();
+                self.settings = Some(settings);
+            }
+            CoreEvent::VideoSettingsAdjusted(changes) => {
+                self.adjusted = changes.into_iter().take(MAX_ADJUSTMENTS).collect();
+            }
+            CoreEvent::VideoSending { kind, changes } => {
+                self.sending
+                    .insert(kind, changes.into_iter().take(MAX_ADJUSTMENTS).collect());
+            }
             CoreEvent::VideoTracks { tracks, .. } => self.on_tracks(tracks),
             CoreEvent::VideoFeed { track, feed } => {
                 if self.feeds.len() < MAX_TRACKS || self.feeds.contains_key(&track) {
@@ -540,6 +562,13 @@ impl VideoModel {
             CoreEvent::LocalVideo(local) => {
                 self.camera_busy = false;
                 self.share_busy = false;
+                // What was said about a track that is off is over.
+                if local.camera.is_none() {
+                    self.sending.remove(&VideoKind::Camera);
+                }
+                if local.screen.is_none() {
+                    self.sending.remove(&VideoKind::Screen);
+                }
                 self.local = local;
             }
             CoreEvent::VideoEncoders(encoders) => self.encoders = Some(encoders),
@@ -615,6 +644,7 @@ impl VideoModel {
         self.feeds.clear();
         self.local = LocalVideo::default();
         self.stats = None;
+        self.sending.clear();
         self.pinned = None;
         self.fullscreen = None;
         self.sizes.clear();
@@ -1683,6 +1713,46 @@ mod tests {
             let _ = app.update(Message::WindowScale(bad));
             assert_eq!(app.window_scale, 2.0, "{bad}");
         }
+    }
+
+    #[test]
+    fn what_the_core_changed_is_kept_until_the_next_echo_and_per_kind_until_the_track_ends() {
+        let adjustment = |setting: &str| VideoAdjustment {
+            setting: setting.to_owned(),
+            asked: "900".into(),
+            used: "120".into(),
+        };
+        let mut model = VideoModel::default();
+        model.on_event(CoreEvent::VideoSettings(VideoSettings::default()));
+        model.on_event(CoreEvent::VideoSettingsAdjusted(vec![adjustment(
+            "screen.fps",
+        )]));
+        assert_eq!(model.adjusted.len(), 1);
+        // A later echo is about a later change: the old report goes.
+        model.on_event(CoreEvent::VideoSettings(VideoSettings::default()));
+        assert!(model.adjusted.is_empty());
+        model.on_event(CoreEvent::VideoSending {
+            kind: VideoKind::Camera,
+            changes: vec![adjustment("camera.size")],
+        });
+        model.on_event(CoreEvent::VideoSending {
+            kind: VideoKind::Screen,
+            changes: vec![adjustment("screen.codec")],
+        });
+        model.on_event(CoreEvent::LocalVideo(LocalVideo {
+            screen: Some(VideoTrackId::from("local-screen-1")),
+            ..LocalVideo::default()
+        }));
+        assert!(!model.sending.contains_key(&VideoKind::Camera));
+        assert!(model.sending.contains_key(&VideoKind::Screen));
+        // Reports are capped.
+        let many = (0..100)
+            .map(|i| adjustment(&format!("camera.layer{i}")))
+            .collect();
+        model.on_event(CoreEvent::VideoSettingsAdjusted(many));
+        assert_eq!(model.adjusted.len(), MAX_ADJUSTMENTS);
+        model.end_call();
+        assert!(model.sending.is_empty());
     }
 
     #[test]

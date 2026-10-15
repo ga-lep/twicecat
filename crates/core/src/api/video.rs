@@ -196,6 +196,13 @@ pub struct VideoSettings {
     /// Remember the screen or window picked in the system's picker
     /// (Wayland's portal), so the next share starts without asking.
     pub remember_screen_choice: bool,
+    /// How the camera is sent, where the person does not leave it to the
+    /// quality above.
+    pub camera_tuning: VideoTuning,
+    /// How a screen share is sent, as `camera_tuning`.
+    pub screen_tuning: VideoTuning,
+    /// How the camera is opened, apart from what is sent.
+    pub camera_capture: CameraCapture,
 }
 
 impl Default for VideoSettings {
@@ -209,12 +216,382 @@ impl Default for VideoSettings {
             prefer_integrated_gpu_on_battery: true,
             upload_cap_kbps: None,
             remember_screen_choice: false,
+            camera_tuning: VideoTuning::default(),
+            screen_tuning: VideoTuning::default(),
+            camera_capture: CameraCapture::default(),
+        }
+    }
+}
+
+/// How a track gives way when the network or the encoder cannot keep up
+/// (`degradation_preference` in WebRTC).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DegradationChoice {
+    /// Keep the frame rate, lower the resolution (the camera's default).
+    KeepFrameRate,
+    /// Keep the resolution, drop frames (a screen share's default: text must
+    /// stay sharp).
+    KeepResolution,
+    /// A bit of both.
+    Balanced,
+}
+
+/// One simulcast layer below the top one, as the person set it. Every field
+/// `None` is left to the quality ladder.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LayerTuning {
+    /// Width in pixels (with `height`: both or neither).
+    pub width: Option<u32>,
+    /// Height in pixels.
+    pub height: Option<u32>,
+    /// Frames per second.
+    pub fps: Option<u32>,
+    /// Bitrate, kb/s.
+    pub bitrate_kbps: Option<u32>,
+}
+
+/// What one kind of video (the camera, or screen shares) is sent as, when
+/// the person does not want the automatic choice. Every field that is
+/// `None` (or empty) is automatic, so the default changes nothing. The core
+/// checks and clamps what is here ([`VideoSettings::validated`]) and the
+/// call's [`LocalVideo`] says what is really sent.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VideoTuning {
+    /// Width of the picture sent (with `height`: both or neither).
+    pub width: Option<u32>,
+    /// Height of the picture sent.
+    pub height: Option<u32>,
+    /// Frames per second.
+    pub fps: Option<u32>,
+    /// The most the top layer may send, kb/s.
+    pub bitrate_kbps: Option<u32>,
+    /// The codec; automatic is what the encoder does best (H.264 on a
+    /// hardware encoder, VP8 in software), or AV1 where
+    /// [`VideoSettings::codec`] asks for it.
+    pub codec: Option<VideoCodec>,
+    /// The encoder, for this kind only; the one in [`VideoSettings::encoder`]
+    /// when `None`.
+    pub encoder: Option<EncoderChoice>,
+    /// How many simulcast layers go out, 1 to 3 (1 is no simulcast); the
+    /// ladder's (up to 3) when `None`.
+    pub layers: Option<u8>,
+    /// The layers below the top, the next one first; what is not named is
+    /// the ladder's.
+    pub lower_layers: Vec<LayerTuning>,
+    /// For VP9 and AV1: one SVC stream with this scalability mode (for
+    /// example `L3T3_KEY`) instead of simulcast. One of [`SCALABILITY_MODES`].
+    pub scalability_mode: Option<String>,
+    /// What gives way under pressure; the kind's own default when `None`.
+    pub degradation: Option<DegradationChoice>,
+}
+
+/// The scalability modes [`VideoTuning::scalability_mode`] may name.
+pub const SCALABILITY_MODES: [&str; 8] = [
+    "L1T2", "L1T3", "L2T2", "L2T3", "L3T3", "L2T2_KEY", "L2T3_KEY", "L3T3_KEY",
+];
+
+/// The pixel format a camera is opened in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CameraFormat {
+    /// The best the camera offers for the mode.
+    #[default]
+    Auto,
+    /// NV12.
+    Nv12,
+    /// YUYV (YUY2).
+    Yuyv,
+    /// Motion JPEG.
+    Mjpeg,
+}
+
+/// How the camera is opened, apart from what is sent: the size and rate it
+/// captures at, and its pixel format.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CameraCapture {
+    /// A mode from the camera's [`VideoDevice::modes`]; the best one for the
+    /// quality when `None`.
+    pub mode: Option<VideoMode>,
+    /// The pixel format.
+    pub format: CameraFormat,
+}
+
+/// Bounds enforced by [`VideoSettings::validated`].
+pub mod video_limits {
+    /// Width of a picture sent, pixels.
+    pub const WIDTH: (u32, u32) = (160, 7680);
+    /// Height of a picture sent, pixels.
+    pub const HEIGHT: (u32, u32) = (90, 4320);
+    /// Frames per second.
+    pub const FPS: (u32, u32) = (1, 120);
+    /// A layer's bitrate, kb/s.
+    pub const BITRATE_KBPS: (u32, u32) = (50, 150_000);
+    /// The upload cap, kb/s.
+    pub const UPLOAD_CAP_KBPS: (u32, u32) = (100, 300_000);
+    /// Simulcast layers.
+    pub const LAYERS: (u8, u8) = (1, 3);
+}
+
+/// One thing [`VideoSettings::validated`] (or the encoder) changed, so the
+/// front end can say so instead of silently sending something else.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VideoAdjustment {
+    /// Which setting, as a path such as `screen.fps` or `camera.layer2.height`.
+    pub setting: String,
+    /// What was asked, in words.
+    pub asked: String,
+    /// What is used, in words.
+    pub used: String,
+}
+
+impl VideoAdjustment {
+    fn new(setting: impl Into<String>, asked: impl fmt::Display, used: impl fmt::Display) -> Self {
+        Self {
+            setting: setting.into(),
+            asked: asked.to_string(),
+            used: used.to_string(),
+        }
+    }
+}
+
+/// Clamps `value` into `range`; records the change.
+fn clamp_to(
+    changes: &mut Vec<VideoAdjustment>,
+    setting: &str,
+    value: &mut Option<u32>,
+    range: (u32, u32),
+    even: bool,
+) {
+    let Some(asked) = *value else {
+        return;
+    };
+    let mut used = asked.clamp(range.0, range.1);
+    if even {
+        used &= !1;
+    }
+    if used != asked {
+        changes.push(VideoAdjustment::new(setting, asked, used));
+        *value = Some(used);
+    }
+}
+
+/// A custom size needs both sides: one alone is dropped.
+fn size_pair(
+    changes: &mut Vec<VideoAdjustment>,
+    setting: &str,
+    w: &mut Option<u32>,
+    h: &mut Option<u32>,
+) {
+    clamp_to(
+        changes,
+        &format!("{setting}.width"),
+        w,
+        video_limits::WIDTH,
+        true,
+    );
+    clamp_to(
+        changes,
+        &format!("{setting}.height"),
+        h,
+        video_limits::HEIGHT,
+        true,
+    );
+    match (*w, *h) {
+        (Some(w0), None) => {
+            changes.push(VideoAdjustment::new(
+                format!("{setting}.width"),
+                w0,
+                "automatic",
+            ));
+            *w = None;
+        }
+        (None, Some(h0)) => {
+            changes.push(VideoAdjustment::new(
+                format!("{setting}.height"),
+                h0,
+                "automatic",
+            ));
+            *h = None;
+        }
+        _ => {}
+    }
+}
+
+impl VideoTuning {
+    /// Whether everything is automatic.
+    pub fn is_automatic(&self) -> bool {
+        *self == Self::default()
+    }
+
+    fn validate(&mut self, name: &str, changes: &mut Vec<VideoAdjustment>) {
+        size_pair(changes, name, &mut self.width, &mut self.height);
+        clamp_to(
+            changes,
+            &format!("{name}.fps"),
+            &mut self.fps,
+            video_limits::FPS,
+            false,
+        );
+        clamp_to(
+            changes,
+            &format!("{name}.bitrate"),
+            &mut self.bitrate_kbps,
+            video_limits::BITRATE_KBPS,
+            false,
+        );
+        // H.265 is received only (plan Q4).
+        if self.codec == Some(VideoCodec::H265) {
+            changes.push(VideoAdjustment::new(
+                format!("{name}.codec"),
+                "H.265",
+                "automatic",
+            ));
+            self.codec = None;
+        }
+        let (min_layers, max_layers) = video_limits::LAYERS;
+        if let Some(layers) = self.layers {
+            let used = layers.clamp(min_layers, max_layers);
+            if used != layers {
+                changes.push(VideoAdjustment::new(format!("{name}.layers"), layers, used));
+                self.layers = Some(used);
+            }
+        }
+        // The layers below the top: at most two, and a size of both sides.
+        let room = usize::from(max_layers) - 1;
+        if self.lower_layers.len() > room {
+            changes.push(VideoAdjustment::new(
+                format!("{name}.layers"),
+                self.lower_layers.len() + 1,
+                max_layers,
+            ));
+            self.lower_layers.truncate(room);
+        }
+        for (i, layer) in self.lower_layers.iter_mut().enumerate() {
+            let at = format!("{name}.layer{}", i + 2);
+            size_pair(changes, &at, &mut layer.width, &mut layer.height);
+            clamp_to(
+                changes,
+                &format!("{at}.fps"),
+                &mut layer.fps,
+                video_limits::FPS,
+                false,
+            );
+            clamp_to(
+                changes,
+                &format!("{at}.bitrate"),
+                &mut layer.bitrate_kbps,
+                video_limits::BITRATE_KBPS,
+                false,
+            );
+        }
+        // A layer is never bigger than the one above it (a custom top size
+        // is the one to compare with).
+        if let (Some(w), Some(h)) = (self.width, self.height) {
+            let mut above = (w, h);
+            for (i, layer) in self.lower_layers.iter_mut().enumerate() {
+                if let (Some(lw), Some(lh)) = (layer.width, layer.height) {
+                    if lw > above.0 || lh > above.1 {
+                        changes.push(VideoAdjustment::new(
+                            format!("{name}.layer{}.size", i + 2),
+                            format!("{lw}\u{d7}{lh}"),
+                            format!("{}\u{d7}{}", above.0, above.1),
+                        ));
+                        layer.width = Some(lw.min(above.0) & !1);
+                        layer.height = Some(lh.min(above.1) & !1);
+                    }
+                    above = (layer.width.unwrap_or(lw), layer.height.unwrap_or(lh));
+                }
+            }
+        }
+        if let Some(mode) = self.scalability_mode.clone() {
+            let known = SCALABILITY_MODES.contains(&mode.as_str());
+            let codec_ok = matches!(self.codec, None | Some(VideoCodec::Vp9 | VideoCodec::Av1));
+            if !known || !codec_ok {
+                changes.push(VideoAdjustment::new(
+                    format!("{name}.svc"),
+                    mode.chars().take(16).collect::<String>(),
+                    "automatic",
+                ));
+                self.scalability_mode = None;
+            }
+        }
+    }
+}
+
+impl VideoSettings {
+    /// These settings with every value inside its bounds (see
+    /// [`video_limits`]), and what was changed, for the front end to say.
+    /// Settings that are already in bounds come back as they are, with
+    /// nothing changed.
+    ///
+    /// ```
+    /// use twicecat_core::api::{VideoSettings, VideoTuning};
+    /// let settings = VideoSettings {
+    ///     screen_tuning: VideoTuning { fps: Some(500), ..VideoTuning::default() },
+    ///     ..VideoSettings::default()
+    /// };
+    /// let (used, changes) = settings.validated();
+    /// assert_eq!(used.screen_tuning.fps, Some(120));
+    /// assert_eq!(changes.len(), 1);
+    /// ```
+    pub fn validated(mut self) -> (Self, Vec<VideoAdjustment>) {
+        let mut changes = Vec::new();
+        clamp_to(
+            &mut changes,
+            "upload_cap",
+            &mut self.upload_cap_kbps,
+            video_limits::UPLOAD_CAP_KBPS,
+            false,
+        );
+        self.camera_tuning.validate("camera", &mut changes);
+        self.screen_tuning.validate("screen", &mut changes);
+        if let Some(mode) = self.camera_capture.mode {
+            let (mut w, mut h, mut f) = (Some(mode.width), Some(mode.height), Some(mode.fps));
+            clamp_to(
+                &mut changes,
+                "capture.width",
+                &mut w,
+                video_limits::WIDTH,
+                true,
+            );
+            clamp_to(
+                &mut changes,
+                "capture.height",
+                &mut h,
+                video_limits::HEIGHT,
+                true,
+            );
+            clamp_to(
+                &mut changes,
+                "capture.fps",
+                &mut f,
+                video_limits::FPS,
+                false,
+            );
+            self.camera_capture.mode = Some(VideoMode {
+                width: w.unwrap_or(mode.width),
+                height: h.unwrap_or(mode.height),
+                fps: f.unwrap_or(mode.fps),
+            });
+        }
+        (self, changes)
+    }
+
+    /// The tuning of one kind.
+    pub fn tuning(&self, kind: VideoKind) -> &VideoTuning {
+        match kind {
+            VideoKind::Camera => &self.camera_tuning,
+            VideoKind::Screen => &self.screen_tuning,
         }
     }
 }
 
 /// A size and rate a camera offers.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct VideoMode {
     /// Width in pixels.
     pub width: u32,
@@ -489,6 +866,10 @@ pub struct CodecLimits {
     pub max_height: u32,
     /// Highest framerate at that size.
     pub max_fps: u32,
+    /// Checked on a real call on this project's test machine. A codec that is
+    /// not is offered all the same, and sent as asked, but the front end says
+    /// it has not been tried.
+    pub tested: bool,
 }
 
 /// One encoder found on this machine.
@@ -655,6 +1036,223 @@ mod tests {
         assert!(feed.is_ended());
         // The last frame stays readable.
         assert_eq!(other.latest().unwrap().timestamp_us, 2);
+    }
+
+    fn says(changes: &[VideoAdjustment], setting: &str) -> bool {
+        changes.iter().any(|c| c.setting == setting)
+    }
+
+    #[test]
+    fn settings_in_bounds_come_back_unchanged() {
+        let settings = VideoSettings {
+            upload_cap_kbps: Some(8_000),
+            camera_tuning: VideoTuning {
+                width: Some(1280),
+                height: Some(720),
+                fps: Some(30),
+                bitrate_kbps: Some(1_700),
+                codec: Some(VideoCodec::Vp9),
+                layers: Some(2),
+                lower_layers: vec![LayerTuning {
+                    width: Some(640),
+                    height: Some(360),
+                    fps: Some(15),
+                    bitrate_kbps: Some(400),
+                }],
+                scalability_mode: Some("L2T3_KEY".into()),
+                degradation: Some(DegradationChoice::Balanced),
+                ..VideoTuning::default()
+            },
+            camera_capture: CameraCapture {
+                mode: Some(VideoMode {
+                    width: 1920,
+                    height: 1080,
+                    fps: 30,
+                }),
+                format: CameraFormat::Mjpeg,
+            },
+            ..VideoSettings::default()
+        };
+        let (used, changes) = settings.clone().validated();
+        assert_eq!(used, settings);
+        assert!(changes.is_empty(), "{changes:?}");
+        assert_eq!(VideoSettings::default().validated().1, Vec::new());
+    }
+
+    #[test]
+    fn every_number_is_clamped_and_each_change_is_reported() {
+        let settings = VideoSettings {
+            upload_cap_kbps: Some(5),
+            screen_tuning: VideoTuning {
+                width: Some(99_999),
+                height: Some(10),
+                fps: Some(0),
+                bitrate_kbps: Some(9_999_999),
+                layers: Some(9),
+                ..VideoTuning::default()
+            },
+            camera_capture: CameraCapture {
+                mode: Some(VideoMode {
+                    width: 100_000,
+                    height: 1,
+                    fps: 1_000,
+                }),
+                ..CameraCapture::default()
+            },
+            ..VideoSettings::default()
+        };
+        let (used, changes) = settings.validated();
+        assert_eq!(used.upload_cap_kbps, Some(video_limits::UPLOAD_CAP_KBPS.0));
+        let t = &used.screen_tuning;
+        assert_eq!(t.width, Some(video_limits::WIDTH.1));
+        assert_eq!(t.height, Some(video_limits::HEIGHT.0));
+        assert_eq!(t.fps, Some(1));
+        assert_eq!(t.bitrate_kbps, Some(video_limits::BITRATE_KBPS.1));
+        assert_eq!(t.layers, Some(3));
+        let mode = used.camera_capture.mode.expect("kept");
+        assert_eq!((mode.width, mode.height, mode.fps), (7680, 90, 120));
+        for setting in [
+            "upload_cap",
+            "screen.width",
+            "screen.height",
+            "screen.fps",
+            "screen.bitrate",
+            "screen.layers",
+            "capture.width",
+            "capture.height",
+            "capture.fps",
+        ] {
+            assert!(
+                says(&changes, setting),
+                "{setting} missing from {changes:?}"
+            );
+        }
+        // What is used is itself in bounds.
+        assert!(used.clone().validated().1.is_empty());
+    }
+
+    #[test]
+    fn odd_sizes_become_even_and_half_a_size_is_dropped() {
+        let settings = VideoSettings {
+            camera_tuning: VideoTuning {
+                width: Some(1281),
+                height: Some(721),
+                ..VideoTuning::default()
+            },
+            screen_tuning: VideoTuning {
+                width: Some(1920),
+                ..VideoTuning::default()
+            },
+            ..VideoSettings::default()
+        };
+        let (used, changes) = settings.validated();
+        assert_eq!(
+            (used.camera_tuning.width, used.camera_tuning.height),
+            (Some(1280), Some(720))
+        );
+        assert_eq!(
+            (used.screen_tuning.width, used.screen_tuning.height),
+            (None, None)
+        );
+        assert!(says(&changes, "camera.width") && says(&changes, "screen.width"));
+    }
+
+    #[test]
+    fn layers_codecs_and_svc_modes_are_checked() {
+        let settings = VideoSettings {
+            camera_tuning: VideoTuning {
+                codec: Some(VideoCodec::H265),
+                scalability_mode: Some("L9T9".into()),
+                lower_layers: vec![LayerTuning::default(); 5],
+                ..VideoTuning::default()
+            },
+            screen_tuning: VideoTuning {
+                codec: Some(VideoCodec::H264),
+                scalability_mode: Some("L3T3_KEY".into()),
+                ..VideoTuning::default()
+            },
+            ..VideoSettings::default()
+        };
+        let (used, changes) = settings.validated();
+        assert_eq!(used.camera_tuning.codec, None, "H.265 is receive-only");
+        assert_eq!(used.camera_tuning.scalability_mode, None);
+        assert_eq!(used.camera_tuning.lower_layers.len(), 2);
+        // SVC needs VP9 or AV1.
+        assert_eq!(used.screen_tuning.scalability_mode, None);
+        for setting in ["camera.codec", "camera.svc", "camera.layers", "screen.svc"] {
+            assert!(
+                says(&changes, setting),
+                "{setting} missing from {changes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_lower_layer_is_never_bigger_than_the_one_above() {
+        let settings = VideoSettings {
+            camera_tuning: VideoTuning {
+                width: Some(1280),
+                height: Some(720),
+                lower_layers: vec![
+                    LayerTuning {
+                        width: Some(1920),
+                        height: Some(1080),
+                        ..LayerTuning::default()
+                    },
+                    LayerTuning {
+                        width: Some(1600),
+                        height: Some(900),
+                        ..LayerTuning::default()
+                    },
+                ],
+                ..VideoTuning::default()
+            },
+            ..VideoSettings::default()
+        };
+        let (used, changes) = settings.validated();
+        let sizes: Vec<_> = used
+            .camera_tuning
+            .lower_layers
+            .iter()
+            .map(|l| (l.width, l.height))
+            .collect();
+        assert_eq!(sizes, [(Some(1280), Some(720)), (Some(1280), Some(720))]);
+        assert!(says(&changes, "camera.layer2.size"), "{changes:?}");
+    }
+
+    #[test]
+    fn an_old_settings_file_loads_with_the_new_fields_automatic() {
+        let old = r#"{"codec":"h264","camera_quality":"hd720p30","upload_cap_kbps":4000}"#;
+        let settings: VideoSettings = serde_json::from_str(old).unwrap();
+        assert!(settings.camera_tuning.is_automatic());
+        assert!(settings.screen_tuning.is_automatic());
+        assert_eq!(settings.camera_capture, CameraCapture::default());
+        assert_eq!(settings.camera_quality, VideoQuality::Hd720p30);
+        // And a new one reads back as written.
+        let tuned = VideoSettings {
+            screen_tuning: VideoTuning {
+                fps: Some(15),
+                degradation: Some(DegradationChoice::KeepFrameRate),
+                encoder: Some(EncoderChoice::Prefer(EncoderBackend::Software)),
+                ..VideoTuning::default()
+            },
+            ..settings
+        };
+        let json = serde_json::to_string(&tuned).unwrap();
+        assert_eq!(serde_json::from_str::<VideoSettings>(&json).unwrap(), tuned);
+    }
+
+    #[test]
+    fn the_tuning_of_a_kind_is_picked_by_kind() {
+        let settings = VideoSettings {
+            camera_tuning: VideoTuning {
+                fps: Some(24),
+                ..VideoTuning::default()
+            },
+            ..VideoSettings::default()
+        };
+        assert_eq!(settings.tuning(VideoKind::Camera).fps, Some(24));
+        assert!(settings.tuning(VideoKind::Screen).is_automatic());
     }
 
     #[test]

@@ -27,7 +27,8 @@ use livekit::e2ee::E2eeOptions;
 use livekit::e2ee::manager::E2eeManager;
 use livekit::id::ParticipantIdentity;
 use livekit::options::{
-    AudioEncoding, TrackPublishOptions, VideoCodec as LkVideoCodec, VideoEncoding, VideoPreset,
+    AudioEncoding, DegradationPreference, TrackPublishOptions, VideoCodec as LkVideoCodec,
+    VideoEncoding, VideoPreset,
 };
 use livekit::prelude::{
     LocalAudioTrack, LocalParticipant, LocalTrack, LocalVideoTrack, Participant, RemoteAudioTrack,
@@ -50,8 +51,8 @@ use super::jwt::SfuAccess;
 use super::video::{LocalSend, PatternSender, Videos};
 use super::{UserVolumes, user_volume};
 use crate::api::{
-    CleaningStatus, CoreError, EncoderBackend, SoundSource, UserId, VideoCodec, VideoFeed,
-    VideoKind, VideoQuality, VideoTrackId,
+    CleaningStatus, CoreError, DegradationChoice, EncoderBackend, SoundSource, UserId, VideoCodec,
+    VideoFeed, VideoKind, VideoQuality, VideoTrackId,
 };
 use crate::audio_session::{self, Voice};
 
@@ -318,6 +319,12 @@ fn video_options(kind: VideoKind, sending: &Sending) -> TrackPublishOptions {
         }),
         simulcast: sending.layers.len() > 1,
         simulcast_layers: Some(sending.layers[1..].iter().rev().map(preset).collect()),
+        scalability_mode: sending.scalability_mode.clone(),
+        degradation_preference: sending.degradation.map(|d| match d {
+            DegradationChoice::KeepFrameRate => DegradationPreference::MaintainFramerate,
+            DegradationChoice::KeepResolution => DegradationPreference::MaintainResolution,
+            DegradationChoice::Balanced => DegradationPreference::Balanced,
+        }),
         ..TrackPublishOptions::default()
     }
 }

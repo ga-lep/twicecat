@@ -910,6 +910,8 @@ impl Cli {
             CoreEvent::VideoDevices(_)
             | CoreEvent::ScreenSources(_)
             | CoreEvent::VideoSettings(_)
+            | CoreEvent::VideoSettingsAdjusted(_)
+            | CoreEvent::VideoSending { .. }
             | CoreEvent::VideoEncoders(_) => {}
         }
     }
