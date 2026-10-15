@@ -42,7 +42,7 @@ pub const MAX_KEYWORDS: usize = 50;
 pub const MAX_STALE_EVENTS: u8 = 3;
 
 /// The Voice & audio section of Settings.
-pub const VOICE_AUDIO_LINE: &str = "Devices, voice activity or push-to-talk (a key or a gamepad button), microphone processing, volume, the mic test, the ringtone, and cleaning other voices.";
+pub const VOICE_AUDIO_LINE: &str = "Every audio option: the processing chain, the noise gate, gain, the voice bitrate, the ringtone, cleaning other voices, announcements and diagnostics.";
 /// The line on the Sessions page of Settings.
 pub const SESSIONS_LINE: &str = "See where you are signed in, which sessions are verified, and sign out of the ones you do not use.";
 /// The typeface line on the About page (SIL OFL 1.1 asks for the notice).
@@ -474,8 +474,12 @@ pub enum SettingsPage {
     Appearance,
     /// Default modes, keywords and the three local toggles.
     Notifications,
-    /// A line and a button that opens the Voice & audio card.
+    /// The microphone, the speakers, how to talk and noise reduction; with
+    /// the advanced switch on, a button to the card with every audio option.
     VoiceAudio,
+    /// The camera and the picture quality; with the advanced switch on, every
+    /// option for the camera and for screen sharing.
+    Video,
     /// The shortcut list.
     Keyboard,
     /// A button that opens the Sessions screen.
@@ -486,11 +490,12 @@ pub enum SettingsPage {
 
 impl SettingsPage {
     /// Every page, in the order of the list at the left of the card.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Profile,
         Self::Appearance,
         Self::Notifications,
         Self::VoiceAudio,
+        Self::Video,
         Self::Keyboard,
         Self::Sessions,
         Self::About,
@@ -503,6 +508,7 @@ impl SettingsPage {
             Self::Appearance => "Appearance",
             Self::Notifications => "Notifications",
             Self::VoiceAudio => "Voice & audio",
+            Self::Video => "Video",
             Self::Keyboard => "Keyboard",
             Self::Sessions => "Sessions",
             Self::About => "About",
@@ -532,7 +538,8 @@ impl SettingsPage {
                 "TrayBadge",
             ],
             Self::VoiceAudio => &["OpenVoiceAudio"],
-            Self::Keyboard | Self::About => &[],
+            // The controls of this page send `Message::VideoSettings`.
+            Self::Video | Self::Keyboard | Self::About => &[],
             Self::Sessions => &["OpenSessions"],
         }
     }
@@ -551,6 +558,8 @@ pub enum SettingsMessage {
     OpenSessions,
     /// **Voice & audio** (plan Q5): closes Settings and opens that card.
     OpenVoiceAudio,
+    /// The **Show advanced settings** switch.
+    Advanced(bool),
     /// The display name field changed.
     NameInput(MessageText),
     /// **Save** next to the display name.
@@ -606,6 +615,7 @@ impl SettingsMessage {
             Self::Page(_) => "Page",
             Self::OpenSessions => "OpenSessions",
             Self::OpenVoiceAudio => "OpenVoiceAudio",
+            Self::Advanced(_) => "Advanced",
             Self::NameInput(_) => "NameInput",
             Self::SaveName => "SaveName",
             Self::ChooseAvatar => "ChooseAvatar",
@@ -630,12 +640,13 @@ impl SettingsMessage {
 
     /// The names of every message (kept by hand beside [`Self::name`]; a test
     /// checks that each belongs to a page, the card or [`Self::NOT_FROM_A_CONTROL`]).
-    pub const ALL_NAMES: [&'static str; 24] = [
+    pub const ALL_NAMES: [&'static str; 25] = [
         "Open",
         "Close",
         "Page",
         "OpenSessions",
         "OpenVoiceAudio",
+        "Advanced",
         "NameInput",
         "SaveName",
         "ChooseAvatar",
@@ -657,9 +668,9 @@ impl SettingsMessage {
         "Saved",
     ];
 
-    /// The messages of the card itself, on every page: its Close button and
-    /// its list of pages.
-    pub const CARD_WIDE: [&'static str; 2] = ["Close", "Page"];
+    /// The messages of the card itself, on every page: its Close button, its
+    /// list of pages and the advanced switch.
+    pub const CARD_WIDE: [&'static str; 3] = ["Close", "Page", "Advanced"];
 
     /// Messages that no control of a page sends: the account area and
     /// Ctrl+, open the card, a dialog and a task answer, a write ends.
@@ -720,21 +731,27 @@ impl App {
             M::Close => {
                 self.settings_ui.open = false;
                 self.settings_ui.error = None;
-                Task::none()
+                self.after_settings_page()
             }
             M::Page(page) => {
                 if self.settings_ui.open {
                     self.settings_ui.page = page;
                 }
-                Task::none()
+                self.after_settings_page()
             }
+            M::Advanced(on) => self.change_local(|s| &mut s.advanced_settings, on),
             M::OpenVoiceAudio => {
                 if !self.settings_ui.open {
                     return Task::none();
                 }
                 self.settings_ui.open = false;
                 self.settings_ui.error = None;
-                self.on_audio(crate::audio_settings::AudioMessage::Open)
+                let left = self.after_settings_page();
+                // The card has every option: it is for the advanced level.
+                Task::batch([
+                    left,
+                    self.on_audio(crate::audio_settings::AudioMessage::Open),
+                ])
             }
             M::OpenSessions => {
                 if !self.settings_ui.open {
@@ -742,7 +759,8 @@ impl App {
                 }
                 self.settings_ui.open = false;
                 self.settings_ui.error = None;
-                self.on_sessions(SessionsMessage::Open)
+                let left = self.after_settings_page();
+                Task::batch([left, self.on_sessions(SessionsMessage::Open)])
             }
             M::NameInput(name) => {
                 let ui = &mut self.settings_ui;
@@ -860,6 +878,34 @@ impl App {
         ui.error = None;
         // Keyboard focus moves off the composer, under the screen.
         iced::widget::operation::focus(NAME_INPUT_ID)
+    }
+
+    /// Settings on `page`, opened if need be (a button of the call dock that
+    /// would open the audio card, while Settings are simple).
+    pub(crate) fn show_settings_page(&mut self, page: SettingsPage) -> Task<Message> {
+        if self.screen != Screen::Main {
+            return Task::none();
+        }
+        if !self.settings_ui.open {
+            if self.other_modal_open() {
+                return Task::none();
+            }
+            self.settings_ui.open = true;
+            self.settings_ui.error = None;
+        }
+        self.settings_ui.page = page;
+        self.after_settings_page()
+    }
+
+    /// The page on screen changed (or Settings closed): the pages that hold
+    /// live controls start or stop being live.
+    pub(crate) fn after_settings_page(&mut self) -> Task<Message> {
+        let ui = &self.settings_ui;
+        let (open, page) = (ui.open, ui.page);
+        Task::batch([
+            self.audio_inline(open && page == SettingsPage::VoiceAudio),
+            self.video_inline(open && page == SettingsPage::Video),
+        ])
     }
 
     fn save_display_name(&mut self) -> Task<Message> {

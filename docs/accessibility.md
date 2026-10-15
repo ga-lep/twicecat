@@ -113,14 +113,29 @@ Rules the code follows (all in tests):
 ## Settings and Sessions
 
 Settings is a card with a list of pages at its left (Profile, Appearance,
-Notifications, Voice & audio, Keyboard, Sessions, About) and one page at its
-right. Ctrl+, always opens it on Profile, and so does opening it again after
-a close.
+Notifications, Voice & audio, Video, Keyboard, Sessions, About) and one page
+at its right. Ctrl+, always opens it on Profile, and so does opening it again
+after a close.
 
+- Two levels. **Show advanced settings** (a checkbox in the card's header,
+  off by default and remembered) adds, under a rule on the same pages, what
+  a person with little technical knowledge does not need: density and the
+  room list (Appearance), keywords, message content in notifications and the
+  tray badge (Notifications), a button to the Voice & audio card with every
+  audio option, and on Video every option the camera and screen sharing can
+  be tuned by. A simple page never shows a control that only does something
+  at the advanced level, and every setting an advanced person changed stays
+  in force when the switch goes back off. The simple Voice & audio page
+  holds the microphone, the speakers, the volume, how you talk (and the key),
+  noise reduction in three words (Off, Standard, Strong) and a test with its
+  level; the call's audio buttons open it, or the card at the advanced level.
+  The simple Video page holds the camera with a preview, and a picture
+  quality in words for the camera and for sharing.
 - Esc closes Settings, as before (one layer per press).
 - Tab and Shift+Tab walk the text fields of the page on show, in the order of
   the widget tree: the display name on Profile, the keyword field on
-  Notifications, and no field on the other pages. This iced gives only text
+  Notifications at the advanced level, and none named on the other pages (the
+  advanced Video page has fields for custom numbers). This iced gives only text
   fields the keyboard focus; buttons, checkboxes, radio buttons and the list
   of pages never take it, so they are reached with the pointer. This is a
   limit of the pinned iced, not a choice; it is on the human checkpoint list.
@@ -222,7 +237,7 @@ muted by a mark and the word "Muted", so neither relies on colour alone.
   the size in words, or says that the system will ask. **Share** stays off
   until something is picked. Esc cancels it.
 - While a share goes out, **You are sharing your screen** with **Stop sharing**
-  floats at the top of the window over every dialog and card.
+  floats at the bottom of the window over every dialog and card.
 - Pictures are drawn by the GPU renderer. When only the software renderer
   runs, the stage says so in words instead of staying black.
 

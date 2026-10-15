@@ -427,6 +427,9 @@ pub struct UiSettings {
     pub room_list: RoomListChoice,
     /// Text scale in percent (80 to 200, in steps of 10).
     pub text_scale_percent: u16,
+    /// Show every setting, audio and video in depth, instead of the few a
+    /// person with little technical knowledge needs. Off by default.
+    pub advanced_settings: bool,
 }
 
 impl Default for UiSettings {
@@ -440,6 +443,7 @@ impl Default for UiSettings {
             density: DensityChoice::Comfortable,
             room_list: RoomListChoice::Expanded,
             text_scale_percent: 100,
+            advanced_settings: false,
         }
     }
 }

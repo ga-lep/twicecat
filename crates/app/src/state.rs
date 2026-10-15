@@ -429,6 +429,8 @@ pub enum Message {
     Audio(crate::audio_settings::AudioMessage),
     /// A control of the call's video: the stage, the camera, sharing.
     Video(crate::video::VideoMessage),
+    /// A control of the Video page of Settings.
+    VideoSettings(crate::video_settings::VideoSettingsMessage),
     /// The window's scale factor (physical pixels per logical pixel) from the
     /// window system.
     WindowScale(f32),
@@ -1326,6 +1328,7 @@ impl App {
             }
             Message::Audio(message) => self.on_audio(message),
             Message::Video(message) => self.on_video(message),
+            Message::VideoSettings(message) => self.on_video_settings(message),
             Message::Ptt(PttMessage::Update(update)) => {
                 self.ptt.update(update);
                 Task::none()
@@ -10811,6 +10814,11 @@ mod tests {
             for page in SettingsPage::ALL {
                 st(&mut rig, S::Page(page));
                 assert_eq!(rig.app.settings_ui.page, page);
+                // Only the pages with live controls ask the core for anything.
+                if !matches!(page, SettingsPage::VoiceAudio | SettingsPage::Video) {
+                    assert!(drain(&mut rig.rx).is_empty(), "{page:?} sends nothing");
+                }
+                drain(&mut rig.rx);
             }
             // Closing and opening again (Ctrl+, too) starts at Profile.
             st(&mut rig, S::Page(SettingsPage::About));
@@ -10818,6 +10826,118 @@ mod tests {
             open(&mut rig);
             assert_eq!(rig.app.settings_ui.page, SettingsPage::Profile);
             assert!(drain(&mut rig.rx).is_empty(), "a page change sends nothing");
+        }
+
+        #[test]
+        fn the_advanced_switch_starts_off_is_saved_and_is_one_switch_for_every_page() {
+            let mut rig = rig();
+            assert!(!rig.app.ui_settings.advanced_settings);
+            open(&mut rig);
+            st(&mut rig, S::Advanced(true));
+            assert!(rig.app.ui_settings.advanced_settings);
+            let written = writes(&rig);
+            assert_eq!(written.len(), 1, "one write");
+            assert!(written[0].advanced_settings);
+            // The same value again writes nothing; going back writes.
+            st(&mut rig, S::Advanced(true));
+            assert_eq!(writes(&rig).len(), 1);
+            st(&mut rig, S::Advanced(false));
+            assert!(!rig.app.ui_settings.advanced_settings);
+            assert_eq!(writes(&rig).len(), 2);
+            // It does not close the card or change its page.
+            assert!(rig.app.settings_ui.open);
+            assert_eq!(
+                rig.app.settings_ui.page,
+                crate::settings::SettingsPage::Profile
+            );
+        }
+
+        #[test]
+        fn voice_controls_open_settings_when_simple_and_the_card_when_advanced() {
+            use crate::audio_settings::AudioMessage as A;
+            use crate::settings::SettingsPage;
+            let mut rig = rig();
+            drain(&mut rig.rx);
+            // Simple: the dock's controls open the Voice & audio page.
+            let _ = rig.app.update(Message::Audio(A::Open));
+            assert!(rig.app.settings_ui.open);
+            assert_eq!(rig.app.settings_ui.page, SettingsPage::VoiceAudio);
+            assert!(!rig.app.audio_ui.open, "no card");
+            assert!(rig.app.audio_ui.live(), "the page's controls work");
+            let sent = drain(&mut rig.rx);
+            assert!(
+                matches!(
+                    sent.as_slice(),
+                    [
+                        Command::GetAudioSettings,
+                        Command::ListAudioDevices,
+                        Command::ProbeGpuEnhancement
+                    ]
+                ),
+                "{sent:?}"
+            );
+            // Leaving the page ends it: the controls stop answering.
+            st(&mut rig, S::Page(SettingsPage::About));
+            assert!(!rig.app.audio_ui.live());
+            // Advanced: the card, as before.
+            st(&mut rig, S::Close);
+            st(&mut rig, S::Advanced(true));
+            let _ = rig.app.update(Message::Audio(A::Open));
+            assert!(rig.app.audio_ui.open);
+            assert!(!rig.app.settings_ui.open);
+        }
+
+        #[test]
+        fn the_microphone_test_of_the_settings_page_stops_when_the_page_goes() {
+            use crate::audio_settings::AudioMessage as A;
+            use crate::settings::SettingsPage;
+            let mut rig = rig();
+            open(&mut rig);
+            st(&mut rig, S::Page(SettingsPage::VoiceAudio));
+            drain(&mut rig.rx);
+            let _ = rig.app.update(Message::Audio(A::MicTest));
+            assert!(rig.app.audio_ui.mic_test.is_some());
+            assert!(
+                drain(&mut rig.rx)
+                    .iter()
+                    .any(|c| matches!(c, Command::StartMicTest { .. })),
+                "the test started"
+            );
+            st(&mut rig, S::Page(SettingsPage::Keyboard));
+            assert!(rig.app.audio_ui.mic_test.is_none());
+            assert!(
+                drain(&mut rig.rx)
+                    .iter()
+                    .any(|c| matches!(c, Command::StopMicTest)),
+                "the test stopped with the page"
+            );
+        }
+
+        #[test]
+        fn the_video_page_asks_for_the_cameras_and_the_encoders_once_and_stops_its_preview() {
+            use crate::settings::SettingsPage;
+            let mut rig = rig();
+            open(&mut rig);
+            drain(&mut rig.rx);
+            st(&mut rig, S::Page(SettingsPage::Video));
+            let sent = drain(&mut rig.rx);
+            assert!(
+                matches!(
+                    sent.as_slice(),
+                    [
+                        Command::GetVideoSettings,
+                        Command::ListVideoDevices,
+                        Command::ProbeVideoEncoders
+                    ]
+                ),
+                "{sent:?}"
+            );
+            // The same page again asks for nothing.
+            st(&mut rig, S::Page(SettingsPage::Video));
+            assert!(drain(&mut rig.rx).is_empty());
+            // Closing Settings leaves the page.
+            st(&mut rig, S::Close);
+            assert!(!rig.app.calls.video.ui.inline);
         }
 
         #[test]
@@ -11994,6 +12114,7 @@ mod tests {
                 "audio card",
                 app4,
                 |app| {
+                    app.ui_settings.advanced_settings = true;
                     let _ = app.update(Message::Audio(crate::audio_settings::AudioMessage::Open));
                 },
                 |app| {

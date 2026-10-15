@@ -867,6 +867,7 @@ mod tests {
     #[test]
     fn the_service_runs_only_while_a_call_the_test_or_the_card_needs_it() {
         let mut rig = Rig::new(ptt(200, false));
+        rig.app.ui_settings.advanced_settings = true;
         assert_eq!(rig.fake.started(), 0, "push-to-talk alone grabs nothing");
 
         rig.update(Message::Audio(AudioMessage::Open));

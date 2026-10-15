@@ -55,6 +55,13 @@ struct Variant {
     list: RoomListChoice,
 }
 
+/// `variant` on `app`, keeping the Settings switch the scenario set.
+fn apply(app: &mut App, variant: Variant) {
+    let mut settings = variant.settings();
+    settings.advanced_settings = app.ui_settings.advanced_settings;
+    app.set_ui_settings(settings);
+}
+
 impl Variant {
     fn settings(self) -> UiSettings {
         UiSettings {
@@ -253,7 +260,7 @@ fn every_screen_lays_out_in_every_variant_at_both_sizes() {
     for scenario in &scenarios {
         let mut app = (scenario.build)();
         for variant in variants(scenario.room_list) {
-            app.set_ui_settings(variant.settings());
+            apply(&mut app, variant);
             for size in SIZES {
                 app.window_width = size.width;
                 let laid = Laid::new(&app, &renderer, size);
@@ -322,6 +329,13 @@ fn the_fixture_reaches_every_screen_it_names() {
         "settings-appearance",
         "settings-notifications",
         "settings-voice-audio",
+        "settings-video",
+        "settings-advanced",
+        "settings-appearance-advanced",
+        "settings-notifications-advanced",
+        "settings-voice-audio-advanced",
+        "settings-video-advanced",
+        "settings-video-advanced-call",
         "settings-keyboard",
         "settings-sessions",
         "settings-about",
@@ -570,7 +584,7 @@ fn write_the_gallery() {
         let mut app = (scenario.build)();
         let mut files = Vec::new();
         for variant in variants(scenario.room_list) {
-            app.set_ui_settings(variant.settings());
+            apply(&mut app, variant);
             let renderer = renderer();
             let mut laid = Laid::new(&app, &renderer, WIDE);
             laid.settle(&renderer, WIDE);
@@ -611,7 +625,7 @@ fn write_the_gallery() {
         }
         let mut files = Vec::new();
         for variant in variants(false) {
-            app.set_ui_settings(variant.settings());
+            apply(&mut app, variant);
             let renderer = renderer();
             let mut laid = Laid::new(&app, &renderer, size);
             laid.settle(&renderer, size);
@@ -1517,6 +1531,7 @@ fn with_settings(app: &mut App, density: (DensityChoice, &str), list: RoomListCh
     let mut settings = variants(false)[0].settings();
     settings.density = density.0;
     settings.room_list = list;
+    settings.advanced_settings = app.ui_settings.advanced_settings;
     app.set_ui_settings(settings);
     app.window_width = WIDE.width;
 }
@@ -2972,15 +2987,32 @@ mod settings_pages {
 
     use super::*;
 
-    const PAGE_SCENARIOS: [(&str, SettingsPage); 7] = [
+    /// Every page at the simple level, then at the advanced one.
+    const PAGE_SCENARIOS: [(&str, SettingsPage); 15] = [
         ("settings", SettingsPage::Profile),
         ("settings-appearance", SettingsPage::Appearance),
         ("settings-notifications", SettingsPage::Notifications),
         ("settings-voice-audio", SettingsPage::VoiceAudio),
+        ("settings-video", SettingsPage::Video),
         ("settings-keyboard", SettingsPage::Keyboard),
         ("settings-sessions", SettingsPage::Sessions),
         ("settings-about", SettingsPage::About),
+        ("settings-advanced", SettingsPage::Profile),
+        ("settings-appearance-advanced", SettingsPage::Appearance),
+        (
+            "settings-notifications-advanced",
+            SettingsPage::Notifications,
+        ),
+        ("settings-voice-audio-advanced", SettingsPage::VoiceAudio),
+        ("settings-video-advanced", SettingsPage::Video),
+        ("settings-video-advanced-call", SettingsPage::Video),
+        ("settings-notifications-long", SettingsPage::Notifications),
     ];
+
+    /// A scenario with the switch on.
+    fn is_advanced(name: &str) -> bool {
+        name.contains("advanced") || name == "settings-notifications-long"
+    }
 
     fn find_body(node: &Node) -> Option<&Node> {
         if node.children().len() == 3 && node.children()[0].bounds().width == NAV_WIDTH {
@@ -2991,7 +3023,9 @@ mod settings_pages {
 
     fn page_app(name: &str) -> App {
         let mut app = scenario_app(name);
-        app.set_ui_settings(variants(false)[0].settings());
+        let mut settings = variants(false)[0].settings();
+        settings.advanced_settings = is_advanced(name);
+        app.set_ui_settings(settings);
         app.window_width = WIDE.width;
         app
     }
@@ -3032,11 +3066,7 @@ mod settings_pages {
     #[test]
     fn nothing_runs_out_of_the_card_sideways_in_any_page_at_both_widths() {
         let renderer = renderer();
-        let names = PAGE_SCENARIOS
-            .map(|(name, _)| name)
-            .into_iter()
-            .chain(["settings-notifications-long"]);
-        for name in names {
+        for (name, _) in PAGE_SCENARIOS {
             for size in SIZES {
                 for density in DENSITIES {
                     let mut app = page_app(name);
@@ -3227,6 +3257,114 @@ mod settings_pages {
         assert!(notices.contains("Copyright (c) 2016 The Inter Project Authors"));
     }
 
+    /// The words a page draws inside the card.
+    fn card_texts(name: &str) -> Vec<String> {
+        let renderer = renderer();
+        let app = page_app(name);
+        let mut laid = Laid::new(&app, &renderer, WIDE);
+        let body = find_body(&laid.node).expect("the body");
+        let card = card_above(&laid.node, body).bounds();
+        texts(&mut laid, &renderer)
+            .into_iter()
+            .filter(|(_, b)| card.contains(b.center()))
+            .map(|(t, _)| t)
+            .collect()
+    }
+
+    /// How tall a page is, scrolled or not.
+    fn content_height(name: &str) -> f32 {
+        let renderer = renderer();
+        let app = page_app(name);
+        let laid = Laid::new(&app, &renderer, WIDE);
+        let body = find_body(&laid.node).expect("the body");
+        body.children()[2].children()[0].bounds().height
+    }
+
+    fn has(shown: &[String], wanted: &str) -> bool {
+        shown.iter().any(|t| t.starts_with(wanted))
+    }
+
+    /// What only the advanced level shows, page by page: nothing of it is on
+    /// the simple page, all of it is on the advanced one.
+    #[test]
+    fn each_level_shows_its_own_choices() {
+        for (simple, advanced, only_advanced) in [
+            (
+                "settings-appearance",
+                "settings-appearance-advanced",
+                &["Density", "Room list"][..],
+            ),
+            (
+                "settings-notifications",
+                "settings-notifications-advanced",
+                &[
+                    "Keywords",
+                    "Show message content in notifications",
+                    "Show the unread count on the tray icon",
+                ][..],
+            ),
+            (
+                "settings-voice-audio",
+                "settings-voice-audio-advanced",
+                &["More audio options"][..],
+            ),
+            (
+                "settings-video",
+                "settings-video-advanced",
+                // The advanced part is below the fold of the card.
+                &[][..],
+            ),
+        ] {
+            let (few, many) = (card_texts(simple), card_texts(advanced));
+            for wanted in only_advanced {
+                assert!(!has(&few, wanted), "{simple} shows {wanted:?}");
+                assert!(has(&many, wanted), "{advanced} lacks {wanted:?}");
+            }
+            // The advanced page is the simple one and more: its content is
+            // longer (the part past the card is scrolled to).
+            let (short, long) = (content_height(simple), content_height(advanced));
+            assert!(
+                long > short + 20.0,
+                "{advanced}: {long} is not above {short}"
+            );
+        }
+        // The simple pages keep what a person needs.
+        let appearance = card_texts("settings-appearance");
+        for wanted in ["Colours", "Text size"] {
+            assert!(has(&appearance, wanted), "Appearance lacks {wanted:?}");
+        }
+        let notifications = card_texts("settings-notifications");
+        for wanted in ["Group rooms", "Direct messages", "Desktop notifications"] {
+            assert!(has(&notifications, wanted), "Notifications lack {wanted:?}");
+        }
+        let voice = card_texts("settings-voice-audio");
+        for wanted in ["Microphone", "Speakers", "How you talk", "Noise reduction"] {
+            assert!(has(&voice, wanted), "Voice & audio lacks {wanted:?}");
+        }
+        let video = card_texts("settings-video");
+        for wanted in ["Camera", "Picture quality"] {
+            assert!(has(&video, wanted), "Video lacks {wanted:?}");
+        }
+    }
+
+    /// The switch is in the card's header on every page and says what it
+    /// does; a click on it sends the opposite of what is set.
+    #[test]
+    fn the_advanced_switch_is_in_the_header_of_every_page() {
+        let renderer = renderer();
+        for (name, _) in PAGE_SCENARIOS {
+            let app = page_app(name);
+            assert!(has(&card_texts(name), "Show advanced settings"), "{name}");
+            let wanted = format!("Settings(Advanced({}))", !is_advanced(name));
+            let found: Vec<String> = senders(&app, &renderer, WIDE)
+                .into_iter()
+                .map(|(_, t)| t)
+                .filter(|t| t.starts_with("Settings(Advanced"))
+                .collect();
+            assert_eq!(found, vec![wanted], "{name}");
+        }
+    }
+
     /// The page on show draws its own title (and the list has its name); the
     /// other pages have only their name in the list.
     #[test]
@@ -3235,7 +3373,14 @@ mod settings_pages {
         for (name, page) in PAGE_SCENARIOS {
             let app = page_app(name);
             let mut laid = Laid::new(&app, &renderer, WIDE);
-            let shown = texts(&mut laid, &renderer);
+            let body = find_body(&laid.node).expect("the body");
+            let card = card_above(&laid.node, body).bounds();
+            // The room behind the card has words of its own (a Video
+            // button): only what the card draws counts.
+            let shown: Vec<_> = texts(&mut laid, &renderer)
+                .into_iter()
+                .filter(|(_, b)| card.contains(b.center()))
+                .collect();
             for other in SettingsPage::ALL {
                 let count = shown.iter().filter(|(t, _)| t == other.label()).count();
                 let wanted = if other == page { 2 } else { 1 };
@@ -3297,7 +3442,7 @@ mod settings_pages {
         )));
         apps.push((SettingsPage::Profile, "profile edited".to_owned(), profile));
         // Notifications with a typed keyword: Add is on.
-        let mut typed = page_app("settings-notifications");
+        let mut typed = page_app("settings-notifications-advanced");
         let _ = typed.update(Message::Settings(SettingsMessage::KeywordInput(
             "word".to_owned().into(),
         )));
@@ -3355,14 +3500,19 @@ mod settings_pages {
         assert_eq!(pages, wanted);
     }
 
-    /// Voice & audio and Sessions each have the one button that opens their
-    /// own screen, apart from the Close of the card.
+    /// Sessions has the one button that opens its screen, apart from the
+    /// Close of the card; Voice & audio has the one that opens the card with
+    /// every audio option only at the advanced level.
     #[test]
     fn the_voice_and_sessions_pages_have_their_one_button() {
         let renderer = renderer();
         for (name, wanted) in [
-            ("settings-voice-audio", "Settings(OpenVoiceAudio)"),
-            ("settings-sessions", "Settings(OpenSessions)"),
+            ("settings-voice-audio", None),
+            (
+                "settings-voice-audio-advanced",
+                Some("Settings(OpenVoiceAudio)"),
+            ),
+            ("settings-sessions", Some("Settings(OpenSessions)")),
         ] {
             let app = page_app(name);
             let found: Vec<String> = senders(&app, &renderer, WIDE)
@@ -3370,7 +3520,8 @@ mod settings_pages {
                 .map(|(_, t)| t)
                 .filter(|t| t.starts_with("Settings(Open"))
                 .collect();
-            assert_eq!(found, vec![wanted.to_owned()], "{name}");
+            let wanted: Vec<String> = wanted.into_iter().map(str::to_owned).collect();
+            assert_eq!(found, wanted, "{name}");
         }
     }
 
@@ -3406,7 +3557,10 @@ mod settings_pages {
             let mine: Vec<&String> = op.0.iter().filter(|id| id.contains("settings-")).collect();
             let wanted = match page {
                 SettingsPage::Profile => vec![id_of(NAME_INPUT_ID)],
-                SettingsPage::Notifications => vec![id_of(KEYWORD_INPUT_ID)],
+                // Keywords are for the advanced level.
+                SettingsPage::Notifications if is_advanced(name) => {
+                    vec![id_of(KEYWORD_INPUT_ID)]
+                }
                 _ => Vec::new(),
             };
             assert_eq!(mine, wanted.iter().collect::<Vec<_>>(), "{name}");
@@ -3418,6 +3572,10 @@ mod settings_pages {
         let renderer = renderer();
         let mut heights = Vec::new();
         for (name, _) in PAGE_SCENARIOS {
+            // The one with a failure shown is checked below.
+            if name == "settings-notifications-long" {
+                continue;
+            }
             let app = page_app(name);
             let laid = Laid::new(&app, &renderer, WIDE);
             let body = find_body(&laid.node).expect("the body");
@@ -4228,7 +4386,7 @@ mod dialogs {
         for variant in variants(false).iter().step_by(5) {
             for (asking, _, confirm, cancel, _) in QUESTIONS {
                 let mut app = scenario_app(asking);
-                app.set_ui_settings(variant.settings());
+                apply(&mut app, *variant);
                 app.window_width = WIDE.width;
                 let list = senders(&app, &renderer, WIDE);
                 let danger = app.current_theme().palette().danger;
@@ -5305,7 +5463,7 @@ mod security_screens {
         for variant in variants(false).iter().step_by(5) {
             for (asking, _, confirm, cancel, _) in QUESTIONS {
                 let mut app = scenario_app(asking);
-                app.set_ui_settings(variant.settings());
+                apply(&mut app, *variant);
                 app.window_width = WIDE.width;
                 let list = senders(&app, &renderer, WIDE);
                 let danger = app.current_theme().palette().danger;

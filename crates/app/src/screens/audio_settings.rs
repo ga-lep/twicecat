@@ -19,9 +19,9 @@ use twicecat_ptt::{KeyboardBackend, Source};
 use crate::audio_settings::{
     AUTO_GAIN_MAX_RANGE, AudioMessage, AudioPage, AudioUi, ButtonChoice, CLEANING_LIMIT_RANGE,
     GpuView, INPUT_GAIN_RANGE, LevelChoice, ModeChoice, NO_GPU_FOUND, NoiseChoice,
-    RELEASE_DELAY_RANGE, SkipChoice, Slider, THRESHOLD_RANGE, backend_label, bitrate_menu,
-    device_menu, diagnostic_rows, diagnostics, dropout_words, gpu_name, gpu_status, gpu_used,
-    gpu_view, key_label, meter, meter_zone, mic_status, unloaded_mic_words, zone_words,
+    RELEASE_DELAY_RANGE, SimpleNoise, SkipChoice, Slider, THRESHOLD_RANGE, backend_label,
+    bitrate_menu, device_menu, diagnostic_rows, diagnostics, dropout_words, gpu_name, gpu_status,
+    gpu_used, gpu_view, key_label, meter, meter_zone, mic_status, unloaded_mic_words, zone_words,
 };
 use crate::ptt::{BadBinding, SourceState};
 use crate::state::{App, Message};
@@ -184,6 +184,20 @@ fn a_checkbox<'a>(
 }
 
 fn devices_page<'a>(app: &'a App, settings: &'a AudioSettings) -> Element<'a, Message> {
+    let mut page = column![
+        heading(AudioPage::Devices.label()),
+        device_rows(app, settings)
+    ]
+    .spacing(tokens::S);
+    if app.calls.call.is_some() {
+        page = page.push(note("A new device is used from the next call."));
+    }
+    page.into()
+}
+
+/// The microphone and speakers menus, each with the device in use written
+/// out under it: the first part of the Devices page, and of the basics.
+fn device_rows<'a>(app: &'a App, settings: &'a AudioSettings) -> Element<'a, Message> {
     let empty = Vec::new();
     let (inputs, outputs) = app
         .calls
@@ -200,8 +214,7 @@ fn devices_page<'a>(app: &'a App, settings: &'a AudioSettings) -> Element<'a, Me
     // A closed menu cuts a long name short: the full name (capped) is
     // written out under it, wrapped.
     let in_use = |label: &str| caption(format!("In use: {}", one_line_capped(label, 200)));
-    let mut page = column![
-        heading(AudioPage::Devices.label()),
+    column![
         labelled(
             "Microphone",
             kit::menu(
@@ -225,11 +238,114 @@ fn devices_page<'a>(app: &'a App, settings: &'a AudioSettings) -> Element<'a, Me
         ),
         in_use(&output.label),
     ]
+    .spacing(tokens::S)
+    .into()
+}
+
+/// The Voice & audio page of Settings: what a person needs to be heard and
+/// to hear, in few words. The microphone and speakers, the volume, how you
+/// talk (and the key), noise reduction in three steps, and a test with its
+/// level. Everything else is in the card (**More audio options**), which
+/// Settings offers once the advanced switch is on: `more` is what it puts
+/// under the heading for that.
+pub fn basics<'a>(app: &'a App, more: Option<Element<'a, Message>>) -> Element<'a, Message> {
+    let Some(settings) = &app.calls.settings else {
+        return column![
+            heading("Voice & audio"),
+            note("Loading the audio settings\u{2026}")
+        ]
+        .spacing(tokens::S)
+        .into();
+    };
+    let status: Element<'_, Message> = match mic_status(app) {
+        Some(status) => banner(status.severity, status.words),
+        None => banner(Severity::Info, unloaded_mic_words(app)),
+    };
+    let ui = &app.audio_ui;
+    let gpu = app.calls.gpu.as_ref();
+    let noise = SimpleNoise::of(&settings.processing.noise_suppression);
+    let mut talking = column![
+        labelled(
+            "How you talk",
+            kit::menu(
+                pick_list(
+                    ModeChoice::ALL,
+                    Some(ModeChoice::of(&settings.input_mode)),
+                    |c| msg(AudioMessage::Mode(c))
+                )
+                .style(kit::menu_style)
+                .width(Fill)
+            )
+        ),
+        note(mode_note(&settings.input_mode)),
+    ]
     .spacing(tokens::S);
-    if app.calls.call.is_some() {
-        page = page.push(note("A new device is used from the next call."));
+    if matches!(settings.input_mode, InputMode::PushToTalk { .. }) {
+        talking = talking
+            .push(key_row(app, settings))
+            .push(note(keyboard_note(app.ptt.keyboard())));
     }
-    page.into()
+    let in_call = app.calls.call.is_some();
+    let running = ui.mic_test.is_some();
+    let test_button = if running {
+        kit::primary_button("Stop the test", Some(msg(AudioMessage::MicTest)))
+    } else {
+        kit::secondary_button(
+            "Test the microphone",
+            (!in_call).then_some(msg(AudioMessage::MicTest)),
+        )
+    };
+    let mut test = column![
+        row![
+            test_button,
+            a_checkbox(
+                "Hear myself (use headphones)",
+                ui.loopback,
+                Some(|on| msg(AudioMessage::Loopback(on))),
+            ),
+        ]
+        .spacing(tokens::M)
+        .align_y(iced::Center),
+        level_meter(app),
+    ]
+    .spacing(tokens::S);
+    if in_call {
+        test = test.push(note("The test is not available during a call."));
+    }
+    let mut head = column![heading("Voice & audio")].spacing(tokens::S);
+    if let Some(more) = more {
+        head = head.push(more);
+    }
+    column![
+        head,
+        status,
+        device_rows(app, settings),
+        a_slider(
+            ui,
+            settings,
+            Slider::MasterVolume,
+            "Volume",
+            (0.0, 200.0),
+            5.0
+        ),
+        talking,
+        labelled(
+            "Noise reduction",
+            kit::menu(
+                pick_list(SimpleNoise::ALL, Some(noise), move |c: SimpleNoise| {
+                    msg(AudioMessage::Noise(
+                        c.choice(&settings.processing.noise_suppression, gpu),
+                    ))
+                })
+                .style(kit::menu_style)
+                .width(Fill)
+            )
+        ),
+        note(noise.words()),
+        test,
+    ]
+    .spacing(tokens::M)
+    .into()
 }
 
 fn value_text(slider: Slider, value: f32) -> String {

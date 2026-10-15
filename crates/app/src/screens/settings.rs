@@ -4,10 +4,16 @@
 //! the timeline's scroll offset and the composer's state. Views only read the
 //! app state; every change goes through `App::update`.
 //!
-//! The pages are Profile, Appearance, Notifications, Voice & audio,
-//! Keyboard, Sessions and About. Voice & audio and Sessions each hold a line
-//! and the button that opens their own screen (the card and the Sessions
-//! screen are unchanged). Settings opens on Profile, also with Ctrl+,.
+//! Two levels, chosen by one saved switch in the card's header (**Show
+//! advanced settings**, off by default). The simple level has few choices in
+//! plain words with good defaults: Profile, Appearance (light or dark,
+//! colours, text size), Notifications (group rooms, direct messages, desktop
+//! notifications), Voice & audio (microphone, speakers, how you talk, noise
+//! reduction, a test), Video (camera, picture quality), Keyboard, Sessions and
+//! About. The advanced level adds below a rule, on the same pages: density
+//! and the room list, keywords, message content and the tray badge, a button
+//! to the card with every audio option, and every tuning of the camera and of
+//! screen sharing. Settings opens on Profile, also with Ctrl+,.
 //!
 //! Tab: this iced only gives text fields the focus (buttons never take it),
 //! so Tab walks the text fields of the page on show, in tree order; the list
@@ -21,6 +27,7 @@ use iced::widget::{
 use iced::{Background, Border, Element, Fill, Length};
 use twicecat_core::api::ThemeChoice;
 
+use crate::screens::{audio_settings, video_settings};
 use crate::settings::{
     DEFAULT_TEXT_SCALE, DRAG_AND_DROP_NOTE, DefaultChoice, DensityOption, INTER_ATTRIBUTION,
     INTER_NOTICES, KEYWORD_INPUT_ID, MAX_TEXT_SCALE, MIN_TEXT_SCALE, NAME_INPUT_ID, RoomListOption,
@@ -85,6 +92,10 @@ fn view(app: &App) -> Element<'_, Message> {
 fn card(app: &App, window_height: f32) -> Element<'_, Message> {
     let header = row![
         words("Settings").size(tokens::HEADLINE).width(Fill),
+        checkbox(app.ui_settings.advanced_settings)
+            .label("Show advanced settings")
+            .text_wrapping(WRAP)
+            .on_toggle(|on| msg(SettingsMessage::Advanced(on))),
         secondary_button("Close", Some(msg(SettingsMessage::Close))),
     ]
     .spacing(tokens::M)
@@ -122,7 +133,8 @@ fn page_view(app: &App) -> Element<'_, Message> {
         SettingsPage::Profile => profile_page(app),
         SettingsPage::Appearance => appearance_page(app),
         SettingsPage::Notifications => notifications_page(app),
-        SettingsPage::VoiceAudio => voice_audio_page(),
+        SettingsPage::VoiceAudio => voice_audio_page(app),
+        SettingsPage::Video => video_settings::page(app),
         SettingsPage::Keyboard => keyboard_page(),
         SettingsPage::Sessions => sessions_page(),
         SettingsPage::About => about_page(),
@@ -236,36 +248,43 @@ fn notifications_page(app: &App) -> Element<'_, Message> {
             .text_wrapping(WRAP)
             .on_toggle(move |on| msg(change(on)))
     };
-    page_of(
-        "Notifications",
-        vec![
-            default_menu(app, "Group rooms", false),
-            default_menu(app, "Direct messages", true),
-            words("Keywords").size(tokens::BODY).into(),
-            keywords.into(),
-            add.into(),
-            note("A message with one of these words notifies you."),
-            toggle(
-                "Desktop notifications",
-                local.desktop_notifications,
-                SettingsMessage::DesktopNotifications,
-            )
-            .into(),
+    let advanced = app.ui_settings.advanced_settings;
+    let mut parts = vec![
+        default_menu(app, "Group rooms", false),
+        default_menu(app, "Direct messages", true),
+        toggle(
+            "Desktop notifications",
+            local.desktop_notifications,
+            SettingsMessage::DesktopNotifications,
+        )
+        .into(),
+        note("This applies to this device only."),
+    ];
+    if advanced {
+        parts.push(kit::divider());
+        parts.push(words("Keywords").size(tokens::BODY).into());
+        parts.push(keywords.into());
+        parts.push(add.into());
+        parts.push(note("A message with one of these words notifies you."));
+        parts.push(
             toggle(
                 "Show message content in notifications",
                 local.show_message_content,
                 SettingsMessage::ShowMessageContent,
             )
             .into(),
+        );
+        parts.push(
             toggle(
                 "Show the unread count on the tray icon",
                 local.tray_badge,
                 SettingsMessage::TrayBadge,
             )
             .into(),
-            note("The three options above apply to this device only."),
-        ],
-    )
+        );
+        parts.push(note("The options of this part apply to this device only."));
+    }
+    page_of("Notifications", parts)
 }
 
 fn appearance_page(app: &App) -> Element<'_, Message> {
@@ -311,19 +330,23 @@ fn appearance_page(app: &App) -> Element<'_, Message> {
             .spacing(tokens::S)
             .align_y(iced::Center)
     };
-    page_of(
-        "Appearance",
-        vec![
-            choice("Follow the system", ThemeChoice::System),
-            choice("Light", ThemeChoice::Light),
-            choice("Dark", ThemeChoice::Dark),
-            words("Colours").size(tokens::BODY).into(),
-            swatches.into(),
-            secondary_button(
-                "Use the default",
-                (!on_default).then(|| msg(SettingsMessage::Palette(None))),
-            )
-            .into(),
+    let mut parts: Vec<Element<'_, Message>> = vec![
+        choice("Follow the system", ThemeChoice::System),
+        choice("Light", ThemeChoice::Light),
+        choice("Dark", ThemeChoice::Dark),
+        words("Colours").size(tokens::BODY).into(),
+        swatches.into(),
+        secondary_button(
+            "Use the default",
+            (!on_default).then(|| msg(SettingsMessage::Palette(None))),
+        )
+        .into(),
+        zoom.into(),
+        note("Ctrl+= and Ctrl+- change the text size, Ctrl+0 resets it."),
+    ];
+    if app.ui_settings.advanced_settings {
+        parts.push(kit::divider());
+        parts.push(
             menu_row(
                 "Density",
                 kit::menu(pick_list(
@@ -333,6 +356,8 @@ fn appearance_page(app: &App) -> Element<'_, Message> {
                 )),
             )
             .into(),
+        );
+        parts.push(
             menu_row(
                 "Room list",
                 kit::menu(pick_list(
@@ -342,10 +367,9 @@ fn appearance_page(app: &App) -> Element<'_, Message> {
                 )),
             )
             .into(),
-            zoom.into(),
-            note("Ctrl+= and Ctrl+- change the text size, Ctrl+0 resets it."),
-        ],
-    )
+        );
+    }
+    page_of("Appearance", parts)
 }
 
 /// One colour set as a button: samples of its accent, surface and text, the
@@ -402,18 +426,22 @@ fn swatch<'a>(family: Family, dark: bool, selected: bool) -> Element<'a, Message
         .into()
 }
 
-fn voice_audio_page<'a>() -> Element<'a, Message> {
-    page_of(
-        "Voice & audio",
-        vec![
-            note(VOICE_AUDIO_LINE),
+fn voice_audio_page(app: &App) -> Element<'_, Message> {
+    // The button to every audio option is at the top, where it is found
+    // without scrolling past the basics.
+    let more = app.ui_settings.advanced_settings.then(|| {
+        row![
+            container(note(VOICE_AUDIO_LINE)).width(Fill),
             secondary_button(
-                "Voice & audio\u{2026}",
+                "More audio options\u{2026}",
                 Some(msg(SettingsMessage::OpenVoiceAudio)),
-            )
-            .into(),
-        ],
-    )
+            ),
+        ]
+        .spacing(tokens::S)
+        .align_y(iced::Center)
+        .into()
+    });
+    audio_settings::basics(app, more)
 }
 
 fn keyboard_page<'a>() -> Element<'a, Message> {
