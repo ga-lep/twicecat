@@ -2599,7 +2599,7 @@ Draft, scope set by the human 2026-10-15. Steps:
 - [x] 4. The `perf` workflow
 - [x] 5. Pipeline quick wins: cancel, fail fast, save only on main, skip docs-only
 - [x] 6. Each shard builds its own binaries; rebalance
-- [ ] 7. Cache the downloads
+- [x] 7. Cache the downloads (changed: setup action, pinned cargo-deny, stack overlap)
 - [ ] 8. Fewer test binaries
 - [ ] 9. `ui_gallery` once, and the draft policy
 - [ ] 10. After-numbers and three green runs

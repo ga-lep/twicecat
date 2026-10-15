@@ -48,3 +48,9 @@ Speed gates that failed without a bug: `call_video` fps (27.1 on CI, 26.3 locall
 
   - **Local, with the stack:** all four shards pass (rc 0 each, 3 to 4 minutes each), and no run step compiled anything. 28 binaries in 4 shards, as before.
   - **HUMAN:** the per-shard build and run step durations on CI, against the numbers above.
+- Task 7: done (ci-speed.7), the parts that run locally.
+  - **Measured first** (run `38716596416`, steps over 15 s): Docker cargo-deny action 61 s in `lint`; libwebrtc 58 s on Windows, 21 s on macOS; rust-cache restore 72 s Windows, 58 s macOS; the models, the CUDA header and Linux libwebrtc under 15 s; the stack start about 30 s on a shard's critical path. So the Docker images and the models are not cached (a restore costs about what a pull or a download does), and the stack start is overlapped with the build instead.
+  - `.github/actions/setup-build` (Linux dependencies, clang 22, libwebrtc from the Actions cache keyed on the checksum file and the fetch script, restore everywhere, save only on main; the script still downloads and verifies on a miss; CUDA header) replaces four copies in `lint`, `test`, `integration` and `perf`.
+  - `scripts/fetch-cargo-deny.sh` and `scripts/checksums/cargo-deny.sha256`: cargo-deny 0.20.2, x86-64 Linux, SHA-256 from GitHub's asset digest (it matched the download). `cargo deny --workspace check` with it: advisories, bans, licenses and sources ok, with the new `twicecat-perf` crate.
+  - Shards start `stack.sh up -d` in the background (own session) as the first step and wait for it after the build.
+  - **Not verified:** nothing of this has run on CI; actionlint not installed. **HUMAN:** two consecutive runs on the same pins (the first saves the libwebrtc cache on main, the second restores) and the step durations; revert the libwebrtc cache if it is not faster on Windows and macOS.

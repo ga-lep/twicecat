@@ -1,0 +1,59 @@
+name: Set up the native build
+description: >
+  What every job that compiles the workspace needs before cargo: the Linux build
+  libraries, clang 22 for webrtc-sys, the pinned libwebrtc (verified by
+  scripts/fetch-libwebrtc.sh, kept in the Actions cache between runs) and
+  LiveKit's CUDA header. It exports LK_CUSTOM_WEBRTC and CUDA_HOME. Run it after
+  checkout and before Swatinem/rust-cache, which hashes CUDA_HOME.
+
+inputs:
+  cuda:
+    description: Fetch the CUDA header for LiveKit's NVENC and NVDEC (x86-64 Linux).
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    - name: Install Linux build dependencies
+      if: runner.os == 'Linux'
+      shell: bash
+      run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libdbus-1-dev libssl-dev pkg-config libglib2.0-dev lld libasound2-dev libpipewire-0.3-dev libudev-dev
+    # webrtc-sys needs clang >= 21 on Linux (Chromium libc++); the image has 22.
+    - name: Use clang 22
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        clang++-22 --version
+        { echo CC=clang-22; echo CXX=clang++-22; } >> "$GITHUB_ENV"
+    # The script's own cache dir. The key is the pinned checksums and the script,
+    # so a new pin or a new unpacking step is a miss; a miss downloads, verifies
+    # the SHA-256 and unpacks as before. Only main saves.
+    - name: Restore libwebrtc
+      id: libwebrtc-cache
+      uses: actions/cache/restore@v4
+      with:
+        path: ~/.cache/twicecat/libwebrtc
+        key: libwebrtc-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/checksums/libwebrtc.sha256', 'scripts/fetch-libwebrtc.sh') }}
+    # webrtc-sys would download libwebrtc unverified; use the pinned SHA-256.
+    - name: Fetch pinned libwebrtc
+      shell: bash
+      # Not inside the echo: a failed fetch must fail the step, not set
+      # an empty LK_CUSTOM_WEBRTC (webrtc-sys then downloads unverified).
+      run: |
+        dir=$(scripts/fetch-libwebrtc.sh)
+        echo "LK_CUSTOM_WEBRTC=$dir" >> "$GITHUB_ENV"
+    - name: Save libwebrtc
+      if: github.ref == 'refs/heads/main' && steps.libwebrtc-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: ~/.cache/twicecat/libwebrtc
+        key: ${{ steps.libwebrtc-cache.outputs.cache-primary-key }}
+    # LiveKit's NVENC/NVDEC are compiled only with cuda.h at build time
+    # (plan Phase 9 Task 6); the path is in the cache key because
+    # webrtc-sys's build script does not watch it.
+    - name: Fetch CUDA header
+      if: inputs.cuda == 'true'
+      shell: bash
+      run: |
+        dir=$(scripts/fetch-cuda-headers.sh)
+        echo "CUDA_HOME=$dir" >> "$GITHUB_ENV"
