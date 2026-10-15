@@ -75,7 +75,12 @@ jobs:
       # Every file with a perf_ test is run by the perf workflow.
       - run: scripts/run-perf-tests.sh --check
       - run: cargo fmt --all --check
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      # The pinned release binary (scripts/fetch-cargo-deny.sh): the Docker-based
+      # action took about a minute to build and run.
+      - name: cargo deny
+        run: |
+          deny=$(scripts/fetch-cargo-deny.sh)
+          "$deny" --workspace check
       # These read the dependency graph (cargo tree, cargo metadata) and compile nothing.
       - run: scripts/check-app-deps.sh
       - run: scripts/check-app-deps.sh livekit
@@ -89,31 +94,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
-      - name: Install Linux build dependencies
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libdbus-1-dev libssl-dev pkg-config libglib2.0-dev lld libasound2-dev libpipewire-0.3-dev libudev-dev
-      # webrtc-sys needs clang >= 21 on Linux (Chromium libc++); the image has 22.
-      - name: Use clang 22
-        if: runner.os == 'Linux'
-        run: |
-          clang++-22 --version
-          { echo CC=clang-22; echo CXX=clang++-22; } >> "$GITHUB_ENV"
-      # webrtc-sys would download libwebrtc unverified; use the pinned SHA-256.
-      - name: Fetch pinned libwebrtc
-        shell: bash
-        # Not inside the echo: a failed fetch must fail the step, not set
-        # an empty LK_CUSTOM_WEBRTC (webrtc-sys then downloads unverified).
-        run: |
-          dir=$(scripts/fetch-libwebrtc.sh)
-          echo "LK_CUSTOM_WEBRTC=$dir" >> "$GITHUB_ENV"
-      # LiveKit's NVENC/NVDEC are compiled only with cuda.h at build time
-      # (plan Phase 9 Task 6); the path is in the cache key because
-      # webrtc-sys's build script does not watch it.
-      - name: Fetch CUDA header
-        shell: bash
-        run: |
-          dir=$(scripts/fetch-cuda-headers.sh)
-          echo "CUDA_HOME=$dir" >> "$GITHUB_ENV"
+      - uses: ./.github/actions/setup-build
       # Only main saves the cache; pull requests restore it.
       - uses: Swatinem/rust-cache@v2
         with:
@@ -137,32 +118,9 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
-      - name: Install Linux build dependencies
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libdbus-1-dev libssl-dev pkg-config libglib2.0-dev lld libasound2-dev libpipewire-0.3-dev libudev-dev
-      # webrtc-sys needs clang >= 21 on Linux (Chromium libc++); the image has 22.
-      - name: Use clang 22
-        if: runner.os == 'Linux'
-        run: |
-          clang++-22 --version
-          { echo CC=clang-22; echo CXX=clang++-22; } >> "$GITHUB_ENV"
-      # webrtc-sys would download libwebrtc unverified; use the pinned SHA-256.
-      - name: Fetch pinned libwebrtc
-        shell: bash
-        # Not inside the echo: a failed fetch must fail the step, not set
-        # an empty LK_CUSTOM_WEBRTC (webrtc-sys then downloads unverified).
-        run: |
-          dir=$(scripts/fetch-libwebrtc.sh)
-          echo "LK_CUSTOM_WEBRTC=$dir" >> "$GITHUB_ENV"
-      # LiveKit's NVENC/NVDEC are compiled only with cuda.h at build time
-      # (plan Phase 9 Task 6); the path is in the cache key because
-      # webrtc-sys's build script does not watch it.
-      - name: Fetch CUDA header
-        if: matrix.os == 'ubuntu-26.04'
-        shell: bash
-        run: |
-          dir=$(scripts/fetch-cuda-headers.sh)
-          echo "CUDA_HOME=$dir" >> "$GITHUB_ENV"
+      - uses: ./.github/actions/setup-build
+        with:
+          cuda: ${{ matrix.os == 'ubuntu-26.04' }}
       # Only main saves the cache; pull requests restore it.
       - uses: Swatinem/rust-cache@v2
         with:
@@ -194,30 +152,14 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
-      - name: Install Linux build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libdbus-1-dev libssl-dev pkg-config libglib2.0-dev lld libasound2-dev libpipewire-0.3-dev libudev-dev
-      # webrtc-sys needs clang >= 21 on Linux (Chromium libc++); the image has 22.
-      - name: Use clang 22
-        if: runner.os == 'Linux'
+      # Pulls and starts Synapse and LiveKit while the build runs; the step after
+      # the build waits for it. A new session, so the runner does not stop it
+      # when this step ends.
+      - name: Start the local stack in the background
         run: |
-          clang++-22 --version
-          { echo CC=clang-22; echo CXX=clang++-22; } >> "$GITHUB_ENV"
-      # webrtc-sys would download libwebrtc unverified; use the pinned SHA-256.
-      - name: Fetch pinned libwebrtc
-        shell: bash
-        # Not inside the echo: a failed fetch must fail the step, not set
-        # an empty LK_CUSTOM_WEBRTC (webrtc-sys then downloads unverified).
-        run: |
-          dir=$(scripts/fetch-libwebrtc.sh)
-          echo "LK_CUSTOM_WEBRTC=$dir" >> "$GITHUB_ENV"
-      # LiveKit's NVENC/NVDEC are compiled only with cuda.h at build time
-      # (plan Phase 9 Task 6); the path is in the cache key because
-      # webrtc-sys's build script does not watch it.
-      - name: Fetch CUDA header
-        shell: bash
-        run: |
-          dir=$(scripts/fetch-cuda-headers.sh)
-          echo "CUDA_HOME=$dir" >> "$GITHUB_ENV"
+          rm -f "$RUNNER_TEMP/stack-up.rc"
+          setsid nohup bash -c 'scripts/stack.sh up -d > "$RUNNER_TEMP/stack-up.log" 2>&1; echo $? > "$RUNNER_TEMP/stack-up.rc"' > /dev/null 2>&1 &
+      - uses: ./.github/actions/setup-build
       # One key for all shards: they restore the dependencies built on main.
       # rust-cache never keeps the workspace crates, so each shard compiles
       # twicecat-core and its tests itself. Only main saves the cache.
@@ -230,16 +172,20 @@ jobs:
       # the script (pinned SHA-256) fills the default cache dir core reads.
       - name: Fetch models
         run: scripts/fetch-models.sh
-      - name: Start local Synapse
-        run: scripts/stack.sh up -d --wait
-      - name: Register test users
-        run: scripts/create-test-users.sh
       # Built before the run so the build and run durations show separately.
       # Only this shard's binaries, with the cargo call the run step makes: the
       # earlier full build was followed by a run step that compiled for 5 to 8
       # minutes again, because its calls selected other targets.
       - name: Build integration tests
         run: scripts/run-integration-tests.sh --shard ${{ matrix.shard }} --no-run
+      - name: Wait for the local stack
+        run: |
+          for _ in $(seq 150); do [ -f "$RUNNER_TEMP/stack-up.rc" ] && break; sleep 2; done
+          cat "$RUNNER_TEMP/stack-up.log"
+          test "$(cat "$RUNNER_TEMP/stack-up.rc")" = 0
+          scripts/stack.sh up -d --wait
+      - name: Register test users
+        run: scripts/create-test-users.sh
       # The real-keychain test needs a desktop session, and hardware_ tests a
       # microphone or speakers; both are human-run.
       - name: Run homeserver integration tests
