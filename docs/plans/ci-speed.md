@@ -114,28 +114,31 @@ Acceptance criteria:
 - `actionlint` accepts the workflow. A docs-only branch is pushed and its checks are read (**HUMAN**).
 Evidence: **HUMAN:** two quick pushes to a draft pull request show the first run cancelled; a docs-only push shows only the `ci-ok` job.
 
-### Task 6: Each shard builds its own binaries; rebalance
+### Task 6: Each shard builds only its own binaries, in one cargo call; rebalance
 Language: ci
 Files: .github/workflows/ci.yml, scripts/integration-shards.sh, scripts/run-integration-tests.sh, docs/plans/ci-speed.progress.md
 Depends on: Task 5
 Acceptance criteria:
-- The "Build integration tests" step of a shard builds only the `--test` targets of `scripts/integration-shards.sh --list N` (one `cargo test --no-run` per package, as `run-integration-tests.sh` runs them) instead of everything. The `lib` entry builds the package's `--lib` test.
-- The run step reuses that build (no rebuild). The ignored-test count across the four shards equals the baseline (`--list --ignored`).
-- The shard table is rebalanced from the measured per-binary durations of runs `38709253505` and `38648005981`, written in the ledger with the sums per shard. `--check` still passes.
-- With CI (**HUMAN**): the per-shard build step against 5–13 min today.
+- Found while measuring (run `38716596416`, ledger): the "Build integration tests" step built all 35 binaries (593–869 s), and the run step then compiled again for 327–600 s, because it ran one cargo call per package with other targets. The step now runs `scripts/run-integration-tests.sh --shard N --no-run`, and the run step makes the same call, so there is one build of the shard's 6 to 8 binaries and no second one.
+- The run script makes one `cargo test -p twicecat-core -p twicecat-app --test … --lib` call per shard instead of one per package. `integration-shards.sh --check` also fails when a test file name exists in both packages (a name selects the target of whichever package has it).
+- The ignored-test count across the four shards equals the baseline (`--check` places every binary; the sum of `passed` of the four local runs matches the baseline sum).
+- The shard table is rebalanced from the measured per-binary seconds of run `38716596416`, plus 20 s of linking per binary. The table and the sums per shard are in the ledger.
+- Locally, with the stack: all four shards pass, and the run step does not compile.
+- With CI (**HUMAN**): the per-shard build and run step durations against the 593–869 s and 327–600 s above.
 Evidence: **HUMAN:** `gh run view <id> --json jobs` per-shard step durations.
 
-### Task 7: Cache the downloads
+### Task 7: Native setup once, a pinned cargo-deny, the stack started during the build
 Language: ci
-Files: .github/workflows/ci.yml, .github/workflows/perf.yml, scripts/fetch-libwebrtc.sh, scripts/fetch-cuda-headers.sh, scripts/fetch-models.sh, scripts/stack.sh (only if needed)
+Files: .github/actions/setup-build/action.yml (new), .github/workflows/ci.yml, .github/workflows/perf.yml, scripts/fetch-cargo-deny.sh (new), scripts/checksums/cargo-deny.sha256 (new)
 Depends on: Task 5
 Acceptance criteria:
-- `actions/cache` (a pinned major version) for the libwebrtc archive, the CUDA headers and the models, each keyed on the SHA-256 file the script already pins (`scripts/checksums/…`), so a changed pin is a miss and a verified download still runs on a miss. The scripts keep verifying the SHA-256 whether the file came from the cache or from the network.
-- The Synapse and LiveKit images are saved with `docker save` into a cache keyed on the image tags in `docker-compose.yml`, and loaded with `docker load` on a hit. A miss pulls as today.
-- `cargo-deny` runs from a cached binary instead of the Docker-based action, with the version pinned.
-- `scripts/check-no-webrtc-download.sh` still passes in every job.
-- With CI (**HUMAN**): the second run on the same pins shows a cache hit for each, and the fetch steps drop under 10 s (libwebrtc was 97 s on Windows).
-Evidence: **HUMAN:** step durations of two consecutive runs.
+- Measured first (run `38716596416`, steps over 15 s): the Docker-based cargo-deny action took 61 s in `lint`; libwebrtc took 58 s on Windows and 21 s on macOS; the models, CUDA header and Linux libwebrtc were under 15 s; the Windows and macOS rust-cache restores took 72 s and 58 s; the stack start took about 30 s on the shards' critical path. This is why the Docker images and the models are not cached (a restore costs about what a pull or a download does) and the stack is overlapped instead.
+- One composite action, `setup-build`, replaces the four copies of the Linux dependencies, clang 22, libwebrtc and CUDA steps (`lint`, `test`, `integration`, `perf`).
+- libwebrtc is kept in the Actions cache (`~/.cache/twicecat/libwebrtc`, restore on every run, save only on main), keyed on the checksum file and the fetch script. The script still downloads, verifies the SHA-256 and unpacks on a miss. **Measured on CI, and reverted if it is not faster on Windows and macOS.**
+- `scripts/fetch-cargo-deny.sh` downloads the pinned cargo-deny release for x86-64 Linux, checks its SHA-256 (the digest GitHub computed for the asset), and prints the binary; `checks` runs `cargo deny --workspace check` with it. `cargo deny check` passes locally with it.
+- In a shard, the stack's `up -d` runs in the background from the first step, and a step after the build waits for it and then runs `up -d --wait` and registers the test users.
+- YAML parses; **actionlint is not installed here**.
+Evidence: **HUMAN:** step durations of two consecutive runs on the same pins (the first saves on main, the second restores).
 
 ### Task 8: Fewer test binaries (linking is the cost)
 Language: rust

@@ -34,3 +34,17 @@ Speed gates that failed without a bug: `call_video` fps (27.1 on CI, 26.3 locall
   - The detection shell was checked on five file lists with the real `grep` (the shell here wraps `grep` in a function that mishandles `-qv`). YAML parsed; **actionlint not installed, not run**.
   - **Rebase note:** PR #27 (`feat/ui-ux-rework`) adds two lines to `ci.yml` that `main` does not have: `cargo check --workspace --lib --bins --locked` (now to go in `lint`) and `scripts/check-font-assets.sh` (now to go in `checks`). The first rebase of one branch onto the other conflicts there; keep both lines in the new jobs. It also adds `twicecat-app:ui_gallery` to `NOT_SHARDED` in `integration-shards.sh`.
   - **HUMAN:** two quick pushes to a draft pull request show the first run cancelled; a docs-only push shows only `changes`, `checks` and `ci-ok` running; the durations of `checks` against the old 8 minutes to the first failure.
+- Task 6: done (ci-speed.6), the parts that run locally.
+  - **Found in run `38716596416` (per-shard, seconds):** the "Build integration tests" step took 593 / 676 / 800 / 869 s (shards 1 to 4) and compiled all 35 binaries; the run step then compiled again for 327 / 511 (117 + 394) / 473 / 637 (150 + 487) s, because it made one cargo call per package with other targets. The tests themselves took 198 / 398 / 256 / 425 s.
+  - **Now:** one `cargo test -p twicecat-core -p twicecat-app --test … --lib` call per shard, made by `run-integration-tests.sh --shard N [--no-run]`; the CI build step and the run step make the same call. `--check` also fails when a test file name exists in both packages.
+  - **Rebalanced** by measured seconds plus 20 s of linking per binary (weight / run seconds):
+
+    | Shard | Binaries | Weight | Run |
+    |---|---|---|---|
+    | 1 | bridge, call_signalling, e2ee_verification, core lib, timeline_actions, timeline_live (6) | 462 | 342 |
+    | 2 | call_video, cli, e2ee_devices, e2ee_recovery, log_hygiene, oauth, timeline (7) | 457 | 317 |
+    | 3 | call_ringing, calls, login, media, notifications, rooms, rtc_stack (7) | 457 | 317 |
+    | 4 | avatars, call_log_hygiene, call_media, e2ee_identity, e2ee_rooms, room_list, threads, timeline_items (8) | 470 | 310 |
+
+  - **Local, with the stack:** all four shards pass (rc 0 each, 3 to 4 minutes each), and no run step compiled anything. 28 binaries in 4 shards, as before.
+  - **HUMAN:** the per-shard build and run step durations on CI, against the numbers above.

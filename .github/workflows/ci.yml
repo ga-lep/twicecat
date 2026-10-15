@@ -235,8 +235,11 @@ jobs:
       - name: Register test users
         run: scripts/create-test-users.sh
       # Built before the run so the build and run durations show separately.
+      # Only this shard's binaries, with the cargo call the run step makes: the
+      # earlier full build was followed by a run step that compiled for 5 to 8
+      # minutes again, because its calls selected other targets.
       - name: Build integration tests
-        run: cargo test -p twicecat-core -p twicecat-app --no-run --locked
+        run: scripts/run-integration-tests.sh --shard ${{ matrix.shard }} --no-run
       # The real-keychain test needs a desktop session, and hardware_ tests a
       # microphone or speakers; both are human-run.
       - name: Run homeserver integration tests
