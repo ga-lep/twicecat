@@ -68,6 +68,8 @@ jobs:
       - run: scripts/check-no-webrtc-download.sh
       # Every test file with ignored tests runs in exactly one integration shard.
       - run: scripts/integration-shards.sh --check
+      # Every file with a perf_ test is run by the perf workflow.
+      - run: scripts/run-perf-tests.sh --check
 
   test:
     timeout-minutes: 60

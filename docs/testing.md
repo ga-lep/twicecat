@@ -31,5 +31,13 @@ record("call_video.camera.received_fps", fps, "fps", Expect::AtLeast(28.0));
 ```
 `$TWICECAT_PERF_FILE`, when set, collects one JSON line per value. `scripts/perf-report.sh CURRENT.jsonl [BASELINE.jsonl]` turns the file into a table with the change against an earlier run. Neither ever fails a build.
 
+## Running them
+```bash
+scripts/run-perf-tests.sh             # all perf_ tests; the #[ignore] ones need the local stack
+scripts/run-perf-tests.sh --no-stack  # only those that need no homeserver
+scripts/run-perf-tests.sh --check     # every file with a perf_ test is listed in the script
+```
+The values go to `target/perf/<timestamp>.jsonl`. A new `perf_` test in a file the script does not list fails `--check`, which the `lint` job runs, in the same way `integration-shards.sh --check` places a new homeserver test in a shard.
+
 ## Where the numbers go
 The `perf` workflow runs on pushes to `main`, on demand and on a pull request with the `perf` label. It uploads `perf.jsonl` and writes the table into the job summary, with the change against the last successful `main` run. It is not a required check. The table renders on the run's **Summary** page (the first entry on the left of the run, above the jobs); the step's log shows the same table as plain text.
