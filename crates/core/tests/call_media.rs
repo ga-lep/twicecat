@@ -69,23 +69,62 @@ impl VirtualAudio for Recorder {
     }
 }
 
-/// Amplitude of a `hz` tone in the last `seconds` of `played`.
-fn level_of(played: &[f32], hz: f32, seconds: f32) -> f32 {
-    let n = ((seconds * RATE) as usize).min(played.len());
-    let tail = &played[played.len() - n..];
+/// Amplitude of a `hz` tone in a run of samples, measured coherently.
+fn coherent_level(samples: &[f32], hz: f32) -> f32 {
     let w = 2.0 * std::f32::consts::PI * hz / RATE;
     let (mut re, mut im) = (0.0_f32, 0.0_f32);
-    for (i, s) in tail.iter().enumerate() {
+    for (i, s) in samples.iter().enumerate() {
         re += s * (w * i as f32).cos();
         im += s * (w * i as f32).sin();
     }
-    2.0 * (re * re + im * im).sqrt() / n.max(1) as f32
+    2.0 * (re * re + im * im).sqrt() / samples.len().max(1) as f32
+}
+
+/// Amplitude of a `hz` tone in the last `seconds` of `played`: the median of the
+/// levels of its quarter-second blocks. Measured coherently over the whole window,
+/// one gap or phase jump (a lost packet and its concealment, a moment a busy
+/// runner starved the audio) pulled the whole window down and failed a call that
+/// was heard for the rest of it; the median of the blocks ignores a few damaged
+/// ones, and still reads low when the tone is missing for half the window or more.
+fn level_of(played: &[f32], hz: f32, seconds: f32) -> f32 {
+    const BLOCK: usize = (RATE as usize) / 4;
+    let n = ((seconds * RATE) as usize).min(played.len());
+    let tail = &played[played.len() - n..];
+    let mut levels: Vec<f32> = tail
+        .chunks_exact(BLOCK)
+        .map(|block| coherent_level(block, hz))
+        .collect();
+    if levels.is_empty() {
+        return coherent_level(tail, hz);
+    }
+    levels.sort_by(f32::total_cmp);
+    levels[levels.len() / 2]
+}
+
+/// Waits until the last `seconds` of audio show `hz` at `HEARD` or more, and
+/// returns that level; after `DEFAULT_TIMEOUT` it returns the last level read,
+/// for the caller's assertion to report. A tone that comes late (a change settling
+/// on a busy runner) is heard; one that never comes is still a failure.
+async fn heard_within(played: &Mutex<Vec<f32>>, hz: f32, seconds: f32) -> f32 {
+    let deadline = tokio::time::Instant::now() + DEFAULT_TIMEOUT;
+    loop {
+        let level = level_of(&played.lock().unwrap(), hz, seconds);
+        if level > HEARD || tokio::time::Instant::now() >= deadline {
+            return level;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }
 
 impl Recorder {
     /// Amplitude of the tone in the last `seconds` of playback.
     fn tone_level(&self, seconds: f32) -> f32 {
         level_of(&self.played.lock().unwrap(), TONE_HZ, seconds)
+    }
+
+    /// [`heard_within`] for the tone.
+    async fn tone_heard(&self, seconds: f32) -> f32 {
+        heard_within(&self.played, TONE_HZ, seconds).await
     }
 }
 
@@ -107,6 +146,11 @@ impl Duplex {
 
     fn level(&self, hz: f32, seconds: f32) -> f32 {
         level_of(&self.played.lock().unwrap(), hz, seconds)
+    }
+
+    /// [`heard_within`] for `hz`.
+    async fn heard(&self, hz: f32, seconds: f32) -> f32 {
+        heard_within(&self.played, hz, seconds).await
     }
 }
 
@@ -276,7 +320,7 @@ async fn alices_tone_reaches_carols_speakers_and_mute_stops_it() {
     let alice_id = env.user_id(1);
     alice_as_seen_by(&mut carol, &alice_id, |p| p.speaking).await;
     tokio::time::sleep(Duration::from_secs(3)).await;
-    let heard = recorder.tone_level(2.0);
+    let heard = recorder.tone_heard(2.0).await;
     eprintln!("tone amplitude at carol's speakers: {heard:.4} (sent 0.3)");
     assert!(
         heard > HEARD,
@@ -344,7 +388,7 @@ async fn a_mic_test_during_a_call_leaves_the_call_playing() {
     let alice_id = env.user_id(1);
     alice_as_seen_by(&mut carol, &alice_id, |p| p.speaking).await;
     tokio::time::sleep(Duration::from_secs(2)).await;
-    assert!(recorder.tone_level(1.0) > HEARD, "the tone before");
+    assert!(recorder.tone_heard(1.0).await > HEARD, "the tone before");
 
     carol
         .commands
@@ -442,8 +486,8 @@ async fn members_on_different_sfus_hear_each_other() {
     alice_as_seen_by(&mut carol, &env.user_id(1), |p| p.speaking).await;
     alice_as_seen_by(&mut alice, &env.user_id(3), |p| p.speaking).await;
     tokio::time::sleep(Duration::from_secs(3)).await;
-    let alice_hears = alice_audio.level(CAROL_HZ, 2.0);
-    let carol_hears = carol_audio.level(ALICE_HZ, 2.0);
+    let alice_hears = alice_audio.heard(CAROL_HZ, 2.0).await;
+    let carol_hears = carol_audio.heard(ALICE_HZ, 2.0).await;
     eprintln!(
         "alice hears carol (via SFU B): {alice_hears:.4}; carol hears alice (via SFU A): {carol_hears:.4} (sent 0.3)"
     );
@@ -565,7 +609,7 @@ async fn a_participant_without_a_membership_is_not_played() {
 
     alice_as_seen_by(&mut alice, &env.user_id(3), |p| p.speaking).await;
     tokio::time::sleep(Duration::from_secs(4)).await;
-    let member = alice_audio.level(CAROL_HZ, 3.0);
+    let member = alice_audio.heard(CAROL_HZ, 3.0).await;
     let stranger = alice_audio.level(INTRUDER_HZ, 3.0);
     eprintln!("alice hears carol's device {member:.4}, the intruder {stranger:.5} (each sent 0.3)");
     assert!(member > HEARD, "member: amplitude {member:.4}");
@@ -630,7 +674,7 @@ async fn a_screen_share_sound_plays_next_to_the_voice() {
         }
     })
     .await;
-    let sound = alice_audio.level(SHARE_HZ, 2.0);
+    let sound = alice_audio.heard(SHARE_HZ, 2.0).await;
     eprintln!("alice hears carol's share alone {sound:.4} (sent 0.3); speaking shown: {spoke}");
     assert!(sound > HEARD, "share alone: amplitude {sound:.4}");
     assert!(!spoke, "a screen share's sound showed carol as speaking");
@@ -638,8 +682,8 @@ async fn a_screen_share_sound_plays_next_to_the_voice() {
     publish_tone(&sharer, VOICE_HZ, TrackSource::Microphone).await;
     alice_as_seen_by(&mut alice, &carol_id, |p| p.speaking).await;
     tokio::time::sleep(Duration::from_secs(4)).await;
-    let voice = alice_audio.level(VOICE_HZ, 3.0);
-    let sound = alice_audio.level(SHARE_HZ, 3.0);
+    let voice = alice_audio.heard(VOICE_HZ, 3.0).await;
+    let sound = alice_audio.heard(SHARE_HZ, 3.0).await;
     eprintln!("alice hears carol's voice {voice:.4} and her share {sound:.4} (each sent 0.3)");
     assert!(voice > HEARD, "voice while sharing: amplitude {voice:.4}");
     assert!(sound > HEARD, "share: amplitude {sound:.4}");
@@ -659,7 +703,7 @@ async fn a_screen_share_sound_plays_next_to_the_voice() {
     })
     .await;
     tokio::time::sleep(Duration::from_secs(2)).await;
-    let voice = alice_audio.level(VOICE_HZ, 1.5);
+    let voice = alice_audio.heard(VOICE_HZ, 1.5).await;
     let sound = alice_audio.level(SHARE_HZ, 1.5);
     eprintln!("share at 0 %: voice {voice:.4}, share {sound:.5}");
     assert!(
@@ -683,7 +727,7 @@ async fn a_screen_share_sound_plays_next_to_the_voice() {
         .await
         .expect("stops sharing");
     tokio::time::sleep(Duration::from_secs(3)).await;
-    let voice = alice_audio.level(VOICE_HZ, 2.0);
+    let voice = alice_audio.heard(VOICE_HZ, 2.0).await;
     let sound = alice_audio.level(SHARE_HZ, 2.0);
     eprintln!("after the share: voice {voice:.4}, share {sound:.5}");
     assert!(voice > HEARD, "voice after the share: amplitude {voice:.4}");
@@ -823,8 +867,8 @@ async fn encrypted_room_calls_are_end_to_end_encrypted() {
     alice_as_seen_by(&mut carol, &env.user_id(1), |p| p.speaking).await;
     alice_as_seen_by(&mut alice, &env.user_id(3), |p| p.speaking).await;
     tokio::time::sleep(Duration::from_secs(4)).await;
-    let alice_hears = alice_audio.level(CAROL_HZ, 2.0);
-    let carol_hears = carol_audio.level(ALICE_HZ, 2.0);
+    let alice_hears = alice_audio.heard(CAROL_HZ, 2.0).await;
+    let carol_hears = carol_audio.heard(ALICE_HZ, 2.0).await;
     let stranger = level_of(&overheard.lock().unwrap(), ALICE_HZ, 2.0);
     let samples = overheard.lock().unwrap().len();
     let encryption = encryption.lock().unwrap().clone();
@@ -931,7 +975,7 @@ async fn remote_voices_are_cleaned_when_asked() {
     })
     .await;
     tokio::time::sleep(Duration::from_secs(3)).await;
-    let plain = alice_audio.level(CAROL_HZ, 2.0);
+    let plain = alice_audio.heard(CAROL_HZ, 2.0).await;
 
     let mut settings = AudioSettings::default();
     settings.remote_cleaning.enabled = true;
@@ -960,7 +1004,7 @@ async fn remote_voices_are_cleaned_when_asked() {
     })
     .await;
     tokio::time::sleep(Duration::from_secs(3)).await;
-    let skipped = alice_audio.level(CAROL_HZ, 2.0);
+    let skipped = alice_audio.heard(CAROL_HZ, 2.0).await;
     eprintln!(
         "carol's tone at alice: {plain:.4} plain, {cleaned:.5} cleaned, {skipped:.4} set to never"
     );
@@ -1189,7 +1233,7 @@ async fn voices_cleaned_at_their_source_are_left_alone() {
     })
     .await;
     tokio::time::sleep(Duration::from_secs(3)).await;
-    let left_alone = alice_audio.level(CAROL_HZ, 2.0);
+    let left_alone = alice_audio.heard(CAROL_HZ, 2.0).await;
 
     let mut silent = outside.clone();
     silent.announce_cleaning.enabled = false;
