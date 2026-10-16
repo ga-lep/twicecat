@@ -1,5 +1,6 @@
-//! A PipeWire video stream we read frames from (plan Task 8): the stream of
-//! a ScreenCast portal session, or any video node (tests).
+//! A PipeWire video stream we read frames from: the stream of a ScreenCast
+//! portal session (plan Task 8), a camera (Task 9), or any video node
+//! (tests).
 //!
 //! Negotiation: we offer DMA-BUFs in the layouts our Vulkan device imports
 //! (one format pod per pixel format, with its modifiers, which the
@@ -8,6 +9,11 @@
 //! NV12 on the GPU, scaled to fit the capture's size; a buffer that fails to
 //! import makes us renegotiate shared memory once. Shared memory is copied
 //! and converted on the CPU at its own size.
+//!
+//! A camera is asked for one mode (format, size, rate) in shared memory:
+//! NV12 is copied, YUYV converted, MJPEG decoded on two threads
+//! ([`super::mjpeg`]), all at the camera's own size, in the colour space
+//! it says it sends (BT.601 limited when it says nothing, as UVC's default).
 //!
 //! The stream's callbacks run on our own thread's PipeWire main loop (not
 //! the real-time data loop: `RT_PROCESS` is not set), so converting there
@@ -19,7 +25,7 @@
 
 use std::io::Cursor;
 use std::os::fd::{BorrowedFd, OwnedFd, RawFd};
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -40,6 +46,8 @@ use pw::spa::utils::{
 };
 use pw::stream::{StreamFlags, StreamRc, StreamState};
 
+use super::camera::{CameraFormat, CameraMode};
+use super::mjpeg::MjpegPool;
 use super::{CaptureEnd, CaptureError, FrameSink, fit_size};
 use crate::gpu::{self, Converter, GpuDevice};
 use crate::{
@@ -77,19 +85,38 @@ fn fourcc_of(format: VideoFormat) -> Option<u32> {
         .map(|(_, fourcc)| fourcc)
 }
 
+/// The node a stream reads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Target {
+    /// This node.
+    Node(u32),
+    /// The node with this `node.name` (looked up when opening).
+    Named(String),
+}
+
+/// What a stream asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Offer {
+    /// A screen: any size, BGRx or BGRA, as DMA-BUFs first when `dma_buf`
+    /// (imported on our Vulkan device).
+    Screen { dma_buf: bool },
+    /// A camera in this mode, in shared memory.
+    Camera(CameraMode),
+}
+
 /// How to open a stream.
 pub(crate) struct StreamOptions {
     /// The PipeWire remote to connect to (a portal session's); the
     /// session's own daemon when `None`.
     pub remote: Option<OwnedFd>,
-    /// The node to read; whatever the session manager links when `None`.
-    pub node: Option<u32>,
+    /// The node to read.
+    pub target: Target,
     /// Frames larger than this are scaled down to fit (GPU path only).
     pub max_size: (u32, u32),
     /// Frames beyond this rate are dropped.
     pub max_fps: u32,
-    /// Offer DMA-BUFs (imported on our Vulkan device) before shared memory.
-    pub dma_buf: bool,
+    /// What to ask for.
+    pub offer: Offer,
 }
 
 /// A running stream; dropping it disconnects it and joins its thread.
@@ -116,7 +143,7 @@ pub(crate) fn open(
     let (stop, stopped) = pw::channel::channel::<()>();
     let (ready_tx, ready) = mpsc::sync_channel(1);
     let thread = std::thread::Builder::new()
-        .name("twicecat-screen-capture".into())
+        .name(name_of(options.offer).into())
         .spawn(move || run(options, sink, stopped, &ready_tx))
         .map_err(|_| CaptureError::Failed("no thread for the capture"))?;
     match ready.recv() {
@@ -131,6 +158,31 @@ pub(crate) fn open(
         Err(_) => {
             let _ = thread.join();
             Err(CaptureError::Failed("the capture thread stopped"))
+        }
+    }
+}
+
+/// The stream's (and its thread's) name.
+fn name_of(offer: Offer) -> &'static str {
+    match offer {
+        Offer::Screen { .. } => "twicecat-screen-capture",
+        Offer::Camera(_) => "twicecat-camera",
+    }
+}
+
+/// Where frames go, from the stream's thread or the MJPEG decoders'.
+struct Out {
+    sink: Box<dyn FrameSink>,
+    ended: bool,
+}
+
+impl Out {
+    fn frame(out: &Mutex<Self>, frame: CpuFrame) {
+        let Ok(mut out) = out.lock() else {
+            return;
+        };
+        if !out.ended {
+            out.sink.frame(frame);
         }
     }
 }
@@ -161,18 +213,31 @@ impl Gpu {
     }
 }
 
+/// How the agreed frames are laid out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Layout {
+    Raw(VideoFormat),
+    Mjpeg,
+}
+
 /// The format both sides agreed on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Negotiated {
-    format: VideoFormat,
+    layout: Layout,
     width: u32,
     height: u32,
     /// Set for DMA-BUFs.
     modifier: Option<u64>,
+    /// How YUV frames' values map to colours.
+    color: ColorSpace,
 }
 
 struct State {
-    sink: Box<dyn FrameSink>,
+    out: Arc<Mutex<Out>>,
+    /// Set when reading a camera.
+    camera: Option<CameraMode>,
+    /// The MJPEG decoders, once a camera agreed MJPEG.
+    mjpeg: Option<MjpegPool>,
     gpu: Option<Gpu>,
     /// A DMA-BUF failed to import: shared memory only from now on.
     shm_only: bool,
@@ -189,12 +254,18 @@ impl State {
     fn end(&mut self, end: CaptureEnd) {
         if !self.ended {
             self.ended = true;
-            self.sink.ended(end);
+            if let Ok(mut out) = self.out.lock() {
+                out.ended = true;
+                out.sink.ended(end);
+            }
         }
     }
 
     /// The formats to offer now, best first.
     fn offers(&self) -> Vec<Vec<u8>> {
+        if let Some(mode) = self.camera {
+            return serialize(&camera_format_object(mode)).into_iter().collect();
+        }
         let mut pods = Vec::new();
         if !self.shm_only
             && let Some(gpu) = &self.gpu
@@ -242,18 +313,41 @@ fn run(
         let _ = ready.send(Err(CaptureError::Unavailable("no PipeWire daemon")));
         return;
     };
+    let node = match &options.target {
+        Target::Node(id) => *id,
+        Target::Named(name) => match super::camera::node_named(&mainloop, &core, name) {
+            Some(id) => id,
+            None => {
+                let _ = ready.send(Err(CaptureError::NoSuchSource));
+                return;
+            }
+        },
+    };
+    let name = name_of(options.offer);
     let mut props = PropertiesBox::new();
     props.insert("media.type", "Video");
     props.insert("media.category", "Capture");
-    props.insert("media.role", "Screen");
-    props.insert("node.name", "twicecat-screen-capture");
-    let Ok(stream) = StreamRc::new(core.clone(), "twicecat-screen-capture", props) else {
+    props.insert(
+        "media.role",
+        match options.offer {
+            Offer::Screen { .. } => "Screen",
+            Offer::Camera(_) => "Camera",
+        },
+    );
+    props.insert("node.name", name);
+    let Ok(stream) = StreamRc::new(core.clone(), name, props) else {
         return failed("could not make the PipeWire stream");
     };
     let fps = options.max_fps.max(1);
+    let (camera, dma_buf) = match options.offer {
+        Offer::Screen { dma_buf } => (None, dma_buf),
+        Offer::Camera(mode) => (Some(mode), false),
+    };
     let state = State {
-        sink,
-        gpu: if options.dma_buf { Gpu::open() } else { None },
+        out: Arc::new(Mutex::new(Out { sink, ended: false })),
+        camera,
+        mjpeg: None,
+        gpu: if dma_buf { Gpu::open() } else { None },
         shm_only: false,
         negotiated: None,
         max_size: options.max_size,
@@ -274,13 +368,10 @@ fn run(
         return failed("could not listen to the PipeWire stream");
     };
     let mut pods: Vec<&Pod> = offers.iter().filter_map(|b| Pod::from_bytes(b)).collect();
+    // That node or none: a camera unplugged is not swapped for another.
+    let flags = StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS | StreamFlags::DONT_RECONNECT;
     if stream
-        .connect(
-            Direction::Input,
-            options.node,
-            StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS,
-            &mut pods,
-        )
+        .connect(Direction::Input, Some(node), flags, &mut pods)
         .is_err()
     {
         return failed("could not connect the PipeWire stream");
@@ -397,6 +488,102 @@ fn format_object(
     }
 }
 
+/// A camera's format pod: its mode, the rate within half a frame a second
+/// (cameras say 30000/1001 for 30).
+fn camera_format_object(mode: CameraMode) -> Object {
+    let id = |v: u32| Value::Id(Id(v));
+    let mut properties = vec![
+        Property::new(
+            FormatProperties::MediaType.as_raw(),
+            id(MediaType::Video.as_raw()),
+        ),
+        Property::new(
+            FormatProperties::MediaSubtype.as_raw(),
+            id(match mode.format {
+                CameraFormat::Mjpeg => MediaSubtype::Mjpg.as_raw(),
+                CameraFormat::Nv12 | CameraFormat::Yuyv => MediaSubtype::Raw.as_raw(),
+            }),
+        ),
+    ];
+    match mode.format {
+        CameraFormat::Nv12 => properties.push(Property::new(
+            FormatProperties::VideoFormat.as_raw(),
+            id(VideoFormat::NV12.as_raw()),
+        )),
+        CameraFormat::Yuyv => properties.push(Property::new(
+            FormatProperties::VideoFormat.as_raw(),
+            id(VideoFormat::YUY2.as_raw()),
+        )),
+        CameraFormat::Mjpeg => {}
+    }
+    properties.push(Property::new(
+        FormatProperties::VideoSize.as_raw(),
+        Value::Rectangle(Rectangle {
+            width: mode.width,
+            height: mode.height,
+        }),
+    ));
+    let fps = mode.fps.max(1);
+    properties.push(Property::new(
+        FormatProperties::VideoFramerate.as_raw(),
+        Value::Choice(ChoiceValue::Fraction(Choice(
+            ChoiceFlags::empty(),
+            ChoiceEnum::Range {
+                default: Fraction { num: fps, denom: 1 },
+                min: Fraction {
+                    num: 2 * fps - 1,
+                    denom: 2,
+                },
+                max: Fraction {
+                    num: 2 * fps + 1,
+                    denom: 2,
+                },
+            },
+        ))),
+    ));
+    Object {
+        type_: SpaTypes::ObjectParamFormat.as_raw(),
+        id: ParamType::EnumFormat.as_raw(),
+        properties,
+    }
+}
+
+/// The colour space a camera's raw format says (VideoInfoRaw's
+/// `color_matrix` and `color_range`, SPA's enums), BT.601 limited when it
+/// says nothing.
+fn color_of(matrix: u32, range: u32) -> ColorSpace {
+    ColorSpace {
+        matrix: if matrix == pw::spa::sys::SPA_VIDEO_COLOR_MATRIX_BT709 {
+            Matrix::Bt709
+        } else {
+            Matrix::Bt601
+        },
+        range: if range == pw::spa::sys::SPA_VIDEO_COLOR_RANGE_0_255 {
+            Range::Full
+        } else {
+            Range::Limited
+        },
+    }
+}
+
+/// The size in a format pod (an MJPEG one, which `VideoInfoRaw` does not
+/// read).
+fn size_in(param: &Pod) -> Option<Rectangle> {
+    let Ok((_, Value::Object(object))) = PodDeserializer::deserialize_any_from(param.as_bytes())
+    else {
+        return None;
+    };
+    object
+        .properties
+        .iter()
+        .find(|p| p.key == FormatProperties::VideoSize.as_raw())
+        .and_then(|p| match p.value {
+            Value::Rectangle(r) => Some(r),
+            Value::Choice(ChoiceValue::Rectangle(Choice(_, ChoiceEnum::None(r)))) => Some(r),
+            _ => None,
+        })
+}
+
 /// The buffers we take: DMA-BUFs, or shared memory (a descriptor or a
 /// pointer).
 fn buffers_object(dma_buf: bool) -> Object {
@@ -421,7 +608,7 @@ fn buffers_object(dma_buf: bool) -> Object {
     }
 }
 
-fn serialize(object: &Object) -> Option<Vec<u8>> {
+pub(super) fn serialize(object: &Object) -> Option<Vec<u8>> {
     PodSerializer::serialize(Cursor::new(Vec::new()), &Value::Object(object.clone()))
         .ok()
         .map(|(cursor, _)| cursor.into_inner())
@@ -490,9 +677,32 @@ fn param_changed(stream: &pw::stream::Stream, state: &mut State, id: u32, param:
         state.negotiated = None;
         return;
     };
-    let Ok((MediaType::Video, MediaSubtype::Raw)) = parse_format(param) else {
-        return;
-    };
+    match parse_format(param) {
+        Ok((MediaType::Video, MediaSubtype::Raw)) => raw_format_changed(stream, state, param),
+        Ok((MediaType::Video, MediaSubtype::Mjpg)) if state.camera.is_some() => {
+            let Some(size) = size_in(param) else {
+                return;
+            };
+            state.negotiated = Some(Negotiated {
+                layout: Layout::Mjpeg,
+                width: size.width,
+                height: size.height,
+                modifier: None,
+                color: SENT,
+            });
+            if state.mjpeg.is_none() {
+                let out = state.out.clone();
+                state.mjpeg = Some(MjpegPool::new(Box::new(move |frame| {
+                    Out::frame(&out, frame);
+                })));
+            }
+            set_buffers(stream, false);
+        }
+        _ => {}
+    }
+}
+
+fn raw_format_changed(stream: &pw::stream::Stream, state: &mut State, param: &Pod) {
     let mut info = VideoInfoRaw::new();
     if info.parse(param).is_err() {
         return;
@@ -529,19 +739,24 @@ fn param_changed(stream: &pw::stream::Stream, state: &mut State, id: u32, param:
         return;
     }
     state.negotiated = Some(Negotiated {
-        format: info.format(),
+        layout: Layout::Raw(info.format()),
         width: size.width,
         height: size.height,
         modifier,
+        color: color_of(info.color_matrix(), info.color_range()),
     });
-    let Some(buffers) = serialize(&buffers_object(modifier.is_some())) else {
+    set_buffers(stream, modifier.is_some());
+}
+
+fn set_buffers(stream: &pw::stream::Stream, dma_buf: bool) {
+    let Some(buffers) = serialize(&buffers_object(dma_buf)) else {
         return;
     };
     let Some(pod) = Pod::from_bytes(&buffers) else {
         return;
     };
     if stream.update_params(&mut [pod]).is_err() {
-        tracing::warn!("could not set the screen cast's buffers");
+        tracing::warn!("could not set the video stream's buffers");
     }
 }
 
@@ -556,7 +771,8 @@ fn process(stream: &pw::stream::Stream, state: &mut State) {
     if !state.pace.due(now) {
         return;
     }
-    let Some(data) = buffer.datas_mut().first_mut() else {
+    let datas = buffer.datas_mut();
+    let Some((data, rest)) = datas.split_first_mut() else {
         return;
     };
     let chunk = data.chunk();
@@ -567,9 +783,11 @@ fn process(stream: &pw::stream::Stream, state: &mut State) {
     let timestamp = now.duration_since(state.started);
     let frame = match data.type_() {
         DataType::DmaBuf => {
-            let (Some(modifier), Some(fourcc)) =
-                (negotiated.modifier, fourcc_of(negotiated.format))
+            let (Some(modifier), Layout::Raw(format)) = (negotiated.modifier, negotiated.layout)
             else {
+                return;
+            };
+            let Some(fourcc) = fourcc_of(format) else {
                 return;
             };
             let Ok(stride) = u32::try_from(stride) else {
@@ -607,7 +825,41 @@ fn process(stream: &pw::stream::Stream, state: &mut State) {
             let Some(bytes) = data.data() else {
                 return;
             };
-            match shm_frame(bytes, offset, stride, negotiated, timestamp) {
+            let at = Shm {
+                offset: offset as usize,
+                size: size as usize,
+                stride,
+            };
+            let frame = match negotiated.layout {
+                Layout::Mjpeg => {
+                    let Some(jpeg) = bytes.get(at.offset..at.offset.saturating_add(at.size)) else {
+                        return;
+                    };
+                    // Copied out: the buffer goes back once this returns.
+                    if let Some(pool) = &mut state.mjpeg
+                        && pool.submit(jpeg.to_vec(), timestamp)
+                    {
+                        state.pace.taken(now);
+                    }
+                    return;
+                }
+                Layout::Raw(VideoFormat::NV12) => {
+                    // The UV plane: its own block, or after Y in this one.
+                    let (w, h) = (negotiated.width as usize, negotiated.height as usize);
+                    let uv = rest.first_mut().and_then(|d| {
+                        let c = d.chunk();
+                        let (offset, size, stride) = (c.offset() as usize, c.size(), c.stride());
+                        if size == 0 {
+                            return None;
+                        }
+                        rows(d.data()?, offset, stride, w, h / 2)
+                    });
+                    nv12_frame(bytes, at, uv, negotiated, timestamp)
+                }
+                Layout::Raw(VideoFormat::YUY2) => yuyv_frame(bytes, at, negotiated, timestamp),
+                Layout::Raw(_) => shm_frame(bytes, offset, stride, negotiated, timestamp),
+            };
+            match frame {
                 Some(frame) => frame,
                 None => return,
             }
@@ -615,7 +867,101 @@ fn process(stream: &pw::stream::Stream, state: &mut State) {
         _ => return,
     };
     state.pace.taken(now);
-    state.sink.frame(frame);
+    Out::frame(&state.out, frame);
+}
+
+/// Where a frame is in a shared-memory block.
+#[derive(Clone, Copy, Debug)]
+struct Shm {
+    offset: usize,
+    size: usize,
+    stride: i32,
+}
+
+/// `rows` rows of `row` bytes from `bytes`, `stride` apart from `offset`,
+/// copied tight; `None` when they do not fit.
+fn rows(bytes: &[u8], offset: usize, stride: i32, row: usize, rows: usize) -> Option<Vec<u8>> {
+    let stride = usize::try_from(stride).ok().filter(|&s| s >= row)?;
+    if rows == 0 {
+        return None;
+    }
+    let len = stride.checked_mul(rows - 1)?.checked_add(row)?;
+    let pixels = bytes.get(offset..offset.checked_add(len)?)?;
+    let mut tight = Vec::with_capacity(row * rows);
+    for line in pixels.chunks(stride) {
+        tight.extend_from_slice(&line[..row]);
+    }
+    Some(tight)
+}
+
+/// A camera's NV12 buffer as a frame: Y from `bytes`, UV as copied from its
+/// own block, or else right after Y's rows in `bytes`.
+fn nv12_frame(
+    bytes: &[u8],
+    at: Shm,
+    uv: Option<Vec<u8>>,
+    negotiated: Negotiated,
+    timestamp: Duration,
+) -> Option<CpuFrame> {
+    let (width, height) = (negotiated.width, negotiated.height);
+    if width < 2 || height < 2 || width % 2 != 0 || height % 2 != 0 {
+        return None;
+    }
+    let (w, h) = (width as usize, height as usize);
+    let y = rows(bytes, at.offset, at.stride, w, h)?;
+    let uv = match uv {
+        Some(uv) => uv,
+        None => {
+            let after = usize::try_from(at.stride).ok()?.checked_mul(h)?;
+            rows(bytes, at.offset.checked_add(after)?, at.stride, w, h / 2)?
+        }
+    };
+    CpuFrame::new(
+        PixelFormat::Nv12,
+        width,
+        height,
+        vec![
+            Plane {
+                data: y.into(),
+                stride: w,
+            },
+            Plane {
+                data: uv.into(),
+                stride: w,
+            },
+        ],
+        negotiated.color,
+        timestamp,
+    )
+    .ok()
+}
+
+/// A camera's YUYV buffer as an NV12 frame, in the camera's colour space.
+fn yuyv_frame(
+    bytes: &[u8],
+    at: Shm,
+    negotiated: Negotiated,
+    timestamp: Duration,
+) -> Option<CpuFrame> {
+    let (width, height) = (negotiated.width, negotiated.height);
+    if width < 2 || height < 2 || width % 2 != 0 || height % 2 != 0 {
+        return None;
+    }
+    let row = width as usize * 2;
+    let packed = rows(bytes, at.offset, at.stride, row, height as usize)?;
+    let yuyv = CpuFrame::new(
+        PixelFormat::Yuyv,
+        width,
+        height,
+        vec![Plane {
+            data: packed.into(),
+            stride: row,
+        }],
+        negotiated.color,
+        timestamp,
+    )
+    .ok()?;
+    convert::to_nv12(&yuyv, negotiated.color).ok()
 }
 
 /// Which frames to take, at most `fps` a second: each frame is due one
@@ -681,7 +1027,7 @@ fn fall_back_to_shm(stream: &pw::stream::Stream, state: &mut State) {
     if state.shm_only {
         return;
     }
-    tracing::info!("the screen cast's GPU buffers could not be imported; using shared memory");
+    tracing::info!("the video stream's GPU buffers could not be imported; using shared memory");
     state.shm_only = true;
     state.negotiated = None;
     let offers = state.offers();
@@ -704,17 +1050,10 @@ fn shm_frame(
         return None;
     }
     let row = width as usize * 4;
-    let stride = usize::try_from(stride).ok().filter(|&s| s >= row)?;
-    let start = offset as usize;
-    let len = stride.checked_mul(height as usize - 1)?.checked_add(row)?;
-    let pixels = bytes.get(start..start.checked_add(len)?)?;
     // Copied row by row into a tight plane: the one copy out of PipeWire's
     // buffer, and yuvutils converts nothing from a padded plane whose last
     // row is not padded too (as a producer's buffer may end).
-    let mut tight = Vec::with_capacity(row * height as usize);
-    for line in pixels.chunks(stride) {
-        tight.extend_from_slice(&line[..row]);
-    }
+    let tight = rows(bytes, offset as usize, stride, row, height as usize)?;
     let bgra = CpuFrame::new(
         PixelFormat::Bgra,
         width,
@@ -894,10 +1233,11 @@ mod tests {
         // A white first row, a black second one.
         bytes[8..8 + w as usize * 4].fill(255);
         let negotiated = Negotiated {
-            format: VideoFormat::BGRx,
+            layout: Layout::Raw(VideoFormat::BGRx),
             width: w,
             height: h,
             modifier: None,
+            color: SENT,
         };
         let frame = shm_frame(&bytes, 8, stride as i32, negotiated, Duration::ZERO).expect("frame");
         assert_eq!(frame.format(), PixelFormat::Nv12);
@@ -1081,10 +1421,10 @@ mod tests {
         let stream = open(
             StreamOptions {
                 remote: None,
-                node: Some(node),
+                target: Target::Node(node),
                 max_size: (1920, 1080),
                 max_fps: 60,
-                dma_buf: false,
+                offer: Offer::Screen { dma_buf: false },
             },
             Box::new(ToChannel {
                 frames: frames_tx,

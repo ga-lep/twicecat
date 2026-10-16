@@ -20,7 +20,7 @@ cd "$(dirname "$0")/.."
 
 # <package>:<binary>, the binary being the test file name without .rs, or `lib`
 # for the package's unit tests.
-PERF_TARGETS="twicecat-app:lib twicecat-core:call_video twicecat-core:cli"
+PERF_TARGETS="twicecat-app:lib twicecat-core:call_video twicecat-core:cli twicecat-video:lib"
 
 check() {
     local failed=0 f pkg name entry

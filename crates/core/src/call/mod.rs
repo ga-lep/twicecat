@@ -50,7 +50,7 @@ use tokio::sync::{Mutex, Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 
 #[cfg(target_os = "linux")]
-pub(crate) use self::capture::{Capture, CaptureSink, PusherSlot, next_serial};
+pub(crate) use self::capture::{Capture, CaptureSink, PreviewSink, PusherSlot, next_serial};
 pub(crate) use self::capture::{CaptureEnded, CaptureSerial, Captured};
 use self::cleaning::Cleaning;
 pub(crate) use self::cleaning::announcement;

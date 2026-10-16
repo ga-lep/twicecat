@@ -8524,8 +8524,10 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "twicecat-perf",
  "x11rb",
  "yuvutils-rs",
+ "zune-jpeg",
 ]
 
 [[package]]

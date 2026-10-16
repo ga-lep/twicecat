@@ -1,6 +1,6 @@
-//! Our screen as captured (plan Phase 9 Task 8): what the connection that
-//! publishes a track holds while it sends one, and the sink the capturer
-//! hands frames to.
+//! Our screen and camera as captured (plan Phase 9 Tasks 8 and 9): what
+//! the connection that publishes a track holds while it sends one, the sink
+//! the capturer hands frames to, and the camera preview's.
 //!
 //! A capture starts before its track is published: the portal's picker
 //! must be answered first, and the track takes the captured size. Its frames
@@ -34,6 +34,9 @@ pub(crate) enum Capture {
     /// Through MIT-SHM (X11).
     #[cfg(target_os = "linux")]
     X11(twicecat_video::capture::x11::X11Capture),
+    /// A camera, through PipeWire.
+    #[cfg(target_os = "linux")]
+    Camera(twicecat_video::capture::camera::Camera),
 }
 
 impl Capture {
@@ -46,6 +49,10 @@ impl Capture {
             #[cfg(target_os = "linux")]
             Self::X11(capture) => {
                 let _ = tokio::task::spawn_blocking(move || drop(capture)).await;
+            }
+            #[cfg(target_os = "linux")]
+            Self::Camera(camera) => {
+                let _ = tokio::task::spawn_blocking(move || drop(camera)).await;
             }
         }
     }
@@ -99,6 +106,35 @@ impl FrameSink for CaptureSink {
 
     fn ended(&mut self, end: CaptureEnd) {
         let _ = self.ended.send((self.kind, self.serial, end));
+    }
+}
+
+/// The camera preview's side: frames to its feed, BT.709 limited range as
+/// the self-view's, the end to the engine.
+#[cfg(target_os = "linux")]
+pub(crate) struct PreviewSink {
+    pub feed: crate::api::VideoFeedSender,
+    pub serial: CaptureSerial,
+    pub ended: mpsc::UnboundedSender<CaptureEnded>,
+}
+
+#[cfg(target_os = "linux")]
+impl FrameSink for PreviewSink {
+    fn frame(&mut self, frame: CpuFrame) {
+        use super::video::{clock_us, is_sent_as_is, to_api_frame, to_sent};
+        let frame = if is_sent_as_is(&frame) {
+            frame
+        } else {
+            match to_sent(&frame) {
+                Some(frame) => frame,
+                None => return,
+            }
+        };
+        self.feed.send(to_api_frame(&frame, clock_us()));
+    }
+
+    fn ended(&mut self, end: CaptureEnd) {
+        let _ = self.ended.send((VideoKind::Camera, self.serial, end));
     }
 }
 

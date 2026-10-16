@@ -56,5 +56,7 @@ twicecat-perf = { path = "../perf" }
 tempfile = "3"
 # Fake banks in the cleaning tests set DeepFilterStatus; test-only, not in normal builds.
 twicecat-audio = { path = "../audio", features = ["test-fakes"] }
+# The virtual camera (an in-process PipeWire camera) for the camera tests; test-only.
+twicecat-video = { path = "../video", features = ["test-camera"] }
 # Paused time for the unread-totals throttle test; a feature of the pinned-in-lock tokio, no new packages.
 tokio = { version = "1", features = ["test-util"] }

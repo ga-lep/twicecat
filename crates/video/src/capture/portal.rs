@@ -18,7 +18,7 @@ use ashpd::desktop::screencast::{
 };
 use ashpd::desktop::{PersistMode, ResponseError, Session};
 
-use super::pw_video::{self, StreamOptions, VideoStream};
+use super::pw_video::{self, Offer, StreamOptions, Target, VideoStream};
 use super::{CaptureError, FrameSink};
 
 /// What the person may pick and how the stream is recorded.
@@ -282,10 +282,10 @@ impl ScreenShare {
         let negotiated = negotiate(&portal, request).await?;
         let options = StreamOptions {
             remote: Some(negotiated.remote),
-            node: Some(negotiated.stream.node),
+            target: Target::Node(negotiated.stream.node),
             max_size: request.max_size,
             max_fps: request.max_fps,
-            dma_buf: true,
+            offer: Offer::Screen { dma_buf: true },
         };
         let stream = match pw_video::open(options, sink) {
             Ok(stream) => stream,

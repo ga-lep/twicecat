@@ -53,8 +53,8 @@ OPTIONS:
                           and speakers are never opened (tests, scripts)
     --test-video          The camera and the screen are a moving test pattern
                           (see /video pattern); without it the screen is
-                          shared for real (/video share); real cameras come
-                          with a later version
+                          shared for real (/video share) and so are cameras
+                          (/video camera)
     --help                Show this help
 
 COMMANDS (type them at the prompt):
@@ -112,6 +112,11 @@ VIDEO (in a call):
                           Share source n of /video sources (X11) or what you
                           pick in the system's picker, at most at that size
                           and rate; with sound: what other applications play
+    /video cameras        List the cameras and the modes they send
+    /video camera <res> <fps> [n]
+                          Send camera n of /video cameras (or the one in the
+                          video settings, else the system's default), in the
+                          mode that size and rate need
     /video off [screen]   Stop your camera (or screen share)
     /video view <n> <w>x<h>|hide
                           Receive track n for that size on screen, or not at
@@ -911,13 +916,13 @@ impl Cli {
             | CoreEvent::LocalVideo(_)
             | CoreEvent::VideoStats(_)
             | CoreEvent::ScreenSources(_)
-            | CoreEvent::VideoEncoders(_)) => {
+            | CoreEvent::VideoEncoders(_)
+            | CoreEvent::VideoDevices(_)) => {
                 for line in self.video.event(event) {
                     println!("{line}");
                 }
             }
-            CoreEvent::VideoDevices(_)
-            | CoreEvent::VideoSettings(_)
+            CoreEvent::VideoSettings(_)
             | CoreEvent::VideoSettingsAdjusted(_)
             | CoreEvent::VideoSending { .. } => {}
         }

@@ -1,17 +1,25 @@
-//! Screen capture (plan Task 8): what a capturer hands over and how it
-//! says it stopped. Linux has two backends: the ScreenCast portal with its
-//! PipeWire stream (Wayland, and X11 desktops that run the portal), and our
-//! own picker data and MIT-SHM capture for X11 ([`x11`]).
+//! Screen and camera capture (plan Tasks 8 and 9): what a capturer hands
+//! over and how it says it stopped. Linux has two screen backends: the
+//! ScreenCast portal with its PipeWire stream (Wayland, and X11 desktops
+//! that run the portal), and our own picker data and MIT-SHM capture for X11
+//! ([`x11`]). Cameras are PipeWire nodes ([`camera`]).
 //!
-//! A capturer converts every frame to NV12 (BT.709, limited range: what we
-//! send) before it hands it over, on its own thread: DMA-BUFs on the GPU
-//! they came from, shared memory on the CPU. Frames, window titles and
-//! restore tokens are never logged.
+//! A capturer converts every frame to NV12 before it hands it over, on its
+//! own thread: screens to BT.709 limited range (what we send), DMA-BUFs on
+//! the GPU they came from, shared memory on the CPU; cameras keep their own
+//! colour space. Frames, window titles, camera identifiers and restore
+//! tokens are never logged.
 
+#[cfg(target_os = "linux")]
+pub mod camera;
+#[cfg(target_os = "linux")]
+pub mod mjpeg;
 #[cfg(target_os = "linux")]
 pub mod portal;
 #[cfg(target_os = "linux")]
 pub(crate) mod pw_video;
+#[cfg(all(target_os = "linux", any(test, feature = "test-camera")))]
+pub mod test_camera;
 #[cfg(target_os = "linux")]
 pub mod x11;
 

@@ -19,12 +19,17 @@ use twicecat_video::{ColorSpace, CpuFrame, PixelFormat, Plane};
 use super::{DEFAULT_TIMEOUT, TestEnv, expect_event, silence, start_core_with_video};
 
 pub async fn logged_in(dir: &std::path::Path, n: u8) -> CoreHandle {
+    logged_in_with(dir, n, VideoBackend::TestPattern).await
+}
+
+/// Like [`logged_in`], with `video` as its cameras and screens.
+pub async fn logged_in_with(dir: &std::path::Path, n: u8, video: VideoBackend) -> CoreHandle {
     let mut core = start_core_with_video(
         dir,
         Arc::new(InMemorySecretStore::new()),
         silence(),
         None,
-        VideoBackend::TestPattern,
+        video,
     );
     let env = TestEnv::load();
     core.commands

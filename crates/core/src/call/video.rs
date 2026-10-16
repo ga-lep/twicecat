@@ -38,7 +38,7 @@ use livekit::webrtc::video_stream::native::NativeVideoStream;
 use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 use twicecat_video::test_pattern::TestPattern;
-use twicecat_video::{CpuFrame, PixelFormat};
+use twicecat_video::{ColorSpace, CpuFrame, PixelFormat};
 
 use super::encoder;
 use super::media::MediaNotice;
@@ -806,19 +806,19 @@ impl FramePusher {
         Self { source, feed, size }
     }
 
-    /// Sends one frame now. A frame that is not NV12 is converted first; one
-    /// that cannot be is dropped.
+    /// Sends one frame now. A frame that is not NV12 in BT.709 limited range
+    /// is converted first; one that cannot be is dropped.
     pub(crate) fn push(&mut self, frame: &CpuFrame) {
         let converted;
-        let frame = if frame.format() == PixelFormat::Nv12 {
+        let frame = if is_sent_as_is(frame) {
             frame
         } else {
-            match twicecat_video::convert::to_nv12(frame, frame.color()) {
-                Ok(nv12) => {
+            match to_sent(frame) {
+                Some(nv12) => {
                     converted = nv12;
                     &converted
                 }
-                Err(_) => return,
+                None => return,
             }
         };
         let now_us = clock_us();
@@ -838,6 +838,24 @@ impl FramePusher {
             buffer,
         });
         self.feed.send(api);
+    }
+}
+
+/// Whether `frame` is what we send: NV12, BT.709 limited range (the track
+/// says nothing of its colours, and receivers take ours as that).
+pub(crate) fn is_sent_as_is(frame: &CpuFrame) -> bool {
+    frame.format() == PixelFormat::Nv12 && frame.color() == ColorSpace::default()
+}
+
+/// `frame` as NV12 in BT.709 limited range: a camera's BT.601 or full-range
+/// YUV goes through BGRA. `None` when the converter refuses it.
+pub(crate) fn to_sent(frame: &CpuFrame) -> Option<CpuFrame> {
+    use twicecat_video::convert::{to_bgra, to_nv12};
+    let sent = ColorSpace::default();
+    match frame.format() {
+        PixelFormat::Bgra => to_nv12(frame, sent).ok(),
+        _ if frame.color() == sent => to_nv12(frame, sent).ok(),
+        _ => to_nv12(&to_bgra(frame).ok()?, sent).ok(),
     }
 }
 
@@ -926,8 +944,9 @@ fn to_nv12_buffer(frame: &CpuFrame) -> NV12Buffer {
     buffer
 }
 
-/// An NV12 frame of ours as the API's frame (the planes are shared).
-fn to_api_frame(frame: &CpuFrame, timestamp_us: i64) -> VideoFrame {
+/// An NV12 frame of ours, BT.709 limited range, as the API's frame (the
+/// planes are shared).
+pub(crate) fn to_api_frame(frame: &CpuFrame, timestamp_us: i64) -> VideoFrame {
     VideoFrame {
         format: VideoPixelFormat::Nv12,
         width: frame.width(),
