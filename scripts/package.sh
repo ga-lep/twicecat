@@ -3,12 +3,17 @@
 #
 #   scripts/package.sh [--profile dist|release] [--formats "tar deb rpm appimage"]
 #                      [--no-build]
+#   scripts/package.sh --formats prefix --prefix DIR --notices FILE
 #
 # Formats: on Linux `tar` (.tar.zst), `deb` and `rpm` (nfpm), `appimage`
 # (appimagetool, from our own AppDir), all by default; on macOS `dmg`; on
 # Windows `msi` (both cargo-packager). `--formats packager-check` on Linux
 # runs cargo-packager's .deb on the same generated config as a dry run of the
-# DMG and MSI configuration (its output is thrown away).
+# DMG and MSI configuration (its output is thrown away). `--formats prefix`
+# (Linux, alone) installs the same tree straight into DIR, with no symbols
+# archive and the notices page copied from FILE: the Flatpak build
+# (packaging/flatpak/) installs into /app this way, offline, where
+# cargo-about cannot run.
 #
 # Every package carries the full build (`--features gpu`, plan Q3), the
 # DeepFilterNet3 models, LICENSE, THIRD_PARTY_NOTICES.html and the Inter
@@ -31,6 +36,7 @@ cd "$(dirname "$0")/.."
 
 usage() {
     echo "usage: $0 [--profile dist|release] [--formats \"tar deb rpm appimage\"] [--no-build]" >&2
+    echo "       $0 --formats prefix --prefix DIR --notices FILE [--profile dist|release] [--no-build]" >&2
     exit 2
 }
 die() { echo "error: $*" >&2; exit 1; }
@@ -46,15 +52,25 @@ sha256_of() {
 profile=dist
 formats=""
 build=1
+prefix=""
+notices=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --profile) [ $# -ge 2 ] || usage; profile=$2; shift 2 ;;
         --formats) [ $# -ge 2 ] || usage; formats=$2; shift 2 ;;
         --no-build) build=0; shift ;;
+        --prefix) [ $# -ge 2 ] || usage; prefix=$2; shift 2 ;;
+        --notices) [ $# -ge 2 ] || usage; notices=$2; shift 2 ;;
         *) usage ;;
     esac
 done
 case "$profile" in dist | release) ;; *) usage ;; esac
+if [ "$formats" = prefix ]; then
+    if [ -z "$prefix" ] || [ -z "$notices" ]; then usage; fi
+    [ -f "$notices" ] || die "no notices page at $notices"
+elif [ -n "$prefix" ] || [ -n "$notices" ]; then
+    usage
+fi
 
 app_id=io.github.ga_lep.Twicecat
 host=$(rustc -vV | awk '/^host:/ { print $2 }')
@@ -74,7 +90,7 @@ if [ -z "$formats" ]; then
 fi
 for f in $formats; do
     case "$os:$f" in
-        linux:tar | linux:deb | linux:rpm | linux:appimage | linux:packager-check | macos:dmg | windows:msi) ;;
+        linux:tar | linux:deb | linux:rpm | linux:appimage | linux:packager-check | linux:prefix | macos:dmg | windows:msi) ;;
         *) die "format $f is not made on $os" ;;
     esac
 done
@@ -104,7 +120,7 @@ mkdir -p "$out"
 models=$(scripts/fetch-models.sh)
 # The notices read the dependency graph offline (--frozen), which needs the
 # crates of every platform in the registry, not only those this build used.
-cargo fetch --locked
+[ -n "$notices" ] || cargo fetch --locked
 notices_args=()
 gpu_pack=0
 [ "$os" = linux ] && gpu_pack=1
@@ -148,29 +164,32 @@ resources() {
 # --- Linux ----------------------------------------------------------------
 
 if [ "$os" = linux ]; then
-    # The libraries the binary links must be the ones nfpm.yaml depends on.
-    needed=$(readelf -d "$binary" | awk '/\(NEEDED\)/ { gsub(/[\[\]]/, "", $5); print $5 }' | sort | tr '\n' ' ')
     case "$arch" in
         x86_64) loader=ld-linux-x86-64.so.2 ;;
         aarch64) loader=ld-linux-aarch64.so.1 ;;
         *) die "no packaging for $arch" ;;
     esac
-    wanted=$(printf '%s\n' libasound.so.2 libc.so.6 libgcc_s.so.1 libm.so.6 libpipewire-0.3.so.0 libudev.so.1 "$loader" | sort | tr '\n' ' ')
-    [ "$needed" = "$wanted" ] || die "the binary links [$needed], packaging/nfpm.yaml expects [$wanted]: update both"
-    # Nor may it need a newer glibc than the floor nfpm.yaml declares, so
-    # a newer build image cannot raise the floor silently (plan Q14).
-    floor=$(tr -d '\r' < packaging/nfpm.yaml | sed -n 's/^ *- libc6 (>= \([0-9.]*\))$/\1/p')
-    rpm_floor=$(tr -d '\r' < packaging/nfpm.yaml | sed -n 's/^ *- glibc >= \([0-9.]*\)$/\1/p')
-    { [ -n "$floor" ] && [ "$floor" = "$rpm_floor" ]; } \
-        || die "packaging/nfpm.yaml: the libc6 floor ($floor) and the glibc floor ($rpm_floor) must be set and equal"
-    newest=$(objdump -T "$binary" | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/^GLIBC_//' | sort -uV | tail -n 1)
-    [ -n "$newest" ] || die "no glibc symbol versions in $binary"
-    [ "$(printf '%s\n%s\n' "$newest" "$floor" | sort -V | tail -n 1)" = "$floor" ] \
-        || die "the binary needs glibc $newest, packaging/nfpm.yaml declares $floor: build in dev/ubuntu-24.04"
-    echo "glibc: the binary needs $newest, the packages declare $floor" >&2
+    if [ "$formats" != prefix ]; then
+        # The libraries the binary links must be the ones nfpm.yaml depends on.
+        needed=$(readelf -d "$binary" | awk '/\(NEEDED\)/ { gsub(/[\[\]]/, "", $5); print $5 }' | sort | tr '\n' ' ')
+        wanted=$(printf '%s\n' libasound.so.2 libc.so.6 libgcc_s.so.1 libm.so.6 libpipewire-0.3.so.0 libudev.so.1 "$loader" | sort | tr '\n' ' ')
+        [ "$needed" = "$wanted" ] || die "the binary links [$needed], packaging/nfpm.yaml expects [$wanted]: update both"
+        # Nor may it need a newer glibc than the floor nfpm.yaml declares, so
+        # a newer build image cannot raise the floor silently (plan Q14).
+        floor=$(tr -d '\r' < packaging/nfpm.yaml | sed -n 's/^ *- libc6 (>= \([0-9.]*\))$/\1/p')
+        rpm_floor=$(tr -d '\r' < packaging/nfpm.yaml | sed -n 's/^ *- glibc >= \([0-9.]*\)$/\1/p')
+        { [ -n "$floor" ] && [ "$floor" = "$rpm_floor" ]; } \
+            || die "packaging/nfpm.yaml: the libc6 floor ($floor) and the glibc floor ($rpm_floor) must be set and equal"
+        newest=$(objdump -T "$binary" | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/^GLIBC_//' | sort -uV | tail -n 1)
+        [ -n "$newest" ] || die "no glibc symbol versions in $binary"
+        [ "$(printf '%s\n%s\n' "$newest" "$floor" | sort -V | tail -n 1)" = "$floor" ] \
+            || die "the binary needs glibc $newest, packaging/nfpm.yaml declares $floor: build in dev/ubuntu-24.04"
+        echo "glibc: the binary needs $newest, the packages declare $floor" >&2
+    fi
 
     stage=$out/stage
     usr=$stage/usr
+    [ "$formats" = prefix ] && usr=$prefix
     mkdir -p "$usr/bin" "$usr/lib/twicecat" "$usr/share/applications" "$usr/share/metainfo" \
         "$usr/share/icons" "$usr/share/doc/twicecat"
     # Stripped in the packages; the unstripped binary is the symbols archive.
@@ -182,7 +201,15 @@ if [ "$os" = linux ]; then
     cp -R packaging/icons/hicolor "$usr/share/icons/"
     cp LICENSE "$usr/share/doc/twicecat/LICENSE"
     font_notices "$usr/share/doc/twicecat"
-    scripts/third-party-notices.sh "$usr/share/doc/twicecat/THIRD_PARTY_NOTICES.html" --target "$host" "${notices_args[@]}"
+    if [ -n "$notices" ]; then
+        cp "$notices" "$usr/share/doc/twicecat/THIRD_PARTY_NOTICES.html"
+    else
+        scripts/third-party-notices.sh "$usr/share/doc/twicecat/THIRD_PARTY_NOTICES.html" --target "$host" "${notices_args[@]}"
+    fi
+    if [ "$formats" = prefix ]; then
+        echo "installed twicecat $version into $prefix" >&2
+        exit 0
+    fi
 
     name=twicecat-$version-linux-$arch
     symbols=$out/$name-symbols

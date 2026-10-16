@@ -20,6 +20,19 @@ sums=scripts/checksums/libwebrtc.sha256
 
 die() { echo "error: $*" >&2; exit 1; }
 
+# fetch_to URL FILE: downloads URL into FILE, or, when TWICECAT_DOWNLOADS is
+# set (an offline build such as the Flatpak), copies the file of the same
+# name from that directory. The caller checks the SHA-256 either way.
+fetch_to() {
+    if [ -n "${TWICECAT_DOWNLOADS:-}" ]; then
+        [ -f "$TWICECAT_DOWNLOADS/${1##*/}" ] || die "${1##*/} is not in TWICECAT_DOWNLOADS ($TWICECAT_DOWNLOADS)"
+        cp "$TWICECAT_DOWNLOADS/${1##*/}" "$2"
+        return
+    fi
+    echo "downloading $1" >&2
+    curl -fsSL --proto '=https' --tlsv1.2 --retry 6 -o "$2" "$1"
+}
+
 host_triple() {
     local os arch
     case "$(uname -s)" in
@@ -121,10 +134,9 @@ if [ ! -f "$marker" ] || [ "$(cat "$marker")" != "$expected" ]; then
     work=$(mktemp -d "$cache_root/$tag/.fetch.XXXXXX")
     trap 'rm -rf "$work"' EXIT
     url="https://github.com/livekit/rust-sdks/releases/download/${tag}/${zip}"
-    echo "downloading $url" >&2
     # GitHub's release downloads answer 5xx now and then (a 504 failed CI);
     # six retries back off over about a minute.
-    curl -fsSL --proto '=https' --tlsv1.2 --retry 6 -o "$work/$zip" "$url"
+    fetch_to "$url" "$work/$zip"
     actual=$(sha256_of "$work/$zip")
     if [ "$actual" != "$expected" ]; then
         die "SHA-256 mismatch for $zip: expected $expected, got $actual"

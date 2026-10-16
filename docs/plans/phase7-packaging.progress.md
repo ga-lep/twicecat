@@ -5,3 +5,4 @@ Task 3: complete (gate ok: 1738 passed; bundled models found from a fake prefix 
 Task 4: complete (gate ok: 1740 passed; desktop-file-validate and appstreamcli --strict valid; icon mutation caught)
 Task 5: complete (gate ok; notices for 4 targets resolve; unaccepted licence and missing file both fail)
 Task 6: complete (gate ok; tar, deb, rpm, AppImage built in Ubuntu 26.04 and all 4 smoke-tested; wrong dependency caught; MSI and DMG config dry-run only, built in CI)
+Task 7: complete (gate ok on Windows; flatpak.sh check ok, two mutations caught; x86_64 bundle built in Flathub's CI image in Docker and smoke-tested; aarch64 in the release workflow)

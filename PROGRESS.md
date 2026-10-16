@@ -3133,7 +3133,7 @@ Plan approved by the human 2026-10-14. Targets: Linux x86_64 and aarch64 (the St
 - [x] 4. Icon, AppStream metainfo, desktop entry (phase7.4)
 - [x] 5. Licence notices (phase7.5)
 - [x] 6. Desktop packages: nfpm (`.deb`, `.rpm`), appimagetool (AppImage), `.tar.zst`; cargo-packager (MSI, DMG; built in CI, Task 8) (phase7.6)
-- [ ] 7. Flatpak, x86_64 and aarch64 (phase7.7)
+- [x] 7. Flatpak, x86_64 and aarch64 (phase7.7): built and smoke-tested on x86_64 (Docker on the Windows machine); aarch64 in the release workflow
 - [ ] 8. Release workflow (phase7.8)
 - [ ] 9. Updates (phase7.9)
 - [ ] 10. Crash reports (phase7.10)
@@ -3152,6 +3152,7 @@ See the plan's "Human checkpoint"; items move here as tasks finish. Already open
 - [ ] (Task 6, Q14) Steam Frame without the Flatpak: the release's aarch64 `.tar.zst` unpacked under `~/.local/opt/twicecat` (with a link in `~/.local/bin`) and its AppImage start in desktop mode and, through "Add a non-Steam game", in game mode; the login is kept and a call works on the built-in mic and speakers.
 - [ ] (Task 6) The Linux packages on real desktops: the `.deb` on Ubuntu 24.04 and 26.04, the `.rpm` on Fedora 43 and 44, the AppImage and the `.tar.zst` anywhere newer; Twicecat appears in the menu with its icon, starts, and DeepFilterNet3 and the GPU entry ("any GPU · WebGPU on Vulkan") work from the bundled files.
 - [ ] (Task 1) Windows: the release `twicecat.exe` opens no console window; `twicecat.exe --version` prints in PowerShell and cmd; on a CPU or VM without AVX2 a message box says why and the app exits.
+- [ ] (Task 7) The Flatpak on a desktop (GNOME and KDE): see the plan's sandbox items; and the aarch64 bundle from the release workflow on the Steam Frame.
 
 ## Phase 7 / Task 1 notes
 - **Version:** one workspace version (`[workspace.package] version = "0.1.0"`, every crate `version.workspace = true`). `twicecat --version` / `-V` and `twicecat-cli --version` print `twicecat 0.1.0` / `twicecat-cli 0.1.0` and exit 0; `--version` with any other argument is refused (exit 2). `scripts/check-version.sh vX.Y.Z` fails unless every workspace crate has that version (run: `v0.1.0` ok; `v0.1.1` and `0.1.0` refused, naming each crate; no argument: usage, exit 2).
@@ -3218,3 +3219,42 @@ See the plan's "Human checkpoint"; items move here as tasks finish. Already open
 - **Added when the branch was rebased on `main` (2026-10-16), which brought the UI rework and Phase 9 video:** every package ships the Inter font's `OFL.txt` and `THIRD-PARTY-NOTICES.md` beside `LICENSE` (the UI rework's checkpoint asked for it; Settings → About names both), and the smoke test checks them; `Info.plist` gains `NSCameraUsageDescription` and the entitlements `com.apple.security.device.camera`, ahead of Phase 9 Task 12 (macOS capture), since macOS ends an app that opens the camera without them. No new Linux dependency: Phase 9 has no VA-API (its Q6), LiveKit's NVENC loads the NVIDIA driver's libraries at run time, and x11rb is pure Rust; `package.sh`'s `NEEDED` guard confirms it on the next Linux build. These were written on the Windows machine and not built into packages yet: the Linux packages and their smoke test need the Linux machine or CI (Task 8).
 - **Tools:** shellcheck 0.10.0 clean on the four new scripts; `docs/building.md` gains a "Packages" section.
 - **Gate:** fmt, clippy (also `--all-features`), `cargo test --workspace --locked` 1740 passed, 0 failed, 153 ignored; dependency and API checks pass (no Rust changed).
+
+## Phase 7 / Task 7 notes
+- **Where this ran:** the Windows machine (2026-10-16), after the branch was rebased on `main` (Phase 9 Tasks 1-11 and the UI rework). The Linux parts ran in Docker Desktop (WSL 2). All three were installed there at the human's request: Rust 1.97.1 with the MSVC Build Tools, Python 3.13, and Docker Desktop.
+- **`packaging/flatpak/io.github.ga_lep.Twicecat.yml`:** `org.freedesktop.Platform`/`Sdk` 26.08 with `org.freedesktop.Sdk.Extension.llvm22` (clang and lld 22, as CI). Two modules:
+  - `rust`: Rust 1.97.1's standalone installer for the architecture, pinned in the new `scripts/checksums/rust.sha256` from static.rust-lang.org's `.sha256` files. It installs under `/app/rust`, and the top-level `cleanup` removes it. Its `build-options` turn off `strip` and debuginfo extraction, which left `libLLVM` without loadable segments (found by the first build: `rustc` would not start).
+  - `twicecat`, built from these sources:
+    - the source tree as a `dir` source, without `target`, `.git`, `.flatpak-builder` and `.idea`;
+    - `cargo-sources.json`;
+    - the notices page and the stateful graph from `target/flatpak/inputs/`;
+    - ten pinned downloads, with `only-arches` where they differ: libwebrtc, the DeepFilterNet3 models, ONNX Runtime 1.28.3's CPU build, the WebGPU plugin 0.4.0, and CUDA's runtime wheel for the header (x86_64).
+
+    Its build commands run `scripts/fetch-libwebrtc.sh`, then `scripts/fetch-cuda-headers.sh` (x86_64), then `scripts/package.sh --formats prefix --prefix /app --notices …`.
+  - `finish-args` are as the plan lists them, each with its reason: wayland, fallback-x11, ipc, dri, network, `xdg-run/pipewire-0`, `org.freedesktop.secrets`, `org.freedesktop.Notifications`, `org.kde.StatusNotifierWatcher` and `--device=input`. Video needs nothing more: ScreenCast and Camera are portals, and NVENC comes through Flatpak's NVIDIA GL extension.
+- **Offline fetching:** `fetch-libwebrtc.sh`, `fetch-models.sh`, `fetch-onnxruntime.sh`, `fetch-webgpu-ep.sh` and `fetch-cuda-headers.sh` share a `fetch_to` helper. When `TWICECAT_DOWNLOADS` is set, it copies `$TWICECAT_DOWNLOADS/<file name>` instead of downloading. The SHA-256 check stays where it was.
+  - Tried with `fetch-models.sh`: a missing file fails ("not in TWICECAT_DOWNLOADS"); the real archive unpacks and verifies; a changed byte fails ("SHA-256 mismatch").
+  - `fetch-models.sh` and `fetch-onnxruntime.sh` now extract with `tar --no-same-owner`. The build sandbox may not chown, and the models archive's files belong to uid 1000; the second build failed on this.
+- **`scripts/package.sh --formats prefix --prefix DIR --notices FILE`:** the Linux staging step, run straight into `DIR` with the given notices page. It skips the symbols archive, `cargo fetch` and the `NEEDED` guard (that guard belongs to nfpm's dependency list).
+- **`scripts/flatpak.sh sources | check | build | smoke`:**
+  - `sources` writes `packaging/flatpak/cargo-sources.json`: 921 crates (the lock has 927 entries, 6 of them ours). It uses flatpak-cargo-generator.py from flatpak-builder-tools `41c20aa10819cdb2a4f3ca171758a96d1955c018`, SHA-256 checked, in a cached venv with tomlkit 0.15.1 and aiohttp 3.14.3. The lock has no git dependencies, so no network is needed.
+  - `check` regenerates and compares the crate list, and compares every `url:`/`sha256:` pair in the manifest with `scripts/checksums/`. Mutations: one changed libwebrtc digest failed with "manifest has …c6, scripts/checksums/ has …c5"; one changed crate version in the JSON failed with "does not match Cargo.lock". Both were reverted and `check` passes again (10 downloads).
+  - `build` checks the stateful graph's SHA-256, takes the notices page from `TWICECAT_FLATPAK_NOTICES` (release CI passes the `.deb`'s page) or makes it with cargo-about, runs `flatpak-builder --user --install-deps-from=flathub`, and writes `<target>/package/flatpak/Twicecat-<v>-<arch>.flatpak`. It reads the version from `Cargo.toml`, since the CI container has no cargo.
+  - `smoke` installs the bundle for the user, then checks `flatpak run --command=twicecat … --version` and the files under `/app/share`.
+- **CI:** the `checks` job runs `scripts/flatpak.sh check`. The build itself is in the release workflow (Task 8).
+- **Plan deviations** (recorded in the plan's Task 7): runtime 26.08 instead of 25.08; the `llvm22` extension; Rust from the pinned installer instead of `rust-stable`.
+- **APIs and tools read (rule 2):**
+  - flatpak-cargo-generator.py at that commit (all 529 lines) and its README's manifest example;
+  - the branches of flathub's `rust-stable`, `llvm21` and `llvm22` extensions;
+  - `llvm22`'s 26.08 manifest;
+  - the tags and digest of `ghcr.io/flathub-infra/flatpak-github-actions` (`freedesktop-26.08` is `sha256:6ed6921b…3039`, amd64 and arm64).
+- **Built here (x86_64), in that image in Docker:**
+  - The inputs came from containers, as release CI makes them. The stateful graph was exported with `scripts/export-deepfilternet.sh` in `python:3.13-bookworm` and has exactly the pinned SHA-256 (`b69eafd3…`; largest difference to upstream's graphs 1.5e-5). The notices page was made with cargo-about 0.9.2 in `rust:1.97.1-bookworm`: 649 crates, 8 other notices.
+  - The sources were an LF copy of this checkout, since Git's CRLF line endings on Windows break the scripts and Synapse's start script in Linux containers.
+  - Three builds. The first stopped when `rustc` would not start (flatpak-builder had stripped the toolchain's `libLLVM`), the second when `tar` could not chown in the sandbox. The third built in 24 min 15 s; the dist profile took 19 min 43 s of that, with fat LTO in Docker's VM. It exported the desktop entry, the 10 icons and the metainfo, and made `Twicecat-0.1.0-x86_64.flatpak` (62.6 MB). `scripts/flatpak.sh smoke` passed in the container: `flatpak run` printed `twicecat 0.1.0`, and every resource is under `/app/share`. aarch64 is built only by the release workflow.
+- **Checks here:** the manifest and `ci.yml` parse as YAML (PyYAML 6.0.2). shellcheck 0.10.0 (the Windows release zip, which has no published checksum; its SHA-256 is `eb6cd53a…e143`) is clean on `flatpak.sh`, `package.sh` and the five fetch scripts. `fetch-cuda-headers.sh` keeps one info note (SC2015) that was there before. actionlint 1.7.7 (the Windows zip, SHA-256 checked against its `checksums.txt`) is clean on every workflow.
+- **Also checked on Windows (Task 1's checkpoint item, not ticked):**
+  - `twicecat.exe` is a Windows GUI-subsystem binary (`dumpbin /headers`: subsystem 2).
+  - `--version` prints `twicecat 0.1.0` and exits 0 from cmd and from PowerShell when captured. An interactive PowerShell does not wait for a GUI program, so its prompt returns before the line appears.
+  - The release app ran here against the local stack: login, an encrypted room with the CLI as the other side, both directions of chat, a call (connected and encrypted, mute, leave) and a restart from the Windows keychain. The refusal on a CPU without AVX2 was not tried.
+- **Gate (Windows, x86_64-pc-windows-msvc):** `cargo fmt --all --check`; `cargo clippy --workspace --all-targets --locked -- -D warnings`, also with `--all-features`. `cargo test --workspace --locked` passed on the rebased branch (2272 passed, 0 failed, 136 ignored, Task 1's commit notes). No Rust changes in this step. `check-app-deps.sh` (also `livekit`), `check-core-api.sh` (with `LC_ALL=C.UTF-8`: Git Bash's `grep -P` refuses the default locale), `integration-shards.sh --check`, `run-perf-tests.sh --check`, `check-no-webrtc-download.sh` and `flatpak.sh check` pass. `check-font-assets.sh` fails here only because Git checks `OFL.txt` out with CRLF; the committed file has the pinned SHA-256 `262481e8…935a`.

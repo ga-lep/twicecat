@@ -25,6 +25,19 @@ sums=scripts/checksums/onnxruntime.sha256
 
 die() { echo "error: $*" >&2; exit 1; }
 
+# fetch_to URL FILE: downloads URL into FILE, or, when TWICECAT_DOWNLOADS is
+# set (an offline build such as the Flatpak), copies the file of the same
+# name from that directory. The caller checks the SHA-256 either way.
+fetch_to() {
+    if [ -n "${TWICECAT_DOWNLOADS:-}" ]; then
+        [ -f "$TWICECAT_DOWNLOADS/${1##*/}" ] || die "${1##*/} is not in TWICECAT_DOWNLOADS ($TWICECAT_DOWNLOADS)"
+        cp "$TWICECAT_DOWNLOADS/${1##*/}" "$2"
+        return
+    fi
+    echo "downloading $1" >&2
+    curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o "$2" "$1"
+}
+
 host_platform() {
     local os arch
     case "$(uname -s)" in
@@ -84,13 +97,13 @@ if [ ! -f "$marker" ] || [ "$(cat "$marker")" != "$expected" ]; then
     work=$(mktemp -d "$cache_root/$version/.fetch.XXXXXX")
     trap 'rm -rf "$work"' EXIT
     url="https://github.com/microsoft/onnxruntime/releases/download/v${version}/${archive}"
-    echo "downloading $url" >&2
-    curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o "$work/$archive" "$url"
+    fetch_to "$url" "$work/$archive"
     actual=$(sha256_of "$work/$archive")
     [ "$actual" = "$expected" ] || die "SHA-256 mismatch for $archive: expected $expected, got $actual"
     mkdir "$work/x"
     if [ "$ext" = tgz ]; then
-        tar -xzf "$work/$archive" -C "$work/x"
+        # Not the archive's owners: a build sandbox (the Flatpak's) may not chown.
+        tar --no-same-owner -xzf "$work/$archive" -C "$work/x"
     elif command -v unzip >/dev/null; then
         unzip -q "$work/$archive" -d "$work/x"
     else
