@@ -45,10 +45,11 @@ use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 use twicecat_audio::{FRAME_LEN, Outgoing, SAMPLE_RATE, SILENCE, SourceId};
 
+use super::capture::{Capture, CaptureSerial, Captured, PusherSlot};
 use super::cleaning::{ANNOUNCE_KEY, Claim, Cleaning};
 use super::encoder::{self, Sending};
 use super::jwt::SfuAccess;
-use super::video::{LocalSend, PatternSender, Videos};
+use super::video::{FramePusher, LocalSend, PatternSender, Videos};
 use super::{UserVolumes, user_volume};
 use crate::api::{
     CleaningStatus, CoreError, DegradationChoice, EncoderBackend, SoundSource, UserId, VideoCodec,
@@ -262,13 +263,32 @@ impl Players {
     }
 }
 
+/// Where the frames of one of our tracks come from.
+pub(crate) enum VideoSource {
+    /// The test pattern, made at the size sent.
+    Pattern,
+    /// A capture, already running.
+    Captured(Captured),
+}
+
+/// What makes the frames of a track being sent.
+enum Frames {
+    Pattern(PatternSender),
+    Captured {
+        capture: Capture,
+        slot: PusherSlot,
+        serial: CaptureSerial,
+        size: Option<(u32, u32)>,
+    },
+}
+
 /// One of our video tracks, on the connection that publishes.
 struct SentVideo {
     id: VideoTrackId,
     track: LocalVideoTrack,
     quality: VideoQuality,
     backend: EncoderBackend,
-    sender: PatternSender,
+    frames: Frames,
 }
 
 /// How long the encoder gets to finish the frames it has before our track
@@ -283,7 +303,13 @@ impl SentVideo {
     /// 0.3.49 `src/nvidia/h264_encoder_impl.cpp:347-352`), which is what
     /// unpublishing or closing the room while frames still come does.
     async fn stop_frames(self) -> (VideoTrackId, LocalVideoTrack) {
-        self.sender.stop().await;
+        match self.frames {
+            Frames::Pattern(sender) => sender.stop().await,
+            Frames::Captured { capture, slot, .. } => {
+                slot.clear();
+                capture.stop().await;
+            }
+        }
         tokio::time::sleep(ENCODER_DRAIN).await;
         (self.id, self.track)
     }
@@ -338,6 +364,8 @@ pub(crate) struct SfuConnection {
     track: Option<LocalAudioTrack>,
     /// Our camera and our screen share, on the connection that publishes.
     videos_sent: HashMap<VideoKind, SentVideo>,
+    /// The sound of our screen share, while it sends one.
+    share_sound: Option<SentShareSound>,
     voice: Option<Voice>,
     players: Arc<StdMutex<Players>>,
     flags: SharedFlags,
@@ -467,6 +495,7 @@ impl SfuConnection {
             room,
             track,
             videos_sent: HashMap::new(),
+            share_sound: None,
             voice: shared.voice.clone(),
             players,
             flags: shared.flags.clone(),
@@ -475,35 +504,52 @@ impl SfuConnection {
         })
     }
 
-    /// Publishes a test pattern as our camera or screen share at
-    /// `quality`, encoded by LiveKit as `sending` says (encoder, codec,
-    /// simulcast layers). Replaces the track of that kind we already send.
-    pub(crate) async fn start_pattern(
+    /// Publishes our camera or screen share at `quality` from `source`,
+    /// encoded by LiveKit as `sending` says (encoder, codec, simulcast
+    /// layers). Replaces the track of that kind we already send. A captured
+    /// source is published at its own size when it fits in what `sending`
+    /// allows, else scaled down to fit (keeping its shape); a capture that
+    /// cannot be published is stopped.
+    pub(crate) async fn start_video(
         &mut self,
         kind: VideoKind,
         quality: VideoQuality,
         sending: &Sending,
+        source: VideoSource,
     ) -> Result<VideoTrackId, CoreError> {
-        self.stop_video(kind).await;
-        let mode = sending.mode();
-        let (width, height, fps) = mode;
-        let source =
+        self.stop_video_track(kind).await;
+        let (max_w, max_h, fps) = sending.mode();
+        let (width, height) = match &source {
+            VideoSource::Pattern => (max_w, max_h),
+            VideoSource::Captured(c) => {
+                twicecat_video::capture::fit_size(c.size.unwrap_or((max_w, max_h)), (max_w, max_h))
+            }
+        };
+        let rtc_source =
             NativeVideoSource::new(VideoResolution { width, height }, kind == VideoKind::Screen);
         let name = match kind {
             VideoKind::Camera => "camera",
             VideoKind::Screen => "screen",
         };
         let track =
-            LocalVideoTrack::create_video_track(name, RtcVideoSource::Native(source.clone()));
-        let publication = self
+            LocalVideoTrack::create_video_track(name, RtcVideoSource::Native(rtc_source.clone()));
+        let published = self
             .room
             .local_participant()
             .publish_track(
                 LocalTrack::Video(track.clone()),
                 video_options(kind, sending),
             )
-            .await
-            .map_err(|_| CoreError::Call("could not publish the video".into()))?;
+            .await;
+        let publication = match published {
+            Ok(publication) => publication,
+            Err(_) => {
+                if let VideoSource::Captured(c) = source {
+                    c.capture.stop().await;
+                }
+                return Err(CoreError::Call("could not publish the video".into()));
+            }
+        };
         // Ours, not the SFU's track ID: a full reconnect publishes the
         // track again under a new one.
         static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -512,15 +558,29 @@ impl SfuConnection {
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         let (tx, feed) = VideoFeed::channel();
-        let sender = match PatternSender::start(source, tx, mode) {
-            Ok(sender) => sender,
-            Err(_) => {
-                let _ = self
-                    .room
-                    .local_participant()
-                    .unpublish_track(&publication.sid())
-                    .await;
-                return Err(CoreError::Internal("no thread for the video".into()));
+        let frames = match source {
+            VideoSource::Pattern => {
+                match PatternSender::start(rtc_source, tx, (width, height, fps)) {
+                    Ok(sender) => Frames::Pattern(sender),
+                    Err(_) => {
+                        let _ = self
+                            .room
+                            .local_participant()
+                            .unpublish_track(&publication.sid())
+                            .await;
+                        return Err(CoreError::Internal("no thread for the video".into()));
+                    }
+                }
+            }
+            VideoSource::Captured(c) => {
+                c.slot
+                    .set(FramePusher::new(rtc_source, tx, (width, height)));
+                Frames::Captured {
+                    capture: c.capture,
+                    slot: c.slot,
+                    serial: c.serial,
+                    size: c.size,
+                }
             }
         };
         self.videos.add_local(
@@ -544,14 +604,163 @@ impl SfuConnection {
                 track,
                 quality,
                 backend: sending.backend,
-                sender,
+                frames,
             },
         );
         Ok(id)
     }
 
+    /// The serial of the capture our track of `kind` sends, if it sends one.
+    pub(crate) fn capture_serial(&self, kind: VideoKind) -> Option<CaptureSerial> {
+        match self.videos_sent.get(&kind)?.frames {
+            Frames::Captured { serial, .. } => Some(serial),
+            Frames::Pattern(_) => None,
+        }
+    }
+
+    /// Publishes the sound of our screen share (what other applications
+    /// play, plan Task 8), stereo, as music: no voice processing, no DTX.
+    /// Replaces the one we send.
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn start_share_sound(&mut self) -> Result<(), CoreError> {
+        use twicecat_video::audio_share::{CHANNELS, SAMPLE_RATE as SHARE_RATE, ShareAudio};
+
+        self.stop_share_sound().await;
+        let source = NativeAudioSource::new(
+            AudioSourceOptions {
+                echo_cancellation: false,
+                noise_suppression: false,
+                auto_gain_control: false,
+            },
+            SHARE_RATE,
+            CHANNELS,
+            SOURCE_QUEUE_MS,
+        );
+        let (tx, rx) = mpsc::channel::<Vec<f32>>(SHARE_SOUND_QUEUE);
+        let capture = ShareAudio::start(Box::new(move |samples| {
+            // A full queue (the call side stalled) drops the newest block.
+            let _ = tx.try_send(samples.to_vec());
+        }))
+        .map_err(|_| CoreError::Call("the shared sound could not be captured".into()))?;
+        let track = LocalAudioTrack::create_audio_track(
+            "screen-sound",
+            RtcAudioSource::Native(source.clone()),
+        );
+        let published = self
+            .room
+            .local_participant()
+            .publish_track(
+                LocalTrack::Audio(track.clone()),
+                TrackPublishOptions {
+                    source: TrackSource::ScreenshareAudio,
+                    audio_encoding: Some(AudioEncoding {
+                        max_bitrate: SHARE_SOUND_BITRATE,
+                    }),
+                    dtx: false,
+                    red: false,
+                    ..TrackPublishOptions::default()
+                },
+            )
+            .await;
+        if published.is_err() {
+            drop(capture);
+            return Err(CoreError::Call("could not publish the shared sound".into()));
+        }
+        let task = spawn_audio_task(send_share_sound(rx, source));
+        self.share_sound = Some(SentShareSound {
+            track,
+            capture,
+            task,
+        });
+        Ok(())
+    }
+
+    /// Stops sending the sound of our screen share, if we send it.
+    pub(crate) async fn stop_share_sound(&mut self) {
+        let Some(sent) = self.share_sound.take() else {
+            return;
+        };
+        sent.task.abort();
+        let _ = sent.task.await;
+        #[cfg(target_os = "linux")]
+        {
+            let capture = sent.capture;
+            let _ = tokio::task::spawn_blocking(move || drop(capture)).await;
+        }
+        if self
+            .room
+            .local_participant()
+            .unpublish_track(&sent.track.sid())
+            .await
+            .is_err()
+        {
+            tracing::debug!("the shared sound track was gone already");
+        }
+    }
+
+    /// Whether the sound of our screen share is sent.
+    pub(crate) fn share_sound_sent(&self) -> bool {
+        self.share_sound.is_some()
+    }
+
     /// Stops sending our track of `kind`, if we send one.
     pub(crate) async fn stop_video(&mut self, kind: VideoKind) {
+        if kind == VideoKind::Screen {
+            self.stop_share_sound().await;
+        }
+        self.stop_video_track(kind).await;
+    }
+
+    /// Publishes our track of `kind` again from the same source, as
+    /// `sending` says (a capture keeps running; its sound is untouched):
+    /// another encoder after the one in use was lost.
+    pub(crate) async fn resend_video(
+        &mut self,
+        kind: VideoKind,
+        quality: VideoQuality,
+        sending: &Sending,
+    ) -> Result<VideoTrackId, CoreError> {
+        let Some(sent) = self.videos_sent.remove(&kind) else {
+            return Err(CoreError::Call("no video of that kind is sent".into()));
+        };
+        self.videos.remove(&sent.id);
+        let source = match sent.frames {
+            Frames::Pattern(sender) => {
+                sender.stop().await;
+                VideoSource::Pattern
+            }
+            Frames::Captured {
+                capture,
+                slot,
+                serial,
+                size,
+            } => {
+                // Frames wait in the slot (dropped) until the new track.
+                slot.clear();
+                VideoSource::Captured(Captured {
+                    capture,
+                    slot,
+                    serial,
+                    size,
+                })
+            }
+        };
+        tokio::time::sleep(ENCODER_DRAIN).await;
+        if self
+            .room
+            .local_participant()
+            .unpublish_track(&sent.track.sid())
+            .await
+            .is_err()
+        {
+            tracing::debug!("the video track was gone already");
+        }
+        self.start_video(kind, quality, sending, source).await
+    }
+
+    /// Stops our video track of `kind` (not the share's sound), if we send
+    /// one.
+    async fn stop_video_track(&mut self, kind: VideoKind) {
         if let Some(sent) = self.videos_sent.remove(&kind) {
             self.videos.remove(&sent.id);
             let (_, track) = sent.stop_frames().await;
@@ -624,6 +833,7 @@ impl SfuConnection {
             }
         }
         self.flags.changed.notify_one();
+        self.stop_share_sound().await;
         // Our frames stop before the room goes (see `SentVideo`).
         for (_, sent) in self.videos_sent.drain() {
             sent.stop_frames().await;
@@ -665,6 +875,49 @@ async fn announce(
             }
             () = reconnected.notified() => sent = None,
             () = tokio::time::sleep(ANNOUNCE_RETRY), if sent.is_none() => {}
+        }
+    }
+}
+
+/// How many blocks of shared sound may wait for the call (a block is one
+/// PipeWire quantum, about 10 to 20 ms).
+#[cfg(target_os = "linux")]
+const SHARE_SOUND_QUEUE: usize = 32;
+/// Opus for music, stereo.
+#[cfg(target_os = "linux")]
+const SHARE_SOUND_BITRATE: u64 = 128_000;
+
+/// The sound of our screen share, on the connection that publishes.
+struct SentShareSound {
+    track: LocalAudioTrack,
+    #[cfg(target_os = "linux")]
+    capture: twicecat_video::audio_share::ShareAudio,
+    task: JoinHandle<()>,
+}
+
+/// Moves the shared sound into the call track in 10 ms stereo frames.
+#[cfg(target_os = "linux")]
+async fn send_share_sound(mut blocks: mpsc::Receiver<Vec<f32>>, source: NativeAudioSource) {
+    const CHANNELS: usize = 2;
+    let frame = FRAME_LEN * CHANNELS;
+    let mut pending: Vec<i16> = Vec::with_capacity(frame * 4);
+    while let Some(block) = blocks.recv().await {
+        pending.extend(
+            block
+                .iter()
+                .map(|&x| (x.clamp(-1.0, 1.0) * f32::from(i16::MAX)) as i16),
+        );
+        while pending.len() >= frame {
+            let audio = AudioFrame {
+                data: pending[..frame].into(),
+                sample_rate: SAMPLE_RATE,
+                num_channels: CHANNELS as u32,
+                samples_per_channel: FRAME_LEN as u32,
+            };
+            if source.capture_frame(&audio).await.is_err() {
+                tracing::debug!("a shared sound frame was rejected by the call track");
+            }
+            pending.drain(..frame);
         }
     }
 }

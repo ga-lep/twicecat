@@ -365,6 +365,35 @@ impl DataPaths {
         self.write_private("video_settings.json", bytes)
     }
 
+    /// `<root>/screen_restore_token`: the ScreenCast portal's token for the
+    /// screen or window picked last time, kept only while "remember my
+    /// choice" is on (plan Phase 9 Task 8). It lets us share that choice
+    /// again without the picker, so it is private (0o600) and never logged.
+    pub fn screen_restore_token_file(&self) -> PathBuf {
+        self.root.join("screen_restore_token")
+    }
+
+    /// The remembered restore token; `None` when there is none (or the file
+    /// is not one we wrote: not a small regular file of text).
+    pub fn read_screen_restore_token(&self) -> Option<String> {
+        let bytes = read_capped_regular_file(&self.screen_restore_token_file())?;
+        let token = String::from_utf8(bytes).ok()?.trim().to_owned();
+        (!token.is_empty()).then_some(token)
+    }
+
+    /// Replaces the remembered restore token atomically.
+    pub fn write_screen_restore_token(&self, token: &str) -> std::io::Result<()> {
+        self.write_private("screen_restore_token", token.as_bytes())
+    }
+
+    /// Forgets the restore token; a missing file is no error.
+    pub fn remove_screen_restore_token(&self) -> std::io::Result<()> {
+        match std::fs::remove_file(self.screen_restore_token_file()) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    }
+
     fn write_private(&self, name: &str, bytes: &[u8]) -> std::io::Result<()> {
         use std::io::Write as _;
 
@@ -816,6 +845,31 @@ mod tests {
         );
         assert!(!dir.path().join("root/call_settings.json.tmp").exists());
         assert!(paths.call_settings_file().starts_with(paths.root()));
+    }
+
+    #[test]
+    fn the_screen_restore_token_is_kept_privately_and_forgotten() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = DataPaths::at(dir.path().join("root"));
+        assert_eq!(paths.read_screen_restore_token(), None);
+        paths.remove_screen_restore_token().unwrap();
+        paths.write_screen_restore_token("token-1").unwrap();
+        paths.write_screen_restore_token("token-2").unwrap();
+        assert_eq!(
+            paths.read_screen_restore_token().as_deref(),
+            Some("token-2")
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(paths.screen_restore_token_file())
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        paths.remove_screen_restore_token().unwrap();
+        assert_eq!(paths.read_screen_restore_token(), None);
     }
 
     #[test]

@@ -29,7 +29,7 @@ AGENTS.md as ever. In particular: rule 2 (every iced and wgpu API read in the re
   - Voice & audio card: the pages and the controls that a beginner needs (devices, talking, noise reduction with a plain Off, Standard, Strong choice, a mic test) and, with the switch, everything the core allows (processing chain, gate, gain, bitrate, GPU, other people's voices, announcements, diagnostics).
   - Video card: camera, a picture of it, quality in plain words for the camera and for sharing; and, with the switch, the encoder, codec, sizes, rates, bitrates, layers, degradation preference, the upload cap, the encoder status and live numbers of the call's video.
   - Acceptance: `update` tests for every control, gallery scenarios and layout tests for both levels, the headless gallery, the shortcuts and accessibility documents.
-- [ ] Step 4: wrap-up (`docs`): PROGRESS.md, the checkpoint list for the human, `docs/accessibility.md`.
+- [x] Step 4: wrap-up (`docs`): PROGRESS.md, the checkpoint list for the human, `docs/accessibility.md`.
 
 ## Decisions taken without asking (recommended answers, change them if wrong)
 - The camera and share shortcuts are Ctrl+Shift+O and Ctrl+Shift+E (Teams' chords), because Ctrl+Shift+V is paste in the composer.

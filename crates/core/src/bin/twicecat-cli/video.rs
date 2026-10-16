@@ -1,17 +1,22 @@
 //! Video commands of `twicecat-cli`: send the core's test pattern as the
-//! camera or a screen share, list the call's video tracks, pick their
-//! layers, print their statistics and the encoders this machine has. A
-//! terminal shows no pictures, so received frames are only counted by the
+//! camera or a screen share, share the screen (the system's picker, or a
+//! source from `/video sources` on X11), send a camera from `/video
+//! cameras`, list the call's video tracks, pick
+//! their layers, print their statistics and the encoders this machine has.
+//! A terminal shows no pictures, so received frames are only counted by the
 //! core's statistics.
 
 use twicecat_core::api::{
-    Command, CoreEvent, LocalVideo, VideoDirection, VideoEncoders, VideoKind, VideoQuality,
-    VideoStats, VideoTrackId, VideoTrackView,
+    Command, CoreEvent, LocalVideo, ScreenSource, ScreenSourceKind, ScreenSources, VideoDevice,
+    VideoDirection, VideoEncoders, VideoKind, VideoQuality, VideoStats, VideoTrackId,
+    VideoTrackView,
 };
 
 use super::sanitize;
 
 pub(crate) const USAGE: &str = "/video | /video pattern <720p|1080p|1440p|2160p> <30|60> [screen] \
+     | /video sources | /video share <720p|1080p|1440p|2160p> <30|60> [n] [sound] \
+     | /video cameras | /video camera <720p|1080p|1440p|2160p> <30|60> [n] \
      | /video off [screen] | /video view <n> <width>x<height>|hide | /video stats \
      | /video encoders";
 
@@ -24,6 +29,23 @@ pub(crate) enum VideoCmd {
     Pattern {
         kind: VideoKind,
         quality: VideoQuality,
+    },
+    /// List what can be shared.
+    Sources,
+    /// Share the screen: source `n` from `/video sources` (X11), or the
+    /// system's picker; with the sound of other applications.
+    Share {
+        quality: VideoQuality,
+        source: Option<usize>,
+        sound: bool,
+    },
+    /// List the cameras.
+    Cameras,
+    /// Send camera `n` from `/video cameras`, or the settings' or default
+    /// one.
+    Camera {
+        quality: VideoQuality,
+        device: Option<usize>,
     },
     /// Stop sending our camera or screen share.
     Off(VideoKind),
@@ -62,6 +84,29 @@ pub(crate) fn parse(arg: &str) -> Result<VideoCmd, &'static str> {
         [] => Ok(VideoCmd::List),
         ["stats"] => Ok(VideoCmd::Stats),
         ["encoders"] => Ok(VideoCmd::Encoders),
+        ["sources"] => Ok(VideoCmd::Sources),
+        ["cameras"] => Ok(VideoCmd::Cameras),
+        ["camera", res, fps, rest @ ..] if rest.len() <= 1 => Ok(VideoCmd::Camera {
+            quality: quality(res, fps).ok_or(USAGE)?,
+            device: match rest {
+                [] => None,
+                [n] => Some(n.parse().map_err(|_| USAGE)?),
+                _ => return Err(USAGE),
+            },
+        }),
+        ["share", res, fps, rest @ ..] if rest.len() <= 2 => {
+            let sound = rest.last() == Some(&"sound");
+            let source = match rest {
+                [] | ["sound"] => None,
+                [n] | [n, "sound"] => Some(n.parse().map_err(|_| USAGE)?),
+                _ => return Err(USAGE),
+            };
+            Ok(VideoCmd::Share {
+                quality: quality(res, fps).ok_or(USAGE)?,
+                source,
+                sound,
+            })
+        }
         ["pattern", res, fps, rest @ ..] if rest.len() <= 1 => Ok(VideoCmd::Pattern {
             kind: kind(rest.first().copied()).ok_or(USAGE)?,
             quality: quality(res, fps).ok_or(USAGE)?,
@@ -89,6 +134,10 @@ pub(crate) fn parse(arg: &str) -> Result<VideoCmd, &'static str> {
 pub(crate) struct Video {
     tracks: Vec<VideoTrackView>,
     show_stats: bool,
+    /// What `/video sources` listed last.
+    sources: Vec<ScreenSource>,
+    /// What `/video cameras` listed last.
+    cameras: Vec<VideoDevice>,
 }
 
 fn kind_name(kind: VideoKind) -> &'static str {
@@ -153,6 +202,49 @@ impl Video {
                 };
                 (vec![command], Vec::new())
             }
+            VideoCmd::Sources => (vec![Command::ListScreenSources], Vec::new()),
+            VideoCmd::Share {
+                quality,
+                source,
+                sound,
+            } => {
+                let source = match source {
+                    None => None,
+                    Some(n) => match n.checked_sub(1).and_then(|i| self.sources.get(i)) {
+                        Some(s) => Some(s.id.clone()),
+                        None => {
+                            return (
+                                Vec::new(),
+                                vec!["No such source. Use /video sources to list them.".into()],
+                            );
+                        }
+                    },
+                };
+                (
+                    vec![Command::StartScreenShare {
+                        source,
+                        quality,
+                        audio: sound,
+                    }],
+                    Vec::new(),
+                )
+            }
+            VideoCmd::Cameras => (vec![Command::ListVideoDevices], Vec::new()),
+            VideoCmd::Camera { quality, device } => {
+                let device = match device {
+                    None => None,
+                    Some(n) => match n.checked_sub(1).and_then(|i| self.cameras.get(i)) {
+                        Some(c) => Some(c.id.clone()),
+                        None => {
+                            return (
+                                Vec::new(),
+                                vec!["No such camera. Use /video cameras to list them.".into()],
+                            );
+                        }
+                    },
+                };
+                (vec![Command::StartCamera { device, quality }], Vec::new())
+            }
             VideoCmd::Off(VideoKind::Camera) => (vec![Command::StopCamera], Vec::new()),
             VideoCmd::Off(VideoKind::Screen) => (vec![Command::StopScreenShare], Vec::new()),
             VideoCmd::View { n, size } => match n.checked_sub(1).and_then(|i| self.tracks.get(i)) {
@@ -216,11 +308,21 @@ impl Video {
                 self.tracks = tracks;
                 lines
             }
-            CoreEvent::LocalVideo(LocalVideo { camera, screen, .. }) => vec![format!(
-                "[video] camera {}, screen share {}",
+            CoreEvent::LocalVideo(LocalVideo {
+                camera,
+                screen,
+                screen_audio,
+            }) => vec![format!(
+                "[video] camera {}, screen share {}{}",
                 if camera.is_some() { "on" } else { "off" },
                 if screen.is_some() { "on" } else { "off" },
+                if screen_audio { " with sound" } else { "" },
             )],
+            CoreEvent::ScreenSources(sources) => self.sources_lines(sources),
+            CoreEvent::VideoDevices(devices) => {
+                self.cameras = devices.cameras;
+                self.camera_lines()
+            }
             CoreEvent::VideoStats(stats) if self.show_stats => {
                 self.show_stats = false;
                 self.stats_lines(&stats)
@@ -228,6 +330,60 @@ impl Video {
             CoreEvent::VideoEncoders(encoders) => encoder_lines(&encoders),
             _ => Vec::new(),
         }
+    }
+
+    fn sources_lines(&mut self, sources: ScreenSources) -> Vec<String> {
+        self.sources = sources.sources;
+        if sources.system_picker {
+            return vec![
+                "[video] The system shows its own picker: /video share <res> <fps> [sound]".into(),
+            ];
+        }
+        if self.sources.is_empty() {
+            return vec!["[video] Nothing to share.".into()];
+        }
+        self.sources
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let kind = match s.kind {
+                    ScreenSourceKind::Monitor => "screen",
+                    ScreenSourceKind::Window => "window",
+                };
+                format!(
+                    "  {}. {kind} {} {}x{}",
+                    i + 1,
+                    sanitize(&s.title),
+                    s.width,
+                    s.height
+                )
+            })
+            .collect()
+    }
+
+    /// The cameras, numbered, with their modes (largest first).
+    fn camera_lines(&self) -> Vec<String> {
+        if self.cameras.is_empty() {
+            return vec!["[video] No camera.".into()];
+        }
+        self.cameras
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let modes: Vec<String> = c
+                    .modes
+                    .iter()
+                    .map(|m| format!("{}x{}@{}", m.width, m.height, m.fps))
+                    .collect();
+                format!(
+                    "  {}. {}{}: {}",
+                    i + 1,
+                    sanitize(&c.name),
+                    if c.is_default { " (default)" } else { "" },
+                    modes.join(" ")
+                )
+            })
+            .collect()
     }
 
     fn has(&self, id: &VideoTrackId) -> bool {
@@ -356,6 +512,124 @@ mod tests {
         assert_eq!(parse("stats"), Ok(VideoCmd::Stats));
         assert_eq!(parse("encoders"), Ok(VideoCmd::Encoders));
         assert_eq!(parse("off camera"), Err(USAGE));
+        assert_eq!(parse("sources"), Ok(VideoCmd::Sources));
+        assert_eq!(
+            parse("share 1080p 60"),
+            Ok(VideoCmd::Share {
+                quality: VideoQuality::Hd1080p60,
+                source: None,
+                sound: false
+            })
+        );
+        assert_eq!(
+            parse("share 4k 30 2 sound"),
+            Ok(VideoCmd::Share {
+                quality: VideoQuality::Uhd2160p30,
+                source: Some(2),
+                sound: true
+            })
+        );
+        assert_eq!(
+            parse("share 720p 30 sound"),
+            Ok(VideoCmd::Share {
+                quality: VideoQuality::Hd720p30,
+                source: None,
+                sound: true
+            })
+        );
+        assert_eq!(parse("share 720p 30 two"), Err(USAGE));
+    }
+
+    #[test]
+    fn sources_are_listed_and_shared_by_number() {
+        let mut video = Video::default();
+        let (commands, lines) = video.command(VideoCmd::Share {
+            quality: VideoQuality::Auto,
+            source: Some(1),
+            sound: false,
+        });
+        assert!(commands.is_empty(), "nothing listed yet");
+        assert_eq!(lines.len(), 1);
+        let lines = video.event(CoreEvent::ScreenSources(ScreenSources {
+            system_picker: false,
+            sources: vec![ScreenSource {
+                id: "x11-window:7".into(),
+                kind: ScreenSourceKind::Window,
+                title: "Notes\u{1b}[31m".into(),
+                width: 800,
+                height: 600,
+                thumbnail: None,
+            }],
+        }));
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("window") && lines[0].contains("800x600"));
+        assert!(!lines[0].contains('\u{1b}'), "titles are sanitised");
+        let (commands, _) = video.command(VideoCmd::Share {
+            quality: VideoQuality::Auto,
+            source: Some(1),
+            sound: true,
+        });
+        assert!(matches!(
+            commands.as_slice(),
+            [Command::StartScreenShare { source: Some(s), audio: true, .. }] if s.as_str() == "x11-window:7"
+        ));
+        let lines = video.event(CoreEvent::ScreenSources(ScreenSources {
+            system_picker: true,
+            sources: Vec::new(),
+        }));
+        assert!(lines[0].contains("picker"));
+    }
+
+    #[test]
+    fn cameras_are_listed_and_sent_by_number() {
+        use twicecat_core::api::{VideoDevices, VideoMode};
+        assert_eq!(parse("cameras"), Ok(VideoCmd::Cameras));
+        assert_eq!(
+            parse("camera 1080p 60 2"),
+            Ok(VideoCmd::Camera {
+                quality: VideoQuality::Hd1080p60,
+                device: Some(2)
+            })
+        );
+        assert_eq!(parse("camera 720p 30 two"), Err(USAGE));
+        let mut video = Video::default();
+        let (commands, lines) = video.command(VideoCmd::Camera {
+            quality: VideoQuality::Hd720p30,
+            device: Some(1),
+        });
+        assert!(commands.is_empty(), "nothing listed yet");
+        assert_eq!(lines.len(), 1);
+        let (commands, _) = video.command(VideoCmd::Camera {
+            quality: VideoQuality::Hd720p30,
+            device: None,
+        });
+        assert!(matches!(
+            commands.as_slice(),
+            [Command::StartCamera { device: None, .. }]
+        ));
+        let lines = video.event(CoreEvent::VideoDevices(VideoDevices {
+            cameras: vec![VideoDevice {
+                id: "v4l2_input.usb-1".into(),
+                name: "Webcam\u{1b}[31m".into(),
+                is_default: true,
+                modes: vec![VideoMode {
+                    width: 1280,
+                    height: 720,
+                    fps: 30,
+                }],
+            }],
+        }));
+        assert_eq!(lines, ["  1. Webcam?[31m (default): 1280x720@30"]);
+        let (commands, _) = video.command(VideoCmd::Camera {
+            quality: VideoQuality::Hd720p30,
+            device: Some(1),
+        });
+        assert!(matches!(
+            commands.as_slice(),
+            [Command::StartCamera { device: Some(d), .. }] if d.as_str() == "v4l2_input.usb-1"
+        ));
+        let none = video.event(CoreEvent::VideoDevices(VideoDevices::default()));
+        assert_eq!(none, ["[video] No camera."]);
     }
 
     #[test]

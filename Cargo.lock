@@ -267,6 +267,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.4.3",
  "serde",
+ "serde_repr",
  "tokio",
  "zbus",
 ]
@@ -8516,10 +8517,17 @@ name = "twicecat-video"
 version = "0.1.0"
 dependencies = [
  "ash",
+ "ashpd",
  "libloading 0.8.9",
  "naga",
+ "pipewire",
  "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "twicecat-perf",
+ "x11rb",
  "yuvutils-rs",
+ "zune-jpeg",
 ]
 
 [[package]]

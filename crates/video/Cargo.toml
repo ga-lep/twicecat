@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 thiserror = "2"
+tracing = "0.1"
 # CPU colour conversion (pure Rust, SIMD; plan Q11, approved 2026-10-13).
 yuvutils-rs = "=0.8.3"
 # Vulkan compute and DMA-BUF import (plan Task 4/Q11): the version already
@@ -18,6 +19,28 @@ ash = "=0.38.0"
 # the version already locked through ash.
 libloading = "=0.8.9"
 
+# Linux capture (plan Tasks 8 and 9, Q9-Q11): the ScreenCast and Camera
+# portals, our own PipeWire client for their streams and for the share's
+# sound, and X11.
+[target.'cfg(target_os = "linux")'.dependencies]
+# Not ashpd's `pipewire` feature: it pulls pipewire 0.9, which cannot link
+# beside the 0.10 that twicecat-audio uses (both claim `links =
+# "pipewire-0.3"`). We open the portal's PipeWire remote ourselves.
+ashpd = { version = "=0.13.13", default-features = false, features = ["tokio", "screencast", "camera"] }
+# The version and feature twicecat-audio already uses.
+pipewire = { version = "=0.10.1", features = ["v0_3_53"] }
+# Already locked (through winit) with these features.
+x11rb = { version = "=0.13.2", features = ["shm", "randr"] }
+# Cameras' Motion-JPEG (plan Task 9, Q10/Q11): pure Rust, the version
+# already locked (through image).
+zune-jpeg = "=0.5.15"
+
+[dev-dependencies]
+# The capture tests wait on the portal state machine (a fake portal); the
+# version the workspace already locks.
+tokio = { version = "1", features = ["macros", "rt"] }
+twicecat-perf = { path = "../perf" }
+
 [build-dependencies]
 # WGSL compute shaders to SPIR-V, validated at build time (plan Q11, approved
 # 2026-10-13): the version already locked through wgpu.
@@ -27,3 +50,6 @@ naga = { version = "=27.0.3", default-features = false, features = ["wgsl-in", "
 # Hardware tests (Vulkan device, conversion, DMA-BUF import): they need a
 # GPU and are compiled only with this feature (plan Task 4).
 hw-video = []
+# A camera made in-process on PipeWire (`capture::test_camera`), for the
+# core's tests (plan Task 9: no `v4l2loopback` on the test machines).
+test-camera = []

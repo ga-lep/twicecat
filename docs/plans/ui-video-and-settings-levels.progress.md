@@ -4,3 +4,6 @@ Step 2: complete (advanced video settings in the core: VideoTuning per kind, Cam
   notes: SVC, degradation preference, software H.264 and AV1, NVENC with tunings and the camera capture mode are not verified (no hardware, no real camera); CLI cannot set a tuning
 Step 3: complete (Settings for two levels: the saved switch, simple and advanced pages for Appearance, Notifications, Voice & audio and the new Video page, live audio basics on the page, gallery scenarios and tests for both levels; gate ok)
   notes: advanced Video page is long and scrolls; camera preview needs the core's preview command (the engine answers not supported)
+Step 4: started (branch feat/video-capture, after Phase 9 Tasks 8 and 9)
+Step 4: complete (wrap-up: PROGRESS.md, checkpoint list, docs/accessibility.md; docs only, the gate of the commit before stands: 2302 tests)
+  notes: [fix] a preview whose camera went away stayed frozen (fix(app) commit, ui.19); [tasks] Phase 9 Tasks 10 and 11 ticked in PROGRESS.md, A/V delay and pop-out left

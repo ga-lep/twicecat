@@ -254,8 +254,12 @@ struct Round {
     view: (u32, u32),
     /// No picture is bigger than this (libwebrtc starts small and grows).
     at_most: (u32, u32),
-    /// Some picture is at least this tall, when it matters.
-    reaches_height: Option<u32>,
+    /// With one layer: carol gets alice's own picture, taller than the layer
+    /// a tile this small would get from three (this tall), and no taller
+    /// than alice sent. Not a fixed size: under CPU load libwebrtc lowers a
+    /// lone layer's resolution to keep the camera's rate (a CI runner sent
+    /// 640x360 for 720p).
+    own_layer_over: Option<u32>,
     /// Carol's received frames per second, from to.
     fps: (f64, f64),
     /// The codec of the received track, when it matters.
@@ -283,7 +287,7 @@ async fn tuned_video_changes_what_the_receiver_gets() {
             codec_choice: VideoCodecChoice::H264,
             view: (640, 360),
             at_most: (640, 360),
-            reaches_height: None,
+            own_layer_over: None,
             fps: (11.0, 18.0),
             codec: None,
             max_kbps: None,
@@ -295,10 +299,10 @@ async fn tuned_video_changes_what_the_receiver_gets() {
                 ..VideoTuning::default()
             },
             codec_choice: VideoCodecChoice::H264,
-            // A small tile would be given the 360p layer if there were one.
+            // A tile this small gets the 180p layer when there are three.
             view: (320, 180),
             at_most: (1280, 720),
-            reaches_height: Some(720),
+            own_layer_over: Some(180),
             fps: (24.0, 32.0),
             codec: None,
             max_kbps: None,
@@ -313,7 +317,7 @@ async fn tuned_video_changes_what_the_receiver_gets() {
             codec_choice: VideoCodecChoice::H264,
             view: (1280, 720),
             at_most: (1280, 720),
-            reaches_height: None,
+            own_layer_over: None,
             fps: (20.0, 32.0),
             codec: Some(VideoCodec::Vp9),
             max_kbps: None,
@@ -328,7 +332,7 @@ async fn tuned_video_changes_what_the_receiver_gets() {
             codec_choice: VideoCodecChoice::H264,
             view: (1280, 720),
             at_most: (1280, 720),
-            reaches_height: None,
+            own_layer_over: None,
             fps: (5.0, 32.0),
             codec: None,
             max_kbps: Some(800),
@@ -391,12 +395,15 @@ async fn tuned_video_changes_what_the_receiver_gets() {
             })
             .await
             .unwrap();
-        let (watched, stats) = statistics(
+        // Alice's own statistics too, read over the same seconds: what she
+        // really sends.
+        let watching = statistics(
             &mut call.carol,
             &mut carol_seen,
             watch(&mut feed, Duration::from_secs(8)),
-        )
-        .await;
+        );
+        let alice_sent = drain(&mut call.alice, &mut alice_seen, Duration::from_secs(10));
+        let ((watched, stats), alice_sent) = tokio::join!(watching, alice_sent);
         eprintln!(
             "{}: sizes {:?}, stats {:?}",
             round.name,
@@ -413,10 +420,28 @@ async fn tuned_video_changes_what_the_receiver_gets() {
             watched.sizes,
             round.at_most
         );
-        if let Some(height) = round.reaches_height {
+        if let Some(layer) = round.own_layer_over {
+            let own: Vec<_> = alice_seen
+                .tracks
+                .iter()
+                .filter(|t| t.is_local && t.kind == VideoKind::Camera)
+                .map(|t| t.id.clone())
+                .collect();
+            let sent: Vec<u32> = alice_sent
+                .iter()
+                .filter(|s| s.direction == VideoDirection::Sent && own.contains(&s.track))
+                .map(|s| s.height)
+                .collect();
+            let tallest = watched.sizes.iter().map(|(_, h)| *h).max().unwrap_or(0);
             assert!(
-                watched.sizes.iter().any(|(_, h)| *h >= height),
-                "{}: sizes {:?}, one at least {height} tall",
+                tallest > layer,
+                "{}: sizes {:?}, none taller than the {layer}p layer; alice sent heights {sent:?}",
+                round.name,
+                watched.sizes
+            );
+            assert!(
+                sent.iter().any(|&h| h >= tallest),
+                "{}: sizes {:?}, taller than alice sent ({sent:?})",
                 round.name,
                 watched.sizes
             );

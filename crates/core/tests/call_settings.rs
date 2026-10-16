@@ -158,27 +158,35 @@ async fn call_commands_need_a_session_or_a_call() {
 
 /// The error a command should answer with.
 enum Answer {
-    NotSupported(&'static str),
     NotInCall,
+    /// A call error naming this.
+    Call(&'static str),
+    /// Not supported on this system: this feature.
+    NotSupported(&'static str),
 }
 
-/// The video commands without a call and without real cameras or screens
-/// (Phase 9 Task 5): what needs a call says so, what needs hardware, the
-/// settings or our encoders answers `NotSupported` until its task.
+/// The video commands without a call and without touching a real camera
+/// (Phase 9 Tasks 5, 8 and 9): what needs a call says so; a preview of a
+/// camera that is not there says that. Listing cameras and screen sources
+/// answers by machine (below).
 #[tokio::test]
 async fn video_commands_answer_without_a_call_or_hardware() {
     let dir = tempfile::tempdir().unwrap();
     let mut handle = core(dir.path());
-    use Answer::{NotInCall, NotSupported};
+    use Answer::{Call, NotInCall, NotSupported};
+    // Cameras are captured on Linux only so far.
+    let no_camera = if cfg!(target_os = "linux") {
+        Call("camera")
+    } else {
+        NotSupported("cameras")
+    };
     let cases = [
-        (Command::ListVideoDevices, NotSupported("cameras")),
-        (Command::ListScreenSources, NotSupported("screen sharing")),
         (
             Command::StartCamera {
                 device: None,
                 quality: VideoQuality::Auto,
             },
-            NotSupported("cameras"),
+            NotInCall,
         ),
         (Command::StopCamera, NotInCall),
         (
@@ -187,7 +195,7 @@ async fn video_commands_answer_without_a_call_or_hardware() {
                 quality: VideoQuality::Uhd2160p60,
                 audio: true,
             },
-            NotSupported("screen-share sound"),
+            NotInCall,
         ),
         (Command::StopScreenShare, NotInCall),
         (
@@ -199,27 +207,54 @@ async fn video_commands_answer_without_a_call_or_hardware() {
             },
             NotInCall,
         ),
+        // A named camera that is not there: never this machine's own.
         (
             Command::StartCameraPreview {
-                device: None,
+                device: Some("twicecat-no-such-camera".into()),
                 quality: VideoQuality::Hd720p30,
             },
-            NotSupported("video"),
+            no_camera,
         ),
-        (Command::StopCameraPreview, NotSupported("video")),
     ];
     for (command, answer) in cases {
         let name = format!("{command:?}");
         send(&handle, command).await;
         let e = expect_event(&mut handle, |e| matches!(e, CoreEvent::Error(_))).await;
         let ok = match answer {
+            NotInCall => matches!(e, CoreEvent::Error(CoreError::NotInCall)),
+            Call(what) => matches!(&e, CoreEvent::Error(CoreError::Call(w)) if w.contains(what)),
             NotSupported(what) => {
                 matches!(&e, CoreEvent::Error(CoreError::NotSupported(w)) if w == what)
             }
-            NotInCall => matches!(e, CoreEvent::Error(CoreError::NotInCall)),
         };
         assert!(ok, "{name}: {e:?}");
     }
+    // The system's picker (Wayland), our own list (X11), or nothing to
+    // share without a display (CI).
+    send(&handle, Command::ListScreenSources).await;
+    let e = expect_event(&mut handle, |e| {
+        matches!(e, CoreEvent::Error(_) | CoreEvent::ScreenSources(_))
+    })
+    .await;
+    assert!(
+        matches!(&e, CoreEvent::ScreenSources(_))
+            || matches!(&e, CoreEvent::Error(CoreError::NotSupported(w)) if w == "screen sharing"),
+        "ListScreenSources: {e:?}"
+    );
+    // The cameras here (listing opens none), or why there are none to list
+    // (no PipeWire on CI; no camera capture outside Linux yet).
+    send(&handle, Command::ListVideoDevices).await;
+    let e = expect_event(&mut handle, |e| {
+        matches!(e, CoreEvent::Error(_) | CoreEvent::VideoDevices(_))
+    })
+    .await;
+    assert!(
+        matches!(&e, CoreEvent::VideoDevices(_))
+            || matches!(&e, CoreEvent::Error(CoreError::Call(w)) if w.contains("camera"))
+            || (!cfg!(target_os = "linux")
+                && matches!(&e, CoreEvent::Error(CoreError::NotSupported(w)) if w == "cameras")),
+        "ListVideoDevices: {e:?}"
+    );
     send(&handle, Command::Shutdown).await;
 }
 

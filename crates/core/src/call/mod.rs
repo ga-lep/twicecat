@@ -19,6 +19,7 @@
 //!
 //! Leaving fires the delayed leave at once (or sends the empty membership).
 
+mod capture;
 mod cleaning;
 mod e2ee;
 mod encoder;
@@ -48,13 +49,16 @@ use matrix_sdk::{Client, Room, RoomState};
 use tokio::sync::{Mutex, Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 
+#[cfg(target_os = "linux")]
+pub(crate) use self::capture::{Capture, CaptureSink, PreviewSink, PusherSlot, next_serial};
+pub(crate) use self::capture::{CaptureEnded, CaptureSerial, Captured};
 use self::cleaning::Cleaning;
 pub(crate) use self::cleaning::announcement;
 use self::e2ee::KeyPlanner;
 pub(crate) use self::e2ee::SECRET_LOG_TARGETS;
 pub(crate) use self::encoder::{Available as VideoEncodersAvailable, Sending, tuned};
-pub(crate) use self::media::MediaNotice;
 use self::media::{ConnectionShared, Publish, SfuConnection, SharedFlags};
+pub(crate) use self::media::{MediaNotice, VideoSource};
 use self::membership::MEMBERSHIP_EXPIRES;
 use self::own_membership::{
     OwnMembership, keep_membership, schedule_delayed_leave, send_membership,
@@ -443,16 +447,50 @@ impl CallSession {
         });
     }
 
-    /// Sends a test pattern as our camera or screen share, `mode` = (width,
-    /// height, fps), replacing the one of that kind we send.
-    pub(crate) async fn start_pattern(
+    /// Sends our camera or screen share from `source` (the test pattern or
+    /// a capture), replacing the one of that kind we send.
+    pub(crate) async fn start_video(
+        &mut self,
+        kind: VideoKind,
+        quality: VideoQuality,
+        sending: &Sending,
+        source: VideoSource,
+    ) -> Result<VideoTrackId, CoreError> {
+        match self.own.as_mut() {
+            Some(own) => own.start_video(kind, quality, sending, source).await,
+            None => {
+                if let VideoSource::Captured(c) = source {
+                    c.capture.stop().await;
+                }
+                Err(CoreError::NotInCall)
+            }
+        }
+    }
+
+    /// Sends our track of `kind` again from the same source as `sending`
+    /// says (the encoder in use was lost).
+    pub(crate) async fn resend_video(
         &mut self,
         kind: VideoKind,
         quality: VideoQuality,
         sending: &Sending,
     ) -> Result<VideoTrackId, CoreError> {
         match self.own.as_mut() {
-            Some(own) => own.start_pattern(kind, quality, sending).await,
+            Some(own) => own.resend_video(kind, quality, sending).await,
+            None => Err(CoreError::NotInCall),
+        }
+    }
+
+    /// The serial of the capture our track of `kind` sends, if it sends one.
+    pub(crate) fn capture_serial(&self, kind: VideoKind) -> Option<CaptureSerial> {
+        self.own.as_ref().and_then(|own| own.capture_serial(kind))
+    }
+
+    /// Sends the sound of our screen share too.
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn start_share_sound(&mut self) -> Result<(), CoreError> {
+        match self.own.as_mut() {
+            Some(own) => own.start_share_sound().await,
             None => Err(CoreError::NotInCall),
         }
     }
@@ -475,7 +513,7 @@ impl CallSession {
         LocalVideo {
             camera: sent(VideoKind::Camera),
             screen: sent(VideoKind::Screen),
-            screen_audio: false,
+            screen_audio: self.own.as_ref().is_some_and(|own| own.share_sound_sent()),
         }
     }
 

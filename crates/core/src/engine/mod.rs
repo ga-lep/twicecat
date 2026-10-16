@@ -152,6 +152,7 @@ impl Core {
             deafened: false,
             call_reconnects: 0,
             ring_gate: watch::channel(RingGate::default()).0,
+            captures: video::Captures::default(),
         };
         tokio::spawn(engine.run(cmd_rx));
         CoreHandle {
@@ -555,6 +556,8 @@ struct Engine {
     /// Whether the ringtone may play, and where; each session's ringer
     /// follows it.
     ring_gate: watch::Sender<RingGate>,
+    /// Screen captures: their ends, and a portal picker that is up.
+    captures: video::Captures,
 }
 
 /// An OAuth login in progress. Its task builds the client, emits `OAuthUrl`,
@@ -1017,6 +1020,9 @@ impl Engine {
                 },
                 joined = next_oauth(&mut self.oauth) => self.on_oauth_done(joined).await,
                 notice = next_media_notice(&mut self.call) => self.on_media_notice(notice).await,
+                capture = video::next_capture_event(&mut self.captures) => {
+                    self.on_capture_event(capture).await;
+                }
                 change = next_change(&mut self.active), if watch_changes => match change {
                     Change::Got(c) => self.on_change(Some(c)).await,
                     Change::Missed => self.on_change(None).await,
@@ -3205,6 +3211,7 @@ mod tests {
             deafened: false,
             call_reconnects: 0,
             ring_gate: watch::channel(RingGate::default()).0,
+            captures: video::Captures::default(),
         }
     }
 
@@ -3396,6 +3403,7 @@ mod tests {
             deafened: false,
             call_reconnects: 0,
             ring_gate: watch::channel(RingGate::default()).0,
+            captures: video::Captures::default(),
         };
         (engine, rx)
     }
