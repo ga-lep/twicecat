@@ -99,6 +99,16 @@ That makes `target/package/flatpak/Twicecat-<version>-<arch>.flatpak` for this m
 
 When `Cargo.lock` changes, regenerate the crate list with `scripts/flatpak.sh sources` and commit it. CI's `scripts/flatpak.sh check` fails until you do. It uses flatpak-cargo-generator.py at a pinned commit in a small Python venv.
 
+### Releases
+
+The "Release" workflow (`.github/workflows/release.yml`) builds every package on GitHub's runners:
+
+- **Linux x86_64 and aarch64:** `scripts/package.sh` and its smoke test, then the Flatpak in Flathub's CI image.
+- **Windows x64:** the MSI.
+- **macOS on Apple Silicon:** the DMG.
+
+It runs on a `v*` tag, after `scripts/check-version.sh` passes, and makes a **draft** release with `SHA256SUMS` and build provenance attestations; publishing it is up to you. "Run workflow" on the Actions tab is a dry run: the same packages as one artifact, and no release. Signing runs only when its secrets exist (the workflow's header lists them); otherwise the job summary and the release notes say "unsigned".
+
 ## Push-to-talk on Linux
 
 On Wayland the global push-to-talk key goes through the desktop's shortcuts portal (KDE Plasma, and GNOME and Hyprland in recent versions). The portal knows Twicecat by its app ID, `io.github.ga_lep.Twicecat`, and looks for a desktop entry with that name. A build run with `cargo run` has none, so install the one in the repository once:

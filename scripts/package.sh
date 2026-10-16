@@ -260,7 +260,7 @@ packager_config() {
     local res=$1 config=$2
     python3 -I - "$config" "$version" "$(realpath "$(dirname "$binary")")" "$(realpath "$res")" \
         "$(realpath "$out/packager")" "$app_id" <<'EOF'
-import json, sys
+import json, os, sys
 config_path, version, binaries_dir, res, out_dir, app_id = sys.argv[1:]
 icons = "packaging/icons/hicolor"
 config = {
@@ -293,6 +293,20 @@ config = {
     },
     "wix": {"languages": ["en-US"]},
 }
+# Signing (plan Q6), only when the release workflow has the human's secrets.
+# macOS: cargo-packager signs the .app with the hardened runtime and the
+# entitlements, notarizes and staples it when APPLE_API_KEY, APPLE_API_ISSUER
+# and APPLE_API_KEY_PATH are set, then signs the DMG (APPLE_CERTIFICATE and
+# APPLE_CERTIFICATE_PASSWORD go into a temporary keychain). Windows: a sign
+# command with %1 for the file, run on twicecat.exe and on the MSI.
+identity = os.environ.get("APPLE_SIGNING_IDENTITY")
+if identity:
+    config["macos"]["signingIdentity"] = identity
+sign_command = os.environ.get("TWICECAT_WINDOWS_SIGN_COMMAND")
+if sign_command:
+    if "%1" not in sign_command:
+        sys.exit("TWICECAT_WINDOWS_SIGN_COMMAND needs %1 for the file to sign")
+    config["windows"] = {"signCommand": sign_command}
 with open(config_path, "w", encoding="utf-8") as f:
     json.dump(config, f, indent=2)
 EOF

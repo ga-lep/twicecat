@@ -3134,7 +3134,7 @@ Plan approved by the human 2026-10-14. Targets: Linux x86_64 and aarch64 (the St
 - [x] 5. Licence notices (phase7.5)
 - [x] 6. Desktop packages: nfpm (`.deb`, `.rpm`), appimagetool (AppImage), `.tar.zst`; cargo-packager (MSI, DMG; built in CI, Task 8) (phase7.6)
 - [x] 7. Flatpak, x86_64 and aarch64 (phase7.7): built and smoke-tested on x86_64 (Docker on the Windows machine); aarch64 in the release workflow
-- [ ] 8. Release workflow (phase7.8)
+- [ ] 8. Release workflow (phase7.8): written and linted (2026-10-16); **not run yet**: its dry run needs the branch pushed and dispatched (the human's), see the checkpoint
 - [ ] 9. Updates (phase7.9)
 - [ ] 10. Crash reports (phase7.10)
 - [ ] 11. The sandbox and the Frame, `docs/install.md` (phase7.11)
@@ -3152,6 +3152,8 @@ See the plan's "Human checkpoint"; items move here as tasks finish. Already open
 - [ ] (Task 6, Q14) Steam Frame without the Flatpak: the release's aarch64 `.tar.zst` unpacked under `~/.local/opt/twicecat` (with a link in `~/.local/bin`) and its AppImage start in desktop mode and, through "Add a non-Steam game", in game mode; the login is kept and a call works on the built-in mic and speakers.
 - [ ] (Task 6) The Linux packages on real desktops: the `.deb` on Ubuntu 24.04 and 26.04, the `.rpm` on Fedora 43 and 44, the AppImage and the `.tar.zst` anywhere newer; Twicecat appears in the menu with its icon, starts, and DeepFilterNet3 and the GPU entry ("any GPU · WebGPU on Vulkan") work from the bundled files.
 - [ ] (Task 1) Windows: the release `twicecat.exe` opens no console window; `twicecat.exe --version` prints in PowerShell and cmd; on a CPU or VM without AVX2 a message box says why and the app exits.
+- [ ] (Tasks 7 and 8) Push the rebased branch (`git push --force-with-lease`; the old tip is in the local branch `backup/phase7-pre-rebase`), then run "Release" from the Actions tab on `feat/phase7-packaging` (the dry run). Expect every job green and a `release-dry-run` artifact with: the Flatpak bundles for x86_64 and aarch64, the AppImages, `.deb`, `.rpm` and `.tar.zst` packages, the MSI, the DMG and `SHA256SUMS`. The workflow has never run; report failures back to the agent.
+- [ ] (Task 8) Choose the Windows signer (Q6) and give the workflow a `WINDOWS_SIGN_COMMAND` secret (a command with `%1`). Add the Apple secrets the workflow's header lists (`APPLE_SIGNING_IDENTITY`, `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_API_KEY`, `APPLE_API_ISSUER`, `APPLE_API_KEY_P8`). A dry run then shows "signed" in the job summaries, and `codesign --verify` passes in the macOS job.
 - [ ] (Task 7) The Flatpak on a desktop (GNOME and KDE): see the plan's sandbox items; and the aarch64 bundle from the release workflow on the Steam Frame.
 
 ## Phase 7 / Task 1 notes
@@ -3258,3 +3260,28 @@ See the plan's "Human checkpoint"; items move here as tasks finish. Already open
   - `--version` prints `twicecat 0.1.0` and exits 0 from cmd and from PowerShell when captured. An interactive PowerShell does not wait for a GUI program, so its prompt returns before the line appears.
   - The release app ran here against the local stack: login, an encrypted room with the CLI as the other side, both directions of chat, a call (connected and encrypted, mute, leave) and a restart from the Windows keychain. The refusal on a CPU without AVX2 was not tried.
 - **Gate (Windows, x86_64-pc-windows-msvc):** `cargo fmt --all --check`; `cargo clippy --workspace --all-targets --locked -- -D warnings`, also with `--all-features`. `cargo test --workspace --locked` passed on the rebased branch (2272 passed, 0 failed, 136 ignored, Task 1's commit notes). No Rust changes in this step. `check-app-deps.sh` (also `livekit`), `check-core-api.sh` (with `LC_ALL=C.UTF-8`: Git Bash's `grep -P` refuses the default locale), `integration-shards.sh --check`, `run-perf-tests.sh --check`, `check-no-webrtc-download.sh` and `flatpak.sh check` pass. `check-font-assets.sh` fails here only because Git checks `OFL.txt` out with CRLF; the committed file has the pinned SHA-256 `262481e8…935a`.
+
+## Phase 7 / Task 8 notes
+- **`.github/workflows/release.yml`** ("Release") runs on `v*` tags and on `workflow_dispatch` (the dry run). Its jobs:
+  - `version`: `scripts/check-version.sh` on the tag, or on `v<version>` for a dry run.
+  - `stateful-graph`: `scripts/export-deepfilternet.sh` with uv 0.12.19; the script stops unless the result has the pinned SHA-256. The same export reproduced that SHA-256 here (Task 7 notes).
+  - `linux` (x86_64 on `ubuntu-26.04`, aarch64 on `ubuntu-26.04-arm`): CI's build packages plus zstd, clang 22, the pinned libwebrtc, CUDA's header on x86_64 and cargo-about 0.9.2; then `scripts/package.sh` (dist profile) and `scripts/smoke-test-packages.sh`.
+  - `flatpak` (both architectures): in `ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-26.08` pinned by digest, privileged. It runs `scripts/flatpak.sh build` and `smoke`, with the `.deb`'s notices page and the exported graph. This is the same image and script as the Task 7 build here.
+  - `windows` (Git Bash with a `python3` shim): cargo-about and cargo-packager 0.11.8, then `scripts/package.sh` (MSI) and `twicecat.exe --version`.
+  - `macos`: the same with the DMG; `codesign --verify --deep --strict` and `stapler validate` when signed.
+  - `release`: the only job with `contents: write`, `id-token: write` and `attestations: write`. It writes `SHA256SUMS` over every artifact and runs `actions/attest-build-provenance`. On a tag it runs `gh release create --draft --verify-tag --generate-notes`, with notes that say what is signed. On a dry run it uploads one `release-dry-run` artifact instead.
+- **Hygiene:**
+  - `contents: read` at the top of the workflow.
+  - Every action is pinned by commit: checkout v6.1.0 `d23441a4…`, upload-artifact v7.0.1 `043fb46d…`, download-artifact v8.0.1 `3e5f45b2…`, attest-build-provenance v4.2.2 `4d101475…` and setup-uv v10.2.0 `c18668ad…`. Each tag was resolved through the GitHub API, and each release is over two weeks old.
+  - `persist-credentials: false` everywhere.
+  - No cache is restored, and no job uses the composite `setup-build` action, whose caches are tag-pinned.
+- **Signing hooks** (in `scripts/package.sh`'s cargo-packager config), active only with the secrets:
+  - **macOS:** `APPLE_SIGNING_IDENTITY` becomes `macos.signingIdentity`. cargo-packager 0.11.8 then:
+    - signs inside-out with `--options runtime`, our entitlements and `--timestamp` (`src/codesign/macos.rs:212-258`);
+    - imports `APPLE_CERTIFICATE` and `APPLE_CERTIFICATE_PASSWORD` into a temporary keychain (`:170-190`);
+    - notarizes with `notarytool submit --wait` from `APPLE_API_KEY`, `APPLE_API_ISSUER` and `APPLE_API_KEY_PATH`, and staples (`:261-345`, `:421-470`; `src/package/app/mod.rs:145-180`);
+    - signs the DMG (`src/package/dmg/mod.rs:194-208`).
+  - **Windows:** `TWICECAT_WINDOWS_SIGN_COMMAND`, which must contain `%1`, becomes `windows.signCommand`. cargo-packager runs it on the main binary and on the MSI (`src/package/wix/mod.rs:476`, `:771`; `src/codesign/windows.rs:29-60`; `src/config/mod.rs:1401-1441`).
+- **Checks here:** actionlint 1.7.7 with shellcheck 0.10.0 on `release.yml` is clean. It also reports two notes in `ci.yml` lines that were already there; they are left as they are.
+- **Not run:** the workflow itself. Pushing and dispatching it is the human's (checkpoint). The Linux packaging job and the Flatpak job repeat what ran here in containers (Task 6 on the Linux machine, Task 7 here). The Windows MSI and the macOS DMG are first built by that dry run.
+- **Gate:** as Task 7's (no Rust changes); actionlint and shellcheck on the workflow as above.
