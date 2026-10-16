@@ -910,7 +910,8 @@ impl Cli {
             event @ (CoreEvent::VideoTracks { .. }
             | CoreEvent::LocalVideo(_)
             | CoreEvent::VideoStats(_)
-            | CoreEvent::ScreenSources(_)) => {
+            | CoreEvent::ScreenSources(_)
+            | CoreEvent::VideoEncoders(_)) => {
                 for line in self.video.event(event) {
                     println!("{line}");
                 }
@@ -918,8 +919,7 @@ impl Cli {
             CoreEvent::VideoDevices(_)
             | CoreEvent::VideoSettings(_)
             | CoreEvent::VideoSettingsAdjusted(_)
-            | CoreEvent::VideoSending { .. }
-            | CoreEvent::VideoEncoders(_) => {}
+            | CoreEvent::VideoSending { .. } => {}
         }
     }
 

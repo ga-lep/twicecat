@@ -1729,6 +1729,14 @@ Phase 2 signed off by the human on 2026-10-02 (merge of PR #3). Every other unti
 - **Fix:** the test measures in audio. Its silent virtual microphone counts the frames it captures, each level remembers the count when it was seen, and the release tail is checked in frames (still on at least 500 ms of audio after the release, off between 0.7 and 3 s of audio). The no-delay test checks its 500 ms the same way. The waits for the levels allow 30 s and 15 s on the clock instead of 10 s and 5 s, and a failure prints both the audio and the clock time.
 - **Checks:** the starved run passed 4 of 4 runs with the new test; the gate was clean (1732 tests, clippy also with `--all-features`); `check-app-deps.sh`, `check-core-api.sh` and `check-no-webrtc-download.sh` pass.
 
+## Phase 9 / `/video encoders` printed nothing in the CLI (fixed 2026-10-16)
+
+- **Found:** while adding the camera commands to `twicecat-cli` (Phase 9 Task 9).
+- **Symptom:** `/video encoders` sent `ProbeVideoEncoders`, the core answered `VideoEncoders`, and nothing was printed.
+- **Cause:** the CLI's event loop (`bin/twicecat-cli.rs`) handed only `VideoTracks`, `LocalVideo` and `VideoStats` to the video module, and dropped `VideoEncoders` with the events it ignores, so `encoder_lines` was never reached.
+- **Fix:** `VideoEncoders` goes to the video module too.
+- **Checks:** run by hand: `/video encoders` now lists NVENC and the software encoders here. The gate was clean (2286 tests).
+
 ## Phase 6 steps (calls: MatrixRTC, LiveKit SFU, native audio; plan docs/plans/phase6-calls.md)
 Order (revised 2026-10-02, plan decision 12; again 2026-10-03 by the human): 1–8, 8b, 9, 10, 11, 12, 14, 13, then 15 and 13b. Deferred options (audio-only libwebrtc build, pure-Rust WebRTC stack, PulseAudio backend) are recorded in the plan.
 - [x] 1. libwebrtc supply chain (pinned SHA-256 fetch script, fail-closed build) and livekit dependency (phase6.1)
