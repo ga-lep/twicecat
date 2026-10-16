@@ -27,3 +27,6 @@ Task 8: complete (commit "feat(video): share the screen on Linux, through the po
 Task 9: started
 Task 9: complete (commit "feat(video): send a Linux camera in calls, with its preview and hot-plug", gate ok; ignored PipeWire tests and the virtual-camera stack test pass)
   notes: [virtual] no v4l2loopback: an in-process PipeWire camera (capture::test_camera, feature test-camera) feeds an encrypted call, stamps in order; [mjpeg] 4K two decoders 111.8 fps (release; debug 5.7, zune-jpeg is generic); cameras' table-less frames get the AVI1 mark zune-jpeg needs; [hotplug] a new node's formats come after the node: wait for EnumFormat READ; [colour] FramePusher converts BT.601/full-range camera frames to BT.709 limited; [fold] Task 8 pacing (frames a hair early were dropped) and CLI screen sources; [fix] CLI dropped VideoEncoders (fix commit, phase9.6); [flake] start-of-call receiver freezes at 720p30 VP8 (Task 6's), 19.8-29.4 fps over 10 s, for Task 14
+Task 10: complete (done as the UI plan's Step 1 on feat/ui-ux-rework, now on main; ticked 2026-10-16)
+  notes: [open] audio-video delay (no per-person playback latency in the core), pop-out window (iced::daemon)
+Task 11: complete (done as the UI plan's Steps 1-3, now on main; preview and capture mode work since Task 9; ticked 2026-10-16)

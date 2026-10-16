@@ -240,6 +240,11 @@ muted by a mark and the word "Muted", so neither relies on colour alone.
   floats at the bottom of the window over every dialog and card.
 - Pictures are drawn by the GPU renderer. When only the software renderer
   runs, the stage says so in words instead of staying black.
+- A camera that is unplugged while it is on (in a call or in the Video
+  page's preview) turns off, and a notice says "the camera was
+  disconnected" in words; the preview does not stay frozen on its last
+  picture. The camera list on the Video page follows cameras as they are
+  plugged in and out.
 
 ## Screen readers: not supported
 
