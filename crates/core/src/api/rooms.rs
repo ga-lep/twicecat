@@ -394,6 +394,19 @@ pub enum RoomListChoice {
     Rail,
 }
 
+/// Whether Twicecat may check GitHub for a newer version once a day (Phase 7
+/// Task 9). Asked once, at the first start where the check applies.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UpdateCheckChoice {
+    /// Not asked yet: the app asks.
+    #[default]
+    Unasked,
+    /// No checks.
+    Off,
+    /// A check at most once a day.
+    On,
+}
+
 /// Settings kept on this device only. No secrets, no content.
 ///
 /// The appearance fields default to "no visible change": no palette (the
@@ -408,6 +421,8 @@ pub enum RoomListChoice {
 /// assert_eq!(s.density, DensityChoice::Comfortable);
 /// assert_eq!(s.room_list, RoomListChoice::Expanded);
 /// assert_eq!(s.text_scale_percent, 100);
+/// assert_eq!(s.update_check, twicecat_core::api::UpdateCheckChoice::Unasked);
+/// assert_eq!(s.update_checked_at, 0);
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UiSettings {
@@ -430,6 +445,11 @@ pub struct UiSettings {
     /// Show every setting, audio and video in depth, instead of the few a
     /// person with little technical knowledge needs. Off by default.
     pub advanced_settings: bool,
+    /// The daily update check, where this copy checks itself.
+    pub update_check: UpdateCheckChoice,
+    /// When the last update check was sent, in seconds since the Unix epoch
+    /// (0: never).
+    pub update_checked_at: u64,
 }
 
 impl Default for UiSettings {
@@ -444,6 +464,8 @@ impl Default for UiSettings {
             room_list: RoomListChoice::Expanded,
             text_scale_percent: 100,
             advanced_settings: false,
+            update_check: UpdateCheckChoice::Unasked,
+            update_checked_at: 0,
         }
     }
 }

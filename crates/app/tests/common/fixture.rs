@@ -37,11 +37,12 @@ use twicecat_core::api::{
     RoomNotificationModeView, RoomPermissions, RoomSummary, SasEmoji, ScreenSource, ScreenSourceId,
     ScreenSourceKind, ScreenSources, ScreenThumbnail, SecurityStatus, SendFailure, SendStatus,
     Shield, ShieldCode, SpaceView, StateChange, SyncState, TextStyle, ThreadSummaryView,
-    TimelineItem, TimelineItemKind, TypingUser, UploadProgress, UserId, UserTrust, UtdReason,
-    VerificationId, VerificationPeer, VerificationPhase, VideoCodec, VideoDevice, VideoDeviceId,
-    VideoDevices, VideoDirection, VideoEncoderInfo, VideoEncoders, VideoFeed, VideoFrame,
-    VideoKind, VideoMatrix, VideoMode, VideoPixelFormat, VideoPlane, VideoRange, VideoSettings,
-    VideoStats, VideoTrackId, VideoTrackStats, VideoTrackView, VideoTuning,
+    TimelineItem, TimelineItemKind, TypingUser, UpdateCheckChoice, UploadProgress, UserId,
+    UserTrust, UtdReason, VerificationId, VerificationPeer, VerificationPhase, VideoCodec,
+    VideoDevice, VideoDeviceId, VideoDevices, VideoDirection, VideoEncoderInfo, VideoEncoders,
+    VideoFeed, VideoFrame, VideoKind, VideoMatrix, VideoMode, VideoPixelFormat, VideoPlane,
+    VideoRange, VideoSettings, VideoStats, VideoTrackId, VideoTrackStats, VideoTrackView,
+    VideoTuning,
 };
 
 /// Drops every command: the gallery never talks to a core.
@@ -109,10 +110,13 @@ fn user(name: &str) -> UserId {
 
 fn fresh() -> App {
     let (_tx, rx) = tokio::sync::mpsc::channel(1);
-    let (app, _boot) = App::new(Startup {
+    let (mut app, _boot) = App::new(Startup {
         sink: Box::new(NullSink),
         events: EventsSlot::new(rx),
     });
+    // The update question was answered, so the screens show without its
+    // bar; `update_question` and `update_available` show the bars.
+    app.ui_settings.update_check = UpdateCheckChoice::Off;
     app
 }
 
@@ -2846,6 +2850,25 @@ fn banner_device() -> App {
     app
 }
 
+fn update_question() -> App {
+    let mut app = main_room();
+    app.ui_settings.update_check = UpdateCheckChoice::Unasked;
+    app
+}
+
+fn update_available() -> App {
+    let mut app = main_room();
+    app.ui_settings.update_check = UpdateCheckChoice::On;
+    feed(
+        &mut app,
+        CoreEvent::UpdateAvailable {
+            version: "0.2.0".into(),
+            url: "https://github.com/ga-lep/twicecat/releases/tag/v0.2.0".into(),
+        },
+    );
+    app
+}
+
 fn banner_recovery_off() -> App {
     let mut app = main_room();
     feed(
@@ -3683,6 +3706,12 @@ pub fn scenarios() -> Vec<Scenario> {
         ),
         s("banner-notice", true, banner_notice, |a| {
             a.security.notice.is_some()
+        }),
+        s("banner-update-question", true, update_question, |a| {
+            a.update_question_shown()
+        }),
+        s("banner-update-available", true, update_available, |a| {
+            a.updates.available.is_some()
         }),
         s("recovery-working", false, recovery_working, |a| {
             a.security.progress.is_some()

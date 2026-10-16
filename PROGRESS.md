@@ -3135,7 +3135,7 @@ Plan approved by the human 2026-10-14. Targets: Linux x86_64 and aarch64 (the St
 - [x] 6. Desktop packages: nfpm (`.deb`, `.rpm`), appimagetool (AppImage), `.tar.zst`; cargo-packager (MSI, DMG; built in CI, Task 8) (phase7.6)
 - [x] 7. Flatpak, x86_64 and aarch64 (phase7.7): built and smoke-tested on x86_64 (Docker on the Windows machine); aarch64 in the release workflow
 - [ ] 8. Release workflow (phase7.8): written and linted (2026-10-16); **not run yet**: its dry run needs the branch pushed and dispatched (the human's), see the checkpoint
-- [ ] 9. Updates (phase7.9)
+- [ ] 9. Updates (phase7.9): 9a done, the opt-in check and link (2026-10-16); 9b, the AppImage updater, next
 - [ ] 10. Crash reports (phase7.10)
 - [ ] 11. The sandbox and the Frame, `docs/install.md` (phase7.11)
 - [ ] 12. apt and dnf repositories on GitHub Pages, AUR `twicecat-bin` (phase7.12; added 2026-10-14, plan Q13)
@@ -3154,6 +3154,10 @@ See the plan's "Human checkpoint"; items move here as tasks finish. Already open
 - [ ] (Task 1) Windows: the release `twicecat.exe` opens no console window; `twicecat.exe --version` prints in PowerShell and cmd; on a CPU or VM without AVX2 a message box says why and the app exits.
 - [ ] (Tasks 7 and 8) Push the rebased branch (`git push --force-with-lease`; the old tip is in the local branch `backup/phase7-pre-rebase`), then run "Release" from the Actions tab on `feat/phase7-packaging` (the dry run). Expect every job green and a `release-dry-run` artifact with: the Flatpak bundles for x86_64 and aarch64, the AppImages, `.deb`, `.rpm` and `.tar.zst` packages, the MSI, the DMG and `SHA256SUMS`. The workflow has never run; report failures back to the agent.
 - [ ] (Task 8) Choose the Windows signer (Q6) and give the workflow a `WINDOWS_SIGN_COMMAND` secret (a command with `%1`). Add the Apple secrets the workflow's header lists (`APPLE_SIGNING_IDENTITY`, `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_API_KEY`, `APPLE_API_ISSUER`, `APPLE_API_KEY_P8`). A dry run then shows "signed" in the job summaries, and `codesign --verify` passes in the macOS job.
+- [ ] (Task 9) In a real window on Windows, macOS or a tarball (not the Flatpak or a package):
+  - the update question bar after the first login (**No thanks** and **Check daily**), and the toggle on Settings → About;
+  - with a published release newer than the build, the "Twicecat X is available." bar, and **Open the release page** opening the browser;
+  - in the Flatpak and in a `.deb`, About shows the line about Flatpak or the package manager instead.
 - [ ] (Task 7) The Flatpak on a desktop (GNOME and KDE): see the plan's sandbox items; and the aarch64 bundle from the release workflow on the Steam Frame.
 
 ## Phase 7 / Task 1 notes
@@ -3285,3 +3289,34 @@ See the plan's "Human checkpoint"; items move here as tasks finish. Already open
 - **Checks here:** actionlint 1.7.7 with shellcheck 0.10.0 on `release.yml` is clean. It also reports two notes in `ci.yml` lines that were already there; they are left as they are.
 - **Not run:** the workflow itself. Pushing and dispatching it is the human's (checkpoint). The Linux packaging job and the Flatpak job repeat what ran here in containers (Task 6 on the Linux machine, Task 7 here). The Windows MSI and the macOS DMG are first built by that dry run.
 - **Gate:** as Task 7's (no Rust changes); actionlint and shellcheck on the workflow as above.
+
+## Phase 7 / Task 9 notes (the check and link; the AppImage updater follows as 9b)
+- **Which copy checks (`api::UpdateMechanism`, detected at run time):**
+  - `/.flatpak-info` → Flatpak;
+  - `APPIMAGE` set → AppImage (checked like the others until 9b);
+  - a binary under `/usr` but not `/usr/local` → the package manager (`.deb`, `.rpm`, AUR);
+  - otherwise (Windows, macOS, an unpacked `.tar.zst`, a source build) → check and link.
+
+  Changed from the plan's build-time `TWICECAT_DISTRIBUTION`: every Linux format ships the same binary (Task 6), so the build cannot tell a `.deb` from a tarball.
+- **The core (`crates/core/src/updates.rs`):**
+  - One GET to `https://api.github.com/repos/ga-lep/twicecat/releases/latest`, the owner and repository taken from the workspace's `repository`. It sends `Accept: application/vnd.github+json` and `User-Agent: twicecat/<version>` (GitHub refuses requests without one), with a 20 s timeout and the reply capped at 1 MiB.
+  - It reads `tag_name` and `html_url` from `serde_json::Value` (no derive, so the serializer guard is untouched). The link must equal `<repository>/releases/tag/<tag>`, and the tag may only use `[A-Za-z0-9._-]`, at most 64 characters.
+  - Errors carry no server text and are logged without the reply. Nothing is downloaded or run.
+  - The versions compare as `MAJOR.MINOR.PATCH` with an optional `v`, and a pre-release sorts before its release (`api::is_newer_version`).
+  - **Schedule:** `Command::ScheduleUpdateChecks { last_checked_at }` starts a task that wakes at least hourly, checks when one is due (`api::update_check_due`: a day after the last one, or at once after a clock set back by more than an hour), and announces each check with `CoreEvent::UpdateChecked { at }` before `UpdateAvailable { version, url }` or `UpToDate`. `StopUpdateChecks` aborts it, and so does a new schedule. `CheckForUpdates` checks once, now (the CLI's new `/update`).
+  - The schedule is in the core, not the app: iced's default executor (thread-pool) has no timer subscription, and switching iced to its `tokio` feature would change the app's whole executor.
+- **The app (`crates/app/src/updates.rs`, `screens/updates.rs`):**
+  - The local settings gain `update_check` (`Unasked`, `Off`, `On`; an older file reads as `Unasked`) and `update_checked_at`.
+  - Where the app checks itself and nothing was answered, an Info bar in the main view's banner slot asks, with **No thanks** and **Check daily**.
+  - Settings → About has the toggle "Check for a newer version once a day" with its note. In the Flatpak it says "Flatpak keeps this copy of Twicecat up to date", and from a package "Your package manager keeps…".
+  - When a newer version is found, an Info bar says "Twicecat X is available." with **Dismiss** and **Open the release page**. The link goes through `links::check_link_url` and `open_link_task`.
+  - At boot `start_update_checks` sends the schedule when the check is on; the toggle sends it or `StopUpdateChecks`. `UpdateChecked` saves the time, a late `UpdateAvailable` after the check was turned off is dropped, and `UpToDate` clears the bar.
+- **Tests:**
+  - Core: `api::updates` (mechanism per install, once a day and clock changes, version order and bad versions) and `updates` (endpoint, link rules with seven bad links, outcome).
+  - Core, against a fake GitHub server on localhost: it checks the user agent and `Accept` headers, a 404, an oversized reply and an unreachable server.
+  - Core, the schedule with tokio's paused clock: the first check one hour after a check 23 hours old, then nothing for 23 hours, then the next; nothing after the abort. A failed check still announces `UpdateChecked`, and a closed channel ends the task.
+  - Core: `paths` (choice and time round trip, an old file asks, wrong values fall back) and two doc tests.
+  - App: `updates` (asked once per mechanism; the answer saved and the command sent; Flatpak and packages never ask or send; the boot schedule only when on; the bar until dismissed and the time saved; turning off hides the bar and drops a late answer) and the CLI's `/update` parse.
+- **The real API (2026-10-16):** `GET /repos/ga-lep/twicecat` answers 200 (the repository is public). `/releases/latest` answers 404 because there is no release yet, which the core treats as no answer: a warning in the log and no event. The first published release makes it answer.
+- **Not verified:** the bars and the toggle in a real window (checkpoint).
+- **Gate (Windows):** `cargo fmt --all --check`; `cargo clippy --workspace --all-targets --locked -- -D warnings`, also with `--all-features`. `cargo test --workspace --locked`: 2287 passed, 2 failed, 158 ignored. The two failures were gallery tests this step broke: their variant settings reset the answer, so the question bar shifted the switcher row and the call stage. The variants now keep the scenario's answer. After that fix the app's 1497 tests pass; the other crates had passed in the full run. The boundary scripts and `flatpak.sh check` pass (the lock did not change).

@@ -32,6 +32,7 @@ mod spaces;
 mod sync;
 mod threads;
 mod timeline;
+mod updates;
 mod upload;
 mod verification;
 mod video_settings;

@@ -25,7 +25,7 @@ use iced::widget::{
     text, text_input,
 };
 use iced::{Background, Border, Element, Fill, Length};
-use twicecat_core::api::ThemeChoice;
+use twicecat_core::api::{ThemeChoice, UpdateCheckChoice, UpdateMechanism};
 
 use crate::screens::{audio_settings, video_settings};
 use crate::settings::{
@@ -39,6 +39,7 @@ use crate::ui::fonts;
 use crate::ui::icons::{Icon, icon};
 use crate::ui::kit::{self, Severity, banner, modal, muted, primary_button, secondary_button};
 use crate::ui::tokens;
+use crate::updates::{self, UpdateMessage};
 
 /// Width of the card.
 const CARD_WIDTH: f32 = 760.0;
@@ -137,7 +138,7 @@ fn page_view(app: &App) -> Element<'_, Message> {
         SettingsPage::Video => video_settings::page(app),
         SettingsPage::Keyboard => keyboard_page(),
         SettingsPage::Sessions => sessions_page(),
-        SettingsPage::About => about_page(),
+        SettingsPage::About => about_page(app),
     }
 }
 
@@ -477,16 +478,29 @@ fn sessions_page<'a>() -> Element<'a, Message> {
     )
 }
 
-fn about_page<'a>() -> Element<'a, Message> {
-    page_of(
-        "About",
-        vec![
-            words(format!("Twicecat {}", env!("CARGO_PKG_VERSION")))
-                .size(tokens::BODY_LARGE)
+fn about_page(app: &App) -> Element<'_, Message> {
+    let updates: Vec<Element<'_, Message>> = match app.updates.mechanism {
+        UpdateMechanism::CheckAndLink | UpdateMechanism::AppImage => vec![
+            checkbox(app.ui_settings.update_check == UpdateCheckChoice::On)
+                .label(updates::TOGGLE)
+                .text_wrapping(WRAP)
+                .on_toggle(|on| Message::Update(UpdateMessage::Choose(on)))
                 .into(),
-            note(DRAG_AND_DROP_NOTE),
-            words(INTER_ATTRIBUTION).size(tokens::BODY).into(),
-            note(INTER_NOTICES),
+            note(updates::TOGGLE_NOTE),
         ],
-    )
+        UpdateMechanism::Flatpak => vec![note(updates::FLATPAK_NOTE)],
+        UpdateMechanism::PackageManager => vec![note(updates::PACKAGE_NOTE)],
+    };
+    let mut parts: Vec<Element<'_, Message>> = vec![
+        words(format!("Twicecat {}", env!("CARGO_PKG_VERSION")))
+            .size(tokens::BODY_LARGE)
+            .into(),
+    ];
+    parts.extend(updates);
+    parts.extend([
+        note(DRAG_AND_DROP_NOTE),
+        words(INTER_ATTRIBUTION).size(tokens::BODY).into(),
+        note(INTER_NOTICES),
+    ]);
+    page_of("About", parts)
 }

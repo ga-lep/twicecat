@@ -153,6 +153,7 @@ impl Core {
             call_reconnects: 0,
             ring_gate: watch::channel(RingGate::default()).0,
             captures: video::Captures::default(),
+            update_checks: None,
         };
         tokio::spawn(engine.run(cmd_rx));
         CoreHandle {
@@ -558,6 +559,8 @@ struct Engine {
     ring_gate: watch::Sender<RingGate>,
     /// Screen captures: their ends, and a portal picker that is up.
     captures: video::Captures,
+    /// The daily update checks, while the user has them on.
+    update_checks: Option<JoinHandle<()>>,
 }
 
 /// An OAuth login in progress. Its task builds the client, emits `OAuthUrl`,
@@ -1379,6 +1382,31 @@ impl Engine {
             }
             Command::UpdateAudioSettings(settings) => {
                 self.store_audio_settings(settings.validated()).await;
+            }
+            Command::CheckForUpdates => {
+                let events = self.events.clone();
+                tokio::spawn(async move {
+                    if let Some(event) = crate::updates::check().await {
+                        let _ = events.send(event).await;
+                    }
+                });
+            }
+            Command::ScheduleUpdateChecks { last_checked_at } => {
+                if let Some(old) = self.update_checks.take() {
+                    old.abort();
+                }
+                let events = self.events.clone();
+                self.update_checks = Some(tokio::spawn(crate::updates::run_schedule(
+                    last_checked_at,
+                    crate::updates::unix_now,
+                    crate::updates::check,
+                    events,
+                )));
+            }
+            Command::StopUpdateChecks => {
+                if let Some(old) = self.update_checks.take() {
+                    old.abort();
+                }
             }
             Command::SetUserVolume {
                 user_id,
@@ -3212,6 +3240,7 @@ mod tests {
             call_reconnects: 0,
             ring_gate: watch::channel(RingGate::default()).0,
             captures: video::Captures::default(),
+            update_checks: None,
         }
     }
 
@@ -3404,6 +3433,7 @@ mod tests {
             call_reconnects: 0,
             ring_gate: watch::channel(RingGate::default()).0,
             captures: video::Captures::default(),
+            update_checks: None,
         };
         (engine, rx)
     }

@@ -27,7 +27,9 @@ use iced::advanced::{Layout, Shell, clipboard, mouse};
 use iced::{Element, Event, Pixels, Rectangle, Renderer, Size, window};
 use twicecat_app::ui::fonts;
 use twicecat_app::{App, Message};
-use twicecat_core::api::{DensityChoice, PaletteChoice, RoomListChoice, ThemeChoice, UiSettings};
+use twicecat_core::api::{
+    DensityChoice, PaletteChoice, RoomListChoice, ThemeChoice, UiSettings, UpdateCheckChoice,
+};
 
 const WIDE: Size = Size::new(1280.0, 800.0);
 const NARROW: Size = Size::new(720.0, 800.0);
@@ -59,6 +61,8 @@ struct Variant {
 fn apply(app: &mut App, variant: Variant) {
     let mut settings = variant.settings();
     settings.advanced_settings = app.ui_settings.advanced_settings;
+    // The scenario's answer to the update question (its bar or none).
+    settings.update_check = app.ui_settings.update_check;
     app.set_ui_settings(settings);
 }
 
@@ -69,6 +73,8 @@ impl Variant {
             palette: Some(self.family.0),
             density: self.density.0,
             room_list: self.list,
+            // Answered: no update question bar over the screens.
+            update_check: UpdateCheckChoice::Off,
             ..UiSettings::default()
         }
     }
@@ -1532,6 +1538,7 @@ fn with_settings(app: &mut App, density: (DensityChoice, &str), list: RoomListCh
     settings.density = density.0;
     settings.room_list = list;
     settings.advanced_settings = app.ui_settings.advanced_settings;
+    settings.update_check = app.ui_settings.update_check;
     app.set_ui_settings(settings);
     app.window_width = WIDE.width;
 }

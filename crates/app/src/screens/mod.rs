@@ -21,6 +21,7 @@ pub mod stage;
 pub mod switcher;
 pub mod thread_panel;
 pub mod timeline_pane;
+pub mod updates;
 pub mod upload_dialog;
 pub mod verification;
 pub mod video_settings;

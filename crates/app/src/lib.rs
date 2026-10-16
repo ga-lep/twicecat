@@ -35,6 +35,7 @@ pub mod threads;
 pub mod timeline;
 pub mod tray;
 pub mod ui;
+pub mod updates;
 pub mod upload;
 pub mod verification;
 pub mod video;

@@ -108,9 +108,14 @@ pub fn banner_action(banner: Banner) -> &'static str {
 }
 
 /// The banner slot at the top of the main view: always a column, empty (and
-/// without padding) when there is nothing to say.
-pub fn banner_slot(model: &SecurityModel) -> Element<'_, Message> {
-    let mut bars: Vec<Element<'_, Message>> = Vec::new();
+/// without padding) when there is nothing to say. `more` (the update bars)
+/// goes below the security banner, in the same column, so the panes keep
+/// their place in the widget tree.
+pub fn banner_slot<'a>(
+    model: &'a SecurityModel,
+    more: Vec<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    let mut bars: Vec<Element<'a, Message>> = Vec::new();
     if let Some(banner) = model.banner() {
         bars.push(banner_bar(banner));
     }
@@ -119,6 +124,7 @@ pub fn banner_slot(model: &SecurityModel) -> Element<'_, Message> {
     {
         bars.push(notice_bar(notice));
     }
+    bars.extend(more);
     let padding = if bars.is_empty() { 0.0 } else { tokens::S };
     Column::from_vec(bars)
         .spacing(tokens::S)
