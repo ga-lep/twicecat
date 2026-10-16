@@ -87,6 +87,18 @@ To build for the Steam Frame (aarch64) on an x86_64 machine, use the cross image
 
 Each must print its version, resolve every library and carry its resources where the app looks for them.
 
+### Flatpak
+
+The Flatpak (`packaging/flatpak/io.github.ga_lep.Twicecat.yml`) is built from this source tree on the Freedesktop 26.08 runtime, with clang 22 from its LLVM extension and Rust 1.97.1 from the standalone installer. The build is offline: every crate comes from `packaging/flatpak/cargo-sources.json`, and every other download (libwebrtc, the models, the "any GPU" pack, CUDA's header) is a source pinned by the same SHA-256 as in `scripts/checksums/`. The fetch scripts take those files from `TWICECAT_DOWNLOADS` instead of the network, and `scripts/package.sh --formats prefix` installs the same tree as the `.deb` into `/app`. It needs `flatpak` and `flatpak-builder` from your distribution.
+
+```bash
+scripts/flatpak.sh build
+```
+
+That makes `target/package/flatpak/Twicecat-<version>-<arch>.flatpak` for this machine's architecture (x86_64 or aarch64). Then `scripts/flatpak.sh smoke` installs it for your user and checks `--version` and the bundled files.
+
+When `Cargo.lock` changes, regenerate the crate list with `scripts/flatpak.sh sources` and commit it. CI's `scripts/flatpak.sh check` fails until you do. It uses flatpak-cargo-generator.py at a pinned commit in a small Python venv.
+
 ## Push-to-talk on Linux
 
 On Wayland the global push-to-talk key goes through the desktop's shortcuts portal (KDE Plasma, and GNOME and Hyprland in recent versions). The portal knows Twicecat by its app ID, `io.github.ga_lep.Twicecat`, and looks for a desktop entry with that name. A build run with `cargo run` has none, so install the one in the repository once:

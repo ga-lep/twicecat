@@ -18,6 +18,19 @@ sums=scripts/checksums/models.sha256
 
 die() { echo "error: $*" >&2; exit 1; }
 
+# fetch_to URL FILE: downloads URL into FILE, or, when TWICECAT_DOWNLOADS is
+# set (an offline build such as the Flatpak), copies the file of the same
+# name from that directory. The caller checks the SHA-256 either way.
+fetch_to() {
+    if [ -n "${TWICECAT_DOWNLOADS:-}" ]; then
+        [ -f "$TWICECAT_DOWNLOADS/${1##*/}" ] || die "${1##*/} is not in TWICECAT_DOWNLOADS ($TWICECAT_DOWNLOADS)"
+        cp "$TWICECAT_DOWNLOADS/${1##*/}" "$2"
+        return
+    fi
+    echo "downloading $1" >&2
+    curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o "$2" "$1"
+}
+
 sha256_of() {
     if command -v sha256sum >/dev/null; then
         sha256sum "$1" | awk '{print $1}'
@@ -41,12 +54,12 @@ if [ ! -f "$marker" ] || [ "$(cat "$marker")" != "$expected" ]; then
     work=$(mktemp -d "$cache_root/.fetch.XXXXXX")
     trap 'rm -rf "$work"' EXIT
     url="https://github.com/Rikorose/DeepFilterNet/raw/${commit}/models/${archive}"
-    echo "downloading $url" >&2
-    curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o "$work/$archive" "$url"
+    fetch_to "$url" "$work/$archive"
     actual=$(sha256_of "$work/$archive")
     [ "$actual" = "$expected" ] || die "SHA-256 mismatch for $archive: expected $expected, got $actual"
     mkdir "$work/x" "$work/out"
-    tar -xzf "$work/$archive" -C "$work/x"
+    # Not the archive's owners: a build sandbox (the Flatpak's) may not chown.
+    tar --no-same-owner -xzf "$work/$archive" -C "$work/x"
     for f in enc.onnx erb_dec.onnx df_dec.onnx config.ini; do
         [ -f "$work/x/tmp/export/$f" ] || die "unexpected archive layout (no tmp/export/$f)"
         mv "$work/x/tmp/export/$f" "$work/out/$f"

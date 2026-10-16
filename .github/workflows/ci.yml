@@ -99,6 +99,9 @@ jobs:
       - run: scripts/check-app-deps.sh livekit
       - run: scripts/check-core-api.sh
       - run: scripts/check-font-assets.sh
+      # The Flatpak's crate list matches Cargo.lock, and its downloads carry
+      # the SHA-256s scripts/checksums/ pins (Phase 7 Task 7).
+      - run: scripts/flatpak.sh check
 
   lint:
     needs: changes

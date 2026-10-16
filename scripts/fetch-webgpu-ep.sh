@@ -22,6 +22,19 @@ sums=scripts/checksums/webgpu-ep.sha256
 
 die() { echo "error: $*" >&2; exit 1; }
 
+# fetch_to URL FILE: downloads URL into FILE, or, when TWICECAT_DOWNLOADS is
+# set (an offline build such as the Flatpak), copies the file of the same
+# name from that directory. The caller checks the SHA-256 either way.
+fetch_to() {
+    if [ -n "${TWICECAT_DOWNLOADS:-}" ]; then
+        [ -f "$TWICECAT_DOWNLOADS/${1##*/}" ] || die "${1##*/} is not in TWICECAT_DOWNLOADS ($TWICECAT_DOWNLOADS)"
+        cp "$TWICECAT_DOWNLOADS/${1##*/}" "$2"
+        return
+    fi
+    echo "downloading $1" >&2
+    curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o "$2" "$1"
+}
+
 sha256_of() {
     if command -v sha256sum >/dev/null; then
         sha256sum "$1" | awk '{print $1}'
@@ -69,8 +82,7 @@ if [ ! -f "$marker" ] || [ "$(cat "$marker")" != "$pinned" ]; then
     work=$(mktemp -d "$cache_root/.fetch.XXXXXX")
     trap 'rm -rf "$work"' EXIT
     wheel=${url##*/}
-    echo "downloading $wheel" >&2
-    curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o "$work/$wheel" "$url"
+    fetch_to "$url" "$work/$wheel"
     actual=$(sha256_of "$work/$wheel")
     [ "$actual" = "$expected" ] || die "SHA-256 mismatch for $wheel: expected $expected, got $actual"
     mkdir -p "$work/out/licenses"

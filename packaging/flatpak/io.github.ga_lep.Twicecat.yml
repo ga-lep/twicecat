@@ -1,0 +1,166 @@
+# Twicecat's own Flatpak (Phase 7 plan Task 7, Q9 a): built from this source
+# tree, offline, with every download pinned by SHA-256. Not a Flathub
+# submission: it links LiveKit's prebuilt libwebrtc (plan Q9).
+#
+# Build it with scripts/flatpak.sh, which prepares the inputs this manifest
+# reads from target/flatpak/ (the notices page and the stateful graph), runs
+# flatpak-builder and makes the .flatpak bundle. cargo-sources.json comes
+# from Cargo.lock (scripts/flatpak.sh sources); `scripts/flatpak.sh check`
+# fails when it, or a SHA-256 below, differs from Cargo.lock and
+# scripts/checksums/.
+id: io.github.ga_lep.Twicecat
+runtime: org.freedesktop.Platform
+runtime-version: "26.08"
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  # clang and lld 22: webrtc-sys needs clang 21 or newer (Chromium's libc++),
+  # and CI builds with 22.
+  - org.freedesktop.Sdk.Extension.llvm22
+command: twicecat
+
+finish-args:
+  # The window: wgpu on Wayland, X11 where there is no Wayland.
+  - --socket=wayland
+  - --socket=fallback-x11
+  # X11 shared memory (x11rb's screen capture and the X11 backend).
+  - --share=ipc
+  # The GPU: wgpu, Vulkan for video conversion and ONNX Runtime's WebGPU,
+  # NVENC through the NVIDIA GL extension.
+  - --device=dri
+  # The homeserver and the calls.
+  - --share=network
+  # Our own PipeWire client (microphone, speakers, the shared screen's
+  # stream from the ScreenCast portal, cameras from the Camera portal).
+  - --filesystem=xdg-run/pipewire-0
+  # The keychain: keyring's Secret Service store talks to it directly
+  # (plan Q9: no Secret portal yet).
+  - --talk-name=org.freedesktop.secrets
+  # Notifications: notify-rust talks to the service directly (plan Q9).
+  - --talk-name=org.freedesktop.Notifications
+  # The tray icon (StatusNotifierItem, through ksni).
+  - --talk-name=org.kde.StatusNotifierWatcher
+  # Gamepads for push-to-talk (gilrs reads evdev; Flatpak 1.15.6 or newer).
+  - --device=input
+  # The GlobalShortcuts, ScreenCast, Camera and file chooser portals need
+  # no permission.
+
+cleanup:
+  # The pinned Rust toolchain, used only to build.
+  - /rust
+
+modules:
+  # Rust 1.97.1, as rust-toolchain.toml pins it, from the standalone
+  # installer (no rustup here).
+  - name: rust
+    buildsystem: simple
+    # Left as installed: flatpak-builder's stripping and debuginfo
+    # extraction leave libLLVM without loadable segments, and rustc then
+    # fails to start. The toolchain is removed after the build anyway.
+    build-options:
+      strip: false
+      no-debuginfo: true
+    build-commands:
+      - ./install.sh --prefix="${FLATPAK_DEST}/rust" --without=rust-docs --disable-ldconfig
+    sources:
+      - type: archive
+        only-arches: [x86_64]
+        url: https://static.rust-lang.org/dist/rust-1.97.1-x86_64-unknown-linux-gnu.tar.xz
+        sha256: 88f28fa9af20594179f85d6df67078dfd6fa93e2f6da5e1e9b0ac4997988ca4f
+      - type: archive
+        only-arches: [aarch64]
+        url: https://static.rust-lang.org/dist/rust-1.97.1-aarch64-unknown-linux-gnu.tar.xz
+        sha256: 9a7a2c336b4787f1b72f6bab7c35d5b7af2fd03cbd39b4fc721466a70d402a7d
+
+  - name: twicecat
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/llvm22/bin:/app/rust/bin
+      prepend-ld-library-path: /usr/lib/sdk/llvm22/lib
+      env:
+        CC: clang
+        CXX: clang++
+        # The crates from cargo-sources.json (its cargo/config replaces
+        # crates.io with them).
+        CARGO_HOME: /run/build/twicecat/cargo
+        CARGO_NET_OFFLINE: "true"
+        # The fetch scripts take their archives from here instead of the
+        # network, and still check each SHA-256.
+        TWICECAT_DOWNLOADS: /run/build/twicecat/downloads
+        XDG_CACHE_HOME: /run/build/twicecat/cache
+        TWICECAT_STATEFUL_MODEL: /run/build/twicecat/inputs/deepfilternet3_stateful.onnx
+    build-commands:
+      # libwebrtc into dev/libwebrtc (.cargo/config.toml's LK_CUSTOM_WEBRTC),
+      # with its PipeWire stubs renamed as for every Linux build.
+      - scripts/fetch-libwebrtc.sh >/dev/null
+      # LiveKit's NVENC and NVDEC are compiled in with CUDA's header
+      # (x86_64 only, as in CI).
+      - if [ "$FLATPAK_ARCH" = x86_64 ]; then scripts/fetch-cuda-headers.sh >/dev/null; fi
+      # The same tree as the .deb (binary, models, the "any GPU" pack, desktop
+      # entry, metainfo, icons, licences), into /app.
+      - scripts/package.sh --formats prefix --prefix "${FLATPAK_DEST}" --notices "inputs/THIRD_PARTY_NOTICES-${FLATPAK_ARCH}.html"
+    sources:
+      - type: dir
+        path: ../..
+        skip:
+          - target
+          - .git
+          - .flatpak-builder
+          - .idea
+      - cargo-sources.json
+      # Made outside the sandbox by scripts/flatpak.sh: the notices need
+      # cargo-about, and the stateful graph needs PyTorch
+      # (scripts/export-deepfilternet.sh); the build checks the graph's
+      # SHA-256 against scripts/checksums/models.sha256.
+      - type: file
+        only-arches: [x86_64]
+        path: ../../target/flatpak/inputs/THIRD_PARTY_NOTICES-x86_64.html
+        dest: inputs
+      - type: file
+        only-arches: [aarch64]
+        path: ../../target/flatpak/inputs/THIRD_PARTY_NOTICES-aarch64.html
+        dest: inputs
+      - type: file
+        path: ../../target/flatpak/inputs/deepfilternet3_stateful.onnx
+        dest: inputs
+      # Downloads, pinned as in scripts/checksums/ (scripts/flatpak.sh check).
+      - type: file
+        url: https://github.com/Rikorose/DeepFilterNet/raw/978576aa8400552a4ce9730838c635aa30db5e61/models/DeepFilterNet3_onnx.tar.gz
+        sha256: c94d91f70911001c946e0fabb4aa9adc37045f45a03b56008cb0c8244cb63616
+        dest: downloads
+      - type: file
+        only-arches: [x86_64]
+        url: https://github.com/livekit/rust-sdks/releases/download/webrtc-89d790b/webrtc-linux-x64-release.zip
+        sha256: b167adad5291cea0e4d66a0454d9d52d2ad714e6b0ed70f4410317d3ebde70c5
+        dest: downloads
+      - type: file
+        only-arches: [aarch64]
+        url: https://github.com/livekit/rust-sdks/releases/download/webrtc-89d790b/webrtc-linux-arm64-release.zip
+        sha256: f716b10eade18dd11b03b9f93b50cee2ca2eec73b975a63f2ae9ea2a35706420
+        dest: downloads
+      - type: file
+        only-arches: [x86_64]
+        url: https://files.pythonhosted.org/packages/2e/24/d1558f3b68b1d26e706813b1d10aa1d785e4698c425af8db8edc3dced472/nvidia_cuda_runtime-13.0.96-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
+        sha256: 7f82250d7782aa23b6cfe765ecc7db554bd3c2870c43f3d1821f1d18aebf0548
+        dest: downloads
+      # The "any GPU" pack (plan Q3 b): ONNX Runtime's CPU build and its
+      # WebGPU plugin.
+      - type: file
+        only-arches: [x86_64]
+        url: https://github.com/microsoft/onnxruntime/releases/download/v1.28.3/onnxruntime-linux-x64-1.28.3.tgz
+        sha256: db14e4863bd37893fc59729d986ab2a0d043d10b7d44da1913c4982b7e3d009c
+        dest: downloads
+      - type: file
+        only-arches: [aarch64]
+        url: https://github.com/microsoft/onnxruntime/releases/download/v1.28.3/onnxruntime-linux-aarch64-1.28.3.tgz
+        sha256: 6c6b1ae96d7b0be9f555092857c6a4f2b0b5587a5298d732d9e52e8253038ce7
+        dest: downloads
+      - type: file
+        only-arches: [x86_64]
+        url: https://files.pythonhosted.org/packages/c1/96/2a18a45079250afcd825687aef2895de266d5abc1cff9f52d2dede7598f2/onnxruntime_ep_webgpu-0.4.0-py3-none-manylinux_2_28_x86_64.whl
+        sha256: 5d8c961eda91a88961cad1fb7621f389f006b18497d6ea9ecf96f729f066cbfb
+        dest: downloads
+      - type: file
+        only-arches: [aarch64]
+        url: https://files.pythonhosted.org/packages/4e/ca/00c70322c19913c81a6bb2239aca83781b97a818b55c2ec3d25cec72dc4c/onnxruntime_ep_webgpu-0.4.0-py3-none-manylinux_2_28_aarch64.whl
+        sha256: 17f660db53b1a509c63e721ac6784a2daa1c4e91a968523ee9986505ee5b0a55
+        dest: downloads
