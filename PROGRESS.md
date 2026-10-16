@@ -1746,6 +1746,14 @@ Phase 2 signed off by the human on 2026-10-02 (merge of PR #3). Every other unti
 - **Tests:** `video::tests::a_preview_whose_camera_went_away_is_off` (another error keeps a running preview; an ended feed and then the error, or then `LocalVideo`, turn it off). The unplugging itself, through the core, is `call_camera::a_virtual_camera_is_listed_previewed_and_its_unplugging_said`.
 - **Checks:** the gate was clean (2302 tests).
 
+## Phase 9 / `tuned_video_changes_what_the_receiver_gets` failed on a loaded CI runner (fixed 2026-10-16)
+
+- **Symptom:** PR #30's `integration (shard 2)` failed in `call_video`: the "one layer" round saw only 640x360 where it asked for 720p ("sizes {(640, 360)}, one at least 720 tall"); the other rounds and the received rate (30.0 fps) were fine. The PR does not touch the core.
+- **Cause:** the test, not the code. The round checks that with one layer a 320x180 tile gets alice's only layer and not a lower simulcast layer, but it asserted a fixed 720p. libwebrtc lowers a lone layer's resolution to keep a camera's frame rate when the CPU is short (the default degradation for cameras), and the shard's 4-core runner runs Synapse, two SFUs and two debug cores beside the test.
+- **Fix:** the round reads alice's own statistics over the same seconds and checks what the claim needs: carol's tallest picture is taller than the 180p layer a tile this small gets from three layers, and no taller than alice sent. The other rounds are unchanged.
+- **Checks:** on the local stack, pinned to 4 cores as the runner has (`taskset -c 0-3`): the test alone 3/3, and the whole `call_video` binary (its four tests at once, as CI runs it) 2/2. The gate was clean (2302 tests).
+- **Seen on the way, left open (#32, "To monitor"):** pinned to 2 cores, the same round stalls: alice's frames reach LiveKit's source (her self-view moves, some `capture_frame` calls block 0.5-0.7 s) but libwebrtc reports nothing sent for the lone 720p layer, and carol's first frame never comes. Dynacast keeps the layer on (LiveKit's log). Not seen on 4 cores.
+
 ## Phase 6 steps (calls: MatrixRTC, LiveKit SFU, native audio; plan docs/plans/phase6-calls.md)
 Order (revised 2026-10-02, plan decision 12; again 2026-10-03 by the human): 1–8, 8b, 9, 10, 11, 12, 14, 13, then 15 and 13b. Deferred options (audio-only libwebrtc build, pure-Rust WebRTC stack, PulseAudio backend) are recorded in the plan.
 - [x] 1. libwebrtc supply chain (pinned SHA-256 fetch script, fail-closed build) and livekit dependency (phase6.1)
