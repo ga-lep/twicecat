@@ -88,6 +88,9 @@ modules:
         TWICECAT_DOWNLOADS: /run/build/twicecat/downloads
         XDG_CACHE_HOME: /run/build/twicecat/cache
         TWICECAT_STATEFUL_MODEL: /run/build/twicecat/inputs/deepfilternet3_stateful.onnx
+        # TWICECAT_FLATPAK_REMOTE stays unset: the release bundle has no
+        # --repo-url, so nothing updates it and the app checks for itself
+        # (plan Q15). Set it to "1" with the Flatpak repository (Task 12).
     build-commands:
       # libwebrtc into dev/libwebrtc (.cargo/config.toml's LK_CUSTOM_WEBRTC),
       # with its PipeWire stubs renamed as for every Linux build.

@@ -1854,6 +1854,8 @@ impl App {
                 task = self.on_call_event(event);
             }
             event @ (CoreEvent::UpdateAvailable { .. }
+            | CoreEvent::UpdateInstalled { .. }
+            | CoreEvent::UpdateInstallFailed
             | CoreEvent::UpToDate
             | CoreEvent::UpdateChecked { .. }) => task = self.on_update_event(event),
             event @ (CoreEvent::VideoDevices(_)

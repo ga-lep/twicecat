@@ -502,6 +502,10 @@ pub enum Command {
     },
     /// No more scheduled checks (the user turned the check off).
     StopUpdateChecks,
+    /// Download, verify and swap in the newer AppImage that an
+    /// `UpdateAvailable { installable: true, .. }` announced; answered by
+    /// `UpdateInstalled` or `UpdateInstallFailed`. The app restarts into it.
+    InstallUpdate,
     /// Replace all audio settings. They are validated, applied (to a running
     /// call too), saved, and echoed back as `AudioSettings`.
     UpdateAudioSettings(AudioSettings),
@@ -897,6 +901,7 @@ impl fmt::Debug for Command {
                 .field("last_checked_at", last_checked_at)
                 .finish(),
             Self::StopUpdateChecks => f.write_str("StopUpdateChecks"),
+            Self::InstallUpdate => f.write_str("InstallUpdate"),
             Self::UpdateAudioSettings(settings) => f
                 .debug_tuple("UpdateAudioSettings")
                 .field(settings)
@@ -1242,9 +1247,19 @@ pub enum CoreEvent {
         version: String,
         /// Its page: `<repository>/releases/tag/v<version>` on github.com.
         url: String,
+        /// This AppImage can install it itself (`InstallUpdate`).
+        installable: bool,
     },
     /// No newer release, answering `CheckForUpdates`.
     UpToDate,
+    /// The newer AppImage is in place of this one; it runs after a restart.
+    UpdateInstalled {
+        /// Its version.
+        version: String,
+    },
+    /// The newer AppImage could not be downloaded, verified or put in place;
+    /// the running one is unchanged.
+    UpdateInstallFailed,
     /// A scheduled check is being sent now (seconds since the Unix epoch),
     /// for the app to keep with its settings.
     UpdateChecked {

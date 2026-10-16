@@ -2,9 +2,15 @@
 //! asked once, the toggle on Settings → About, the banner when a newer
 //! version is out, and the link to its release page. The core asks GitHub
 //! once a day while the check is on (`Command::ScheduleUpdateChecks`);
-//! nothing is downloaded or run. A Flatpak or a package from the
-//! distribution is updated by Flatpak or the package manager: the app never
-//! asks there.
+//! nothing is downloaded or run. A Flatpak from a repository, or a package
+//! whose repository is set up, is updated by Flatpak or the package manager:
+//! the app never asks there. A Flatpak bundle or a package installed from a
+//! downloaded file checks like the tarball, since nothing else updates it
+//! (plan Q15). An AppImage that can update itself (Task 9b) installs the
+//! newer one on request, then starts it when this one has shut down.
+
+use std::path::PathBuf;
+use std::sync::Mutex;
 
 use iced::Task;
 use twicecat_core::api::{Command, CoreEvent, UpdateCheckChoice, UpdateMechanism};
@@ -20,10 +26,25 @@ pub const TOGGLE: &str = "Check for a newer version once a day";
 /// Under the toggle.
 pub const TOGGLE_NOTE: &str =
     "Twicecat asks GitHub's list of releases and shows a link; nothing is downloaded or installed.";
-/// On Settings → About in the Flatpak.
+/// On Settings → About in a Flatpak from a repository.
 pub const FLATPAK_NOTE: &str = "Flatpak keeps this copy of Twicecat up to date.";
-/// On Settings → About for a package from the distribution.
+/// On Settings → About for a package whose repository is set up.
 pub const PACKAGE_NOTE: &str = "Your package manager keeps this copy of Twicecat up to date.";
+
+/// After the newer AppImage is in place.
+pub const FAILED: &str = "The update could not be installed. This copy of Twicecat is unchanged.";
+
+/// The program to start once the app has shut down (the new AppImage), set
+/// by **Restart now** and read by `main` after the window closed.
+static RESTART: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// The program **Restart now** asked for, once.
+pub fn take_restart() -> Option<PathBuf> {
+    RESTART
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+}
 
 /// What the app knows about updates.
 #[derive(Debug)]
@@ -32,6 +53,12 @@ pub struct UpdateUi {
     pub mechanism: UpdateMechanism,
     /// A newer release the core found, until dismissed.
     pub available: Option<Available>,
+    /// The AppImage's install is running.
+    pub installing: bool,
+    /// The newer AppImage's version, once it is in place.
+    pub installed: Option<String>,
+    /// The install failed (until dismissed).
+    pub install_failed: bool,
 }
 
 impl Default for UpdateUi {
@@ -39,6 +66,9 @@ impl Default for UpdateUi {
         Self {
             mechanism: UpdateMechanism::CheckAndLink,
             available: None,
+            installing: false,
+            installed: None,
+            install_failed: false,
         }
     }
 }
@@ -50,6 +80,8 @@ pub struct Available {
     pub version: String,
     /// Its page on github.com (checked by the core).
     pub url: String,
+    /// This AppImage can install it itself.
+    pub installable: bool,
 }
 
 impl Available {
@@ -68,6 +100,10 @@ pub enum UpdateMessage {
     OpenRelease,
     /// Hide the banner until the next start.
     Dismiss,
+    /// Install the newer AppImage.
+    Install,
+    /// Close, then start the newer AppImage.
+    Restart,
 }
 
 impl App {
@@ -125,7 +161,34 @@ impl App {
             },
             UpdateMessage::Dismiss => {
                 self.updates.available = None;
+                self.updates.install_failed = false;
                 Task::none()
+            }
+            UpdateMessage::Install => {
+                let ready = self
+                    .updates
+                    .available
+                    .as_ref()
+                    .is_some_and(|a| a.installable);
+                if !ready || self.updates.installing || self.updates.installed.is_some() {
+                    return Task::none();
+                }
+                self.updates.installing = true;
+                self.updates.install_failed = false;
+                self.send(Command::InstallUpdate)
+            }
+            UpdateMessage::Restart => {
+                let Some(appimage) = std::env::var_os("APPIMAGE") else {
+                    return Task::none();
+                };
+                if self.updates.installed.is_none() {
+                    return Task::none();
+                }
+                *RESTART
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                    Some(PathBuf::from(appimage));
+                self.update(Message::CloseRequested)
             }
         }
     }
@@ -134,10 +197,29 @@ impl App {
     pub(crate) fn on_update_event(&mut self, event: CoreEvent) -> Task<Message> {
         match event {
             // A late answer after the check was turned off is dropped.
-            CoreEvent::UpdateAvailable { version, url }
-                if self.ui_settings.update_check == UpdateCheckChoice::On =>
+            CoreEvent::UpdateAvailable {
+                version,
+                url,
+                installable,
+            } if self.ui_settings.update_check == UpdateCheckChoice::On
+                && self.updates.installed.is_none() =>
             {
-                self.updates.available = Some(Available { version, url });
+                self.updates.available = Some(Available {
+                    version,
+                    url,
+                    installable,
+                });
+                Task::none()
+            }
+            CoreEvent::UpdateInstalled { version } => {
+                self.updates.installing = false;
+                self.updates.available = None;
+                self.updates.installed = Some(version);
+                Task::none()
+            }
+            CoreEvent::UpdateInstallFailed => {
+                self.updates.installing = false;
+                self.updates.install_failed = true;
                 Task::none()
             }
             CoreEvent::UpToDate => {
@@ -270,6 +352,7 @@ mod tests {
             CoreEvent::UpdateAvailable {
                 version: "9.0.0".into(),
                 url: PAGE.into(),
+                installable: false,
             },
         );
         let available = app.updates.available.clone().expect("the banner");
@@ -286,6 +369,7 @@ mod tests {
             CoreEvent::UpdateAvailable {
                 version: "9.0.0".into(),
                 url: PAGE.into(),
+                installable: false,
             },
         );
         core(&mut app, CoreEvent::UpToDate);
@@ -301,6 +385,7 @@ mod tests {
             CoreEvent::UpdateAvailable {
                 version: "9.0.0".into(),
                 url: PAGE.into(),
+                installable: false,
             },
         );
         let _ = app.update(Message::Update(UpdateMessage::Choose(false)));
@@ -310,6 +395,7 @@ mod tests {
             CoreEvent::UpdateAvailable {
                 version: "9.0.0".into(),
                 url: PAGE.into(),
+                installable: false,
             },
         );
         assert!(app.updates.available.is_none());
@@ -320,5 +406,86 @@ mod tests {
                 "StopUpdateChecks"
             ]
         );
+    }
+
+    fn available(app: &mut App, installable: bool) {
+        core(
+            app,
+            CoreEvent::UpdateAvailable {
+                version: "9.0.0".into(),
+                url: PAGE.into(),
+                installable,
+            },
+        );
+    }
+
+    #[test]
+    fn only_an_installable_update_is_installed_and_only_once() {
+        let (mut app, mut rx, _store) = app(UpdateMechanism::AppImage);
+        let _ = app.update(Message::Update(UpdateMessage::Choose(true)));
+        drain(&mut rx);
+        // A link-only update has nothing to install.
+        available(&mut app, false);
+        let _ = app.update(Message::Update(UpdateMessage::Install));
+        assert!(drain(&mut rx).is_empty());
+        assert!(!app.updates.installing);
+        available(&mut app, true);
+        let _ = app.update(Message::Update(UpdateMessage::Install));
+        let _ = app.update(Message::Update(UpdateMessage::Install));
+        assert_eq!(drain(&mut rx), ["InstallUpdate"]);
+        assert!(app.updates.installing);
+        core(
+            &mut app,
+            CoreEvent::UpdateInstalled {
+                version: "9.0.0".into(),
+            },
+        );
+        assert!(!app.updates.installing);
+        assert_eq!(app.updates.installed.as_deref(), Some("9.0.0"));
+        assert!(app.updates.available.is_none());
+        // A later check while the new one waits for the restart changes
+        // nothing.
+        available(&mut app, true);
+        assert!(app.updates.available.is_none());
+        let _ = app.update(Message::Update(UpdateMessage::Install));
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn a_failed_install_says_so_until_dismissed_and_can_be_tried_again() {
+        let (mut app, mut rx, _store) = app(UpdateMechanism::AppImage);
+        let _ = app.update(Message::Update(UpdateMessage::Choose(true)));
+        available(&mut app, true);
+        let _ = app.update(Message::Update(UpdateMessage::Install));
+        core(&mut app, CoreEvent::UpdateInstallFailed);
+        assert!(app.updates.install_failed && !app.updates.installing);
+        assert!(app.updates.available.is_some());
+        let _ = app.update(Message::Update(UpdateMessage::Install));
+        assert!(!app.updates.install_failed);
+        assert_eq!(
+            drain(&mut rx),
+            [
+                "ScheduleUpdateChecks { last_checked_at: 0 }",
+                "InstallUpdate",
+                "InstallUpdate"
+            ]
+        );
+        core(&mut app, CoreEvent::UpdateInstallFailed);
+        let _ = app.update(Message::Update(UpdateMessage::Dismiss));
+        assert!(!app.updates.install_failed && app.updates.available.is_none());
+    }
+
+    #[test]
+    fn restart_needs_an_installed_update_in_an_appimage() {
+        let (mut app, _rx, _store) = app(UpdateMechanism::AppImage);
+        let _ = app.update(Message::Update(UpdateMessage::Restart));
+        assert!(take_restart().is_none());
+        // The test process is no AppImage (no APPIMAGE), so even an
+        // installed update does not ask for a restart here.
+        app.updates.installed = Some("9.0.0".into());
+        if std::env::var_os("APPIMAGE").is_none() {
+            let _ = app.update(Message::Update(UpdateMessage::Restart));
+            assert!(take_restart().is_none());
+        }
     }
 }

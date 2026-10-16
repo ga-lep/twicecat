@@ -863,9 +863,11 @@ impl Cli {
             CoreEvent::Security(status) => println!("{}", security_line(&status)),
             // The key is never printed.
             CoreEvent::RecoveryKeyReady(_) => println!("{RECOVERY_KEY_LINE}"),
-            CoreEvent::UpdateAvailable { version, url } => {
+            CoreEvent::UpdateAvailable { version, url, .. } => {
                 println!("[update] Twicecat {version} is available: {url}");
             }
+            // The CLI installs nothing.
+            CoreEvent::UpdateInstalled { .. } | CoreEvent::UpdateInstallFailed => {}
             CoreEvent::UpToDate => println!(
                 "[update] Twicecat {} is up to date",
                 env!("CARGO_PKG_VERSION")
