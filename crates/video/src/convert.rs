@@ -5,6 +5,7 @@
 //! conversions are `yuvutils-rs`'s SIMD code; repacking chroma between NV12
 //! and I420 is a copy, done here.
 
+use std::borrow::Cow;
 use std::time::Duration;
 
 use yuvutils_rs::{
@@ -39,6 +40,45 @@ fn tight(data: Vec<u8>, stride: usize) -> Plane {
         data: data.into(),
         stride,
     }
+}
+
+/// Plane `i` of `frame` as yuvutils reads it: every row `stride` bytes,
+/// the last one too. yuvutils splits a plane into rows (or row pairs) with
+/// `chunks_exact` (`rgba_to_nv.rs:811`, `:885`; `yuv_to_rgba.rs:632`), so
+/// a last row without its padding, which [`CpuFrame::new`] allows, is
+/// skipped and its output left zero, while its size checks pass
+/// (`yuv_error.rs:131`). Such a plane is copied with the padding added; a
+/// full one is used as it is.
+fn full_rows(frame: &CpuFrame, i: usize) -> Cow<'_, [u8]> {
+    let plane = &frame.planes()[i];
+    let (_, rows) = frame.format().plane_shape(i, frame.width(), frame.height());
+    let full = plane.stride * rows;
+    if plane.data.len() >= full {
+        Cow::Borrowed(&plane.data)
+    } else {
+        let mut data = Vec::with_capacity(full);
+        data.extend_from_slice(&plane.data);
+        data.resize(full, 0);
+        Cow::Owned(data)
+    }
+}
+
+/// Plane `i` of `frame` with its rows packed tight, exactly as long as
+/// they are, for yuvutils' checks that refuse padding: an NV12 UV plane
+/// must be exactly its minimum width times its rows (`yuv_error.rs:268`),
+/// a YUYV frame exactly two bytes a pixel (`yuv_error.rs:165`). A tight
+/// plane is used as it is.
+fn tight_rows(frame: &CpuFrame, i: usize) -> Cow<'_, [u8]> {
+    let plane = &frame.planes()[i];
+    let (row, rows) = frame.format().plane_shape(i, frame.width(), frame.height());
+    if plane.stride == row {
+        return Cow::Borrowed(&plane.data[..row * rows]);
+    }
+    let mut data = Vec::with_capacity(row * rows);
+    for r in 0..rows {
+        data.extend_from_slice(&plane.data[r * plane.stride..][..row]);
+    }
+    Cow::Owned(data)
 }
 
 fn u32_of(n: usize) -> Result<u32, VideoError> {
@@ -102,7 +142,7 @@ pub fn to_nv12(frame: &CpuFrame, color: ColorSpace) -> Result<CpuFrame, VideoErr
             };
             yuvutils_rs::bgra_to_yuv_nv12(
                 &mut image,
-                &bgra.data,
+                &full_rows(frame, 0),
                 u32_of(bgra.stride)?,
                 range(color.range),
                 matrix(color.matrix),
@@ -183,13 +223,12 @@ pub fn to_i420(frame: &CpuFrame, color: ColorSpace) -> Result<CpuFrame, VideoErr
             )
         }
         PixelFormat::Yuyv => {
-            let packed = &frame.planes()[0];
             let mut image = planar(w, h);
             yuvutils_rs::yuyv422_to_yuv420(
                 &mut image,
                 &YuvPackedImage {
-                    yuy: &packed.data,
-                    yuy_stride: u32_of(packed.stride)?,
+                    yuy: &tight_rows(frame, 0),
+                    yuy_stride: u32_of(w * 2)?,
                     width: frame.width(),
                     height: frame.height(),
                 },
@@ -203,7 +242,7 @@ pub fn to_i420(frame: &CpuFrame, color: ColorSpace) -> Result<CpuFrame, VideoErr
             let mut image = planar(w, h);
             yuvutils_rs::bgra_to_yuv420(
                 &mut image,
-                &bgra.data,
+                &full_rows(frame, 0),
                 u32_of(bgra.stride)?,
                 range(color.range),
                 matrix(color.matrix),
@@ -227,13 +266,13 @@ pub fn to_bgra(frame: &CpuFrame) -> Result<CpuFrame, VideoError> {
     match frame.format() {
         PixelFormat::Bgra => return Ok(frame.clone()),
         PixelFormat::Nv12 => {
-            let (y, uv) = (&frame.planes()[0], &frame.planes()[1]);
+            let y = &frame.planes()[0];
             yuvutils_rs::yuv_nv12_to_bgra(
                 &YuvBiPlanarImage {
-                    y_plane: &y.data,
+                    y_plane: &full_rows(frame, 0),
                     y_stride: u32_of(y.stride)?,
-                    uv_plane: &uv.data,
-                    uv_stride: u32_of(uv.stride)?,
+                    uv_plane: &tight_rows(frame, 1),
+                    uv_stride: u32_of(w as usize)?,
                     width: w,
                     height: h,
                 },
@@ -249,11 +288,11 @@ pub fn to_bgra(frame: &CpuFrame) -> Result<CpuFrame, VideoError> {
             let p = frame.planes();
             yuvutils_rs::yuv420_to_bgra(
                 &YuvPlanarImage {
-                    y_plane: &p[0].data,
+                    y_plane: &full_rows(frame, 0),
                     y_stride: u32_of(p[0].stride)?,
-                    u_plane: &p[1].data,
+                    u_plane: &full_rows(frame, 1),
                     u_stride: u32_of(p[1].stride)?,
-                    v_plane: &p[2].data,
+                    v_plane: &full_rows(frame, 2),
                     v_stride: u32_of(p[2].stride)?,
                     width: w,
                     height: h,
@@ -407,5 +446,84 @@ mod tests {
         let b = to_i420(&padded, ColorSpace::default()).unwrap();
         assert_eq!(a.planes()[1], b.planes()[1]);
         assert_eq!(a.planes()[2], b.planes()[2]);
+    }
+
+    /// `frame` with each plane's rows 16 bytes apart more than they need,
+    /// and the last row unpadded (the buffer ends with its pixels), as
+    /// `CpuFrame::new` allows and a capture's buffer may end.
+    fn last_row_unpadded(frame: &CpuFrame) -> CpuFrame {
+        let planes = frame
+            .planes()
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let (row, rows) = frame.format().plane_shape(i, frame.width(), frame.height());
+                let stride = row + 16;
+                let mut data = vec![0xEE; stride * (rows - 1) + row];
+                for r in 0..rows {
+                    data[r * stride..r * stride + row]
+                        .copy_from_slice(&p.data[r * p.stride..r * p.stride + row]);
+                }
+                Plane {
+                    data: data.into(),
+                    stride,
+                }
+            })
+            .collect();
+        CpuFrame::new(
+            frame.format(),
+            frame.width(),
+            frame.height(),
+            planes,
+            frame.color(),
+            frame.timestamp(),
+        )
+        .expect("a layout CpuFrame::new allows")
+    }
+
+    /// Plane contents, row by row, without the padding.
+    fn rows_of(frame: &CpuFrame) -> Vec<Vec<u8>> {
+        (0..frame.planes().len())
+            .flat_map(|i| {
+                let (_, rows) = frame.format().plane_shape(i, frame.width(), frame.height());
+                (0..rows).map(move |r| frame.row(i, r).to_vec())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_unpadded_last_row_converts_like_a_padded_one() {
+        let sent = ColorSpace::default();
+        // Wide enough for the SIMD paths, odd row pairs included.
+        let source = bgra(64, 6);
+        let nv12 = to_nv12(&source, sent).unwrap();
+        let i420 = to_i420(&source, sent).unwrap();
+        let yuyv =
+            CpuFrame::filled(PixelFormat::Yuyv, 64, 6, &[0x80], sent, Duration::ZERO).unwrap();
+        type Convert = fn(&CpuFrame) -> CpuFrame;
+        let cases: [(&str, &CpuFrame, Convert); 7] = [
+            ("BGRA to NV12", &source, |f| {
+                to_nv12(f, ColorSpace::default()).unwrap()
+            }),
+            ("BGRA to I420", &source, |f| {
+                to_i420(f, ColorSpace::default()).unwrap()
+            }),
+            ("NV12 to BGRA", &nv12, |f| to_bgra(f).unwrap()),
+            ("I420 to BGRA", &i420, |f| to_bgra(f).unwrap()),
+            ("NV12 to I420", &nv12, |f| {
+                to_i420(f, ColorSpace::default()).unwrap()
+            }),
+            ("I420 to NV12", &i420, |f| {
+                to_nv12(f, ColorSpace::default()).unwrap()
+            }),
+            ("YUYV to I420", &yuyv, |f| {
+                to_i420(f, ColorSpace::default()).unwrap()
+            }),
+        ];
+        for (name, frame, convert) in cases {
+            let expected = rows_of(&convert(frame));
+            let got = rows_of(&convert(&last_row_unpadded(frame)));
+            assert_eq!(got, expected, "{name}");
+        }
     }
 }
