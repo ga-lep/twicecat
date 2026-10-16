@@ -14,6 +14,13 @@ name: Release
 #   APPLE_API_ISSUER and APPLE_API_KEY_P8 (the .p8 file's text).
 # - Windows: WINDOWS_SIGN_COMMAND, a command with %1 for the file (the signer
 #   is not chosen yet).
+# - The AppImage's own updater (plan Q7 b): the minisign key pair from
+#   `cargo packager signer generate`, its public half committed as
+#   packaging/appimage-updater.pub and its private half and password as
+#   TWICECAT_UPDATER_PRIVATE_KEY and TWICECAT_UPDATER_PRIVATE_KEY_PASSWORD.
+#   With both, the AppImage is built with the public key, signed, and
+#   described in latest.json for the updater; without them it only checks
+#   and links.
 #
 # Actions are pinned by commit, and no job restores a cache: release builds
 # start from the pinned downloads only.
@@ -108,10 +115,22 @@ jobs:
         with:
           name: stateful-graph
           path: ${{ runner.temp }}/stateful
+      # The updater is built in only when the AppImage can also be signed.
+      - name: AppImage updater key
+        env:
+          UPDATER_KEY: ${{ secrets.TWICECAT_UPDATER_PRIVATE_KEY }}
+        run: |
+          if [ -n "$UPDATER_KEY" ] && [ -f packaging/appimage-updater.pub ]; then
+            echo "TWICECAT_UPDATER_PUBKEY=$(tr -d '\r\n' < packaging/appimage-updater.pub)" >> "$GITHUB_ENV"
+            cargo install cargo-packager@0.11.8 --locked
+          else
+            echo "AppImage: no updater key, it checks and links only." >> "$GITHUB_STEP_SUMMARY"
+          fi
       # As the runner's user, with the checkout and the Twicecat cache at their
       # paths, so the packages land in target/package/ for the steps below.
       # The fetches run inside: a failed one fails the step (webrtc-sys would
-      # otherwise download libwebrtc unverified).
+      # otherwise download libwebrtc unverified). TWICECAT_UPDATER_PUBKEY
+      # passes through only when the step above set it.
       - name: Build and package (dist profile, in the image)
         env:
           TWICECAT_STATEFUL_MODEL: ${{ runner.temp }}/stateful/deepfilternet3_stateful.onnx
@@ -119,7 +138,7 @@ jobs:
         run: |
           mkdir -p "$HOME/.cache/twicecat"
           docker run --rm --user "$(id -u):$(id -g)" -e HOME="$HOME" \
-            -e TWICECAT_STATEFUL_MODEL -e ARCH -e CARGO_TERM_COLOR \
+            -e TWICECAT_STATEFUL_MODEL -e TWICECAT_UPDATER_PUBKEY -e ARCH -e CARGO_TERM_COLOR \
             -v "$PWD:$PWD" -v "$HOME/.cache/twicecat:$HOME/.cache/twicecat" -v "$RUNNER_TEMP:$RUNNER_TEMP" \
             --workdir "$PWD" twicecat-ubuntu-24.04-build bash -euo pipefail -c '
               LK_CUSTOM_WEBRTC=$(scripts/fetch-libwebrtc.sh)
@@ -131,6 +150,16 @@ jobs:
               scripts/package.sh'
       - name: Smoke-test the packages
         run: scripts/smoke-test-packages.sh "target/package/${{ matrix.arch }}-unknown-linux-gnu"
+      # The signature the updater checks (minisign, as base64), next to it.
+      - name: Sign the AppImage for its updater
+        if: env.TWICECAT_UPDATER_PUBKEY != ''
+        env:
+          CARGO_PACKAGER_SIGN_PRIVATE_KEY: ${{ secrets.TWICECAT_UPDATER_PRIVATE_KEY }}
+          CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD: ${{ secrets.TWICECAT_UPDATER_PRIVATE_KEY_PASSWORD }}
+        run: |
+          for image in target/package/${{ matrix.arch }}-unknown-linux-gnu/*.AppImage; do
+            cargo packager signer sign "$image"
+          done
       # The Flatpak job uses the same notices page as the .deb (same target,
       # same "any GPU" pack).
       - name: Collect
@@ -138,6 +167,7 @@ jobs:
           out=target/package/${{ matrix.arch }}-unknown-linux-gnu
           mkdir -p "$RUNNER_TEMP/dist" "$RUNNER_TEMP/notices"
           cp "$out"/*.tar.zst "$out"/*.deb "$out"/*.rpm "$out"/*.AppImage "$RUNNER_TEMP/dist/"
+          if ls "$out"/*.AppImage.sig >/dev/null 2>&1; then cp "$out"/*.AppImage.sig "$RUNNER_TEMP/dist/"; fi
           cp "$out/stage/usr/share/doc/twicecat/THIRD_PARTY_NOTICES.html" "$RUNNER_TEMP/notices/"
           ls -l "$RUNNER_TEMP/dist"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -330,6 +360,37 @@ jobs:
           pattern: dist-*
           path: dist
           merge-multiple: true
+      # The AppImage updater's manifest, when the AppImages were signed: the
+      # newest version and, per architecture, its download and signature.
+      # It reaches the updater once this release is published as the latest.
+      - name: latest.json
+        env:
+          TAG: ${{ needs.version.outputs.tag }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          if ls dist/*.AppImage.sig >/dev/null 2>&1; then
+            python3 -I - dist "$GITHUB_REPOSITORY" "$TAG" "$VERSION" <<'EOF'
+          import datetime, json, pathlib, sys
+          dist, repo, tag, version = sys.argv[1:]
+          platforms = {}
+          for sig in sorted(pathlib.Path(dist).glob("*.AppImage.sig")):
+              image = sig.name[: -len(".sig")]
+              arch = "aarch64" if "aarch64" in image else "x86_64"
+              platforms[f"linux-{arch}"] = {
+                  "url": f"https://github.com/{repo}/releases/download/{tag}/{image}",
+                  "signature": sig.read_text().strip(),
+                  "format": "appimage",
+              }
+          manifest = {
+              "version": version,
+              "notes": f"https://github.com/{repo}/releases/tag/{tag}",
+              "pub_date": datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat(),
+              "platforms": platforms,
+          }
+          pathlib.Path(dist, "latest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+          EOF
+            cat dist/latest.json
+          fi
       - name: SHA256SUMS
         working-directory: dist
         run: |

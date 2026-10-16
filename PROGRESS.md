@@ -3135,7 +3135,7 @@ Plan approved by the human 2026-10-14. Targets: Linux x86_64 and aarch64 (the St
 - [x] 6. Desktop packages: nfpm (`.deb`, `.rpm`), appimagetool (AppImage), `.tar.zst`; cargo-packager (MSI, DMG; built in CI, Task 8) (phase7.6)
 - [x] 7. Flatpak, x86_64 and aarch64 (phase7.7): built and smoke-tested on x86_64 (Docker on the Windows machine); aarch64 in the release workflow
 - [ ] 8. Release workflow (phase7.8): written and linted (2026-10-16); **not run yet**: its dry run needs the branch pushed and dispatched (the human's), see the checkpoint
-- [ ] 9. Updates (phase7.9): 9a done, the opt-in check and link (2026-10-16); 9b, the AppImage updater, next
+- [x] 9. Updates (phase7.9): 9a, the opt-in check and link; 9b, the AppImage updates itself (2026-10-17); a real update between two signed releases is on the checkpoint
 - [ ] 10. Crash reports (phase7.10)
 - [ ] 11. The sandbox and the Frame, `docs/install.md` (phase7.11)
 - [ ] 12. apt and dnf repositories on GitHub Pages, AUR `twicecat-bin` (phase7.12; added 2026-10-14, plan Q13)
@@ -3157,7 +3157,11 @@ See the plan's "Human checkpoint"; items move here as tasks finish. Already open
 - [ ] (Task 9) In a real window on Windows, macOS or a tarball (not the Flatpak or a package):
   - the update question bar after the first login (**No thanks** and **Check daily**), and the toggle on Settings → About;
   - with a published release newer than the build, the "Twicecat X is available." bar, and **Open the release page** opening the browser;
-  - in the Flatpak and in a `.deb`, About shows the line about Flatpak or the package manager instead.
+  - the Flatpak installed from the release bundle and a `.deb` installed from the downloaded file ask the question and check like a tarball (Q15); once `/etc/apt/sources.list.d/twicecat.sources` exists (by hand for now, from the package after Task 12), the `.deb` shows the line about the package manager instead.
+- [ ] (Task 9b) Create the AppImage updater's key pair yourself with `cargo packager signer generate` (cargo-packager 0.11.8). Commit its public half as `packaging/appimage-updater.pub`, and add the private half and its password as the secrets `TWICECAT_UPDATER_PRIVATE_KEY` and `TWICECAT_UPDATER_PRIVATE_KEY_PASSWORD`. Then publish two releases and check, from the older AppImage with the check on:
+  - the "available" bar offers **Install the update**;
+  - it installs, **Restart now** starts the new version, and the login is kept;
+  - a tampered or wrongly signed AppImage is refused with the failure bar.
 - [ ] (Task 7) The Flatpak on a desktop (GNOME and KDE): see the plan's sandbox items; and the aarch64 bundle from the release workflow on the Steam Frame.
 
 ## Phase 7 / Task 1 notes
@@ -3292,12 +3296,14 @@ See the plan's "Human checkpoint"; items move here as tasks finish. Already open
 
 ## Phase 7 / Task 9 notes (the check and link; the AppImage updater follows as 9b)
 - **Which copy checks (`api::UpdateMechanism`, detected at run time):**
-  - `/.flatpak-info` → Flatpak;
+  - `/.flatpak-info` and a build with `TWICECAT_FLATPAK_REMOTE=1` → Flatpak;
   - `APPIMAGE` set → AppImage (checked like the others until 9b);
-  - a binary under `/usr` but not `/usr/local` → the package manager (`.deb`, `.rpm`, AUR);
-  - otherwise (Windows, macOS, an unpacked `.tar.zst`, a source build) → check and link.
+  - a binary under `/usr` but not `/usr/local`, with Twicecat's apt or dnf repository entry (`/etc/apt/sources.list.d/twicecat.sources`, `/etc/yum.repos.d/twicecat.repo`) or pacman's record of `twicecat-bin` → the package manager (`.deb`, `.rpm`, AUR);
+  - otherwise (Windows, macOS, an unpacked `.tar.zst`, a source build, a Flatpak bundle, a package from a downloaded file) → check and link.
 
-  Changed from the plan's build-time `TWICECAT_DISTRIBUTION`: every Linux format ships the same binary (Task 6), so the build cannot tell a `.deb` from a tarball.
+  Changed from the plan's build-time `TWICECAT_DISTRIBUTION`: every Linux format ships the same binary (Task 6), so the build cannot tell a `.deb` from a tarball. The Flatpak is its own build, so it alone gets a build-time variable.
+
+  Changed by Q15 (human, 2026-10-17: (c)): at first the Flatpak and every `/usr` install were left to their package manager. But the release's bundle has no `--repo-url`, so its `twicecat-origin` remote has an empty URL (flatpak 1.16.1, `flatpak-dir.c:10150`, `:14482`), and a downloaded `.deb` or `.rpm` has no repository until Task 12. Those copies got no notice at all. The sandbox cannot see its origin (`/.flatpak-info` has none, `flatpak-run.c:1420-1489`), hence the build variable. Tests: `each_install_gets_its_mechanism` (a Flatpak with and without the variable; `/usr` with and without a repository; `/usr/local` and `/usrx` with one) `only_the_value_1_marks_a_flatpak_from_a_repository` (the build variable, read at run time: a `const` match on `str` does not compile on stable Rust) and `a_package_manager_updates_only_with_a_repository_or_from_the_aur` (each entry in a temporary root; someone else's entries, `.rpmsave`, `twicecat-git` and a directory in place of the file are not). Mutation: dropping the repository condition fails the first.
 - **The core (`crates/core/src/updates.rs`):**
   - One GET to `https://api.github.com/repos/ga-lep/twicecat/releases/latest`, the owner and repository taken from the workspace's `repository`. It sends `Accept: application/vnd.github+json` and `User-Agent: twicecat/<version>` (GitHub refuses requests without one), with a 20 s timeout and the reply capped at 1 MiB.
   - It reads `tag_name` and `html_url` from `serde_json::Value` (no derive, so the serializer guard is untouched). The link must equal `<repository>/releases/tag/<tag>`, and the tag may only use `[A-Za-z0-9._-]`, at most 64 characters.
@@ -3320,3 +3326,42 @@ See the plan's "Human checkpoint"; items move here as tasks finish. Already open
 - **The real API (2026-10-16):** `GET /repos/ga-lep/twicecat` answers 200 (the repository is public). `/releases/latest` answers 404 because there is no release yet, which the core treats as no answer: a warning in the log and no event. The first published release makes it answer.
 - **Not verified:** the bars and the toggle in a real window (checkpoint).
 - **Gate (Windows):** `cargo fmt --all --check`; `cargo clippy --workspace --all-targets --locked -- -D warnings`, also with `--all-features`. `cargo test --workspace --locked`: 2287 passed, 2 failed, 158 ignored. The two failures were gallery tests this step broke: their variant settings reset the answer, so the question bar shifted the switcher row and the call stage. The variants now keep the scenario's answer. After that fix the app's 1497 tests pass; the other crates had passed in the full run. The boundary scripts and `flatpak.sh check` pass (the lock did not change).
+
+## Phase 7 / Task 9b notes (the AppImage updates itself)
+- **Dependency (Q11, approved =0.2.3):** `cargo-packager-updater = "=0.2.3"` for Linux only, in the core.
+  - New in `Cargo.lock`: cargo-packager-updater 0.2.3, cargo-packager-utils 0.1.1, ctor 0.2.9, dirs 5.0.1, dirs-sys 0.4.1, minisign-verify 0.2.5, redox_users 0.4.6, wasm-streams 0.4.2. The windows-sys 0.48 family is in the lock too, but is never built here: the dependency is Linux-only.
+  - Resolving the lock also moved `tempfile` 3.27.0's `getrandom` from 0.3.4 to 0.4.3 (both were already locked). That entry was put back to 0.3.4 by hand, and `cargo metadata --locked` accepts it, so no existing crate changes.
+  - TLS: its reqwest 0.12 gets rustls with the system's roots from `livekit-net` and its own `rustls-tls` default.
+  - `packaging/flatpak/cargo-sources.json` was regenerated (`flatpak.sh check` passes).
+- **`crates/core/src/appimage_update.rs` (Linux):** the updater runs only when three things hold:
+  - `APPIMAGE` is set;
+  - the build has the public key (`TWICECAT_UPDATER_PUBKEY` at build time; the release workflow sets it only when it can also sign);
+  - `SSL_CERT_FILE` and `SSL_CERT_DIR` are set.
+
+  What it does:
+  - It reads `<repository>/releases/latest/download/latest.json`, the manifest of the latest published release (drafts are never "latest").
+  - It downloads the new AppImage, verifies its minisign signature (`src/lib.rs:760`, `verify_signature` `:1187-1208`) and swaps it in on the same filesystem (`:940-1012`).
+  - Errors are fixed texts; the library's can carry URLs and paths.
+  - Where the AppImage can update itself, the daily check uses that manifest (`UpdateAvailable { installable: true, .. }`, with the release page as the link); everywhere else it asks GitHub's API.
+  - `Command::InstallUpdate` runs the install on a blocking thread, answered by `UpdateInstalled { version }` or `UpdateInstallFailed`.
+- **The `set_var` the human asked to work around:**
+  - The library calls `std::env::set_var("SSL_CERT_FILE"/"SSL_CERT_DIR")` on every check when they are unset (`src/lib.rs:510-519`).
+  - `twicecat_core::prepare_appimage_tls` (`unsafe`) prevents that. The app's `main` calls it as its very first statement, before any thread exists, and it acts only in an AppImage of a build with the key.
+  - It sets each variable, only if unset, to the first certificate bundle that exists: Debian, Ubuntu, Arch, SteamOS and Gentoo's `/etc/ssl/certs/ca-certificates.crt`, Fedora's `/etc/pki/tls/certs/ca-bundle.crt`, openSUSE's `/etc/ssl/ca-bundle.pem`, then `/etc/pki/tls/cacert.pem` and `/etc/ssl/cert.pem`. The folder is `/etc/ssl/certs`, `/etc/pki/tls/certs`, or else the bundle's own.
+  - Without a bundle nothing is set and the updater stays off, so the library never sets them itself.
+  - With these set, rustls-native-certs (LiveKit's TLS too) reads the same bundle it would have found on its own.
+- **The app:**
+  - An installable update's bar has **Dismiss**, **Open the release page** and **Install the update** (shown as "Installing…" while it runs).
+  - Then a Success bar: "Twicecat X is installed. It starts when Twicecat restarts." with **Restart now**. It records `$APPIMAGE` for `main` and closes the app the usual way; after the window has closed, `main` starts the new AppImage, so the stores were already released.
+  - A failed install shows a Danger bar with **Dismiss** and leaves the update installable, to be tried again.
+- **The release workflow:**
+  - With `TWICECAT_UPDATER_PRIVATE_KEY` and `packaging/appimage-updater.pub`, the Linux jobs build with the public key, install cargo-packager 0.11.8 and sign each AppImage with `cargo packager signer sign` (it writes `<AppImage>.sig`, the minisign signature as base64; `src/cli/signer/sign.rs`, `src/sign.rs:144-192`).
+  - The release job then writes `latest.json`: the version, the notes link, `pub_date` (RFC 3339), and per `linux-<arch>` the download URL, the signature and `format: appimage`. These are the fields `custom_serialization.rs` reads; the platform key is `<target>-<arch>` (`src/lib.rs:438-452`).
+  - Without the secrets, the job summary says "AppImage: no updater key, it checks and links only."
+- **Tests:**
+  - Core (Linux): `appimage_update::tests` (the bundle and folder on Debian, Fedora, a bundle without a known folder, none; the manifest URL; a build without the key never updates) and `updates` with the new field.
+  - App: `updates` (only an installable update is installed and only once; a later check while the new one waits changes nothing; a failed install is shown until dismissed and can be tried again; restart needs an installed update in an AppImage).
+- **Not verified (checkpoint):** a real update from one signed release to the next. The key pair does not exist yet, and the human creates it.
+- **Gate:**
+  - Windows: `cargo fmt --all --check`; `cargo clippy --workspace --all-targets --locked -- -D warnings`, also with `--all-features`; `cargo test --workspace --locked`: 2292 passed, 0 failed, 158 ignored; the boundary scripts and `flatpak.sh check` pass.
+  - Linux, for the Linux-only code: `cargo clippy -p twicecat-core -p twicecat-app --all-targets -- -D warnings`, and the core's `updates`, `appimage_update` and `paths` tests (38) and the app's `updates` tests (12), all passing. They ran in `dev/ubuntu-26.04`'s image, built here with apt's date check off, because this machine's clock runs about 40 minutes behind Ubuntu's archive; the repository's Dockerfile is unchanged.

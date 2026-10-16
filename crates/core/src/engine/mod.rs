@@ -1408,6 +1408,12 @@ impl Engine {
                     old.abort();
                 }
             }
+            Command::InstallUpdate => {
+                let events = self.events.clone();
+                tokio::spawn(async move {
+                    let _ = events.send(crate::updates::install().await).await;
+                });
+            }
             Command::SetUserVolume {
                 user_id,
                 source,

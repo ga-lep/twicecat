@@ -60,3 +60,12 @@ twicecat-audio = { path = "../audio", features = ["test-fakes"] }
 twicecat-video = { path = "../video", features = ["test-camera"] }
 # Paused time for the unread-totals throttle test; a feature of the pinned-in-lock tokio, no new packages.
 tokio = { version = "1", features = ["test-util"] }
+
+# The AppImage updates itself (Phase 7 plan Q7 b; Q11 approved =0.2.3): its
+# signed manifest checked, the new AppImage downloaded, verified (minisign)
+# and swapped in (crates/core/src/appimage_update.rs). New in the lock with
+# it: cargo-packager-utils, ctor, dirs 5, dirs-sys 0.4, minisign-verify,
+# redox_users, wasm-streams, and the windows-sys 0.48 family for other
+# platforms.
+[target.'cfg(target_os = "linux")'.dependencies]
+cargo-packager-updater = "=0.2.3"

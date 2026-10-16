@@ -1,24 +1,54 @@
 //! Update checks (Phase 7 plan Task 9, Q7): which mechanism this copy of
 //! Twicecat updates through, and when a check is due.
 
+#[cfg(any(target_os = "linux", test))]
 use std::path::Path;
 use std::time::Duration;
 
 /// How this copy of Twicecat gets new versions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UpdateMechanism {
-    /// Windows, macOS, an unpacked `.tar.zst` or a build from source: an
-    /// opt-in check, once a day, that shows a link to the release page.
-    /// Nothing is downloaded or run.
+    /// Windows, macOS, an unpacked `.tar.zst`, a build from source, and the
+    /// Linux packages nothing updates (a Flatpak bundle with no repository,
+    /// a `.deb` or `.rpm` installed from a downloaded file): an opt-in
+    /// check, once a day, that shows a link to the release page. Nothing is
+    /// downloaded or run.
     CheckAndLink,
     /// An AppImage (`APPIMAGE` is set). Checked like `CheckAndLink` until it
     /// can update itself.
     AppImage,
-    /// The Flatpak: Flatpak updates it.
+    /// A Flatpak installed from a repository: Flatpak updates it.
     Flatpak,
-    /// Installed under `/usr` (`.deb`, `.rpm`, AUR): the package manager
-    /// updates it.
+    /// Installed under `/usr` with Twicecat's apt or dnf repository set up,
+    /// or from the AUR: the package manager updates it.
     PackageManager,
+}
+
+/// Whether this Flatpak comes from a repository that Flatpak updates it
+/// from: `TWICECAT_FLATPAK_REMOTE=1` at build time (`value`), set by the
+/// manifest once the bundle carries `--repo-url` (plan Q15). The sandbox
+/// cannot see its origin (`/.flatpak-info` has none), so the build says it.
+#[cfg(any(target_os = "linux", test))]
+fn flatpak_remote(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+/// What the Linux rules read about the running copy.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Install<'a> {
+    /// `/.flatpak-info` exists: this is a Flatpak.
+    pub flatpak: bool,
+    /// The Flatpak was built to come from a repository
+    /// (`TWICECAT_FLATPAK_REMOTE`).
+    pub flatpak_remote: bool,
+    /// `APPIMAGE` is set.
+    pub appimage: bool,
+    /// The running binary.
+    pub exe: &'a Path,
+    /// A package manager can update Twicecat: its apt or dnf repository
+    /// entry exists, or pacman installed it ([`package_repository`]).
+    pub repository: bool,
 }
 
 impl UpdateMechanism {
@@ -27,11 +57,13 @@ impl UpdateMechanism {
         #[cfg(target_os = "linux")]
         {
             let exe = std::env::current_exe().unwrap_or_default();
-            Self::detect(
-                Path::new("/.flatpak-info").exists(),
-                std::env::var_os("APPIMAGE").is_some(),
-                &exe,
-            )
+            Self::detect(Install {
+                flatpak: Path::new("/.flatpak-info").exists(),
+                flatpak_remote: flatpak_remote(option_env!("TWICECAT_FLATPAK_REMOTE")),
+                appimage: std::env::var_os("APPIMAGE").is_some(),
+                exe: &exe,
+                repository: package_repository(Path::new("/")),
+            })
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -39,15 +71,23 @@ impl UpdateMechanism {
         }
     }
 
-    /// The Linux rules: Flatpak, then AppImage (its files are mounted under
-    /// `/tmp`), then a binary under `/usr` but not `/usr/local` (where
-    /// copies built by hand go), else a check.
-    pub fn detect(flatpak_info: bool, appimage: bool, exe: &Path) -> Self {
-        if flatpak_info {
-            Self::Flatpak
-        } else if appimage {
+    /// The Linux rules: a Flatpak from a repository, then an AppImage (its
+    /// files are mounted under `/tmp`), then a binary under `/usr` but not
+    /// `/usr/local` (where copies built by hand go) that a package manager
+    /// can update; anything else checks, including a Flatpak bundle and a
+    /// package installed from a downloaded file, which nothing updates.
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn detect(install: Install<'_>) -> Self {
+        let packaged = install.exe.starts_with("/usr") && !install.exe.starts_with("/usr/local");
+        if install.flatpak {
+            if install.flatpak_remote {
+                Self::Flatpak
+            } else {
+                Self::CheckAndLink
+            }
+        } else if install.appimage {
             Self::AppImage
-        } else if exe.starts_with("/usr") && !exe.starts_with("/usr/local") {
+        } else if packaged && install.repository {
             Self::PackageManager
         } else {
             Self::CheckAndLink
@@ -58,6 +98,27 @@ impl UpdateMechanism {
     pub fn checks_itself(self) -> bool {
         matches!(self, Self::CheckAndLink | Self::AppImage)
     }
+}
+
+/// Whether a package manager updates Twicecat on the system under `root`:
+/// the apt or dnf repository entry the install instructions (plan Task 12)
+/// and the packages themselves (Q15) put in place, or pacman's record of the
+/// AUR package `twicecat-bin`, which AUR helpers update.
+#[cfg(any(target_os = "linux", test))]
+fn package_repository(root: &Path) -> bool {
+    let entries = [
+        "etc/apt/sources.list.d/twicecat.sources",
+        "etc/yum.repos.d/twicecat.repo",
+    ];
+    entries.iter().any(|entry| root.join(entry).is_file())
+        || std::fs::read_dir(root.join("var/lib/pacman/local")).is_ok_and(|records| {
+            records.flatten().any(|record| {
+                record
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with("twicecat-bin-"))
+            })
+        })
 }
 
 /// How often a check is due.
@@ -128,48 +189,118 @@ fn parse_version(text: &str) -> Option<(u64, u64, u64, bool)> {
 mod tests {
     use super::*;
 
+    /// A binary at `exe`, outside any Flatpak or AppImage, with no package
+    /// repository set up.
+    fn at(exe: &str) -> Install<'_> {
+        Install {
+            flatpak: false,
+            flatpak_remote: false,
+            appimage: false,
+            exe: Path::new(exe),
+            repository: false,
+        }
+    }
+
     #[test]
     fn each_install_gets_its_mechanism() {
         let detect = UpdateMechanism::detect;
+        let flatpak = Install {
+            flatpak: true,
+            ..at("/app/bin/twicecat")
+        };
         assert_eq!(
-            detect(true, false, Path::new("/app/bin/twicecat")),
+            detect(Install {
+                flatpak_remote: true,
+                ..flatpak
+            }),
             UpdateMechanism::Flatpak
         );
+        // The release's bundle has no repository behind it: nothing updates
+        // it, so it checks.
+        assert_eq!(detect(flatpak), UpdateMechanism::CheckAndLink);
         // An AppImage's binary runs from its mount under /tmp.
         assert_eq!(
-            detect(
-                false,
-                true,
-                Path::new("/tmp/.mount_TwicecXYZ/usr/bin/twicecat")
-            ),
+            detect(Install {
+                appimage: true,
+                ..at("/tmp/.mount_TwicecXYZ/usr/bin/twicecat")
+            }),
             UpdateMechanism::AppImage
         );
+        let packaged = at("/usr/bin/twicecat");
         assert_eq!(
-            detect(false, false, Path::new("/usr/bin/twicecat")),
+            detect(Install {
+                repository: true,
+                ..packaged
+            }),
             UpdateMechanism::PackageManager
         );
+        // A .deb or .rpm installed from a downloaded file: no repository.
+        assert_eq!(detect(packaged), UpdateMechanism::CheckAndLink);
         assert_eq!(
-            detect(
-                false,
-                false,
-                Path::new("/home/me/twicecat-0.1.0-linux-x86_64/bin/twicecat")
-            ),
+            detect(at("/home/me/twicecat-0.1.0-linux-x86_64/bin/twicecat")),
             UpdateMechanism::CheckAndLink
         );
-        // Built from source and installed by hand: no package manager.
+        // Built from source and installed by hand: no package manager, even
+        // with the repository set up for another copy.
         assert_eq!(
-            detect(false, false, Path::new("/usr/local/bin/twicecat")),
+            detect(Install {
+                repository: true,
+                ..at("/usr/local/bin/twicecat")
+            }),
             UpdateMechanism::CheckAndLink
         );
         // Paths compare by component.
         assert_eq!(
-            detect(false, false, Path::new("/usrx/bin/twicecat")),
+            detect(Install {
+                repository: true,
+                ..at("/usrx/bin/twicecat")
+            }),
             UpdateMechanism::CheckAndLink
         );
         assert!(UpdateMechanism::CheckAndLink.checks_itself());
         assert!(UpdateMechanism::AppImage.checks_itself());
         assert!(!UpdateMechanism::Flatpak.checks_itself());
         assert!(!UpdateMechanism::PackageManager.checks_itself());
+    }
+
+    #[test]
+    fn only_the_value_1_marks_a_flatpak_from_a_repository() {
+        assert!(flatpak_remote(Some("1")));
+        for value in [None, Some(""), Some("0"), Some("true"), Some(" 1")] {
+            assert!(!flatpak_remote(value), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn a_package_manager_updates_only_with_a_repository_or_from_the_aur() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        assert!(!package_repository(root));
+        let put = |path: &str| {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "").unwrap();
+        };
+        let clear = || {
+            for dir in ["etc", "var"] {
+                let _ = std::fs::remove_dir_all(root.join(dir));
+            }
+        };
+        for entry in [
+            "etc/apt/sources.list.d/twicecat.sources",
+            "etc/yum.repos.d/twicecat.repo",
+            "var/lib/pacman/local/twicecat-bin-0.1.0-1/desc",
+        ] {
+            put(entry);
+            assert!(package_repository(root), "{entry}");
+            clear();
+        }
+        // Someone else's entries, or a directory where the file should be.
+        put("etc/apt/sources.list.d/other.sources");
+        put("etc/yum.repos.d/twicecat.repo.rpmsave");
+        put("var/lib/pacman/local/twicecat-git-r1-1/desc");
+        std::fs::create_dir_all(root.join("etc/apt/sources.list.d/twicecat.sources")).unwrap();
+        assert!(!package_repository(root));
     }
 
     #[test]

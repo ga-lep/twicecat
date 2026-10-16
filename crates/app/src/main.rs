@@ -168,6 +168,11 @@ fn run(options: Options) -> Result<(), String> {
         // Best effort: nothing useful to do if it fails.
         let _ = std::fs::remove_dir_all(dir);
     }
+    // **Restart now** after an AppImage update: the new AppImage, now that
+    // this one has let go of its stores.
+    if let Some(program) = twicecat_app::updates::take_restart() {
+        let _ = std::process::Command::new(program).spawn();
+    }
     result.map_err(|error| format!("the window failed: {error}"))
 }
 
@@ -217,6 +222,11 @@ fn attach_parent_console() {
 fn attach_parent_console() {}
 
 fn main() -> ExitCode {
+    #[cfg(target_os = "linux")]
+    // SAFETY: the first thing `main` does, before any thread exists.
+    unsafe {
+        twicecat_core::prepare_appimage_tls();
+    }
     twicecat_core::require_cpu_level();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let options = match parse_args(&args) {

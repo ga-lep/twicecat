@@ -106,6 +106,7 @@ pub(crate) fn outcome(result: Result<Release, Fail>, current: &str) -> Option<Co
             Some(CoreEvent::UpdateAvailable {
                 version,
                 url: release.url,
+                installable: false,
             })
         }
         Ok(_) => Some(CoreEvent::UpToDate),
@@ -116,10 +117,49 @@ pub(crate) fn outcome(result: Result<Release, Fail>, current: &str) -> Option<Co
     }
 }
 
-/// The check the engine runs for `Command::CheckForUpdates`.
+/// The check the engine runs: an AppImage that can update itself reads the
+/// signed manifest of the latest release (installable), any other copy asks
+/// GitHub's API (a link only).
 pub(crate) async fn check() -> Option<CoreEvent> {
+    #[cfg(target_os = "linux")]
+    if crate::appimage_update::available() {
+        let checked = tokio::task::spawn_blocking(crate::appimage_update::check_blocking).await;
+        return match checked {
+            Ok(Ok(Some(update))) => Some(CoreEvent::UpdateAvailable {
+                url: format!("{}/releases/tag/v{}", repository(), update.version),
+                version: update.version,
+                installable: true,
+            }),
+            Ok(Ok(None)) => Some(CoreEvent::UpToDate),
+            Ok(Err(fail)) => {
+                tracing::warn!(?fail, "the AppImage's update check got no answer");
+                None
+            }
+            Err(_) => None,
+        };
+    }
     let result = latest_release(&endpoint(), repository()).await;
     outcome(result, env!("CARGO_PKG_VERSION"))
+}
+
+/// `Command::InstallUpdate`: the AppImage's updater, or a failure anywhere
+/// else.
+pub(crate) async fn install() -> CoreEvent {
+    #[cfg(target_os = "linux")]
+    {
+        match tokio::task::spawn_blocking(crate::appimage_update::install_blocking).await {
+            Ok(Ok(version)) => CoreEvent::UpdateInstalled { version },
+            Ok(Err(fail)) => {
+                tracing::warn!(?fail, "the AppImage update was not installed");
+                CoreEvent::UpdateInstallFailed
+            }
+            Err(_) => CoreEvent::UpdateInstallFailed,
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        CoreEvent::UpdateInstallFailed
+    }
 }
 
 /// Seconds since the Unix epoch on the wall clock.
@@ -250,7 +290,8 @@ mod tests {
         };
         assert!(matches!(
             outcome(Ok(newer), "0.1.0"),
-            Some(CoreEvent::UpdateAvailable { version, url: u }) if version == "0.2.0" && u == url
+            Some(CoreEvent::UpdateAvailable { version, url: u, installable: false })
+                if version == "0.2.0" && u == url
         ));
         let same = Release {
             tag: "v0.1.0".into(),
