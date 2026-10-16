@@ -7,3 +7,4 @@ Task 5: complete (gate ok; notices for 4 targets resolve; unaccepted licence and
 Task 6: complete (gate ok; tar, deb, rpm, AppImage built in Ubuntu 26.04 and all 4 smoke-tested; wrong dependency caught; MSI and DMG config dry-run only, built in CI)
 Task 7: complete (gate ok on Windows; flatpak.sh check ok, two mutations caught; x86_64 bundle built in Flathub's CI image in Docker and smoke-tested; aarch64 in the release workflow)
 Task 8: written (actionlint+shellcheck clean; signing hooks read in cargo-packager 0.11.8; workflow NOT run yet: the human pushes and dispatches the dry run)
+Task 9a: complete (gate ok on Windows: full run 2287 passed + the 2 gallery tests fixed after it; fake GitHub server, paused-clock schedule, app flow tests; the real API answers 404 until a release exists; 9b the AppImage updater next)

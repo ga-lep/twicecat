@@ -1085,7 +1085,7 @@ impl App {
     }
 
     /// Writes the local settings through the store, in a task.
-    fn save_local(&mut self) -> Task<Message> {
+    pub(crate) fn save_local(&mut self) -> Task<Message> {
         self.settings_ui.error = None;
         self.settings_store
             .save(self.ui_settings)

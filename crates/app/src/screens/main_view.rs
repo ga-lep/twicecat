@@ -431,7 +431,7 @@ fn notification_menu<'a>(app: &'a App, room: &RoomId) -> Element<'a, Message> {
 /// The main screen: panes above a status bar.
 pub fn view(app: &App) -> Element<'_, Message> {
     let content = main_column(
-        security::banner_slot(&app.security),
+        security::banner_slot(&app.security, crate::screens::updates::bars(app)),
         main_row(app),
         status_bar(app),
     );
@@ -1468,7 +1468,11 @@ mod tests {
             content: &'a text_editor::Content,
         ) -> Element<'a, Message> {
             let panes = row![timeline_layer(space().into(), None), text_editor(content)].into();
-            let base = main_column(security::banner_slot(model), panes, text("status").into());
+            let base = main_column(
+                security::banner_slot(model, Vec::new()),
+                panes,
+                text("status").into(),
+            );
             security::layer(base, security::screen(model))
         }
         let tags = |tree: &Tree| {

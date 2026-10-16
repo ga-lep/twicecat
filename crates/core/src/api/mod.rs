@@ -13,6 +13,7 @@ mod media;
 mod rooms;
 mod security;
 mod types;
+mod updates;
 mod video;
 
 pub use audio::{
@@ -34,7 +35,7 @@ pub use rooms::{
     CreateRoomRequest, DensityChoice, MembershipView, NotificationKind, NotificationSettingsView,
     NotificationView, OwnProfileView, PaletteChoice, PowerLevelView, Role, RoomDetailsView,
     RoomListChoice, RoomMemberView, RoomNotificationModeView, RoomPermissions, RoomVisibility,
-    SpaceView, ThemeChoice, ThreadSummaryView, UiSettings,
+    SpaceView, ThemeChoice, ThreadSummaryView, UiSettings, UpdateCheckChoice,
 };
 pub use security::{
     CancelReason, CrossSigning, DeviceSummary, DeviceTrust, DeviceVerification, QrImage,
@@ -49,6 +50,7 @@ pub use types::{
     SendFailure, SendStatus, StateChange, SyncState, TextFormat, TextStyle, TimelineItem,
     TimelineItemKind, TypingUser, UserId,
 };
+pub use updates::{UPDATE_CHECK_INTERVAL, UpdateMechanism, is_newer_version, update_check_due};
 pub use video::{
     CameraCapture, CameraFormat, CodecLimits, DegradationChoice, EncoderBackend, EncoderChoice,
     LayerTuning, LocalVideo, QualityLimitation, SCALABILITY_MODES, ScreenSource, ScreenSourceId,
@@ -484,6 +486,22 @@ pub enum Command {
     /// Find which GPU backends can run speech enhancement here (the first
     /// time takes about a second); answered by `GpuEnhancement`.
     ProbeGpuEnhancement,
+
+    // Updates (Phase 7).
+    /// Ask GitHub for the latest release of Twicecat now; answered by
+    /// `UpdateAvailable` or `UpToDate`, or by nothing when GitHub gives no
+    /// answer. Nothing is downloaded.
+    CheckForUpdates,
+    /// Check once a day from now on (the user turned the check on): the
+    /// first check when one is due after `last_checked_at` (seconds since
+    /// the Unix epoch, 0 for never; see `update_check_due`), each announced
+    /// by `UpdateChecked` before its answer. Replaces an earlier schedule.
+    ScheduleUpdateChecks {
+        /// When the last check was sent.
+        last_checked_at: u64,
+    },
+    /// No more scheduled checks (the user turned the check off).
+    StopUpdateChecks,
     /// Replace all audio settings. They are validated, applied (to a running
     /// call too), saved, and echoed back as `AudioSettings`.
     UpdateAudioSettings(AudioSettings),
@@ -873,6 +891,12 @@ impl fmt::Debug for Command {
             Self::ListAudioDevices => f.write_str("ListAudioDevices"),
             Self::GetAudioSettings => f.write_str("GetAudioSettings"),
             Self::ProbeGpuEnhancement => f.write_str("ProbeGpuEnhancement"),
+            Self::CheckForUpdates => f.write_str("CheckForUpdates"),
+            Self::ScheduleUpdateChecks { last_checked_at } => f
+                .debug_struct("ScheduleUpdateChecks")
+                .field("last_checked_at", last_checked_at)
+                .finish(),
+            Self::StopUpdateChecks => f.write_str("StopUpdateChecks"),
             Self::UpdateAudioSettings(settings) => f
                 .debug_tuple("UpdateAudioSettings")
                 .field(settings)
@@ -1210,6 +1234,23 @@ pub enum CoreEvent {
     /// GPU speech enhancement: answering `ProbeGpuEnhancement`, and when
     /// where DeepFilterNet3 runs changes.
     GpuEnhancement(GpuEnhancement),
+
+    // Updates (Phase 7).
+    /// A newer release exists, answering `CheckForUpdates`.
+    UpdateAvailable {
+        /// Its version, such as `0.2.0`.
+        version: String,
+        /// Its page: `<repository>/releases/tag/v<version>` on github.com.
+        url: String,
+    },
+    /// No newer release, answering `CheckForUpdates`.
+    UpToDate,
+    /// A scheduled check is being sent now (seconds since the Unix epoch),
+    /// for the app to keep with its settings.
+    UpdateChecked {
+        /// When.
+        at: u64,
+    },
 
     // Video (Phase 9).
     /// Cameras, answering `ListVideoDevices` or after a hot-plug.

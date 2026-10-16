@@ -3,7 +3,9 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::api::{DensityChoice, PaletteChoice, RoomListChoice, ThemeChoice, UiSettings};
+use crate::api::{
+    DensityChoice, PaletteChoice, RoomListChoice, ThemeChoice, UiSettings, UpdateCheckChoice,
+};
 
 /// Largest settings file read (64 KiB); anything bigger is treated as corrupt.
 const MAX_SETTINGS_BYTES: u64 = 64 * 1024;
@@ -50,6 +52,15 @@ fn settings_from_map(map: &serde_json::Map<String, serde_json::Value>) -> UiSett
             .and_then(serde_json::Value::as_u64)
             .map_or(defaults.text_scale_percent, clamp_text_scale),
         advanced_settings: flag("advanced_settings", defaults.advanced_settings),
+        update_check: match text("update_check") {
+            Some("Off") => UpdateCheckChoice::Off,
+            Some("On") => UpdateCheckChoice::On,
+            _ => defaults.update_check,
+        },
+        update_checked_at: map
+            .get("update_checked_at")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(defaults.update_checked_at),
     }
 }
 
@@ -271,6 +282,12 @@ impl DataPaths {
             },
             "text_scale_percent": settings.text_scale_percent,
             "advanced_settings": settings.advanced_settings,
+            "update_check": match settings.update_check {
+                UpdateCheckChoice::Unasked => "Unasked",
+                UpdateCheckChoice::Off => "Off",
+                UpdateCheckChoice::On => "On",
+            },
+            "update_checked_at": settings.update_checked_at,
         });
         // No key while `None`, so a later change of the app's default reaches
         // this user.
@@ -715,6 +732,33 @@ mod tests {
         assert!(p.read_settings().advanced_settings);
         assert!(!read_text(&p, r#"{"advanced_settings":"yes"}"#).advanced_settings);
         assert!(read_text(&p, r#"{"advanced_settings":true}"#).advanced_settings);
+    }
+
+    #[test]
+    fn the_update_choice_and_time_are_kept_and_an_old_file_asks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = DataPaths::at(tmp.path().join("root"));
+        for choice in [
+            UpdateCheckChoice::Unasked,
+            UpdateCheckChoice::Off,
+            UpdateCheckChoice::On,
+        ] {
+            let s = UiSettings {
+                update_check: choice,
+                update_checked_at: 1_800_000_000,
+                ..UiSettings::default()
+            };
+            p.write_settings(&s).unwrap();
+            assert_eq!(p.read_settings(), s);
+        }
+        // A file from before the check: not asked, never checked.
+        let s = read_text(&p, r#"{"theme":"Dark"}"#);
+        assert_eq!(s.update_check, UpdateCheckChoice::Unasked);
+        assert_eq!(s.update_checked_at, 0);
+        // Wrong values fall back per field.
+        let s = read_text(&p, r#"{"update_check":"Sometimes","update_checked_at":-5}"#);
+        assert_eq!(s.update_check, UpdateCheckChoice::Unasked);
+        assert_eq!(s.update_checked_at, 0);
     }
 
     #[test]

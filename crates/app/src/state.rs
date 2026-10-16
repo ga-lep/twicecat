@@ -96,7 +96,7 @@ pub(crate) fn attention_at(level: window::UserAttention) -> Task<Message> {
     window::oldest().and_then(move |id| window::request_user_attention(id, Some(level)))
 }
 
-fn open_link_task(url: links::CheckedUrl) -> Task<Message> {
+pub(crate) fn open_link_task(url: links::CheckedUrl) -> Task<Message> {
     Task::perform(async move { links::open_link(&url) }, |ok| {
         Message::LinkOpened { ok }
     })
@@ -336,6 +336,8 @@ pub enum Message {
     VerifyPeerRequested(UserId),
     /// A message of the security banner and screens.
     Security(SecurityMessage),
+    /// The update question, banner and toggle.
+    Update(crate::updates::UpdateMessage),
     /// A button of the verification dialog.
     Verification(VerificationMessage),
     /// A button of the Sessions screen or the logout warning.
@@ -592,6 +594,8 @@ pub struct App {
     draft_dirty: bool,
     /// The security banner and screens.
     pub security: SecurityModel,
+    /// Update checks: how this copy is updated, and a newer version found.
+    pub updates: crate::updates::UpdateUi,
     /// The verification dialog, while a flow is open.
     pub verification: Option<VerificationModel>,
     /// The Sessions screen and the logout warning.
@@ -713,6 +717,7 @@ impl App {
             draft_seq: 0,
             draft_dirty: false,
             security: SecurityModel::default(),
+            updates: crate::updates::UpdateUi::default(),
             verification: None,
             sessions: SessionsModel::default(),
             calls: CallModel::default(),
@@ -748,6 +753,8 @@ impl App {
                 .expect("iced boots the application exactly once");
             let (mut app, task) = App::new(startup);
             app.set_ui_settings(ui_settings);
+            app.updates.mechanism = twicecat_core::api::UpdateMechanism::current();
+            let task = Task::batch([task, app.start_update_checks()]);
             app.set_settings_store(Box::new(store.clone()));
             app.set_notifier(Box::new(notifications::SystemNotifier));
             app.set_tray_factory(Box::new(SystemTrayFactory));
@@ -1317,6 +1324,7 @@ impl App {
                 _ => Task::none(),
             },
             Message::Security(message) => self.on_security(message),
+            Message::Update(message) => self.on_update(message),
             Message::Verification(message) => self.on_verification(message),
             Message::Sessions(message) => self.on_sessions(message),
             Message::Rooms(message) => self.on_rooms(message),
@@ -1845,6 +1853,9 @@ impl App {
                 self.audio_card_saw(&event);
                 task = self.on_call_event(event);
             }
+            event @ (CoreEvent::UpdateAvailable { .. }
+            | CoreEvent::UpToDate
+            | CoreEvent::UpdateChecked { .. }) => task = self.on_update_event(event),
             event @ (CoreEvent::VideoDevices(_)
             | CoreEvent::ScreenSources(_)
             | CoreEvent::VideoSettings(_)

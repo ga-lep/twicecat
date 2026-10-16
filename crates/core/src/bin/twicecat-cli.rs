@@ -65,6 +65,8 @@ COMMANDS (type them at the prompt):
     /select <index|id>    Open a room (index from /rooms, or a room ID)
     /send <text>          Send a message to the open room
     /logout               Log out and delete the stored session
+    /update               Ask GitHub whether a newer Twicecat is out (nothing
+                          is downloaded)
     /quit                 Shut down
 
 CALLS (voice, MatrixRTC; joining opens the microphone and speakers):
@@ -198,6 +200,7 @@ enum Repl {
     Select(String),
     Send(String),
     Logout,
+    Update,
     Quit,
     /// A call or audio command, or its usage when the arguments are wrong.
     Call(Result<calls::CallCmd, &'static str>),
@@ -259,6 +262,7 @@ fn parse_repl(line: &str) -> Repl {
         "login" => Repl::Login,
         "rooms" => Repl::Rooms,
         "logout" => Repl::Logout,
+        "update" => Repl::Update,
         "quit" => Repl::Quit,
         "oauth" if !arg.trim().is_empty() => Repl::OAuth(arg.trim().to_owned()),
         "select" if !arg.trim().is_empty() => Repl::Select(arg.trim().to_owned()),
@@ -719,6 +723,7 @@ impl Cli {
                 .await
             }
             Repl::Logout => self.send(Command::Logout).await,
+            Repl::Update => self.send(Command::CheckForUpdates).await,
             Repl::Quit => Flow::Quit,
             Repl::Call(Ok(cmd)) => {
                 let selected = self.selected.as_ref().map(|s| &s.id);
@@ -858,6 +863,15 @@ impl Cli {
             CoreEvent::Security(status) => println!("{}", security_line(&status)),
             // The key is never printed.
             CoreEvent::RecoveryKeyReady(_) => println!("{RECOVERY_KEY_LINE}"),
+            CoreEvent::UpdateAvailable { version, url } => {
+                println!("[update] Twicecat {version} is available: {url}");
+            }
+            CoreEvent::UpToDate => println!(
+                "[update] Twicecat {} is up to date",
+                env!("CARGO_PKG_VERSION")
+            ),
+            // The CLI schedules no checks.
+            CoreEvent::UpdateChecked { .. } => {}
             // Recovery progress, re-authentication, verification (including
             // QR codes), devices and trust are for the graphical app.
             CoreEvent::RecoveryProgress(_)
@@ -1207,6 +1221,7 @@ mod tests {
             Repl::Send("hello  world ".into())
         );
         assert_eq!(parse_repl("/logout"), Repl::Logout);
+        assert_eq!(parse_repl("/update"), Repl::Update);
         assert_eq!(parse_repl("/quit"), Repl::Quit);
         assert_eq!(parse_repl("/bogus x"), Repl::Unknown("/bogus".into()));
         assert_eq!(parse_repl("plain"), Repl::Text("plain".into()));
