@@ -232,6 +232,31 @@ impl GpuDevice {
     pub fn can_import_dma_buf(&self) -> bool {
         self.shared.dma_buf.is_some()
     }
+
+    /// The DRM format modifiers of `fourcc` (a DRM fourcc such as
+    /// [`crate::gpu::XRGB8888`]) this device imports; empty when it imports
+    /// none.
+    #[cfg(target_os = "linux")]
+    pub fn dma_buf_modifiers(&self, fourcc: u32) -> Vec<u64> {
+        super::dmabuf::importable_modifiers(&self.shared, fourcc)
+    }
+
+    /// Opens the GPU a desktop most likely renders on, for frames the
+    /// compositor shares as DMA-BUFs: the integrated GPU of a laptop with
+    /// two (compositors render there unless told otherwise), else the first.
+    /// A buffer from the other GPU fails to import and the capture falls
+    /// back to shared memory.
+    ///
+    /// # Errors
+    /// As [`GpuDevice::open`].
+    pub fn open_for_capture() -> Result<Self, GpuError> {
+        let gpus = crate::probe::vulkan_gpus();
+        let integrated = gpus
+            .iter()
+            .find(|g| g.kind == crate::probe::GpuKind::Integrated)
+            .map(|g| g.uuid);
+        Self::open(integrated)
+    }
 }
 
 fn compute_family(instance: &ash::Instance, physical: vk::PhysicalDevice) -> Option<u32> {

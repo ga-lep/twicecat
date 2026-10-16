@@ -256,6 +256,12 @@ pub fn probe() -> Probe {
     out
 }
 
+/// The Vulkan GPUs only, without opening NVIDIA's libraries (to pick the
+/// device capture imports on); empty when Vulkan cannot be asked.
+pub(crate) fn vulkan_gpus() -> Vec<Gpu> {
+    vulkan::probe().unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

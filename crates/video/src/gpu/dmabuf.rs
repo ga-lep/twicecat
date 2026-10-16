@@ -119,6 +119,47 @@ pub(super) fn import(shared: &Arc<Shared>, frame: &DmaBufFrame) -> Result<Image,
     }
 }
 
+/// The DRM format modifiers of `fourcc` this device can import as a
+/// sampled single-plane image, in the driver's order; empty for a fourcc we
+/// do not import or a device without DMA-BUF import. What a PipeWire
+/// stream offers its producer (plan Task 8).
+pub(super) fn importable_modifiers(shared: &Shared, fourcc: u32) -> Vec<u64> {
+    if shared.dma_buf.is_none() {
+        return Vec::new();
+    }
+    let Some(format) = format_of(fourcc) else {
+        return Vec::new();
+    };
+    let instance = &shared.instance;
+    let mut list = vk::DrmFormatModifierPropertiesListEXT::default();
+    let mut props = vk::FormatProperties2::default().push_next(&mut list);
+    // SAFETY: the physical device belongs to this instance; the chain lives
+    // until the call returns. A list without an array asks for the count.
+    unsafe { instance.get_physical_device_format_properties2(shared.physical, format, &mut props) };
+    let count = list.drm_format_modifier_count as usize;
+    if count == 0 {
+        return Vec::new();
+    }
+    let mut found = vec![vk::DrmFormatModifierPropertiesEXT::default(); count];
+    let mut list = vk::DrmFormatModifierPropertiesListEXT::default()
+        .drm_format_modifier_properties(&mut found);
+    let mut props = vk::FormatProperties2::default().push_next(&mut list);
+    // SAFETY: as above; the array has room for `count` entries, the count
+    // the driver gave.
+    unsafe { instance.get_physical_device_format_properties2(shared.physical, format, &mut props) };
+    let filled = (list.drm_format_modifier_count as usize).min(count);
+    found[..filled]
+        .iter()
+        .filter(|m| {
+            m.drm_format_modifier_plane_count == 1
+                && m.drm_format_modifier_tiling_features
+                    .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE)
+        })
+        .map(|m| m.drm_format_modifier)
+        .filter(|&m| check_importable(shared, format, m, vk::ImageUsageFlags::SAMPLED).is_ok())
+        .collect()
+}
+
 fn check_importable(
     shared: &Shared,
     format: vk::Format,

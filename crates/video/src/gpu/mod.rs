@@ -14,6 +14,8 @@ pub use convert::Converter;
 pub use device::GpuDevice;
 #[cfg(all(target_os = "linux", feature = "hw-video"))]
 pub use dmabuf::export_for_test;
+#[cfg(target_os = "linux")]
+pub use dmabuf::{ABGR8888, ARGB8888, XBGR8888, XRGB8888};
 
 use ash::vk;
 

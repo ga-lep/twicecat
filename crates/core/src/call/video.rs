@@ -2,14 +2,15 @@
 //! everyone else's on every SFU connection, reported as `VideoTracks` with
 //! a [`VideoFeed`] per track, and their statistics about once a second.
 //!
-//! We send raw frames into LiveKit's video source; LiveKit encodes them
-//! with the encoder [`super::encoder`] picks (NVENC or VideoToolbox H.264,
-//! else libwebrtc's VP8) and makes the simulcast layers. The only frames we
-//! send so far come from the test pattern
-//! ([`VideoBackend::TestPattern`](crate::api::VideoBackend)); real capture
-//! comes with Tasks 8 and 9. A hardware encoder that stops, or that LiveKit
-//! replaced, is reported to the engine ([`MediaNotice::EncoderLost`]), which
-//! sends the track again on the software path.
+//! We send raw frames into LiveKit's video source ([`FramePusher`]);
+//! LiveKit encodes them with the encoder [`super::encoder`] picks (NVENC or
+//! VideoToolbox H.264, else libwebrtc's VP8) and makes the simulcast layers.
+//! The frames come from the test pattern
+//! ([`VideoBackend::TestPattern`](crate::api::VideoBackend)) or from a
+//! screen capture ([`super::capture`], Task 8). A hardware encoder that
+//! stops, or that LiveKit replaced, is reported to the engine
+//! ([`MediaNotice::EncoderLost`]), which sends the track again on the
+//! software path.
 //!
 //! A remote track is shown only while its sender is an active member of the
 //! call, as for audio (`media`): the call services hand out tokens to any
@@ -36,8 +37,8 @@ use livekit::webrtc::video_source::native::NativeVideoSource;
 use livekit::webrtc::video_stream::native::NativeVideoStream;
 use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
-use twicecat_video::CpuFrame;
 use twicecat_video::test_pattern::TestPattern;
+use twicecat_video::{CpuFrame, PixelFormat};
 
 use super::encoder;
 use super::media::MediaNotice;
@@ -789,6 +790,57 @@ pub(crate) struct LocalSend {
     pub feed: VideoFeed,
 }
 
+/// Puts our frames into a LiveKit source and the self-view: NV12 frames
+/// of any size, scaled down (by libwebrtc's libyuv) to fit the size the
+/// track was published at when they are larger. Called on the thread that
+/// makes the frames.
+pub(crate) struct FramePusher {
+    source: NativeVideoSource,
+    feed: VideoFeedSender,
+    /// The largest size sent.
+    size: (u32, u32),
+}
+
+impl FramePusher {
+    pub(crate) fn new(source: NativeVideoSource, feed: VideoFeedSender, size: (u32, u32)) -> Self {
+        Self { source, feed, size }
+    }
+
+    /// Sends one frame now. A frame that is not NV12 is converted first; one
+    /// that cannot be is dropped.
+    pub(crate) fn push(&mut self, frame: &CpuFrame) {
+        let converted;
+        let frame = if frame.format() == PixelFormat::Nv12 {
+            frame
+        } else {
+            match twicecat_video::convert::to_nv12(frame, frame.color()) {
+                Ok(nv12) => {
+                    converted = nv12;
+                    &converted
+                }
+                Err(_) => return,
+            }
+        };
+        let now_us = clock_us();
+        let size = (frame.width(), frame.height());
+        let target = twicecat_video::capture::fit_size(size, self.size);
+        let mut buffer = to_nv12_buffer(frame);
+        let api = if target == size {
+            to_api_frame(frame, now_us)
+        } else {
+            buffer = buffer.scale(target.0 as i32, target.1 as i32);
+            buffer_to_api_frame(&buffer, now_us)
+        };
+        self.source.capture_frame(&RtcFrame {
+            rotation: VideoRotation::VideoRotation0,
+            timestamp_us: now_us,
+            frame_metadata: None,
+            buffer,
+        });
+        self.feed.send(api);
+    }
+}
+
 /// Sends a test pattern into a LiveKit source from its own thread, until
 /// stopped or dropped.
 pub(crate) struct PatternSender {
@@ -806,9 +858,10 @@ impl PatternSender {
     ) -> Result<Self, std::io::Error> {
         let stop = Arc::new(AtomicBool::new(false));
         let running = stop.clone();
+        let pusher = FramePusher::new(source, feed, (width, height));
         let thread = std::thread::Builder::new()
             .name("twicecat-video-pattern".into())
-            .spawn(move || send_pattern(&source, &feed, (width, height, fps), &running))?;
+            .spawn(move || send_pattern(pusher, (width, height, fps), &running))?;
         Ok(Self {
             stop,
             thread: Some(thread),
@@ -832,26 +885,16 @@ impl Drop for PatternSender {
     }
 }
 
-fn send_pattern(
-    source: &NativeVideoSource,
-    feed: &VideoFeedSender,
-    (width, height, fps): (u32, u32, u32),
-    stop: &AtomicBool,
-) {
+fn send_pattern(mut pusher: FramePusher, (width, height, fps): (u32, u32, u32), stop: &AtomicBool) {
     let pattern = TestPattern::new(width, height);
     let interval = Duration::from_secs(1) / fps.max(1);
     let mut next = Instant::now();
     let mut counter = 0_u32;
     while !stop.load(Ordering::Relaxed) {
+        // The stamp's send time is the core's video clock, as the pusher's.
         let now_us = clock_us();
         let frame = pattern.frame(counter, Duration::from_micros(now_us.unsigned_abs()));
-        source.capture_frame(&RtcFrame {
-            rotation: VideoRotation::VideoRotation0,
-            timestamp_us: now_us,
-            frame_metadata: None,
-            buffer: to_nv12_buffer(&frame),
-        });
-        feed.send(to_api_frame(&frame, now_us));
+        pusher.push(&frame);
         counter = counter.wrapping_add(1);
         next += interval;
         let now = Instant::now();
@@ -897,6 +940,33 @@ fn to_api_frame(frame: &CpuFrame, timestamp_us: i64) -> VideoFrame {
                 stride: p.stride,
             })
             .collect(),
+        matrix: VideoMatrix::Bt709,
+        range: VideoRange::Limited,
+        timestamp_us,
+    }
+}
+
+/// A libwebrtc NV12 buffer as the API's frame (copied out).
+fn buffer_to_api_frame(buffer: &NV12Buffer, timestamp_us: i64) -> VideoFrame {
+    let (w, h) = (buffer.width() as usize, buffer.height() as usize);
+    let (stride_y, stride_uv) = buffer.strides();
+    let (y, uv) = buffer.data();
+    let copy = |plane: &[u8], stride: u32, rows: usize| {
+        let stride = stride as usize;
+        let mut out = Vec::with_capacity(w * rows);
+        for row in 0..rows {
+            out.extend_from_slice(&plane[row * stride..row * stride + w]);
+        }
+        VideoPlane {
+            data: out.into(),
+            stride: w,
+        }
+    };
+    VideoFrame {
+        format: VideoPixelFormat::Nv12,
+        width: buffer.width(),
+        height: buffer.height(),
+        planes: vec![copy(y, stride_y, h), copy(uv, stride_uv, h / 2)],
         matrix: VideoMatrix::Bt709,
         range: VideoRange::Limited,
         timestamp_us,
@@ -988,6 +1058,40 @@ mod tests {
         let api = to_api_frame(&frame, 9);
         assert_eq!((api.width, api.height, api.timestamp_us), (128, 72, 9));
         assert!(Arc::ptr_eq(&api.planes[0].data, &planes[0].data));
+    }
+
+    // LiveKit's source spawns onto Tokio when made.
+    #[tokio::test]
+    async fn frames_larger_than_the_track_are_scaled_keeping_their_shape() {
+        use livekit::webrtc::video_source::VideoResolution;
+
+        let source = NativeVideoSource::new(
+            VideoResolution {
+                width: 640,
+                height: 360,
+            },
+            true,
+        );
+        let (tx, feed) = VideoFeed::channel();
+        let mut pusher = FramePusher::new(source, tx, (640, 360));
+
+        // Larger: scaled down to the size sent.
+        pusher.push(&TestPattern::new(1280, 720).frame(1, Duration::ZERO));
+        let got = feed.latest().expect("a frame");
+        assert_eq!((got.width, got.height), (640, 360));
+        assert_eq!(got.planes[0].data.len(), 640 * 360);
+
+        // A wider shape keeps it.
+        pusher.push(&TestPattern::new(1280, 400).frame(2, Duration::ZERO));
+        let got = feed.latest().expect("a frame");
+        assert_eq!((got.width, got.height), (640, 200));
+
+        // One that fits goes as it is: the self-view shares its planes.
+        let small = TestPattern::new(320, 180).frame(3, Duration::ZERO);
+        pusher.push(&small);
+        let got = feed.latest().expect("a frame");
+        assert_eq!((got.width, got.height), (320, 180));
+        assert!(Arc::ptr_eq(&got.planes[0].data, &small.planes()[0].data));
     }
 
     #[test]

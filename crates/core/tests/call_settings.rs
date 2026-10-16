@@ -162,9 +162,11 @@ enum Answer {
     NotInCall,
 }
 
-/// The video commands without a call and without real cameras or screens
-/// (Phase 9 Task 5): what needs a call says so, what needs hardware, the
-/// settings or our encoders answers `NotSupported` until its task.
+/// The video commands without a call and without real cameras (Phase 9
+/// Task 5): what needs a call says so, what needs hardware, the settings or
+/// our encoders answers `NotSupported` until its task. Screen sharing
+/// (Task 8) needs a call to start; listing its sources answers by session
+/// (below).
 #[tokio::test]
 async fn video_commands_answer_without_a_call_or_hardware() {
     let dir = tempfile::tempdir().unwrap();
@@ -172,7 +174,6 @@ async fn video_commands_answer_without_a_call_or_hardware() {
     use Answer::{NotInCall, NotSupported};
     let cases = [
         (Command::ListVideoDevices, NotSupported("cameras")),
-        (Command::ListScreenSources, NotSupported("screen sharing")),
         (
             Command::StartCamera {
                 device: None,
@@ -187,7 +188,7 @@ async fn video_commands_answer_without_a_call_or_hardware() {
                 quality: VideoQuality::Uhd2160p60,
                 audio: true,
             },
-            NotSupported("screen-share sound"),
+            NotInCall,
         ),
         (Command::StopScreenShare, NotInCall),
         (
@@ -220,6 +221,18 @@ async fn video_commands_answer_without_a_call_or_hardware() {
         };
         assert!(ok, "{name}: {e:?}");
     }
+    // The system's picker (Wayland), our own list (X11), or nothing to
+    // share without a display (CI).
+    send(&handle, Command::ListScreenSources).await;
+    let e = expect_event(&mut handle, |e| {
+        matches!(e, CoreEvent::Error(_) | CoreEvent::ScreenSources(_))
+    })
+    .await;
+    assert!(
+        matches!(&e, CoreEvent::ScreenSources(_))
+            || matches!(&e, CoreEvent::Error(CoreError::NotSupported(w)) if w == "screen sharing"),
+        "ListScreenSources: {e:?}"
+    );
     send(&handle, Command::Shutdown).await;
 }
 

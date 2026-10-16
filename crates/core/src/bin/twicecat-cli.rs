@@ -52,8 +52,9 @@ OPTIONS:
     --silent-audio        Calls send silence and play nothing; the microphone
                           and speakers are never opened (tests, scripts)
     --test-video          The camera and the screen are a moving test pattern
-                          (see /video pattern); real cameras and screens come
-                          with later versions
+                          (see /video pattern); without it the screen is
+                          shared for real (/video share); real cameras come
+                          with a later version
     --help                Show this help
 
 COMMANDS (type them at the prompt):
@@ -99,12 +100,18 @@ CALLS (voice, MatrixRTC; joining opens the microphone and speakers):
                           every talker at once, little CPU; the CPU takes
                           over if no GPU keeps up)
 
-VIDEO (in a call; needs --test-video to send):
+VIDEO (in a call):
     /video                List the call's video tracks
     /video pattern <res> <fps> [screen]
-                          Send the test pattern as your camera (or a screen
-                          share): 720p 30, 1080p 60, 1440p 60, 2160p 30 or
-                          2160p 60; sent at most at 1080p30 for now
+                          With --test-video: send the test pattern as your
+                          camera (or a screen share): 720p 30, 1080p 60,
+                          1440p 60, 2160p 30 or 2160p 60
+    /video sources        List the screens and windows to share (X11), or
+                          say that the system shows its own picker (Wayland)
+    /video share <res> <fps> [n] [sound]
+                          Share source n of /video sources (X11) or what you
+                          pick in the system's picker, at most at that size
+                          and rate; with sound: what other applications play
     /video off [screen]   Stop your camera (or screen share)
     /video view <n> <w>x<h>|hide
                           Receive track n for that size on screen, or not at
@@ -902,13 +909,13 @@ impl Cli {
             CoreEvent::VideoFeed { .. } | CoreEvent::CameraPreview(_) => {}
             event @ (CoreEvent::VideoTracks { .. }
             | CoreEvent::LocalVideo(_)
-            | CoreEvent::VideoStats(_)) => {
+            | CoreEvent::VideoStats(_)
+            | CoreEvent::ScreenSources(_)) => {
                 for line in self.video.event(event) {
                     println!("{line}");
                 }
             }
             CoreEvent::VideoDevices(_)
-            | CoreEvent::ScreenSources(_)
             | CoreEvent::VideoSettings(_)
             | CoreEvent::VideoSettingsAdjusted(_)
             | CoreEvent::VideoSending { .. }
