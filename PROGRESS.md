@@ -1737,6 +1737,15 @@ Phase 2 signed off by the human on 2026-10-02 (merge of PR #3). Every other unti
 - **Fix:** `VideoEncoders` goes to the video module too.
 - **Checks:** run by hand: `/video encoders` now lists NVENC and the software encoders here. The gate was clean (2286 tests).
 
+## UI / the Video page's camera preview stayed frozen when its camera went away (fixed 2026-10-16)
+
+- **Found:** with Phase 9 Task 9 the core's camera preview works, and ends its feed when the camera is unplugged ("the camera was disconnected") or taken by the call's camera (`StartCamera` stops a preview first: a camera streams in one mode at a time).
+- **Symptom (from the code):** the Video page kept the ended feed, so its last picture stayed on screen with **Hide my camera**, as if it ran.
+- **Cause:** `VideoModel::on_error` turned the preview off only when it had not started yet (no feed), and `LocalVideo` did not look at it.
+- **Fix:** on an error and on `LocalVideo`, a preview whose feed ended is dropped and the page's preview switch goes off (`drop_ended_preview`).
+- **Tests:** `video::tests::a_preview_whose_camera_went_away_is_off` (another error keeps a running preview; an ended feed and then the error, or then `LocalVideo`, turn it off). The unplugging itself, through the core, is `call_camera::a_virtual_camera_is_listed_previewed_and_its_unplugging_said`.
+- **Checks:** the gate was clean (2302 tests).
+
 ## Phase 6 steps (calls: MatrixRTC, LiveKit SFU, native audio; plan docs/plans/phase6-calls.md)
 Order (revised 2026-10-02, plan decision 12; again 2026-10-03 by the human): 1–8, 8b, 9, 10, 11, 12, 14, 13, then 15 and 13b. Deferred options (audio-only libwebrtc build, pure-Rust WebRTC stack, PulseAudio backend) are recorded in the plan.
 - [x] 1. libwebrtc supply chain (pinned SHA-256 fetch script, fail-closed build) and livekit dependency (phase6.1)

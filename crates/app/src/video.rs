@@ -565,6 +565,8 @@ impl VideoModel {
             CoreEvent::LocalVideo(local) => {
                 self.camera_busy = false;
                 self.share_busy = false;
+                // Starting the camera in a call stops its preview.
+                self.drop_ended_preview();
                 // What was said about a track that is off is over.
                 if local.camera.is_none() {
                     self.sending.remove(&VideoKind::Camera);
@@ -640,6 +642,17 @@ impl VideoModel {
         self.share_busy = false;
         // A preview that could not start is not running.
         if self.preview.is_none() {
+            self.ui.preview = false;
+        }
+        // Nor one whose camera was unplugged.
+        self.drop_ended_preview();
+    }
+
+    /// A preview whose feed ended (its camera unplugged, or taken by the
+    /// call) is off: its last picture is not left frozen on the page.
+    fn drop_ended_preview(&mut self) {
+        if self.preview.as_ref().is_some_and(VideoFeed::is_ended) {
+            self.preview = None;
             self.ui.preview = false;
         }
     }
@@ -1774,5 +1787,31 @@ mod tests {
         let _ = app.update(Message::SelectRoom(RoomId::from("!z:x")));
         assert!(!app.stage_visible());
         let _ = CallIntent::Video;
+    }
+
+    #[test]
+    fn a_preview_whose_camera_went_away_is_off() {
+        let mut model = VideoModel::default();
+        let (sender, feed) = VideoFeed::channel();
+        model.ui.preview = true;
+        assert!(model.on_event(CoreEvent::CameraPreview(feed)));
+        // Another error while it runs: it stays.
+        model.on_error(&CoreError::Call("something else".into()));
+        assert!(model.ui.preview && model.preview.is_some());
+        // Unplugged: the feed ends, then the error comes.
+        drop(sender);
+        model.on_error(&CoreError::Call("the camera was disconnected".into()));
+        assert!(!model.ui.preview && model.preview.is_none());
+
+        // Taken by the call's camera: the feed ends, then LocalVideo.
+        let (sender, feed) = VideoFeed::channel();
+        model.ui.preview = true;
+        model.on_event(CoreEvent::CameraPreview(feed));
+        drop(sender);
+        model.on_event(CoreEvent::LocalVideo(LocalVideo {
+            camera: Some(VideoTrackId::from("local-camera-1")),
+            ..LocalVideo::default()
+        }));
+        assert!(!model.ui.preview && model.preview.is_none());
     }
 }
