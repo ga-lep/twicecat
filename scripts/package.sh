@@ -258,11 +258,16 @@ fi
 
 packager_config() {
     local res=$1 config=$2
+    # macOS's realpath refuses a path that does not exist yet.
+    mkdir -p "$out/packager"
     python3 -I - "$config" "$version" "$(realpath "$(dirname "$binary")")" "$(realpath "$res")" \
         "$(realpath "$out/packager")" "$app_id" <<'EOF'
 import json, os, sys
 config_path, version, binaries_dir, res, out_dir, app_id = sys.argv[1:]
-icons = "packaging/icons/hicolor"
+# cargo-packager reads relative paths from the config's directory, not ours.
+repo = os.getcwd()
+icons = os.path.join(repo, "packaging/icons/hicolor")
+macos = os.path.join(repo, "packaging/macos")
 config = {
     "productName": "Twicecat",
     "name": "twicecat",
@@ -272,7 +277,7 @@ config = {
     "homepage": "https://github.com/ga-lep/twicecat",
     "authors": ["The Twicecat developers"],
     "publisher": "The Twicecat developers",
-    "licenseFile": "LICENSE",
+    "licenseFile": os.path.join(repo, "LICENSE"),
     "category": "SocialNetworking",
     "outDir": out_dir,
     "binariesDir": binaries_dir,
@@ -285,11 +290,11 @@ config = {
                   {"src": f"{res}/OFL.txt", "target": "OFL.txt"},
                   {"src": f"{res}/THIRD-PARTY-NOTICES.md", "target": "THIRD-PARTY-NOTICES.md"}],
     "icons": [f"{icons}/{n}x{n}/apps/{app_id}.png" for n in (16, 32, 64, 128, 256, 512)]
-             + ["packaging/icons/" + app_id + ".ico"],
+             + [os.path.join(repo, "packaging/icons", app_id + ".ico")],
     "macos": {
         "minimumSystemVersion": "13.0",
-        "infoPlistPath": "packaging/macos/Info.plist",
-        "entitlements": "packaging/macos/entitlements.plist",
+        "infoPlistPath": os.path.join(macos, "Info.plist"),
+        "entitlements": os.path.join(macos, "entitlements.plist"),
     },
     "wix": {"languages": ["en-US"]},
 }
@@ -314,7 +319,8 @@ EOF
 
 packager_formats=""
 for f in $formats; do
-    case "$f" in dmg | msi) packager_formats="$packager_formats $f" ;; packager-check) packager_formats=" deb" ;; esac
+    # cargo-packager names its MSI format after the toolset that builds it.
+    case "$f" in dmg) packager_formats="$packager_formats dmg" ;; msi) packager_formats="$packager_formats wix" ;; packager-check) packager_formats=" deb" ;; esac
 done
 if [ -n "$packager_formats" ]; then
     command -v cargo-packager >/dev/null || die "cargo-packager is not installed (cargo install cargo-packager@0.11.8 --locked)"
