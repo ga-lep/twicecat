@@ -179,14 +179,14 @@ fn cli_joins_mutes_and_leaves_a_call() {
     assert!(connected.contains("(not encrypted)"), "{connected}");
     cli.write("/mute");
     cli.expect("Microphone muted.");
-    // Our own membership shows up once it has synced back.
+    // Our own membership shows up once it has synced back, and the mute once
+    // core has re-reported the participants; "Microphone muted." comes first.
     let me = (0..30).find_map(|_| {
         cli.write("/who");
-        cli.expect_within("[you", Duration::from_secs(1))
+        cli.expect_within("[you, muted", Duration::from_secs(1))
     });
-    let me = me.expect("never listed in /who");
+    let me = me.expect("never listed as muted in /who");
     assert!(me.contains(env.user_id(1).as_str()), "{me}");
-    assert!(me.contains("[you, muted]"), "{me}");
     cli.write("/leave");
     cli.expect("Left the call in");
     cli.write("/quit");
