@@ -4,6 +4,13 @@ ignore = [
     { id = "RUSTSEC-2024-0436", reason = "paste unmaintained, transitive via iced/wgpu" },
     { id = "RUSTSEC-2026-0192", reason = "ttf-parser unmaintained, transitive via iced text stack" },
     { id = "RUSTSEC-2026-0319", reason = "anymap2 unmaintained, transitive via matrix-sdk 0.19.1; no fix without changing the pin" },
+    # zip 0.6.6 comes only from webrtc-sys-build 0.3.19 (the newest, zip ^0.6),
+    # used by its download_webrtc(), which extracts LiveKit's archive. Our builds
+    # never run it: LK_CUSTOM_WEBRTC points at scripts/fetch-libwebrtc.sh's
+    # verified copy, and CI's scripts/check-no-webrtc-download.sh fails if it ran.
+    { id = "RUSTSEC-2026-0367", reason = "zip 0.6.6 SUID bits on extract; only webrtc-sys-build's download path, never run (LK_CUSTOM_WEBRTC)" },
+    { id = "RUSTSEC-2026-0368", reason = "zip 0.6.6 symlink targets on extract; only webrtc-sys-build's download path, never run (LK_CUSTOM_WEBRTC)" },
+    { id = "RUSTSEC-2026-0369", reason = "zip 0.6.6 permissions through symlinks; only webrtc-sys-build's download path, never run (LK_CUSTOM_WEBRTC)" },
 ]
 
 [bans]
