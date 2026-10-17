@@ -385,6 +385,11 @@ def main():
         dynamic_axes=dynamic_axes,
         opset_version=OPSET,
         dynamo=False,
+        # Folding would bake each BatchNorm into its Conv here, in float math
+        # whose last bits follow the CPU's code paths: the release runner and
+        # an AVX2 machine got different graphs. Unfolded, the graph is the same
+        # everywhere, and ONNX Runtime folds them when it loads it.
+        do_constant_folding=False,
         external_data=False,
     )
     import onnx
