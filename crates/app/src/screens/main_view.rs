@@ -431,7 +431,13 @@ fn notification_menu<'a>(app: &'a App, room: &RoomId) -> Element<'a, Message> {
 /// The main screen: panes above a status bar.
 pub fn view(app: &App) -> Element<'_, Message> {
     let content = main_column(
-        security::banner_slot(&app.security, crate::screens::updates::bars(app)),
+        security::banner_slot(
+            &app.security,
+            crate::screens::updates::bars(app)
+                .into_iter()
+                .chain(crate::screens::crash::bars(app))
+                .collect(),
+        ),
         main_row(app),
         status_bar(app),
     );

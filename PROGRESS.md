@@ -3136,7 +3136,7 @@ Plan approved by the human 2026-10-14. Targets: Linux x86_64 and aarch64 (the St
 - [x] 7. Flatpak, x86_64 and aarch64 (phase7.7): built and smoke-tested on x86_64 (Docker on the Windows machine); aarch64 in the release workflow
 - [ ] 8. Release workflow (phase7.8): written and linted (2026-10-16); **not run yet**: its dry run needs the branch pushed and dispatched (the human's), see the checkpoint
 - [x] 9. Updates (phase7.9): 9a, the opt-in check and link; 9b, the AppImage updates itself (2026-10-17); a real update between two signed releases is on the checkpoint
-- [ ] 10. Crash reports (phase7.10)
+- [x] 10. Crash reports (phase7.10): local reports and a bar at the next start (2026-10-17); the bar in a window and **Show report** on each OS are on the checkpoint
 - [ ] 11. The sandbox and the Frame, `docs/install.md` (phase7.11)
 - [ ] 12. apt and dnf repositories on GitHub Pages, AUR `twicecat-bin` (phase7.12; added 2026-10-14, plan Q13)
 - [ ] 13. Wrap-up (phase7.13)
@@ -3162,6 +3162,11 @@ See the plan's "Human checkpoint"; items move here as tasks finish. Already open
   - the "available" bar offers **Install the update**;
   - it installs, **Restart now** starts the new version, and the login is kept;
   - a tampered or wrongly signed AppImage is refused with the failure bar.
+- [ ] (Task 10) Crash reports: put a text file named `crash-20261017-120000.txt` in Twicecat's data directory (or let a debug build panic) and start Twicecat, in both themes:
+  - the Warning bar "Twicecat ran into an error last time and wrote a report. Nothing was sent." appears above the rooms;
+  - **Show report** opens the file in the system's text viewer (Linux, Flatpak, Windows, macOS);
+  - **Open an issue** opens GitHub's new-issue page with the title and the report filled in, and nothing is sent until you submit;
+  - **Delete** removes the bar and every `crash-*.txt`, and the bar does not come back at the next start.
 - [ ] (Task 7) The Flatpak on a desktop (GNOME and KDE): see the plan's sandbox items; and the aarch64 bundle from the release workflow on the Steam Frame.
 
 ## Phase 7 / Task 1 notes
@@ -3365,3 +3370,44 @@ See the plan's "Human checkpoint"; items move here as tasks finish. Already open
 - **Gate:**
   - Windows: `cargo fmt --all --check`; `cargo clippy --workspace --all-targets --locked -- -D warnings`, also with `--all-features`; `cargo test --workspace --locked`: 2292 passed, 0 failed, 158 ignored; the boundary scripts and `flatpak.sh check` pass.
   - Linux, for the Linux-only code: `cargo clippy -p twicecat-core -p twicecat-app --all-targets -- -D warnings`, and the core's `updates`, `appimage_update` and `paths` tests (38) and the app's `updates` tests (12), all passing. They ran in `dev/ubuntu-26.04`'s image, built here with apt's date check off, because this machine's clock runs about 40 minutes behind Ubuntu's archive; the repository's Dockerfile is unchanged.
+
+## Phase 7 / Task 10 notes
+- **`crates/app/src/crash.rs`:**
+  - **The hook:** `main` reads the newest report an earlier run left, then installs the hook, so this run's report waits for the next start. The hook keeps the default one (which still prints), then writes `crash-<UTC YYYYMMDD-HHMMSS>.txt` in the data directory (mode 0600 on Unix). It writes one report per run, so a burst of panics leaves one file, and it keeps the newest 5.
+  - **What a report holds:**
+    - version, OS and architecture;
+    - the CPU level the build targets, from its target features (`x86-64-v4`/`v3`/`x86-64`, or the architecture);
+    - the GPU backend that runs DeepFilterNet3, from the last `GpuEnhancement`;
+    - the thread's name, the panic's words, its location (from `crates/` on);
+    - the frames of a captured backtrace whose symbol starts with `twicecat`, each with its path from `crates/` on.
+
+    Other crates' frames and every path outside `crates/` never reach it. A generic or closure suffix is cut at its first `<`, and a build without symbols says so.
+  - **The scrubber**, applied word by word to the thread name, the panic's words and the GPU line:
+    - Matrix IDs (`@`, `!`, `#`, `$`, `+` with a `:`) become `<id>`;
+    - anything with `://` becomes `<address>`;
+    - e-mail addresses become `<email>`;
+    - paths under `/home`, `/Users`, `/var/home`, `~/` or `X:\Users` become `<home path>`;
+    - host names become `<host>`: dotted names ending in letters, not one of the file extensions the program names (`rs`, `toml`, `json`, `onnx`…), with or without a port;
+    - runs of 20 or more base64 or hex characters with a digit become `<token>`.
+
+    Surrounding quotes and brackets are kept, and the program's own words stay: "index out of bounds", `Option::unwrap()`, `crates/…:120`, `enc.onnx`.
+  - **At the next start**, a Warning bar in the main view's banner slot says "Twicecat ran into an error last time and wrote a report. Nothing was sent." Its buttons:
+    - **Delete** removes every report;
+    - **Show report** opens the file in the system's viewer;
+    - **Open an issue** opens `<repository>/issues/new` with a title naming the version and the report as a code block in the body, percent-encoded, cut at 6,000 characters with a note. It goes through the app's link check, and the user reads it on GitHub before sending.
+- **Changed from the plan:**
+  - "Twicecat closed unexpectedly" is now "ran into an error". The hook also sees panics that are caught, such as the PipeWire thread's (`crates/audio/src/pw/thread.rs`), where the app kept running.
+  - The OS line has no version: that needs platform calls, and the version alone rarely helps.
+- **Tests:**
+  - `crash::tests`, in the app library:
+    - twelve scrubbing cases and five that must stay;
+    - the backtrace filter on a mixed backtrace with Linux and Windows paths, keeping three of six frames;
+    - a rendered report that holds every fact and none of "alice", "bob", "example.org", the user names, `matrix_sdk`, `/rustc/` or the registry;
+    - writing seven reports keeps five, and the newest is read back;
+    - Delete leaves the other files;
+    - the issue link, encoded and cut, passes the link check;
+    - the bar shows a report until Delete removes the files.
+  - `tests/crash_hook.rs`, in its own process: two panics in a thread named `sync @alice:example.org`, with IDs and a token in the message, leave one report with the scrubbed thread, words and location, and with the GPU line.
+  - A gallery case, `banner-crash-report`.
+- **Not verified:** the bar in a real window, **Show report** opening the viewer on each OS, and the issue page with a real report (checkpoint).
+- **Gate (Windows):** `cargo fmt --all --check`; `cargo clippy --workspace --all-targets --locked -- -D warnings`, also with `--all-features`; `cargo test --workspace --locked --no-fail-fast`: 2299 passed, 0 failed, 158 ignored (the gallery reran alone after another build on this machine had left its first run without memory); `check-app-deps`, `check-core-api`, `check-no-webrtc-download` and `flatpak.sh check` pass. `check-font-assets` fails here only because the Windows checkout turns `OFL.txt` into CRLF: the committed file has the SHA-256 that `SOURCE.md` lists.

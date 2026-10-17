@@ -130,6 +130,10 @@ fn run(options: Options) -> Result<(), String> {
     // Read before the window opens so the stored choices apply from the start.
     let ui_settings = data.read_settings();
     let settings_store = DiskSettings::new(data.clone());
+    // An earlier run's report first, then this run's hook (Task 10).
+    let crash_dir = data.root().to_path_buf();
+    let crash = (crash_dir.clone(), twicecat_app::crash::newest(&crash_dir));
+    twicecat_app::crash::install(crash_dir);
     let config = CoreConfig {
         data,
         homeserver_override: options.homeserver,
@@ -149,7 +153,7 @@ fn run(options: Options) -> Result<(), String> {
     // The app (and with it the bridge and the core's runtime) is dropped when
     // `run` returns, before the temporary directory is removed.
     let application = iced::application(
-        App::booter(startup, ui_settings, settings_store),
+        App::booter(startup, ui_settings, settings_store, crash),
         App::update,
         App::view,
     );

@@ -9,3 +9,4 @@ Task 7: complete (gate ok on Windows; flatpak.sh check ok, two mutations caught;
 Task 8: written (actionlint+shellcheck clean; signing hooks read in cargo-packager 0.11.8; workflow NOT run yet: the human pushes and dispatches the dry run)
 Task 9a: complete (gate ok on Windows: full run 2287 passed + the 2 gallery tests fixed after it; fake GitHub server, paused-clock schedule, app flow tests; the real API answers 404 until a release exists; 9b the AppImage updater next)
 Task 9b: complete (gate ok on Windows 2292 passed and on Linux for the Linux-only code; cargo-packager-updater =0.2.3 with the TLS variables set before threads; a real signed update is a checkpoint item)
+Task 10: complete (gate ok on Windows 2299 passed; panic hook, scrubber and bar tested, the hook in its own process; the bar in a real window, Show report per OS and the issue page are checkpoint items)
