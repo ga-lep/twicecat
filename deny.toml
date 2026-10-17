@@ -11,6 +11,12 @@ ignore = [
     { id = "RUSTSEC-2026-0367", reason = "zip 0.6.6 SUID bits on extract; only webrtc-sys-build's download path, never run (LK_CUSTOM_WEBRTC)" },
     { id = "RUSTSEC-2026-0368", reason = "zip 0.6.6 symlink targets on extract; only webrtc-sys-build's download path, never run (LK_CUSTOM_WEBRTC)" },
     { id = "RUSTSEC-2026-0369", reason = "zip 0.6.6 permissions through symlinks; only webrtc-sys-build's download path, never run (LK_CUSTOM_WEBRTC)" },
+    # zbus 5's helper crates, folded into zbus 6. zbus 5 comes from the pinned
+    # iced 0.14.0 (mundy), ashpd 0.13.13 and keyring 4.2.0, plus tray-icon and
+    # notify-rust; none of them is on zbus 6 yet.
+    { id = "RUSTSEC-2026-0370", reason = "zvariant unmaintained (merged into zbus 6), transitive via zbus 5 from pinned iced/ashpd/keyring" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names unmaintained (merged into zbus 6), transitive via zbus 5 from pinned iced/ashpd/keyring" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive unmaintained (merged into zbus 6), transitive via zbus 5 from pinned iced/ashpd/keyring" },
 ]
 
 [bans]
