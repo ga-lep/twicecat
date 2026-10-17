@@ -7,7 +7,8 @@
 #   scripts/smoke-test-packages.sh <package dir>
 #
 # The .tar.zst and the AppImage run here (this machine's glibc must be at
-# least the build's); the .deb installs with apt in ubuntu:24.04 and 26.04 and
+# least the build's, and it needs the .deb's depends in packaging/nfpm.yaml,
+# such as libpipewire); the .deb installs with apt in ubuntu:24.04 and 26.04 and
 # the .rpm with dnf in fedora:43 and 44, their dependencies taken from the
 # distribution, so a
 # wrong package name fails here. Needs Docker for those two; a package that is
