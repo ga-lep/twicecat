@@ -2870,6 +2870,19 @@ fn update_available() -> App {
     app
 }
 
+fn crash_report() -> App {
+    let mut app = main_room();
+    let dir = std::env::temp_dir().join("twicecat-gallery-crash");
+    app.set_crash_reports(
+        dir.clone(),
+        Some(twicecat_app::crash::PendingReport {
+            path: dir.join("crash-20270115-080000.txt"),
+            text: "Twicecat 0.1.0 crash report".into(),
+        }),
+    );
+    app
+}
+
 fn banner_recovery_off() -> App {
     let mut app = main_room();
     feed(
@@ -3713,6 +3726,9 @@ pub fn scenarios() -> Vec<Scenario> {
         }),
         s("banner-update-available", true, update_available, |a| {
             a.updates.available.is_some()
+        }),
+        s("banner-crash-report", true, crash_report, |a| {
+            a.crash.is_some()
         }),
         s("recovery-working", false, recovery_working, |a| {
             a.security.progress.is_some()

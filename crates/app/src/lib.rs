@@ -10,6 +10,7 @@ pub mod blocking;
 pub mod bridge;
 pub mod calls;
 pub mod composer;
+pub mod crash;
 pub mod dates;
 pub mod dialogs;
 pub mod emoji;

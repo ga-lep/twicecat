@@ -5,6 +5,7 @@
 
 pub mod audio_settings;
 pub mod call;
+pub mod crash;
 pub mod loading;
 pub mod login;
 pub mod main_view;

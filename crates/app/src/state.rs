@@ -338,6 +338,8 @@ pub enum Message {
     Security(SecurityMessage),
     /// The update question, banner and toggle.
     Update(crate::updates::UpdateMessage),
+    /// The bar about a crash report from an earlier run.
+    Crash(crate::crash::CrashMessage),
     /// A button of the verification dialog.
     Verification(VerificationMessage),
     /// A button of the Sessions screen or the logout warning.
@@ -596,6 +598,10 @@ pub struct App {
     pub security: SecurityModel,
     /// Update checks: how this copy is updated, and a newer version found.
     pub updates: crate::updates::UpdateUi,
+    /// A crash report an earlier run left, until deleted.
+    pub crash: Option<crate::crash::PendingReport>,
+    /// Where crash reports go (the data directory).
+    pub crash_dir: Option<std::path::PathBuf>,
     /// The verification dialog, while a flow is open.
     pub verification: Option<VerificationModel>,
     /// The Sessions screen and the logout warning.
@@ -718,6 +724,8 @@ impl App {
             draft_dirty: false,
             security: SecurityModel::default(),
             updates: crate::updates::UpdateUi::default(),
+            crash: None,
+            crash_dir: None,
             verification: None,
             sessions: SessionsModel::default(),
             calls: CallModel::default(),
@@ -743,6 +751,7 @@ impl App {
         startup: Startup,
         ui_settings: UiSettings,
         store: impl SettingsStore + Clone + 'static,
+        crash: (std::path::PathBuf, Option<crate::crash::PendingReport>),
     ) -> impl Fn() -> (App, Task<Message>) {
         let startup = Mutex::new(Some(startup));
         move || {
@@ -753,6 +762,7 @@ impl App {
                 .expect("iced boots the application exactly once");
             let (mut app, task) = App::new(startup);
             app.set_ui_settings(ui_settings);
+            app.set_crash_reports(crash.0.clone(), crash.1.clone());
             app.updates.mechanism = twicecat_core::api::UpdateMechanism::current();
             let task = Task::batch([task, app.start_update_checks()]);
             app.set_settings_store(Box::new(store.clone()));
@@ -1325,6 +1335,7 @@ impl App {
             },
             Message::Security(message) => self.on_security(message),
             Message::Update(message) => self.on_update(message),
+            Message::Crash(message) => self.on_crash(message),
             Message::Verification(message) => self.on_verification(message),
             Message::Sessions(message) => self.on_sessions(message),
             Message::Rooms(message) => self.on_rooms(message),
@@ -1850,6 +1861,11 @@ impl App {
             | CoreEvent::InputLevel(_)
             | CoreEvent::AudioStats(_)
             | CoreEvent::GpuEnhancement(_)) => {
+                if let CoreEvent::GpuEnhancement(gpu) = &event {
+                    crate::crash::set_gpu_backend(
+                        gpu.running.map(crate::audio_settings::backend_label),
+                    );
+                }
                 self.audio_card_saw(&event);
                 task = self.on_call_event(event);
             }
