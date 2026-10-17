@@ -107,7 +107,7 @@ The "Release" workflow (`.github/workflows/release.yml`) builds every package on
 - **Windows x64:** the MSI.
 - **macOS on Apple Silicon:** the DMG.
 
-It runs on a `v*` tag, after `scripts/check-version.sh` passes, and makes a **draft** release with `SHA256SUMS` and build provenance attestations; publishing it is up to you. "Run workflow" on the Actions tab is a dry run: the same packages as one artifact, and no release. Signing runs only when its secrets exist (the workflow's header lists them); otherwise the job summary and the release notes say "unsigned".
+It runs on a `v*` tag, after `scripts/check-version.sh` passes, and makes a **draft** release (a pre-release when the tag has a label, as in `v0.1.0-alpha`; the packages keep the workspace version, as WiX takes only a numeric pre-release) with `SHA256SUMS` and build provenance attestations; publishing it is up to you. "Run workflow" on the Actions tab is a dry run: the same packages as one artifact, and no release. Signing runs only when its secrets exist (the workflow's header lists them); otherwise the job summary and the release notes say "unsigned".
 
 ## Push-to-talk on Linux
 

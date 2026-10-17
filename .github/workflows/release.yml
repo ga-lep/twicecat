@@ -454,7 +454,11 @@ jobs:
             if [ "$MACOS_SIGNED" = true ]; then echo "- macOS: signed with a Developer ID and notarized."; else echo "- macOS: **unsigned**; macOS refuses to open it until you allow it in System Settings → Privacy & Security."; fi
             echo "- Linux: packages are not signed; SHA256SUMS and the attestations cover them."
           } > "$RUNNER_TEMP/notes.md"
-          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag --draft \
+          # A labelled tag (v0.1.0-alpha, scripts/check-version.sh) is a
+          # pre-release, which the updater's "latest release" never offers.
+          prerelease=()
+          case "$TAG" in *-*) prerelease=(--prerelease) ;; esac
+          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag --draft "${prerelease[@]}" \
             --title "Twicecat ${TAG#v}" --notes-file "$RUNNER_TEMP/notes.md" --generate-notes
       # A dry run keeps everything as one artifact instead.
       - name: Dry run
