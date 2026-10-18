@@ -22,7 +22,7 @@ use twicecat_core::api::{
     GpuBackend, GpuEnhancement, InputLevel, InputMode, NoiseSuppression, NsLevel, SkipCleaned,
     limits,
 };
-use twicecat_ptt::{GamepadButton, KeyBinding};
+use twicecat_ptt::{GamepadButton, KeyBinding, MouseButton};
 
 use crate::state::{App, Message};
 use crate::text_safety::{MAX_NAME_CHARS, name_or_placeholder};
@@ -45,6 +45,11 @@ pub const DEFAULT_RELEASE_MS: u32 = 200;
 pub const DEFAULT_THRESHOLD_DB: f32 = -50.0;
 /// Said when a captured key cannot be a push-to-talk key.
 pub const UNBINDABLE_KEY: &str = "This key cannot be used for push-to-talk. Try another, or Esc.";
+
+/// Why a captured mouse button was refused (a numbered one this system does
+/// not report outside the window).
+pub const UNBINDABLE_MOUSE: &str =
+    "This mouse button cannot be used for push-to-talk. Try another, or Esc.";
 
 /// A slider of the card.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -291,6 +296,75 @@ impl fmt::Display for ButtonChoice {
     }
 }
 
+/// An entry of the mouse button menu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MouseChoice {
+    /// No button.
+    None,
+    /// A button.
+    Button(MouseButton),
+    /// The saved button is not one this system has (shown, not offered).
+    Unknown,
+}
+
+impl MouseChoice {
+    /// The menu: none, the middle button and the two side buttons; plus the
+    /// saved one when it is another (set with **Set key…**) or unknown.
+    pub fn menu(saved: Option<&str>) -> (Vec<Self>, Self) {
+        let mut menu = vec![
+            Self::None,
+            Self::Button(MouseButton::MIDDLE),
+            Self::Button(MouseButton::BACK),
+            Self::Button(MouseButton::FORWARD),
+        ];
+        let chosen = match saved.map(str::parse::<MouseButton>) {
+            None => Self::None,
+            Some(Ok(button)) => Self::Button(button),
+            Some(Err(_)) => Self::Unknown,
+        };
+        if !menu.contains(&chosen) {
+            menu.push(chosen);
+        }
+        (menu, chosen)
+    }
+}
+
+impl fmt::Display for MouseChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::None => f.write_str("None"),
+            Self::Unknown => f.write_str("Saved button (not recognised)"),
+            Self::Button(button) => f.write_str(&mouse_label(*button)),
+        }
+    }
+}
+
+/// A mouse button as the menu names it.
+pub fn mouse_label(button: MouseButton) -> String {
+    if let Some(number) = button.number() {
+        format!("Button {number}")
+    } else if button == MouseButton::MIDDLE {
+        "Middle button (wheel click)".to_owned()
+    } else if button == MouseButton::BACK {
+        "Back side button (mouse 4)".to_owned()
+    } else {
+        "Forward side button (mouse 5)".to_owned()
+    }
+}
+
+/// A stored mouse binding in a sentence: "hold the back side button
+/// (mouse 4)". A binding that does not parse is "the mouse button".
+pub fn mouse_words(binding: &str) -> String {
+    match binding.parse::<MouseButton>() {
+        Ok(button) => match button.number() {
+            Some(number) => format!("mouse button {number}"),
+            None if button == MouseButton::MIDDLE => "the middle mouse button".to_owned(),
+            None => format!("the {}", mouse_label(button).to_lowercase()),
+        },
+        Err(_) => "the mouse button".to_owned(),
+    }
+}
+
 /// A stored key binding as people write it: `Ctrl+Shift+T`, `F13`. A
 /// binding that does not parse is shown as stored.
 pub fn key_label(binding: &str) -> String {
@@ -375,8 +449,16 @@ pub fn capture(key: CapturedKey) -> Capture {
 }
 
 /// The capture message for a window event: key presses (not repeats) of
-/// identified keys.
+/// identified keys, and presses of mouse buttons other than left and right
+/// (those still work the card, Cancel included).
 pub fn capture_message(event: &iced::Event) -> Option<Message> {
+    if let iced::Event::Mouse(iced::mouse::Event::ButtonPressed(button)) = event {
+        return (!matches!(
+            button,
+            iced::mouse::Button::Left | iced::mouse::Button::Right
+        ))
+        .then_some(Message::Audio(AudioMessage::CapturedMouse(*button)));
+    }
     let iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
         physical_key: Physical::Code(code),
         modifiers,
@@ -865,15 +947,21 @@ pub struct MicStatus {
 /// binding must not fill the card's top lines.
 const MAX_STATUS_KEY_CHARS: usize = 40;
 
-/// The key or button push-to-talk uses, in words, capped.
+/// The key or button push-to-talk uses, in words, capped: the key, else the
+/// mouse button, else the gamepad button.
 fn trigger_words(settings: &AudioSettings) -> String {
     let bindings = &settings.push_to_talk;
-    match (bindings.key.as_deref(), bindings.gamepad_button.is_some()) {
-        (Some(key), _) => {
+    match (
+        bindings.key.as_deref(),
+        bindings.mouse_button.as_deref(),
+        bindings.gamepad_button.is_some(),
+    ) {
+        (Some(key), _, _) => {
             crate::text_safety::one_line_capped(&key_label(key), MAX_STATUS_KEY_CHARS)
         }
-        (None, true) => "the gamepad button".to_owned(),
-        (None, false) => "a key (none is set)".to_owned(),
+        (None, Some(mouse), _) => mouse_words(mouse),
+        (None, None, true) => "the gamepad button".to_owned(),
+        (None, None, false) => "a key (none is set)".to_owned(),
     }
 }
 
@@ -1082,7 +1170,9 @@ impl AudioPage {
                 "CaptureKey",
                 "CancelCapture",
                 "Captured",
+                "CapturedMouse",
                 "ClearKey",
+                "Mouse",
                 "Button",
                 "Slide",
                 "SlideReleased",
@@ -1241,8 +1331,12 @@ pub enum AudioMessage {
     CancelCapture,
     /// A key pressed while waiting.
     Captured(CapturedKey),
+    /// A mouse button (not left or right) pressed while waiting.
+    CapturedMouse(iced::mouse::Button),
     /// **Clear** beside the key.
     ClearKey,
+    /// The mouse button menu.
+    Mouse(MouseChoice),
     /// The gamepad button menu.
     Button(ButtonChoice),
 }
@@ -1286,7 +1380,9 @@ impl AudioMessage {
             Self::CaptureKey => "CaptureKey",
             Self::CancelCapture => "CancelCapture",
             Self::Captured(_) => "Captured",
+            Self::CapturedMouse(_) => "CapturedMouse",
             Self::ClearKey => "ClearKey",
+            Self::Mouse(_) => "Mouse",
             Self::Button(_) => "Button",
         }
     }
@@ -1434,7 +1530,26 @@ impl App {
                     self.edit_audio(|s| s.push_to_talk.key = Some(binding))
                 }
             },
+            M::CapturedMouse(_) if !self.audio_ui.capturing => Task::none(),
+            M::CapturedMouse(button) => match crate::ptt::mouse_binding(button) {
+                Some(binding) => {
+                    self.stop_capture();
+                    self.edit_audio(|s| s.push_to_talk.mouse_button = Some(binding.to_string()))
+                }
+                None => {
+                    self.audio_ui.capture_note = Some(UNBINDABLE_MOUSE);
+                    Task::none()
+                }
+            },
             M::ClearKey => self.edit_audio(|s| s.push_to_talk.key = None),
+            M::Mouse(choice) => self.edit_audio(|s| {
+                s.push_to_talk.mouse_button = match choice {
+                    MouseChoice::None => None,
+                    MouseChoice::Button(button) => Some(button.to_string()),
+                    // Not offered; picking it again keeps what is saved.
+                    MouseChoice::Unknown => s.push_to_talk.mouse_button.take(),
+                };
+            }),
             M::Button(choice) => self.edit_audio(|s| {
                 s.push_to_talk.gamepad_button = match choice {
                     ButtonChoice::None => None,
@@ -1626,6 +1741,7 @@ mod tests {
             },
             push_to_talk: PushToTalkBindings {
                 key: Some("ctrl+shift+KeyT".into()),
+                mouse_button: None,
                 gamepad_button: Some("south".into()),
             },
             ..AudioSettings::default()
@@ -2579,6 +2695,79 @@ mod tests {
         }
 
         #[test]
+        fn the_mouse_menu_offers_the_middle_and_side_buttons_and_keeps_the_saved_one() {
+            let (menu, chosen) = MouseChoice::menu(Some("back"));
+            assert_eq!(menu.len(), 4);
+            assert_eq!(chosen, MouseChoice::Button(MouseButton::BACK));
+            assert_eq!(chosen.to_string(), "Back side button (mouse 4)");
+            let labels: std::collections::HashSet<String> =
+                menu.iter().map(ToString::to_string).collect();
+            assert_eq!(labels.len(), menu.len(), "every label differs");
+            assert_eq!(MouseChoice::menu(None).1, MouseChoice::None);
+            let (menu, chosen) = MouseChoice::menu(Some("left"));
+            assert_eq!(chosen, MouseChoice::Unknown);
+            assert_eq!(menu.last(), Some(&MouseChoice::Unknown));
+            // A numbered button set with Set key... is shown, where the
+            // system has them.
+            if let Some(twelve) = MouseButton::other(12) {
+                let (menu, chosen) = MouseChoice::menu(Some("button12"));
+                assert_eq!(chosen, MouseChoice::Button(twelve));
+                assert_eq!(menu.last(), Some(&chosen));
+                assert_eq!(chosen.to_string(), "Button 12");
+                assert_eq!(mouse_words("button12"), "mouse button 12");
+            }
+            assert_eq!(mouse_words("middle"), "the middle mouse button");
+            assert_eq!(mouse_words("forward"), "the forward side button (mouse 5)");
+            assert_eq!(mouse_words("nonsense"), "the mouse button");
+
+            let (mut app, mut rx) = card();
+            let forward = MouseChoice::Button(MouseButton::FORWARD);
+            let _ = app.update(audio(AudioMessage::Mouse(forward)));
+            let s = sent_one(&mut rx);
+            assert_eq!(s.push_to_talk.mouse_button.as_deref(), Some("forward"));
+            assert_eq!(s.push_to_talk.key, stored().push_to_talk.key);
+            let _ = app.update(core(CoreEvent::AudioSettings(s)));
+            let _ = app.update(audio(AudioMessage::Mouse(MouseChoice::None)));
+            assert_eq!(sent_one(&mut rx).push_to_talk.mouse_button, None);
+            let _ = app.update(audio(AudioMessage::Mouse(MouseChoice::Unknown)));
+            assert!(drain(&mut rx).is_empty(), "not offered: nothing changes");
+        }
+
+        #[test]
+        fn set_key_also_takes_a_mouse_button_but_not_a_click() {
+            use iced::mouse::{Button as B, Event};
+            let press = |b| iced::Event::Mouse(Event::ButtonPressed(b));
+            assert!(capture_message(&press(B::Left)).is_none());
+            assert!(capture_message(&press(B::Right)).is_none());
+            assert!(capture_message(&iced::Event::Mouse(Event::ButtonReleased(B::Back))).is_none());
+            assert!(matches!(
+                capture_message(&press(B::Back)),
+                Some(Message::Audio(AudioMessage::CapturedMouse(B::Back)))
+            ));
+
+            let (mut app, mut rx) = card();
+            let _ = app.update(audio(AudioMessage::CapturedMouse(B::Middle)));
+            assert!(drain(&mut rx).is_empty(), "not waiting: nothing changes");
+            let _ = app.update(audio(AudioMessage::CaptureKey));
+            let _ = app.update(audio(AudioMessage::CapturedMouse(B::Middle)));
+            let s = sent_one(&mut rx);
+            assert_eq!(s.push_to_talk.mouse_button.as_deref(), Some("middle"));
+            assert_eq!(
+                s.push_to_talk.key,
+                stored().push_to_talk.key,
+                "the key stays"
+            );
+            assert!(!app.audio_ui.capturing);
+            // No system numbers another button 3 (winit names it, or it is
+            // a click or the wheel).
+            let _ = app.update(audio(AudioMessage::CaptureKey));
+            let _ = app.update(audio(AudioMessage::CapturedMouse(B::Other(3))));
+            assert_eq!(app.audio_ui.capture_note, Some(UNBINDABLE_MOUSE));
+            assert!(app.audio_ui.capturing, "still waiting");
+            assert!(drain(&mut rx).is_empty());
+        }
+
+        #[test]
         fn keys_read_as_people_write_them() {
             assert_eq!(key_label("shift+control+KeyT"), "Ctrl+Shift+T");
             assert_eq!(key_label("ctrl+shift+KeyT"), "Ctrl+Shift+T");
@@ -2677,6 +2866,8 @@ mod tests {
             fn window_key(&self, pressed: bool) {
                 self.0.lock().unwrap().push(pressed);
             }
+
+            fn window_mouse(&self, _pressed: bool) {}
         }
 
         impl crate::ptt::PttStarter for Keys {
@@ -2880,7 +3071,9 @@ mod tests {
                 AudioMessage::CaptureKey,
                 AudioMessage::CancelCapture,
                 AudioMessage::Captured(key),
+                AudioMessage::CapturedMouse(iced::mouse::Button::Back),
                 AudioMessage::ClearKey,
+                AudioMessage::Mouse(MouseChoice::None),
                 AudioMessage::Button(ButtonChoice::None),
             ]
         }

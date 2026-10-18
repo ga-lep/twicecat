@@ -8592,12 +8592,17 @@ name = "twicecat-ptt"
 version = "0.1.0"
 dependencies = [
  "ashpd",
+ "block2 0.6.2",
  "futures-util",
  "gilrs",
  "global-hotkey",
+ "objc2 0.6.4",
+ "objc2-app-kit 0.3.2",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "windows-sys 0.59.0",
+ "x11rb",
 ]
 
 [[package]]

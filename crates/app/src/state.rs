@@ -1360,6 +1360,13 @@ impl App {
                 }
                 Task::none()
             }
+            Message::Ptt(PttMessage::WindowMouse(mouse)) => {
+                // As for the key: while the card waits, no press.
+                if !self.audio_ui.capturing || !mouse.pressed {
+                    self.ptt.window_mouse(mouse);
+                }
+                Task::none()
+            }
             Message::Spaces(SpacesMessage::Select(space)) => self.select_space(space),
             Message::Threads(message) => self.on_threads(message),
             Message::Shortcut { shortcut, captured } => self.on_shortcut(shortcut, captured),

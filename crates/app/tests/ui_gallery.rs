@@ -2411,9 +2411,11 @@ mod audio {
             "Bitrate",
             "Skip",
             "Mode",
+            "Mouse",
             "Button",
-            // A key press, and a timer.
+            // A key or mouse button press, and a timer.
             "Captured",
+            "CapturedMouse",
             "SlideDue",
             // Only the talk line opens a page directly.
             "OpenAt",

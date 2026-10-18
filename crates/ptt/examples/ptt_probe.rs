@@ -1,13 +1,15 @@
 //! Prints push-to-talk transitions for a binding, for checking hotkeys,
-//! the portal and gamepads on a real desktop (human checkpoint):
+//! mouse buttons, the portal and gamepads on a real desktop (human
+//! checkpoint):
 //!
 //! ```text
-//! cargo run -p twicecat-ptt --example ptt_probe -- --key ctrl+shift+KeyT --button left_thumb
+//! cargo run -p twicecat-ptt --example ptt_probe -- --key ctrl+shift+KeyT --mouse back --button left_thumb
 //! ```
 //!
 //! `--keyboard portal|hotkey|window` overrides the detected mechanism. Stop
 //! with Ctrl+C. Windows and macOS need an event loop on the main thread for
-//! hotkeys, which this probe does not run: use it there for gamepads only.
+//! hotkeys and the macOS mouse monitor, which this probe does not run: use
+//! it there for gamepads (and the mouse button on Windows) only.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -22,6 +24,7 @@ fn main() -> Result<(), String> {
         match arg.as_str() {
             "--key" => config.key = Some(value.parse().map_err(|e| format!("{e}"))?),
             "--button" => config.gamepad = Some(value.parse().map_err(|e| format!("{e}"))?),
+            "--mouse" => config.mouse = Some(value.parse().map_err(|e| format!("{e}"))?),
             "--keyboard" => {
                 config.keyboard = match value.as_str() {
                     "portal" => KeyboardBackend::Portal,

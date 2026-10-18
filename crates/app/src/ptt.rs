@@ -12,9 +12,10 @@
 //! toggle-to-talk) and sends it to the core, waiting for room so a release
 //! is never lost; then it tells the window, for the screen only.
 //!
-//! The key pressed in Twicecat's own window is a source too (gamescope and
-//! compositors without the shortcuts portal have no other keyboard source).
-//! Key presses are never logged, and bindings only by name.
+//! The key and the mouse button pressed in Twicecat's own window are sources
+//! too (gamescope and compositors without the shortcuts portal have no other
+//! keyboard source, and Wayland no other mouse source). Key presses are never
+//! logged, and bindings only by name.
 
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, mpsc as std_mpsc};
@@ -27,7 +28,8 @@ use iced::keyboard::key::{Code, Physical};
 use tokio::sync::mpsc;
 use twicecat_core::api::{AudioSettings, Command, InputMode};
 use twicecat_ptt::{
-    GamepadButton, Held, KeyBinding, KeyboardBackend, PttConfig, PttEvent, PttService, Sink, Source,
+    GamepadButton, Held, KeyBinding, KeyboardBackend, MouseButton, PttConfig, PttEvent, PttService,
+    Sink, Source,
 };
 
 use crate::state::Message;
@@ -36,11 +38,17 @@ use crate::state::Message;
 pub trait PttHandle {
     /// The bound key was pressed or released in the window.
     fn window_key(&self, pressed: bool);
+    /// The bound mouse button was pressed or released in the window.
+    fn window_mouse(&self, pressed: bool);
 }
 
 impl PttHandle for PttService {
     fn window_key(&self, pressed: bool) {
         PttService::window_key(self, pressed);
+    }
+
+    fn window_mouse(&self, pressed: bool) {
+        PttService::window_mouse(self, pressed);
     }
 }
 
@@ -66,6 +74,8 @@ impl PttStarter for ServiceStarter {
 pub enum BadBinding {
     /// The key.
     Key,
+    /// The mouse button.
+    Mouse,
     /// The gamepad button.
     Button,
 }
@@ -96,6 +106,13 @@ pub fn setup_for(settings: &AudioSettings, keyboard: KeyboardBackend) -> Option<
         }
         parsed
     });
+    let mouse = bindings.mouse_button.as_deref().and_then(|text| {
+        let parsed = text.parse::<MouseButton>().ok();
+        if parsed.is_none() {
+            bad.push(BadBinding::Mouse);
+        }
+        parsed
+    });
     let gamepad = bindings.gamepad_button.as_deref().and_then(|text| {
         let parsed = text.parse::<GamepadButton>().ok();
         if parsed.is_none() {
@@ -106,6 +123,7 @@ pub fn setup_for(settings: &AudioSettings, keyboard: KeyboardBackend) -> Option<
     Some(Setup {
         config: PttConfig {
             key,
+            mouse,
             gamepad,
             keyboard,
         },
@@ -283,6 +301,15 @@ pub struct WindowKey {
     pub pressed: bool,
 }
 
+/// A mouse button pressed or released in the window, while the service runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WindowMouse {
+    /// The button.
+    pub button: iced::mouse::Button,
+    /// Pressed (`true`) or released.
+    pub pressed: bool,
+}
+
 /// A push-to-talk message.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PttMessage {
@@ -290,16 +317,33 @@ pub enum PttMessage {
     Update(PttUpdate),
     /// A key in the window.
     WindowKey(WindowKey),
+    /// A mouse button in the window.
+    WindowMouse(WindowMouse),
 }
 
-/// The window key message for a keyboard event: presses (not repeats) and
-/// releases of identified keys. Also when a widget used the key: a focused
-/// composer still talks.
-fn window_key_message(
+/// The window message for a keyboard or mouse event: presses (not repeats)
+/// and releases of identified keys, and presses and releases of mouse
+/// buttons other than left and right. Also when a widget used them: a
+/// focused composer still talks.
+fn window_input_message(
     event: iced::Event,
     _status: iced::event::Status,
     _window: iced::window::Id,
 ) -> Option<Message> {
+    let (button, pressed) = match event {
+        iced::Event::Mouse(iced::mouse::Event::ButtonPressed(button)) => (button, true),
+        iced::Event::Mouse(iced::mouse::Event::ButtonReleased(button)) => (button, false),
+        event => return window_key_message(event),
+    };
+    mouse_binding(button)?;
+    Some(Message::Ptt(PttMessage::WindowMouse(WindowMouse {
+        button,
+        pressed,
+    })))
+}
+
+/// The window key message for a keyboard event.
+fn window_key_message(event: iced::Event) -> Option<Message> {
     let (physical_key, modifiers, pressed) = match event {
         iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
             physical_key,
@@ -337,6 +381,19 @@ pub fn held(modifiers: Modifiers) -> Held {
 /// The W3C name of a physical key (`KeyT`), as `twicecat-ptt` reads it.
 pub fn code_name(code: Code) -> String {
     format!("{code:?}")
+}
+
+/// The binding a window's mouse button stands for: `None` for left and
+/// right (they click) and for a numbered button this system has not.
+pub fn mouse_binding(button: iced::mouse::Button) -> Option<MouseButton> {
+    use iced::mouse::Button as B;
+    match button {
+        B::Left | B::Right => None,
+        B::Middle => Some(MouseButton::MIDDLE),
+        B::Back => Some(MouseButton::BACK),
+        B::Forward => Some(MouseButton::FORWARD),
+        B::Other(number) => MouseButton::other(number),
+    }
 }
 
 /// What a source reports, for the screen.
@@ -389,8 +446,10 @@ pub struct PttModel {
     /// The audio session last seen (in a call, mic test running), so a new
     /// one starts with the microphone let go.
     session: (bool, bool),
-    /// The window source is held.
+    /// The window's key source is held.
     window_held: bool,
+    /// The window's mouse source is held.
+    window_mouse_held: bool,
     /// What each source of the running service reported.
     pub sources: Vec<(Source, SourceState)>,
     /// Transmitting, as last sent to the core.
@@ -433,6 +492,7 @@ impl PttModel {
             generation: 0,
             session: (false, false),
             window_held: false,
+            window_mouse_held: false,
             sources: Vec::new(),
             talking: false,
         }
@@ -529,6 +589,7 @@ impl PttModel {
     pub fn stop(&mut self) {
         self.running = None;
         self.window_held = false;
+        self.window_mouse_held = false;
         self.sources.clear();
         self.send(Forward::Stop { retire: true });
     }
@@ -554,14 +615,33 @@ impl PttModel {
         }
     }
 
-    /// The window lost focus: its key is let go (its release goes
-    /// elsewhere).
+    /// A mouse button in the window: the bound one presses and lets go.
+    pub fn window_mouse(&mut self, mouse: WindowMouse) {
+        let Some(running) = &self.running else {
+            return;
+        };
+        if running.setup.config.mouse.is_none()
+            || running.setup.config.mouse != mouse_binding(mouse.button)
+        {
+            return;
+        }
+        if self.window_mouse_held != mouse.pressed {
+            self.window_mouse_held = mouse.pressed;
+            running.handle.window_mouse(mouse.pressed);
+        }
+    }
+
+    /// The window lost focus: its key and mouse button are let go (their
+    /// releases go elsewhere).
     pub fn window_unfocused(&mut self) {
-        if self.window_held {
-            self.window_held = false;
-            if let Some(running) = &self.running {
-                running.handle.window_key(false);
-            }
+        let Some(running) = &self.running else {
+            return;
+        };
+        if std::mem::take(&mut self.window_held) {
+            running.handle.window_key(false);
+        }
+        if std::mem::take(&mut self.window_mouse_held) {
+            running.handle.window_mouse(false);
         }
     }
 
@@ -597,12 +677,12 @@ impl PttModel {
     }
 
     /// The subscriptions: the forwarding thread's updates always, and the
-    /// window's keys while a service runs.
+    /// window's keys and mouse buttons while a service runs.
     pub fn subscription(&self) -> Subscription<Message> {
         let updates = Subscription::run_with(self.updates.clone(), updates_stream)
             .map(|update| Message::Ptt(PttMessage::Update(update)));
         if self.running.is_some() {
-            Subscription::batch([updates, iced::event::listen_with(window_key_message)])
+            Subscription::batch([updates, iced::event::listen_with(window_input_message)])
         } else {
             updates
         }
@@ -631,6 +711,7 @@ mod tests {
         configs: Vec<PttConfig>,
         sinks: Vec<Sink>,
         window: Vec<bool>,
+        mouse: Vec<bool>,
         dropped: usize,
     }
 
@@ -645,6 +726,10 @@ mod tests {
     impl PttHandle for FakeHandle {
         fn window_key(&self, pressed: bool) {
             self.seen.lock().unwrap().window.push(pressed);
+        }
+
+        fn window_mouse(&self, pressed: bool) {
+            self.seen.lock().unwrap().mouse.push(pressed);
         }
     }
 
@@ -689,6 +774,10 @@ mod tests {
         fn window(&self) -> Vec<bool> {
             std::mem::take(&mut self.0.lock().unwrap().window)
         }
+
+        fn mouse(&self) -> Vec<bool> {
+            std::mem::take(&mut self.0.lock().unwrap().mouse)
+        }
     }
 
     fn core(event: CoreEvent) -> Message {
@@ -703,6 +792,7 @@ mod tests {
             },
             push_to_talk: PushToTalkBindings {
                 key: Some("ctrl+shift+KeyT".into()),
+                mouse_button: Some("back".into()),
                 gamepad_button: Some("south".into()),
             },
             ..AudioSettings::default()
@@ -818,6 +908,7 @@ mod tests {
             setup.config,
             PttConfig {
                 key: Some("ctrl+shift+KeyT".parse().unwrap()),
+                mouse: Some(MouseButton::BACK),
                 gamepad: Some("south".parse().unwrap()),
                 keyboard: KeyboardBackend::Portal,
             }
@@ -828,7 +919,10 @@ mod tests {
         none.push_to_talk = PushToTalkBindings::default();
         let setup = setup_for(&none, KeyboardBackend::WindowOnly).unwrap();
         assert!(setup.toggle);
-        assert_eq!((setup.config.key, setup.config.gamepad), (None, None));
+        assert_eq!(
+            (setup.config.key, setup.config.mouse, setup.config.gamepad),
+            (None, None, None)
+        );
         assert!(setup.bad.is_empty(), "nothing bound is not an error");
 
         let mut bad = ptt(200, false);
@@ -838,9 +932,12 @@ mod tests {
         assert!(setup.config.gamepad.is_some(), "the button still works");
         assert_eq!(setup.bad, [BadBinding::Key]);
         bad.push_to_talk.gamepad_button = Some("paddle9".into());
+        bad.push_to_talk.mouse_button = Some("left".into());
+        let setup = setup_for(&bad, KeyboardBackend::Hotkey).unwrap();
+        assert_eq!(setup.config.mouse, None);
         assert_eq!(
-            setup_for(&bad, KeyboardBackend::Hotkey).unwrap().bad,
-            [BadBinding::Key, BadBinding::Button]
+            setup.bad,
+            [BadBinding::Key, BadBinding::Mouse, BadBinding::Button]
         );
     }
 
@@ -1001,6 +1098,78 @@ mod tests {
         assert!(rig.fake.window().is_empty(), "no key bound");
     }
 
+    fn click(rig: &mut Rig, button: iced::mouse::Button, pressed: bool) {
+        rig.update(Message::Ptt(PttMessage::WindowMouse(WindowMouse {
+            button,
+            pressed,
+        })));
+    }
+
+    #[test]
+    fn the_bound_mouse_button_in_the_window_is_a_source() {
+        use iced::mouse::Button as B;
+        let mut rig = Rig::new(ptt(200, false));
+        click(&mut rig, B::Back, true);
+        assert!(rig.fake.mouse().is_empty(), "no service, no button");
+        rig.join();
+        click(&mut rig, B::Forward, true);
+        click(&mut rig, B::Middle, true);
+        click(&mut rig, B::Left, true);
+        assert!(rig.fake.mouse().is_empty(), "not the binding");
+        click(&mut rig, B::Back, true);
+        click(&mut rig, B::Back, true);
+        click(&mut rig, B::Back, false);
+        assert_eq!(rig.fake.mouse(), [true, false]);
+        assert!(rig.fake.window().is_empty(), "the key's source is apart");
+
+        // Both held, then the window loses focus: both let go.
+        click(&mut rig, B::Back, true);
+        rig.key(Code::KeyT, CTRL_SHIFT, true);
+        rig.update(Message::WindowFocus(false));
+        click(&mut rig, B::Back, false);
+        assert_eq!(rig.fake.mouse(), [true, false], "losing focus lets go");
+        assert_eq!(rig.fake.window(), [true, false]);
+
+        // While the card waits for a new binding, the button does not
+        // press; its release still lets go.
+        rig.update(Message::Audio(AudioMessage::Open));
+        click(&mut rig, B::Back, true);
+        rig.update(Message::Audio(AudioMessage::CaptureKey));
+        click(&mut rig, B::Back, false);
+        rig.update(Message::Audio(AudioMessage::CancelCapture));
+        assert_eq!(rig.fake.mouse(), [true, false]);
+        rig.update(Message::Audio(AudioMessage::CaptureKey));
+        click(&mut rig, B::Forward, true);
+        assert!(rig.fake.mouse().is_empty());
+    }
+
+    #[test]
+    fn window_mouse_events_become_messages_except_left_and_right() {
+        use iced::mouse::{Button as B, Event};
+        let id = iced::window::Id::unique();
+        let status = iced::event::Status::Captured;
+        let message = |event| window_input_message(iced::Event::Mouse(event), status, id);
+        assert!(matches!(
+            message(Event::ButtonPressed(B::Back)),
+            Some(Message::Ptt(PttMessage::WindowMouse(WindowMouse {
+                button: B::Back,
+                pressed: true,
+            })))
+        ));
+        assert!(matches!(
+            message(Event::ButtonReleased(B::Middle)),
+            Some(Message::Ptt(PttMessage::WindowMouse(WindowMouse {
+                pressed: false,
+                ..
+            })))
+        ));
+        assert!(message(Event::ButtonPressed(B::Left)).is_none());
+        assert!(message(Event::ButtonReleased(B::Right)).is_none());
+        assert!(message(Event::CursorLeft).is_none());
+        assert_eq!(mouse_binding(B::Forward), Some(MouseButton::FORWARD));
+        assert_eq!(mouse_binding(B::Other(12)), MouseButton::other(12));
+    }
+
     #[test]
     fn window_key_events_become_messages_only_for_real_keys() {
         use iced::keyboard::{Event, Key, Location};
@@ -1020,7 +1189,7 @@ mod tests {
         let t = Physical::Code(Code::KeyT);
         assert!(
             matches!(
-                window_key_message(press(t, false), status, id),
+                window_input_message(press(t, false), status, id),
                 Some(Message::Ptt(PttMessage::WindowKey(WindowKey {
                     code: Code::KeyT,
                     pressed: true,
@@ -1029,9 +1198,9 @@ mod tests {
             ),
             "captured by a widget still counts"
         );
-        assert!(window_key_message(press(t, true), status, id).is_none());
+        assert!(window_input_message(press(t, true), status, id).is_none());
         let unknown = Physical::Unidentified(iced::keyboard::key::NativeCode::Unidentified);
-        assert!(window_key_message(press(unknown, false), status, id).is_none());
+        assert!(window_input_message(press(unknown, false), status, id).is_none());
         let release = iced::Event::Keyboard(Event::KeyReleased {
             key: Key::Unidentified,
             modified_key: Key::Unidentified,
@@ -1040,7 +1209,7 @@ mod tests {
             modifiers: Modifiers::empty(),
         });
         assert!(matches!(
-            window_key_message(release, status, id),
+            window_input_message(release, status, id),
             Some(Message::Ptt(PttMessage::WindowKey(WindowKey {
                 pressed: false,
                 ..

@@ -108,7 +108,9 @@ Rules the code follows (all in tests):
 - While the Voice & audio card waits for a push-to-talk key (**Set key…**),
   every key goes to it and no shortcut runs: the next key with its
   modifiers becomes the binding, a modifier alone keeps waiting, and Esc,
-  **Cancel**, closing the card or leaving the window stop waiting.
+  **Cancel**, closing the card or leaving the window stop waiting. A mouse
+  button other than left and right pressed then becomes the mouse binding
+  instead; left and right still work the card.
 
 ## Settings and Sessions
 
@@ -178,8 +180,9 @@ order, so Tab reaches it:
 - the Voice & audio card (from Settings or the call bar's **Audio…**): menus,
   checkboxes, and for each slider **−** and **+** beside it; Esc closes it.
   Its Talking section sets voice activity, push-to-talk or toggle-to-talk,
-  the key (**Set key…**, **Clear**), the gamepad button (a menu, so no pad
-  is needed to pick one) and the release delay;
+  the key (**Set key…**, **Clear**), the mouse button and the gamepad
+  button (menus, so no mouse button or pad is needed to pick one) and the
+  release delay;
 - the incoming-call card, a modal layer above everything else: **Decline**
   then **Accept**, side by side with a gap, and Esc to hide it. iced 0.14's
   buttons take no keys, so the card also answers to **Ctrl+Shift+A** (accept)
