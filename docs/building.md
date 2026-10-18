@@ -11,6 +11,22 @@ There are two builds of the desktop app. They differ only in where voices are cl
 
 RustRover has a run configuration for each build, shared in `.run/`. They appear in the run menu as **Twicecat full (GPU)** and **Twicecat light (CPU only)**.
 
+## Before the first build
+
+- **Rust 1.97.1.** `rust-toolchain.toml` pins it with rustfmt and clippy; rustup installs it on the first `cargo` call.
+- **libwebrtc, once.** Run `scripts/fetch-libwebrtc.sh` before the first build. It downloads LiveKit's prebuilt libwebrtc, checks its pinned SHA-256 and prints the directory it unpacked. On Linux and macOS it also links that directory into `dev/libwebrtc`, where `.cargo/config.toml` looks. On Windows, symlinks need extra privileges, so export the printed path as `LK_CUSTOM_WEBRTC` instead. Never let webrtc-sys download libwebrtc itself: that download is not checked (`scripts/check-no-webrtc-download.sh` catches it).
+- **Linux:** clang 21 or newer for webrtc-sys (libwebrtc's libc++ needs it; Ubuntu 24.04's clang 18 is too old), with `CC=clang-22 CXX=clang++-22` or your version; `lld` (aarch64 links with it); and the development packages, on Debian and Ubuntu:
+
+  ```bash
+  sudo apt-get install libxkbcommon-dev libwayland-dev libx11-dev libdbus-1-dev libssl-dev pkg-config libglib2.0-dev lld libasound2-dev libpipewire-0.3-dev libudev-dev
+  ```
+
+  `.github/actions/setup-build/action.yml` is the list CI installs, and `dev/ubuntu-24.04/Dockerfile` builds everything on Ubuntu 24.04 with clang 22 from apt.llvm.org.
+- **Windows:** the Visual Studio Build Tools with the C++ workload, and Git Bash for the scripts.
+- **macOS:** the Xcode command line tools.
+
+The scripts in `scripts/` are bash; run them from the repository root.
+
 ## Hardware video encoding (NVIDIA, Linux)
 
 Both builds encode call video with LiveKit's own encoders. On Linux, LiveKit's NVENC encoder and NVDEC decoder are compiled in only when NVIDIA's `cuda.h` is there at build time. Get it once with `scripts/fetch-cuda-headers.sh` (about 2 MB, from NVIDIA's pinned CUDA runtime wheel, under NVIDIA's licence). It is linked into `dev/cuda`, where `.cargo/config.toml` points `CUDA_HOME`. A system CUDA toolkit works too: set `CUDA_HOME` to it.
