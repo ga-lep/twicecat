@@ -17,11 +17,12 @@
 #
 # Every package carries the full build (`--features gpu`, plan Q3), the
 # DeepFilterNet3 models, LICENSE, THIRD_PARTY_NOTICES.html and the Inter
-# font's OFL.txt with THIRD-PARTY-NOTICES.md; Linux packages
-# also the "any GPU" pack: ONNX Runtime's CPU build, its WebGPU plugin and the
-# stateful graph (plan Q3 b), in the layout crates/audio/src/paths.rs reads
-# (<prefix>/lib/twicecat: not share/, which is the data directory when the
-# .tar.zst is unpacked into ~/.local). Linux packages ship a stripped binary; the
+# font's OFL.txt with THIRD-PARTY-NOTICES.md; Linux packages and the Windows
+# MSI also the "any GPU" pack: ONNX Runtime's CPU build, its WebGPU plugin and
+# the stateful graph (plan Q3 b; the MSI since 2026-10-18, human request), in
+# the layout crates/audio/src/paths.rs reads (beside the .exe on Windows;
+# <prefix>/lib/twicecat on Linux: not share/, which is the data directory when
+# the .tar.zst is unpacked into ~/.local). Linux packages ship a stripped binary; the
 # unstripped one goes into a separate symbols archive (plan Q4).
 #
 # Inputs come from the pinned fetch scripts (models, ONNX Runtime, the WebGPU
@@ -123,7 +124,7 @@ models=$(scripts/fetch-models.sh)
 [ -n "$notices" ] || cargo fetch --locked
 notices_args=()
 gpu_pack=0
-[ "$os" = linux ] && gpu_pack=1
+case "$os" in linux | windows) gpu_pack=1 ;; esac
 
 # font_notices DIR: the Inter typeface's licence and the notice that names
 # it, which Settings -> About points to (the OFL asks for both beside the
@@ -154,9 +155,16 @@ resources() {
         ep=$(scripts/fetch-webgpu-ep.sh)
         platform=$(basename "$(dirname "$ort")")
         mkdir -p "$dir/onnxruntime/1.28.3/$platform/lib" "$dir/onnxruntime/$(basename "$ep")"
-        # The libraries only (symbolic links kept), not headers or CMake files.
-        cp -P "$ort"/libonnxruntime*.so* "$dir/onnxruntime/1.28.3/$platform/lib/"
-        cp -P "$ep"/*.so "$dir/onnxruntime/$(basename "$ep")/"
+        # The libraries only (symbolic links kept), not headers, import
+        # libraries, symbols or CMake files. On Windows the plugin comes with
+        # the DirectX shader compiler Direct3D 12 needs (fetch-webgpu-ep.sh).
+        if [ "$os" = windows ]; then
+            cp "$ort"/*.dll "$dir/onnxruntime/1.28.3/$platform/lib/"
+            cp "$ep"/*.dll "$dir/onnxruntime/$(basename "$ep")/"
+        else
+            cp -P "$ort"/libonnxruntime*.so* "$dir/onnxruntime/1.28.3/$platform/lib/"
+            cp -P "$ep"/*.so "$dir/onnxruntime/$(basename "$ep")/"
+        fi
         notices_args=(--onnxruntime "$(dirname "$ort")" --webgpu-ep "$ep")
     fi
 }
@@ -288,7 +296,10 @@ config = {
                   {"src": f"{res}/LICENSE", "target": "LICENSE"},
                   {"src": f"{res}/THIRD_PARTY_NOTICES.html", "target": "THIRD_PARTY_NOTICES.html"},
                   {"src": f"{res}/OFL.txt", "target": "OFL.txt"},
-                  {"src": f"{res}/THIRD-PARTY-NOTICES.md", "target": "THIRD-PARTY-NOTICES.md"}],
+                  {"src": f"{res}/THIRD-PARTY-NOTICES.md", "target": "THIRD-PARTY-NOTICES.md"}]
+                 # The "any GPU" pack, when the package carries it (the MSI).
+                 + ([{"src": f"{res}/onnxruntime", "target": "onnxruntime"}]
+                    if os.path.isdir(f"{res}/onnxruntime") else []),
     "icons": [f"{icons}/{n}x{n}/apps/{app_id}.png" for n in (16, 32, 64, 128, 256, 512)]
              + [os.path.join(repo, "packaging/icons", app_id + ".ico")],
     "macos": {
@@ -325,11 +336,13 @@ done
 if [ -n "$packager_formats" ]; then
     command -v cargo-packager >/dev/null || die "cargo-packager is not installed (cargo install cargo-packager@0.11.8 --locked)"
     res=$out/resources
-    gpu_pack=0
+    # The MSI carries the pack; the DMG does not, nor the Linux dry run.
+    if [ "$os" != windows ]; then gpu_pack=0; fi
+    notices_args=()
     resources "$res"
     cp LICENSE "$res/LICENSE"
     font_notices "$res"
-    scripts/third-party-notices.sh "$res/THIRD_PARTY_NOTICES.html" --target "$host"
+    scripts/third-party-notices.sh "$res/THIRD_PARTY_NOTICES.html" --target "$host" "${notices_args[@]}"
     packager_config "$res" "$out/packager.json"
     for f in $packager_formats; do
         cargo packager --config "$out/packager.json" --formats "$f"

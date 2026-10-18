@@ -66,7 +66,7 @@ It builds each CPU level, prints the size of `twicecat` and times the voice chai
 | macOS | `.app` in a DMG | cargo-packager |
 | Windows | MSI | cargo-packager |
 
-Every package carries the full (GPU) build, the DeepFilterNet3 models, `LICENSE` and `THIRD_PARTY_NOTICES.html`. Linux packages also carry the "any GPU" pack: ONNX Runtime's CPU build, its WebGPU plugin and the stateful graph. On Linux these resources go in `<prefix>/lib/twicecat`, beside `<prefix>/bin/twicecat`. They don't go in `<prefix>/share/twicecat`, because that is the app's data directory when the `.tar.zst` is unpacked into `~/.local`. They need:
+Every package carries the full (GPU) build, the DeepFilterNet3 models, `LICENSE` and `THIRD_PARTY_NOTICES.html`. Linux packages and the Windows MSI also carry the "any GPU" pack: ONNX Runtime's CPU build, its WebGPU plugin (on Windows with the DirectX shader compiler it needs) and the stateful graph. On Windows they go beside `twicecat.exe`. On Linux these resources go in `<prefix>/lib/twicecat`, beside `<prefix>/bin/twicecat`. They don't go in `<prefix>/share/twicecat`, because that is the app's data directory when the `.tar.zst` is unpacked into `~/.local`. They need:
 
 - the models, ONNX Runtime and the WebGPU plugin, which the script fetches with the pinned fetch scripts;
 - the stateful graph from `scripts/export-deepfilternet.sh`, or `TWICECAT_STATEFUL_MODEL` (checked against its pinned SHA-256);
