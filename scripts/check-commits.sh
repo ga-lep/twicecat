@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Checks the commits of a feature branch (AGENTS.md rule 5): every commit in
-# base..head is a Conventional Commit of type feat, fix or docs; no merges and no
-# leftover fixup!/squash!/amend! commits (fold them with
+# base..head is a Conventional Commit of type feat, fix or docs; no non-base
+# merges and no leftover fixup!/squash!/amend! commits (fold them with
 # `git rebase --autosquash <base>`).
 #
 # Usage: scripts/check-commits.sh <base> [head]   (head defaults to HEAD)
