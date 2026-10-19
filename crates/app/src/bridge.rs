@@ -27,8 +27,9 @@ const RUNTIME_SHUTDOWN: Duration = Duration::from_secs(5);
 /// One item of the event stream.
 #[derive(Debug, Clone)]
 pub enum BridgeEvent {
-    /// The core sent an event.
-    Core(CoreEvent),
+    /// The core sent an event (boxed: some events are large, and the
+    /// message that carries it on boxes it anyway).
+    Core(Box<CoreEvent>),
     /// The core's event channel closed (after `Shutdown`).
     Closed,
 }
@@ -70,7 +71,7 @@ pub fn events_stream(slot: &EventsSlot) -> impl Stream<Item = BridgeEvent> + use
     stream::unfold(slot.take(), |receiver| async move {
         let mut receiver = receiver?;
         match receiver.recv().await {
-            Some(event) => Some((BridgeEvent::Core(event), Some(receiver))),
+            Some(event) => Some((BridgeEvent::Core(Box::new(event)), Some(receiver))),
             None => Some((BridgeEvent::Closed, None)),
         }
     })
@@ -79,7 +80,7 @@ pub fn events_stream(slot: &EventsSlot) -> impl Stream<Item = BridgeEvent> + use
 /// The Iced subscription that turns the core's events into messages.
 pub fn events_subscription(slot: EventsSlot) -> Subscription<Message> {
     Subscription::run_with(slot, events_stream).map(|event| match event {
-        BridgeEvent::Core(event) => Message::Core(Box::new(event)),
+        BridgeEvent::Core(event) => Message::Core(event),
         BridgeEvent::Closed => Message::CoreClosed,
     })
 }
@@ -232,10 +233,10 @@ mod tests {
         ]);
         let got = collect(&slot);
         assert_eq!(got.len(), 3, "{got:?}");
-        assert!(matches!(got[0], BridgeEvent::Core(CoreEvent::NoSession)));
+        assert!(matches!(&got[0], BridgeEvent::Core(e) if matches!(**e, CoreEvent::NoSession)));
         assert!(matches!(
-            got[1],
-            BridgeEvent::Core(CoreEvent::SyncState(SyncState::Running))
+            &got[1],
+            BridgeEvent::Core(e) if matches!(**e, CoreEvent::SyncState(SyncState::Running))
         ));
         assert!(matches!(got[2], BridgeEvent::Closed));
     }
@@ -264,7 +265,8 @@ mod tests {
         assert!(try_send(&tx, Command::RestoreSession).is_ok());
         let started = Instant::now();
         let pending = try_send(&tx, Command::Shutdown).expect_err("channel is full");
-        assert!(started.elapsed() < Duration::from_millis(50));
+        // A full sink must not block (it would hang for ever); 5 s only guards that.
+        assert!(started.elapsed() < Duration::from_secs(5));
         let first = rx.try_recv().expect("first command");
         assert!(matches!(first, Command::RestoreSession));
         iced::futures::executor::block_on(pending.deliver());

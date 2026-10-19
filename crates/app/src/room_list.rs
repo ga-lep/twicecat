@@ -934,7 +934,17 @@ mod tests {
     // slower in debug builds (a 10,000-item reset took a 24 ms median there
     // while Linux and macOS stay well under 16 ms), so Windows gets a looser
     // bound that still catches an order-of-magnitude regression.
-    const BUDGET: Duration = Duration::from_millis(if cfg!(windows) { 50 } else { 16 });
+    /// What a batch is expected to take, from the medians measured on a laptop and
+    /// on the CI runners (0.4 to 1.1 ms in a debug build), with about twice the
+    /// worst as the margin. The Phase 3 plan's 16 ms frame budget is far above
+    /// these; a value past its expectation is a regression long before it is a
+    /// dropped frame. Only an indicator (docs/testing.md).
+    fn expected(name: &str) -> Duration {
+        match name {
+            "mixed on 2000" => Duration::from_millis(1),
+            _ => Duration::from_millis(2),
+        }
+    }
 
     /// Deterministic synthetic room `i`: name, avatar and a 100-char preview.
     fn synthetic(i: usize) -> RoomSummary {
@@ -1032,8 +1042,8 @@ mod tests {
         sorted[sorted.len() / 2]
     }
 
-    #[test]
-    fn room_list_batches_under_16ms() {
+    /// The median time of each batch shape.
+    fn time_shapes() -> Vec<(&'static str, Duration)> {
         let shapes: Vec<(&str, usize, Vec<ListDiff<RoomSummary>>)> = vec![
             (
                 "reset 2000",
@@ -1063,18 +1073,36 @@ mod tests {
                 ],
             ),
         ];
-        let mut failures = Vec::new();
-        for (name, start, diffs) in &shapes {
-            let timings = time_shape(*start, diffs);
-            let med = median(&timings);
-            println!("{name}: median {med:?}, all {timings:?}");
-            if med >= BUDGET {
-                failures.push(format!(
-                    "{name}: median {med:?} >= {BUDGET:?}; all {timings:?}"
-                ));
-            }
+        shapes
+            .iter()
+            .map(|(name, start, diffs)| {
+                let timings = time_shape(*start, diffs);
+                let med = median(&timings);
+                println!("{name}: median {med:?}, all {timings:?}");
+                (*name, med)
+            })
+            .collect()
+    }
+
+    /// A batch is nowhere near taking seconds (docs/testing.md, R2). How fast
+    /// it is, is `perf_room_list_batches`.
+    #[test]
+    fn room_list_batches_do_not_take_seconds() {
+        for (name, median) in time_shapes() {
+            assert!(median < Duration::from_secs(1), "{name}: median {median:?}");
         }
-        assert!(failures.is_empty(), "too slow:\n{}", failures.join("\n"));
+    }
+
+    /// Each batch applies within its expectation. An indicator, not a gate.
+    #[test]
+    fn perf_room_list_batches() {
+        for (name, median) in time_shapes() {
+            twicecat_perf::record_duration(
+                &format!("app.room_list.batch.{name}"),
+                median,
+                expected(name),
+            );
+        }
     }
 }
 

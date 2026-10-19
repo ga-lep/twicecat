@@ -3,11 +3,20 @@ name: CI
 on:
   push:
     branches: [main]
+  # ready_for_review: leaving draft starts the run with Windows and macOS.
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
 
 permissions:
   contents: read
+
+# A newer push to a pull request cancels the run it replaces. Any other run has
+# its own group (its commit), so a run on main is never cancelled or replaced
+# while it waits: every commit there keeps its own result.
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -16,7 +25,50 @@ env:
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
-  lint:
+  # Whether the change touches anything but documentation. A documentation-only
+  # pull request skips the builds and the tests; checks and ci-ok still run, so a
+  # required check never stays pending. (Not `paths-ignore`: that would leave
+  # the checks of such a pull request missing.)
+  changes:
+    runs-on: ubuntu-26.04
+    outputs:
+      code: ${{ steps.diff.outputs.code }}
+      os: ${{ steps.diff.outputs.os }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - id: diff
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          DRAFT: ${{ github.event.pull_request.draft }}
+        run: |
+          code=true
+          if [ "$EVENT" = pull_request ]; then
+            files=$(git diff --name-only "origin/$BASE_REF...$HEAD_SHA")
+            # Only documentation: markdown files, and everything under docs/.
+            if [ -n "$files" ] && ! printf '%s\n' "$files" | grep -qvE '^docs/|\.md$'; then
+              code=false
+            fi
+          fi
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "code changed: $code"
+          # The slow legs, Windows and macOS, run on main and on pull requests that
+          # are ready for review; a draft gets the two Linux legs (Linux x86-64 and
+          # aarch64). Marking the pull request ready starts a full run.
+          os='["ubuntu-26.04","ubuntu-26.04-arm","windows-latest","macos-latest"]'
+          if [ "$EVENT" = pull_request ] && [ "$DRAFT" = true ]; then
+            os='["ubuntu-26.04","ubuntu-26.04-arm"]'
+          fi
+          echo "os=$os" >> "$GITHUB_OUTPUT"
+          echo "test legs: $os"
+
+  # Everything that needs no build, so a mistake shows in about a minute and not
+  # after clippy.
+  checks:
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v6
@@ -31,73 +83,84 @@ jobs:
           BASE_REF: ${{ github.base_ref }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: scripts/check-commits.sh "origin/$BASE_REF" "$HEAD_SHA"
-      - name: Install Linux build dependencies
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libdbus-1-dev libssl-dev pkg-config libglib2.0-dev lld libasound2-dev libpipewire-0.3-dev libudev-dev
-      # webrtc-sys needs clang >= 21 on Linux (Chromium libc++); the image has 22.
-      - name: Use clang 22
-        if: runner.os == 'Linux'
-        run: |
-          clang++-22 --version
-          { echo CC=clang-22; echo CXX=clang++-22; } >> "$GITHUB_ENV"
-      # webrtc-sys would download libwebrtc unverified; use the pinned SHA-256.
-      - name: Fetch pinned libwebrtc
-        shell: bash
-        # Not inside the echo: a failed fetch must fail the step, not set
-        # an empty LK_CUSTOM_WEBRTC (webrtc-sys then downloads unverified).
-        run: |
-          dir=$(scripts/fetch-libwebrtc.sh)
-          echo "LK_CUSTOM_WEBRTC=$dir" >> "$GITHUB_ENV"
-      - uses: Swatinem/rust-cache@v2
+      # Every test file with ignored tests runs in exactly one integration shard.
+      - run: scripts/integration-shards.sh --check
+      # Every file with a perf_ test is run by the perf workflow.
+      - run: scripts/run-perf-tests.sh --check
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-      # Without dev-dependency features: --all-targets unifies them and hides missing normal features.
-      - run: cargo check --workspace --lib --bins --locked
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      # The pinned release binary (scripts/fetch-cargo-deny.sh): the Docker-based
+      # action took about a minute to build and run.
+      - name: cargo deny
+        run: |
+          deny=$(scripts/fetch-cargo-deny.sh)
+          "$deny" --workspace check
+      # These read the dependency graph (cargo tree, cargo metadata) and compile nothing.
       - run: scripts/check-app-deps.sh
       - run: scripts/check-app-deps.sh livekit
       - run: scripts/check-core-api.sh
       - run: scripts/check-font-assets.sh
+      # The Flatpak's crate list matches Cargo.lock, and its downloads carry
+      # the SHA-256s scripts/checksums/ pins (Phase 7 Task 7).
+      - run: scripts/flatpak.sh check
+      # Every package name the tools make has a name in the release scheme.
+      - run: scripts/release-names.sh --check
+
+  lint:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-build
+      # Only main saves the cache; pull requests restore it.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          env-vars: CUDA_HOME
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      # Without dev-dependency features: --all-targets unifies them and hides missing normal features.
+      - run: cargo check --workspace --lib --bins --locked
       - run: scripts/check-no-webrtc-download.sh
-      # Every test file with ignored tests runs in exactly one integration shard.
-      - run: scripts/integration-shards.sh --check
 
   test:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         # Linux runners are 26.04: libwebrtc's hermetic libc++ needs clang >= 21
         # (24.04 has 18). ubuntu-26.04-arm is aarch64 Linux, the Steam Frame target.
-        os: [ubuntu-26.04, ubuntu-26.04-arm, windows-latest, macos-latest]
+        # The list comes from the changes job: Windows and macOS only on main and
+        # on pull requests that are ready for review.
+        os: ${{ fromJSON(needs.changes.outputs.os) }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
-      - name: Install Linux build dependencies
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libdbus-1-dev libssl-dev pkg-config libglib2.0-dev lld libasound2-dev libpipewire-0.3-dev libudev-dev
-      # webrtc-sys needs clang >= 21 on Linux (Chromium libc++); the image has 22.
-      - name: Use clang 22
-        if: runner.os == 'Linux'
-        run: |
-          clang++-22 --version
-          { echo CC=clang-22; echo CXX=clang++-22; } >> "$GITHUB_ENV"
-      # webrtc-sys would download libwebrtc unverified; use the pinned SHA-256.
-      - name: Fetch pinned libwebrtc
-        shell: bash
-        # Not inside the echo: a failed fetch must fail the step, not set
-        # an empty LK_CUSTOM_WEBRTC (webrtc-sys then downloads unverified).
-        run: |
-          dir=$(scripts/fetch-libwebrtc.sh)
-          echo "LK_CUSTOM_WEBRTC=$dir" >> "$GITHUB_ENV"
+      - uses: ./.github/actions/setup-build
+        with:
+          cuda: ${{ matrix.os == 'ubuntu-26.04' }}
+      # Only main saves the cache; pull requests restore it.
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          env-vars: CUDA_HOME
       # The lint job already runs clippy on Linux.
       - name: Clippy (non-Linux only)
         if: runner.os != 'Linux'
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-      - run: cargo test --workspace --locked
+      # perf_ tests are indicators and run in the perf workflow (docs/testing.md).
+      # Not the integration test files whose tests are all #[ignore]: they run in
+      # the shards, and each is a 500 MB binary to link here for "0 passed".
+      - name: Unit tests
+        shell: bash
+        run: cargo test --workspace --locked $(scripts/unit-test-targets.sh) -- --skip perf_
+      - name: Doc tests
+        run: cargo test --workspace --locked --doc -- --skip perf_
       - name: No unverified libwebrtc download
         shell: bash
         run: scripts/check-no-webrtc-download.sh
@@ -106,8 +169,16 @@ jobs:
   # interfere. The binaries of a shard are listed in scripts/integration-shards.sh.
   integration:
     name: integration (shard ${{ matrix.shard }})
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-26.04
     timeout-minutes: 45
+    env:
+      # The tests' wait for an expected event (crates/core/tests/common): 90 s
+      # instead of 30 s. A shared 4-core runner runs Synapse, LiveKit and two
+      # debug cores at once; a timeout only ends a wait that has failed, so it
+      # costs a passing run nothing. Read when the tests are built.
+      TWICECAT_TEST_TIMEOUT_SECS: 90
     strategy:
       fail-fast: false
       matrix:
@@ -116,22 +187,14 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
-      - name: Install Linux build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libdbus-1-dev libssl-dev pkg-config libglib2.0-dev lld libasound2-dev libpipewire-0.3-dev libudev-dev
-      # webrtc-sys needs clang >= 21 on Linux (Chromium libc++); the image has 22.
-      - name: Use clang 22
-        if: runner.os == 'Linux'
+      # Pulls and starts Synapse and LiveKit while the build runs; the step after
+      # the build waits for it. A new session, so the runner does not stop it
+      # when this step ends.
+      - name: Start the local stack in the background
         run: |
-          clang++-22 --version
-          { echo CC=clang-22; echo CXX=clang++-22; } >> "$GITHUB_ENV"
-      # webrtc-sys would download libwebrtc unverified; use the pinned SHA-256.
-      - name: Fetch pinned libwebrtc
-        shell: bash
-        # Not inside the echo: a failed fetch must fail the step, not set
-        # an empty LK_CUSTOM_WEBRTC (webrtc-sys then downloads unverified).
-        run: |
-          dir=$(scripts/fetch-libwebrtc.sh)
-          echo "LK_CUSTOM_WEBRTC=$dir" >> "$GITHUB_ENV"
+          rm -f "$RUNNER_TEMP/stack-up.rc"
+          setsid nohup bash -c 'scripts/stack.sh up -d > "$RUNNER_TEMP/stack-up.log" 2>&1; echo $? > "$RUNNER_TEMP/stack-up.rc"' > /dev/null 2>&1 &
+      - uses: ./.github/actions/setup-build
       # One key for all shards: they restore the dependencies built on main.
       # rust-cache never keeps the workspace crates, so each shard compiles
       # twicecat-core and its tests itself. Only main saves the cache.
@@ -139,17 +202,25 @@ jobs:
         with:
           shared-key: integration
           save-if: ${{ github.ref == 'refs/heads/main' }}
+          env-vars: CUDA_HOME
       # The ignored cleaning tests (core lib and call_media) need DeepFilterNet3;
       # the script (pinned SHA-256) fills the default cache dir core reads.
       - name: Fetch models
         run: scripts/fetch-models.sh
-      - name: Start local Synapse
-        run: scripts/stack.sh up -d --wait
+      # Built before the run so the build and run durations show separately.
+      # Only this shard's binaries, with the cargo call the run step makes: the
+      # earlier full build was followed by a run step that compiled for 5 to 8
+      # minutes again, because its calls selected other targets.
+      - name: Build integration tests
+        run: scripts/run-integration-tests.sh --shard ${{ matrix.shard }} --no-run
+      - name: Wait for the local stack
+        run: |
+          for _ in $(seq 150); do [ -f "$RUNNER_TEMP/stack-up.rc" ] && break; sleep 2; done
+          cat "$RUNNER_TEMP/stack-up.log"
+          test "$(cat "$RUNNER_TEMP/stack-up.rc")" = 0
+          scripts/stack.sh up -d --wait
       - name: Register test users
         run: scripts/create-test-users.sh
-      # Built before the run so the build and run durations show separately.
-      - name: Build integration tests
-        run: cargo test -p twicecat-core -p twicecat-app --no-run --locked
       # The real-keychain test needs a desktop session, and hardware_ tests a
       # microphone or speakers; both are human-run.
       - name: Run homeserver integration tests
@@ -161,11 +232,33 @@ jobs:
         if: always()
         run: scripts/stack.sh down -v
 
-  # The required check: green only when all four shards passed.
+  # Green only when all four shards passed, or when the change is documentation
+  # only and the shards were skipped.
   integration-ok:
     if: always()
-    needs: integration
+    needs: [changes, integration]
     runs-on: ubuntu-26.04
     steps:
       - name: All integration shards passed
-        run: test "${{ needs.integration.result }}" = success
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          CODE: ${{ needs.changes.outputs.code }}
+          SHARDS: ${{ needs.integration.result }}
+        run: |
+          test "$CHANGES" = success
+          if [ "$CODE" = true ]; then test "$SHARDS" = success; fi
+
+  # The one check that covers the whole workflow: it fails when any job failed or
+  # was cancelled, and passes when jobs were skipped because only documentation
+  # changed. Make this the required check.
+  ci-ok:
+    if: always()
+    needs: [changes, checks, lint, test, integration-ok]
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Every job passed or was skipped
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "results: $RESULTS"
+          case " $RESULTS " in *" failure "*|*" cancelled "*) exit 1 ;; esac

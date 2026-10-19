@@ -5,12 +5,19 @@
 # webrtc.ninja. An LK_CUSTOM_WEBRTC from the environment (CI, Windows) wins.
 [env]
 LK_CUSTOM_WEBRTC = { value = "dev/libwebrtc", relative = true }
+# CUDA's driver API header for LiveKit's NVENC/NVDEC (plan Phase 9 Task 6),
+# linked into dev/cuda by scripts/fetch-cuda-headers.sh; without it webrtc-sys
+# builds without them (software video). A CUDA_HOME from the environment (a
+# system toolkit) wins. See dev/cuda/README.md.
+CUDA_HOME = { value = "dev/cuda", relative = true }
 
-# x86_64 Linux builds for x86-64-v3 (AVX2, FMA, BMI2; Intel since Haswell,
-# 2013, AMD since Excavator, 2015): the voice chain is 17 % cheaper, mostly
-# FMA (plan Task 15). twicecat_core::require_cpu_level refuses older CPUs at startup
-# with a message instead of a crash. RUSTFLAGS from the environment replaces
-# this.
+# x86_64 Linux and Windows build for x86-64-v3 (AVX2, FMA, BMI2; Intel since
+# Haswell, 2013, AMD since Excavator, 2015; 96 % of Steam's PCs in September
+# 2026): the voice chain is 11 % cheaper than the baseline (Phase 7
+# measurements; 17 % in Phase 6 Task 15), mostly AEC3. twicecat_core's CPU
+# check refuses older CPUs before `main`, with a message instead of a crash.
+# RUSTFLAGS from the environment replaces this; to build another level, pass
+# `--target` too, or the flags also reach build scripts, which run here.
 #
 # Linux keeps debug info in split DWARF files (.dwo) beside the objects instead
 # of copying it into every executable: each of the ~40 test binaries links the
@@ -29,7 +36,7 @@ rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "split-debuginfo=unpacked"]
 # libwebrtc is built against the static MSVC runtime (/MT); without this the
 # link fails with LNK2038 RuntimeLibrary mismatches.
 [target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "target-feature=+crt-static"]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "target-cpu=x86-64-v3"]
 
 [target.aarch64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]

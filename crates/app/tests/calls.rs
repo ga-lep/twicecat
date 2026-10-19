@@ -303,6 +303,7 @@ impl AppUnderTest {
                 max_upload_bytes_override: None,
                 audio: AudioBackend::Virtual(Arc::new(Silence)),
                 call_service_override: None,
+                video: twicecat_core::api::VideoBackend::System,
             },
             Arc::new(InMemorySecretStore::new()),
         )
@@ -334,7 +335,7 @@ impl AppUnderTest {
             });
             match event {
                 Ok(Some(BridgeEvent::Core(event))) => {
-                    let _ = self.app.update(Message::Core(Box::new(event)));
+                    let _ = self.app.update(Message::Core(event));
                 }
                 Ok(Some(BridgeEvent::Closed)) => {
                     let _ = self.app.update(Message::CoreClosed);
@@ -354,6 +355,15 @@ impl AppUnderTest {
         ));
         let _ = self.app.update(Message::LoginSubmitted);
         self.until("main screen", 60, |app| app.screen == Screen::Main);
+    }
+
+    /// The arming wait of the card now showing ends. The harness drops the
+    /// tasks `update` returns, so the timer that would end it never runs;
+    /// until it does, the card answers nothing (clicks already on their way
+    /// when it came up were meant for what was under it).
+    fn arm(&mut self) {
+        let seq = self.app.calls.arm_seq();
+        let _ = self.app.update(Message::RingArmed(seq));
     }
 
     fn call(&mut self, message: CallMessage) {
@@ -401,6 +411,13 @@ fn a_cli_call_rings_the_app_which_declines_then_answers() {
     let ring = carol.app.calls.card().expect("the card").clone();
     assert!(ring.ring, "a DM call rings");
     assert_eq!(ring.caller.as_str(), env.user_id(1));
+    // A card that has just come up ignores an answer.
+    carol.call(CallMessage::Decline(room.clone()));
+    assert!(
+        carol.app.calls.card().is_some(),
+        "an answer before the card is armed does nothing"
+    );
+    carol.arm();
     carol.call(CallMessage::Decline(room.clone()));
     cli.expect(&format!("{} declined the call in", env.user_id(3)));
     carol.until("the ring to stop", 30, |app| {
@@ -416,6 +433,7 @@ fn a_cli_call_rings_the_app_which_declines_then_answers() {
     carol.until("a second card", 60, |app| {
         app.calls.card().is_some_and(|r| r.room_id == room)
     });
+    carol.arm();
     carol.call(CallMessage::Accept(room.clone()));
     carol.until("connected with alice", 60, |app| {
         app.calls.call.as_ref().is_some_and(|c| {

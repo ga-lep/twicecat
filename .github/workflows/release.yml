@@ -1,0 +1,494 @@
+name: Release
+
+# Phase 7 plan Task 8. On a `v*` tag: check the tag against the version, build
+# every package with the dist profile, smoke-test them, sign what the human's
+# secrets allow, and make a DRAFT release with SHA256SUMS.txt and build provenance
+# attestations; the human publishes it. "Run workflow" (Actions tab) is a dry
+# run: the same packages as one artifact, and no release.
+#
+# Signing (plan Q6) runs only when its secrets exist; without them the
+# package is unsigned and the job summary and the release notes say so.
+# - macOS: APPLE_SIGNING_IDENTITY ("Developer ID Application: …"),
+#   APPLE_CERTIFICATE (the .p12, base64) and APPLE_CERTIFICATE_PASSWORD;
+#   notarization with an App Store Connect API key: APPLE_API_KEY (its ID),
+#   APPLE_API_ISSUER and APPLE_API_KEY_P8 (the .p8 file's text).
+# - Windows: WINDOWS_SIGN_COMMAND, a command with %1 for the file (the signer
+#   is not chosen yet).
+# - The AppImage's own updater (plan Q7 b): the minisign key pair from
+#   `cargo packager signer generate`, its public half committed as
+#   packaging/appimage-updater.pub and its private half and password as
+#   TWICECAT_UPDATER_PRIVATE_KEY and TWICECAT_UPDATER_PRIVATE_KEY_PASSWORD.
+#   With both, the AppImage is built with the public key, signed, and
+#   described in latest.json for the updater; without them it only checks
+#   and links.
+#
+# Actions are pinned by commit, and no job restores a cache: release builds
+# start from the pinned downloads only.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    runs-on: ubuntu-26.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      # A tag must name the workspace version and have a metainfo release; a
+      # dry run checks the version it would tag.
+      - id: version
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          version=$(awk '/^\[/ { s = $0 } s == "[workspace.package]" && $1 == "version" { gsub(/"/, "", $3); print $3 }' Cargo.toml)
+          tag="v$version"
+          if [ "$REF_TYPE" = tag ]; then tag=$REF_NAME; fi
+          scripts/check-version.sh "$tag"
+          { echo "version=$version"; echo "tag=$tag"; } >> "$GITHUB_OUTPUT"
+
+  # The stateful DeepFilterNet3 graph for the "any GPU" pack (plan Q3 b): the
+  # export is reproducible, and the script stops unless the result has the
+  # SHA-256 pinned in scripts/checksums/models.sha256. One file for every
+  # architecture.
+  stateful-graph:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.12.19"
+          enable-cache: false
+      - name: Export the graph
+        run: |
+          dir=$(scripts/export-deepfilternet.sh)
+          mkdir -p "$RUNNER_TEMP/stateful"
+          cp "$dir/deepfilternet3_stateful.onnx" "$RUNNER_TEMP/stateful/"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: stateful-graph
+          path: ${{ runner.temp }}/stateful/deepfilternet3_stateful.onnx
+          if-no-files-found: error
+          retention-days: 7
+
+  linux:
+    needs: [version, stateful-graph]
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-26.04
+            arch: x86_64
+          - runner: ubuntu-26.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      # The dist profile's fat LTO links the app in one LLVM module, which
+      # outgrew the 4-vCPU runner's memory on aarch64 (rustc killed with
+      # SIGKILL). Swap lets it finish, slower, without changing the profile.
+      - name: Swap for the fat-LTO link
+        run: |
+          free -h
+          sudo swapoff -a
+          sudo rm -f /swapfile /mnt/swapfile
+          sudo fallocate -l 16G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap -q /swapfile
+          sudo swapon /swapfile
+          free -h
+          df -h /
+      # The packages build in Ubuntu 24.04 (glibc 2.39, plan Q14), with clang
+      # 22 from apt.llvm.org (webrtc-sys needs clang >= 21 for Chromium's
+      # libc++), Rust 1.97.1 and cargo-about: the image local builds use. The
+      # runner (Ubuntu 26.04) only smoke-tests and signs.
+      - name: Build image (Ubuntu 24.04)
+        run: docker build -t twicecat-ubuntu-24.04-build dev/ubuntu-24.04
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: stateful-graph
+          path: ${{ runner.temp }}/stateful
+      # The updater is built in only when the AppImage can also be signed.
+      - name: AppImage updater key
+        env:
+          UPDATER_KEY: ${{ secrets.TWICECAT_UPDATER_PRIVATE_KEY }}
+        run: |
+          if [ -n "$UPDATER_KEY" ] && [ -f packaging/appimage-updater.pub ]; then
+            echo "TWICECAT_UPDATER_PUBKEY=$(tr -d '\r\n' < packaging/appimage-updater.pub)" >> "$GITHUB_ENV"
+            cargo install cargo-packager@0.11.8 --locked
+          else
+            echo "AppImage: no updater key, it checks and links only." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      # As the runner's user, with the checkout and the Twicecat cache at their
+      # paths, so the packages land in target/package/ for the steps below.
+      # The fetches run inside: a failed one fails the step (webrtc-sys would
+      # otherwise download libwebrtc unverified). TWICECAT_UPDATER_PUBKEY
+      # passes through only when the step above set it.
+      - name: Build and package (dist profile, in the image)
+        env:
+          TWICECAT_STATEFUL_MODEL: ${{ runner.temp }}/stateful/deepfilternet3_stateful.onnx
+          ARCH: ${{ matrix.arch }}
+        run: |
+          mkdir -p "$HOME/.cache/twicecat"
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME="$HOME" \
+            -e TWICECAT_STATEFUL_MODEL -e TWICECAT_UPDATER_PUBKEY -e ARCH -e CARGO_TERM_COLOR \
+            -v "$PWD:$PWD" -v "$HOME/.cache/twicecat:$HOME/.cache/twicecat" -v "$RUNNER_TEMP:$RUNNER_TEMP" \
+            --workdir "$PWD" twicecat-ubuntu-24.04-build bash -euo pipefail -c '
+              LK_CUSTOM_WEBRTC=$(scripts/fetch-libwebrtc.sh)
+              export LK_CUSTOM_WEBRTC
+              if [ "$ARCH" = x86_64 ]; then
+                CUDA_HOME=$(scripts/fetch-cuda-headers.sh)
+                export CUDA_HOME
+              fi
+              scripts/package.sh'
+      # The .tar.zst and the AppImage run on the runner, which is a server
+      # image: give it the libraries the binary links that desktops have, the
+      # .deb's depends in packaging/nfpm.yaml.
+      - name: Runtime libraries for the smoke test
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends libpipewire-0.3-0t64 libasound2t64 libudev1
+      - name: Smoke-test the packages
+        run: scripts/smoke-test-packages.sh "target/package/${{ matrix.arch }}-unknown-linux-gnu"
+      # The signature the updater checks (minisign, as base64), next to it.
+      - name: Sign the AppImage for its updater
+        if: env.TWICECAT_UPDATER_PUBKEY != ''
+        env:
+          CARGO_PACKAGER_SIGN_PRIVATE_KEY: ${{ secrets.TWICECAT_UPDATER_PRIVATE_KEY }}
+          CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD: ${{ secrets.TWICECAT_UPDATER_PRIVATE_KEY_PASSWORD }}
+        run: |
+          for image in target/package/${{ matrix.arch }}-unknown-linux-gnu/*.AppImage; do
+            cargo packager signer sign "$image"
+          done
+      # The Flatpak job uses the same notices page as the .deb (same target,
+      # same "any GPU" pack).
+      - name: Collect
+        run: |
+          out=target/package/${{ matrix.arch }}-unknown-linux-gnu
+          mkdir -p "$RUNNER_TEMP/dist" "$RUNNER_TEMP/notices"
+          cp "$out"/*.tar.zst "$out"/*.deb "$out"/*.rpm "$out"/*.AppImage "$RUNNER_TEMP/dist/"
+          if ls "$out"/*.AppImage.sig >/dev/null 2>&1; then cp "$out"/*.AppImage.sig "$RUNNER_TEMP/dist/"; fi
+          cp "$out/stage/usr/share/doc/twicecat/THIRD_PARTY_NOTICES.html" "$RUNNER_TEMP/notices/"
+          ls -l "$RUNNER_TEMP/dist"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-linux-${{ matrix.arch }}
+          path: ${{ runner.temp }}/dist/*
+          if-no-files-found: error
+          retention-days: 7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: notices-linux-${{ matrix.arch }}
+          path: ${{ runner.temp }}/notices/THIRD_PARTY_NOTICES.html
+          if-no-files-found: error
+          retention-days: 7
+
+  # flatpak-builder in Flathub's own CI image (privileged, for bubblewrap),
+  # started with docker rather than as the job's container so that the runner
+  # can add swap first: the image has no swapon, and the app's fat-LTO link
+  # outgrew the aarch64 runner's memory here as in the linux job.
+  flatpak:
+    needs: [version, stateful-graph, linux]
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-26.04
+            arch: x86_64
+          - runner: ubuntu-26.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    env:
+      FLATPAK_IMAGE: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-26.08@sha256:6ed6921bb5a9e1a916989971844f159b854b7b225880c381fa34f7a158863039
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Swap for the fat-LTO link
+        run: |
+          free -h
+          sudo swapoff -a
+          sudo rm -f /swapfile /mnt/swapfile
+          sudo fallocate -l 16G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap -q /swapfile
+          sudo swapon /swapfile
+          free -h
+          df -h /
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: stateful-graph
+          path: ${{ runner.temp }}/stateful
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: notices-linux-${{ matrix.arch }}
+          path: ${{ runner.temp }}/notices
+      # Both steps share one HOME, where flatpak keeps the runtimes the build
+      # installs and the smoke test needs.
+      - name: Build the Flatpak
+        run: |
+          docker run --rm --privileged -v "$PWD:$PWD" -w "$PWD" -v "$RUNNER_TEMP:$RUNNER_TEMP" \
+            -e HOME="$RUNNER_TEMP/flatpak-home" -e CARGO_TERM_COLOR \
+            -e TWICECAT_STATEFUL_MODEL="$RUNNER_TEMP/stateful/deepfilternet3_stateful.onnx" \
+            -e TWICECAT_FLATPAK_NOTICES="$RUNNER_TEMP/notices/THIRD_PARTY_NOTICES.html" \
+            "$FLATPAK_IMAGE" scripts/flatpak.sh build
+      - name: Smoke-test the Flatpak
+        run: |
+          docker run --rm --privileged -v "$PWD:$PWD" -w "$PWD" -v "$RUNNER_TEMP:$RUNNER_TEMP" \
+            -e HOME="$RUNNER_TEMP/flatpak-home" "$FLATPAK_IMAGE" scripts/flatpak.sh smoke
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-flatpak-${{ matrix.arch }}
+          path: target/package/flatpak/*.flatpak
+          if-no-files-found: error
+          retention-days: 7
+
+  windows:
+    needs: [version, stateful-graph]
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      # The scripts call python3; Windows has python.
+      - name: python3
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          printf '#!/bin/sh\nexec python "$@"\n' > "$RUNNER_TEMP/bin/python3"
+          chmod +x "$RUNNER_TEMP/bin/python3"
+          cygpath -w "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Fetch pinned libwebrtc
+        run: |
+          dir=$(scripts/fetch-libwebrtc.sh)
+          echo "LK_CUSTOM_WEBRTC=$dir" >> "$GITHUB_ENV"
+      - name: Install cargo-about and cargo-packager
+        run: |
+          cargo install cargo-about@0.9.2 --locked --features cli
+          cargo install cargo-packager@0.11.8 --locked
+      # The MSI carries the "any GPU" pack too (plan Q3 b, Windows added
+      # 2026-10-18): WebGPU on Direct3D 12 for every GPU.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: stateful-graph
+          path: ${{ runner.temp }}/stateful
+      - name: Build and package (dist profile)
+        env:
+          TWICECAT_WINDOWS_SIGN_COMMAND: ${{ secrets.WINDOWS_SIGN_COMMAND }}
+        run: |
+          TWICECAT_STATEFUL_MODEL="$(cygpath -u "$RUNNER_TEMP")/stateful/deepfilternet3_stateful.onnx" \
+            scripts/package.sh
+          # What the app's GPU check needs beside twicecat.exe
+          # (crates/core/src/gpu_enhancement.rs).
+          res=target/package/x86_64-pc-windows-msvc/resources
+          for f in onnxruntime/1.28.3/win-x64/lib/onnxruntime.dll \
+                   onnxruntime/webgpu-ep-0.4.0/onnxruntime_providers_webgpu.dll \
+                   onnxruntime/webgpu-ep-0.4.0/dxcompiler.dll \
+                   onnxruntime/webgpu-ep-0.4.0/dxil.dll \
+                   models/deepfilternet3-stateful/deepfilternet3_stateful.onnx; do
+            [ -f "$res/$f" ] || { echo "the MSI's resources lack $f"; exit 1; }
+          done
+      - name: Smoke-test the binary
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          got=$(target/x86_64-pc-windows-msvc/dist/twicecat.exe --version)
+          [ "$got" = "twicecat $VERSION" ] || { echo "--version printed '$got'"; exit 1; }
+          echo "ok: $got"
+      - name: Collect
+        env:
+          SIGNED: ${{ secrets.WINDOWS_SIGN_COMMAND != '' }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/dist"
+          find target/package -name '*.msi' -exec cp {} "$RUNNER_TEMP/dist/" \;
+          ls -l "$RUNNER_TEMP/dist"
+          if [ "$SIGNED" = true ]; then
+            echo "Windows: the MSI and twicecat.exe are signed." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Windows: **unsigned** (no WINDOWS_SIGN_COMMAND secret): SmartScreen warns on first start." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-windows-x86_64
+          path: ${{ runner.temp }}/dist/*.msi
+          if-no-files-found: error
+          retention-days: 7
+
+  macos:
+    needs: version
+    runs-on: macos-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Fetch pinned libwebrtc
+        run: |
+          dir=$(scripts/fetch-libwebrtc.sh)
+          echo "LK_CUSTOM_WEBRTC=$dir" >> "$GITHUB_ENV"
+      - name: Install cargo-about and cargo-packager
+        run: |
+          cargo install cargo-about@0.9.2 --locked --features cli
+          cargo install cargo-packager@0.11.8 --locked
+      # cargo-packager reads the key from a file.
+      - name: Notarization key
+        env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: |
+          if [ -n "$APPLE_API_KEY_P8" ]; then
+            umask 077
+            printf '%s\n' "$APPLE_API_KEY_P8" > "$RUNNER_TEMP/AuthKey.p8"
+            echo "APPLE_API_KEY_PATH=$RUNNER_TEMP/AuthKey.p8" >> "$GITHUB_ENV"
+          fi
+      - name: Build and package (dist profile)
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: scripts/package.sh
+      - name: Smoke-test the binary
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          got=$(target/aarch64-apple-darwin/dist/twicecat --version)
+          [ "$got" = "twicecat $VERSION" ] || { echo "--version printed '$got'"; exit 1; }
+          echo "ok: $got"
+      - name: Check the signature
+        env:
+          SIGNED: ${{ secrets.APPLE_SIGNING_IDENTITY != '' }}
+        run: |
+          app=$(find target/package -name 'Twicecat.app' -type d | head -1)
+          if [ "$SIGNED" = true ]; then
+            codesign --verify --deep --strict --verbose=2 "$app"
+            xcrun stapler validate "$app" || echo "::warning::the app is signed but not stapled (no notarization key?)"
+            echo "macOS: signed with the Developer ID; see the job log for notarization." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "macOS: **unsigned** (no APPLE_SIGNING_IDENTITY secret): Gatekeeper refuses it unless the user allows it in System Settings." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Collect
+        run: |
+          mkdir -p "$RUNNER_TEMP/dist"
+          find target/package -name '*.dmg' -exec cp {} "$RUNNER_TEMP/dist/" \;
+          ls -l "$RUNNER_TEMP/dist"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-macos-aarch64
+          path: ${{ runner.temp }}/dist/*.dmg
+          if-no-files-found: error
+          retention-days: 7
+
+  # The only job that writes: the release names, SHA256SUMS.txt, the attestations, the draft.
+  release:
+    needs: [version, linux, flatpak, windows, macos]
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      # One name per file, twicecat-<tag>-<os>-<arch>.<format>, so the release
+      # page groups them by system (the packaging tools each name theirs their
+      # own way).
+      - name: Name the files
+        env:
+          TAG: ${{ needs.version.outputs.tag }}
+        run: scripts/release-names.sh dist "$TAG"
+      # The AppImage updater's manifest, when the AppImages were signed: the
+      # newest version and, per architecture, its download and signature.
+      # It reaches the updater once this release is published as the latest.
+      - name: latest.json
+        env:
+          TAG: ${{ needs.version.outputs.tag }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          if ls dist/*.AppImage.sig >/dev/null 2>&1; then
+            python3 -I - dist "$GITHUB_REPOSITORY" "$TAG" "$VERSION" <<'EOF'
+          import datetime, json, pathlib, sys
+          dist, repo, tag, version = sys.argv[1:]
+          platforms = {}
+          for sig in sorted(pathlib.Path(dist).glob("*.AppImage.sig")):
+              image = sig.name[: -len(".sig")]
+              # The updater's target names, from the file's arch (release-names.sh).
+              arch = "aarch64" if "-linux-arm64." in image else "x86_64"
+              platforms[f"linux-{arch}"] = {
+                  "url": f"https://github.com/{repo}/releases/download/{tag}/{image}",
+                  "signature": sig.read_text().strip(),
+                  "format": "appimage",
+              }
+          manifest = {
+              "version": version,
+              "notes": f"https://github.com/{repo}/releases/tag/{tag}",
+              "pub_date": datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat(),
+              "platforms": platforms,
+          }
+          pathlib.Path(dist, "latest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+          EOF
+            cat dist/latest.json
+          fi
+      # .txt, so a browser shows it rather than downloading it.
+      - name: SHA256SUMS.txt
+        working-directory: dist
+        run: |
+          sha256sum -- * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*
+      - name: Draft release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+          WINDOWS_SIGNED: ${{ secrets.WINDOWS_SIGN_COMMAND != '' }}
+          MACOS_SIGNED: ${{ secrets.APPLE_SIGNING_IDENTITY != '' }}
+        run: |
+          scripts/release-notes.sh "$TAG" "$GITHUB_REPOSITORY" "$WINDOWS_SIGNED" "$MACOS_SIGNED" > "$RUNNER_TEMP/notes.md"
+          # A labelled tag (v0.1.0-alpha, scripts/check-version.sh) is a
+          # pre-release, which the updater's "latest release" never offers.
+          prerelease=()
+          case "$TAG" in *-*) prerelease=(--prerelease) ;; esac
+          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag --draft "${prerelease[@]}" \
+            --title "Twicecat ${TAG#v}" --notes-file "$RUNNER_TEMP/notes.md" --generate-notes
+      # A dry run keeps everything as one artifact instead.
+      - name: Dry run
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-dry-run
+          path: dist/*
+          retention-days: 7

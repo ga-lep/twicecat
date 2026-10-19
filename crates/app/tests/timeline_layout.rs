@@ -3,13 +3,15 @@
 //! exist, and that the spacers keep the content height (plan Q15c).
 
 use chrono::Utc;
+use iced::advanced::graphics::text::font_system;
 use iced::advanced::layout::{Limits, Node};
 use iced::advanced::renderer::Headless;
 use iced::advanced::widget::Tree;
-use iced::{Font, Pixels, Renderer, Size};
+use iced::{Pixels, Renderer, Size};
 use twicecat_app::rich_text::Revealed;
 use twicecat_app::screens::timeline_pane::{RichEnv, view_in};
 use twicecat_app::timeline::{MAX_BUILT_ROWS, TimelineView};
+use twicecat_app::ui::fonts;
 use twicecat_core::api::{
     ListDiff, MessageDetails, SendStatus, StateChange, TimelineItem, TimelineItemKind, UserId,
 };
@@ -18,16 +20,24 @@ const NOW: u64 = 1_790_000_000_000;
 const WIDTH: f32 = 800.0;
 const HEIGHT: f32 = 600.0;
 
+/// The headless renderer with the bundled typeface, the one the app draws
+/// with: the estimates are compared with real measurements, which must not
+/// depend on the fonts a machine happens to have.
 fn renderer() -> Renderer {
+    use std::borrow::Cow;
+    use std::sync::Once;
+    static FONTS: Once = Once::new();
+    FONTS.call_once(|| {
+        let mut system = font_system().write().expect("the font system");
+        for face in fonts::ALL {
+            system.load_font(Cow::Borrowed(face));
+        }
+    });
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()
         .expect("a current-thread runtime");
     runtime
-        .block_on(Renderer::new(
-            Font::DEFAULT,
-            Pixels(16.0),
-            Some("tiny-skia"),
-        ))
+        .block_on(Renderer::new(fonts::BODY, Pixels(16.0), Some("tiny-skia")))
         .expect("the headless tiny-skia renderer is not available")
 }
 

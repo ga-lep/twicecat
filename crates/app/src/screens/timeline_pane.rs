@@ -2019,8 +2019,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn building_the_view_for_10000_items_is_fast() {
+    /// The median time to build the view of 10,000 items.
+    fn median_build_time() -> Duration {
         let timeline = big_timeline(10_000);
         let (theme, revealed) = (theme(), Revealed::new());
         let _ = built_by(&timeline);
@@ -2034,7 +2034,27 @@ mod tests {
         times.sort();
         let median = times[times.len() / 2];
         println!("timeline_pane view build, median of 15: {median:?}");
-        assert!(median < Duration::from_millis(16), "{median:?}");
+        median
+    }
+
+    /// The view of 10,000 items is built in far less than a second
+    /// (docs/testing.md, R2): it only draws the window, not the list. How fast
+    /// it is, is `perf_building_the_view_for_10000_items`.
+    #[test]
+    fn building_the_view_for_10000_items_does_not_take_seconds() {
+        let median = median_build_time();
+        assert!(median < Duration::from_secs(1), "{median:?}");
+    }
+
+    /// Within 0.5 ms (0.1 to 0.16 ms measured on a laptop and on CI; the 16 ms
+    /// frame budget is far above). An indicator, not a gate.
+    #[test]
+    fn perf_building_the_view_for_10000_items() {
+        twicecat_perf::record_duration(
+            "app.timeline_pane.view_10000_items",
+            median_build_time(),
+            Duration::from_micros(500),
+        );
     }
 
     #[test]

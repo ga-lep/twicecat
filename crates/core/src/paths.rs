@@ -3,7 +3,9 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::api::{DensityChoice, PaletteChoice, RoomListChoice, ThemeChoice, UiSettings};
+use crate::api::{
+    DensityChoice, PaletteChoice, RoomListChoice, ThemeChoice, UiSettings, UpdateCheckChoice,
+};
 
 /// Largest settings file read (64 KiB); anything bigger is treated as corrupt.
 const MAX_SETTINGS_BYTES: u64 = 64 * 1024;
@@ -49,6 +51,16 @@ fn settings_from_map(map: &serde_json::Map<String, serde_json::Value>) -> UiSett
             .get("text_scale_percent")
             .and_then(serde_json::Value::as_u64)
             .map_or(defaults.text_scale_percent, clamp_text_scale),
+        advanced_settings: flag("advanced_settings", defaults.advanced_settings),
+        update_check: match text("update_check") {
+            Some("Off") => UpdateCheckChoice::Off,
+            Some("On") => UpdateCheckChoice::On,
+            _ => defaults.update_check,
+        },
+        update_checked_at: map
+            .get("update_checked_at")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(defaults.update_checked_at),
     }
 }
 
@@ -269,6 +281,13 @@ impl DataPaths {
                 RoomListChoice::Rail => "Rail",
             },
             "text_scale_percent": settings.text_scale_percent,
+            "advanced_settings": settings.advanced_settings,
+            "update_check": match settings.update_check {
+                UpdateCheckChoice::Unasked => "Unasked",
+                UpdateCheckChoice::Off => "Off",
+                UpdateCheckChoice::On => "On",
+            },
+            "update_checked_at": settings.update_checked_at,
         });
         // No key while `None`, so a later change of the app's default reaches
         // this user.
@@ -339,11 +358,65 @@ impl DataPaths {
     /// the old or the new file. On Unix the file gets mode 0o600 and the
     /// root 0o700.
     pub fn write_call_settings(&self, bytes: &[u8]) -> std::io::Result<()> {
+        self.write_private("call_settings.json", bytes)
+    }
+
+    /// `<root>/video_settings.json`: camera, qualities, codec and encoder
+    /// choices (plan Phase 9). No secrets.
+    pub fn video_settings_file(&self) -> PathBuf {
+        self.root.join("video_settings.json")
+    }
+
+    /// Reads the video settings file; a missing file is `Ok(None)`.
+    pub fn read_video_settings(&self) -> std::io::Result<Option<Vec<u8>>> {
+        match std::fs::read(self.video_settings_file()) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Replaces the video settings file atomically, as
+    /// [`Self::write_call_settings`] does.
+    pub fn write_video_settings(&self, bytes: &[u8]) -> std::io::Result<()> {
+        self.write_private("video_settings.json", bytes)
+    }
+
+    /// `<root>/screen_restore_token`: the ScreenCast portal's token for the
+    /// screen or window picked last time, kept only while "remember my
+    /// choice" is on (plan Phase 9 Task 8). It lets us share that choice
+    /// again without the picker, so it is private (0o600) and never logged.
+    pub fn screen_restore_token_file(&self) -> PathBuf {
+        self.root.join("screen_restore_token")
+    }
+
+    /// The remembered restore token; `None` when there is none (or the file
+    /// is not one we wrote: not a small regular file of text).
+    pub fn read_screen_restore_token(&self) -> Option<String> {
+        let bytes = read_capped_regular_file(&self.screen_restore_token_file())?;
+        let token = String::from_utf8(bytes).ok()?.trim().to_owned();
+        (!token.is_empty()).then_some(token)
+    }
+
+    /// Replaces the remembered restore token atomically.
+    pub fn write_screen_restore_token(&self, token: &str) -> std::io::Result<()> {
+        self.write_private("screen_restore_token", token.as_bytes())
+    }
+
+    /// Forgets the restore token; a missing file is no error.
+    pub fn remove_screen_restore_token(&self) -> std::io::Result<()> {
+        match std::fs::remove_file(self.screen_restore_token_file()) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    }
+
+    fn write_private(&self, name: &str, bytes: &[u8]) -> std::io::Result<()> {
         use std::io::Write as _;
 
         create_private_dir_all(&self.root)?;
-        let path = self.call_settings_file();
-        let tmp = self.root.join("call_settings.json.tmp");
+        let path = self.root.join(name);
+        let tmp = self.root.join(format!("{name}.tmp"));
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create(true).truncate(true);
         #[cfg(unix)]
@@ -643,6 +716,49 @@ mod tests {
         assert_eq!(s.density, DensityChoice::Comfortable);
         assert_eq!(s.room_list, RoomListChoice::Expanded);
         assert_eq!(s.text_scale_percent, 100);
+        // Settings are simple until the person asks for the rest.
+        assert!(!s.advanced_settings);
+    }
+
+    #[test]
+    fn the_advanced_switch_is_kept_and_a_wrong_value_is_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = DataPaths::at(tmp.path().join("root"));
+        p.write_settings(&UiSettings {
+            advanced_settings: true,
+            ..UiSettings::default()
+        })
+        .unwrap();
+        assert!(p.read_settings().advanced_settings);
+        assert!(!read_text(&p, r#"{"advanced_settings":"yes"}"#).advanced_settings);
+        assert!(read_text(&p, r#"{"advanced_settings":true}"#).advanced_settings);
+    }
+
+    #[test]
+    fn the_update_choice_and_time_are_kept_and_an_old_file_asks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = DataPaths::at(tmp.path().join("root"));
+        for choice in [
+            UpdateCheckChoice::Unasked,
+            UpdateCheckChoice::Off,
+            UpdateCheckChoice::On,
+        ] {
+            let s = UiSettings {
+                update_check: choice,
+                update_checked_at: 1_800_000_000,
+                ..UiSettings::default()
+            };
+            p.write_settings(&s).unwrap();
+            assert_eq!(p.read_settings(), s);
+        }
+        // A file from before the check: not asked, never checked.
+        let s = read_text(&p, r#"{"theme":"Dark"}"#);
+        assert_eq!(s.update_check, UpdateCheckChoice::Unasked);
+        assert_eq!(s.update_checked_at, 0);
+        // Wrong values fall back per field.
+        let s = read_text(&p, r#"{"update_check":"Sometimes","update_checked_at":-5}"#);
+        assert_eq!(s.update_check, UpdateCheckChoice::Unasked);
+        assert_eq!(s.update_checked_at, 0);
     }
 
     #[test]
@@ -773,6 +889,46 @@ mod tests {
         );
         assert!(!dir.path().join("root/call_settings.json.tmp").exists());
         assert!(paths.call_settings_file().starts_with(paths.root()));
+    }
+
+    #[test]
+    fn the_screen_restore_token_is_kept_privately_and_forgotten() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = DataPaths::at(dir.path().join("root"));
+        assert_eq!(paths.read_screen_restore_token(), None);
+        paths.remove_screen_restore_token().unwrap();
+        paths.write_screen_restore_token("token-1").unwrap();
+        paths.write_screen_restore_token("token-2").unwrap();
+        assert_eq!(
+            paths.read_screen_restore_token().as_deref(),
+            Some("token-2")
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(paths.screen_restore_token_file())
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        paths.remove_screen_restore_token().unwrap();
+        assert_eq!(paths.read_screen_restore_token(), None);
+    }
+
+    #[test]
+    fn video_settings_round_trip_and_replace() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = DataPaths::at(dir.path().join("root"));
+        assert_eq!(paths.read_video_settings().unwrap(), None);
+        paths.write_video_settings(b"{\"a\":1}").unwrap();
+        paths.write_video_settings(b"{\"a\":2}").unwrap();
+        assert_eq!(
+            paths.read_video_settings().unwrap().as_deref(),
+            Some(&b"{\"a\":2}"[..])
+        );
+        assert!(!dir.path().join("root/video_settings.json.tmp").exists());
+        assert!(paths.read_call_settings().unwrap().is_none());
     }
 
     #[cfg(unix)]

@@ -21,7 +21,7 @@ use super::membership::{
     self, CALL_MEMBER_EVENT, DELAYED_LEAVE, DELAYED_LEAVE_RESTART, MEMBERSHIP_EXPIRES,
 };
 use super::now_ms;
-use crate::api::CoreError;
+use crate::api::{CallIntent, CoreError};
 
 /// Refresh our membership this long before it would expire.
 const REFRESH_MARGIN: Duration = Duration::from_secs(10 * 60);
@@ -104,6 +104,8 @@ pub(super) struct OwnMembership {
     pub(super) user_id: String,
     pub(super) device_id: String,
     pub(super) service_url: String,
+    /// A voice or a video call, kept on every refresh.
+    pub(super) intent: CallIntent,
     pub(super) delay_id: Arc<Mutex<Option<String>>>,
     /// Woken by `watch_participants` when our membership is gone from the
     /// room state.
@@ -149,6 +151,7 @@ impl OwnMembership {
             self.room.room_id().as_str(),
             created_ts,
             validity,
+            self.intent,
         );
         send_membership(&self.room, &self.state_key, content)
             .await

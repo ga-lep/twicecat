@@ -1,0 +1,11 @@
+# Git for Windows checks text out with CRLF by default (core.autocrlf=true).
+# Shell scripts and the files the local stack mounts into its Linux
+# containers keep LF everywhere: sh fails on `set -eu\r`.
+*.sh text eol=lf
+Dockerfile text eol=lf
+dev/synapse/** text eol=lf
+dev/livekit/** text eol=lf
+dev/element/** text eol=lf
+# The bundled font's files are checked byte for byte against the SHA-256s in
+# their SOURCE.md (scripts/check-font-assets.sh).
+crates/app/assets/fonts/** -text

@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use common::calls::{add_member_device, allow_calls, membership_of, sfu_room};
 use common::{
     DEFAULT_TIMEOUT, TestEnv, create_encrypted_room, create_room, expect_event, raw_login,
     start_core_with_audio, start_core_with_call_service, unique_room_name, wait_for_room,
@@ -22,7 +23,8 @@ use twicecat_core::CoreHandle;
 use twicecat_core::api::{
     AUDIO_FRAME_LEN, AudioBackend, AudioProcessing, AudioSettings, CallIntent, CallSounds,
     CallState, CleaningStatus, Command, CoreEvent, InputMode, ListDiff, NoiseSuppression,
-    Participant, Password, RoomId, SkipReason, SyncState, UserId, VirtualAudio, VoiceCleaning,
+    Participant, Password, RoomId, SkipReason, SoundSource, SyncState, UserId, VirtualAudio,
+    VoiceCleaning,
 };
 use twicecat_core::secrets::InMemorySecretStore;
 
@@ -68,23 +70,62 @@ impl VirtualAudio for Recorder {
     }
 }
 
-/// Amplitude of a `hz` tone in the last `seconds` of `played`.
-fn level_of(played: &[f32], hz: f32, seconds: f32) -> f32 {
-    let n = ((seconds * RATE) as usize).min(played.len());
-    let tail = &played[played.len() - n..];
+/// Amplitude of a `hz` tone in a run of samples, measured coherently.
+fn coherent_level(samples: &[f32], hz: f32) -> f32 {
     let w = 2.0 * std::f32::consts::PI * hz / RATE;
     let (mut re, mut im) = (0.0_f32, 0.0_f32);
-    for (i, s) in tail.iter().enumerate() {
+    for (i, s) in samples.iter().enumerate() {
         re += s * (w * i as f32).cos();
         im += s * (w * i as f32).sin();
     }
-    2.0 * (re * re + im * im).sqrt() / n.max(1) as f32
+    2.0 * (re * re + im * im).sqrt() / samples.len().max(1) as f32
+}
+
+/// Amplitude of a `hz` tone in the last `seconds` of `played`: the median of the
+/// levels of its quarter-second blocks. Measured coherently over the whole window,
+/// one gap or phase jump (a lost packet and its concealment, a moment a busy
+/// runner starved the audio) pulled the whole window down and failed a call that
+/// was heard for the rest of it; the median of the blocks ignores a few damaged
+/// ones, and still reads low when the tone is missing for half the window or more.
+fn level_of(played: &[f32], hz: f32, seconds: f32) -> f32 {
+    const BLOCK: usize = (RATE as usize) / 4;
+    let n = ((seconds * RATE) as usize).min(played.len());
+    let tail = &played[played.len() - n..];
+    let mut levels: Vec<f32> = tail
+        .chunks_exact(BLOCK)
+        .map(|block| coherent_level(block, hz))
+        .collect();
+    if levels.is_empty() {
+        return coherent_level(tail, hz);
+    }
+    levels.sort_by(f32::total_cmp);
+    levels[levels.len() / 2]
+}
+
+/// Waits until the last `seconds` of audio show `hz` at `HEARD` or more, and
+/// returns that level; after `DEFAULT_TIMEOUT` it returns the last level read,
+/// for the caller's assertion to report. A tone that comes late (a change settling
+/// on a busy runner) is heard; one that never comes is still a failure.
+async fn heard_within(played: &Mutex<Vec<f32>>, hz: f32, seconds: f32) -> f32 {
+    let deadline = tokio::time::Instant::now() + DEFAULT_TIMEOUT;
+    loop {
+        let level = level_of(&played.lock().unwrap(), hz, seconds);
+        if level > HEARD || tokio::time::Instant::now() >= deadline {
+            return level;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }
 
 impl Recorder {
     /// Amplitude of the tone in the last `seconds` of playback.
     fn tone_level(&self, seconds: f32) -> f32 {
         level_of(&self.played.lock().unwrap(), TONE_HZ, seconds)
+    }
+
+    /// [`heard_within`] for the tone.
+    async fn tone_heard(&self, seconds: f32) -> f32 {
+        heard_within(&self.played, TONE_HZ, seconds).await
     }
 }
 
@@ -106,6 +147,11 @@ impl Duplex {
 
     fn level(&self, hz: f32, seconds: f32) -> f32 {
         level_of(&self.played.lock().unwrap(), hz, seconds)
+    }
+
+    /// [`heard_within`] for `hz`.
+    async fn heard(&self, hz: f32, seconds: f32) -> f32 {
+        heard_within(&self.played, hz, seconds).await
     }
 }
 
@@ -223,51 +269,9 @@ async fn alice_as_seen_by(core: &mut CoreHandle, alice: &str, done: impl Fn(&Par
 
 /// The call service `user`'s membership publishes on (`foci_preferred[0]`).
 async fn call_service_of(reader: &matrix_sdk::Client, room_id: &str, user: &str) -> Option<String> {
-    use matrix_sdk::ruma::api::client::state::get_state_events;
-    let reply = reader
-        .send(get_state_events::v3::Request::new(
-            room_id.try_into().unwrap(),
-        ))
-        .await
-        .ok()?;
-    reply.room_state.iter().find_map(|raw| {
-        let event: Value = raw.deserialize_as().ok()?;
-        (event["type"] == "org.matrix.msc3401.call.member" && event["sender"] == user)
-            .then(|| {
-                event["content"]["foci_preferred"][0]["livekit_service_url"]
-                    .as_str()
-                    .map(str::to_owned)
-            })
-            .flatten()
-    })
-}
-
-/// Lets members at power level 0 publish call memberships (as Element does).
-async fn allow_calls(admin: &matrix_sdk::Client, room_id: &str) {
-    use matrix_sdk::ruma::api::client::state::{get_state_event_for_key, send_state_event};
-    use matrix_sdk::ruma::events::StateEventType;
-    let room: matrix_sdk::ruma::OwnedRoomId = room_id.try_into().unwrap();
-    let reply = admin
-        .send(get_state_event_for_key::v3::Request::new(
-            room.clone(),
-            StateEventType::RoomPowerLevels,
-            String::new(),
-        ))
-        .await
-        .unwrap();
-    let mut levels: Value = serde_json::from_str(reply.event_or_content.get()).unwrap();
-    levels["events"]["org.matrix.msc3401.call.member"] = serde_json::json!(0);
-    admin
-        .send(send_state_event::v3::Request::new_raw(
-            room,
-            StateEventType::RoomPowerLevels,
-            String::new(),
-            matrix_sdk::ruma::serde::Raw::new(&levels)
-                .unwrap()
-                .cast_unchecked(),
-        ))
-        .await
-        .unwrap();
+    membership_of(reader, room_id, user).await?["foci_preferred"][0]["livekit_service_url"]
+        .as_str()
+        .map(str::to_owned)
 }
 
 #[tokio::test]
@@ -311,7 +315,7 @@ async fn alices_tone_reaches_carols_speakers_and_mute_stops_it() {
     let alice_id = env.user_id(1);
     alice_as_seen_by(&mut carol, &alice_id, |p| p.speaking).await;
     tokio::time::sleep(Duration::from_secs(3)).await;
-    let heard = recorder.tone_level(2.0);
+    let heard = recorder.tone_heard(2.0).await;
     eprintln!("tone amplitude at carol's speakers: {heard:.4} (sent 0.3)");
     assert!(
         heard > HEARD,
@@ -379,7 +383,7 @@ async fn a_mic_test_during_a_call_leaves_the_call_playing() {
     let alice_id = env.user_id(1);
     alice_as_seen_by(&mut carol, &alice_id, |p| p.speaking).await;
     tokio::time::sleep(Duration::from_secs(2)).await;
-    assert!(recorder.tone_level(1.0) > HEARD, "the tone before");
+    assert!(recorder.tone_heard(1.0).await > HEARD, "the tone before");
 
     carol
         .commands
@@ -477,8 +481,8 @@ async fn members_on_different_sfus_hear_each_other() {
     alice_as_seen_by(&mut carol, &env.user_id(1), |p| p.speaking).await;
     alice_as_seen_by(&mut alice, &env.user_id(3), |p| p.speaking).await;
     tokio::time::sleep(Duration::from_secs(3)).await;
-    let alice_hears = alice_audio.level(CAROL_HZ, 2.0);
-    let carol_hears = carol_audio.level(ALICE_HZ, 2.0);
+    let alice_hears = alice_audio.heard(CAROL_HZ, 2.0).await;
+    let carol_hears = carol_audio.heard(ALICE_HZ, 2.0).await;
     eprintln!(
         "alice hears carol (via SFU B): {alice_hears:.4}; carol hears alice (via SFU A): {carol_hears:.4} (sent 0.3)"
     );
@@ -497,64 +501,31 @@ async fn members_on_different_sfus_hear_each_other() {
     }
 }
 
-/// Joins the call's LiveKit room as `client`'s user with a made-up device
-/// (a token from the call service, no call membership) and publishes a
-/// `hz` tone: what anyone with a Matrix account could do.
-async fn intrude(client: &matrix_sdk::Client, room_id: &str, hz: f32) -> livekit::prelude::Room {
+/// Publishes a `hz` tone on `room` as `source`.
+async fn publish_tone(
+    room: &livekit::prelude::Room,
+    hz: f32,
+    source: livekit::prelude::TrackSource,
+) -> livekit::prelude::LocalTrackPublication {
     use livekit::options::TrackPublishOptions;
-    use livekit::prelude::{LocalAudioTrack, LocalTrack, Room, RoomOptions, TrackSource};
+    use livekit::prelude::{LocalAudioTrack, LocalTrack};
     use livekit::webrtc::audio_frame::AudioFrame;
     use livekit::webrtc::audio_source::native::NativeAudioSource;
     use livekit::webrtc::audio_source::{AudioSourceOptions, RtcAudioSource};
-    use matrix_sdk::ruma::api::client::account::request_openid_token;
 
-    let env = TestEnv::load();
-    let openid = client
-        .send(request_openid_token::v3::Request::new(
-            client.user_id().unwrap().to_owned(),
-        ))
-        .await
-        .unwrap();
-    let body = serde_json::json!({
-        "room": room_id,
-        "openid_token": {
-            "access_token": openid.access_token,
-            "token_type": openid.token_type,
-            "matrix_server_name": openid.matrix_server_name,
-            "expires_in": openid.expires_in.as_secs(),
-        },
-        "device_id": "INTRUDER",
-    });
-    let reply = matrix_sdk::reqwest::Client::new()
-        .post(format!("{}/sfu/get", env.get("LK_JWT_URL")))
-        .header("content-type", "application/json")
-        .body(body.to_string())
-        .send()
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
-    let reply: Value = serde_json::from_str(&reply).unwrap();
-    let (room, _events) = Room::connect(
-        reply["url"].as_str().unwrap(),
-        reply["jwt"].as_str().unwrap(),
-        RoomOptions::default(),
-    )
-    .await
-    .expect("intruder connects");
-    let source = NativeAudioSource::new(AudioSourceOptions::default(), 48_000, 1, 50);
-    let track = LocalAudioTrack::create_audio_track("tone", RtcAudioSource::Native(source.clone()));
-    room.local_participant()
+    let audio = NativeAudioSource::new(AudioSourceOptions::default(), 48_000, 1, 50);
+    let track = LocalAudioTrack::create_audio_track("tone", RtcAudioSource::Native(audio.clone()));
+    let publication = room
+        .local_participant()
         .publish_track(
             LocalTrack::Audio(track),
             TrackPublishOptions {
-                source: TrackSource::Microphone,
+                source,
                 ..TrackPublishOptions::default()
             },
         )
         .await
-        .expect("intruder publishes");
+        .expect("publishes a tone");
     tokio::spawn(async move {
         let mut n = 0u64;
         let mut ticker = tokio::time::interval(Duration::from_millis(10));
@@ -573,11 +544,20 @@ async fn intrude(client: &matrix_sdk::Client, room_id: &str, hz: f32) -> livekit
                 num_channels: 1,
                 samples_per_channel: 480,
             };
-            if source.capture_frame(&frame).await.is_err() {
+            if audio.capture_frame(&frame).await.is_err() {
                 return;
             }
         }
     });
+    publication
+}
+
+/// Joins the call's LiveKit room as `client`'s user with a made-up device
+/// (a token from the call service, no call membership) and publishes a
+/// `hz` tone: what anyone with a Matrix account could do.
+async fn intrude(client: &matrix_sdk::Client, room_id: &str, hz: f32) -> livekit::prelude::Room {
+    let room = sfu_room(client, room_id, "INTRUDER").await;
+    publish_tone(&room, hz, livekit::prelude::TrackSource::Microphone).await;
     room
 }
 
@@ -624,7 +604,7 @@ async fn a_participant_without_a_membership_is_not_played() {
 
     alice_as_seen_by(&mut alice, &env.user_id(3), |p| p.speaking).await;
     tokio::time::sleep(Duration::from_secs(4)).await;
-    let member = alice_audio.level(CAROL_HZ, 3.0);
+    let member = alice_audio.heard(CAROL_HZ, 3.0).await;
     let stranger = alice_audio.level(INTRUDER_HZ, 3.0);
     eprintln!("alice hears carol's device {member:.4}, the intruder {stranger:.5} (each sent 0.3)");
     assert!(member > HEARD, "member: amplitude {member:.4}");
@@ -635,6 +615,122 @@ async fn a_participant_without_a_membership_is_not_played() {
         core.commands.send(Command::LeaveCall).await.unwrap();
         core.commands.send(Command::Shutdown).await.unwrap();
     }
+}
+
+/// Element Call sends a screen share's sound as a second audio track next
+/// to the microphone: alice plays both, and when carol stops sharing her
+/// voice keeps playing (players were keyed by participant only, so the
+/// share replaced the voice and its end silenced carol). The share's sound
+/// alone never shows carol as speaking, and has its own volume.
+#[tokio::test]
+#[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
+async fn a_screen_share_sound_plays_next_to_the_voice() {
+    use livekit::prelude::TrackSource;
+    const VOICE_HZ: f32 = 600.0;
+    const SHARE_HZ: f32 = 800.0;
+    const DEVICE: &str = "SHARER";
+    let env = TestEnv::load();
+    let alice_raw = raw_login(1).await;
+    let carol_raw = raw_login(3).await;
+    let room_id = create_room(&alice_raw, &unique_room_name(), Some(&env.user_id(3)))
+        .await
+        .to_string();
+    allow_calls(&alice_raw, &room_id).await;
+    carol_raw
+        .join_room_by_id(room_id.as_str().try_into().unwrap())
+        .await
+        .unwrap();
+
+    let alice_audio = Arc::new(Duplex::new(TONE_HZ));
+    let dir_a = tempfile::tempdir().unwrap();
+    let mut alice = logged_in(dir_a.path(), 1, AudioBackend::Virtual(alice_audio.clone())).await;
+    wait_for_room(&mut alice, &room_id).await;
+    join(&mut alice, &room_id).await;
+
+    // Carol joins as another client would: alice's membership, as hers.
+    let carol_id = env.user_id(3);
+    add_member_device(&carol_raw, &room_id, &env.user_id(1), DEVICE).await;
+    let sharer = sfu_room(&carol_raw, &room_id, DEVICE).await;
+    let share = publish_tone(&sharer, SHARE_HZ, TrackSource::ScreenshareAudio).await;
+
+    // Only the share sounds: heard, and carol is not speaking.
+    let mut spoke = false;
+    let mut list: Vec<Participant> = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = alice.events.recv().await {
+            if let CoreEvent::CallParticipants { diffs, .. } = event {
+                for diff in diffs {
+                    ListDiff::apply(&diff, &mut list);
+                }
+                spoke |= list
+                    .iter()
+                    .any(|p| p.user_id.as_str() == carol_id && p.speaking);
+            }
+        }
+    })
+    .await;
+    let sound = alice_audio.heard(SHARE_HZ, 2.0).await;
+    eprintln!("alice hears carol's share alone {sound:.4} (sent 0.3); speaking shown: {spoke}");
+    assert!(sound > HEARD, "share alone: amplitude {sound:.4}");
+    assert!(!spoke, "a screen share's sound showed carol as speaking");
+
+    publish_tone(&sharer, VOICE_HZ, TrackSource::Microphone).await;
+    alice_as_seen_by(&mut alice, &carol_id, |p| p.speaking).await;
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let voice = alice_audio.heard(VOICE_HZ, 3.0).await;
+    let sound = alice_audio.heard(SHARE_HZ, 3.0).await;
+    eprintln!("alice hears carol's voice {voice:.4} and her share {sound:.4} (each sent 0.3)");
+    assert!(voice > HEARD, "voice while sharing: amplitude {voice:.4}");
+    assert!(sound > HEARD, "share: amplitude {sound:.4}");
+
+    // The share's own volume: off, and the voice stays.
+    alice
+        .commands
+        .send(Command::SetUserVolume {
+            user_id: UserId::from(carol_id.as_str()),
+            source: SoundSource::ScreenShare,
+            percent: 0,
+        })
+        .await
+        .unwrap();
+    alice_as_seen_by(&mut alice, &carol_id, |p| {
+        p.share_volume_percent == 0 && p.volume_percent == 100
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let voice = alice_audio.heard(VOICE_HZ, 1.5).await;
+    let sound = alice_audio.level(SHARE_HZ, 1.5);
+    eprintln!("share at 0 %: voice {voice:.4}, share {sound:.5}");
+    assert!(
+        voice > HEARD,
+        "voice with the share at 0 %: amplitude {voice:.4}"
+    );
+    assert!(sound < 0.01, "share at 0 %: amplitude {sound:.4}");
+    alice
+        .commands
+        .send(Command::SetUserVolume {
+            user_id: UserId::from(carol_id.as_str()),
+            source: SoundSource::ScreenShare,
+            percent: 100,
+        })
+        .await
+        .unwrap();
+
+    sharer
+        .local_participant()
+        .unpublish_track(&share.sid())
+        .await
+        .expect("stops sharing");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let voice = alice_audio.heard(VOICE_HZ, 2.0).await;
+    let sound = alice_audio.level(SHARE_HZ, 2.0);
+    eprintln!("after the share: voice {voice:.4}, share {sound:.5}");
+    assert!(voice > HEARD, "voice after the share: amplitude {voice:.4}");
+    assert!(sound < 0.01, "share after it stopped: amplitude {sound:.4}");
+
+    let _ = sharer.close().await;
+    alice.commands.send(Command::LeaveCall).await.unwrap();
+    alice.commands.send(Command::Shutdown).await.unwrap();
 }
 
 /// Joins the call's LiveKit room as `client`'s user with a made-up device,
@@ -766,8 +862,8 @@ async fn encrypted_room_calls_are_end_to_end_encrypted() {
     alice_as_seen_by(&mut carol, &env.user_id(1), |p| p.speaking).await;
     alice_as_seen_by(&mut alice, &env.user_id(3), |p| p.speaking).await;
     tokio::time::sleep(Duration::from_secs(4)).await;
-    let alice_hears = alice_audio.level(CAROL_HZ, 2.0);
-    let carol_hears = carol_audio.level(ALICE_HZ, 2.0);
+    let alice_hears = alice_audio.heard(CAROL_HZ, 2.0).await;
+    let carol_hears = carol_audio.heard(ALICE_HZ, 2.0).await;
     let stranger = level_of(&overheard.lock().unwrap(), ALICE_HZ, 2.0);
     let samples = overheard.lock().unwrap().len();
     let encryption = encryption.lock().unwrap().clone();
@@ -874,7 +970,7 @@ async fn remote_voices_are_cleaned_when_asked() {
     })
     .await;
     tokio::time::sleep(Duration::from_secs(3)).await;
-    let plain = alice_audio.level(CAROL_HZ, 2.0);
+    let plain = alice_audio.heard(CAROL_HZ, 2.0).await;
 
     let mut settings = AudioSettings::default();
     settings.call_sounds.enabled = false;
@@ -904,7 +1000,7 @@ async fn remote_voices_are_cleaned_when_asked() {
     })
     .await;
     tokio::time::sleep(Duration::from_secs(3)).await;
-    let skipped = alice_audio.level(CAROL_HZ, 2.0);
+    let skipped = alice_audio.heard(CAROL_HZ, 2.0).await;
     eprintln!(
         "carol's tone at alice: {plain:.4} plain, {cleaned:.5} cleaned, {skipped:.4} set to never"
     );
@@ -1136,7 +1232,7 @@ async fn voices_cleaned_at_their_source_are_left_alone() {
     })
     .await;
     tokio::time::sleep(Duration::from_secs(3)).await;
-    let left_alone = alice_audio.level(CAROL_HZ, 2.0);
+    let left_alone = alice_audio.heard(CAROL_HZ, 2.0).await;
 
     let mut silent = outside.clone();
     silent.announce_cleaning.enabled = false;

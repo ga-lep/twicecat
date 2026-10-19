@@ -7,11 +7,18 @@
 //! about theirs.
 //!
 //! A LiveKit identity is the member's `user:device` (session memberships).
+//! A participant may send two audio tracks, its voice and the sound of a
+//! screen share (Element Call): each plays as its own source, and only the
+//! voice is cleaned and counts as muted.
 //! A participant that is not an active member on that SFU is not played:
 //! the call services hand out tokens to any Matrix user (as Element Call,
 //! which only shows participants matching a membership).
+//!
+//! Video tracks go to the call's [`Videos`]: received ones from every
+//! connection, ours from the connection that publishes (`video`).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock};
 use std::time::Duration;
 
@@ -19,9 +26,12 @@ use futures_util::StreamExt as _;
 use livekit::e2ee::E2eeOptions;
 use livekit::e2ee::manager::E2eeManager;
 use livekit::id::ParticipantIdentity;
-use livekit::options::{AudioEncoding, TrackPublishOptions};
+use livekit::options::{
+    AudioEncoding, DegradationPreference, TrackPublishOptions, VideoCodec as LkVideoCodec,
+    VideoEncoding, VideoPreset,
+};
 use livekit::prelude::{
-    LocalAudioTrack, LocalParticipant, LocalTrack, Participant, RemoteAudioTrack,
+    LocalAudioTrack, LocalParticipant, LocalTrack, LocalVideoTrack, Participant, RemoteAudioTrack,
     RemoteParticipant, RemoteTrack, RemoteTrackPublication, Room, RoomEvent, RoomOptions,
     TrackKind, TrackSource,
 };
@@ -29,14 +39,22 @@ use livekit::webrtc::audio_frame::AudioFrame;
 use livekit::webrtc::audio_source::native::NativeAudioSource;
 use livekit::webrtc::audio_source::{AudioSourceOptions, RtcAudioSource};
 use livekit::webrtc::audio_stream::native::NativeAudioStream;
+use livekit::webrtc::video_source::native::NativeVideoSource;
+use livekit::webrtc::video_source::{RtcVideoSource, VideoResolution};
 use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 use twicecat_audio::{FRAME_LEN, Outgoing, SAMPLE_RATE, SILENCE, SourceId};
 
+use super::capture::{Capture, CaptureSerial, Captured, PusherSlot};
 use super::cleaning::{ANNOUNCE_KEY, Claim, Cleaning};
+use super::encoder::{self, Sending};
 use super::jwt::SfuAccess;
+use super::video::{FramePusher, LocalSend, PatternSender, Videos};
 use super::{UserVolumes, user_volume};
-use crate::api::{CleaningStatus, CoreError, UserId};
+use crate::api::{
+    CleaningStatus, CoreError, DegradationChoice, EncoderBackend, SoundSource, UserId, VideoCodec,
+    VideoFeed, VideoKind, VideoQuality, VideoTrackId,
+};
 use crate::audio_session::{self, Voice};
 
 /// How long one attempt to open the SFU's signalling websocket may take.
@@ -85,6 +103,9 @@ pub(crate) enum MediaNotice {
     Reconnected,
     /// The SFU connection is gone for good.
     Disconnected,
+    /// The hardware encoder of our track of this kind stopped, or LiveKit
+    /// replaced it (`video`).
+    EncoderLost(VideoKind),
 }
 
 /// The identities a connection plays; the call updates it as memberships
@@ -133,55 +154,91 @@ fn to_i16(frame: &twicecat_audio::Frame, out: &mut [i16; FRAME_LEN]) {
     }
 }
 
-fn volume_of(volumes: &UserVolumes, identity: &str) -> u16 {
-    user_volume(volumes, &UserId::from(user_of(identity)))
+fn volume_of(volumes: &UserVolumes, identity: &str, feed: Feed) -> u16 {
+    user_volume(volumes, &UserId::from(user_of(identity)), feed.sound())
 }
+
+/// What a remote audio track carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Feed {
+    /// The microphone, or a track that names no source.
+    Voice,
+    /// A screen share's sound: never cleaned, its mute is not the
+    /// participant's.
+    Share,
+}
+
+impl Feed {
+    fn of(source: TrackSource) -> Self {
+        match source {
+            TrackSource::ScreenshareAudio => Self::Share,
+            _ => Self::Voice,
+        }
+    }
+
+    /// Which per-user volume it plays at.
+    fn sound(self) -> SoundSource {
+        match self {
+            Self::Voice => SoundSource::Voice,
+            Self::Share => SoundSource::ScreenShare,
+        }
+    }
+}
+
+/// A participant's track: its identity and what the track carries.
+type TrackKey = (String, Feed);
 
 /// The subscribed remote audio tracks of one connection and the ones
 /// playing: exactly those of expected identities.
 #[derive(Default)]
 struct Players {
-    tracks: HashMap<String, RemoteAudioTrack>,
-    playing: HashMap<String, (SourceId, JoinHandle<()>)>,
+    tracks: HashMap<TrackKey, RemoteAudioTrack>,
+    playing: HashMap<TrackKey, (SourceId, JoinHandle<()>)>,
     expected: BTreeSet<String>,
     /// Cleans the voices that play (shared by the call's connections).
     cleaning: Option<Cleaning>,
 }
 
 impl Players {
-    fn stop(&mut self, identity: &str, voice: Option<&Voice>) {
-        if let Some((id, task)) = self.playing.remove(identity) {
+    fn stop(&mut self, key: &TrackKey, voice: Option<&Voice>) {
+        if let Some((id, task)) = self.playing.remove(key) {
             task.abort();
             if let Some(voice) = voice {
                 audio_session::voice_control(voice).remove_source(id);
             }
-            if let Some(cleaning) = &self.cleaning {
+            if let (Some(cleaning), (identity, Feed::Voice)) = (&self.cleaning, key) {
                 cleaning.remove(identity);
             }
         }
     }
 
+    /// Forgets every track of `identity`.
+    fn forget(&mut self, identity: &str) {
+        self.tracks.retain(|(id, _), _| id != identity);
+    }
+
     /// Starts and stops mixer sources so that exactly the subscribed tracks
     /// of expected identities play.
     fn reconcile(&mut self, voice: Option<&Voice>, volumes: &UserVolumes) {
-        let stale: Vec<String> = self
+        let stale: Vec<TrackKey> = self
             .playing
             .keys()
-            .filter(|id| !self.tracks.contains_key(*id) || !self.expected.contains(*id))
+            .filter(|key| !self.tracks.contains_key(*key) || !self.expected.contains(&key.0))
             .cloned()
             .collect();
-        for identity in stale {
-            self.stop(&identity, voice);
+        for key in stale {
+            self.stop(&key, voice);
         }
         let Some(voice) = voice else {
             return;
         };
-        for (identity, track) in &self.tracks {
-            if self.playing.contains_key(identity) || !self.expected.contains(identity) {
+        for (key, track) in &self.tracks {
+            let (identity, feed) = key;
+            if self.playing.contains_key(key) || !self.expected.contains(identity) {
                 continue;
             }
             let Some((id, input)) =
-                audio_session::voice_control(voice).add_source(volume_of(volumes, identity))
+                audio_session::voice_control(voice).add_source(volume_of(volumes, identity, *feed))
             else {
                 tracing::warn!("mixer queue full; a participant is not played");
                 continue;
@@ -189,20 +246,112 @@ impl Players {
             let stream = NativeAudioStream::new(track.rtc_track(), SAMPLE_RATE as i32, 1);
             let flag = input.cleaning_flag();
             self.playing.insert(
-                identity.clone(),
+                key.clone(),
                 (id, spawn_audio_task(read_track(stream, input))),
             );
-            if let Some(cleaning) = &self.cleaning {
+            if let (Some(cleaning), Feed::Voice) = (&self.cleaning, feed) {
                 cleaning.add(identity, id, flag);
             }
         }
     }
 
     fn stop_all(&mut self, voice: Option<&Voice>) {
-        let all: Vec<String> = self.playing.keys().cloned().collect();
-        for identity in all {
-            self.stop(&identity, voice);
+        let all: Vec<TrackKey> = self.playing.keys().cloned().collect();
+        for key in all {
+            self.stop(&key, voice);
         }
+    }
+}
+
+/// Where the frames of one of our tracks come from.
+pub(crate) enum VideoSource {
+    /// The test pattern, made at the size sent.
+    Pattern,
+    /// A capture, already running.
+    Captured(Captured),
+}
+
+/// What makes the frames of a track being sent.
+enum Frames {
+    Pattern(PatternSender),
+    Captured {
+        capture: Capture,
+        slot: PusherSlot,
+        serial: CaptureSerial,
+        size: Option<(u32, u32)>,
+    },
+}
+
+/// One of our video tracks, on the connection that publishes.
+struct SentVideo {
+    id: VideoTrackId,
+    track: LocalVideoTrack,
+    quality: VideoQuality,
+    backend: EncoderBackend,
+    frames: Frames,
+}
+
+/// How long the encoder gets to finish the frames it has before our track
+/// stops: a few frames at 30 fps.
+const ENCODER_DRAIN: Duration = Duration::from_millis(150);
+
+impl SentVideo {
+    /// Stops the frames and lets the encoder finish its last ones. LiveKit's
+    /// NVENC encoder aborts the process when a frame it encoded can no
+    /// longer be sent (it returns an error after handing the frame over,
+    /// and libwebrtc's simulcast adapter then pops an empty queue; webrtc-sys
+    /// 0.3.49 `src/nvidia/h264_encoder_impl.cpp:347-352`), which is what
+    /// unpublishing or closing the room while frames still come does.
+    async fn stop_frames(self) -> (VideoTrackId, LocalVideoTrack) {
+        match self.frames {
+            Frames::Pattern(sender) => sender.stop().await,
+            Frames::Captured { capture, slot, .. } => {
+                slot.clear();
+                capture.stop().await;
+            }
+        }
+        tokio::time::sleep(ENCODER_DRAIN).await;
+        (self.id, self.track)
+    }
+}
+
+/// LiveKit's publish options for our track of `kind` sent as `sending`:
+/// the encoder named (never LiveKit's `Auto`, see `encoder`), the codec, the
+/// top layer's bitrate and framerate, and our two lower layers in place of
+/// LiveKit's defaults (plan Q12), which it lists low first.
+fn video_options(kind: VideoKind, sending: &Sending) -> TrackPublishOptions {
+    let preset = |l: &twicecat_video::ladder::Layer| {
+        VideoPreset::new(
+            l.width,
+            l.height,
+            u64::from(l.bitrate_bps),
+            f64::from(l.fps),
+        )
+    };
+    let top = sending.layers[0];
+    TrackPublishOptions {
+        source: super::video::source_of(kind),
+        video_codec: match sending.codec {
+            VideoCodec::H264 => LkVideoCodec::H264,
+            VideoCodec::H265 => LkVideoCodec::H265,
+            VideoCodec::Vp9 => LkVideoCodec::VP9,
+            VideoCodec::Av1 => LkVideoCodec::AV1,
+            VideoCodec::Vp8 => LkVideoCodec::VP8,
+        },
+        video_encoder: encoder::livekit_backend(sending.backend),
+        video_encoding: Some(VideoEncoding {
+            max_bitrate: u64::from(top.bitrate_bps),
+            max_framerate: f64::from(top.fps),
+        }),
+        simulcast: sending.layers.len() > 1,
+        simulcast_layers: Some(sending.layers[1..].iter().rev().map(preset).collect()),
+        scalability_mode: sending.scalability_mode.clone(),
+        degradation_preference: sending.degradation.map(|d| match d {
+            DegradationChoice::KeepFrameRate => DegradationPreference::MaintainFramerate,
+            DegradationChoice::KeepResolution => DegradationPreference::MaintainResolution,
+            DegradationChoice::Balanced => DegradationPreference::Balanced,
+        }),
+        ..TrackPublishOptions::default()
     }
 }
 
@@ -213,9 +362,14 @@ pub(crate) struct SfuConnection {
     room: Room,
     /// Our microphone, on the connection that publishes.
     track: Option<LocalAudioTrack>,
+    /// Our camera and our screen share, on the connection that publishes.
+    videos_sent: HashMap<VideoKind, SentVideo>,
+    /// The sound of our screen share, while it sends one.
+    share_sound: Option<SentShareSound>,
     voice: Option<Voice>,
     players: Arc<StdMutex<Players>>,
     flags: SharedFlags,
+    videos: Videos,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -229,6 +383,8 @@ pub(crate) struct ConnectionShared {
     pub volumes: UserVolumes,
     pub flags: SharedFlags,
     pub cleaning: Cleaning,
+    /// The call's video tracks.
+    pub videos: Videos,
     pub notices: mpsc::Sender<(String, MediaNotice)>,
 }
 
@@ -246,6 +402,11 @@ impl SfuConnection {
         let mut options = RoomOptions::default();
         options.encryption = shared.encryption.clone();
         options.connect_timeout = SIGNAL_TIMEOUT;
+        // As Element Call: the SFU sends each viewer the smallest layer that
+        // covers its size on screen (`SetVideoView`), and asks publishers to
+        // stop encoding the layers nobody watches.
+        options.adaptive_stream = true;
+        options.dynacast = true;
         let (room, room_events) =
             tokio::time::timeout(CONNECT_TIMEOUT, Room::connect(&sfu.url, &sfu.jwt, options))
                 .await
@@ -321,6 +482,7 @@ impl SfuConnection {
                 volumes: shared.volumes.clone(),
                 flags: shared.flags.clone(),
                 cleaning: shared.cleaning.clone(),
+                videos: shared.videos.clone(),
                 reannounce,
                 notices: shared.notices.clone(),
             },
@@ -332,11 +494,296 @@ impl SfuConnection {
             key,
             room,
             track,
+            videos_sent: HashMap::new(),
+            share_sound: None,
             voice: shared.voice.clone(),
             players,
             flags: shared.flags.clone(),
+            videos: shared.videos.clone(),
             tasks,
         })
+    }
+
+    /// Publishes our camera or screen share at `quality` from `source`,
+    /// encoded by LiveKit as `sending` says (encoder, codec, simulcast
+    /// layers). Replaces the track of that kind we already send. A captured
+    /// source is published at its own size when it fits in what `sending`
+    /// allows, else scaled down to fit (keeping its shape); a capture that
+    /// cannot be published is stopped.
+    pub(crate) async fn start_video(
+        &mut self,
+        kind: VideoKind,
+        quality: VideoQuality,
+        sending: &Sending,
+        source: VideoSource,
+    ) -> Result<VideoTrackId, CoreError> {
+        self.stop_video_track(kind).await;
+        let (max_w, max_h, fps) = sending.mode();
+        let (width, height) = match &source {
+            VideoSource::Pattern => (max_w, max_h),
+            VideoSource::Captured(c) => {
+                twicecat_video::capture::fit_size(c.size.unwrap_or((max_w, max_h)), (max_w, max_h))
+            }
+        };
+        let rtc_source =
+            NativeVideoSource::new(VideoResolution { width, height }, kind == VideoKind::Screen);
+        let name = match kind {
+            VideoKind::Camera => "camera",
+            VideoKind::Screen => "screen",
+        };
+        let track =
+            LocalVideoTrack::create_video_track(name, RtcVideoSource::Native(rtc_source.clone()));
+        let published = self
+            .room
+            .local_participant()
+            .publish_track(
+                LocalTrack::Video(track.clone()),
+                video_options(kind, sending),
+            )
+            .await;
+        let publication = match published {
+            Ok(publication) => publication,
+            Err(_) => {
+                if let VideoSource::Captured(c) = source {
+                    c.capture.stop().await;
+                }
+                return Err(CoreError::Call("could not publish the video".into()));
+            }
+        };
+        // Ours, not the SFU's track ID: a full reconnect publishes the
+        // track again under a new one.
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let id = VideoTrackId::from(format!(
+            "local-{name}-{}",
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let (tx, feed) = VideoFeed::channel();
+        let frames = match source {
+            VideoSource::Pattern => {
+                match PatternSender::start(rtc_source, tx, (width, height, fps)) {
+                    Ok(sender) => Frames::Pattern(sender),
+                    Err(_) => {
+                        let _ = self
+                            .room
+                            .local_participant()
+                            .unpublish_track(&publication.sid())
+                            .await;
+                        return Err(CoreError::Internal("no thread for the video".into()));
+                    }
+                }
+            }
+            VideoSource::Captured(c) => {
+                c.slot
+                    .set(FramePusher::new(rtc_source, tx, (width, height)));
+                Frames::Captured {
+                    capture: c.capture,
+                    slot: c.slot,
+                    serial: c.serial,
+                    size: c.size,
+                }
+            }
+        };
+        self.videos.add_local(
+            &self.key,
+            id.clone(),
+            LocalSend {
+                kind,
+                track: track.clone(),
+                codec: sending.codec,
+                backend: sending.backend,
+                width,
+                height,
+                fps,
+                feed,
+            },
+        );
+        self.videos_sent.insert(
+            kind,
+            SentVideo {
+                id: id.clone(),
+                track,
+                quality,
+                backend: sending.backend,
+                frames,
+            },
+        );
+        Ok(id)
+    }
+
+    /// The serial of the capture our track of `kind` sends, if it sends one.
+    pub(crate) fn capture_serial(&self, kind: VideoKind) -> Option<CaptureSerial> {
+        match self.videos_sent.get(&kind)?.frames {
+            Frames::Captured { serial, .. } => Some(serial),
+            Frames::Pattern(_) => None,
+        }
+    }
+
+    /// Publishes the sound of our screen share (what other applications
+    /// play, plan Task 8), stereo, as music: no voice processing, no DTX.
+    /// Replaces the one we send.
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn start_share_sound(&mut self) -> Result<(), CoreError> {
+        use twicecat_video::audio_share::{CHANNELS, SAMPLE_RATE as SHARE_RATE, ShareAudio};
+
+        self.stop_share_sound().await;
+        let source = NativeAudioSource::new(
+            AudioSourceOptions {
+                echo_cancellation: false,
+                noise_suppression: false,
+                auto_gain_control: false,
+            },
+            SHARE_RATE,
+            CHANNELS,
+            SOURCE_QUEUE_MS,
+        );
+        let (tx, rx) = mpsc::channel::<Vec<f32>>(SHARE_SOUND_QUEUE);
+        let capture = ShareAudio::start(Box::new(move |samples| {
+            // A full queue (the call side stalled) drops the newest block.
+            let _ = tx.try_send(samples.to_vec());
+        }))
+        .map_err(|_| CoreError::Call("the shared sound could not be captured".into()))?;
+        let track = LocalAudioTrack::create_audio_track(
+            "screen-sound",
+            RtcAudioSource::Native(source.clone()),
+        );
+        let published = self
+            .room
+            .local_participant()
+            .publish_track(
+                LocalTrack::Audio(track.clone()),
+                TrackPublishOptions {
+                    source: TrackSource::ScreenshareAudio,
+                    audio_encoding: Some(AudioEncoding {
+                        max_bitrate: SHARE_SOUND_BITRATE,
+                    }),
+                    dtx: false,
+                    red: false,
+                    ..TrackPublishOptions::default()
+                },
+            )
+            .await;
+        if published.is_err() {
+            drop(capture);
+            return Err(CoreError::Call("could not publish the shared sound".into()));
+        }
+        let task = spawn_audio_task(send_share_sound(rx, source));
+        self.share_sound = Some(SentShareSound {
+            track,
+            capture,
+            task,
+        });
+        Ok(())
+    }
+
+    /// Stops sending the sound of our screen share, if we send it.
+    pub(crate) async fn stop_share_sound(&mut self) {
+        let Some(sent) = self.share_sound.take() else {
+            return;
+        };
+        sent.task.abort();
+        let _ = sent.task.await;
+        #[cfg(target_os = "linux")]
+        {
+            let capture = sent.capture;
+            let _ = tokio::task::spawn_blocking(move || drop(capture)).await;
+        }
+        if self
+            .room
+            .local_participant()
+            .unpublish_track(&sent.track.sid())
+            .await
+            .is_err()
+        {
+            tracing::debug!("the shared sound track was gone already");
+        }
+    }
+
+    /// Whether the sound of our screen share is sent.
+    pub(crate) fn share_sound_sent(&self) -> bool {
+        self.share_sound.is_some()
+    }
+
+    /// Stops sending our track of `kind`, if we send one.
+    pub(crate) async fn stop_video(&mut self, kind: VideoKind) {
+        if kind == VideoKind::Screen {
+            self.stop_share_sound().await;
+        }
+        self.stop_video_track(kind).await;
+    }
+
+    /// Publishes our track of `kind` again from the same source, as
+    /// `sending` says (a capture keeps running; its sound is untouched):
+    /// another encoder after the one in use was lost.
+    pub(crate) async fn resend_video(
+        &mut self,
+        kind: VideoKind,
+        quality: VideoQuality,
+        sending: &Sending,
+    ) -> Result<VideoTrackId, CoreError> {
+        let Some(sent) = self.videos_sent.remove(&kind) else {
+            return Err(CoreError::Call("no video of that kind is sent".into()));
+        };
+        self.videos.remove(&sent.id);
+        let source = match sent.frames {
+            Frames::Pattern(sender) => {
+                sender.stop().await;
+                VideoSource::Pattern
+            }
+            Frames::Captured {
+                capture,
+                slot,
+                serial,
+                size,
+            } => {
+                // Frames wait in the slot (dropped) until the new track.
+                slot.clear();
+                VideoSource::Captured(Captured {
+                    capture,
+                    slot,
+                    serial,
+                    size,
+                })
+            }
+        };
+        tokio::time::sleep(ENCODER_DRAIN).await;
+        if self
+            .room
+            .local_participant()
+            .unpublish_track(&sent.track.sid())
+            .await
+            .is_err()
+        {
+            tracing::debug!("the video track was gone already");
+        }
+        self.start_video(kind, quality, sending, source).await
+    }
+
+    /// Stops our video track of `kind` (not the share's sound), if we send
+    /// one.
+    async fn stop_video_track(&mut self, kind: VideoKind) {
+        if let Some(sent) = self.videos_sent.remove(&kind) {
+            self.videos.remove(&sent.id);
+            let (_, track) = sent.stop_frames().await;
+            if self
+                .room
+                .local_participant()
+                .unpublish_track(&track.sid())
+                .await
+                .is_err()
+            {
+                tracing::debug!("the video track was gone already");
+            }
+        }
+    }
+
+    /// Our video track of `kind`, while we send one.
+    pub(crate) fn video_sent(&self, kind: VideoKind) -> Option<VideoTrackId> {
+        self.videos_sent.get(&kind).map(|s| s.id.clone())
+    }
+
+    /// The quality and encoder of our track of `kind`, while we send one.
+    pub(crate) fn video_sending(&self, kind: VideoKind) -> Option<(VideoQuality, EncoderBackend)> {
+        self.videos_sent.get(&kind).map(|s| (s.quality, s.backend))
     }
 
     /// Mutes or unmutes the published track (others see it as muted).
@@ -350,14 +797,15 @@ impl SfuConnection {
         }
     }
 
-    /// Applies a user's new playback volume to their devices' sources.
-    pub(crate) fn set_user_volume(&self, user: &UserId, percent: u16) {
+    /// Applies a user's new playback volume to their devices' sources of
+    /// that sound.
+    pub(crate) fn set_user_volume(&self, user: &UserId, source: SoundSource, percent: u16) {
         let Some(voice) = &self.voice else {
             return;
         };
         let players = self.players.lock().expect("players lock");
-        for (identity, (id, _)) in &players.playing {
-            if user_of(identity) == user.as_str() {
+        for ((identity, feed), (id, _)) in &players.playing {
+            if user_of(identity) == user.as_str() && feed.sound() == source {
                 audio_session::voice_control(voice).set_source_volume(*id, percent);
             }
         }
@@ -375,7 +823,7 @@ impl SfuConnection {
             players
                 .tracks
                 .drain()
-                .map(|(identity, _)| identity)
+                .map(|((identity, _), _)| identity)
                 .collect()
         };
         if let Ok(mut f) = self.flags.flags.write() {
@@ -385,6 +833,12 @@ impl SfuConnection {
             }
         }
         self.flags.changed.notify_one();
+        self.stop_share_sound().await;
+        // Our frames stop before the room goes (see `SentVideo`).
+        for (_, sent) in self.videos_sent.drain() {
+            sent.stop_frames().await;
+        }
+        self.videos.remove_sfu(&self.key);
         let _ = self.room.close().await;
     }
 }
@@ -421,6 +875,49 @@ async fn announce(
             }
             () = reconnected.notified() => sent = None,
             () = tokio::time::sleep(ANNOUNCE_RETRY), if sent.is_none() => {}
+        }
+    }
+}
+
+/// How many blocks of shared sound may wait for the call (a block is one
+/// PipeWire quantum, about 10 to 20 ms).
+#[cfg(target_os = "linux")]
+const SHARE_SOUND_QUEUE: usize = 32;
+/// Opus for music, stereo.
+#[cfg(target_os = "linux")]
+const SHARE_SOUND_BITRATE: u64 = 128_000;
+
+/// The sound of our screen share, on the connection that publishes.
+struct SentShareSound {
+    track: LocalAudioTrack,
+    #[cfg(target_os = "linux")]
+    capture: twicecat_video::audio_share::ShareAudio,
+    task: JoinHandle<()>,
+}
+
+/// Moves the shared sound into the call track in 10 ms stereo frames.
+#[cfg(target_os = "linux")]
+async fn send_share_sound(mut blocks: mpsc::Receiver<Vec<f32>>, source: NativeAudioSource) {
+    const CHANNELS: usize = 2;
+    let frame = FRAME_LEN * CHANNELS;
+    let mut pending: Vec<i16> = Vec::with_capacity(frame * 4);
+    while let Some(block) = blocks.recv().await {
+        pending.extend(
+            block
+                .iter()
+                .map(|&x| (x.clamp(-1.0, 1.0) * f32::from(i16::MAX)) as i16),
+        );
+        while pending.len() >= frame {
+            let audio = AudioFrame {
+                data: pending[..frame].into(),
+                sample_rate: SAMPLE_RATE,
+                num_channels: CHANNELS as u32,
+                samples_per_channel: FRAME_LEN as u32,
+            };
+            if source.capture_frame(&audio).await.is_err() {
+                tracing::debug!("a shared sound frame was rejected by the call track");
+            }
+            pending.drain(..frame);
         }
     }
 }
@@ -502,6 +999,7 @@ struct EventContext {
     volumes: UserVolumes,
     flags: SharedFlags,
     cleaning: Cleaning,
+    videos: Videos,
     /// On the connection that publishes: announce again.
     reannounce: Option<Arc<Notify>>,
     notices: mpsc::Sender<(String, MediaNotice)>,
@@ -604,25 +1102,52 @@ async fn handle_events(
                 publication,
                 participant,
             } => {
-                let identity = participant.identity().as_str().to_owned();
-                cx.read_claim(&participant, &publication);
-                heard.insert(identity.clone(), (participant, publication));
+                let key = (
+                    participant.identity().as_str().to_owned(),
+                    Feed::of(publication.source()),
+                );
+                if key.1 == Feed::Voice {
+                    cx.read_claim(&participant, &publication);
+                    heard.insert(key.0.clone(), (participant, publication));
+                }
                 cx.with_players(|p| {
-                    // A new track of the same identity replaces the old one.
-                    p.stop(&identity, cx.voice.as_ref());
-                    p.tracks.insert(identity, track);
+                    // A new track of the same identity and feed replaces the
+                    // old one.
+                    p.stop(&key, cx.voice.as_ref());
+                    p.tracks.insert(key, track);
                 });
+            }
+            RoomEvent::TrackSubscribed {
+                track: RemoteTrack::Video(track),
+                publication,
+                participant,
+            } => {
+                cx.videos
+                    .add_remote(&cx.key, participant.identity().as_str(), track, publication);
+            }
+            RoomEvent::TrackUnsubscribed {
+                track: RemoteTrack::Video(_),
+                publication,
+                ..
+            } => {
+                cx.videos
+                    .remove(&VideoTrackId::from(publication.sid().as_str()));
             }
             RoomEvent::TrackUnsubscribed {
                 track: RemoteTrack::Audio(_),
+                publication,
                 participant,
-                ..
             } => {
-                let identity = participant.identity().as_str().to_owned();
-                heard.remove(&identity);
-                cx.cleaning.set_claim(&identity, Claim::None);
+                let key = (
+                    participant.identity().as_str().to_owned(),
+                    Feed::of(publication.source()),
+                );
+                if key.1 == Feed::Voice {
+                    heard.remove(&key.0);
+                    cx.cleaning.set_claim(&key.0, Claim::None);
+                }
                 cx.with_players(|p| {
-                    p.tracks.remove(&identity);
+                    p.tracks.remove(&key);
                 });
             }
             RoomEvent::ParticipantAttributesChanged {
@@ -638,9 +1163,8 @@ async fn handle_events(
                 talkers.remove(&identity);
                 heard.remove(&identity);
                 cx.cleaning.set_claim(&identity, Claim::None);
-                cx.with_players(|p| {
-                    p.tracks.remove(&identity);
-                });
+                cx.with_players(|p| p.forget(&identity));
+                cx.videos.remove_identity(&cx.key, &identity);
                 cx.flags(|f| {
                     if let Some(s) = f.speaking.get_mut(&cx.key) {
                         s.remove(&identity);
@@ -665,7 +1189,9 @@ async fn handle_events(
             RoomEvent::TrackMuted {
                 participant,
                 publication,
-            } if publication.kind() == TrackKind::Audio => {
+            } if publication.kind() == TrackKind::Audio
+                && Feed::of(publication.source()) == Feed::Voice =>
+            {
                 let identity = participant.identity().as_str().to_owned();
                 cx.flags(|f| {
                     f.muted.insert(identity);
@@ -674,11 +1200,23 @@ async fn handle_events(
             RoomEvent::TrackUnmuted {
                 participant,
                 publication,
-            } if publication.kind() == TrackKind::Audio => {
+            } if publication.kind() == TrackKind::Audio
+                && Feed::of(publication.source()) == Feed::Voice =>
+            {
                 let identity = participant.identity().as_str().to_owned();
                 cx.flags(|f| {
                     f.muted.remove(&identity);
                 });
+            }
+            RoomEvent::TrackMuted { publication, .. } if publication.kind() == TrackKind::Video => {
+                cx.videos
+                    .set_muted(&VideoTrackId::from(publication.sid().as_str()), true);
+            }
+            RoomEvent::TrackUnmuted { publication, .. }
+                if publication.kind() == TrackKind::Video =>
+            {
+                cx.videos
+                    .set_muted(&VideoTrackId::from(publication.sid().as_str()), false);
             }
             RoomEvent::Reconnecting => cx.notice(MediaNotice::Reconnecting).await,
             RoomEvent::Reconnected => {
@@ -721,6 +1259,14 @@ mod tests {
         assert_eq!(s[0], i16::MAX);
         assert_eq!(s[1], -i16::MAX);
         assert_eq!(s[2], i16::MAX / 2);
+    }
+
+    #[test]
+    fn only_screen_share_audio_is_a_share() {
+        assert_eq!(Feed::of(TrackSource::ScreenshareAudio), Feed::Share);
+        for source in [TrackSource::Microphone, TrackSource::Unknown] {
+            assert_eq!(Feed::of(source), Feed::Voice);
+        }
     }
 
     #[test]

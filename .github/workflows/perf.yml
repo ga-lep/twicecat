@@ -1,0 +1,87 @@
+name: Performance
+
+# Indicators, never a gate (docs/testing.md, tier 4): runs the perf_ tests one at
+# a time on a quiet runner, reports each value against its expectation and
+# against the last successful run on main, and keeps the numbers as an artifact.
+# A value outside its expectation shows as a warning; the run stays green. It is
+# not a required check and nothing in ci.yml waits for it.
+#
+# Runs on pushes to main, on demand (Actions tab, "Run workflow"), and on a pull
+# request that carries the `perf` label.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [labeled, synchronize]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  # gh run download: the last main run's numbers.
+  actions: read
+
+concurrency:
+  group: perf-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+
+jobs:
+  perf:
+    name: performance indicators
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'perf')
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    # Whatever happens here, the run is not a verdict on the code.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-build
+      # The dependencies the integration shards build; only main saves them.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: integration
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          env-vars: CUDA_HOME
+      - name: Start local Synapse
+        run: scripts/stack.sh up -d --wait
+      - name: Register test users
+        run: scripts/create-test-users.sh
+      - name: Run the perf_ tests
+        run: |
+          mkdir -p target/perf
+          TWICECAT_PERF_FILE="$PWD/target/perf/perf.jsonl" scripts/run-perf-tests.sh
+      # The last successful run on main, when there is one.
+      - name: Fetch the last main numbers
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          id=$(gh run list --workflow perf.yml --branch main --status success --limit 1 --json databaseId --jq '.[0].databaseId // empty' || true)
+          if [ -n "$id" ]; then
+            gh run download "$id" --name perf --dir baseline || echo "no usable baseline in run $id"
+          else
+            echo "no earlier main run"
+          fi
+      - name: Report
+        if: always()
+        run: |
+          if [ -s target/perf/perf.jsonl ]; then
+              scripts/perf-report.sh target/perf/perf.jsonl "$([ -r baseline/perf.jsonl ] && echo baseline/perf.jsonl || echo /dev/null)"
+          else
+              echo "No indicators were recorded." | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: perf
+          path: target/perf/perf.jsonl
+          if-no-files-found: warn
+      - run: scripts/check-no-webrtc-download.sh
+      - name: Stop local Synapse
+        if: always()
+        run: scripts/stack.sh down -v

@@ -21,21 +21,28 @@ use twicecat_app::switcher::SwitcherMessage;
 use twicecat_app::threads::ThreadsMessage;
 use twicecat_app::upload::{Outcome, Prepared, Refusal, Source, UploadPaths};
 use twicecat_app::verification::Phase;
+use twicecat_app::video::VideoMessage;
 use twicecat_app::{App, Message, Screen, Startup};
 use twicecat_app::{CommandSink, EventsSlot};
 use twicecat_core::api::{
     AudioDevice, AudioDeviceId, AudioDevices, AudioSettings, AudioStats, Block, CallIntent,
-    CallState, CancelReason, CleaningStatus, Command, CoreError, CoreEvent, CrossSigning, DeviceId,
-    DeviceSummary, DeviceTrust, DeviceVerification, EnhancerBackend, EventId, GpuBackend,
-    GpuEnhancement, Inline, InputLevel, InputMode, ItemActions, ListDiff, MediaContent, MediaKind,
+    CallState, CancelReason, CleaningStatus, CodecLimits, Command, CoreError, CoreEvent,
+    CrossSigning, DegradationChoice, DeviceId, DeviceSummary, DeviceTrust, DeviceVerification,
+    EncoderBackend, EnhancerBackend, EventId, GpuBackend, GpuEnhancement, Inline, InputLevel,
+    InputMode, ItemActions, LayerTuning, ListDiff, LocalVideo, MediaContent, MediaKind,
     MembershipView, MentionTarget, MessageDetails, MessageKind, MessagePreview, NoiseSuppression,
     PaginationState, Participant, ParticipantId, PlaceholderKind, PowerLevelView, QrImage,
-    ReactionGroup, ReauthAction, RecoveryKey, RecoveryProgress, RecoveryStatus, ReplyPreview,
-    ReplyState, RichText, Role, RoomDetailsView, RoomId, RoomMemberView, RoomNotificationModeView,
-    RoomPermissions, RoomSummary, SasEmoji, SecurityStatus, SendFailure, SendStatus, Shield,
-    ShieldCode, SpaceView, StateChange, SyncState, TextStyle, ThreadSummaryView, TimelineItem,
-    TimelineItemKind, TypingUser, UploadProgress, UserId, UserTrust, UtdReason, VerificationId,
-    VerificationPeer, VerificationPhase,
+    QualityLimitation, ReactionGroup, ReauthAction, RecoveryKey, RecoveryProgress, RecoveryStatus,
+    ReplyPreview, ReplyState, RichText, Role, RoomDetailsView, RoomId, RoomMemberView,
+    RoomNotificationModeView, RoomPermissions, RoomSummary, SasEmoji, ScreenSource, ScreenSourceId,
+    ScreenSourceKind, ScreenSources, ScreenThumbnail, SecurityStatus, SendFailure, SendStatus,
+    Shield, ShieldCode, SpaceView, StateChange, SyncState, TextStyle, ThreadSummaryView,
+    TimelineItem, TimelineItemKind, TypingUser, UpdateCheckChoice, UploadProgress, UserId,
+    UserTrust, UtdReason, VerificationId, VerificationPeer, VerificationPhase, VideoCodec,
+    VideoDevice, VideoDeviceId, VideoDevices, VideoDirection, VideoEncoderInfo, VideoEncoders,
+    VideoFeed, VideoFrame, VideoKind, VideoMatrix, VideoMode, VideoPixelFormat, VideoPlane,
+    VideoRange, VideoSettings, VideoStats, VideoTrackId, VideoTrackStats, VideoTrackView,
+    VideoTuning,
 };
 
 /// Drops every command: the gallery never talks to a core.
@@ -103,10 +110,13 @@ fn user(name: &str) -> UserId {
 
 fn fresh() -> App {
     let (_tx, rx) = tokio::sync::mpsc::channel(1);
-    let (app, _boot) = App::new(Startup {
+    let (mut app, _boot) = App::new(Startup {
         sink: Box::new(NullSink),
         events: EventsSlot::new(rx),
     });
+    // The update question was answered, so the screens show without its
+    // bar; `update_question` and `update_available` show the bars.
+    app.ui_settings.update_check = UpdateCheckChoice::Off;
     app
 }
 
@@ -897,6 +907,7 @@ fn person(
         muted,
         speaking,
         volume_percent: 100,
+        share_volume_percent: 100,
         cleaning,
     }
 }
@@ -1028,6 +1039,190 @@ fn main_call_ptt_talking() -> App {
 
 fn main_call_ptt_idle() -> App {
     main_call_ptt(false)
+}
+
+// ---- Video in calls -----------------------------------------------------
+
+/// A small NV12 gradient: the gallery cannot draw it (the headless renderer
+/// has no GPU), but a track with a frame is a track with a picture.
+fn video_feed() -> VideoFeed {
+    let (tx, feed) = VideoFeed::channel();
+    let (w, h) = (64usize, 36usize);
+    let luma: Vec<u8> = (0..w * h).map(|i| (16 + (i % w) * 3) as u8).collect();
+    tx.send(VideoFrame {
+        format: VideoPixelFormat::Nv12,
+        width: w as u32,
+        height: h as u32,
+        planes: vec![
+            VideoPlane {
+                data: luma.into(),
+                stride: w,
+            },
+            VideoPlane {
+                data: vec![128; w * h / 2].into(),
+                stride: w,
+            },
+        ],
+        matrix: VideoMatrix::Bt709,
+        range: VideoRange::Limited,
+        timestamp_us: 0,
+    });
+    // The sender goes with the feed's last clone: the track stays live.
+    std::mem::forget(tx);
+    feed
+}
+
+fn video_track(who: &str, kind: VideoKind, local: bool, muted: bool) -> VideoTrackView {
+    VideoTrackView {
+        id: VideoTrackId::from(format!("{who}-{kind:?}")),
+        participant: ParticipantId::from(format!("{who}-participant")),
+        user_id: user(who),
+        device_id: DeviceId::from("GALLERYDEV"),
+        is_local: local,
+        kind,
+        width: 1280,
+        height: 720,
+        fps: Some(30),
+        codec: Some(VideoCodec::H264),
+        muted,
+    }
+}
+
+/// The lounge call with these tracks, each with a picture.
+fn call_with_video(tracks: Vec<VideoTrackView>) -> App {
+    let mut app = main_room();
+    call_connected(&mut app);
+    feed(
+        &mut app,
+        CoreEvent::VideoTracks {
+            room_id: room("lounge"),
+            tracks: tracks.clone(),
+        },
+    );
+    for track in tracks {
+        feed(
+            &mut app,
+            CoreEvent::VideoFeed {
+                track: track.id,
+                feed: video_feed(),
+            },
+        );
+    }
+    app
+}
+
+fn main_call_video() -> App {
+    call_with_video(vec![
+        video_track("me", VideoKind::Camera, true, false),
+        video_track("bea", VideoKind::Camera, false, false),
+        video_track("cy", VideoKind::Camera, false, true),
+    ])
+}
+
+fn main_call_video_share() -> App {
+    call_with_video(vec![
+        video_track("me", VideoKind::Camera, true, false),
+        video_track("bea", VideoKind::Camera, false, false),
+        video_track("dee", VideoKind::Screen, false, false),
+    ])
+}
+
+fn main_call_video_folded() -> App {
+    let mut app = main_call_video();
+    press(&mut app, Message::Video(VideoMessage::ToggleStage));
+    app
+}
+
+fn main_call_sharing() -> App {
+    let mut app = main_call_video();
+    feed(
+        &mut app,
+        CoreEvent::LocalVideo(LocalVideo {
+            camera: Some(VideoTrackId::from("me-Camera")),
+            screen: Some(VideoTrackId::from("me-Screen")),
+            screen_audio: true,
+        }),
+    );
+    app
+}
+
+fn video_fullscreen() -> App {
+    let mut app = main_call_video_share();
+    press(
+        &mut app,
+        Message::Video(VideoMessage::Fullscreen(VideoTrackId::from("dee-Screen"))),
+    );
+    app
+}
+
+fn share_picker() -> App {
+    let mut app = main_call_video();
+    press(&mut app, Message::Video(VideoMessage::ToggleShare));
+    // About the size the picker shows them at: a tiny picture scaled up a lot
+    // is drawn out of place by the software renderer.
+    let thumb = |shade: u8| {
+        let (w, h) = (160usize, 90usize);
+        let rgba: Vec<u8> = (0..w * h)
+            .flat_map(|i| {
+                let edge = i % w < 3 || i % w + 3 >= w || i / w < 3 || i / w + 3 >= h;
+                if edge {
+                    [20, 20, 20, 255]
+                } else {
+                    [shade, (i % w) as u8, 255 - shade, 255]
+                }
+            })
+            .collect();
+        ScreenThumbnail {
+            width: w as u32,
+            height: h as u32,
+            rgba: rgba.into(),
+        }
+    };
+    let source = |id: &str, kind, title: &str, w, h, shade| ScreenSource {
+        id: ScreenSourceId::from(id),
+        kind,
+        title: title.to_owned(),
+        width: w,
+        height: h,
+        thumbnail: Some(thumb(shade)),
+    };
+    feed(
+        &mut app,
+        CoreEvent::ScreenSources(ScreenSources {
+            system_picker: false,
+            sources: vec![
+                source("m1", ScreenSourceKind::Monitor, "Screen 1", 2560, 1440, 60),
+                source("m2", ScreenSourceKind::Monitor, "Screen 2", 1920, 1080, 120),
+                source("w1", ScreenSourceKind::Window, "Notes", 1200, 800, 180),
+                source(
+                    "w2",
+                    ScreenSourceKind::Window,
+                    "A very long window title that must not run out of its card",
+                    900,
+                    700,
+                    220,
+                ),
+            ],
+        }),
+    );
+    press(
+        &mut app,
+        Message::Video(VideoMessage::PickSource(ScreenSourceId::from("m2"))),
+    );
+    app
+}
+
+fn share_picker_system() -> App {
+    let mut app = main_call_video();
+    press(&mut app, Message::Video(VideoMessage::ToggleShare));
+    feed(
+        &mut app,
+        CoreEvent::ScreenSources(ScreenSources {
+            system_picker: true,
+            sources: Vec::new(),
+        }),
+    );
+    app
 }
 
 fn main_call_notice() -> App {
@@ -1183,8 +1378,16 @@ fn voice_page_with(
     if let Some(gpu) = gpu {
         feed(&mut app, CoreEvent::GpuEnhancement(gpu));
     }
+    advanced(&mut app, true);
     press(&mut app, Message::Audio(AudioMessage::OpenAt(page)));
     app
+}
+
+/// The Settings switch **Show advanced settings** on or off.
+fn advanced(app: &mut App, on: bool) {
+    let mut settings = app.ui_settings;
+    settings.advanced_settings = on;
+    app.set_ui_settings(settings);
 }
 
 fn gpu_found() -> Option<GpuEnhancement> {
@@ -1349,8 +1552,176 @@ fn settings_notifications_long() -> App {
     app
 }
 
+/// The Voice & audio page: the stored settings and the devices echoed, so
+/// the basics are shown rather than a line saying they are loading.
 fn settings_voice_audio() -> App {
-    settings_page(SettingsPage::VoiceAudio)
+    let mut app = settings();
+    feed(&mut app, CoreEvent::AudioDevices(devices()));
+    let mut stored = ptt_settings(Some("F13"));
+    stored.input_device = Some(AudioDeviceId::from("in-usb"));
+    stored.output_device = Some(AudioDeviceId::from("out-usb"));
+    feed(&mut app, CoreEvent::AudioSettings(stored));
+    press(
+        &mut app,
+        Message::Settings(SettingsMessage::Page(SettingsPage::VoiceAudio)),
+    );
+    app
+}
+
+/// A page, with the Settings switch on.
+fn settings_advanced(build: fn() -> App) -> App {
+    let mut app = build();
+    advanced(&mut app, true);
+    app
+}
+
+fn cameras() -> VideoDevices {
+    let mode = |width, height, fps| VideoMode { width, height, fps };
+    VideoDevices {
+        cameras: vec![
+            VideoDevice {
+                id: VideoDeviceId::from("cam-usb"),
+                name: "USB webcam".to_owned(),
+                is_default: true,
+                modes: vec![
+                    mode(1920, 1080, 30),
+                    mode(1280, 720, 30),
+                    mode(640, 480, 30),
+                ],
+            },
+            VideoDevice {
+                id: VideoDeviceId::from("cam-built-in"),
+                name: "Integrated camera".to_owned(),
+                is_default: false,
+                modes: vec![mode(1280, 720, 30)],
+            },
+        ],
+    }
+}
+
+fn encoders() -> VideoEncoders {
+    let limits = |codec, max_height, tested| CodecLimits {
+        codec,
+        max_width: max_height * 16 / 9,
+        max_height,
+        max_fps: 60,
+        tested,
+    };
+    VideoEncoders {
+        encoders: vec![
+            VideoEncoderInfo {
+                backend: EncoderBackend::Nvenc,
+                gpu: Some("NVIDIA GeForce RTX 4070".to_owned()),
+                hardware: true,
+                codecs: vec![
+                    limits(VideoCodec::H264, 2160, true),
+                    limits(VideoCodec::Av1, 2160, false),
+                ],
+            },
+            VideoEncoderInfo {
+                backend: EncoderBackend::Software,
+                gpu: None,
+                hardware: false,
+                codecs: vec![limits(VideoCodec::Vp8, 1080, true)],
+            },
+        ],
+        in_use: None,
+    }
+}
+
+/// The Video page of Settings, with a camera list and the encoders found.
+fn settings_video() -> App {
+    let mut app = settings();
+    feed(&mut app, CoreEvent::VideoDevices(cameras()));
+    feed(&mut app, CoreEvent::VideoSettings(VideoSettings::default()));
+    feed(&mut app, CoreEvent::VideoEncoders(encoders()));
+    press(
+        &mut app,
+        Message::Settings(SettingsMessage::Page(SettingsPage::Video)),
+    );
+    app
+}
+
+/// The same with the advanced switch on and tuned values in both kinds.
+fn settings_video_advanced() -> App {
+    let mut app = settings_video();
+    advanced(&mut app, true);
+    feed(
+        &mut app,
+        CoreEvent::VideoSettings(VideoSettings {
+            upload_cap_kbps: Some(4000),
+            camera_tuning: VideoTuning {
+                width: Some(1280),
+                height: Some(720),
+                fps: Some(30),
+                bitrate_kbps: Some(1700),
+                layers: Some(3),
+                lower_layers: vec![LayerTuning {
+                    bitrate_kbps: Some(600),
+                    ..LayerTuning::default()
+                }],
+                degradation: Some(DegradationChoice::Balanced),
+                ..VideoTuning::default()
+            },
+            screen_tuning: VideoTuning {
+                codec: Some(VideoCodec::Vp9),
+                scalability_mode: Some("L3T3_KEY".to_owned()),
+                ..VideoTuning::default()
+            },
+            ..VideoSettings::default()
+        }),
+    );
+    app
+}
+
+/// In a call with video, the advanced page also shows what is being sent.
+fn settings_video_advanced_in_call() -> App {
+    let mut app = main_call_video();
+    advanced(&mut app, true);
+    feed(&mut app, CoreEvent::VideoDevices(cameras()));
+    feed(&mut app, CoreEvent::VideoSettings(VideoSettings::default()));
+    let mut found = encoders();
+    found.in_use = Some(EncoderBackend::Nvenc);
+    feed(&mut app, CoreEvent::VideoEncoders(found));
+    feed(
+        &mut app,
+        CoreEvent::VideoStats(VideoStats {
+            tracks: vec![
+                VideoTrackStats {
+                    track: VideoTrackId::from("me-Camera"),
+                    direction: VideoDirection::Sent,
+                    width: 1280,
+                    height: 720,
+                    fps: 29.6,
+                    bitrate_kbps: 1650,
+                    frame_ms: Some(2.4),
+                    limitation: QualityLimitation::Bandwidth,
+                    freezes: 0,
+                    implementation: Some("NVIDIA H264 Encoder".to_owned()),
+                    hardware: true,
+                },
+                VideoTrackStats {
+                    track: VideoTrackId::from("bea-Camera"),
+                    direction: VideoDirection::Received,
+                    width: 640,
+                    height: 360,
+                    fps: 24.0,
+                    bitrate_kbps: 620,
+                    frame_ms: Some(1.1),
+                    limitation: QualityLimitation::None,
+                    freezes: 2,
+                    implementation: Some("libvpx".to_owned()),
+                    hardware: false,
+                },
+            ],
+        }),
+    );
+    press(&mut app, Message::Settings(SettingsMessage::Open));
+    press(
+        &mut app,
+        Message::Settings(SettingsMessage::Page(SettingsPage::Video)),
+    );
+    app
 }
 
 fn settings_keyboard() -> App {
@@ -2479,6 +2850,39 @@ fn banner_device() -> App {
     app
 }
 
+fn update_question() -> App {
+    let mut app = main_room();
+    app.ui_settings.update_check = UpdateCheckChoice::Unasked;
+    app
+}
+
+fn update_available() -> App {
+    let mut app = main_room();
+    app.ui_settings.update_check = UpdateCheckChoice::On;
+    feed(
+        &mut app,
+        CoreEvent::UpdateAvailable {
+            version: "0.2.0".into(),
+            url: "https://github.com/ga-lep/twicecat/releases/tag/v0.2.0".into(),
+            installable: false,
+        },
+    );
+    app
+}
+
+fn crash_report() -> App {
+    let mut app = main_room();
+    let dir = std::env::temp_dir().join("twicecat-gallery-crash");
+    app.set_crash_reports(
+        dir.clone(),
+        Some(twicecat_app::crash::PendingReport {
+            path: dir.join("crash-20270115-080000.txt"),
+            text: "Twicecat 0.1.0 crash report".into(),
+        }),
+    );
+    app
+}
+
 fn banner_recovery_off() -> App {
     let mut app = main_room();
     feed(
@@ -2809,6 +3213,43 @@ pub fn scenarios() -> Vec<Scenario> {
         s("main-call-rows-open", true, main_call_rows_open, |a| {
             a.calls.rows_open.len() == 2
         }),
+        s("main-call-video", true, main_call_video, |a| {
+            a.stage_visible() && a.calls.video.tracks.len() == 3
+        }),
+        s("main-call-video-share", true, main_call_video_share, |a| {
+            a.stage_visible()
+                && a.calls
+                    .video
+                    .tracks
+                    .iter()
+                    .any(|t| t.kind == VideoKind::Screen)
+        }),
+        s(
+            "main-call-video-folded",
+            true,
+            main_call_video_folded,
+            |a| !a.calls.video.stage_open && !a.calls.video.tracks.is_empty(),
+        ),
+        s("main-call-sharing", true, main_call_sharing, |a| {
+            a.calls.video.sharing()
+        }),
+        s("video-fullscreen", true, video_fullscreen, |a| {
+            a.calls.video.fullscreen.is_some()
+        }),
+        s("share-picker", false, share_picker, |a| {
+            a.calls
+                .video
+                .picker
+                .as_ref()
+                .is_some_and(|p| p.selected.is_some() && p.sources.is_some())
+        }),
+        s("share-picker-system", false, share_picker_system, |a| {
+            a.calls
+                .video
+                .picker
+                .as_ref()
+                .is_some_and(|p| p.system_picker)
+        }),
         s("ring-long-id", true, ring_long_id, |a| {
             a.calls.card().is_some_and(|r| r.caller.as_str().len() > 80)
         }),
@@ -2952,6 +3393,51 @@ pub fn scenarios() -> Vec<Scenario> {
         s("settings-voice-audio", false, settings_voice_audio, |a| {
             a.settings_ui.open && a.settings_ui.page == SettingsPage::VoiceAudio
         }),
+        s("settings-video", false, settings_video, |a| {
+            a.settings_ui.open && a.settings_ui.page == SettingsPage::Video
+        }),
+        s(
+            "settings-advanced",
+            false,
+            || settings_advanced(settings),
+            |a| a.ui_settings.advanced_settings && a.settings_ui.page == SettingsPage::Profile,
+        ),
+        s(
+            "settings-appearance-advanced",
+            false,
+            || settings_advanced(settings_appearance),
+            |a| a.ui_settings.advanced_settings && a.settings_ui.page == SettingsPage::Appearance,
+        ),
+        s(
+            "settings-notifications-advanced",
+            false,
+            || settings_advanced(settings_notifications),
+            |a| {
+                a.ui_settings.advanced_settings && a.settings_ui.page == SettingsPage::Notifications
+            },
+        ),
+        s(
+            "settings-voice-audio-advanced",
+            false,
+            || settings_advanced(settings_voice_audio),
+            |a| a.ui_settings.advanced_settings && a.settings_ui.page == SettingsPage::VoiceAudio,
+        ),
+        s(
+            "settings-video-advanced",
+            false,
+            settings_video_advanced,
+            |a| a.ui_settings.advanced_settings && a.settings_ui.page == SettingsPage::Video,
+        ),
+        s(
+            "settings-video-advanced-call",
+            false,
+            settings_video_advanced_in_call,
+            |a| {
+                a.ui_settings.advanced_settings
+                    && a.settings_ui.page == SettingsPage::Video
+                    && a.calls.call.is_some()
+            },
+        ),
         s("settings-keyboard", false, settings_keyboard, |a| {
             a.settings_ui.open && a.settings_ui.page == SettingsPage::Keyboard
         }),
@@ -3234,6 +3720,15 @@ pub fn scenarios() -> Vec<Scenario> {
         ),
         s("banner-notice", true, banner_notice, |a| {
             a.security.notice.is_some()
+        }),
+        s("banner-update-question", true, update_question, |a| {
+            a.update_question_shown()
+        }),
+        s("banner-update-available", true, update_available, |a| {
+            a.updates.available.is_some()
+        }),
+        s("banner-crash-report", true, crash_report, |a| {
+            a.crash.is_some()
         }),
         s("recovery-working", false, recovery_working, |a| {
             a.security.progress.is_some()

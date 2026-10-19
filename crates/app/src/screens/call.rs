@@ -218,13 +218,21 @@ pub fn talk_line(app: &App) -> Option<(String, bool)> {
     }
     let bindings = &settings.push_to_talk;
     let verb = if toggle { "press" } else { "hold" };
-    let line = match (bindings.key.as_deref(), bindings.gamepad_button.is_some()) {
-        (Some(key), _) => format!(
+    let line = match (
+        bindings.key.as_deref(),
+        bindings.mouse_button.as_deref(),
+        bindings.gamepad_button.is_some(),
+    ) {
+        (Some(key), _, _) => format!(
             "Not talking: {verb} {}",
             crate::audio_settings::key_label(key)
         ),
-        (None, true) => format!("Not talking: {verb} the gamepad button"),
-        (None, false) => "Not talking: no key or button is set (Audio\u{2026})".to_owned(),
+        (None, Some(mouse), _) => format!(
+            "Not talking: {verb} {}",
+            crate::audio_settings::mouse_words(mouse)
+        ),
+        (None, None, true) => format!("Not talking: {verb} the gamepad button"),
+        (None, None, false) => "Not talking: no key or button is set (Audio\u{2026})".to_owned(),
     };
     Some((line, false))
 }
@@ -385,7 +393,11 @@ pub fn dock_call(app: &App) -> Option<DockCall> {
     let line = talk_line(app);
     let off = current.muted || current.deafened;
     let gated = match app.calls.settings.as_ref() {
-        Some(s) if s.push_to_talk.key.is_none() && s.push_to_talk.gamepad_button.is_some() => {
+        Some(s)
+            if s.push_to_talk.key.is_none()
+                && s.push_to_talk.mouse_button.is_none()
+                && s.push_to_talk.gamepad_button.is_some() =>
+        {
             MicLook::GatedPad
         }
         _ => MicLook::GatedKey,
@@ -642,6 +654,15 @@ pub fn dock(app: &App) -> Element<'_, Message> {
             row![
                 mic_button(dock.mic, dock.mic_words.clone()),
                 deafen,
+                crate::screens::stage::camera_button(app),
+                crate::screens::stage::share_button(app),
+            ]
+            .spacing(tokens::S)
+            .align_y(iced::Center)
+            .into(),
+        );
+        lines.push(
+            row![
                 audio,
                 space().width(Fill),
                 kit::danger_button(
@@ -738,6 +759,8 @@ pub fn rail_dock(app: &App) -> Element<'_, Message> {
             }),
             dock.deafen_words,
         ));
+        items.push(crate::screens::stage::camera_button(app));
+        items.push(crate::screens::stage::share_button(app));
         // A gap before Leave, so it is not a stray click from Deafen.
         items.push(space().height(tokens::M).into());
         items.push(tip(
@@ -1203,6 +1226,7 @@ mod tests {
             input_mode: ptt(false),
             push_to_talk: PushToTalkBindings {
                 key: None,
+                mouse_button: None,
                 gamepad_button: Some("South".to_owned()),
             },
             ..AudioSettings::default()

@@ -1,6 +1,11 @@
 //! Twicecat desktop app entry point: parses the command line, starts the core
 //! on its own runtime and runs the Iced application.
 
+// Release builds on Windows are GUI programs: no console window opens beside
+// the app. `--help`, `--version` and argument errors still reach a terminal
+// that started it (`attach_parent_console`).
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher as _, Hasher as _};
 use std::path::PathBuf;
@@ -37,6 +42,7 @@ OPTIONS:
                           data directory that is deleted on exit. The session
                           is not revoked on the server; revoke it from your
                           account settings.
+    --version             Show the version
     --help                Show this help
 
 The app and twicecat-cli share the same data directory and keychain entry, so a
@@ -55,6 +61,7 @@ struct Options {
 enum Parsed {
     Run(Options),
     Help,
+    Version,
 }
 
 fn parse_args(args: &[String]) -> Result<Parsed, String> {
@@ -63,6 +70,12 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
         homeserver: None,
         ephemeral: false,
     };
+    if args.iter().any(|arg| arg == "--version" || arg == "-V") {
+        return match args {
+            [_] => Ok(Parsed::Version),
+            _ => Err("--version takes no other arguments".to_owned()),
+        };
+    }
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -117,6 +130,10 @@ fn run(options: Options) -> Result<(), String> {
     // Read before the window opens so the stored choices apply from the start.
     let ui_settings = data.read_settings();
     let settings_store = DiskSettings::new(data.clone());
+    // An earlier run's report first, then this run's hook (Task 10).
+    let crash_dir = data.root().to_path_buf();
+    let crash = (crash_dir.clone(), twicecat_app::crash::newest(&crash_dir));
+    twicecat_app::crash::install(crash_dir);
     let config = CoreConfig {
         data,
         homeserver_override: options.homeserver,
@@ -124,6 +141,7 @@ fn run(options: Options) -> Result<(), String> {
         max_upload_bytes_override: None,
         audio: AudioBackend::System,
         call_service_override: None,
+        video: twicecat_core::api::VideoBackend::System,
     };
     let (bridge, events) = Bridge::start(config, secrets)
         .map_err(|error| format!("could not start the core runtime: {error}"))?;
@@ -135,7 +153,7 @@ fn run(options: Options) -> Result<(), String> {
     // The app (and with it the bridge and the core's runtime) is dropped when
     // `run` returns, before the temporary directory is removed.
     let application = iced::application(
-        App::booter(startup, ui_settings, settings_store),
+        App::booter(startup, ui_settings, settings_store, crash),
         App::update,
         App::view,
     );
@@ -154,45 +172,81 @@ fn run(options: Options) -> Result<(), String> {
         // Best effort: nothing useful to do if it fails.
         let _ = std::fs::remove_dir_all(dir);
     }
+    // **Restart now** after an AppImage update: the new AppImage, now that
+    // this one has let go of its stores.
+    if let Some(program) = twicecat_app::updates::take_restart() {
+        let _ = std::process::Command::new(program).spawn();
+    }
     result.map_err(|error| format!("the window failed: {error}"))
 }
 
-/// The window's settings: on Linux its app ID is the desktop entry's name
-/// (`packaging/linux/`), so the compositor and the shortcuts portal tie the
-/// window to it.
+/// The window's settings: its icon, and on Linux its app ID, the desktop
+/// entry's name (`packaging/linux/`), so the compositor and the shortcuts
+/// portal tie the window to it (Wayland compositors take the icon from the
+/// entry instead).
 fn window_settings() -> iced::window::Settings {
     // The width the layout assumes until the first resize event arrives.
     let size = iced::Size::new(twicecat_app::layout::DEFAULT_WINDOW_WIDTH, 800.0);
-    #[cfg(target_os = "linux")]
-    {
-        iced::window::Settings {
-            size,
-            platform_specific: iced::window::settings::PlatformSpecific {
-                application_id: twicecat_ptt::APP_ID.to_owned(),
-                ..Default::default()
-            },
+    iced::window::Settings {
+        size,
+        icon: ui::app_icon::window_icon(),
+        #[cfg(target_os = "linux")]
+        platform_specific: iced::window::settings::PlatformSpecific {
+            application_id: twicecat_ptt::APP_ID.to_owned(),
             ..Default::default()
-        }
+        },
+        ..Default::default()
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        iced::window::Settings {
-            size,
-            ..Default::default()
+}
+
+/// `twicecat <version>`, as `--version` prints it.
+fn version_line() -> String {
+    format!("twicecat {}", env!("CARGO_PKG_VERSION"))
+}
+
+/// Gives a Windows GUI build the console of the terminal that started it,
+/// so `--help`, `--version` and argument errors are seen. Output already
+/// redirected to a pipe or a file is left as it is; started from the desktop
+/// there is no console, and the text goes nowhere.
+#[cfg(windows)]
+fn attach_parent_console() {
+    use windows::Win32::System::Console::{
+        ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_OUTPUT_HANDLE,
+    };
+    // SAFETY: both calls take plain values and only change this process's
+    // standard handles, before anything else uses them.
+    unsafe {
+        if GetStdHandle(STD_OUTPUT_HANDLE).is_err() {
+            let _ = AttachConsole(ATTACH_PARENT_PROCESS);
         }
     }
 }
 
+#[cfg(not(windows))]
+fn attach_parent_console() {}
+
 fn main() -> ExitCode {
+    #[cfg(target_os = "linux")]
+    // SAFETY: the first thing `main` does, before any thread exists.
+    unsafe {
+        twicecat_core::prepare_appimage_tls();
+    }
     twicecat_core::require_cpu_level();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let options = match parse_args(&args) {
         Ok(Parsed::Run(options)) => options,
         Ok(Parsed::Help) => {
+            attach_parent_console();
             print!("{HELP}");
             return ExitCode::SUCCESS;
         }
+        Ok(Parsed::Version) => {
+            attach_parent_console();
+            println!("{}", version_line());
+            return ExitCode::SUCCESS;
+        }
         Err(message) => {
+            attach_parent_console();
             eprintln!("twicecat: {message}\nTry --help.");
             return ExitCode::from(2);
         }
@@ -241,6 +295,8 @@ mod tests {
             }))
         );
         assert_eq!(parse_args(&args(&["--help"])), Ok(Parsed::Help));
+        assert_eq!(parse_args(&args(&["--version"])), Ok(Parsed::Version));
+        assert_eq!(parse_args(&args(&["-V"])), Ok(Parsed::Version));
         assert_eq!(parse_args(&args(&[])).map(|p| p == Parsed::Help), Ok(false));
     }
 
@@ -250,6 +306,18 @@ mod tests {
         assert!(parse_args(&args(&["--homeserver"])).is_err());
         assert!(parse_args(&args(&["--ephemeral", "--data-dir", "/d"])).is_err());
         assert!(parse_args(&args(&["--nope"])).is_err());
+        assert!(parse_args(&args(&["--version", "--ephemeral"])).is_err());
+        assert!(parse_args(&args(&["--data-dir", "/d", "--version"])).is_err());
+        assert!(parse_args(&args(&["--help", "--version"])).is_err());
+    }
+
+    #[test]
+    fn version_names_the_workspace_version() {
+        assert_eq!(
+            version_line(),
+            format!("twicecat {}", env!("CARGO_PKG_VERSION"))
+        );
+        assert!(HELP.contains("--version"));
     }
 
     #[test]
@@ -274,6 +342,7 @@ mod tests {
             "Name=Twicecat",
             "Exec=twicecat",
             &format!("StartupWMClass={}", twicecat_ptt::APP_ID),
+            &format!("Icon={}", twicecat_ptt::APP_ID),
         ] {
             assert!(lines.contains(&wanted), "missing {wanted}");
         }
@@ -297,6 +366,54 @@ mod tests {
             assert!(
                 out.status.success() && out.stdout.is_empty(),
                 "desktop-file-validate: {}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
+    /// The icon the entry names exists in every size packages install, the
+    /// window gets it, and the AppStream metadata describes the same app
+    /// (validated where `appstreamcli` is installed).
+    #[test]
+    fn the_icon_and_the_metainfo_carry_the_app_id() {
+        let packaging = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging");
+        let id = twicecat_ptt::APP_ID;
+        assert!(
+            packaging
+                .join(format!("icons/hicolor/scalable/apps/{id}.svg"))
+                .is_file()
+        );
+        for size in [16, 24, 32, 48, 64, 128, 256, 512] {
+            let path = packaging.join(format!("icons/hicolor/{size}x{size}/apps/{id}.png"));
+            let image = image::open(&path).expect("the icon decodes");
+            assert_eq!((image.width(), image.height()), (size, size), "{path:?}");
+        }
+        assert!(packaging.join(format!("icons/{id}.ico")).is_file());
+        assert!(window_settings().icon.is_some());
+
+        let path = packaging.join(format!("linux/{id}.metainfo.xml"));
+        let metainfo = std::fs::read_to_string(&path).expect("the metainfo exists");
+        assert!(metainfo.contains(&format!("<id>{id}</id>")));
+        assert!(metainfo.contains(&format!(
+            "<launchable type=\"desktop-id\">{id}.desktop</launchable>"
+        )));
+        assert!(metainfo.contains("<binary>twicecat</binary>"));
+        assert!(
+            metainfo.contains(&format!(
+                "<release version=\"{}\"",
+                env!("CARGO_PKG_VERSION")
+            )),
+            "the metainfo lists this version"
+        );
+        if let Ok(out) = std::process::Command::new("appstreamcli")
+            .args(["validate", "--strict", "--no-net"])
+            .arg(&path)
+            .output()
+        {
+            assert!(
+                out.status.success(),
+                "appstreamcli: {}{}",
                 String::from_utf8_lossy(&out.stdout),
                 String::from_utf8_lossy(&out.stderr)
             );

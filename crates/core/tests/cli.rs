@@ -179,14 +179,14 @@ fn cli_joins_mutes_and_leaves_a_call() {
     assert!(connected.contains("(not encrypted)"), "{connected}");
     cli.write("/mute");
     cli.expect("Microphone muted.");
-    // Our own membership shows up once it has synced back.
+    // Our own membership shows up once it has synced back, and the mute once
+    // core has re-reported the participants; "Microphone muted." comes first.
     let me = (0..30).find_map(|_| {
         cli.write("/who");
-        cli.expect_within("[you", Duration::from_secs(1))
+        cli.expect_within("[you, muted", Duration::from_secs(1))
     });
-    let me = me.expect("never listed in /who");
+    let me = me.expect("never listed as muted in /who");
     assert!(me.contains(env.user_id(1).as_str()), "{me}");
-    assert!(me.contains("[you, muted]"), "{me}");
     cli.write("/leave");
     cli.expect("Left the call in");
     cli.write("/quit");
@@ -211,5 +211,134 @@ fn cli_joins_mutes_and_leaves_a_call() {
     assert!(
         !cli.seen.iter().any(|l| l.contains(password)),
         "password in stdout"
+    );
+}
+
+/// Logs a CLI in as test user `n`, with the test pattern as its camera.
+fn video_cli(env: &TestEnv, n: u8) -> Session {
+    let mut cli = Session::start(&[
+        "--ephemeral",
+        "--homeserver",
+        env.homeserver_url(),
+        "--password-stdin",
+        "--silent-audio",
+        "--test-video",
+    ]);
+    cli.write(env.user(n));
+    cli.write(env.password(n));
+    cli.expect(&format!("Logged in as {}", env.user_id(n)));
+    cli
+}
+
+/// Joins `room_id`'s call once the CLI's sync knows the room.
+fn join_call(cli: &mut Session, name: &str, room_id: &str) {
+    let listed = (0..30).any(|_| {
+        cli.write("/rooms");
+        cli.expect_within(name, Duration::from_secs(1)).is_some()
+    });
+    assert!(listed, "the room never showed up in /rooms");
+    cli.write(&format!("/call {room_id}"));
+    let connected = cli.expect("In the call in");
+    assert!(connected.contains("(end-to-end encrypted)"), "{connected}");
+}
+
+/// A feed below this is stalled, which is a bug; between this and the nominal
+/// rate it is slow, which only the `perf_` test reports (docs/testing.md, R1).
+const STREAMING_FLOOR_FPS: f32 = 5.0;
+
+/// Two CLIs in an encrypted call: alice sends the test pattern as her
+/// camera (`/video pattern`), carol lists it, asks for its full size and
+/// reads its rate (`/video stats`); alice's hang-up removes it. Audio is
+/// silent and virtual. Returns the viewer's frame rate at full size: the first
+/// reading, then `more_readings` more, a second apart.
+fn two_clis_exchange_a_test_pattern(more_readings: usize) -> Vec<f32> {
+    let env = TestEnv::load();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let alice = runtime.block_on(common::raw_login(1));
+    let carol = runtime.block_on(common::raw_login(3));
+    let name = common::unique_room_name();
+    let room_id = runtime
+        .block_on(common::create_encrypted_room(
+            &alice,
+            &name,
+            Some(&env.user_id(3)),
+        ))
+        .to_string();
+    runtime.block_on(async {
+        common::calls::allow_calls(&alice, &room_id).await;
+        carol
+            .join_room_by_id(room_id.as_str().try_into().unwrap())
+            .await
+            .unwrap();
+    });
+
+    let mut sender = video_cli(&env, 1);
+    let mut viewer = video_cli(&env, 3);
+    join_call(&mut sender, &name, &room_id);
+    join_call(&mut viewer, &name, &room_id);
+    sender.write("/video pattern 720p 30");
+    sender.expect("[video] camera on, screen share off");
+    viewer.expect(&format!("[video] + {} camera", env.user_id(1)));
+    viewer.write("/video view 1 1280x720");
+    // The SFU moves to the top layer within a few seconds. The first stats
+    // at that size cover the switch, so the later readings are the steady rate.
+    let stats_at_full_size = |viewer: &mut Session| {
+        std::thread::sleep(Duration::from_secs(1));
+        viewer.write("/video stats");
+        viewer.expect_within("received 1280x720", Duration::from_secs(2))
+    };
+    let first = (0..20).find_map(|_| stats_at_full_size(&mut viewer));
+    let mut readings = vec![first.expect("never received the 1280x720 layer")];
+    for _ in 0..more_readings {
+        if let Some(line) = stats_at_full_size(&mut viewer) {
+            readings.push(line);
+        }
+    }
+    let fps_of = |line: &String| -> f32 {
+        line.split_whitespace()
+            .skip_while(|w| *w != "1280x720")
+            .nth(1)
+            .and_then(|w| w.parse().ok())
+            .unwrap_or_else(|| panic!("no fps in {line:?}"))
+    };
+    let rates: Vec<f32> = readings.iter().map(fps_of).collect();
+
+    sender.write("/leave");
+    sender.expect("Left the call in");
+    viewer.expect(&format!("[video] - {} camera", env.user_id(1)));
+    for mut cli in [sender, viewer] {
+        cli.write("/quit");
+        let status = cli.child.wait().expect("wait for twicecat-cli");
+        assert!(status.success(), "exit status {status:?}");
+    }
+    rates
+}
+
+#[test]
+#[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
+fn two_clis_send_and_receive_a_test_pattern() {
+    let rates = two_clis_exchange_a_test_pattern(0);
+    assert!(
+        rates[0] >= STREAMING_FLOOR_FPS,
+        "the feed stalled at {} fps at 1280x720",
+        rates[0]
+    );
+}
+
+/// The viewer's steady frame rate at 1280x720 over about 10 s, on a quiet
+/// machine. An indicator (docs/testing.md): a busy runner lowers it, and
+/// nothing is wrong.
+#[test]
+#[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
+fn perf_two_clis_receive_a_test_pattern_at_the_frame_rate() {
+    let mut rates = two_clis_exchange_a_test_pattern(10);
+    rates.remove(0); // the first reading covers the layer switch
+    rates.sort_by(f32::total_cmp);
+    let median = rates[rates.len() / 2];
+    twicecat_perf::record(
+        "cli.video.received_fps_720p",
+        f64::from(median),
+        "fps",
+        twicecat_perf::Expect::AtLeast(29.0), // 30 on a laptop and on CI
     );
 }

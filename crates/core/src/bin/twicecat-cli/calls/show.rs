@@ -97,6 +97,9 @@ pub(super) fn who(participants: &[Participant]) -> Vec<String> {
             if p.volume_percent != 100 {
                 flags.push(format!("volume {} %", p.volume_percent));
             }
+            if p.share_volume_percent != 100 {
+                flags.push(format!("screen-share volume {} %", p.share_volume_percent));
+            }
             let cleaning = match p.cleaning {
                 CleaningStatus::Off => None,
                 CleaningStatus::Starting => Some("cleaning soon"),
@@ -329,6 +332,7 @@ mod tests {
             muted: true,
             speaking: true,
             volume_percent: 50,
+            share_volume_percent: 100,
             cleaning,
         };
         let lines = who(&[

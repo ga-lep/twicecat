@@ -9,10 +9,15 @@ pub enum Source {
     Hotkey,
     /// The GlobalShortcuts portal (Wayland).
     Portal,
+    /// A global mouse button (X11, Windows, macOS).
+    Mouse,
     /// A gamepad button.
     Gamepad,
     /// A key pressed in Twicecat's own window, forwarded by the app.
     Window,
+    /// A mouse button pressed in Twicecat's own window, forwarded by the
+    /// app.
+    WindowMouse,
 }
 
 impl Source {
@@ -22,6 +27,8 @@ impl Source {
             Self::Portal => 2,
             Self::Gamepad => 4,
             Self::Window => 8,
+            Self::Mouse => 16,
+            Self::WindowMouse => 32,
         }
     }
 }
@@ -67,6 +74,19 @@ mod tests {
         assert!(m.transmitting());
         assert_eq!(m.set(Source::Gamepad, false), Some(false));
         assert!(!m.transmitting());
+    }
+
+    /// Over Twicecat's window a global button and the window's both see one
+    /// click; the window's key does not let go of the mouse.
+    #[test]
+    fn each_mouse_source_and_the_window_key_hold_on_their_own() {
+        let mut m = Merger::default();
+        assert_eq!(m.set(Source::Mouse, true), Some(true));
+        assert_eq!(m.set(Source::WindowMouse, true), None);
+        assert_eq!(m.set(Source::Window, true), None);
+        assert_eq!(m.set(Source::Window, false), None);
+        assert_eq!(m.set(Source::Mouse, false), None);
+        assert_eq!(m.set(Source::WindowMouse, false), Some(false));
     }
 
     #[test]

@@ -27,7 +27,9 @@ use iced::advanced::{Layout, Shell, clipboard, mouse};
 use iced::{Element, Event, Pixels, Rectangle, Renderer, Size, window};
 use twicecat_app::ui::fonts;
 use twicecat_app::{App, Message};
-use twicecat_core::api::{DensityChoice, PaletteChoice, RoomListChoice, ThemeChoice, UiSettings};
+use twicecat_core::api::{
+    DensityChoice, PaletteChoice, RoomListChoice, ThemeChoice, UiSettings, UpdateCheckChoice,
+};
 
 const WIDE: Size = Size::new(1280.0, 800.0);
 const NARROW: Size = Size::new(720.0, 800.0);
@@ -55,6 +57,15 @@ struct Variant {
     list: RoomListChoice,
 }
 
+/// `variant` on `app`, keeping the Settings switch the scenario set.
+fn apply(app: &mut App, variant: Variant) {
+    let mut settings = variant.settings();
+    settings.advanced_settings = app.ui_settings.advanced_settings;
+    // The scenario's answer to the update question (its bar or none).
+    settings.update_check = app.ui_settings.update_check;
+    app.set_ui_settings(settings);
+}
+
 impl Variant {
     fn settings(self) -> UiSettings {
         UiSettings {
@@ -62,6 +73,8 @@ impl Variant {
             palette: Some(self.family.0),
             density: self.density.0,
             room_list: self.list,
+            // Answered: no update question bar over the screens.
+            update_check: UpdateCheckChoice::Off,
             ..UiSettings::default()
         }
     }
@@ -253,7 +266,7 @@ fn every_screen_lays_out_in_every_variant_at_both_sizes() {
     for scenario in &scenarios {
         let mut app = (scenario.build)();
         for variant in variants(scenario.room_list) {
-            app.set_ui_settings(variant.settings());
+            apply(&mut app, variant);
             for size in SIZES {
                 app.window_width = size.width;
                 let laid = Laid::new(&app, &renderer, size);
@@ -322,6 +335,13 @@ fn the_fixture_reaches_every_screen_it_names() {
         "settings-appearance",
         "settings-notifications",
         "settings-voice-audio",
+        "settings-video",
+        "settings-advanced",
+        "settings-appearance-advanced",
+        "settings-notifications-advanced",
+        "settings-voice-audio-advanced",
+        "settings-video-advanced",
+        "settings-video-advanced-call",
         "settings-keyboard",
         "settings-sessions",
         "settings-about",
@@ -386,7 +406,7 @@ fn room_pane_place(laid: &Laid<'_>) -> (Vec<usize>, Vec<usize>) {
 }
 
 /// Child counts down the room pane: container, then the column of
-/// `[title, timeline, bars, editor]`.
+/// `[title, stage, timeline, bars, editor]`.
 fn pane_shape(pane: &Node) -> Vec<usize> {
     let column = &pane.children()[0];
     vec![pane.children().len(), column.children().len()]
@@ -406,8 +426,8 @@ fn the_room_pane_keeps_its_place_as_panels_bars_and_banners_come_and_go() {
     };
     assert_eq!(
         shape,
-        vec![1, 4],
-        "container around [title, timeline, bars, editor]"
+        vec![1, 5],
+        "container around [title, stage, timeline, bars, editor]"
     );
     let steps: [Step; 8] = [
         ("thread opens", fixture::thread_open),
@@ -570,7 +590,7 @@ fn write_the_gallery() {
         let mut app = (scenario.build)();
         let mut files = Vec::new();
         for variant in variants(scenario.room_list) {
-            app.set_ui_settings(variant.settings());
+            apply(&mut app, variant);
             let renderer = renderer();
             let mut laid = Laid::new(&app, &renderer, WIDE);
             laid.settle(&renderer, WIDE);
@@ -611,7 +631,7 @@ fn write_the_gallery() {
         }
         let mut files = Vec::new();
         for variant in variants(false) {
-            app.set_ui_settings(variant.settings());
+            apply(&mut app, variant);
             let renderer = renderer();
             let mut laid = Laid::new(&app, &renderer, size);
             laid.settle(&renderer, size);
@@ -1517,6 +1537,8 @@ fn with_settings(app: &mut App, density: (DensityChoice, &str), list: RoomListCh
     let mut settings = variants(false)[0].settings();
     settings.density = density.0;
     settings.room_list = list;
+    settings.advanced_settings = app.ui_settings.advanced_settings;
+    settings.update_check = app.ui_settings.update_check;
     app.set_ui_settings(settings);
     app.window_width = WIDE.width;
 }
@@ -1559,10 +1581,19 @@ fn the_expanded_dock_never_spills_and_keeps_leave_apart_at_300_px() {
             }
             let lines = dock_lines(dock);
             let controls = lines.last().expect("the controls row");
-            // [mic, deafen, audio, spacer, leave]
+            // The row above it: [mic, deafen, camera, share].
+            let toggles = &lines[lines.len() - 2];
+            assert_eq!(toggles.children().len(), 4, "{what}");
+            for (i, kid) in toggles.children().iter().enumerate() {
+                assert!(
+                    kid.bounds().x + kid.bounds().width <= toggles.bounds().width + 0.5,
+                    "{what}: toggle {i} is cut off"
+                );
+            }
+            // [audio, spacer, leave]
             let kids = controls.children();
-            assert_eq!(kids.len(), 5, "{what}");
-            let (audio, leave) = (kids[2].bounds(), kids[4].bounds());
+            assert_eq!(kids.len(), 3, "{what}");
+            let (audio, leave) = (kids[0].bounds(), kids[2].bounds());
             assert!(
                 leave.x - (audio.x + audio.width) >= 15.5,
                 "{what}: Leave is {} px from Audio",
@@ -2380,9 +2411,11 @@ mod audio {
             "Bitrate",
             "Skip",
             "Mode",
+            "Mouse",
             "Button",
-            // A key press, and a timer.
+            // A key or mouse button press, and a timer.
             "Captured",
+            "CapturedMouse",
             "SlideDue",
             // Only the talk line opens a page directly.
             "OpenAt",
@@ -2416,7 +2449,7 @@ mod audio {
                 .map(|line| centre_of(&laid, line))
                 .collect();
             let controls = dock_lines(dock).last().expect("controls");
-            (lines, centre_of(&laid, &controls.children()[2]))
+            (lines, centre_of(&laid, &controls.children()[0]))
         };
         let mut hit = false;
         for at in lines {
@@ -2963,15 +2996,32 @@ mod settings_pages {
 
     use super::*;
 
-    const PAGE_SCENARIOS: [(&str, SettingsPage); 7] = [
+    /// Every page at the simple level, then at the advanced one.
+    const PAGE_SCENARIOS: [(&str, SettingsPage); 15] = [
         ("settings", SettingsPage::Profile),
         ("settings-appearance", SettingsPage::Appearance),
         ("settings-notifications", SettingsPage::Notifications),
         ("settings-voice-audio", SettingsPage::VoiceAudio),
+        ("settings-video", SettingsPage::Video),
         ("settings-keyboard", SettingsPage::Keyboard),
         ("settings-sessions", SettingsPage::Sessions),
         ("settings-about", SettingsPage::About),
+        ("settings-advanced", SettingsPage::Profile),
+        ("settings-appearance-advanced", SettingsPage::Appearance),
+        (
+            "settings-notifications-advanced",
+            SettingsPage::Notifications,
+        ),
+        ("settings-voice-audio-advanced", SettingsPage::VoiceAudio),
+        ("settings-video-advanced", SettingsPage::Video),
+        ("settings-video-advanced-call", SettingsPage::Video),
+        ("settings-notifications-long", SettingsPage::Notifications),
     ];
+
+    /// A scenario with the switch on.
+    fn is_advanced(name: &str) -> bool {
+        name.contains("advanced") || name == "settings-notifications-long"
+    }
 
     fn find_body(node: &Node) -> Option<&Node> {
         if node.children().len() == 3 && node.children()[0].bounds().width == NAV_WIDTH {
@@ -2982,7 +3032,9 @@ mod settings_pages {
 
     fn page_app(name: &str) -> App {
         let mut app = scenario_app(name);
-        app.set_ui_settings(variants(false)[0].settings());
+        let mut settings = variants(false)[0].settings();
+        settings.advanced_settings = is_advanced(name);
+        app.set_ui_settings(settings);
         app.window_width = WIDE.width;
         app
     }
@@ -3023,11 +3075,7 @@ mod settings_pages {
     #[test]
     fn nothing_runs_out_of_the_card_sideways_in_any_page_at_both_widths() {
         let renderer = renderer();
-        let names = PAGE_SCENARIOS
-            .map(|(name, _)| name)
-            .into_iter()
-            .chain(["settings-notifications-long"]);
-        for name in names {
+        for (name, _) in PAGE_SCENARIOS {
             for size in SIZES {
                 for density in DENSITIES {
                     let mut app = page_app(name);
@@ -3218,6 +3266,114 @@ mod settings_pages {
         assert!(notices.contains("Copyright (c) 2016 The Inter Project Authors"));
     }
 
+    /// The words a page draws inside the card.
+    fn card_texts(name: &str) -> Vec<String> {
+        let renderer = renderer();
+        let app = page_app(name);
+        let mut laid = Laid::new(&app, &renderer, WIDE);
+        let body = find_body(&laid.node).expect("the body");
+        let card = card_above(&laid.node, body).bounds();
+        texts(&mut laid, &renderer)
+            .into_iter()
+            .filter(|(_, b)| card.contains(b.center()))
+            .map(|(t, _)| t)
+            .collect()
+    }
+
+    /// How tall a page is, scrolled or not.
+    fn content_height(name: &str) -> f32 {
+        let renderer = renderer();
+        let app = page_app(name);
+        let laid = Laid::new(&app, &renderer, WIDE);
+        let body = find_body(&laid.node).expect("the body");
+        body.children()[2].children()[0].bounds().height
+    }
+
+    fn has(shown: &[String], wanted: &str) -> bool {
+        shown.iter().any(|t| t.starts_with(wanted))
+    }
+
+    /// What only the advanced level shows, page by page: nothing of it is on
+    /// the simple page, all of it is on the advanced one.
+    #[test]
+    fn each_level_shows_its_own_choices() {
+        for (simple, advanced, only_advanced) in [
+            (
+                "settings-appearance",
+                "settings-appearance-advanced",
+                &["Density", "Room list"][..],
+            ),
+            (
+                "settings-notifications",
+                "settings-notifications-advanced",
+                &[
+                    "Keywords",
+                    "Show message content in notifications",
+                    "Show the unread count on the tray icon",
+                ][..],
+            ),
+            (
+                "settings-voice-audio",
+                "settings-voice-audio-advanced",
+                &["More audio options"][..],
+            ),
+            (
+                "settings-video",
+                "settings-video-advanced",
+                // The advanced part is below the fold of the card.
+                &[][..],
+            ),
+        ] {
+            let (few, many) = (card_texts(simple), card_texts(advanced));
+            for wanted in only_advanced {
+                assert!(!has(&few, wanted), "{simple} shows {wanted:?}");
+                assert!(has(&many, wanted), "{advanced} lacks {wanted:?}");
+            }
+            // The advanced page is the simple one and more: its content is
+            // longer (the part past the card is scrolled to).
+            let (short, long) = (content_height(simple), content_height(advanced));
+            assert!(
+                long > short + 20.0,
+                "{advanced}: {long} is not above {short}"
+            );
+        }
+        // The simple pages keep what a person needs.
+        let appearance = card_texts("settings-appearance");
+        for wanted in ["Colours", "Text size"] {
+            assert!(has(&appearance, wanted), "Appearance lacks {wanted:?}");
+        }
+        let notifications = card_texts("settings-notifications");
+        for wanted in ["Group rooms", "Direct messages", "Desktop notifications"] {
+            assert!(has(&notifications, wanted), "Notifications lack {wanted:?}");
+        }
+        let voice = card_texts("settings-voice-audio");
+        for wanted in ["Microphone", "Speakers", "How you talk", "Noise reduction"] {
+            assert!(has(&voice, wanted), "Voice & audio lacks {wanted:?}");
+        }
+        let video = card_texts("settings-video");
+        for wanted in ["Camera", "Picture quality"] {
+            assert!(has(&video, wanted), "Video lacks {wanted:?}");
+        }
+    }
+
+    /// The switch is in the card's header on every page and says what it
+    /// does; a click on it sends the opposite of what is set.
+    #[test]
+    fn the_advanced_switch_is_in_the_header_of_every_page() {
+        let renderer = renderer();
+        for (name, _) in PAGE_SCENARIOS {
+            let app = page_app(name);
+            assert!(has(&card_texts(name), "Show advanced settings"), "{name}");
+            let wanted = format!("Settings(Advanced({}))", !is_advanced(name));
+            let found: Vec<String> = senders(&app, &renderer, WIDE)
+                .into_iter()
+                .map(|(_, t)| t)
+                .filter(|t| t.starts_with("Settings(Advanced"))
+                .collect();
+            assert_eq!(found, vec![wanted], "{name}");
+        }
+    }
+
     /// The page on show draws its own title (and the list has its name); the
     /// other pages have only their name in the list.
     #[test]
@@ -3226,7 +3382,14 @@ mod settings_pages {
         for (name, page) in PAGE_SCENARIOS {
             let app = page_app(name);
             let mut laid = Laid::new(&app, &renderer, WIDE);
-            let shown = texts(&mut laid, &renderer);
+            let body = find_body(&laid.node).expect("the body");
+            let card = card_above(&laid.node, body).bounds();
+            // The room behind the card has words of its own (a Video
+            // button): only what the card draws counts.
+            let shown: Vec<_> = texts(&mut laid, &renderer)
+                .into_iter()
+                .filter(|(_, b)| card.contains(b.center()))
+                .collect();
             for other in SettingsPage::ALL {
                 let count = shown.iter().filter(|(t, _)| t == other.label()).count();
                 let wanted = if other == page { 2 } else { 1 };
@@ -3288,7 +3451,7 @@ mod settings_pages {
         )));
         apps.push((SettingsPage::Profile, "profile edited".to_owned(), profile));
         // Notifications with a typed keyword: Add is on.
-        let mut typed = page_app("settings-notifications");
+        let mut typed = page_app("settings-notifications-advanced");
         let _ = typed.update(Message::Settings(SettingsMessage::KeywordInput(
             "word".to_owned().into(),
         )));
@@ -3346,14 +3509,19 @@ mod settings_pages {
         assert_eq!(pages, wanted);
     }
 
-    /// Voice & audio and Sessions each have the one button that opens their
-    /// own screen, apart from the Close of the card.
+    /// Sessions has the one button that opens its screen, apart from the
+    /// Close of the card; Voice & audio has the one that opens the card with
+    /// every audio option only at the advanced level.
     #[test]
     fn the_voice_and_sessions_pages_have_their_one_button() {
         let renderer = renderer();
         for (name, wanted) in [
-            ("settings-voice-audio", "Settings(OpenVoiceAudio)"),
-            ("settings-sessions", "Settings(OpenSessions)"),
+            ("settings-voice-audio", None),
+            (
+                "settings-voice-audio-advanced",
+                Some("Settings(OpenVoiceAudio)"),
+            ),
+            ("settings-sessions", Some("Settings(OpenSessions)")),
         ] {
             let app = page_app(name);
             let found: Vec<String> = senders(&app, &renderer, WIDE)
@@ -3361,7 +3529,8 @@ mod settings_pages {
                 .map(|(_, t)| t)
                 .filter(|t| t.starts_with("Settings(Open"))
                 .collect();
-            assert_eq!(found, vec![wanted.to_owned()], "{name}");
+            let wanted: Vec<String> = wanted.into_iter().map(str::to_owned).collect();
+            assert_eq!(found, wanted, "{name}");
         }
     }
 
@@ -3397,7 +3566,10 @@ mod settings_pages {
             let mine: Vec<&String> = op.0.iter().filter(|id| id.contains("settings-")).collect();
             let wanted = match page {
                 SettingsPage::Profile => vec![id_of(NAME_INPUT_ID)],
-                SettingsPage::Notifications => vec![id_of(KEYWORD_INPUT_ID)],
+                // Keywords are for the advanced level.
+                SettingsPage::Notifications if is_advanced(name) => {
+                    vec![id_of(KEYWORD_INPUT_ID)]
+                }
                 _ => Vec::new(),
             };
             assert_eq!(mine, wanted.iter().collect::<Vec<_>>(), "{name}");
@@ -3409,6 +3581,10 @@ mod settings_pages {
         let renderer = renderer();
         let mut heights = Vec::new();
         for (name, _) in PAGE_SCENARIOS {
+            // The one with a failure shown is checked below.
+            if name == "settings-notifications-long" {
+                continue;
+            }
             let app = page_app(name);
             let laid = Laid::new(&app, &renderer, WIDE);
             let body = find_body(&laid.node).expect("the body");
@@ -4219,7 +4395,7 @@ mod dialogs {
         for variant in variants(false).iter().step_by(5) {
             for (asking, _, confirm, cancel, _) in QUESTIONS {
                 let mut app = scenario_app(asking);
-                app.set_ui_settings(variant.settings());
+                apply(&mut app, *variant);
                 app.window_width = WIDE.width;
                 let list = senders(&app, &renderer, WIDE);
                 let danger = app.current_theme().palette().danger;
@@ -5296,7 +5472,7 @@ mod security_screens {
         for variant in variants(false).iter().step_by(5) {
             for (asking, _, confirm, cancel, _) in QUESTIONS {
                 let mut app = scenario_app(asking);
-                app.set_ui_settings(variant.settings());
+                apply(&mut app, *variant);
                 app.window_width = WIDE.width;
                 let list = senders(&app, &renderer, WIDE);
                 let danger = app.current_theme().palette().danger;
@@ -5895,7 +6071,7 @@ mod security_screens {
             let laid = Laid::new(&app, &renderer, WIDE);
             room_pane_place(&laid)
         };
-        assert_eq!(base.1, vec![1, 4]);
+        assert_eq!(base.1, vec![1, 5]);
         for name in all().chain(["banner-device", "banner-recovery-off", "banner-notice"]) {
             for size in [WIDE, NARROW] {
                 let app = app_at(name, size);
@@ -5923,5 +6099,315 @@ mod security_screens {
                 .all(|t| !t.contains('\n') || t.len() > 100 || true)
         );
         let _ = count;
+    }
+}
+
+// ---- Video in calls: the stage, the picker and the sharing bar -------------
+
+mod video_stage {
+    use super::*;
+    use twicecat_app::video::VideoMessage;
+    use twicecat_core::api::{
+        CoreEvent, ScreenSource, ScreenSourceId, ScreenSourceKind, ScreenSources, VideoTrackId,
+    };
+
+    /// The room pane's column `[title, stage, timeline, bars, editor]`.
+    fn room_column_node<'n>(laid: &'n Laid<'_>) -> &'n Node {
+        let mut node = &laid.node;
+        loop {
+            let kids = node.children();
+            if kids.len() == 3 && kids[1].children().len() == 5 {
+                return &kids[1].children()[2].children()[0];
+            }
+            node = &kids[0];
+        }
+    }
+
+    /// Every message a click at the middle of each node makes.
+    fn clicks_everywhere(laid: &mut Laid<'_>, renderer: &Renderer, size: Size) -> Vec<Message> {
+        laid.settle(renderer, size);
+        let mut all = Vec::new();
+        collect_bounds(&laid.node, iced::Point::ORIGIN, &mut all, 0);
+        let mut messages = Vec::new();
+        for (rect, _) in all.iter().filter(|(r, _)| r.width > 0.0 && r.height > 0.0) {
+            let at = iced::Point::new(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+            messages.extend(click(laid, renderer, size, at));
+        }
+        messages
+    }
+
+    fn video(m: &Message) -> Option<&VideoMessage> {
+        match m {
+            Message::Video(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn the_stage_sits_between_the_title_and_the_timeline_and_leaves_the_timeline_room() {
+        let renderer = renderer();
+        for name in ["main-call-video", "main-call-video-share"] {
+            for width in [1280.0, 1000.0, 900.0] {
+                let mut app = scenario_app(name);
+                with_settings(&mut app, DENSITIES[0], RoomListChoice::Expanded);
+                app.window_width = width;
+                let size = Size::new(width, 800.0);
+                let laid = Laid::new(&app, &renderer, size);
+                let column = room_column_node(&laid);
+                let kids = column.children();
+                let (stage, timeline) = (kids[1].bounds(), kids[2].bounds());
+                let what = format!("{name} at {width}");
+                assert!(
+                    stage.height > 150.0,
+                    "{what}: the stage is {}",
+                    stage.height
+                );
+                assert!(
+                    timeline.height >= 150.0,
+                    "{what}: the timeline is {}",
+                    timeline.height
+                );
+                assert!(
+                    stage.y + stage.height <= timeline.y + 0.5,
+                    "{what}: the stage runs over the timeline"
+                );
+                // Nothing on the stage spills out of its parent.
+                let mut out = Vec::new();
+                spills(&kids[1], iced::Point::ORIGIN, &mut out);
+                assert!(out.is_empty(), "{what}: spills {out:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn without_video_the_stage_takes_no_room() {
+        let renderer = renderer();
+        for name in ["main-call-connected", "main-room", "main-call-video-folded"] {
+            let mut app = scenario_app(name);
+            with_settings(&mut app, DENSITIES[0], RoomListChoice::Expanded);
+            let laid = Laid::new(&app, &renderer, WIDE);
+            let kids = room_column_node(&laid).children();
+            let stage = kids[1].bounds();
+            if name == "main-call-video-folded" {
+                // One line with the buttons that bring it back.
+                assert!(stage.height > 0.0 && stage.height < 80.0, "{stage:?}");
+            } else {
+                assert_eq!(stage.height, 0.0, "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_click_on_a_picture_pins_it_and_the_sharing_bar_stops_the_share() {
+        let renderer = renderer();
+        // The small tiles of the strip have no buttons: only a click on the
+        // picture can pin them.
+        let app = scenario_app("main-call-video-share");
+        let mut laid = Laid::new(&app, &renderer, WIDE);
+        let pinned = clicks_everywhere(&mut laid, &renderer, WIDE);
+        assert!(
+            pinned.iter().any(|m| matches!(
+                video(m),
+                Some(VideoMessage::Pin(t)) if *t == VideoTrackId::from("bea-Camera")
+            )),
+            "no click pins a picture: {pinned:?}"
+        );
+        assert!(
+            pinned.iter().all(|m| !matches!(
+                video(m),
+                Some(VideoMessage::StopShare | VideoMessage::StartShare)
+            )),
+            "{pinned:?}"
+        );
+        let sharing = scenario_app("main-call-sharing");
+        let mut laid = Laid::new(&sharing, &renderer, WIDE);
+        let sent = clicks_everywhere(&mut laid, &renderer, WIDE);
+        assert!(
+            sent.iter()
+                .any(|m| matches!(video(m), Some(VideoMessage::StopShare))),
+            "no click stops the share: {sent:?}"
+        );
+    }
+
+    #[test]
+    fn the_sharing_bar_stays_in_the_window_at_every_width() {
+        let renderer = renderer();
+        for width in [1280.0, 900.0, 720.0, 520.0] {
+            let mut app = scenario_app("main-call-sharing");
+            with_settings(&mut app, DENSITIES[0], RoomListChoice::Expanded);
+            app.window_width = width;
+            let size = Size::new(width, 800.0);
+            let mut laid = Laid::new(&app, &renderer, size);
+            let sent = clicks_everywhere(&mut laid, &renderer, size);
+            assert!(
+                sent.iter()
+                    .any(|m| matches!(video(m), Some(VideoMessage::StopShare))),
+                "Stop sharing cannot be reached at {width}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_picker_starts_a_share_only_once_something_is_picked() {
+        let renderer = renderer();
+        let monitor = |id: &str| ScreenSource {
+            id: ScreenSourceId::from(id),
+            kind: ScreenSourceKind::Monitor,
+            title: id.to_owned(),
+            width: 1920,
+            height: 1080,
+            thumbnail: None,
+        };
+        let mut app = scenario_app("main-call-video");
+        let _ = app.update(Message::Video(VideoMessage::ToggleShare));
+        let _ = app.update(Message::Core(Box::new(CoreEvent::ScreenSources(
+            ScreenSources {
+                system_picker: false,
+                sources: vec![monitor("one"), monitor("two")],
+            },
+        ))));
+        let mut laid = Laid::new(&app, &renderer, WIDE);
+        let sent = clicks_everywhere(&mut laid, &renderer, WIDE);
+        assert!(
+            sent.iter()
+                .all(|m| !matches!(video(m), Some(VideoMessage::StartShare))),
+            "Share started with nothing picked: {sent:?}"
+        );
+        assert!(
+            sent.iter()
+                .any(|m| matches!(video(m), Some(VideoMessage::PickSource(_)))),
+            "no card can be picked: {sent:?}"
+        );
+        assert!(
+            sent.iter()
+                .any(|m| matches!(video(m), Some(VideoMessage::CancelShare))),
+            "no way out: {sent:?}"
+        );
+        // A system picker needs nothing picked.
+        let app = scenario_app("share-picker-system");
+        let mut laid = Laid::new(&app, &renderer, WIDE);
+        let sent = clicks_everywhere(&mut laid, &renderer, WIDE);
+        assert!(
+            sent.iter()
+                .any(|m| matches!(video(m), Some(VideoMessage::StartShare))),
+            "{sent:?}"
+        );
+        // A source picked: Share works.
+        let app = scenario_app("share-picker");
+        let mut laid = Laid::new(&app, &renderer, WIDE);
+        let sent = clicks_everywhere(&mut laid, &renderer, WIDE);
+        assert!(
+            sent.iter()
+                .any(|m| matches!(video(m), Some(VideoMessage::StartShare))),
+            "{sent:?}"
+        );
+    }
+
+    /// Draws the stage with the headless wgpu renderer, where a shader widget
+    /// really runs, and looks at the pixels of the tiles. Skipped where there
+    /// is no adapter (CI).
+    #[test]
+    fn the_gpu_draws_the_pictures_of_the_stage() {
+        use iced::advanced::renderer::Headless as _;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a current-thread runtime");
+        let Some(gpu) = runtime.block_on(Renderer::new(fonts::BODY, Pixels(16.0), Some("wgpu")))
+        else {
+            eprintln!("no wgpu adapter: skipped");
+            return;
+        };
+        if !gpu.name().to_lowercase().contains("wgpu") {
+            eprintln!("renderer {}: skipped", gpu.name());
+            return;
+        }
+        // Fonts for the labels, as the other tests load them.
+        let _ = renderer();
+        let mut app = scenario_app("main-call-video");
+        with_settings(&mut app, DENSITIES[0], RoomListChoice::Expanded);
+        let mut laid = Laid::new(&app, &gpu, WIDE);
+        laid.settle(&gpu, WIDE);
+        let stage = &room_column_node(&laid).children()[1];
+        let origin = origin_of(&laid.node, stage, iced::Point::ORIGIN).expect("the stage");
+        let mut all = Vec::new();
+        collect_bounds(stage, origin, &mut all, 0);
+        // The tiles are the 16:9 boxes at least 100 wide.
+        let mut tiles: Vec<Rectangle> = all
+            .iter()
+            .map(|(r, _)| *r)
+            .filter(|r| r.width > 100.0 && (r.width / r.height - 16.0 / 9.0).abs() < 0.02)
+            .collect();
+        tiles.dedup_by(|a, b| (a.x - b.x).abs() < 1.0 && (a.y - b.y).abs() < 1.0);
+        assert!(tiles.len() >= 3, "found {} tiles", tiles.len());
+        let pixels = laid.pixels(&app, gpu, WIDE);
+        // For a look: `TWICECAT_GALLERY_DIR=... cargo test ... the_gpu_draws`.
+        if std::env::var_os("TWICECAT_GALLERY_DIR").is_some() {
+            let dir = gallery_dir();
+            std::fs::create_dir_all(&dir).expect("create the gallery directory");
+            image::RgbaImage::from_raw(WIDE.width as u32, WIDE.height as u32, pixels.clone())
+                .expect("width x height x 4 bytes")
+                .save(dir.join("gpu-main-call-video.png"))
+                .expect("write the PNG");
+        }
+        let at = |x: f32, y: f32| {
+            let i = (y as usize * WIDE.width as usize + x as usize) * 4;
+            [pixels[i], pixels[i + 1], pixels[i + 2]]
+        };
+        // The gradient frame is neutral grey, from dark to light: two tiles
+        // (our camera and Bea's) show it, so the centre of each is the middle
+        // grey and not black.
+        let grey: Vec<_> = tiles
+            .iter()
+            .map(|r| at(r.x + r.width / 2.0, r.y + r.height / 2.0))
+            // Y = 112 of limited range 16..235 is 112 of 255 on screen: the
+            // picture is drawn as the frame says, not darker or lighter.
+            .filter(|p| p.iter().all(|c| (104..=120).contains(c)))
+            .collect();
+        assert_eq!(
+            grey.len(),
+            2,
+            "the pictures of two tiles are on screen: {:?}",
+            tiles
+                .iter()
+                .map(|r| at(r.x + r.width / 2.0, r.y + r.height / 2.0))
+                .collect::<Vec<_>>()
+        );
+        // The gradient runs from dark (left) to light (right). Bea's picture
+        // is drawn as it is; ours, the camera, is mirrored as in a mirror.
+        let edges = |r: Rectangle| {
+            (
+                at(r.x + 12.0, r.y + r.height / 2.0),
+                at(r.x + r.width - 12.0, r.y + r.height / 2.0),
+            )
+        };
+        let (ours_left, ours_right) = edges(tiles[0]);
+        let (bea_left, bea_right) = edges(tiles[1]);
+        assert!(
+            bea_left[0] < bea_right[0],
+            "left {bea_left:?} right {bea_right:?}"
+        );
+        assert!(
+            ours_left[0] > ours_right[0],
+            "left {ours_left:?} right {ours_right:?}"
+        );
+    }
+
+    #[test]
+    fn the_full_screen_view_covers_the_window_and_has_a_way_out() {
+        let renderer = renderer();
+        let app = scenario_app("video-fullscreen");
+        let mut laid = Laid::new(&app, &renderer, WIDE);
+        let sent = clicks_everywhere(&mut laid, &renderer, WIDE);
+        assert!(
+            sent.iter()
+                .any(|m| matches!(video(m), Some(VideoMessage::ExitFullscreen))),
+            "{sent:?}"
+        );
+        // Under it nothing is reachable: no click on the window makes another
+        // message than the way out.
+        assert!(
+            sent.iter().all(|m| !matches!(m, Message::SelectRoom(_))),
+            "{sent:?}"
+        );
     }
 }

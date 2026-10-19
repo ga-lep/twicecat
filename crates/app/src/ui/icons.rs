@@ -83,11 +83,21 @@ pub enum Icon {
     Home,
     /// The members of a room.
     Members,
+    /// A camera.
+    Camera,
+    /// Sharing a screen or window.
+    ScreenShare,
+    /// A picture shown over the whole window.
+    Fullscreen,
+    /// A picture kept in the big place.
+    Pin,
+    /// Video, as a settings page.
+    Video,
 }
 
 impl Icon {
     /// Every icon, in declaration order.
-    pub const ALL: [Self; 36] = [
+    pub const ALL: [Self; 41] = [
         Self::Lock,
         Self::LockOpen,
         Self::Call,
@@ -124,6 +134,11 @@ impl Icon {
         Self::Dot,
         Self::Home,
         Self::Members,
+        Self::Camera,
+        Self::ScreenShare,
+        Self::Fullscreen,
+        Self::Pin,
+        Self::Video,
     ];
 
     /// The Unicode text that draws the icon today.
@@ -165,6 +180,11 @@ impl Icon {
             Self::Dot => "\u{25CF}",
             Self::Home => "\u{2302}",
             Self::Members => "\u{1F464}",
+            Self::Camera => "\u{1F4F7}",
+            Self::ScreenShare => "\u{1F4FA}",
+            Self::Fullscreen => "\u{26F6}",
+            Self::Pin => "\u{1F4CC}",
+            Self::Video => "\u{1F3A5}",
         }
     }
 
@@ -207,6 +227,11 @@ impl Icon {
             Self::Dot => "Status",
             Self::Home => "Home",
             Self::Members => "Members",
+            Self::Camera => "Camera",
+            Self::ScreenShare => "Share your screen",
+            Self::Fullscreen => "Full screen",
+            Self::Pin => "Pin",
+            Self::Video => "Video",
         }
     }
 }
@@ -273,7 +298,7 @@ mod tests {
             assert!(!icon.label().trim().is_empty(), "{icon:?}");
             assert!(seen.insert(icon.glyph()), "{icon:?} repeats a glyph");
         }
-        assert_eq!(Icon::ALL.len(), 36);
+        assert_eq!(Icon::ALL.len(), 41);
         assert_eq!(Icon::Home.label(), "Home");
         assert_eq!(Icon::Members.label(), "Members");
     }

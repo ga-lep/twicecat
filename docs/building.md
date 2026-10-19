@@ -11,6 +11,30 @@ There are two builds of the desktop app. They differ only in where voices are cl
 
 RustRover has a run configuration for each build, shared in `.run/`. They appear in the run menu as **Twicecat full (GPU)** and **Twicecat light (CPU only)**.
 
+## Before the first build
+
+- **Rust 1.97.1.** `rust-toolchain.toml` pins it with rustfmt and clippy; rustup installs it on the first `cargo` call.
+- **libwebrtc, once.** Run `scripts/fetch-libwebrtc.sh` before the first build. It downloads LiveKit's prebuilt libwebrtc, checks its pinned SHA-256 and prints the directory it unpacked. On Linux and macOS it also links that directory into `dev/libwebrtc`, where `.cargo/config.toml` looks. On Windows, symlinks need extra privileges, so export the printed path as `LK_CUSTOM_WEBRTC` instead. Never let webrtc-sys download libwebrtc itself: that download is not checked (`scripts/check-no-webrtc-download.sh` catches it).
+- **Linux:** clang 21 or newer for webrtc-sys (libwebrtc's libc++ needs it; Ubuntu 24.04's clang 18 is too old), with `CC=clang-22 CXX=clang++-22` or your version; `lld` (aarch64 links with it); and the development packages, on Debian and Ubuntu:
+
+  ```bash
+  sudo apt-get install libxkbcommon-dev libwayland-dev libx11-dev libdbus-1-dev libssl-dev pkg-config libglib2.0-dev lld libasound2-dev libpipewire-0.3-dev libudev-dev
+  ```
+
+  `.github/actions/setup-build/action.yml` is the list CI installs, and `dev/ubuntu-24.04/Dockerfile` builds everything on Ubuntu 24.04 with clang 22 from apt.llvm.org.
+- **Windows:** the Visual Studio Build Tools with the C++ workload, and Git Bash for the scripts.
+- **macOS:** the Xcode command line tools.
+
+The scripts in `scripts/` are bash; run them from the repository root.
+
+## Hardware video encoding (NVIDIA, Linux)
+
+Both builds encode call video with LiveKit's own encoders. On Linux, LiveKit's NVENC encoder and NVDEC decoder are compiled in only when NVIDIA's `cuda.h` is there at build time. Get it once with `scripts/fetch-cuda-headers.sh` (about 2 MB, from NVIDIA's pinned CUDA runtime wheel, under NVIDIA's licence). It is linked into `dev/cuda`, where `.cargo/config.toml` points `CUDA_HOME`. A system CUDA toolkit works too: set `CUDA_HOME` to it.
+
+If you built before fetching the header, run `cargo clean -p webrtc-sys` once. webrtc-sys does not notice the header appearing.
+
+Without the header, or on a machine without an NVIDIA GPU, video is encoded on the CPU (VP8, up to 1080p30). The NVIDIA libraries are loaded at run time, so the same binary runs everywhere.
+
 ## What the full build needs at run time
 
 Nothing GPU-related is linked at build time. The full build loads these files when a call or mic test starts. Each script checks a pinned SHA-256 and unpacks into `~/.cache/twicecat/`.
@@ -34,6 +58,73 @@ In the app, open **Settings → Voice & audio**.
 
 The core prefers TensorRT, then CUDA, DirectML, WebGPU and Core ML, and uses the first that starts.
 
+## Release builds
+
+Releases are built with the `dist` profile: `cargo build --profile dist -p twicecat-app`. It is `release` with fat link-time optimisation over one codegen unit: 1–3 % faster on the voice chain and 22 % smaller once stripped, but 16 minutes instead of 4½ on a 24-core laptop. Use `--release` for everyday work.
+
+The CPU level is set per target in `.cargo/config.toml`. x86_64 Linux and Windows build for x86-64-v3 (AVX2, FMA, BMI2), which saves about 11 % of the voice chain against the x86-64 baseline. The app refuses an older CPU at start with a message instead of crashing: on Linux on stderr, on Windows in a message box. macOS and aarch64 use the target's default. Phase 7's plan (`docs/plans/phase7-packaging.md`) has the measurements behind these choices.
+
+To measure them again, on this machine or another:
+
+```bash
+scripts/measure-builds.sh
+```
+
+It builds each CPU level, prints the size of `twicecat` and times the voice chain per 10 ms on one core of each kind. The defaults are x86-64 and v3, plus v4 where the CPU has AVX-512; on aarch64, generic, Cortex-A76 and the CPU's own. `--variants`, `--profile dist`, `--cores`, `--rounds` and `--frames` change that. Other levels are built with `--target`, so their flags never reach the build scripts, which run on this machine. The "Profile" workflow (Actions tab) runs the same script on GitHub's x86_64 or arm runner.
+
+## Packages
+
+`scripts/package.sh` builds the release binary and packages it for the machine it runs on, into `target/package/<triple>/`:
+
+| Machine | Packages | Made by |
+| --- | --- | --- |
+| Linux | `.tar.zst`, `.deb`, `.rpm`, AppImage, plus a symbols archive | nfpm, appimagetool |
+| macOS | `.app` in a DMG | cargo-packager |
+| Windows | MSI | cargo-packager |
+
+Every package carries the full (GPU) build, the DeepFilterNet3 models, `LICENSE` and `THIRD_PARTY_NOTICES.html`. Linux packages and the Windows MSI also carry the "any GPU" pack: ONNX Runtime's CPU build, its WebGPU plugin (on Windows with the DirectX shader compiler it needs) and the stateful graph. On Windows they go beside `twicecat.exe`. On Linux these resources go in `<prefix>/lib/twicecat`, beside `<prefix>/bin/twicecat`. They don't go in `<prefix>/share/twicecat`, because that is the app's data directory when the `.tar.zst` is unpacked into `~/.local`. They need:
+
+- the models, ONNX Runtime and the WebGPU plugin, which the script fetches with the pinned fetch scripts;
+- the stateful graph from `scripts/export-deepfilternet.sh`, or `TWICECAT_STATEFUL_MODEL` (checked against its pinned SHA-256);
+- the packaging tools, fetched pinned by `scripts/fetch-packaging-tools.sh`: nfpm, appimagetool and the AppImage runtime (Linux), or `cargo install cargo-packager@0.11.8 --locked` (macOS, Windows);
+- `cargo install cargo-about@0.9.2 --locked --features cli`, for the notices.
+
+Options: `--profile release` (faster, for testing; releases use `dist`), `--formats "tar deb"`, `--no-build`.
+
+Linux packages need the build machine's glibc or newer. Release CI builds them in the Ubuntu 24.04 image in `dev/ubuntu-24.04/Dockerfile` (glibc 2.39), so they run on the Steam Frame, Ubuntu 24.04, Debian 13, and Fedora 43 or newer. A package built on a newer distribution needs that distribution's glibc. `package.sh` stops when the binary needs a newer glibc than the floor `packaging/nfpm.yaml` declares, so build in that image; its header has the commands.
+
+To build for the Steam Frame (aarch64) on an x86_64 machine, use the cross image in `dev/ubuntu-24.04-aarch64-cross/Dockerfile`: it builds the binary in about 5 minutes, and `scripts/package.sh --no-build` packages it on an aarch64 machine.
+
+`scripts/smoke-test-packages.sh target/package/<triple>` then checks each Linux package headless:
+
+- **`.tar.zst` and AppImage:** run here.
+- **`.deb`:** installed with apt in `ubuntu:24.04` and `ubuntu:26.04`.
+- **`.rpm`:** installed with dnf in `fedora:43` and `fedora:44`.
+
+Each must print its version, resolve every library and carry its resources where the app looks for them.
+
+### Flatpak
+
+The Flatpak (`packaging/flatpak/io.github.ga_lep.Twicecat.yml`) is built from this source tree on the Freedesktop 26.08 runtime, with clang 22 from its LLVM extension and Rust 1.97.1 from the standalone installer. The build is offline: every crate comes from `packaging/flatpak/cargo-sources.json`, and every other download (libwebrtc, the models, the "any GPU" pack, CUDA's header) is a source pinned by the same SHA-256 as in `scripts/checksums/`. The fetch scripts take those files from `TWICECAT_DOWNLOADS` instead of the network, and `scripts/package.sh --formats prefix` installs the same tree as the `.deb` into `/app`. It needs `flatpak` and `flatpak-builder` from your distribution.
+
+```bash
+scripts/flatpak.sh build
+```
+
+That makes `target/package/flatpak/Twicecat-<version>-<arch>.flatpak` for this machine's architecture (x86_64 or aarch64). Then `scripts/flatpak.sh smoke` installs it for your user and checks `--version` and the bundled files.
+
+When `Cargo.lock` changes, regenerate the crate list with `scripts/flatpak.sh sources` and commit it. CI's `scripts/flatpak.sh check` fails until you do. It uses flatpak-cargo-generator.py at a pinned commit in a small Python venv.
+
+### Releases
+
+The "Release" workflow (`.github/workflows/release.yml`) builds every package on GitHub's runners:
+
+- **Linux x86_64 and aarch64:** `scripts/package.sh` and its smoke test, then the Flatpak in Flathub's CI image.
+- **Windows x64:** the MSI.
+- **macOS on Apple Silicon:** the DMG.
+
+It runs on a `v*` tag, after `scripts/check-version.sh` passes, and makes a **draft** release (a pre-release when the tag has a label, as in `v0.1.0-alpha`; the packages keep the workspace version, as WiX takes only a numeric pre-release) with `SHA256SUMS.txt` and build provenance attestations. Its files are named `twicecat-<tag>-<os>-<arch>.<format>` (`scripts/release-names.sh`), and its notes start with a table of downloads (`scripts/release-notes.sh`); publishing it is up to you. "Run workflow" on the Actions tab is a dry run: the same packages as one artifact, and no release. Signing runs only when its secrets exist (the workflow's header lists them); otherwise the job summary and the release notes say "unsigned".
+
 ## Push-to-talk on Linux
 
 On Wayland the global push-to-talk key goes through the desktop's shortcuts portal (KDE Plasma, and GNOME and Hyprland in recent versions). The portal knows Twicecat by its app ID, `io.github.ga_lep.Twicecat`, and looks for a desktop entry with that name. A build run with `cargo run` has none, so install the one in the repository once:
@@ -46,7 +137,9 @@ The first time push-to-talk starts (a call, the mic test, or the Voice & audio c
 
 On X11, Windows and macOS the key is registered directly; nothing needs installing. In SteamOS game mode (gamescope) there is no global shortcut: the key works while Twicecat's window has focus, and a gamepad button works everywhere.
 
-To see what push-to-talk receives on a desktop, without the app: `cargo run -p twicecat-ptt --example ptt_probe -- --key ctrl+shift+KeyT --button left_thumb`.
+A mouse button (the middle one, the side buttons "mouse 4" and "mouse 5", or on X11 and macOS another one, picked with **Set key…**) works in every app on X11 (XInput 2.1 or newer), Windows and macOS. Other apps still receive its clicks, so a side button still goes back in a browser. Wayland shows an app the mouse only over its own windows, so there, and in game mode, the button works while Twicecat's window has focus.
+
+To see what push-to-talk receives on a desktop, without the app: `cargo run -p twicecat-ptt --example ptt_probe -- --key ctrl+shift+KeyT --mouse back --button left_thumb`.
 
 ## Disk use
 

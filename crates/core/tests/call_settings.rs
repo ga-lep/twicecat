@@ -1,16 +1,18 @@
-//! Audio settings through the core API: defaults, validation, persistence
-//! across restarts, per-user volume, a corrupt file, device listing, and the
-//! call commands that are not available yet. Needs no server or audio device.
+//! Audio and video settings through the core API: defaults, validation,
+//! persistence across restarts, per-user volume, a corrupt file, device
+//! listing, the video encoders, and the call commands that are not
+//! available yet. Needs no server or audio device.
 
 mod common;
 
 use std::sync::Arc;
 
-use common::{expect_event, start_core, start_core_with_audio};
+use common::{expect_event, silence, start_core, start_core_with_audio, start_core_with_video};
 use twicecat_core::CoreHandle;
 use twicecat_core::api::{
-    AudioSettings, CallIntent, Command, CoreError, CoreEvent, InputMode, PushToTalkBindings,
-    RoomId, UserId,
+    AudioSettings, CallIntent, Command, CoreError, CoreEvent, EncoderBackend, EncoderChoice,
+    InputMode, PushToTalkBindings, RoomId, SoundSource, TEST_PATTERN_ID, UserId, VideoBackend,
+    VideoQuality, VideoSettings, VideoTrackId,
 };
 use twicecat_core::paths::DataPaths;
 use twicecat_core::secrets::InMemorySecretStore;
@@ -51,6 +53,7 @@ async fn update_is_validated_saved_and_survives_a_restart() {
         voice_bitrate_kbps: 96,
         push_to_talk: PushToTalkBindings {
             key: Some("ctrl+shift+KeyT".into()),
+            mouse_button: Some("back".into()),
             gamepad_button: Some("left_thumb".into()),
         },
         ..AudioSettings::default()
@@ -82,6 +85,7 @@ async fn user_volume_is_remembered() {
         &handle,
         Command::SetUserVolume {
             user_id: bob.clone(),
+            source: SoundSource::Voice,
             percent: 300,
         },
     )
@@ -91,6 +95,19 @@ async fn user_volume_is_remembered() {
         &handle,
         Command::SetUserVolume {
             user_id: bob.clone(),
+            source: SoundSource::ScreenShare,
+            percent: 30,
+        },
+    )
+    .await;
+    let s = settings(&mut handle).await;
+    assert_eq!(s.user_share_volume(&bob), 30);
+    assert_eq!(s.user_volume(&bob), 200, "the voice keeps its own");
+    send(
+        &handle,
+        Command::SetUserVolume {
+            user_id: bob.clone(),
+            source: SoundSource::Voice,
             percent: 100,
         },
     )
@@ -98,6 +115,7 @@ async fn user_volume_is_remembered() {
     let s = settings(&mut handle).await;
     assert_eq!(s.user_volume(&bob), 100);
     assert!(s.user_volumes.is_empty(), "100 % is not stored");
+    assert_eq!(s.user_share_volume(&bob), 30);
 }
 
 #[tokio::test]
@@ -137,6 +155,286 @@ async fn call_commands_need_a_session_or_a_call() {
     send(&handle, Command::SetMicMuted(true)).await;
     let e = expect_event(&mut handle, |e| matches!(e, CoreEvent::Error(_))).await;
     assert!(matches!(e, CoreEvent::Error(CoreError::NotInCall)), "{e:?}");
+}
+
+/// The error a command should answer with.
+enum Answer {
+    NotInCall,
+    /// A call error naming this.
+    Call(&'static str),
+    /// Not supported on this system: this feature.
+    NotSupported(&'static str),
+}
+
+/// The video commands without a call and without touching a real camera
+/// (Phase 9 Tasks 5, 8 and 9): what needs a call says so; a preview of a
+/// camera that is not there says that. Listing cameras and screen sources
+/// answers by machine (below).
+#[tokio::test]
+async fn video_commands_answer_without_a_call_or_hardware() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut handle = core(dir.path());
+    use Answer::{Call, NotInCall, NotSupported};
+    // Cameras are captured on Linux only so far.
+    let no_camera = if cfg!(target_os = "linux") {
+        Call("camera")
+    } else {
+        NotSupported("cameras")
+    };
+    let cases = [
+        (
+            Command::StartCamera {
+                device: None,
+                quality: VideoQuality::Auto,
+            },
+            NotInCall,
+        ),
+        (Command::StopCamera, NotInCall),
+        (
+            Command::StartScreenShare {
+                source: None,
+                quality: VideoQuality::Uhd2160p60,
+                audio: true,
+            },
+            NotInCall,
+        ),
+        (Command::StopScreenShare, NotInCall),
+        (
+            Command::SetVideoView {
+                track: VideoTrackId::from("t"),
+                width: 640,
+                height: 360,
+                visible: true,
+            },
+            NotInCall,
+        ),
+        // A named camera that is not there: never this machine's own.
+        (
+            Command::StartCameraPreview {
+                device: Some("twicecat-no-such-camera".into()),
+                quality: VideoQuality::Hd720p30,
+            },
+            no_camera,
+        ),
+    ];
+    for (command, answer) in cases {
+        let name = format!("{command:?}");
+        send(&handle, command).await;
+        let e = expect_event(&mut handle, |e| matches!(e, CoreEvent::Error(_))).await;
+        let ok = match answer {
+            NotInCall => matches!(e, CoreEvent::Error(CoreError::NotInCall)),
+            Call(what) => matches!(&e, CoreEvent::Error(CoreError::Call(w)) if w.contains(what)),
+            NotSupported(what) => {
+                matches!(&e, CoreEvent::Error(CoreError::NotSupported(w)) if w == what)
+            }
+        };
+        assert!(ok, "{name}: {e:?}");
+    }
+    // The system's picker (Wayland), our own list (X11), or nothing to
+    // share without a display (CI).
+    send(&handle, Command::ListScreenSources).await;
+    let e = expect_event(&mut handle, |e| {
+        matches!(e, CoreEvent::Error(_) | CoreEvent::ScreenSources(_))
+    })
+    .await;
+    assert!(
+        matches!(&e, CoreEvent::ScreenSources(_))
+            || matches!(&e, CoreEvent::Error(CoreError::NotSupported(w)) if w == "screen sharing"),
+        "ListScreenSources: {e:?}"
+    );
+    // The cameras here (listing opens none), or why there are none to list
+    // (no PipeWire on CI; no camera capture outside Linux yet).
+    send(&handle, Command::ListVideoDevices).await;
+    let e = expect_event(&mut handle, |e| {
+        matches!(e, CoreEvent::Error(_) | CoreEvent::VideoDevices(_))
+    })
+    .await;
+    assert!(
+        matches!(&e, CoreEvent::VideoDevices(_))
+            || matches!(&e, CoreEvent::Error(CoreError::Call(w)) if w.contains("camera"))
+            || (!cfg!(target_os = "linux")
+                && matches!(&e, CoreEvent::Error(CoreError::NotSupported(w)) if w == "cameras")),
+        "ListVideoDevices: {e:?}"
+    );
+    send(&handle, Command::Shutdown).await;
+}
+
+async fn video_settings(handle: &mut CoreHandle) -> VideoSettings {
+    match expect_event(handle, |e| matches!(e, CoreEvent::VideoSettings(_))).await {
+        CoreEvent::VideoSettings(s) => s,
+        _ => unreachable!("filtered by the predicate"),
+    }
+}
+
+/// Video settings start at their defaults, are saved, and come back after a
+/// restart; a forced software encoder stays forced.
+#[tokio::test]
+async fn video_settings_persist_across_restarts() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut handle = core(dir.path());
+    send(&handle, Command::GetVideoSettings).await;
+    assert_eq!(video_settings(&mut handle).await, VideoSettings::default());
+    assert!(!DataPaths::at(dir.path()).video_settings_file().exists());
+    let chosen = VideoSettings {
+        encoder: EncoderChoice::Prefer(EncoderBackend::Software),
+        screen_quality: VideoQuality::Uhd2160p30,
+        ..VideoSettings::default()
+    };
+    send(&handle, Command::UpdateVideoSettings(chosen.clone())).await;
+    assert_eq!(video_settings(&mut handle).await, chosen);
+    send(&handle, Command::Shutdown).await;
+    while handle.events.recv().await.is_some() {}
+
+    let mut handle = core(dir.path());
+    send(&handle, Command::GetVideoSettings).await;
+    assert_eq!(video_settings(&mut handle).await, chosen);
+    send(&handle, Command::Shutdown).await;
+}
+
+/// Advanced video settings out of bounds are brought inside, saved that way,
+/// echoed, and said in a `VideoSettingsAdjusted` after the echo; settings in
+/// bounds say nothing, and an old file without the new fields still loads.
+#[tokio::test]
+async fn advanced_video_settings_are_validated_and_reported() {
+    use twicecat_core::api::{VideoTuning, video_limits};
+    let dir = tempfile::tempdir().unwrap();
+    let mut handle = core(dir.path());
+    let asked = VideoSettings {
+        screen_tuning: VideoTuning {
+            fps: Some(900),
+            bitrate_kbps: Some(7_000),
+            ..VideoTuning::default()
+        },
+        ..VideoSettings::default()
+    };
+    send(&handle, Command::UpdateVideoSettings(asked)).await;
+    let echoed = video_settings(&mut handle).await;
+    assert_eq!(echoed.screen_tuning.fps, Some(video_limits::FPS.1));
+    assert_eq!(echoed.screen_tuning.bitrate_kbps, Some(7_000));
+    match expect_event(&mut handle, |e| {
+        matches!(e, CoreEvent::VideoSettingsAdjusted(_))
+    })
+    .await
+    {
+        CoreEvent::VideoSettingsAdjusted(changes) => {
+            assert_eq!(changes.len(), 1, "{changes:?}");
+            assert_eq!(changes[0].setting, "screen.fps");
+        }
+        _ => unreachable!("filtered by the predicate"),
+    }
+    // In bounds: no report.
+    send(&handle, Command::UpdateVideoSettings(echoed.clone())).await;
+    assert_eq!(video_settings(&mut handle).await, echoed);
+    send(&handle, Command::GetVideoSettings).await;
+    assert_eq!(video_settings(&mut handle).await, echoed);
+    send(&handle, Command::Shutdown).await;
+    while let Some(event) = handle.events.recv().await {
+        assert!(
+            !matches!(event, CoreEvent::VideoSettingsAdjusted(_)),
+            "nothing was out of bounds the second time"
+        );
+    }
+    // Saved inside the bounds: a restart reads them back as echoed.
+    let mut handle = core(dir.path());
+    send(&handle, Command::GetVideoSettings).await;
+    assert_eq!(video_settings(&mut handle).await, echoed);
+    send(&handle, Command::Shutdown).await;
+}
+
+/// A settings file from before the advanced fields existed loads, with
+/// everything new automatic.
+#[tokio::test]
+async fn an_old_video_settings_file_still_loads() {
+    let dir = tempfile::tempdir().unwrap();
+    DataPaths::at(dir.path())
+        .write_video_settings(
+            br#"{"version": 1, "settings": {"encoder": {"prefer": "software"}, "upload_cap_kbps": 6000}}"#,
+        )
+        .unwrap();
+    let mut handle = core(dir.path());
+    send(&handle, Command::GetVideoSettings).await;
+    let loaded = video_settings(&mut handle).await;
+    assert_eq!(loaded.upload_cap_kbps, Some(6_000));
+    assert!(loaded.camera_tuning.is_automatic() && loaded.screen_tuning.is_automatic());
+    send(&handle, Command::Shutdown).await;
+}
+
+/// The encoder list always ends with the software path, and names no
+/// encoder in use outside a call.
+#[tokio::test]
+async fn the_encoders_end_with_software() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut handle = core(dir.path());
+    send(&handle, Command::ProbeVideoEncoders).await;
+    let e = expect_event(&mut handle, |e| matches!(e, CoreEvent::VideoEncoders(_))).await;
+    let CoreEvent::VideoEncoders(encoders) = e else {
+        unreachable!("filtered by the predicate")
+    };
+    let last = encoders
+        .encoders
+        .last()
+        .expect("at least the software path");
+    assert_eq!(last.backend, EncoderBackend::Software);
+    assert!(!last.hardware);
+    assert!(
+        encoders
+            .encoders
+            .iter()
+            .all(|e| e.hardware == (e.backend != EncoderBackend::Software)),
+        "{encoders:?}"
+    );
+    assert_eq!(encoders.in_use, None);
+    send(&handle, Command::Shutdown).await;
+}
+
+/// With the test pattern as camera and screen, both are listed, and
+/// sending one needs a call.
+#[tokio::test]
+async fn the_test_pattern_is_the_camera_and_the_screen() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut handle = start_core_with_video(
+        dir.path(),
+        Arc::new(InMemorySecretStore::new()),
+        silence(),
+        None,
+        VideoBackend::TestPattern,
+    );
+    send(&handle, Command::ListVideoDevices).await;
+    let e = expect_event(&mut handle, |e| matches!(e, CoreEvent::VideoDevices(_))).await;
+    let CoreEvent::VideoDevices(devices) = e else {
+        unreachable!("filtered by the predicate")
+    };
+    assert_eq!(devices.cameras.len(), 1);
+    assert_eq!(devices.cameras[0].id.as_str(), TEST_PATTERN_ID);
+    assert!(devices.cameras[0].is_default);
+    send(&handle, Command::ListScreenSources).await;
+    let e = expect_event(&mut handle, |e| matches!(e, CoreEvent::ScreenSources(_))).await;
+    let CoreEvent::ScreenSources(sources) = e else {
+        unreachable!("filtered by the predicate")
+    };
+    assert!(!sources.system_picker);
+    assert_eq!(sources.sources[0].id.as_str(), TEST_PATTERN_ID);
+    send(
+        &handle,
+        Command::StartCamera {
+            device: None,
+            quality: VideoQuality::Hd720p30,
+        },
+    )
+    .await;
+    let e = expect_event(&mut handle, |e| matches!(e, CoreEvent::Error(_))).await;
+    assert!(matches!(e, CoreEvent::Error(CoreError::NotInCall)), "{e:?}");
+    send(
+        &handle,
+        Command::StartCamera {
+            device: Some("usb-cam".into()),
+            quality: VideoQuality::Hd720p30,
+        },
+    )
+    .await;
+    let e = expect_event(&mut handle, |e| matches!(e, CoreEvent::Error(_))).await;
+    assert!(matches!(e, CoreEvent::Error(CoreError::Call(_))), "{e:?}");
+    send(&handle, Command::Shutdown).await;
 }
 
 #[tokio::test]

@@ -5,6 +5,8 @@
 #![recursion_limit = "256"]
 
 pub mod api;
+#[cfg(target_os = "linux")]
+mod appimage_update;
 mod audio_session;
 mod avatars;
 mod call;
@@ -33,8 +35,12 @@ mod spaces;
 mod sync;
 mod threads;
 mod timeline;
+mod updates;
 mod upload;
 mod verification;
+mod video_settings;
 
+#[cfg(target_os = "linux")]
+pub use appimage_update::prepare_tls as prepare_appimage_tls;
 pub use cpu_level::require_cpu_level;
 pub use engine::{Core, CoreConfig, CoreHandle, DEFAULT_ROOM_LIST_PAGE_SIZE};

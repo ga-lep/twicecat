@@ -1,6 +1,6 @@
 [package]
 name = "twicecat-core"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 repository.workspace = true
 license.workspace = true
@@ -41,7 +41,9 @@ rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] 
 # Build with LK_CUSTOM_WEBRTC from scripts/fetch-libwebrtc.sh (pinned SHA-256);
 # without it webrtc-sys downloads libwebrtc unverified.
 twicecat-audio = { path = "../audio" }
-livekit = { version = "=0.9.3", default-features = false, features = ["native", "rustls-tls-native-roots"] }
+# Frames, the test pattern and (later) capture and our encoders (Phase 9).
+twicecat-video = { path = "../video" }
+livekit = { version = "=0.9.5", default-features = false, features = ["native", "rustls-tls-native-roots"] }
 
 [features]
 # GPU speech enhancement (plan Task 13b): DeepFilterNet3 on ONNX Runtime,
@@ -49,8 +51,21 @@ livekit = { version = "=0.9.3", default-features = false, features = ["native", 
 gpu-enhancement = ["twicecat-audio/onnxruntime"]
 
 [dev-dependencies]
+# Performance indicators recorded by tests (docs/testing.md); std only.
+twicecat-perf = { path = "../perf" }
 tempfile = "3"
 # Fake banks in the cleaning tests set DeepFilterStatus; test-only, not in normal builds.
 twicecat-audio = { path = "../audio", features = ["test-fakes"] }
+# The virtual camera (an in-process PipeWire camera) for the camera tests; test-only.
+twicecat-video = { path = "../video", features = ["test-camera"] }
 # Paused time for the unread-totals throttle test; a feature of the pinned-in-lock tokio, no new packages.
 tokio = { version = "1", features = ["test-util"] }
+
+# The AppImage updates itself (Phase 7 plan Q7 b; Q11 approved =0.2.3): its
+# signed manifest checked, the new AppImage downloaded, verified (minisign)
+# and swapped in (crates/core/src/appimage_update.rs). New in the lock with
+# it: cargo-packager-utils, ctor, dirs 5, dirs-sys 0.4, minisign-verify,
+# redox_users, wasm-streams, and the windows-sys 0.48 family for other
+# platforms.
+[target.'cfg(target_os = "linux")'.dependencies]
+cargo-packager-updater = "=0.2.3"

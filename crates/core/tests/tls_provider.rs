@@ -28,6 +28,7 @@ async fn starting_the_core_installs_a_tls_provider() {
             max_upload_bytes_override: None,
             audio: Default::default(),
             call_service_override: None,
+            video: twicecat_core::api::VideoBackend::System,
         },
         Arc::new(InMemorySecretStore::new()),
     );

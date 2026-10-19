@@ -24,6 +24,8 @@ on macOS.
 | Ctrl+= / Ctrl+- / Ctrl+0 | Make the text larger / smaller / back to 100 % |
 | Ctrl+Shift+M | In a call: mute or unmute the microphone |
 | Ctrl+Shift+D | In a call: deafen or undeafen |
+| Ctrl+Shift+O | In a call: turn the camera on or off |
+| Ctrl+Shift+E | In a call: share your screen, or stop sharing |
 | Ctrl+Shift+A / Ctrl+Shift+X | While a call rings (its card is showing): accept / decline it |
 | Tab / Shift+Tab | Move to the next / previous field |
 | Esc | Close the topmost dialog, panel, Settings, the Sessions card or the switcher |
@@ -53,12 +55,14 @@ Rules the code follows (all in tests):
   7. Settings;
   8. a room dialog, the user card, the room settings (a question about leaving
      or encryption first) or the member list;
-  9. a security screen (recovery setup, a question about changing the key or
+  9. the share picker (it only cancels, never starts a share), then the
+     full-screen view of a video;
+  10. a security screen (recovery setup, a question about changing the key or
      resetting the identity);
-  10. the logout warning, then the Sessions card's password prompt, its
+  11. the logout warning, then the Sessions card's password prompt, its
       sign-out question, a rename in progress, then the card itself;
-  11. the composer's suggestions, then its reply or edit mode;
-  12. the thread panel, then the participants panel of a call (the one on
+  12. the composer's suggestions, then its reply or edit mode;
+  13. the thread panel, then the participants panel of a call (the one on
       screen first when the window is too narrow for both).
 
   A text field that took the Esc to drop its focus does not keep an overlay
@@ -97,12 +101,68 @@ Rules the code follows (all in tests):
   it has the focus; other fields (the display name, search, the server field)
   do not. They also do nothing when no card is showing, during the first
   0.6 s of a card, and when the key is still held from the previous ring.
-- Ctrl+Shift+M and Ctrl+Shift+D act only during a call, also over a dialog
-  (the call goes on behind it); without a call they do nothing.
+- Ctrl+Shift+M, Ctrl+Shift+D, Ctrl+Shift+O and Ctrl+Shift+E act only during
+  a call, also over a dialog (the call goes on behind it); without a call they
+  do nothing. Ctrl+Shift+V is not used for the camera: in the composer it is
+  paste.
 - While the Voice & audio card waits for a push-to-talk key (**Set key…**),
   every key goes to it and no shortcut runs: the next key with its
   modifiers becomes the binding, a modifier alone keeps waiting, and Esc,
-  **Cancel**, closing the card or leaving the window stop waiting.
+  **Cancel**, closing the card or leaving the window stop waiting. A mouse
+  button other than left and right pressed then becomes the mouse binding
+  instead; left and right still work the card.
+
+## Settings and Sessions
+
+Settings is a card with a list of pages at its left (Profile, Appearance,
+Notifications, Voice & audio, Video, Keyboard, Sessions, About) and one page
+at its right. Ctrl+, always opens it on Profile, and so does opening it again
+after a close.
+
+- Two levels. **Show advanced settings** (a checkbox in the card's header,
+  off by default and remembered) adds, under a rule on the same pages, what
+  a person with little technical knowledge does not need: density and the
+  room list (Appearance), keywords, message content in notifications and the
+  tray badge (Notifications), a button to the Voice & audio card with every
+  audio option, and on Video every option the camera and screen sharing can
+  be tuned by. A simple page never shows a control that only does something
+  at the advanced level, and every setting an advanced person changed stays
+  in force when the switch goes back off. The simple Voice & audio page
+  holds the microphone, the speakers, the volume, how you talk (and the key),
+  noise reduction in three words (Off, Standard, Strong) and a test with its
+  level; the call's audio buttons open it, or the card at the advanced level.
+  The simple Video page holds the camera with a preview, and a picture
+  quality in words for the camera and for sharing.
+- Esc closes Settings, as before (one layer per press).
+- Tab and Shift+Tab walk the text fields of the page on show, in the order of
+  the widget tree: the display name on Profile, the keyword field on
+  Notifications at the advanced level, and none named on the other pages (the
+  advanced Video page has fields for custom numbers). This iced gives only text
+  fields the keyboard focus; buttons, checkboxes, radio buttons and the list
+  of pages never take it, so they are reached with the pointer. This is a
+  limit of the pinned iced, not a choice; it is on the human checkpoint list.
+  A page change keeps the text typed in the fields of the other pages.
+- The Sessions page of Settings has one button, **Manage sessions...**, which
+  closes Settings and opens the Sessions card. That card closes with its
+  **Close** button or with Esc. Esc closes one thing per press, topmost
+  first: the logout warning, the password prompt, the sign-out question, then
+  the card. It only ever cancels or closes, never confirms a sign-out or a
+  log-out, and while the card or one of its prompts is open it never reaches
+  the room behind it (reply or edit, thread panel, call panel). While the
+  password is on its way to the server the prompt cannot be cancelled, and
+  Esc does nothing. A session named like a tag ("Verified", "This device") or
+  like a device ID is shown in quotes. The rename field and the password prompt
+  are text fields; the prompt takes the focus when it opens.
+- The destructive buttons of Sessions (Sign out, Sign out of all other
+  sessions, Sign out anyway) are red, say what they do in words, sit at least
+  12 px from every other control, and each asks first: the button that asks is
+  not where the one that confirms appears. No key presses a button, so Enter
+  cannot confirm one; Enter in the password field sends it only when the field
+  is not empty.
+- Whether a session is verified is shown in words (**This device**,
+  **Verified**, **Not verified**, **No encryption keys**) and in colour.
+  Session names and IDs come from the server: they are cleaned, capped and
+  wrapped inside the row, and the end of an ID is never cut off.
 
 ## Settings and Sessions
 
@@ -157,8 +217,9 @@ order, so Tab reaches it:
 - the Voice & audio card (from Settings or the call bar's **Audio…**): menus,
   checkboxes, and for each slider **−** and **+** beside it; Esc closes it.
   Its Talking section sets voice activity, push-to-talk or toggle-to-talk,
-  the key (**Set key…**, **Clear**), the gamepad button (a menu, so no pad
-  is needed to pick one) and the release delay;
+  the key (**Set key…**, **Clear**), the mouse button and the gamepad
+  button (menus, so no mouse button or pad is needed to pick one) and the
+  release delay;
 - the incoming-call card, a modal layer above everything else: **Decline**
   then **Accept**, side by side with a gap, and Esc to hide it. iced 0.14's
   buttons take no keys, so the card also answers to **Ctrl+Shift+A** (accept)
@@ -195,6 +256,35 @@ release delay). A slider moved by the wheel or the
 keys, which never reports a release, sends its value after a 400 ms pause.
 Speaking is shown by a ring around the picture and by the word "Speaking",
 muted by a mark and the word "Muted", so neither relies on colour alone.
+
+### Video in calls
+
+- The camera and the share are buttons in the call dock (and the rail's
+  column), and in the stage's header: **Camera** and **Share your screen**.
+  Each shows that it is on by colour and by a check beside the glyph, and
+  its tooltip says what a press does. They answer to Ctrl+Shift+O and
+  Ctrl+Shift+E.
+- The stage is above the timeline of the call's room while someone sends a
+  picture. It has a **Hide** button (the pictures stop being sent to this
+  window while it is hidden), and a line with **Show video** when it is.
+  Each tile writes the person's name, "(you)" for the own camera, "screen" for a
+  share, a mark and the words "Camera off" when the camera is off, and the
+  microphone mark when they are muted. Speaking is a thick ring in the
+  speaking colour around the tile, as for the avatars. A person without a
+  camera shows their avatar. **Pin** keeps a tile in the big place;
+  **Full screen** opens it over the window (Esc, or **Exit full screen**).
+- The share picker lists the screens and windows with a picture, a name and
+  the size in words, or says that the system will ask. **Share** stays off
+  until something is picked. Esc cancels it.
+- While a share goes out, **You are sharing your screen** with **Stop sharing**
+  floats at the bottom of the window over every dialog and card.
+- Pictures are drawn by the GPU renderer. When only the software renderer
+  runs, the stage says so in words instead of staying black.
+- A camera that is unplugged while it is on (in a call or in the Video
+  page's preview) turns off, and a notice says "the camera was
+  disconnected" in words; the preview does not stay frozen on its last
+  picture. The camera list on the Video page follows cameras as they are
+  plugged in and out.
 
 ## Screen readers: not supported
 

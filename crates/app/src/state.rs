@@ -96,7 +96,7 @@ pub(crate) fn attention_at(level: window::UserAttention) -> Task<Message> {
     window::oldest().and_then(move |id| window::request_user_attention(id, Some(level)))
 }
 
-fn open_link_task(url: links::CheckedUrl) -> Task<Message> {
+pub(crate) fn open_link_task(url: links::CheckedUrl) -> Task<Message> {
     Task::perform(async move { links::open_link(&url) }, |ok| {
         Message::LinkOpened { ok }
     })
@@ -336,6 +336,10 @@ pub enum Message {
     VerifyPeerRequested(UserId),
     /// A message of the security banner and screens.
     Security(SecurityMessage),
+    /// The update question, banner and toggle.
+    Update(crate::updates::UpdateMessage),
+    /// The bar about a crash report from an earlier run.
+    Crash(crate::crash::CrashMessage),
     /// A button of the verification dialog.
     Verification(VerificationMessage),
     /// A button of the Sessions screen or the logout warning.
@@ -427,6 +431,13 @@ pub enum Message {
     Settings(SettingsMessage),
     /// A control of the Voice & audio card.
     Audio(crate::audio_settings::AudioMessage),
+    /// A control of the call's video: the stage, the camera, sharing.
+    Video(crate::video::VideoMessage),
+    /// A control of the Video page of Settings.
+    VideoSettings(crate::video_settings::VideoSettingsMessage),
+    /// The window's scale factor (physical pixels per logical pixel) from the
+    /// window system.
+    WindowScale(f32),
     /// Push-to-talk: the service's state, and keys in the window.
     Ptt(PttMessage),
     /// A button of the spaces sidebar.
@@ -484,6 +495,9 @@ pub struct App {
     pub list_viewport_h: f32,
     /// The window's logical width, from `window::resize_events`.
     pub window_width: f32,
+    /// Physical pixels per logical pixel, from the window system (the text
+    /// zoom is not part of it). Video is asked for in physical pixels.
+    pub window_scale: f32,
     /// The side panel opened last (see [`crate::layout::layout_for`]).
     pub newest_panel: crate::layout::SidePanel,
     /// The row height the list was last laid out with, so a change of the
@@ -582,6 +596,12 @@ pub struct App {
     draft_dirty: bool,
     /// The security banner and screens.
     pub security: SecurityModel,
+    /// Update checks: how this copy is updated, and a newer version found.
+    pub updates: crate::updates::UpdateUi,
+    /// A crash report an earlier run left, until deleted.
+    pub crash: Option<crate::crash::PendingReport>,
+    /// Where crash reports go (the data directory).
+    pub crash_dir: Option<std::path::PathBuf>,
     /// The verification dialog, while a flow is open.
     pub verification: Option<VerificationModel>,
     /// The Sessions screen and the logout warning.
@@ -656,6 +676,7 @@ impl App {
             list_offset_y: 0.0,
             list_viewport_h: room_list::DEFAULT_VIEWPORT_HEIGHT,
             window_width: crate::layout::DEFAULT_WINDOW_WIDTH,
+            window_scale: 1.0,
             newest_panel: crate::layout::SidePanel::default(),
             shown_row_height: 0.0,
             load_more_at: None,
@@ -702,6 +723,9 @@ impl App {
             draft_seq: 0,
             draft_dirty: false,
             security: SecurityModel::default(),
+            updates: crate::updates::UpdateUi::default(),
+            crash: None,
+            crash_dir: None,
             verification: None,
             sessions: SessionsModel::default(),
             calls: CallModel::default(),
@@ -727,6 +751,7 @@ impl App {
         startup: Startup,
         ui_settings: UiSettings,
         store: impl SettingsStore + Clone + 'static,
+        crash: (std::path::PathBuf, Option<crate::crash::PendingReport>),
     ) -> impl Fn() -> (App, Task<Message>) {
         let startup = Mutex::new(Some(startup));
         move || {
@@ -737,6 +762,9 @@ impl App {
                 .expect("iced boots the application exactly once");
             let (mut app, task) = App::new(startup);
             app.set_ui_settings(ui_settings);
+            app.set_crash_reports(crash.0.clone(), crash.1.clone());
+            app.updates.mechanism = twicecat_core::api::UpdateMechanism::current();
+            let task = Task::batch([task, app.start_update_checks()]);
             app.set_settings_store(Box::new(store.clone()));
             app.set_notifier(Box::new(notifications::SystemNotifier));
             app.set_tray_factory(Box::new(SystemTrayFactory));
@@ -980,6 +1008,7 @@ impl App {
         let fills_before = self.pane_layout().panel_fills;
         let task = self.update_inner(message);
         self.note_panels(thread_before, call_before);
+        let task = Task::batch([task, self.video_sync_views()]);
         // The reaction picker takes the keyboard: it must never stay open in
         // a pane the user cannot see.
         if self
@@ -1157,8 +1186,15 @@ impl App {
                 self.window_width = width;
                 Task::none()
             }
-            Message::WindowOpened(_) => {
+            Message::WindowOpened(id) => {
                 self.ensure_tray();
+                window::scale_factor(id).map(Message::WindowScale)
+            }
+            Message::WindowScale(scale) => {
+                // A factor that is not a sane number keeps the last one.
+                if scale.is_finite() && (0.25..=16.0).contains(&scale) {
+                    self.window_scale = scale;
+                }
                 Task::none()
             }
             Message::NotificationShown { room_id, id } => {
@@ -1298,6 +1334,8 @@ impl App {
                 _ => Task::none(),
             },
             Message::Security(message) => self.on_security(message),
+            Message::Update(message) => self.on_update(message),
+            Message::Crash(message) => self.on_crash(message),
             Message::Verification(message) => self.on_verification(message),
             Message::Sessions(message) => self.on_sessions(message),
             Message::Rooms(message) => self.on_rooms(message),
@@ -1308,6 +1346,8 @@ impl App {
                 Task::none()
             }
             Message::Audio(message) => self.on_audio(message),
+            Message::Video(message) => self.on_video(message),
+            Message::VideoSettings(message) => self.on_video_settings(message),
             Message::Ptt(PttMessage::Update(update)) => {
                 self.ptt.update(update);
                 Task::none()
@@ -1317,6 +1357,13 @@ impl App {
                 // press; its release still lets go.
                 if !self.audio_ui.capturing || !key.pressed {
                     self.ptt.window_key(key);
+                }
+                Task::none()
+            }
+            Message::Ptt(PttMessage::WindowMouse(mouse)) => {
+                // As for the key: while the card waits, no press.
+                if !self.audio_ui.capturing || !mouse.pressed {
+                    self.ptt.window_mouse(mouse);
                 }
                 Task::none()
             }
@@ -1821,9 +1868,30 @@ impl App {
             | CoreEvent::InputLevel(_)
             | CoreEvent::AudioStats(_)
             | CoreEvent::GpuEnhancement(_)) => {
+                if let CoreEvent::GpuEnhancement(gpu) = &event {
+                    crate::crash::set_gpu_backend(
+                        gpu.running.map(crate::audio_settings::backend_label),
+                    );
+                }
                 self.audio_card_saw(&event);
                 task = self.on_call_event(event);
             }
+            event @ (CoreEvent::UpdateAvailable { .. }
+            | CoreEvent::UpdateInstalled { .. }
+            | CoreEvent::UpdateInstallFailed
+            | CoreEvent::UpToDate
+            | CoreEvent::UpdateChecked { .. }) => task = self.on_update_event(event),
+            event @ (CoreEvent::VideoDevices(_)
+            | CoreEvent::ScreenSources(_)
+            | CoreEvent::VideoSettings(_)
+            | CoreEvent::VideoSettingsAdjusted(_)
+            | CoreEvent::VideoSending { .. }
+            | CoreEvent::VideoTracks { .. }
+            | CoreEvent::VideoFeed { .. }
+            | CoreEvent::CameraPreview(_)
+            | CoreEvent::LocalVideo(_)
+            | CoreEvent::VideoEncoders(_)
+            | CoreEvent::VideoStats(_)) => task = self.on_video_event(event),
         }
         task
     }
@@ -2800,13 +2868,19 @@ impl App {
                 screens::verification::layer(base, self)
             }
             Screen::Main => screens::call::ring_layer(
-                screens::verification::layer(
-                    screens::switcher::layer(
-                        screens::upload_dialog::layer(
-                            screens::media_viewer::layer(
-                                screens::audio_settings::layer(
-                                    screens::settings::layer(
-                                        screens::room_dialogs::layer(main_view::view(self), self),
+                screens::stage::sharing_layer(
+                    screens::verification::layer(
+                        screens::switcher::layer(
+                            screens::upload_dialog::layer(
+                                screens::media_viewer::layer(
+                                    screens::audio_settings::layer(
+                                        screens::settings::layer(
+                                            screens::room_dialogs::layer(
+                                                screens::stage::layers(main_view::view(self), self),
+                                                self,
+                                            ),
+                                            self,
+                                        ),
                                         self,
                                     ),
                                     self,
@@ -2845,6 +2919,9 @@ impl App {
                     iced::Event::Window(window::Event::Unfocused) => {
                         Some(Message::WindowFocus(false))
                     }
+                    iced::Event::Window(window::Event::Rescaled(scale)) => {
+                        Some(Message::WindowScale(scale))
+                    }
                     other => crate::audio_settings::capture_message(&other),
                 })
             } else {
@@ -2852,6 +2929,9 @@ impl App {
                     iced::Event::Window(window::Event::Focused) => Some(Message::WindowFocus(true)),
                     iced::Event::Window(window::Event::Unfocused) => {
                         Some(Message::WindowFocus(false))
+                    }
+                    iced::Event::Window(window::Event::Rescaled(scale)) => {
+                        Some(Message::WindowScale(scale))
                     }
                     other => upload::event_message(&other).or_else(|| {
                         keys::event_message(&other, status == iced::event::Status::Captured)
@@ -2970,7 +3050,8 @@ mod tests {
         let (mut app, mut rx) = app_with(1);
         let started = Instant::now();
         let task = app.update(Message::CloseRequested);
-        assert!(started.elapsed() < Duration::from_millis(50));
+        // A full sink must not block (it would hang for ever); 5 s only guards that.
+        assert!(started.elapsed() < Duration::from_secs(5));
         assert!(task.units() > 0, "the fallback task carries the command");
         assert!(matches!(rx.try_recv(), Ok(Command::RestoreSession)));
         assert!(
@@ -10633,6 +10714,7 @@ mod tests {
                 muted: !local,
                 speaking: local,
                 volume_percent: 100,
+                share_volume_percent: 100,
                 cleaning: CleaningStatus::Cleaned,
             };
             let _ = app.update(core(CoreEvent::CallParticipants {
@@ -10768,6 +10850,11 @@ mod tests {
             for page in SettingsPage::ALL {
                 st(&mut rig, S::Page(page));
                 assert_eq!(rig.app.settings_ui.page, page);
+                // Only the pages with live controls ask the core for anything.
+                if !matches!(page, SettingsPage::VoiceAudio | SettingsPage::Video) {
+                    assert!(drain(&mut rig.rx).is_empty(), "{page:?} sends nothing");
+                }
+                drain(&mut rig.rx);
             }
             // Closing and opening again (Ctrl+, too) starts at Profile.
             st(&mut rig, S::Page(SettingsPage::About));
@@ -10775,6 +10862,118 @@ mod tests {
             open(&mut rig);
             assert_eq!(rig.app.settings_ui.page, SettingsPage::Profile);
             assert!(drain(&mut rig.rx).is_empty(), "a page change sends nothing");
+        }
+
+        #[test]
+        fn the_advanced_switch_starts_off_is_saved_and_is_one_switch_for_every_page() {
+            let mut rig = rig();
+            assert!(!rig.app.ui_settings.advanced_settings);
+            open(&mut rig);
+            st(&mut rig, S::Advanced(true));
+            assert!(rig.app.ui_settings.advanced_settings);
+            let written = writes(&rig);
+            assert_eq!(written.len(), 1, "one write");
+            assert!(written[0].advanced_settings);
+            // The same value again writes nothing; going back writes.
+            st(&mut rig, S::Advanced(true));
+            assert_eq!(writes(&rig).len(), 1);
+            st(&mut rig, S::Advanced(false));
+            assert!(!rig.app.ui_settings.advanced_settings);
+            assert_eq!(writes(&rig).len(), 2);
+            // It does not close the card or change its page.
+            assert!(rig.app.settings_ui.open);
+            assert_eq!(
+                rig.app.settings_ui.page,
+                crate::settings::SettingsPage::Profile
+            );
+        }
+
+        #[test]
+        fn voice_controls_open_settings_when_simple_and_the_card_when_advanced() {
+            use crate::audio_settings::AudioMessage as A;
+            use crate::settings::SettingsPage;
+            let mut rig = rig();
+            drain(&mut rig.rx);
+            // Simple: the dock's controls open the Voice & audio page.
+            let _ = rig.app.update(Message::Audio(A::Open));
+            assert!(rig.app.settings_ui.open);
+            assert_eq!(rig.app.settings_ui.page, SettingsPage::VoiceAudio);
+            assert!(!rig.app.audio_ui.open, "no card");
+            assert!(rig.app.audio_ui.live(), "the page's controls work");
+            let sent = drain(&mut rig.rx);
+            assert!(
+                matches!(
+                    sent.as_slice(),
+                    [
+                        Command::GetAudioSettings,
+                        Command::ListAudioDevices,
+                        Command::ProbeGpuEnhancement
+                    ]
+                ),
+                "{sent:?}"
+            );
+            // Leaving the page ends it: the controls stop answering.
+            st(&mut rig, S::Page(SettingsPage::About));
+            assert!(!rig.app.audio_ui.live());
+            // Advanced: the card, as before.
+            st(&mut rig, S::Close);
+            st(&mut rig, S::Advanced(true));
+            let _ = rig.app.update(Message::Audio(A::Open));
+            assert!(rig.app.audio_ui.open);
+            assert!(!rig.app.settings_ui.open);
+        }
+
+        #[test]
+        fn the_microphone_test_of_the_settings_page_stops_when_the_page_goes() {
+            use crate::audio_settings::AudioMessage as A;
+            use crate::settings::SettingsPage;
+            let mut rig = rig();
+            open(&mut rig);
+            st(&mut rig, S::Page(SettingsPage::VoiceAudio));
+            drain(&mut rig.rx);
+            let _ = rig.app.update(Message::Audio(A::MicTest));
+            assert!(rig.app.audio_ui.mic_test.is_some());
+            assert!(
+                drain(&mut rig.rx)
+                    .iter()
+                    .any(|c| matches!(c, Command::StartMicTest { .. })),
+                "the test started"
+            );
+            st(&mut rig, S::Page(SettingsPage::Keyboard));
+            assert!(rig.app.audio_ui.mic_test.is_none());
+            assert!(
+                drain(&mut rig.rx)
+                    .iter()
+                    .any(|c| matches!(c, Command::StopMicTest)),
+                "the test stopped with the page"
+            );
+        }
+
+        #[test]
+        fn the_video_page_asks_for_the_cameras_and_the_encoders_once_and_stops_its_preview() {
+            use crate::settings::SettingsPage;
+            let mut rig = rig();
+            open(&mut rig);
+            drain(&mut rig.rx);
+            st(&mut rig, S::Page(SettingsPage::Video));
+            let sent = drain(&mut rig.rx);
+            assert!(
+                matches!(
+                    sent.as_slice(),
+                    [
+                        Command::GetVideoSettings,
+                        Command::ListVideoDevices,
+                        Command::ProbeVideoEncoders
+                    ]
+                ),
+                "{sent:?}"
+            );
+            // The same page again asks for nothing.
+            st(&mut rig, S::Page(SettingsPage::Video));
+            assert!(drain(&mut rig.rx).is_empty());
+            // Closing Settings leaves the page.
+            st(&mut rig, S::Close);
+            assert!(!rig.app.calls.video.ui.inline);
         }
 
         #[test]
@@ -11951,6 +12150,7 @@ mod tests {
                 "audio card",
                 app4,
                 |app| {
+                    app.ui_settings.advanced_settings = true;
                     let _ = app.update(Message::Audio(crate::audio_settings::AudioMessage::Open));
                 },
                 |app| {

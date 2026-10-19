@@ -5,7 +5,9 @@
 // Each test file uses a different subset of these helpers.
 #![allow(dead_code)]
 
+pub mod calls;
 pub mod stack_env;
+pub mod video;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -20,8 +22,33 @@ use twicecat_core::paths::DataPaths;
 use twicecat_core::secrets::InMemorySecretStore;
 use twicecat_core::{Core, CoreConfig, CoreHandle};
 
-/// Default wait for an expected event.
-pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default wait for an expected event: 30 s, or `TWICECAT_TEST_TIMEOUT_SECS` when
+/// that is set while the tests are built (CI sets it: a shared 4-core runner runs
+/// Synapse, LiveKit and two debug cores at once and is several times slower than
+/// a laptop). A timeout only ever ends a wait that has failed, so a longer one
+/// costs a passing run nothing (docs/testing.md, rule R2).
+pub const DEFAULT_TIMEOUT: Duration =
+    Duration::from_secs(timeout_secs(option_env!("TWICECAT_TEST_TIMEOUT_SECS"), 30));
+
+/// `text` as seconds, or `default` when it is absent or not a plain number.
+const fn timeout_secs(text: Option<&str>, default: u64) -> u64 {
+    let Some(text) = text else { return default };
+    let bytes = text.as_bytes();
+    if bytes.is_empty() {
+        return default;
+    }
+    let mut seconds = 0_u64;
+    let mut i = 0;
+    while i < bytes.len() {
+        let digit = bytes[i];
+        if !digit.is_ascii_digit() || seconds > u64::MAX / 20 {
+            return default;
+        }
+        seconds = seconds * 10 + (digit - b'0') as u64;
+        i += 1;
+    }
+    if seconds == 0 { default } else { seconds }
+}
 
 /// The stack settings and test accounts: `.env.test`, overridden by
 /// `.env.local`, overridden by environment variables ([`stack_env`]).
@@ -105,6 +132,24 @@ pub fn start_core_with_call_service(
     audio: twicecat_core::api::AudioBackend,
     call_service: Option<String>,
 ) -> CoreHandle {
+    start_core_with_video(
+        dir,
+        secrets,
+        audio,
+        call_service,
+        twicecat_core::api::VideoBackend::System,
+    )
+}
+
+/// Like [`start_core_with_call_service`], with `video` as its cameras and
+/// screens.
+pub fn start_core_with_video(
+    dir: &Path,
+    secrets: Arc<InMemorySecretStore>,
+    audio: twicecat_core::api::AudioBackend,
+    call_service: Option<String>,
+    video: twicecat_core::api::VideoBackend,
+) -> CoreHandle {
     let env = TestEnv::load();
     Core::start(
         CoreConfig {
@@ -114,6 +159,7 @@ pub fn start_core_with_call_service(
             max_upload_bytes_override: None,
             audio,
             call_service_override: call_service,
+            video,
         },
         secrets,
     )
@@ -131,7 +177,7 @@ impl twicecat_core::api::VirtualAudio for Silence {
     fn playback(&self, _: &[f32; twicecat_core::api::AUDIO_FRAME_LEN]) {}
 }
 
-fn silence() -> twicecat_core::api::AudioBackend {
+pub fn silence() -> twicecat_core::api::AudioBackend {
     twicecat_core::api::AudioBackend::Virtual(Arc::new(Silence))
 }
 
@@ -179,6 +225,7 @@ fn start_core_with(
             max_upload_bytes_override,
             audio: silence(),
             call_service_override: None,
+            video: twicecat_core::api::VideoBackend::System,
         },
         secrets,
     )

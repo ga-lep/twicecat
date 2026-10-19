@@ -3,10 +3,12 @@
 //! Sources, merged so that any one held means transmit:
 //! - a global keyboard shortcut: global-hotkey on X11, Windows and macOS,
 //!   the GlobalShortcuts portal on Wayland;
+//! - a global mouse button (not the left or right one) on X11, Windows and
+//!   macOS; other applications still get its clicks;
 //! - a gamepad button (gilrs);
-//! - a key pressed in Twicecat's own window, forwarded by the app (the only
-//!   keyboard source in gamescope's game mode, which has no global
-//!   shortcuts).
+//! - the key or mouse button pressed in Twicecat's own window, forwarded by
+//!   the app (the only keyboard source in gamescope's game mode, which has no
+//!   global shortcuts, and the only mouse source on Wayland).
 //!
 //! The service reports [`PttEvent`]s through a callback; the app forwards
 //! `Transmit` to the core as `Command::PushToTalk`. The release tail is the
@@ -18,10 +20,11 @@ mod binding;
 mod gamepad;
 mod hotkey;
 mod merge;
+mod mouse;
 #[cfg(target_os = "linux")]
 mod portal;
 
-pub use binding::{BindingError, GamepadButton, Held, KeyBinding};
+pub use binding::{BindingError, GamepadButton, Held, KeyBinding, MouseButton};
 pub use merge::Source;
 
 use merge::Merger;
@@ -47,14 +50,17 @@ pub enum PttEvent {
 /// order, with an internal lock held: keep it short (send on a channel).
 pub type Sink = Arc<dyn Fn(PttEvent) + Send + Sync>;
 
-/// Which global keyboard shortcut mechanism a session has.
+/// Which global keyboard shortcut mechanism a session has. It also says
+/// whether a mouse button works outside Twicecat's window: only with
+/// `Hotkey`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyboardBackend {
-    /// The GlobalShortcuts portal (Wayland).
+    /// The GlobalShortcuts portal (Wayland; no global mouse buttons).
     Portal,
-    /// global-hotkey (X11, Windows, macOS).
+    /// global-hotkey (X11, Windows, macOS), and the global mouse button.
     Hotkey,
-    /// None: only the window key and gamepads (gamescope, no display).
+    /// None: only the window's key and mouse button, and gamepads
+    /// (gamescope, no display).
     WindowOnly,
 }
 
@@ -95,6 +101,8 @@ impl KeyboardBackend {
 pub struct PttConfig {
     /// The global keyboard shortcut, if any.
     pub key: Option<KeyBinding>,
+    /// The mouse button, if any.
+    pub mouse: Option<MouseButton>,
     /// The gamepad button, if any.
     pub gamepad: Option<GamepadButton>,
     /// The keyboard mechanism ([`KeyboardBackend::detect`] by default).
@@ -105,6 +113,7 @@ impl Default for PttConfig {
     fn default() -> Self {
         Self {
             key: None,
+            mouse: None,
             gamepad: None,
             keyboard: KeyboardBackend::detect(),
         }
@@ -137,13 +146,15 @@ impl Shared {
 /// transmitting, reports `Transmit(false)`.
 ///
 /// Start and drop it on the app's main thread: global-hotkey needs that on
-/// macOS (main thread) and Windows (a thread with a message loop).
+/// macOS (main thread) and Windows (a thread with a message loop), and so
+/// does the mouse monitor on macOS.
 pub struct PttService {
     shared: Arc<Shared>,
     // Dropped in this order before the final release.
     hotkeys: Option<hotkey::Hotkeys>,
     #[cfg(target_os = "linux")]
     portal: Option<portal::Portal>,
+    mouse: Option<mouse::Hook>,
     gamepads: Option<gamepad::Gamepads>,
 }
 
@@ -160,6 +171,7 @@ impl PttService {
             hotkeys: None,
             #[cfg(target_os = "linux")]
             portal: None,
+            mouse: None,
             gamepads: None,
         };
         if let Some(key) = config.key {
@@ -187,6 +199,21 @@ impl PttService {
         }
         #[cfg(not(target_os = "linux"))]
         let _ = runtime;
+        if let Some(button) = config.mouse {
+            match config.keyboard {
+                KeyboardBackend::Hotkey => {
+                    service.mouse = mouse::Hook::start(button, shared.clone());
+                }
+                KeyboardBackend::Portal => {
+                    shared.notify(PttEvent::Unavailable {
+                        source: Source::Mouse,
+                        reason: "Wayland shows an app mouse buttons only over its own windows"
+                            .into(),
+                    });
+                }
+                KeyboardBackend::WindowOnly => {}
+            }
+        }
         if let Some(button) = config.gamepad {
             service.gamepads = Some(gamepad::Gamepads::start(button, shared));
         }
@@ -196,6 +223,12 @@ impl PttService {
     /// The bound key was pressed or released in Twicecat's own window.
     pub fn window_key(&self, pressed: bool) {
         self.shared.report(Source::Window, pressed);
+    }
+
+    /// The bound mouse button was pressed or released in Twicecat's own
+    /// window.
+    pub fn window_mouse(&self, pressed: bool) {
+        self.shared.report(Source::WindowMouse, pressed);
     }
 
     /// Whether the microphone should transmit now.
@@ -215,12 +248,15 @@ impl Drop for PttService {
         {
             self.portal = None;
         }
+        self.mouse = None;
         self.gamepads = None;
         for source in [
             Source::Hotkey,
             Source::Portal,
+            Source::Mouse,
             Source::Gamepad,
             Source::Window,
+            Source::WindowMouse,
         ] {
             self.shared.report(source, false);
         }
@@ -285,6 +321,7 @@ mod tests {
         let seen = events.clone();
         let config = PttConfig {
             key: None,
+            mouse: None,
             gamepad: None,
             keyboard: KeyboardBackend::WindowOnly,
         };
@@ -310,8 +347,8 @@ mod tests {
         );
     }
 
-    /// A key binding with no global mechanism starts nothing: the window
-    /// key is the only keyboard source.
+    /// Bindings with no global mechanism start nothing: the window's key and
+    /// mouse button are the only sources.
     #[test]
     fn window_only_sessions_start_no_global_shortcut() {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -321,6 +358,7 @@ mod tests {
         let seen = events.clone();
         let config = PttConfig {
             key: Some("F13".parse().unwrap()),
+            mouse: Some(MouseButton::BACK),
             gamepad: None,
             keyboard: KeyboardBackend::WindowOnly,
         };
@@ -329,7 +367,7 @@ mod tests {
             runtime.handle(),
             Arc::new(move |e| seen.lock().unwrap().push(e)),
         );
-        assert!(service.hotkeys.is_none());
+        assert!(service.hotkeys.is_none() && service.mouse.is_none());
         drop(service);
         assert!(events.lock().unwrap().is_empty());
     }

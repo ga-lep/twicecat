@@ -1,0 +1,9 @@
+Step 1: complete (video in the new UI: renderer, stage, full-screen view, picker, sharing bar, buttons, shortcuts; gate ok, no security review run (no new input, no new dependency; titles and thumbnails from the core are cleaned and capped, frames never logged), evidence: PROGRESS.md "Video in the new UI and Settings levels steps")
+  notes: Ctrl+Shift+O and Ctrl+Shift+E instead of Ctrl+Shift+V and S (paste); audio-video delay not built (no per-person latency in the core API); no pop-out window; cargo deny not installed here
+Step 2: complete (advanced video settings in the core: VideoTuning per kind, CameraCapture, validated() with VideoAdjustment, call::encoder::tuned, VideoSettingsAdjusted and VideoSending events; gate ok; stack tests run by hand on the local stack: the existing delivery test, tuned_video_changes_what_the_receiver_gets and a_tuning_the_encoder_cannot_do_is_adjusted_and_said all pass)
+  notes: SVC, degradation preference, software H.264 and AV1, NVENC with tunings and the camera capture mode are not verified (no hardware, no real camera); CLI cannot set a tuning
+Step 3: complete (Settings for two levels: the saved switch, simple and advanced pages for Appearance, Notifications, Voice & audio and the new Video page, live audio basics on the page, gallery scenarios and tests for both levels; gate ok)
+  notes: advanced Video page is long and scrolls; camera preview needs the core's preview command (the engine answers not supported)
+Step 4: started (branch feat/video-capture, after Phase 9 Tasks 8 and 9)
+Step 4: complete (wrap-up: PROGRESS.md, checkpoint list, docs/accessibility.md; docs only, the gate of the commit before stands: 2302 tests)
+  notes: [fix] a preview whose camera went away stayed frozen (fix(app) commit, ui.19); [tasks] Phase 9 Tasks 10 and 11 ticked in PROGRESS.md, A/V delay and pop-out left

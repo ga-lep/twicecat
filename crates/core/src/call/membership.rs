@@ -11,6 +11,8 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
+use crate::api::CallIntent;
+
 /// The state event type (MSC3401, unstable prefix, as Element sends it).
 pub(crate) const CALL_MEMBER_EVENT: &str = "org.matrix.msc3401.call.member";
 
@@ -44,7 +46,8 @@ pub(crate) fn member_id(user_id: &str, device_id: &str) -> String {
 }
 
 /// Our join content. `created_ts` is copied from the first join when the
-/// membership is refreshed; `expires_ms` grows with each refresh.
+/// membership is refreshed; `expires_ms` grows with each refresh. `intent`
+/// is what rings and call lists show (a voice or a video call).
 pub(crate) fn join_content(
     user_id: &str,
     device_id: &str,
@@ -52,6 +55,7 @@ pub(crate) fn join_content(
     room_id: &str,
     created_ts: Option<u64>,
     expires: Duration,
+    intent: CallIntent,
 ) -> Value {
     let mut content = json!({
         "application": "m.call",
@@ -60,7 +64,7 @@ pub(crate) fn join_content(
         "device_id": device_id,
         "membershipID": member_id(user_id, device_id),
         "expires": u64::try_from(expires.as_millis()).unwrap_or(u64::MAX),
-        "m.call.intent": "audio",
+        "m.call.intent": intent.as_str(),
         "focus_active": { "type": "livekit", "focus_selection": "multi_sfu" },
         "foci_preferred": [{
             "type": "livekit",
@@ -240,6 +244,7 @@ mod tests {
             "!room:example.org",
             None,
             MEMBERSHIP_EXPIRES,
+            CallIntent::Audio,
         );
         assert_eq!(
             c,
@@ -259,9 +264,31 @@ mod tests {
                 }],
             })
         );
-        let refreshed = join_content(ALICE, "DEV", "u", "!r:x", Some(5), MEMBERSHIP_EXPIRES * 2);
+        let refreshed = join_content(
+            ALICE,
+            "DEV",
+            "u",
+            "!r:x",
+            Some(5),
+            MEMBERSHIP_EXPIRES * 2,
+            CallIntent::Audio,
+        );
         assert_eq!(refreshed["created_ts"], 5);
         assert_eq!(refreshed["expires"], 28_800_000);
+    }
+
+    #[test]
+    fn a_video_call_says_so_in_the_membership() {
+        let c = join_content(
+            ALICE,
+            "DEV",
+            "u",
+            "!r:x",
+            None,
+            MEMBERSHIP_EXPIRES,
+            CallIntent::Video,
+        );
+        assert_eq!(c["m.call.intent"], "video");
     }
 
     #[test]
@@ -273,6 +300,7 @@ mod tests {
             "!r:x",
             None,
             MEMBERSHIP_EXPIRES,
+            CallIntent::Audio,
         );
         let key = state_key(ALICE, "DEV", "11");
         let m = parse(ALICE, &key, 1_000, &c).expect("valid");
@@ -357,6 +385,7 @@ mod tests {
             "!r:x",
             None,
             MEMBERSHIP_EXPIRES,
+            CallIntent::Audio,
         );
         c["membershipID"] = json!("a-random-uuid");
         let m = parse(ALICE, &state_key(ALICE, "DEV", "11"), 0, &c).unwrap();
@@ -367,7 +396,15 @@ mod tests {
 
     #[test]
     fn left_foreign_or_spoofed_memberships_are_ignored() {
-        let good = join_content(ALICE, "DEV", "u", "!r:x", None, MEMBERSHIP_EXPIRES);
+        let good = join_content(
+            ALICE,
+            "DEV",
+            "u",
+            "!r:x",
+            None,
+            MEMBERSHIP_EXPIRES,
+            CallIntent::Audio,
+        );
         let key = state_key(ALICE, "DEV", "11");
         assert!(parse(ALICE, &key, 0, &json!({})).is_none(), "left");
         assert!(

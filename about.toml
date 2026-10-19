@@ -1,0 +1,26 @@
+# cargo-about (scripts/third-party-notices.sh): which licences the notices may
+# name for the crates the app ships. The same list deny.toml allows, with its
+# ksni exception (Linux only; deny.toml's webpki-root-certs exception concerns
+# a crate the app does not ship); the app's own crates (publish = false) are
+# skipped. Build and dev dependencies are not shipped, so they are left out.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "BSL-1.0",
+    "CC0-1.0",
+    "MPL-2.0",
+]
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+
+[private]
+ignore = true
+
+[ksni]
+accepted = ["Unlicense"]

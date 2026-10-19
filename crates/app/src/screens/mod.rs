@@ -5,6 +5,7 @@
 
 pub mod audio_settings;
 pub mod call;
+pub mod crash;
 pub mod loading;
 pub mod login;
 pub mod main_view;
@@ -17,11 +18,14 @@ pub mod security;
 pub mod sessions;
 pub mod settings;
 pub mod spaces_sidebar;
+pub mod stage;
 pub mod switcher;
 pub mod thread_panel;
 pub mod timeline_pane;
+pub mod updates;
 pub mod upload_dialog;
 pub mod verification;
+pub mod video_settings;
 
 use iced::widget::container;
 use iced::{Element, Fill};

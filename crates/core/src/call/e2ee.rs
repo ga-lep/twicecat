@@ -19,7 +19,8 @@
 //!
 //! Received keys are taken only from Olm-decrypted events whose claimed
 //! device is the one the Olm session belongs to (js-sdk cannot check this
-//! yet). Key bytes are never logged.
+//! yet). Key bytes are never logged, and neither are LiveKit's: see
+//! [`SECRET_LOG_TARGETS`].
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -37,6 +38,14 @@ use tokio::sync::watch;
 use zeroize::Zeroizing;
 
 use super::{membership, now_ms};
+
+/// Log targets that carry call keys, turned off by [`crate::logging`]
+/// whatever the filter asks. libwebrtc's own log reaches `log` as `debug`
+/// under `libwebrtc`, whatever its severity (libwebrtc 0.3.52
+/// `native/peer_connection_factory.rs:41-43`), and its frame cryptor writes
+/// the secret and the derived key there each time a key is set or
+/// ratcheted (webrtc-sdk/webrtc#308; the strings are in our prebuilt).
+pub(crate) const SECRET_LOG_TARGETS: &[&str] = &["libwebrtc"];
 
 /// The to-device event type carrying call keys.
 pub(crate) const KEYS_EVENT: &str = "io.element.call.encryption_keys";

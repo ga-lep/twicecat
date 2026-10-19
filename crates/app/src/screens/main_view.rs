@@ -22,7 +22,7 @@ use crate::rooms::RoomsMessage;
 use crate::screens::loading::sync_label;
 use crate::screens::timeline_pane::RichEnv;
 use crate::screens::{
-    call, media_viewer, room_dialogs, room_list_pane, security, sessions, spaces_sidebar,
+    call, media_viewer, room_dialogs, room_list_pane, security, sessions, spaces_sidebar, stage,
     thread_panel, timeline_pane,
 };
 use crate::sessions::SessionsMessage;
@@ -334,6 +334,9 @@ fn header<'a>(app: &'a App, title: String) -> Element<'a, Message> {
             Icon::Settings,
             HeaderAction::Settings.message(),
         ));
+        if let Some(video) = app.calls.video_button(room) {
+            controls.push(kit::secondary_button(video.label.clone(), call_message(&video)).into());
+        }
         if let Some(call) = app.calls.button(room) {
             controls.push(call_button(call));
         }
@@ -428,7 +431,13 @@ fn notification_menu<'a>(app: &'a App, room: &RoomId) -> Element<'a, Message> {
 /// The main screen: panes above a status bar.
 pub fn view(app: &App) -> Element<'_, Message> {
     let content = main_column(
-        security::banner_slot(&app.security),
+        security::banner_slot(
+            &app.security,
+            crate::screens::updates::bars(app)
+                .into_iter()
+                .chain(crate::screens::crash::bars(app))
+                .collect(),
+        ),
         main_row(app),
         status_bar(app),
     );
@@ -516,7 +525,14 @@ fn room_pane(app: &App, hidden: bool) -> Element<'_, Message> {
 
     let theme = app.current_theme();
     let env = rich_env(app, &theme);
-    let timeline = container(timeline_pane::view(&app.timeline, env)).height(Fill);
+    // The stage above the timeline takes a share of the column's height
+    // while it is open; the timeline keeps the rest.
+    let timeline_height = if stage::slot_state(app) == stage::Slot::Open {
+        Length::FillPortion(stage::TIMELINE_PORTION)
+    } else {
+        Fill
+    };
+    let timeline = container(timeline_pane::view(&app.timeline, env)).height(timeline_height);
     // The picker floats over the bottom right corner of the timeline its
     // message is in: a thread item's is drawn by the thread panel.
     let picker = picker_layer(app, false);
@@ -561,6 +577,7 @@ fn room_pane(app: &App, hidden: bool) -> Element<'_, Message> {
     }
     let body = room_column(
         header(app, title),
+        stage::slot(app),
         timeline_layer(timeline.into(), picker),
         bars,
         editor(app, enabled),
@@ -575,19 +592,21 @@ fn room_pane(app: &App, hidden: bool) -> Element<'_, Message> {
         .into()
 }
 
-/// The room pane's column, always `[title, timeline, bars, editor]`. iced
+/// The room pane's column, always `[title, stage, timeline, bars, editor]`
+/// (the stage is an empty space without video). iced
 /// keeps a widget's state only while the widget at that place in the tree
 /// keeps its type: with the bars (link and command bars, notices, typing
 /// line, suggestion list, reply bar) as siblings, the editor moved whenever
 /// one came or went and lost its focus. `from_vec` keeps an empty bar column.
 fn room_column<'a>(
     title: Element<'a, Message>,
+    stage: Element<'a, Message>,
     timeline: Element<'a, Message>,
     bars: Vec<Element<'a, Message>>,
     editor: Element<'a, Message>,
 ) -> Element<'a, Message> {
     let bars = Column::from_vec(bars).spacing(8).width(Fill);
-    Column::from_vec(vec![title, timeline, bars.into(), editor])
+    Column::from_vec(vec![title, stage, timeline, bars.into(), editor])
         .spacing(8)
         .width(Fill)
         .height(Fill)
@@ -1398,30 +1417,48 @@ mod tests {
         use iced::advanced::widget::Tree;
 
         let content = text_editor::Content::new();
-        let build = |bars: usize, picker: bool| -> Element<'_, Message> {
+        let build = |bars: usize, picker: bool, stage: bool| -> Element<'_, Message> {
             let bars = (0..bars).map(|_| text("bar").into()).collect();
             let picker = picker.then(|| text("picker").into());
+            // The stage is another widget while a call has video, and an
+            // empty space otherwise.
+            let stage: Element<'_, Message> = if stage {
+                Column::new().push(text("stage")).into()
+            } else {
+                space().into()
+            };
             room_column(
                 text("title").into(),
+                stage,
                 timeline_layer(space().into(), picker),
                 bars,
                 text_editor(&content).into(),
             )
         };
-        let mut tree = Tree::new(build(0, false));
+        let mut tree = Tree::new(build(0, false, false));
         let tags = |tree: &Tree| {
             (
-                tree.children.iter().map(|c| c.tag).collect::<Vec<_>>(),
-                tree.children[1].children[0].tag,
+                [0, 2, 3, 4].map(|i| tree.children[i].tag),
+                tree.children[2].children[0].tag,
             )
         };
         let before = tags(&tree);
-        // A suggestion list, a notice, the reaction picker...: the editor
-        // (keeping its focus) and the timeline (its scroll) keep their tags,
-        // so `Tree::diff` keeps their state.
-        for (bars, picker) in [(1, false), (3, true), (0, true), (0, false)] {
-            tree.diff(build(bars, picker));
-            assert_eq!(tags(&tree), before, "{bars} bars, picker {picker}");
+        // A suggestion list, a notice, the reaction picker, a call's video...:
+        // the editor (keeping its focus) and the timeline (its scroll) keep
+        // their tags, so `Tree::diff` keeps their state.
+        for (bars, picker, stage) in [
+            (1, false, false),
+            (3, true, false),
+            (0, true, true),
+            (2, false, true),
+            (0, false, false),
+        ] {
+            tree.diff(build(bars, picker, stage));
+            assert_eq!(
+                tags(&tree),
+                before,
+                "{bars} bars, picker {picker}, stage {stage}"
+            );
         }
     }
 
@@ -1437,7 +1474,11 @@ mod tests {
             content: &'a text_editor::Content,
         ) -> Element<'a, Message> {
             let panes = row![timeline_layer(space().into(), None), text_editor(content)].into();
-            let base = main_column(security::banner_slot(model), panes, text("status").into());
+            let base = main_column(
+                security::banner_slot(model, Vec::new()),
+                panes,
+                text("status").into(),
+            );
             security::layer(base, security::screen(model))
         }
         let tags = |tree: &Tree| {

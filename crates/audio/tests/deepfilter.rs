@@ -99,7 +99,18 @@ fn deep_filter_removes_more_stationary_noise_than_rnnoise_in_real_time() {
         df_db >= rn_db,
         "DeepFilterNet3 {df_db:.1} dB, RNNoise {rn_db:.1} dB"
     );
-    assert!(mean < Duration::from_millis(5), "mean {mean:?} per frame");
+    // The real-time claim is a number, not a gate (docs/testing.md): a busy
+    // machine is slower, and the filter is not wrong.
+    twicecat_perf::record_duration(
+        "audio.deepfilter.cpu_mean_frame",
+        mean,
+        Duration::from_millis(5),
+    );
+    twicecat_perf::record_duration(
+        "audio.deepfilter.cpu_worst_frame",
+        worst,
+        Duration::from_millis(10),
+    );
 }
 
 fn read_wav(path: &str) -> Vec<f32> {

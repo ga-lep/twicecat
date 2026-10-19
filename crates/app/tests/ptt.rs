@@ -3,9 +3,15 @@
 //! forwarding thread, `Command::PushToTalk`, the core's gate and its release
 //! tail, seen in the mic test's `InputLevel::transmitting`.
 //!
+//! Times are measured in audio, frames of 10 ms the virtual microphone gave:
+//! the gate's tail is counted in frames, and on a busy CI runner the virtual
+//! device falls behind the clock and skips the frames it missed (a release
+//! tail of 1000 ms once took 3.2 s on macOS).
+//!
 //! The app is put on its main screen with made-up session events (the core
 //! has no session); the audio commands work without one.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -25,12 +31,14 @@ use twicecat_core::paths::DataPaths;
 use twicecat_core::secrets::InMemorySecretStore;
 use twicecat_ptt::{KeyboardBackend, PttConfig, PttEvent, Sink};
 
-/// Silent virtual devices: no real microphone is opened.
-struct Silence;
+/// Silent virtual devices: no real microphone is opened. Counts the frames
+/// captured.
+struct Silence(Arc<AtomicU64>);
 
 impl VirtualAudio for Silence {
     fn capture(&self, frame: &mut [f32; AUDIO_FRAME_LEN]) {
         frame.fill(0.0);
+        self.0.fetch_add(1, Ordering::Relaxed);
     }
     fn playback(&self, _: &[f32; AUDIO_FRAME_LEN]) {}
 }
@@ -43,6 +51,7 @@ struct Nothing;
 
 impl PttHandle for Nothing {
     fn window_key(&self, _pressed: bool) {}
+    fn window_mouse(&self, _pressed: bool) {}
 }
 
 impl PttStarter for FakeSource {
@@ -66,12 +75,20 @@ struct Rig {
     pump: tokio::runtime::Runtime,
     events: BoxStream<'static, BridgeEvent>,
     dir: std::path::PathBuf,
+    frames: Arc<AtomicU64>,
 }
 
-/// A level the core reported, and when the test saw it.
+/// A level the core reported, and when the test saw it: on the clock and in
+/// frames captured.
 struct Level {
     at: Instant,
+    frame: u64,
     transmitting: bool,
+}
+
+/// Audio time between two frame counts.
+fn audio(from: u64, to: u64) -> Duration {
+    Duration::from_millis(to.saturating_sub(from) * 10)
 }
 
 impl Rig {
@@ -85,13 +102,15 @@ impl Rig {
                 .as_nanos()
         );
         let dir = std::env::temp_dir().join(format!("twicecat-app-ptt-test-{tag}"));
+        let frames = Arc::new(AtomicU64::new(0));
         let (bridge, slot) = Bridge::start(
             CoreConfig {
                 data: DataPaths::at(&dir),
                 homeserver_override: None,
                 room_list_page_size: twicecat_core::DEFAULT_ROOM_LIST_PAGE_SIZE,
                 max_upload_bytes_override: None,
-                audio: AudioBackend::Virtual(Arc::new(Silence)),
+                audio: AudioBackend::Virtual(Arc::new(Silence(frames.clone()))),
+                video: twicecat_core::api::VideoBackend::System,
                 call_service_override: None,
             },
             Arc::new(InMemorySecretStore::new()),
@@ -129,7 +148,13 @@ impl Rig {
             pump,
             events: events_stream(&slot).boxed(),
             dir,
+            frames,
         }
+    }
+
+    /// Frames the virtual microphone has captured so far.
+    fn frame(&self) -> u64 {
+        self.frames.load(Ordering::Relaxed)
     }
 
     /// Sends a command to the core directly (as the forwarding thread does).
@@ -145,6 +170,7 @@ impl Rig {
             .block_on(async { tokio::time::timeout(within, self.events.next()).await });
         match event {
             Ok(Some(BridgeEvent::Core(event))) => {
+                let event = *event;
                 if matches!(
                     event,
                     CoreEvent::AudioSettings(_) | CoreEvent::InputLevel(_) | CoreEvent::Error(_)
@@ -181,6 +207,7 @@ impl Rig {
                 Some(CoreEvent::InputLevel(level)) => {
                     let level = Level {
                         at: Instant::now(),
+                        frame: self.frame(),
                         transmitting: level.transmitting,
                     };
                     let stop = done(&level);
@@ -212,6 +239,7 @@ fn push_to_talk(release_delay_ms: u32) -> AudioSettings {
         },
         push_to_talk: PushToTalkBindings {
             key: Some("F13".into()),
+            mouse_button: None,
             gamepad_button: None,
         },
         ..AudioSettings::default()
@@ -232,24 +260,26 @@ fn a_release_keeps_transmitting_for_the_delay_then_stops() {
     rig.levels_until(5, |l| l.transmitting);
 
     rig.source.report(PttEvent::Transmit(false));
-    let released = Instant::now();
-    let levels = rig.levels_until(10, |l| !l.transmitting);
-    let closed = levels.last().unwrap().at.duration_since(released);
+    let (released, released_at) = (rig.frame(), Instant::now());
+    let levels = rig.levels_until(30, |l| !l.transmitting);
+    let last = levels.last().unwrap();
+    let closed = audio(released, last.frame);
+    let on_the_clock = last.at.duration_since(released_at);
     let last_open = levels
         .iter()
         .filter(|l| l.transmitting)
-        .map(|l| l.at.duration_since(released))
+        .map(|l| audio(released, l.frame))
         .max()
         .unwrap_or_default();
     // A 1000 ms tail: still open well after the release, closed soon after
     // the tail (the levels come every 50 ms).
     assert!(
         last_open >= Duration::from_millis(500),
-        "open for {last_open:?} after the release"
+        "open for {last_open:?} of audio after the release"
     );
     assert!(
         closed >= Duration::from_millis(700) && closed <= Duration::from_secs(3),
-        "closed {closed:?} after the release"
+        "closed {closed:?} of audio ({on_the_clock:?} on the clock) after the release"
     );
     rig.close();
 }
@@ -264,12 +294,12 @@ fn without_a_delay_a_release_stops_at_once_and_voice_activity_ignores_presses() 
     rig.source.report(PttEvent::Transmit(true));
     rig.levels_until(5, |l| l.transmitting);
     rig.source.report(PttEvent::Transmit(false));
-    let released = Instant::now();
-    let levels = rig.levels_until(5, |l| !l.transmitting);
-    let closed = levels.last().unwrap().at.duration_since(released);
+    let released = rig.frame();
+    let levels = rig.levels_until(15, |l| !l.transmitting);
+    let closed = audio(released, levels.last().unwrap().frame);
     assert!(
         closed < Duration::from_millis(500),
-        "closed after {closed:?}"
+        "closed after {closed:?} of audio"
     );
 
     // Voice activity, silent microphone: a press (the fake service keeps
