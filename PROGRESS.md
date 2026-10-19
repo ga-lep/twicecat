@@ -1,5 +1,7 @@
 # Progress
 
+The project's overview, status, build and run instructions are in [README.md](README.md); this file is the detailed ledger.
+
 ## Pinned versions
 - Rust toolchain 1.97.1 (rust-toolchain.toml, with rustfmt and clippy), edition 2024, resolver 3
 - iced =0.14.0
@@ -3415,3 +3417,17 @@ See the plan's "Human checkpoint"; items move here as tasks finish. Already open
   - A gallery case, `banner-crash-report`.
 - **Not verified:** the bar in a real window, **Show report** opening the viewer on each OS, and the issue page with a real report (checkpoint).
 - **Gate (Windows):** `cargo fmt --all --check`; `cargo clippy --workspace --all-targets --locked -- -D warnings`, also with `--all-features`; `cargo test --workspace --locked --no-fail-fast`: 2299 passed, 0 failed, 158 ignored (the gallery reran alone after another build on this machine had left its first run without memory); `check-app-deps`, `check-core-api`, `check-no-webrtc-download` and `flatpak.sh check` pass. `check-font-assets` fails here only because the Windows checkout turns `OFL.txt` into CRLF: the committed file has the SHA-256 that `SOURCE.md` lists.
+
+## Dev / the local stack did not start on a Windows clone (fixed 2026-10-18)
+- **Found while checking the README's commands (ga-lep/twicecat#33):** Git for Windows checks text out with CRLF by default (`core.autocrlf=true`), and the repository had no `.gitattributes`. `dev/synapse/start.sh`, mounted into the Synapse container, then started with `set -eu\r`, so Synapse exited at once (`/start-dev.sh: 3: set: Illegal option -`) and `scripts/stack.sh up -d --wait` failed with "dependency synapse failed to start". The same made `check-font-assets.sh` fail on `OFL.txt` (the Phase 7 / Task 10 gate note above).
+- **Fix:** `.gitattributes` keeps LF for `*.sh`, Dockerfiles and `dev/synapse`, `dev/livekit` and `dev/element` on every checkout, and checks `crates/app/assets/fonts/` out without any conversion. The index already holds LF, so no file content changes.
+- **Checked (Windows 11):** after re-checking the files out, `git ls-files --eol` shows `w/lf` for them; `scripts/stack.sh up -d --wait` brings every service up healthy; `scripts/create-test-users.sh` registers the three users; `scripts/check-font-assets.sh` prints "OK for 5 files" (it failed before).
+- **Gate (Windows):** fmt, clippy (`-D warnings`), `cargo check --workspace --lib --bins --locked`, `cargo test --workspace --locked` (2301 passed, 0 failed, 158 ignored) and the four `check-*.sh` scripts pass.
+
+## README (ga-lep/twicecat#33; branch docs/readme)
+- **Added:** `README.md` at the root: what Twicecat is, the status per phase (with the v0.1.0-alpha pre-release), the workspace layout, building, running the app and `twicecat-cli`, the local stack, the gallery, the gate and Conventional Commits, accessibility, the licence and third-party notices, security. It links to `docs/` instead of copying it. `SECURITY.md`: report privately through GitHub's **Report a vulnerability**, what to leave out of a report, what counts. `docs/building.md` gains "Before the first build" (toolchain, libwebrtc, the Linux packages and clang, Windows and macOS tools), which it did not have. Four screenshots from the gallery in `docs/images/` (login, room, call with the participants panel, Voice & audio settings; Twicecat colour set, dark, comfortable, 1280x800). No `docs/themes.md` link: it is not on `main` yet.
+- **Fixed on the way:** the local stack did not start on a Windows clone (section above).
+- **Commands run (Windows 11, from this branch):** `scripts/fetch-libwebrtc.sh` with `LK_CUSTOM_WEBRTC` exported (MSVC Build Tools only, no clang); the gallery command (1 passed, 175 s; the PNGs and `index.html` written); `scripts/stack.sh up -d --wait` (all services healthy after the fix); `scripts/create-test-users.sh`; `twicecat-cli --help`, `twicecat --help` and `--version`; `twicecat-cli --ephemeral --homeserver http://127.0.0.1:8008 --password-stdin` logged in as the first test user and synced.
+- **Not run:** `cargo run --release -p twicecat-app` opening a window (rendering is a human check); the commands on Linux and macOS (CI runs the build ones on every push); the Linux `apt-get` line was copied from `.github/actions/setup-build/action.yml`, not run here.
+- **Gate (Windows):** `cargo fmt --all --check`; `cargo clippy --workspace --all-targets --locked -- -D warnings`; `cargo check --workspace --lib --bins --locked`; `cargo test --workspace --locked --no-fail-fast -j 6`: 2301 passed, 0 failed, 158 ignored (the first run, with the default 24 jobs, ran out of memory linking the test binaries: "the paging file is too small"); `check-app-deps`, `check-core-api` (under `LC_ALL=C.UTF-8`: Git Bash's grep refuses `-P` in its default locale), `check-font-assets` and `check-no-webrtc-download` pass.
+- **For the human:** turn on private vulnerability reporting (Settings → Code security → Private vulnerability reporting); until then the link in `SECURITY.md` offers no form. Read the README's pitch and status table.
