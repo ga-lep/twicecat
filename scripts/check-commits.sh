@@ -11,11 +11,24 @@ head="${2:-HEAD}"
 # Capture first so a git failure aborts the script (set -e).
 merges=$(git rev-list --merges "$base..$head")
 log=$(git log --format='%h %s' --no-merges "$base..$head")
+base_tip=$(git rev-parse "$base")
 
 status=0
 if [ -n "$merges" ]; then
-    printf 'error: merge commits on the branch (rebase instead):\n%s\n' "$merges" >&2
-    status=1
+    bad_merges=()
+    while IFS= read -r merge; do
+        [ -n "$merge" ] || continue
+        merge_parent=$(git rev-parse "$merge^2")
+        if git merge-base --is-ancestor "$merge_parent" "$base_tip"; then
+            continue
+        fi
+        bad_merges+=("$merge")
+    done <<<"$merges"
+    if [ "${#bad_merges[@]}" -gt 0 ]; then
+        printf 'error: disallowed merge commits on the branch:\n' >&2
+        printf '%s\n' "${bad_merges[@]}" >&2
+        status=1
+    fi
 fi
 pattern='^[0-9a-f]+ (feat|fix|docs)(\([a-z0-9._/-]+\))?!?: [^ ].*$'
 while IFS= read -r line; do
