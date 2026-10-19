@@ -1,6 +1,7 @@
-//! Push-to-talk bindings: a keyboard shortcut and a gamepad button. Both are
-//! kept as strings in the audio settings (`ctrl+shift+KeyT`, `left_thumb`),
-//! so the core stores them without knowing this crate.
+//! Push-to-talk bindings: a keyboard shortcut, a mouse button and a gamepad
+//! button. All are kept as strings in the audio settings
+//! (`ctrl+shift+KeyT`, `back`, `left_thumb`), so the core stores them
+//! without knowing this crate.
 
 use std::fmt;
 use std::str::FromStr;
@@ -16,6 +17,9 @@ pub enum BindingError {
     /// Not a gamepad button name.
     #[error("not a gamepad button: {0}")]
     Button(String),
+    /// Not a mouse button this system has, or the left or right one.
+    #[error("not a mouse button: {0}")]
+    Mouse(String),
 }
 
 /// A keyboard shortcut: optional modifiers and one key, written as
@@ -180,6 +184,96 @@ fn keysym_name(code: Code) -> Option<String> {
         _ => return None,
     };
     Some(named.to_owned())
+}
+
+/// A mouse button: the middle one (the wheel's click), the two side buttons
+/// (`back` and `forward`, "mouse 4" and "mouse 5"), or another one by the
+/// system's own number (`button12`), which only X11, Wayland and macOS
+/// report. Left and right click, so they are never bindings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MouseButton(Mouse);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Mouse {
+    Middle,
+    Back,
+    Forward,
+    Other(u16),
+}
+
+/// The lowest number of another button, as winit numbers them: on X11 1 to
+/// 9 are the left, middle and right buttons, the wheel's four directions,
+/// back and forward (Wayland numbers others by their evdev code, from 0x110);
+/// on macOS 0 to 4 are left, right, middle, back and forward. Windows has no
+/// other buttons.
+const FIRST_OTHER: Option<u16> = if cfg!(target_os = "macos") {
+    Some(5)
+} else if cfg!(target_os = "windows") {
+    None
+} else {
+    Some(10)
+};
+
+impl MouseButton {
+    /// The middle button (the wheel's click).
+    pub const MIDDLE: Self = Self(Mouse::Middle);
+    /// The back side button ("mouse 4").
+    pub const BACK: Self = Self(Mouse::Back);
+    /// The forward side button ("mouse 5").
+    pub const FORWARD: Self = Self(Mouse::Forward);
+
+    /// Another button by the number winit gives it (`Other(n)`), when this
+    /// system has such a button.
+    pub fn other(number: u16) -> Option<Self> {
+        FIRST_OTHER
+            .is_some_and(|first| number >= first)
+            .then_some(Self(Mouse::Other(number)))
+    }
+
+    /// Another button by the number the system gives it, unchecked: the
+    /// global sources decode their own system's numbers.
+    #[cfg(any(test, target_os = "linux", target_os = "macos"))]
+    pub(crate) const fn numbered(number: u16) -> Self {
+        Self(Mouse::Other(number))
+    }
+
+    /// The number of another button; `None` for the middle and side ones.
+    pub fn number(self) -> Option<u16> {
+        match self.0 {
+            Mouse::Other(number) => Some(number),
+            Mouse::Middle | Mouse::Back | Mouse::Forward => None,
+        }
+    }
+}
+
+impl FromStr for MouseButton {
+    type Err = BindingError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let wanted = s.trim().to_ascii_lowercase();
+        match wanted.as_str() {
+            "middle" => Some(Self::MIDDLE),
+            "back" => Some(Self::BACK),
+            "forward" => Some(Self::FORWARD),
+            other => other
+                .strip_prefix("button")
+                .filter(|n| !n.starts_with('+'))
+                .and_then(|n| n.parse().ok())
+                .and_then(Self::other),
+        }
+        .ok_or_else(|| BindingError::Mouse(s.to_owned()))
+    }
+}
+
+impl fmt::Display for MouseButton {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Mouse::Middle => f.write_str("middle"),
+            Mouse::Back => f.write_str("back"),
+            Mouse::Forward => f.write_str("forward"),
+            Mouse::Other(number) => write!(f, "button{number}"),
+        }
+    }
 }
 
 /// A gamepad button, by its position (`south` is A on an Xbox pad, cross on
@@ -365,6 +459,50 @@ mod tests {
         assert_eq!(key("PageUp").portal_trigger().as_deref(), Some("Page_Up"));
         // No keysym name known: the portal's dialog picks the key.
         assert_eq!(key("AudioVolumeMute").portal_trigger(), None);
+    }
+
+    #[test]
+    fn mouse_buttons_round_trip_by_name() {
+        for (text, button) in [
+            ("middle", MouseButton::MIDDLE),
+            ("Back", MouseButton::BACK),
+            (" forward ", MouseButton::FORWARD),
+        ] {
+            assert_eq!(text.parse::<MouseButton>(), Ok(button));
+            assert_eq!(button.to_string().parse::<MouseButton>(), Ok(button));
+            assert_eq!(button.number(), None);
+        }
+        assert_eq!(MouseButton::BACK.to_string(), "back");
+        for bad in [
+            "",
+            "left",
+            "right",
+            "mouse4",
+            "button",
+            "button+12",
+            "button-1",
+            "button70000",
+        ] {
+            assert!(bad.parse::<MouseButton>().is_err(), "{bad:?}");
+        }
+        // Other buttons, by the system's own numbers.
+        match FIRST_OTHER {
+            Some(first) => {
+                assert_eq!(
+                    MouseButton::other(first - 1),
+                    None,
+                    "a named one or the wheel"
+                );
+                let button = MouseButton::other(first).unwrap();
+                assert_eq!(button.to_string(), format!("button{first}"));
+                assert_eq!(button.to_string().parse::<MouseButton>(), Ok(button));
+                assert_eq!(button.number(), Some(first));
+            }
+            None => {
+                assert_eq!(MouseButton::other(12), None);
+                assert!("button12".parse::<MouseButton>().is_err());
+            }
+        }
     }
 
     #[test]

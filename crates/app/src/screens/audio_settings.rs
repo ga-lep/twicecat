@@ -18,7 +18,7 @@ use twicecat_ptt::{KeyboardBackend, Source};
 
 use crate::audio_settings::{
     AUTO_GAIN_MAX_RANGE, AudioMessage, AudioPage, AudioUi, ButtonChoice, CLEANING_LIMIT_RANGE,
-    GpuView, INPUT_GAIN_RANGE, LevelChoice, ModeChoice, NO_GPU_FOUND, NoiseChoice,
+    GpuView, INPUT_GAIN_RANGE, LevelChoice, ModeChoice, MouseChoice, NO_GPU_FOUND, NoiseChoice,
     RELEASE_DELAY_RANGE, SimpleNoise, SkipChoice, Slider, THRESHOLD_RANGE, backend_label,
     bitrate_menu, device_menu, diagnostic_rows, diagnostics, dropout_words, gpu_name, gpu_status,
     gpu_used, gpu_view, key_label, meter, meter_zone, mic_status, unloaded_mic_words, zone_words,
@@ -365,8 +365,9 @@ pub fn source_name(source: Source) -> &'static str {
     match source {
         Source::Hotkey => "Global shortcut",
         Source::Portal => "Desktop shortcut",
+        Source::Mouse => "Mouse button",
         Source::Gamepad => "Gamepad",
-        Source::Window => "Twicecat's window",
+        Source::Window | Source::WindowMouse => "Twicecat's window",
     }
 }
 
@@ -376,6 +377,11 @@ pub fn source_line(source: Source, state: &SourceState) -> String {
         SourceState::Ready(trigger) if trigger.is_empty() => {
             format!("{}: ready.", source_name(source))
         }
+        SourceState::Ready(trigger) if source == Source::Mouse => format!(
+            "{}: ready, press {}.",
+            source_name(source),
+            crate::audio_settings::mouse_words(trigger)
+        ),
         SourceState::Ready(trigger) => format!(
             "{}: ready, press {}.",
             source_name(source),
@@ -407,6 +413,21 @@ pub fn keyboard_note(keyboard: KeyboardBackend) -> &'static str {
     }
 }
 
+/// Where the mouse button works, for the session's keyboard mechanism
+/// (which also says whether the mouse is seen outside the window).
+pub fn mouse_note(keyboard: KeyboardBackend) -> &'static str {
+    match keyboard {
+        KeyboardBackend::Hotkey => {
+            "The mouse button works in every app too, and they still receive its clicks: \
+             pick one no app you talk in needs."
+        }
+        KeyboardBackend::Portal => {
+            "On Wayland the mouse button works only while Twicecat's window has focus."
+        }
+        KeyboardBackend::WindowOnly => "The mouse button works while Twicecat's window has focus.",
+    }
+}
+
 /// The send mode in words, under the menu that sets it.
 fn mode_note(mode: &InputMode) -> &'static str {
     match mode {
@@ -415,12 +436,12 @@ fn mode_note(mode: &InputMode) -> &'static str {
              Microphone. The microphone is open for the whole call."
         }
         InputMode::PushToTalk { toggle: false, .. } => {
-            "Nothing is sent until you hold the key or the gamepad button, and for a moment \
-             after you let go."
+            "Nothing is sent until you hold the key, the mouse button or the gamepad button, \
+             and for a moment after you let go."
         }
         InputMode::PushToTalk { toggle: true, .. } => {
-            "Nothing is sent until you press the key or the gamepad button; it keeps sending \
-             until you press it again."
+            "Nothing is sent until you press the key, the mouse button or the gamepad button; \
+             it keeps sending until you press it again."
         }
     }
 }
@@ -462,6 +483,8 @@ fn talking_page<'a>(app: &'a App, settings: &'a AudioSettings) -> Element<'a, Me
         InputMode::PushToTalk { .. } => {
             page = page
                 .push(key_row(app, settings))
+                .push(labelled("Mouse button", mouse_menu(settings)))
+                .push(note(mouse_note(app.ptt.keyboard())))
                 .push(labelled("Gamepad button", button_menu(settings)))
                 .push(a_slider(
                     &app.audio_ui,
@@ -481,6 +504,9 @@ fn talking_page<'a>(app: &'a App, settings: &'a AudioSettings) -> Element<'a, Me
                         Severity::Danger,
                         match bad {
                             BadBinding::Key => "The saved key cannot be used: set it again.",
+                            BadBinding::Mouse => {
+                                "The saved mouse button cannot be used: pick it again."
+                            }
                             BadBinding::Button => {
                                 "The saved gamepad button cannot be used: pick it again."
                             }
@@ -509,8 +535,8 @@ pub const CAPTURING_WORDS: &str = "Press a key\u{2026}";
 
 /// The words under the key row: the way out while it waits, else why the last
 /// key was refused.
-pub const CAPTURING_HINT: &str =
-    "Press the key together with the modifiers you want (Ctrl, Shift, Alt). Esc cancels.";
+pub const CAPTURING_HINT: &str = "Press the key together with the modifiers you want (Ctrl, \
+     Shift, Alt), or a mouse button other than left and right. Esc cancels.";
 
 /// The key row. The same four widgets whether it waits or not
 /// (`[box, Set key or Cancel, Clear]` and a hint slot), so the focus stays
@@ -550,6 +576,15 @@ fn key_row<'a>(app: &'a App, settings: &'a AudioSettings) -> Element<'a, Message
     column![labelled("Key", control.into()), hint]
         .spacing(tokens::XS)
         .into()
+}
+
+fn mouse_menu(settings: &AudioSettings) -> Element<'_, Message> {
+    let (menu, chosen) = MouseChoice::menu(settings.push_to_talk.mouse_button.as_deref());
+    kit::menu(
+        pick_list(menu, Some(chosen), |c| msg(AudioMessage::Mouse(c)))
+            .style(kit::menu_style)
+            .width(Fill),
+    )
 }
 
 fn button_menu(settings: &AudioSettings) -> Element<'_, Message> {

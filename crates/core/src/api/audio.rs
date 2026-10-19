@@ -350,6 +350,10 @@ pub struct PushToTalkBindings {
     /// Global keyboard shortcut in global-hotkey syntax: modifiers, then one
     /// key (`ctrl+shift+KeyT`, `F13`).
     pub key: Option<String>,
+    /// Mouse button other than left and right (`middle`, `back`, `forward`,
+    /// or the system's own number, `button12`). Missing from files written
+    /// before it existed, which read as none.
+    pub mouse_button: Option<String>,
     /// Gamepad button by position (`south`, `left_thumb`, `right_trigger2`).
     pub gamepad_button: Option<String>,
 }
@@ -503,6 +507,7 @@ impl AudioSettings {
         // Bindings are short ASCII names; anything else is dropped.
         for binding in [
             &mut self.push_to_talk.key,
+            &mut self.push_to_talk.mouse_button,
             &mut self.push_to_talk.gamepad_button,
         ] {
             if binding.as_ref().is_some_and(|b| {
@@ -707,6 +712,7 @@ mod tests {
     fn validated_drops_malformed_push_to_talk_bindings() {
         let keep = PushToTalkBindings {
             key: Some("ctrl+shift+KeyT".into()),
+            mouse_button: Some("back".into()),
             gamepad_button: Some("left_thumb".into()),
         };
         let s = AudioSettings {
@@ -718,6 +724,7 @@ mod tests {
             let s = AudioSettings {
                 push_to_talk: PushToTalkBindings {
                     key: Some(bad.to_owned()),
+                    mouse_button: Some(bad.to_owned()),
                     gamepad_button: Some(bad.to_owned()),
                 },
                 ..AudioSettings::default()
@@ -725,6 +732,21 @@ mod tests {
             .validated();
             assert_eq!(s.push_to_talk, PushToTalkBindings::default(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn bindings_written_before_the_mouse_button_still_load() {
+        let old =
+            serde_json::json!({ "push_to_talk": { "key": "F13", "gamepad_button": "south" } });
+        let s: AudioSettings = serde_json::from_value(old).unwrap();
+        assert_eq!(
+            s.push_to_talk,
+            PushToTalkBindings {
+                key: Some("F13".into()),
+                mouse_button: None,
+                gamepad_button: Some("south".into()),
+            }
+        );
     }
 
     #[test]
@@ -799,7 +821,7 @@ mod tests {
                     "cancel_system_audio": false,
                 },
                 "input_mode": { "kind": "voice_activity", "automatic": true, "threshold_db": -50.0 },
-                "push_to_talk": { "key": null, "gamepad_button": null },
+                "push_to_talk": { "key": null, "mouse_button": null, "gamepad_button": null },
                 "input_gain_db": 0.0,
                 "output_volume_percent": 100,
                 "voice_bitrate_kbps": 64,

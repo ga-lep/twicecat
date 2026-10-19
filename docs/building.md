@@ -137,7 +137,9 @@ The first time push-to-talk starts (a call, the mic test, or the Voice & audio c
 
 On X11, Windows and macOS the key is registered directly; nothing needs installing. In SteamOS game mode (gamescope) there is no global shortcut: the key works while Twicecat's window has focus, and a gamepad button works everywhere.
 
-To see what push-to-talk receives on a desktop, without the app: `cargo run -p twicecat-ptt --example ptt_probe -- --key ctrl+shift+KeyT --button left_thumb`.
+A mouse button (the middle one, the side buttons "mouse 4" and "mouse 5", or on X11 and macOS another one, picked with **Set key…**) works in every app on X11 (XInput 2.1 or newer), Windows and macOS. Other apps still receive its clicks, so a side button still goes back in a browser. Wayland shows an app the mouse only over its own windows, so there, and in game mode, the button works while Twicecat's window has focus.
+
+To see what push-to-talk receives on a desktop, without the app: `cargo run -p twicecat-ptt --example ptt_probe -- --key ctrl+shift+KeyT --mouse back --button left_thumb`.
 
 ## Disk use
 

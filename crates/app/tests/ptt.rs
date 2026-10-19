@@ -51,6 +51,7 @@ struct Nothing;
 
 impl PttHandle for Nothing {
     fn window_key(&self, _pressed: bool) {}
+    fn window_mouse(&self, _pressed: bool) {}
 }
 
 impl PttStarter for FakeSource {
@@ -238,6 +239,7 @@ fn push_to_talk(release_delay_ms: u32) -> AudioSettings {
         },
         push_to_talk: PushToTalkBindings {
             key: Some("F13".into()),
+            mouse_button: None,
             gamepad_button: None,
         },
         ..AudioSettings::default()

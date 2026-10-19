@@ -53,6 +53,7 @@ async fn update_is_validated_saved_and_survives_a_restart() {
         voice_bitrate_kbps: 96,
         push_to_talk: PushToTalkBindings {
             key: Some("ctrl+shift+KeyT".into()),
+            mouse_button: Some("back".into()),
             gamepad_button: Some("left_thumb".into()),
         },
         ..AudioSettings::default()
