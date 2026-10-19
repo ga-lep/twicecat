@@ -2,7 +2,7 @@ name: Release
 
 # Phase 7 plan Task 8. On a `v*` tag: check the tag against the version, build
 # every package with the dist profile, smoke-test them, sign what the human's
-# secrets allow, and make a DRAFT release with SHA256SUMS and build provenance
+# secrets allow, and make a DRAFT release with SHA256SUMS.txt and build provenance
 # attestations; the human publishes it. "Run workflow" (Actions tab) is a dry
 # run: the same packages as one artifact, and no release.
 #
@@ -266,7 +266,7 @@ jobs:
           retention-days: 7
 
   windows:
-    needs: version
+    needs: [version, stateful-graph]
     runs-on: windows-latest
     timeout-minutes: 120
     defaults:
@@ -291,10 +291,28 @@ jobs:
         run: |
           cargo install cargo-about@0.9.2 --locked --features cli
           cargo install cargo-packager@0.11.8 --locked
+      # The MSI carries the "any GPU" pack too (plan Q3 b, Windows added
+      # 2026-10-18): WebGPU on Direct3D 12 for every GPU.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: stateful-graph
+          path: ${{ runner.temp }}/stateful
       - name: Build and package (dist profile)
         env:
           TWICECAT_WINDOWS_SIGN_COMMAND: ${{ secrets.WINDOWS_SIGN_COMMAND }}
-        run: scripts/package.sh
+        run: |
+          TWICECAT_STATEFUL_MODEL="$(cygpath -u "$RUNNER_TEMP")/stateful/deepfilternet3_stateful.onnx" \
+            scripts/package.sh
+          # What the app's GPU check needs beside twicecat.exe
+          # (crates/core/src/gpu_enhancement.rs).
+          res=target/package/x86_64-pc-windows-msvc/resources
+          for f in onnxruntime/1.28.3/win-x64/lib/onnxruntime.dll \
+                   onnxruntime/webgpu-ep-0.4.0/onnxruntime_providers_webgpu.dll \
+                   onnxruntime/webgpu-ep-0.4.0/dxcompiler.dll \
+                   onnxruntime/webgpu-ep-0.4.0/dxil.dll \
+                   models/deepfilternet3-stateful/deepfilternet3_stateful.onnx; do
+            [ -f "$res/$f" ] || { echo "the MSI's resources lack $f"; exit 1; }
+          done
       - name: Smoke-test the binary
         env:
           VERSION: ${{ needs.version.outputs.version }}
@@ -386,7 +404,7 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # The only job that writes: SHA256SUMS, the attestations, the draft.
+  # The only job that writes: the release names, SHA256SUMS.txt, the attestations, the draft.
   release:
     needs: [version, linux, flatpak, windows, macos]
     runs-on: ubuntu-26.04
@@ -395,11 +413,21 @@ jobs:
       id-token: write
       attestations: write
     steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: dist-*
           path: dist
           merge-multiple: true
+      # One name per file, twicecat-<tag>-<os>-<arch>.<format>, so the release
+      # page groups them by system (the packaging tools each name theirs their
+      # own way).
+      - name: Name the files
+        env:
+          TAG: ${{ needs.version.outputs.tag }}
+        run: scripts/release-names.sh dist "$TAG"
       # The AppImage updater's manifest, when the AppImages were signed: the
       # newest version and, per architecture, its download and signature.
       # It reaches the updater once this release is published as the latest.
@@ -415,7 +443,8 @@ jobs:
           platforms = {}
           for sig in sorted(pathlib.Path(dist).glob("*.AppImage.sig")):
               image = sig.name[: -len(".sig")]
-              arch = "aarch64" if "aarch64" in image else "x86_64"
+              # The updater's target names, from the file's arch (release-names.sh).
+              arch = "aarch64" if "-linux-arm64." in image else "x86_64"
               platforms[f"linux-{arch}"] = {
                   "url": f"https://github.com/{repo}/releases/download/{tag}/{image}",
                   "signature": sig.read_text().strip(),
@@ -431,11 +460,12 @@ jobs:
           EOF
             cat dist/latest.json
           fi
-      - name: SHA256SUMS
+      # .txt, so a browser shows it rather than downloading it.
+      - name: SHA256SUMS.txt
         working-directory: dist
         run: |
-          sha256sum -- * > SHA256SUMS
-          cat SHA256SUMS
+          sha256sum -- * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: dist/*
@@ -447,13 +477,7 @@ jobs:
           WINDOWS_SIGNED: ${{ secrets.WINDOWS_SIGN_COMMAND != '' }}
           MACOS_SIGNED: ${{ secrets.APPLE_SIGNING_IDENTITY != '' }}
         run: |
-          {
-            echo "Packages for Linux (x86_64 and aarch64: Flatpak, AppImage, .deb, .rpm, .tar.zst), Windows x64 (MSI) and macOS on Apple Silicon (DMG). Check downloads against SHA256SUMS, or with \`gh attestation verify <file> --repo $GITHUB_REPOSITORY\`."
-            echo
-            if [ "$WINDOWS_SIGNED" = true ]; then echo "- Windows: signed."; else echo "- Windows: **unsigned**; SmartScreen warns on first start."; fi
-            if [ "$MACOS_SIGNED" = true ]; then echo "- macOS: signed with a Developer ID and notarized."; else echo "- macOS: **unsigned**; macOS refuses to open it until you allow it in System Settings → Privacy & Security."; fi
-            echo "- Linux: packages are not signed; SHA256SUMS and the attestations cover them."
-          } > "$RUNNER_TEMP/notes.md"
+          scripts/release-notes.sh "$TAG" "$GITHUB_REPOSITORY" "$WINDOWS_SIGNED" "$MACOS_SIGNED" > "$RUNNER_TEMP/notes.md"
           # A labelled tag (v0.1.0-alpha, scripts/check-version.sh) is a
           # pre-release, which the updater's "latest release" never offers.
           prerelease=()
