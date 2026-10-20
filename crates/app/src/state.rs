@@ -1958,6 +1958,8 @@ impl App {
                 self.tray
                     .set_unread(notifications, self.ui_settings.tray_badge);
             }
+            // The rail's badges read this in a later step; nothing uses it yet.
+            CoreEvent::SpaceUnread { .. } => {}
             CoreEvent::RoomCreated { room_id } => task = self.on_room_created(room_id),
             CoreEvent::RoomJoined { room_id } => task = self.on_room_joined(room_id),
             CoreEvent::RoomDetails(details) => task = self.on_room_details(details),

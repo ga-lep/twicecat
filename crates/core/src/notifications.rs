@@ -20,15 +20,17 @@ use matrix_sdk::ruma::{OwnedRoomId, UserId as SdkUserId};
 use matrix_sdk::sync::Notification;
 use matrix_sdk::{Client, NotificationSettingsError, Room};
 use serde_json::Value;
-use tokio::sync::{Notify, broadcast, mpsc};
+use tokio::sync::{Notify, broadcast, mpsc, watch};
 use tokio::task::JoinSet;
 
 use crate::api::{
     ActionKind, Block, CoreError, CoreEvent, EventId, Inline, MessageText, NotificationKind,
-    NotificationSettingsView, NotificationView, RoomId, RoomNotificationModeView, UserId,
+    NotificationSettingsView, NotificationView, RoomId, RoomNotificationModeView, SpaceUnreadView,
+    UnreadCountsView, UserId,
 };
 use crate::rich_text;
 use crate::room_list::{highlights_of, is_bidi_control, name_or_id};
+use crate::spaces::SpaceChildren;
 
 /// Longest notification preview, in characters.
 pub(crate) const PREVIEW_MAX_CHARS: usize = 120;
@@ -387,10 +389,13 @@ pub(crate) fn validate_keyword(
 }
 
 /// The unread counts of one joined room.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RoomCounts {
+    pub(crate) id: OwnedRoomId,
     pub(crate) notifications: u64,
     pub(crate) highlights: u64,
+    /// The room is marked unread, or has unread messages.
+    pub(crate) unread: bool,
     /// The room's effective notification mode is "mute".
     pub(crate) muted: bool,
 }
@@ -399,7 +404,7 @@ pub(crate) struct RoomCounts {
 pub(crate) type Totals = (u64, u64);
 
 /// Sums the counts of the rooms that are not muted (saturating).
-pub(crate) fn totals(rooms: impl IntoIterator<Item = RoomCounts>) -> Totals {
+pub(crate) fn totals<'a>(rooms: impl IntoIterator<Item = &'a RoomCounts>) -> Totals {
     rooms
         .into_iter()
         .filter(|r| !r.muted)
@@ -411,10 +416,89 @@ pub(crate) fn totals(rooms: impl IntoIterator<Item = RoomCounts>) -> Totals {
         })
 }
 
+/// Adds the rooms that are not muted into one [`UnreadCountsView`].
+fn sum_counts<'a>(rooms: impl IntoIterator<Item = &'a RoomCounts>) -> UnreadCountsView {
+    rooms
+        .into_iter()
+        .filter(|r| !r.muted)
+        .fold(UnreadCountsView::default(), |sum, r| UnreadCountsView {
+            notifications: sum.notifications.saturating_add(r.notifications),
+            highlights: sum.highlights.saturating_add(r.highlights),
+            unread: sum.unread || r.unread,
+        })
+}
+
+/// Unread counts for each space (by ID order) and for the rooms in no space.
+///
+/// `children` holds each known space's SDK descendants. A space ID is never
+/// a room: it is left out of every sum and of `outside`. A space that no
+/// other space lists is top-level; its direct children that are spaces
+/// themselves stand for their own descendants, and a room that is reached
+/// twice counts once. A room in two top-level spaces counts in both.
+pub(crate) fn space_totals(
+    rooms: &[RoomCounts],
+    children: &SpaceChildren,
+) -> (Vec<SpaceUnreadView>, UnreadCountsView) {
+    let listed: HashSet<&OwnedRoomId> = children.values().flatten().collect();
+    let mut ids: Vec<&OwnedRoomId> = children.keys().collect();
+    ids.sort_unstable();
+    let spaces = ids
+        .into_iter()
+        .map(|space| {
+            let top_level = !listed.contains(space);
+            let mut members: HashSet<&OwnedRoomId> = HashSet::new();
+            for child in &children[space] {
+                match children.get(child) {
+                    // A space is never a room; a top-level space also takes
+                    // everything its sub-space holds.
+                    Some(inner) if top_level => {
+                        members.extend(inner.iter().filter(|id| !children.contains_key(*id)));
+                    }
+                    Some(_) => {}
+                    None => {
+                        members.insert(child);
+                    }
+                }
+            }
+            SpaceUnreadView {
+                space: RoomId::from(space.as_str()),
+                counts: sum_counts(rooms.iter().filter(|r| members.contains(&r.id))),
+            }
+        })
+        .collect();
+    let outside = sum_counts(
+        rooms
+            .iter()
+            .filter(|r| !listed.contains(&r.id) && !children.contains_key(&r.id)),
+    );
+    (spaces, outside)
+}
+
+/// Everything one computation yields: the tray totals, and the per-space
+/// counts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Rollup {
+    pub(crate) totals: Totals,
+    pub(crate) spaces: Vec<SpaceUnreadView>,
+    pub(crate) outside: UnreadCountsView,
+}
+
+impl Rollup {
+    /// The rollup of `rooms` given the spaces' descendants.
+    pub(crate) fn of(rooms: &[RoomCounts], children: &SpaceChildren) -> Self {
+        let (spaces, outside) = space_totals(rooms, children);
+        Self {
+            totals: totals(rooms),
+            spaces,
+            outside,
+        }
+    }
+}
+
 /// Where the totals come from, and when they may have changed.
 pub(crate) trait TotalsSource: Send {
-    /// The current totals.
-    fn compute(&mut self) -> impl Future<Output = Totals> + Send;
+    /// The current totals and per-space counts.
+    fn compute(&mut self) -> impl Future<Output = Rollup> + Send;
     /// Waits for a possible change; false when no change can come any more.
     fn changed(&mut self) -> impl Future<Output = bool> + Send;
 }
@@ -422,22 +506,34 @@ pub(crate) trait TotalsSource: Send {
 /// Shortest time between two totals computations.
 pub(crate) const TOTALS_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Sends [`CoreEvent::UnreadTotals`] when the totals change: once at the
-/// start, then at most once per `interval`. A change that arrives within the
-/// interval is picked up when it ends.
+/// Sends [`CoreEvent::UnreadTotals`] and [`CoreEvent::SpaceUnread`], each when
+/// its value changes: once at the start, then at most once per `interval`. A
+/// change that arrives within the interval is picked up when it ends.
 pub(crate) async fn run_totals<S: TotalsSource>(
     mut source: S,
     events: mpsc::Sender<CoreEvent>,
     interval: Duration,
 ) {
-    let mut last = None;
+    let mut last_totals = None;
+    let mut last_spaces: Option<(Vec<SpaceUnreadView>, UnreadCountsView)> = None;
     loop {
         let now = source.compute().await;
-        if last != Some(now) {
-            last = Some(now);
+        if last_totals != Some(now.totals) {
+            last_totals = Some(now.totals);
             let event = CoreEvent::UnreadTotals {
-                notifications: now.0,
-                highlights: now.1,
+                notifications: now.totals.0,
+                highlights: now.totals.1,
+            };
+            if events.send(event).await.is_err() {
+                return;
+            }
+        }
+        let spaces = (now.spaces, now.outside);
+        if last_spaces.as_ref() != Some(&spaces) {
+            last_spaces = Some(spaces.clone());
+            let event = CoreEvent::SpaceUnread {
+                spaces: spaces.0,
+                outside: spaces.1,
             };
             if events.send(event).await.is_err() {
                 return;
@@ -541,26 +637,35 @@ struct SdkTotals {
     settings: NotificationSettings,
     /// Pinged by the forwarders when a room or the settings changed.
     changed: Arc<Notify>,
+    /// The descendants of each space; a change recomputes the roll-up.
+    spaces: watch::Receiver<SpaceChildren>,
 }
 
 impl TotalsSource for SdkTotals {
-    async fn compute(&mut self) -> Totals {
+    async fn compute(&mut self) -> Rollup {
         let mut counts = Vec::new();
         for room in self.client.joined_rooms() {
             counts.push(RoomCounts {
+                id: room.room_id().to_owned(),
                 notifications: room.num_unread_notifications(),
                 highlights: highlights_of(
                     room.num_unread_mentions(),
                     room.unread_notification_counts().highlight_count,
                 ),
+                unread: room.is_marked_unread() || room.num_unread_messages() > 0,
                 muted: is_muted(&self.settings, &room).await,
             });
         }
-        totals(counts)
+        let children = self.spaces.borrow_and_update().clone();
+        Rollup::of(&counts, &children)
     }
 
     async fn changed(&mut self) -> bool {
-        self.changed.notified().await;
+        tokio::select! {
+            () = self.changed.notified() => {}
+            // A closed watch only means no more space changes can come.
+            Ok(()) = self.spaces.changed() => {}
+        }
         true
     }
 }
@@ -838,7 +943,11 @@ impl NotificationTasks {
     /// Registers the notification handler (once: this runs once per client)
     /// and starts the tasks. Call it before the sync starts, so that no
     /// event is missed.
-    pub(crate) async fn start(client: &Client, events: &mpsc::Sender<CoreEvent>) -> Self {
+    pub(crate) async fn start(
+        client: &Client,
+        events: &mpsc::Sender<CoreEvent>,
+        spaces: watch::Receiver<SpaceChildren>,
+    ) -> Self {
         let keywords = Keywords::default();
         let handler = Arc::new(Handler {
             events: events.downgrade(),
@@ -875,6 +984,7 @@ impl NotificationTasks {
                 client: client.clone(),
                 settings,
                 changed,
+                spaces,
             },
             events.clone(),
             TOTALS_INTERVAL,
@@ -1246,10 +1356,16 @@ mod tests {
         }
     }
 
+    fn room_id(id: &str) -> OwnedRoomId {
+        id.try_into().unwrap()
+    }
+
     fn counts(n: u64, h: u64, muted: bool) -> RoomCounts {
         RoomCounts {
+            id: room_id("!r:x"),
             notifications: n,
             highlights: h,
+            unread: false,
             muted,
         }
     }
@@ -1267,22 +1383,174 @@ mod tests {
             ),
         ];
         for (rooms, want) in table {
-            assert_eq!(totals(rooms.iter().copied()), want, "{rooms:?}");
+            assert_eq!(totals(rooms), want, "{rooms:?}");
         }
     }
 
-    /// A source whose totals and change signals the test drives.
+    fn room(id: &str, n: u64, h: u64) -> RoomCounts {
+        RoomCounts {
+            id: room_id(id),
+            notifications: n,
+            highlights: h,
+            unread: false,
+            muted: false,
+        }
+    }
+
+    /// Descendants as the SDK builds them: a level-0 space lists its direct
+    /// children; a level-1 space lists all its descendants and itself, last.
+    fn tree(spaces: &[(&str, &[&str])]) -> SpaceChildren {
+        Arc::new(
+            spaces
+                .iter()
+                .map(|(space, kids)| (room_id(space), kids.iter().map(|k| room_id(k)).collect()))
+                .collect(),
+        )
+    }
+
+    fn of(spaces: &[SpaceUnreadView], id: &str) -> UnreadCountsView {
+        spaces
+            .iter()
+            .find(|s| s.space.as_str() == id)
+            .unwrap_or_else(|| panic!("no entry for {id}"))
+            .counts
+    }
+
+    fn view(n: u64, h: u64) -> UnreadCountsView {
+        UnreadCountsView {
+            notifications: n,
+            highlights: h,
+            unread: false,
+        }
+    }
+
+    #[test]
+    fn a_muted_room_counts_nowhere() {
+        let mut muted = room("!a:x", 9, 4);
+        muted.muted = true;
+        muted.unread = true;
+        let rooms = [muted, room("!b:x", 2, 1), room("!out:x", 1, 0)];
+        let (spaces, outside) = space_totals(&rooms, &tree(&[("!s:x", &["!a:x", "!b:x"])]));
+        assert_eq!(of(&spaces, "!s:x"), view(2, 1));
+        assert_eq!(outside, view(1, 0));
+        // A room only muted gives no unread flag either.
+        let (spaces, _) = space_totals(&rooms[..1], &tree(&[("!s:x", &["!a:x"])]));
+        assert_eq!(of(&spaces, "!s:x"), UnreadCountsView::default());
+    }
+
+    #[test]
+    fn a_room_of_a_sub_space_counts_for_it_and_for_the_top_space_once() {
+        // `!top` holds `!direct` and the sub-space `!sub`, which holds `!deep`
+        // and, as the SDK lists it, itself last. `!both` is in both lists.
+        let children = tree(&[
+            ("!top:x", &["!direct:x", "!sub:x", "!both:x"]),
+            ("!sub:x", &["!deep:x", "!both:x", "!sub:x"]),
+        ]);
+        let rooms = [
+            room("!direct:x", 1, 0),
+            room("!deep:x", 10, 2),
+            room("!both:x", 100, 0),
+            // A space's own counts are not a room's.
+            room("!sub:x", 1000, 0),
+            room("!top:x", 10_000, 0),
+        ];
+        let (spaces, outside) = space_totals(&rooms, &children);
+        assert_eq!(of(&spaces, "!sub:x"), view(110, 2));
+        assert_eq!(of(&spaces, "!top:x"), view(111, 2));
+        assert_eq!(outside, UnreadCountsView::default());
+        assert_eq!(spaces.len(), 2);
+    }
+
+    #[test]
+    fn a_room_in_two_top_level_spaces_counts_in_both() {
+        let children = tree(&[("!s:x", &["!a:x"]), ("!t:x", &["!a:x", "!b:x"])]);
+        let rooms = [room("!a:x", 3, 1), room("!b:x", 4, 0)];
+        let (spaces, outside) = space_totals(&rooms, &children);
+        assert_eq!(of(&spaces, "!s:x"), view(3, 1));
+        assert_eq!(of(&spaces, "!t:x"), view(7, 1));
+        assert_eq!(outside, UnreadCountsView::default());
+    }
+
+    #[test]
+    fn rooms_in_no_space_count_outside() {
+        let children = tree(&[("!s:x", &["!a:x"])]);
+        let rooms = [room("!a:x", 3, 0), room("!dm:x", 5, 2), room("!r:x", 1, 0)];
+        let (spaces, outside) = space_totals(&rooms, &children);
+        assert_eq!(of(&spaces, "!s:x"), view(3, 0));
+        assert_eq!(outside, view(6, 2));
+        let (spaces, outside) = space_totals(&rooms, &tree(&[]));
+        assert!(spaces.is_empty());
+        assert_eq!(outside, view(9, 2));
+    }
+
+    #[test]
+    fn a_space_id_is_not_a_room_even_when_the_list_is_cut_or_odd() {
+        // A space whose own ID is the only entry, and a space nobody lists
+        // that is still a space: neither adds to `outside` or to a sum.
+        let children = tree(&[("!s:x", &["!s:x"]), ("!lone:x", &[])]);
+        let rooms = [room("!s:x", 7, 0), room("!lone:x", 8, 0)];
+        let (spaces, outside) = space_totals(&rooms, &children);
+        assert_eq!(of(&spaces, "!s:x"), UnreadCountsView::default());
+        assert_eq!(of(&spaces, "!lone:x"), UnreadCountsView::default());
+        assert_eq!(outside, UnreadCountsView::default());
+    }
+
+    #[test]
+    fn the_sums_saturate() {
+        let children = tree(&[("!s:x", &["!a:x", "!b:x"])]);
+        let rooms = [
+            room("!a:x", u64::MAX, u64::MAX),
+            room("!b:x", 5, 5),
+            room("!c:x", u64::MAX, 1),
+            room("!d:x", 1, u64::MAX),
+        ];
+        let (spaces, outside) = space_totals(&rooms, &children);
+        assert_eq!(of(&spaces, "!s:x"), view(u64::MAX, u64::MAX));
+        assert_eq!(outside, view(u64::MAX, u64::MAX));
+    }
+
+    #[test]
+    fn unread_is_the_flag_alone() {
+        let mut flagged = room("!a:x", 0, 0);
+        flagged.unread = true;
+        let children = tree(&[("!s:x", &["!a:x", "!b:x"])]);
+        let (spaces, outside) = space_totals(&[flagged.clone(), room("!b:x", 0, 0)], &children);
+        assert_eq!(
+            of(&spaces, "!s:x"),
+            UnreadCountsView {
+                notifications: 0,
+                highlights: 0,
+                unread: true
+            }
+        );
+        assert!(!outside.unread);
+        let (spaces, _) = space_totals(&[room("!a:x", 0, 0)], &children);
+        assert!(!of(&spaces, "!s:x").unread);
+        // And outside a space.
+        flagged.id = room_id("!free:x");
+        assert!(space_totals(&[flagged], &children).1.unread);
+    }
+
+    #[test]
+    fn spaces_come_in_id_order() {
+        let children = tree(&[("!b:x", &[]), ("!a:x", &[]), ("!c:x", &[])]);
+        let (spaces, _) = space_totals(&[], &children);
+        let ids: Vec<&str> = spaces.iter().map(|s| s.space.as_str()).collect();
+        assert_eq!(ids, ["!a:x", "!b:x", "!c:x"]);
+    }
+
+    /// A source whose rollup and change signals the test drives.
     struct Fake {
-        value: std::sync::Arc<std::sync::Mutex<Totals>>,
+        value: std::sync::Arc<std::sync::Mutex<Rollup>>,
         changes: mpsc::UnboundedReceiver<()>,
         computes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl TotalsSource for Fake {
-        async fn compute(&mut self) -> Totals {
+        async fn compute(&mut self) -> Rollup {
             self.computes
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            *self.value.lock().unwrap()
+            self.value.lock().unwrap().clone()
         }
 
         async fn changed(&mut self) -> bool {
@@ -1290,18 +1558,32 @@ mod tests {
         }
     }
 
+    fn roll(n: u64, h: u64) -> Rollup {
+        Rollup {
+            totals: (n, h),
+            spaces: Vec::new(),
+            outside: UnreadCountsView::default(),
+        }
+    }
+
+    /// What was sent: the totals, and how many `SpaceUnread` events.
     fn sent(rx: &mut mpsc::Receiver<CoreEvent>) -> Vec<Totals> {
-        let mut out = Vec::new();
+        sent_both(rx).0
+    }
+
+    fn sent_both(rx: &mut mpsc::Receiver<CoreEvent>) -> (Vec<Totals>, Vec<UnreadCountsView>) {
+        let (mut totals, mut outside) = (Vec::new(), Vec::new());
         while let Ok(event) = rx.try_recv() {
             match event {
                 CoreEvent::UnreadTotals {
                     notifications,
                     highlights,
-                } => out.push((notifications, highlights)),
+                } => totals.push((notifications, highlights)),
+                CoreEvent::SpaceUnread { outside: o, .. } => outside.push(o),
                 other => panic!("{other:?}"),
             }
         }
-        out
+        (totals, outside)
     }
 
     async fn settle() {
@@ -1312,7 +1594,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn totals_are_sent_at_most_once_a_second_and_only_on_change() {
-        let value = std::sync::Arc::new(std::sync::Mutex::new((0, 0)));
+        let value = std::sync::Arc::new(std::sync::Mutex::new(roll(0, 0)));
         let computes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (change_tx, changes) = mpsc::unbounded_channel();
         let (tx, mut rx) = mpsc::channel(16);
@@ -1328,7 +1610,7 @@ mod tests {
 
         // A burst of changes inside the interval: nothing yet.
         for n in 1..=5 {
-            *value.lock().unwrap() = (n, 0);
+            *value.lock().unwrap() = roll(n, 0);
             change_tx.send(()).unwrap();
         }
         tokio::time::advance(Duration::from_millis(900)).await;
@@ -1349,11 +1631,11 @@ mod tests {
         // After a quiet spell a change goes out right away, and is followed
         // by a pause again.
         tokio::time::advance(Duration::from_secs(30)).await;
-        *value.lock().unwrap() = (0, 0);
+        *value.lock().unwrap() = roll(0, 0);
         change_tx.send(()).unwrap();
         settle().await;
         assert_eq!(sent(&mut rx), vec![(0, 0)]);
-        *value.lock().unwrap() = (1, 1);
+        *value.lock().unwrap() = roll(1, 1);
         change_tx.send(()).unwrap();
         tokio::time::advance(Duration::from_millis(500)).await;
         settle().await;
@@ -1369,12 +1651,62 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn space_counts_are_sent_only_on_a_change_and_at_most_once_a_second() {
+        let value = std::sync::Arc::new(std::sync::Mutex::new(roll(0, 0)));
+        let (change_tx, changes) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(16);
+        let source = Fake {
+            value: value.clone(),
+            changes,
+            computes: std::sync::Arc::default(),
+        };
+        let task = tokio::spawn(run_totals(source, tx, TOTALS_INTERVAL));
+        settle().await;
+        // Both events go out at the start.
+        let (totals, outside) = sent_both(&mut rx);
+        assert_eq!((totals.len(), outside.len()), (1, 1));
+
+        // Only the space counts change, in a burst: nothing inside the
+        // interval, then one event, and no `UnreadTotals`.
+        for n in 1..=5 {
+            value.lock().unwrap().outside = view(n, 0);
+            change_tx.send(()).unwrap();
+        }
+        tokio::time::advance(Duration::from_millis(900)).await;
+        settle().await;
+        assert_eq!(sent_both(&mut rx), (vec![], vec![]));
+        tokio::time::advance(Duration::from_millis(101)).await;
+        settle().await;
+        assert_eq!(sent_both(&mut rx), (vec![], vec![view(5, 0)]));
+
+        // A signal without a change sends nothing.
+        change_tx.send(()).unwrap();
+        tokio::time::advance(TOTALS_INTERVAL).await;
+        settle().await;
+        assert_eq!(sent_both(&mut rx), (vec![], vec![]));
+
+        // A change in one space's counts is a change.
+        value.lock().unwrap().spaces = vec![SpaceUnreadView {
+            space: RoomId::from("!s:x"),
+            counts: view(1, 0),
+        }];
+        change_tx.send(()).unwrap();
+        tokio::time::advance(TOTALS_INTERVAL).await;
+        settle().await;
+        assert_eq!(sent_both(&mut rx), (vec![], vec![view(5, 0)]));
+
+        drop(change_tx);
+        tokio::time::advance(TOTALS_INTERVAL).await;
+        task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn totals_stop_when_nobody_listens() {
         let (change_tx, changes) = mpsc::unbounded_channel();
         let (tx, rx) = mpsc::channel(1);
         drop(rx);
         let source = Fake {
-            value: std::sync::Arc::new(std::sync::Mutex::new((1, 0))),
+            value: std::sync::Arc::new(std::sync::Mutex::new(roll(1, 0))),
             changes,
             computes: std::sync::Arc::default(),
         };

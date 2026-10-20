@@ -36,8 +36,8 @@ pub use rooms::{
     CreateRoomRequest, DensityChoice, MAX_SPACE_ROOMS, MembershipView, NotificationKind,
     NotificationSettingsView, NotificationView, OwnProfileView, PowerLevelView, Role,
     RoomDetailsView, RoomListChoice, RoomMemberView, RoomNotificationModeView, RoomPermissions,
-    RoomVisibility, SpaceView, ThemeChoice, ThemeName, ThemeNameError, ThreadSummaryView,
-    UiSettings, UpdateCheckChoice,
+    RoomVisibility, SpaceUnreadView, SpaceView, ThemeChoice, ThemeName, ThemeNameError,
+    ThreadSummaryView, UiSettings, UnreadCountsView, UpdateCheckChoice,
 };
 pub use security::{
     CancelReason, CrossSigning, DeviceSummary, DeviceTrust, DeviceVerification, QrImage,
@@ -1138,6 +1138,15 @@ pub enum CoreEvent {
         notifications: u64,
         /// Unread highlights.
         highlights: u64,
+    },
+    /// Unread counts per space and for the rooms in no space (the Home
+    /// badge), over all joined rooms, muted ones left out. Sent by the
+    /// rules of `UnreadTotals`: at most once a second, only on a change.
+    SpaceUnread {
+        /// One entry per known space (top-level and sub-space), by ID.
+        spaces: Vec<SpaceUnreadView>,
+        /// Rooms in no space, direct messages included.
+        outside: UnreadCountsView,
     },
     /// A room was created.
     RoomCreated {

@@ -16,8 +16,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{
-    DEFAULT_TIMEOUT, TestEnv, assert_local_homeserver, create_dm, create_room, hex, login_and_run,
-    outgoing, raw_login, reset_notification_baseline, send_content, send_text, start_core,
+    DEFAULT_TIMEOUT, TestEnv, assert_local_homeserver, create_dm, create_room, create_room_raw,
+    create_space_raw, hex, login_and_run, outgoing, raw_login, reset_notification_baseline,
+    send_content, send_text, start_core, unique_room_name,
 };
 use matrix_sdk::ruma::api::client::membership::joined_rooms;
 use matrix_sdk::ruma::events::Mentions;
@@ -26,7 +27,8 @@ use matrix_sdk::ruma::{OwnedRoomId, OwnedUserId};
 use twicecat_core::CoreHandle;
 use twicecat_core::api::{
     ActionKind, Command, CoreEvent, ListDiff, NotificationKind, NotificationSettingsView,
-    NotificationView, RoomId, RoomNotificationModeView, RoomSummary,
+    NotificationView, RoomId, RoomNotificationModeView, RoomSummary, SpaceUnreadView,
+    UnreadCountsView,
 };
 use twicecat_core::secrets::InMemorySecretStore;
 
@@ -40,6 +42,8 @@ struct Seen {
     settings: Option<NotificationSettingsView>,
     settings_events: usize,
     totals: Vec<(u64, u64)>,
+    /// Every `SpaceUnread` so far: the spaces, and the rooms outside.
+    space_unread: Vec<(Vec<SpaceUnreadView>, UnreadCountsView)>,
     rooms: Vec<RoomSummary>,
     failures: Vec<(ActionKind, RoomId)>,
 }
@@ -56,6 +60,7 @@ impl Seen {
                 notifications,
                 highlights,
             } => self.totals.push((notifications, highlights)),
+            CoreEvent::SpaceUnread { spaces, outside } => self.space_unread.push((spaces, outside)),
             CoreEvent::RoomListChanged(diffs) => {
                 for diff in diffs {
                     ListDiff::apply(&diff, &mut self.rooms);
@@ -70,6 +75,16 @@ impl Seen {
 
     fn room(&self, id: &OwnedRoomId) -> Option<&RoomSummary> {
         self.rooms.iter().find(|r| r.id.as_str() == id.as_str())
+    }
+
+    /// The latest unread counts of a space, once the core has sent them.
+    fn space_counts(&self, space: &OwnedRoomId) -> Option<UnreadCountsView> {
+        self.space_unread
+            .last()?
+            .0
+            .iter()
+            .find(|s| s.space.as_str() == space.as_str())
+            .map(|s| s.counts)
     }
 
     fn has_notification(&self, event_text: &str) -> bool {
@@ -537,4 +552,57 @@ async fn unread_totals_follow_a_message_and_mark_read() {
     })
     .await;
     f.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "needs local homeserver: docker compose up -d --wait"]
+async fn space_unread_follows_a_message_in_a_room_of_the_space() {
+    // Carol (the core) owns the space and its room, so every count is hers
+    // alone; alice, a raw client, posts.
+    let mut f = Fixture::start(true).await;
+    let room = create_room_raw(3, &unique_room_name(), false, &[&f.alice_id.clone()]).await;
+    f.alice
+        .join_room_by_id(&room)
+        .await
+        .expect("alice joins the room");
+    f.created.push(room.clone());
+    let space = create_space_raw(3, &unique_room_name(), std::slice::from_ref(&room)).await;
+
+    // The space is known, and quiet.
+    f.wait("the space with no unread", |s| {
+        s.space_counts(&space) == Some(UnreadCountsView::default())
+    })
+    .await;
+
+    let text = format!("space-{}", hex());
+    send_text(&f.alice, &room, &text).await;
+    f.wait("an unread notification in the space", |s| {
+        s.space_counts(&space).is_some_and(|c| c.notifications >= 1)
+    })
+    .await;
+    let counts = f.seen.space_counts(&space).unwrap();
+    assert!(counts.unread || counts.notifications >= 1);
+    // The room is in the space, so the Home badge does not hold it.
+    assert_eq!(f.seen.space_unread.last().unwrap().1.notifications, 0);
+
+    f.core
+        .commands
+        .send(Command::SelectRoom(RoomId::from(room.as_str())))
+        .await
+        .unwrap();
+    f.core
+        .commands
+        .send(Command::MarkRead {
+            room_id: RoomId::from(room.as_str()),
+            fully_read: true,
+        })
+        .await
+        .unwrap();
+    f.wait("the space back at zero", |s| {
+        s.space_counts(&space)
+            .is_some_and(|c| c.notifications == 0 && !c.unread)
+    })
+    .await;
+    f.finish().await;
+    common::leave_all_created(3, &[space]).await;
 }

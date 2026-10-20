@@ -331,6 +331,12 @@ fn phase5_line(event: &CoreEvent) -> Option<String> {
             notifications,
             highlights,
         } => format!("[unread] {notifications} notifications, {highlights} highlights"),
+        CoreEvent::SpaceUnread { spaces, outside } => format!(
+            "[space-unread] spaces={} outside=(n={},h={})",
+            spaces.len(),
+            outside.notifications,
+            outside.highlights
+        ),
         CoreEvent::RoomCreated { .. } => "[rooms] created".to_owned(),
         CoreEvent::RoomJoined { .. } => "[rooms] joined".to_owned(),
         CoreEvent::RoomDetails(details) => {
@@ -902,6 +908,7 @@ impl Cli {
             | CoreEvent::Notification(_)
             | CoreEvent::NotificationSettings(_)
             | CoreEvent::UnreadTotals { .. }
+            | CoreEvent::SpaceUnread { .. }
             | CoreEvent::RoomCreated { .. }
             | CoreEvent::RoomJoined { .. }
             | CoreEvent::RoomDetails(_)
@@ -1447,6 +1454,21 @@ mod tests {
                 notifications: 3,
                 highlights: 1,
             },
+            CoreEvent::SpaceUnread {
+                spaces: vec![twicecat_core::api::SpaceUnreadView {
+                    space: room(),
+                    counts: twicecat_core::api::UnreadCountsView {
+                        notifications: 4,
+                        highlights: 2,
+                        unread: true,
+                    },
+                }],
+                outside: twicecat_core::api::UnreadCountsView {
+                    notifications: 1,
+                    highlights: 0,
+                    unread: true,
+                },
+            },
             CoreEvent::RoomCreated { room_id: room() },
             CoreEvent::RoomJoined { room_id: room() },
             CoreEvent::RoomDetails(twicecat_core::api::RoomDetailsView {
@@ -1501,6 +1523,18 @@ mod tests {
             })
             .as_deref(),
             Some("[unread] 3 notifications, 1 highlights")
+        );
+        let line = phase5_line(&CoreEvent::SpaceUnread {
+            spaces: Vec::new(),
+            outside: twicecat_core::api::UnreadCountsView {
+                notifications: 1,
+                highlights: 0,
+                unread: true,
+            },
+        });
+        assert_eq!(
+            line.as_deref(),
+            Some("[space-unread] spaces=0 outside=(n=1,h=0)")
         );
         assert!(phase5_line(&CoreEvent::LoggedOut).is_none());
     }

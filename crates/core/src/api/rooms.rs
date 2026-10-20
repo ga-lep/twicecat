@@ -316,6 +316,29 @@ pub struct SpaceView {
     pub rooms: Vec<RoomId>,
 }
 
+/// Unread counts of a group of rooms. Muted rooms are left out of the sums,
+/// and the sums saturate.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UnreadCountsView {
+    /// Unread notifications.
+    pub notifications: u64,
+    /// Unread highlights (mentions).
+    pub highlights: u64,
+    /// Some room is marked unread or has unread messages.
+    pub unread: bool,
+}
+
+/// The unread counts of one space, over every room it holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpaceUnreadView {
+    /// The space's room ID.
+    pub space: RoomId,
+    /// Counts over the rooms of the space. For a top-level space these are
+    /// its direct rooms and the descendants of its sub-spaces, each room
+    /// once; a space ID never counts as a room.
+    pub counts: UnreadCountsView,
+}
+
 /// The most room IDs a [`SpaceView`] carries in `rooms`; the rest are left out.
 pub const MAX_SPACE_ROOMS: usize = 2000;
 

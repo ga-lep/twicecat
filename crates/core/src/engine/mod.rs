@@ -2262,8 +2262,9 @@ impl Engine {
     async fn start_security(&mut self) {
         if let Some(active) = self.active.as_mut() {
             // Before the sync starts, so that no notification is missed.
+            let spaces = active.rooms.subscribe_children();
             active.notifications =
-                Some(NotificationTasks::start(&active.client, &self.events).await);
+                Some(NotificationTasks::start(&active.client, &self.events, spaces).await);
             active.security.start(&active.client, &self.events);
             active.rooms.start(&active.client, &self.events);
             active.media.send_limits(&active.client, &self.events);
