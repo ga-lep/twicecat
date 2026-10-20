@@ -342,7 +342,13 @@ fn phase5_line(event: &CoreEvent) -> Option<String> {
         CoreEvent::OwnProfile(profile) => {
             format!("[profile] avatar: {}", profile.avatar.is_some())
         }
-        CoreEvent::Spaces(spaces) => format!("[spaces] {} spaces", spaces.len()),
+        CoreEvent::Spaces(spaces) => {
+            let counts: Vec<String> = spaces
+                .iter()
+                .map(|s| format!("space level={} rooms={}", s.level, s.rooms.len()))
+                .collect();
+            format!("[spaces] {} spaces: {}", spaces.len(), counts.join(", "))
+        }
         CoreEvent::ThreadDiff { diffs, .. } => format!("[thread] {} changes", diffs.len()),
         CoreEvent::ThreadPagination { state, .. } => format!("[thread] pagination {state:?}"),
         _ => return None,
@@ -1467,6 +1473,7 @@ mod tests {
                 avatar: None,
                 level: 0,
                 children: 1,
+                rooms: Vec::new(),
             }]),
             CoreEvent::ThreadDiff {
                 room_id: room(),

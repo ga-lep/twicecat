@@ -307,7 +307,17 @@ pub struct SpaceView {
     pub level: u32,
     /// Number of child rooms.
     pub children: u64,
+    /// The rooms this space holds, from the SDK space filter's descendants,
+    /// unchanged and at most [`MAX_SPACE_ROOMS`]. For a level 0 space these
+    /// are its direct children, rooms and sub-spaces alike; for a level 1
+    /// space they are all its descendants, recursively, and the SDK also
+    /// lists the space itself, last. A consumer that wants rooms only leaves
+    /// out `id`.
+    pub rooms: Vec<RoomId>,
 }
+
+/// The most room IDs a [`SpaceView`] carries in `rooms`; the rest are left out.
+pub const MAX_SPACE_ROOMS: usize = 2000;
 
 impl fmt::Debug for SpaceView {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -317,6 +327,7 @@ impl fmt::Debug for SpaceView {
             .field("avatar", &self.avatar)
             .field("level", &self.level)
             .field("children", &self.children)
+            .field("rooms", &self.rooms.len())
             .finish()
     }
 }

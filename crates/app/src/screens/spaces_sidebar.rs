@@ -156,6 +156,7 @@ mod tests {
             avatar: None,
             level: 0,
             children: 0,
+            rooms: Vec::new(),
         };
         assert_eq!(space_name(&space), crate::text_safety::NAME_PLACEHOLDER);
         space.name = format!("a\nb{}", "z".repeat(1000));

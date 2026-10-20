@@ -33,10 +33,11 @@ pub use media::{
     UploadProgress, UploadThumbnail,
 };
 pub use rooms::{
-    CreateRoomRequest, DensityChoice, MembershipView, NotificationKind, NotificationSettingsView,
-    NotificationView, OwnProfileView, PowerLevelView, Role, RoomDetailsView, RoomListChoice,
-    RoomMemberView, RoomNotificationModeView, RoomPermissions, RoomVisibility, SpaceView,
-    ThemeChoice, ThemeName, ThemeNameError, ThreadSummaryView, UiSettings, UpdateCheckChoice,
+    CreateRoomRequest, DensityChoice, MAX_SPACE_ROOMS, MembershipView, NotificationKind,
+    NotificationSettingsView, NotificationView, OwnProfileView, PowerLevelView, Role,
+    RoomDetailsView, RoomListChoice, RoomMemberView, RoomNotificationModeView, RoomPermissions,
+    RoomVisibility, SpaceView, ThemeChoice, ThemeName, ThemeNameError, ThreadSummaryView,
+    UiSettings, UpdateCheckChoice,
 };
 pub use security::{
     CancelReason, CrossSigning, DeviceSummary, DeviceTrust, DeviceVerification, QrImage,
@@ -1890,6 +1891,7 @@ mod tests {
                 avatar: None,
                 level: 0,
                 children: 3,
+                rooms: Vec::new(),
             }]),
         ];
         for ev in events {

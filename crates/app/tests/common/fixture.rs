@@ -238,6 +238,7 @@ fn main_no_room() -> App {
                 avatar: None,
                 level: 0,
                 children: 4,
+                rooms: Vec::new(),
             },
             SpaceView {
                 id: room("space-work"),
@@ -245,6 +246,7 @@ fn main_no_room() -> App {
                 avatar: None,
                 level: 0,
                 children: 6,
+                rooms: Vec::new(),
             },
         ]),
     );

@@ -170,6 +170,7 @@ mod tests {
             avatar: None,
             level,
             children: 0,
+            rooms: Vec::new(),
         }
     }
 
