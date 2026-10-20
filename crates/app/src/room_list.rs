@@ -59,6 +59,27 @@ pub fn contains(rooms: &[RoomSummary], id: &RoomId) -> bool {
     rooms.iter().any(|room| room.id == *id)
 }
 
+/// A scroll offset and a viewport height made safe for the windowing
+/// arithmetic of a list `total_h` tall: NaN and negative inputs count as zero,
+/// an infinite viewport as zero, and a stale offset (the list shrank under it)
+/// is clamped to the last page. Shared by the flat list ([`visible_range`])
+/// and the sectioned one (`sections::visible_lines`). Returns
+/// `(offset, viewport)`.
+pub(crate) fn clamp_window(offset_y: f32, viewport_h: f32, total_h: f32) -> (f32, f32) {
+    let viewport = if viewport_h.is_finite() {
+        viewport_h.max(0.0)
+    } else {
+        0.0
+    };
+    let max_offset = (total_h - viewport).max(0.0);
+    let offset = if offset_y.is_nan() {
+        0.0
+    } else {
+        offset_y.clamp(0.0, max_offset)
+    };
+    (offset, viewport)
+}
+
 /// The rows to build for a scrollable showing `viewport_h` pixels at
 /// `offset_y`, with `overscan` extra rows on each side, clamped to `len`.
 ///
@@ -81,17 +102,7 @@ pub fn visible_range(
     if len == 0 || row_h.is_nan() || row_h <= 0.0 {
         return 0..0;
     }
-    let viewport = if viewport_h.is_finite() {
-        viewport_h.max(0.0)
-    } else {
-        0.0
-    };
-    let max_offset = (len as f32 * row_h - viewport).max(0.0);
-    let offset = if offset_y.is_nan() {
-        0.0
-    } else {
-        offset_y.clamp(0.0, max_offset)
-    };
+    let (offset, viewport) = clamp_window(offset_y, viewport_h, len as f32 * row_h);
     // Float to usize casts saturate, so the arithmetic below cannot wrap.
     let first = (offset / row_h).floor() as usize;
     let last = ((offset + viewport) / row_h).ceil() as usize;

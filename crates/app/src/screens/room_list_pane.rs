@@ -17,7 +17,9 @@ use iced::widget::{
     Column, button, column, container, image, row, scrollable, space, stack, text, text_input,
 };
 use iced::{Background, Color, Element, Fill, Length, border};
-use twicecat_core::api::{RoomListChoice, RoomListTab, RoomNotificationModeView, RoomSummary};
+use twicecat_core::api::{
+    RoomListChoice, RoomListTab, RoomNotificationModeView, RoomSummary, SectionKey,
+};
 
 use crate::avatars::{AvatarState, Avatars, NEUTRAL_INITIALS, initials, placeholder_color};
 use crate::calls::CallPill;
@@ -29,9 +31,14 @@ use crate::room_list::{
 };
 use crate::rooms::RoomsMessage;
 use crate::screens::{call, main_view};
+use crate::sections::{
+    EMPTY_HINT, Header, Line, line_height, line_offsets, line_spacers, visible_lines,
+};
 use crate::settings::SettingsMessage;
+use crate::spaces::SpacesMessage;
 use crate::state::{App, Message};
 use crate::theme;
+use crate::ui::fonts;
 use crate::ui::icons::{self, Icon};
 use crate::ui::kit;
 use crate::ui::tokens::{self, Density};
@@ -145,6 +152,8 @@ pub fn count_label(count: u64) -> String {
 
 /// The mark of an encrypted room, in the list row and the room header.
 pub const LOCK_MARK: &str = Icon::Lock.glyph();
+/// The word at the right of the Starred header: the stars are the user's own.
+pub const PERSONAL_LABEL: &str = "personal";
 /// The tag of a voice room (MSC3417 call room).
 pub const VOICE_TAG: &str = "Voice";
 
@@ -390,6 +399,9 @@ struct RowEnv<'a> {
 
 /// The scrollable with only the rows near the viewport built.
 fn windowed_list(app: &App) -> Element<'_, Message> {
+    if let Some(lines) = app.section_lines() {
+        return sectioned_list(app, &lines);
+    }
     let len = app.rooms.len();
     let rail = app.pane_layout().list == RoomListChoice::Rail;
     let row_h = app.room_row_height();
@@ -416,7 +428,16 @@ fn windowed_list(app: &App) -> Element<'_, Message> {
             room_row(room, &env, selected, mode, call)
         }
     });
-    // Room for the scrollbar, so it never covers a count or a time.
+    scroller(top, rows, bottom)
+}
+
+/// The scrollable of both lists: `rows` between two spacers that keep its
+/// content as tall as the whole list, with room for the scrollbar.
+fn scroller<'a>(
+    top: f32,
+    rows: impl IntoIterator<Item = Element<'a, Message>>,
+    bottom: f32,
+) -> Element<'a, Message> {
     let content = column![space().height(top)]
         .extend(rows)
         .push(space().height(bottom))
@@ -431,6 +452,89 @@ fn windowed_list(app: &App) -> Element<'_, Message> {
             viewport_h: viewport.bounds().height,
         })
         .height(Fill)
+        .into()
+}
+
+/// The sectioned list (a space is selected): headers, rooms and hints, each
+/// at its own height, with only the lines near the viewport built. Rooms keep
+/// today's row.
+fn sectioned_list<'a>(app: &'a App, lines: &[Line<'a>]) -> Element<'a, Message> {
+    let density = app.density();
+    let offsets = line_offsets(lines, density);
+    let range = visible_lines(
+        &offsets,
+        app.list_offset_y,
+        app.list_viewport_h,
+        OVERSCAN_ROWS,
+    );
+    let (top, bottom) = line_spacers(&offsets, &range);
+    let env = RowEnv {
+        avatars: &app.avatars,
+        density,
+        now_ms: u64::try_from(Local::now().timestamp_millis()).unwrap_or(0),
+    };
+    let rows = lines[range].iter().map(|line| match line {
+        Line::Header(header) => section_header(header, density),
+        Line::Room(room) => {
+            let selected = app.selected.as_ref() == Some(&room.id);
+            let mode = app.effective_room_mode(&room.id);
+            let call = app.calls.pill(&room.id);
+            room_row(room, &env, selected, mode, call)
+        }
+        Line::EmptyHint(_) => container(text(EMPTY_HINT).size(tokens::CAPTION).style(kit::muted))
+            .padding([0.0, tokens::S])
+            .center_y(Length::Fixed(line_height(line, density)))
+            .into(),
+    });
+    scroller(top, rows, bottom)
+}
+
+/// The header of a section: a chevron, the name, "personal" on Starred, and
+/// the rolled-up badge while it is collapsed. A click collapses or expands it.
+fn section_header<'a>(header: &Header<'a>, density: Density) -> Element<'a, Message> {
+    let chevron = if header.collapsed {
+        Icon::SectionClosed
+    } else {
+        Icon::SectionOpen
+    };
+    let mut content = row![
+        text(chevron.glyph())
+            .size(tokens::CAPTION)
+            .style(kit::muted)
+            .width(Length::Fixed(14.0))
+            .wrapping(Wrapping::None),
+        container(
+            text(row_name(header.name))
+                .size(tokens::CAPTION)
+                .font(fonts::BODY_SEMIBOLD)
+                .style(kit::muted)
+                .wrapping(Wrapping::None)
+        )
+        .width(Fill)
+        .clip(true),
+    ]
+    .spacing(tokens::XS)
+    .align_y(iced::Center);
+    if header.key == SectionKey::Starred {
+        content = content.push(
+            text(PERSONAL_LABEL)
+                .size(tokens::CAPTION)
+                .style(kit::muted)
+                .wrapping(Wrapping::None),
+        );
+    }
+    if header.collapsed {
+        content = content.push(badge_view(header.badge, false));
+    }
+    let height = line_height(&Line::Header(header.clone()), density);
+    button(content)
+        .on_press(Message::Spaces(SpacesMessage::ToggleSection(
+            header.key.clone(),
+        )))
+        .width(Fill)
+        .height(Length::Fixed(height))
+        .padding([0.0, tokens::S])
+        .style(kit::ghost_style)
         .into()
 }
 

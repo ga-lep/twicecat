@@ -399,6 +399,8 @@ fn the_fixture_reaches_every_screen_it_names() {
         "rail-dragging-into",
         "rail-menu",
         "rail-folder-name",
+        "space-sections",
+        "space-sections-collapsed",
         "verification-requested",
         "verification-emojis",
         "verification-done",
@@ -1400,6 +1402,139 @@ fn rail_states_draws_every_slot_whole_and_apart_at_every_width() {
                     );
                 }
             }
+        }
+    }
+}
+
+// ---- Sections inside a space (sidebar plan, Task 8) -----------------------
+
+#[test]
+fn space_sections_draw_every_line_whole_and_apart_in_both_densities_and_themes() {
+    use twicecat_app::screens::room_list_pane::SCROLLBAR_GUTTER;
+    use twicecat_app::sections::{
+        COMPACT_HEADER_HEIGHT, HEADER_HEIGHT, Line, line_height, line_offsets,
+    };
+    let renderer = renderer();
+    for name in ["space-sections", "space-sections-collapsed"] {
+        let scenario = fixture::scenarios()
+            .into_iter()
+            .find(|s| s.name == name)
+            .expect("the scenario");
+        for variant in variants(true) {
+            let mut app = (scenario.build)();
+            apply(&mut app, variant);
+            for size in SIZES {
+                app.window_width = size.width;
+                let what = format!("{name} {} at {}", variant.tag(), size.width);
+                let sectioned = variant.list == RoomListChoice::Expanded && size.width >= 800.0;
+                assert_eq!(app.sections_shown(), sectioned, "{what}");
+                let laid = Laid::new(&app, &renderer, size);
+                if !sectioned {
+                    // The rail, or a window under 800 px: the flat list, whose
+                    // rows are all the rail's 56 px.
+                    let (rows, _) = list_rows(&laid);
+                    assert!(!rows.is_empty(), "{what}");
+                    assert!(
+                        rows.iter().all(|(r, _)| (r.height - 56.0).abs() < 0.5),
+                        "{what}: the rail stays flat"
+                    );
+                    continue;
+                }
+                let lines = app.section_lines().expect("sections show");
+                let density = app.density();
+                let offsets = line_offsets(&lines, density);
+                let (rows, content_width) = list_rows(&laid);
+                // The list is short enough to be built whole.
+                assert_eq!(rows.len(), lines.len(), "{what}: every line is built");
+                let mut y = rows[0].0.y;
+                for (i, ((rect, node), line)) in rows.iter().zip(&lines).enumerate() {
+                    let at = format!("{what}, line {i}");
+                    assert!(
+                        (rect.height - line_height(line, density)).abs() < 0.5,
+                        "{at}: {} high",
+                        rect.height
+                    );
+                    assert!(
+                        (rect.y - (rows[0].0.y + offsets[i])).abs() < 0.5
+                            && (rect.y - y).abs() < 0.5,
+                        "{at}: lines follow one another with no gap or overlap"
+                    );
+                    y = rect.y + rect.height;
+                    if matches!(line, Line::Header(_)) {
+                        let header = if density == twicecat_app::ui::tokens::Density::Comfortable {
+                            HEADER_HEIGHT
+                        } else {
+                            COMPACT_HEADER_HEIGHT
+                        };
+                        assert!((rect.height - header).abs() < 0.5, "{at}");
+                    }
+                    assert!(
+                        rect.x + rect.width
+                            <= rect.x - node.bounds().x + content_width - SCROLLBAR_GUTTER + 0.5,
+                        "{at}: reaches into the scrollbar's gutter"
+                    );
+                    let mut leaves = Vec::new();
+                    painted_leaves(
+                        node,
+                        iced::Point::new(rect.x - node.bounds().x, rect.y - node.bounds().y),
+                        &mut leaves,
+                    );
+                    for leaf in &leaves {
+                        assert!(
+                            leaf.x >= rect.x - 0.5
+                                && leaf.y >= rect.y - 0.5
+                                && leaf.x + leaf.width <= rect.x + rect.width + 0.5
+                                && leaf.y + leaf.height <= rect.y + rect.height + 0.5,
+                            "{at}: {leaf:?} sticks out of {rect:?}"
+                        );
+                    }
+                    for (a, first) in leaves.iter().enumerate() {
+                        for second in &leaves[a + 1..] {
+                            assert!(
+                                !overlap(first, second),
+                                "{at}: {first:?} overlaps {second:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_big_sectioned_space_builds_only_the_lines_in_view() {
+    use twicecat_core::api::{RoomId, RoomSummary};
+    let renderer = renderer();
+    let scenario = fixture::scenarios()
+        .into_iter()
+        .find(|s| s.name == "space-sections")
+        .expect("the scenario");
+    let mut app = (scenario.build)();
+    app.rooms = (0..10_000)
+        .map(|i| {
+            RoomSummary::new(
+                RoomId::from(format!("!big{i}:example.org")),
+                format!("Room {i}"),
+            )
+        })
+        .collect();
+    app.list_viewport_h = 700.0;
+    for density in DENSITIES {
+        let mut settings = variants(false)[0].settings();
+        settings.density = density.0;
+        app.set_ui_settings(settings);
+        assert!(app.sections_shown());
+        for offset in [0.0, 100_000.0, f32::MAX] {
+            app.list_offset_y = offset;
+            let laid = Laid::new(&app, &renderer, WIDE);
+            let (rows, _) = list_rows(&laid);
+            assert!(
+                (1..100).contains(&rows.len()),
+                "{} at {offset}: {} lines built",
+                density.1,
+                rows.len()
+            );
         }
     }
 }

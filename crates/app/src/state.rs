@@ -40,6 +40,7 @@ use crate::room_list;
 use crate::rooms::{RoomsMessage, RoomsModel};
 use crate::screens::login::{self, BrowserUrl, LoginForm};
 use crate::screens::{self, loading, main_view};
+use crate::sections;
 use crate::security::{Busy, SecurityMessage, SecurityModel};
 use crate::sessions::{SessionsMessage, SessionsModel, logout_needs_warning};
 use crate::settings::{NoSettingsStore, SettingsMessage, SettingsModel, SettingsStore};
@@ -2228,19 +2229,36 @@ impl App {
     /// the set is empty. An ID is requested once per session whatever the
     /// answer, so a failing homeserver is not hit again by scrolling.
     fn request_avatars(&mut self) -> Task<Message> {
-        let len = self.rooms.len();
-        let range = room_list::visible_range(
-            self.list_offset_y,
-            self.list_viewport_h,
-            self.room_row_height(),
-            len,
-            room_list::OVERSCAN_ROWS,
-        );
-        let ids = self.avatars.take_unrequested(
+        let avatars: Vec<twicecat_core::api::AvatarId> = if let Some(lines) = self.section_lines() {
+            let offsets = sections::line_offsets(&lines, self.density());
+            let range = sections::visible_lines(
+                &offsets,
+                self.list_offset_y,
+                self.list_viewport_h,
+                room_list::OVERSCAN_ROWS,
+            );
+            lines[range]
+                .iter()
+                .filter_map(|line| match line {
+                    sections::Line::Room(room) => room.avatar.clone(),
+                    _ => None,
+                })
+                .collect()
+        } else {
+            let len = self.rooms.len();
+            let range = room_list::visible_range(
+                self.list_offset_y,
+                self.list_viewport_h,
+                self.room_row_height(),
+                len,
+                room_list::OVERSCAN_ROWS,
+            );
             self.rooms[range]
                 .iter()
-                .filter_map(|room| room.avatar.clone()),
-        );
+                .filter_map(|room| room.avatar.clone())
+                .collect()
+        };
+        let ids = self.avatars.take_unrequested(avatars);
         if ids.is_empty() {
             return Task::none();
         }
@@ -2254,6 +2272,15 @@ impl App {
         let len = self.rooms.len();
         if self.load_more_at == Some(len) {
             return Task::none();
+        }
+        if self.sections_shown() {
+            // Sections need every room to be placed, so the pages are asked
+            // for one after the other, wherever the viewport is.
+            if !sections::must_load_all(len, self.total_rooms) {
+                return Task::none();
+            }
+            self.load_more_at = Some(len);
+            return self.send(Command::LoadMoreRooms);
         }
         let range = room_list::visible_range(
             self.list_offset_y,

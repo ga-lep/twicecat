@@ -15,8 +15,8 @@ use std::fmt;
 
 use iced::{Point, Subscription, Task, mouse, touch};
 use twicecat_core::api::{
-    Command, RailEntry, RoomId, RoomListQuery, SidebarLayout, SpaceUnreadView, SpaceView,
-    UnreadCountsView,
+    Command, RailEntry, RoomId, RoomListQuery, SectionKey, SidebarLayout, SpaceUnreadView,
+    SpaceView, UnreadCountsView,
 };
 
 use crate::drag::{Outcome, Target, Zone};
@@ -286,6 +286,9 @@ pub enum SpacesMessage {
     Exit(RailKey),
     /// The left button went down on an item of the rail.
     Press(RailKey),
+    /// A click on a section header of the room list: collapses or expands
+    /// the section of the selected space, and saves it.
+    ToggleSection(SectionKey),
     /// The left button came up over an item of the rail: a click when it
     /// went down on the same item and the pointer has not left it since.
     Release(RailKey),
@@ -320,6 +323,19 @@ impl App {
     pub(crate) fn on_rail(&mut self, message: SpacesMessage) -> Task<Message> {
         match message {
             SpacesMessage::Select(space) => self.select_space(space),
+            SpacesMessage::ToggleSection(key) => {
+                // Saved per space; refused (and nothing changes) while no
+                // layout is loaded or the stored file is protected.
+                let Some(space) = self.query.space.clone() else {
+                    return Task::none();
+                };
+                match self.apply_sidebar(SidebarOp::ToggleSection { space, key }) {
+                    // The rooms in view changed: their avatars and the pages
+                    // are due as after any change of the list.
+                    Ok(save) => Task::batch([save, self.after_list_change()]),
+                    Err(_) => Task::none(),
+                }
+            }
             SpacesMessage::Enter(key) => {
                 self.rail_hover = Some(key);
                 Task::none()

@@ -26,6 +26,7 @@ pub mod rich_text;
 pub mod room_list;
 pub mod rooms;
 pub mod screens;
+pub mod sections;
 pub mod security;
 pub mod sessions;
 pub mod settings;

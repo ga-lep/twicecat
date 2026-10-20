@@ -434,6 +434,174 @@ fn rail_folder_name() -> App {
     app
 }
 
+// ---- Sections inside a space ---------------------------------------------
+
+/// The ID of a space of the sections scenarios.
+fn sec_space(name: &str) -> RoomId {
+    room(&format!("sec-{name}"))
+}
+
+/// A room of the sections scenarios, with a line of preview.
+fn sec_room(name: &str, title: &str, minutes_ago: u64) -> RoomSummary {
+    let mut room = summary(&format!("sec-r-{name}"), title);
+    room.last_message = Some(preview(
+        "bea",
+        "Bea Example",
+        "Sounds good to me",
+        minutes_ago,
+    ));
+    room
+}
+
+/// The "Twicecat HQ" space with a Tech, a Hobbies and a Voice sub-space, and
+/// its rooms: `collapsed` has Tech (a mention) and Hobbies (a count) shut.
+fn space_sections(collapsed: bool) -> App {
+    use twicecat_app::sidebar_store::{SidebarAnswer, SidebarLoad};
+    use twicecat_app::spaces::SpacesMessage;
+    use twicecat_core::api::{SectionKey, SidebarLayout, SpaceLayout};
+
+    let mut app = logged_in_loading();
+    let rid = |name: &str| room(&format!("sec-r-{name}"));
+    let mut roadmap = sec_room("roadmap", "Roadmap", 3);
+    roadmap.unread_messages = 1;
+    let mut general = sec_room("general", "General", 8);
+    general.unread_messages = 3;
+    general.unread_notifications = 3;
+    let random = sec_room("random", "Random", 90);
+    let announcements = sec_room("news", "Announcements", 600);
+    let mut rust = sec_room("rust", "Rust help", 12);
+    rust.unread_messages = 7;
+    rust.unread_notifications = 5;
+    rust.highlights = 2;
+    let mut devops = sec_room("devops", "DevOps", 40);
+    devops.unread_messages = 3;
+    devops.unread_notifications = 3;
+    let asyncs = sec_room("async", "Async questions", 55);
+    let mut boards = sec_room("boards", "Board games", 25);
+    boards.unread_messages = 4;
+    boards.unread_notifications = 4;
+    let mut cooking = sec_room("cooking", "Cooking", 70);
+    cooking.unread_messages = 7;
+    cooking.unread_notifications = 7;
+    let mut lounge = sec_room("lounge", "Lounge", 130);
+    lounge.is_call_room = true;
+    let mut pair = sec_room("pair", "Pair programming", 200);
+    pair.is_call_room = true;
+    let mut alice = sec_room("alice", "Alice Example", 5);
+    alice.is_dm = true;
+    alice.dm_peer = Some(user("alice"));
+    alice.unread_messages = 1;
+    let mut rows = vec![
+        roadmap,
+        general,
+        rust,
+        alice,
+        boards,
+        devops,
+        random,
+        cooking,
+        asyncs,
+        lounge,
+        pair,
+        announcements,
+    ];
+    for (id, title) in [
+        ("tech", "Tech"),
+        ("hobbies", "Hobbies"),
+        ("voice", "Voice"),
+        ("rustlang", "Rust"),
+    ] {
+        let mut row = RoomSummary::new(sec_space(id), title.to_owned());
+        row.is_space = true;
+        rows.push(row);
+    }
+    let total = u32::try_from(rows.len()).expect("a few rooms");
+    feed(
+        &mut app,
+        CoreEvent::RoomListChanged(vec![ListDiff::Reset { values: rows }]),
+    );
+    feed(
+        &mut app,
+        CoreEvent::RoomListLoaded {
+            total_rooms: Some(total),
+        },
+    );
+    let view = |id: &str, name: &str, level: u32, rooms: Vec<RoomId>| SpaceView {
+        id: sec_space(id),
+        name: name.to_owned(),
+        avatar: None,
+        level,
+        children: rooms.len() as u64,
+        rooms,
+    };
+    let all = |names: &[&str]| names.iter().map(|n| rid(n)).collect::<Vec<_>>();
+    feed(
+        &mut app,
+        CoreEvent::Spaces(vec![
+            view(
+                "hq",
+                "Twicecat HQ",
+                0,
+                [
+                    all(&["roadmap", "general", "random", "news", "alice"]),
+                    vec![sec_space("tech"), sec_space("hobbies"), sec_space("voice")],
+                ]
+                .concat(),
+            ),
+            view(
+                "tech",
+                "Tech",
+                1,
+                [
+                    all(&["rust", "devops", "async"]),
+                    vec![sec_space("rustlang"), sec_space("tech")],
+                ]
+                .concat(),
+            ),
+            view(
+                "hobbies",
+                "Hobbies",
+                1,
+                [all(&["boards", "cooking"]), vec![sec_space("hobbies")]].concat(),
+            ),
+            view(
+                "voice",
+                "Voice",
+                1,
+                [all(&["lounge", "pair"]), vec![sec_space("voice")]].concat(),
+            ),
+        ]),
+    );
+    let mut stored = SpaceLayout::new(sec_space("hq"));
+    stored.starred = vec![rid("roadmap")];
+    if collapsed {
+        stored.collapsed = vec![
+            SectionKey::SubSpace(sec_space("tech")),
+            SectionKey::SubSpace(sec_space("hobbies")),
+        ];
+    }
+    let mut layout = SidebarLayout::new(user("me"));
+    layout.spaces = vec![stored];
+    press(
+        &mut app,
+        Message::SidebarLoaded(SidebarAnswer::new(user("me"), SidebarLoad::Layout(layout))),
+    );
+    press(
+        &mut app,
+        Message::Spaces(SpacesMessage::Select(Some(sec_space("hq")))),
+    );
+    press(&mut app, Message::SelectRoom(rid("general")));
+    app
+}
+
+fn space_sections_expanded() -> App {
+    space_sections(false)
+}
+
+fn space_sections_collapsed() -> App {
+    space_sections(true)
+}
+
 // ---- Timeline -----------------------------------------------------------
 
 fn run(text: &str, style: TextStyle) -> Inline {
@@ -3402,6 +3570,15 @@ pub fn scenarios() -> Vec<Scenario> {
                         if d.error.is_some() && d.text.chars().count() == 33
                 )
         }),
+        s("space-sections", true, space_sections_expanded, |a| {
+            in_main(a) && a.sections_shown() && a.selected.is_some()
+        }),
+        s(
+            "space-sections-collapsed",
+            true,
+            space_sections_collapsed,
+            |a| in_main(a) && a.sections_shown() && a.selected.is_some(),
+        ),
         s("main-no-room", true, main_no_room, |a| {
             in_main(a) && a.selected.is_none() && a.rooms.len() > 10
         }),

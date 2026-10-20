@@ -1,0 +1,1295 @@
+//! The room list of a space as collapsible sections (sidebar plan, decision 4,
+//! Task 8): where each room goes, the rolled-up badge of a collapsed section,
+//! and the windowing of a list whose lines differ in height.
+//!
+//! Sections show only with a space selected, the All tab, a blank search and
+//! the expanded list ([`App::sections_shown`]). Anything else keeps the flat
+//! list of `room_list`.
+//!
+//! Room names and IDs belong to people: nothing here logs them, and no
+//! `Debug` of a type here shows one.
+
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
+use std::ops::Range;
+
+use twicecat_core::api::{
+    RoomId, RoomListChoice, RoomListTab, RoomNotificationModeView, RoomSummary, SectionKey,
+    SpaceLayout, SpaceView,
+};
+
+use crate::room_list::{Badge, clamp_window, row_height};
+use crate::state::App;
+use crate::ui::tokens::Density;
+
+/// One line of the sectioned list.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Line<'a> {
+    /// The header of a section.
+    Header(Header<'a>),
+    /// A room.
+    Room(&'a RoomSummary),
+    /// The hint under an empty custom section.
+    EmptyHint(SectionKey),
+}
+
+/// The header of a section. `Debug` of the key hides a room ID; the name is
+/// not shown by `Debug`.
+#[derive(Clone, PartialEq)]
+pub struct Header<'a> {
+    /// Which section.
+    pub key: SectionKey,
+    /// The name as stored or reported: sub-space names come from other
+    /// people and pass through `text_safety` where they are drawn.
+    pub name: &'a str,
+    /// Whether the section is collapsed.
+    pub collapsed: bool,
+    /// The rolled-up badge of its rooms: [`Badge::None`] unless collapsed.
+    pub badge: Badge,
+}
+
+impl std::fmt::Debug for Header<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Header")
+            .field("key", &self.key)
+            .field("collapsed", &self.collapsed)
+            .field("badge", &self.badge)
+            .finish()
+    }
+}
+
+/// Height of a section header, comfortable.
+pub const HEADER_HEIGHT: f32 = 32.0;
+/// Height of a section header, compact.
+pub const COMPACT_HEADER_HEIGHT: f32 = 28.0;
+/// Height of the hint under an empty custom section, comfortable.
+pub const HINT_HEIGHT: f32 = 36.0;
+/// Height of the hint under an empty custom section, compact.
+pub const COMPACT_HINT_HEIGHT: f32 = 32.0;
+
+/// The words under an empty custom section.
+pub const EMPTY_HINT: &str = "Drop or move rooms here";
+
+/// One section while the rooms are being placed.
+struct Bucket<'a> {
+    key: SectionKey,
+    name: &'a str,
+    /// Hidden while empty (every section but the user's own).
+    hide_empty: bool,
+    /// The rooms with their sort key: the order the user gave in Starred and
+    /// custom sections, else the order of the list.
+    rooms: Vec<(usize, &'a RoomSummary)>,
+}
+
+/// Places the rooms of `space` in sections and returns the lines to draw
+/// (decision 4).
+///
+/// `spaces` are all the spaces the core reports: the level 1 ones whose ID is
+/// among `space.rooms` are its sub-spaces. `rooms` are the rooms of the list
+/// in its own (recent activity) order. Each room is placed once, in the first
+/// of: Starred, a custom section, its sub-space's section, Direct messages
+/// (when it is a DM), Channels. Spaces are never rows, and the selected
+/// space's own ID, which a level 1 space lists among its rooms, is left out.
+/// Every section but a custom one is hidden while empty; an empty custom one
+/// is followed by [`Line::EmptyHint`]. A collapsed section keeps its header,
+/// with the badge of its rooms, and drops its rooms.
+pub fn build<'a>(
+    space: &'a SpaceView,
+    spaces: &'a [SpaceView],
+    rooms: &'a [RoomSummary],
+    layout: Option<&'a SpaceLayout>,
+) -> Vec<Line<'a>> {
+    let own = &space.id;
+    // The sub-spaces: level 1 children of a level 0 space. A level 1 space
+    // has none, whatever its list holds.
+    let held: HashSet<&RoomId> = space.rooms.iter().collect();
+    let mut seen_subs: HashSet<&RoomId> = HashSet::new();
+    let subs: Vec<&SpaceView> = if space.level == 0 {
+        spaces
+            .iter()
+            .filter(|s| {
+                s.level == 1 && s.id != *own && held.contains(&s.id) && seen_subs.insert(&s.id)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    // Which sub-space holds a room (the first one, in the core's order). A
+    // sub-space's own ID and the selected space's are not rooms.
+    let mut sub_of: HashMap<&RoomId, &RoomId> = HashMap::new();
+    for sub in &subs {
+        for id in &sub.rooms {
+            if *id != sub.id && *id != *own {
+                sub_of.entry(id).or_insert(&sub.id);
+            }
+        }
+    }
+    let mut not_rows: HashSet<&RoomId> = subs.iter().map(|s| &s.id).collect();
+    not_rows.insert(own);
+
+    let mut starred_at: HashMap<&RoomId, usize> = HashMap::new();
+    let mut custom_at: HashMap<&RoomId, (u16, usize)> = HashMap::new();
+    if let Some(layout) = layout {
+        for (n, id) in layout.starred.iter().enumerate() {
+            starred_at.entry(id).or_insert(n);
+        }
+        for custom in &layout.custom {
+            for (n, id) in custom.rooms.iter().enumerate() {
+                custom_at.entry(id).or_insert((custom.id, n));
+            }
+        }
+    }
+
+    // The sections in their default order.
+    let mut buckets: Vec<Bucket<'a>> = Vec::new();
+    let mut slot: HashMap<SectionKey, usize> = HashMap::new();
+    let mut add = |key: SectionKey, name: &'a str, hide_empty: bool| {
+        if !slot.contains_key(&key) {
+            slot.insert(key.clone(), buckets.len());
+            buckets.push(Bucket {
+                key,
+                name,
+                hide_empty,
+                rooms: Vec::new(),
+            });
+        }
+    };
+    add(SectionKey::Starred, "Starred", true);
+    add(SectionKey::Channels, "Channels", true);
+    for sub in &subs {
+        add(SectionKey::SubSpace(sub.id.clone()), &sub.name, true);
+    }
+    for custom in layout.map_or(&[][..], |l| l.custom.as_slice()) {
+        add(SectionKey::Custom(custom.id), custom.name.as_str(), false);
+    }
+    add(SectionKey::Direct, "Direct messages", true);
+
+    let mut placed: HashSet<&RoomId> = HashSet::new();
+    for (n, room) in rooms.iter().enumerate() {
+        if room.is_space || not_rows.contains(&room.id) || !placed.insert(&room.id) {
+            continue;
+        }
+        let (key, at) = if let Some(&at) = starred_at.get(&room.id) {
+            (SectionKey::Starred, at)
+        } else if let Some(&(id, at)) = custom_at.get(&room.id) {
+            (SectionKey::Custom(id), at)
+        } else if let Some(&sub) = sub_of.get(&room.id) {
+            (SectionKey::SubSpace(sub.clone()), n)
+        } else if room.is_dm {
+            (SectionKey::Direct, n)
+        } else {
+            (SectionKey::Channels, n)
+        };
+        if let Some(&i) = slot.get(&key) {
+            buckets[i].rooms.push((at, room));
+        }
+    }
+    for bucket in &mut buckets {
+        if matches!(bucket.key, SectionKey::Starred | SectionKey::Custom(_)) {
+            bucket.rooms.sort_by_key(|(at, _)| *at);
+        }
+    }
+
+    let collapsed: &[SectionKey] = layout.map_or(&[], |l| l.collapsed.as_slice());
+    let mut lines = Vec::new();
+    for key in section_order(&buckets, layout) {
+        let bucket = &buckets[slot[&key]];
+        let is_collapsed = collapsed.contains(&key);
+        let badge = if is_collapsed {
+            let all: Vec<&RoomSummary> = bucket.rooms.iter().map(|(_, r)| *r).collect();
+            section_badge(&all)
+        } else {
+            Badge::None
+        };
+        lines.push(Line::Header(Header {
+            key: key.clone(),
+            name: bucket.name,
+            collapsed: is_collapsed,
+            badge,
+        }));
+        if is_collapsed {
+            continue;
+        }
+        if bucket.rooms.is_empty() {
+            lines.push(Line::EmptyHint(key));
+        } else {
+            lines.extend(bucket.rooms.iter().map(|(_, r)| Line::Room(r)));
+        }
+    }
+    lines
+}
+
+/// The sections to draw, in order: the stored order for the keys it names
+/// (unknown ones are skipped, and kept in the file), and each drawn section it
+/// does not name right after the section that precedes it by default.
+fn section_order(buckets: &[Bucket<'_>], layout: Option<&SpaceLayout>) -> Vec<SectionKey> {
+    let defaults: Vec<&SectionKey> = buckets
+        .iter()
+        .filter(|b| !(b.hide_empty && b.rooms.is_empty()))
+        .map(|b| &b.key)
+        .collect();
+    let mut order: Vec<SectionKey> = Vec::new();
+    for key in layout.map_or(&[][..], |l| l.order.as_slice()) {
+        if defaults.contains(&key) && !order.contains(key) {
+            order.push(key.clone());
+        }
+    }
+    for (i, key) in defaults.iter().enumerate() {
+        if order.contains(key) {
+            continue;
+        }
+        let after = defaults[..i]
+            .iter()
+            .rev()
+            .find_map(|earlier| order.iter().position(|k| k == *earlier));
+        order.insert(after.map_or(0, |p| p + 1), (*key).clone());
+    }
+    order
+}
+
+/// The badge of a collapsed section over its rooms: `badge_for`'s priority
+/// (highlights, then notifications, then a dot) over the sums. Muted rooms
+/// are left out, as the core leaves them out of a space's totals; the sums
+/// saturate.
+pub fn section_badge(rooms: &[&RoomSummary]) -> Badge {
+    let (mut notifications, mut highlights, mut unread) = (0u64, 0u64, false);
+    for room in rooms {
+        if room.notification_mode == Some(RoomNotificationModeView::Mute) {
+            continue;
+        }
+        notifications = notifications.saturating_add(room.unread_notifications);
+        highlights = highlights.saturating_add(room.highlights);
+        unread |= room.unread_messages > 0 || room.marked_unread;
+    }
+    if highlights > 0 {
+        Badge::Highlight(highlights)
+    } else if notifications > 0 {
+        Badge::Count(notifications)
+    } else if unread {
+        Badge::Dot
+    } else {
+        Badge::None
+    }
+}
+
+/// The height of `line` in `density`.
+pub fn line_height(line: &Line<'_>, density: Density) -> f32 {
+    match (line, density) {
+        (Line::Header(_), Density::Comfortable) => HEADER_HEIGHT,
+        (Line::Header(_), Density::Compact) => COMPACT_HEADER_HEIGHT,
+        (Line::Room(_), density) => row_height(density),
+        (Line::EmptyHint(_), Density::Comfortable) => HINT_HEIGHT,
+        (Line::EmptyHint(_), Density::Compact) => COMPACT_HINT_HEIGHT,
+    }
+}
+
+/// The top of every line and, last, the total height: `lines.len() + 1`
+/// prefix sums.
+pub fn line_offsets(lines: &[Line<'_>], density: Density) -> Vec<f32> {
+    let mut offsets = Vec::with_capacity(lines.len() + 1);
+    let mut top = 0.0_f32;
+    offsets.push(top);
+    for line in lines {
+        top += line_height(line, density);
+        offsets.push(top);
+    }
+    offsets
+}
+
+/// The lines to build for a scrollable showing `viewport_h` pixels at
+/// `offset_y`: those that cross the viewport, plus `overscan` on each side.
+/// `offsets` are the prefix sums of [`line_offsets`]; two binary searches
+/// find the ends. NaN and negative inputs count as zero and a stale offset
+/// is clamped to the last page, as [`crate::room_list::visible_range`] does
+/// (both use the same clamping), so the range never leaves the lines.
+pub fn visible_lines(
+    offsets: &[f32],
+    offset_y: f32,
+    viewport_h: f32,
+    overscan: usize,
+) -> Range<usize> {
+    let Some(len) = offsets.len().checked_sub(1).filter(|len| *len > 0) else {
+        return 0..0;
+    };
+    let (offset, viewport) = clamp_window(offset_y, viewport_h, offsets[len]);
+    // The first line whose bottom is below the top of the viewport, and the
+    // first whose top is at or below its bottom.
+    let first = offsets[1..].partition_point(|bottom| *bottom <= offset);
+    let last = offsets[..len].partition_point(|top| *top < offset + viewport);
+    let start = first.saturating_sub(overscan).min(len);
+    let end = last.saturating_add(overscan).min(len).max(start);
+    start..end
+}
+
+/// The heights of the spacers above and below the built `range` of lines, so
+/// the scrollable's content stays as tall as all the lines.
+pub fn line_spacers(offsets: &[f32], range: &Range<usize>) -> (f32, f32) {
+    let total = offsets.last().copied().unwrap_or(0.0);
+    let top = offsets.get(range.start).copied().unwrap_or(0.0);
+    let end = offsets.get(range.end).copied().unwrap_or(total);
+    (top, (total - end).max(0.0))
+}
+
+/// The load-all rule: in sectioned mode every room of the space is needed to
+/// place it, so another page is asked for whenever the core says there are
+/// more rooms than are loaded (the caller sends it once per loaded length).
+pub fn must_load_all(len: usize, total: Option<u32>) -> bool {
+    total.is_some_and(|total| usize::try_from(total).unwrap_or(usize::MAX) > len)
+}
+
+impl App {
+    /// Whether the room list shows sections now: a space is selected, the tab
+    /// is All, the search is blank and the list is expanded (not the rail).
+    /// Anything else keeps the flat list.
+    pub fn sections_shown(&self) -> bool {
+        self.query.tab == RoomListTab::All
+            && self.query.search.trim().is_empty()
+            && self.pane_layout().list == RoomListChoice::Expanded
+            && self
+                .query
+                .space
+                .as_ref()
+                .is_some_and(|id| self.spaces.contains(id))
+    }
+
+    /// The lines of the sectioned list; `None` while the list is flat.
+    pub fn section_lines(&self) -> Option<Vec<Line<'_>>> {
+        if !self.sections_shown() {
+            return None;
+        }
+        let id = self.query.space.as_ref()?;
+        let space = self.spaces.spaces().iter().find(|s| s.id == *id)?;
+        let stored = self
+            .sidebar
+            .layout()
+            .and_then(|layout| layout.spaces.iter().find(|s| s.space == *id));
+        Some(build(space, self.spaces.spaces(), &self.rooms, stored))
+    }
+
+    /// The rooms as the list draws them, in order: the list itself while it
+    /// is flat, else the room lines of the sections, so a room in a
+    /// collapsed section is not among them. The room-stepping keys walk this.
+    pub(crate) fn rooms_as_drawn(&self) -> Cow<'_, [RoomSummary]> {
+        match self.section_lines() {
+            None => Cow::Borrowed(&self.rooms),
+            Some(lines) => Cow::Owned(
+                lines
+                    .into_iter()
+                    .filter_map(|line| match line {
+                        Line::Room(room) => Some(room.clone()),
+                        Line::Header(_) | Line::EmptyHint(_) => None,
+                    })
+                    .collect(),
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use tokio::sync::mpsc;
+    use twicecat_core::api::{
+        Command, CoreEvent, CustomSection, DeviceId, ListDiff, RoomId, RoomListChoice, RoomListTab,
+        RoomNotificationModeView, RoomSummary, SectionKey, SidebarLabel, SidebarLayout,
+        SpaceLayout, SpaceView, UserId,
+    };
+
+    use super::*;
+    use crate::bridge::EventsSlot;
+    use crate::room_list::{Badge, OVERSCAN_ROWS, visible_range};
+    use crate::sidebar::Op;
+    use crate::sidebar_store::{MemorySidebar, SidebarAnswer, SidebarLoad};
+    use crate::spaces::SpacesMessage;
+    use crate::state::{Message, Startup};
+    use crate::ui::tokens::Density;
+
+    fn rid(n: &str) -> RoomId {
+        RoomId::from(format!("!{n}:x"))
+    }
+
+    fn room(n: &str) -> RoomSummary {
+        RoomSummary::new(rid(n), n.to_owned())
+    }
+
+    fn dm(n: &str) -> RoomSummary {
+        let mut r = room(n);
+        r.is_dm = true;
+        r
+    }
+
+    fn space_row(n: &str) -> RoomSummary {
+        let mut r = room(n);
+        r.is_space = true;
+        r
+    }
+
+    fn view(n: &str, level: u32, rooms: &[&str]) -> SpaceView {
+        SpaceView {
+            id: rid(n),
+            name: n.to_owned(),
+            avatar: None,
+            level,
+            children: rooms.len() as u64,
+            rooms: rooms.iter().map(|r| rid(r)).collect(),
+        }
+    }
+
+    /// Space `sp` (level 0) with the sub-spaces `tech` (which holds a
+    /// level-2 room `rustroom`) and `voice`, and the SDK's own-ID-last
+    /// convention for the level-1 spaces.
+    fn spaces() -> Vec<SpaceView> {
+        vec![
+            view(
+                "sp",
+                0,
+                &["chan1", "chan2", "dm1", "tech", "voice", "starred1"],
+            ),
+            view(
+                "tech",
+                1,
+                &["t1", "t2", "rustroom", "rust", "techdm", "tech"],
+            ),
+            view("voice", 1, &["v1", "voice"]),
+        ]
+    }
+
+    /// Rooms in recent-activity order, the sub-space rows among them.
+    fn rooms() -> Vec<RoomSummary> {
+        let mut v1 = room("v1");
+        v1.is_call_room = true;
+        vec![
+            room("t1"),
+            room("chan1"),
+            space_row("tech"),
+            v1,
+            room("rustroom"),
+            room("chan2"),
+            dm("dm1"),
+            space_row("voice"),
+            space_row("rust"),
+            room("t2"),
+            dm("techdm"),
+            room("starred1"),
+        ]
+    }
+
+    fn lines_of<'a>(lines: &[Line<'a>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| match line {
+                Line::Header(h) => format!("# {}", h.name),
+                Line::Room(r) => r.name.clone(),
+                Line::EmptyHint(_) => "~hint".to_owned(),
+            })
+            .collect()
+    }
+
+    fn built(layout: Option<&SpaceLayout>) -> Vec<String> {
+        let sp = spaces();
+        let rs = rooms();
+        lines_of(&build(&sp[0], &sp, &rs, layout))
+    }
+
+    fn label(s: &str) -> SidebarLabel {
+        SidebarLabel::try_from(s).expect("a valid name")
+    }
+
+    // ---- placement ----
+
+    #[test]
+    fn every_room_of_the_space_appears_exactly_once() {
+        let out = built(None);
+        let mut seen = HashSet::new();
+        for line in &out {
+            if !line.starts_with('#') {
+                assert!(seen.insert(line.clone()), "{line} twice in {out:?}");
+            }
+        }
+        let want: HashSet<String> = [
+            "t1", "t2", "chan1", "chan2", "v1", "rustroom", "dm1", "techdm", "starred1",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+        assert_eq!(seen, want);
+    }
+
+    #[test]
+    fn the_default_order_and_the_default_places() {
+        assert_eq!(
+            built(None),
+            [
+                "# Channels",
+                "chan1",
+                "chan2",
+                "starred1",
+                "# tech",
+                "t1",
+                "rustroom",
+                "t2",
+                "techdm",
+                "# voice",
+                "v1",
+                "# Direct messages",
+                "dm1",
+            ]
+        );
+    }
+
+    #[test]
+    fn starred_beats_custom_beats_sub_space_beats_dm_beats_channels() {
+        let mut layout = SpaceLayout::new(rid("sp"));
+        layout.starred = vec![rid("t1"), rid("chan1")];
+        layout.custom = vec![CustomSection {
+            id: 7,
+            name: label("Mine"),
+            rooms: vec![rid("t1"), rid("t2"), rid("dm1")],
+        }];
+        let out = built(Some(&layout));
+        assert_eq!(
+            out,
+            [
+                "# Starred",
+                "t1",
+                "chan1",
+                "# Channels",
+                "chan2",
+                "starred1",
+                "# tech",
+                "rustroom",
+                "techdm",
+                "# voice",
+                "v1",
+                "# Mine",
+                "t2",
+                "dm1",
+            ],
+            "t1 starred and in custom: Starred; t2 custom over its sub-space; \
+             dm1 custom over DM; techdm (a DM in a sub-space) stays in the sub-space"
+        );
+    }
+
+    #[test]
+    fn the_stored_order_of_starred_and_custom_rooms_is_kept() {
+        let mut layout = SpaceLayout::new(rid("sp"));
+        layout.starred = vec![rid("chan2"), rid("chan1")];
+        layout.custom = vec![CustomSection {
+            id: 1,
+            name: label("C"),
+            rooms: vec![rid("t2"), rid("t1")],
+        }];
+        let out = built(Some(&layout));
+        assert_eq!(&out[..3], ["# Starred", "chan2", "chan1"]);
+        let at = out.iter().position(|l| l == "# C").expect("custom header");
+        assert_eq!(&out[at..at + 3], ["# C", "t2", "t1"]);
+    }
+
+    #[test]
+    fn sub_space_rows_are_not_rows_and_a_level_2_room_lands_in_its_level_1_section() {
+        let out = built(None);
+        for gone in ["tech", "voice", "rust"] {
+            assert!(!out.iter().any(|l| l == gone), "{gone} drawn as a row");
+        }
+        let at = out
+            .iter()
+            .position(|l| l == "# tech")
+            .expect("Tech section");
+        assert!(out[at + 1..].iter().take(4).any(|l| l == "rustroom"));
+    }
+
+    #[test]
+    fn the_spaces_own_id_is_left_out() {
+        // A level-1 space is the selected one: the SDK lists it in its own
+        // rooms, last (or not at all once the 2000-room cap cuts it off).
+        let sp = vec![view("tech", 1, &["t1", "t2", "tech"])];
+        for own_row in [space_row("tech"), room("tech")] {
+            let rs = vec![room("t1"), own_row, room("t2")];
+            let out = lines_of(&build(&sp[0], &sp, &rs, None));
+            assert_eq!(out, ["# Channels", "t1", "t2"], "no row, no section for it");
+        }
+        // Cut off by the cap: the same result.
+        let cut = vec![view("tech", 1, &["t1", "t2"])];
+        let rs = vec![room("t1"), room("t2")];
+        assert_eq!(
+            lines_of(&build(&cut[0], &cut, &rs, None)),
+            ["# Channels", "t1", "t2"]
+        );
+        // A level-0 space whose spaces list also holds a level-1 space that
+        // is itself: never its own sub-space.
+        let both = vec![view("a", 0, &["a", "r1"]), view("a", 1, &["a", "r1"])];
+        let rs = vec![room("r1")];
+        assert_eq!(
+            lines_of(&build(&both[0], &both, &rs, None)),
+            ["# Channels", "r1"]
+        );
+    }
+
+    #[test]
+    fn a_level_1_space_in_two_sub_spaces_is_placed_once() {
+        let sp = vec![
+            view("sp", 0, &["a", "b"]),
+            view("a", 1, &["x", "a"]),
+            view("b", 1, &["x", "b"]),
+        ];
+        let rs = vec![room("x")];
+        assert_eq!(
+            lines_of(&build(&sp[0], &sp, &rs, None)),
+            ["# a", "x"],
+            "the first sub-space wins; the other is empty and hidden"
+        );
+    }
+
+    #[test]
+    fn empty_built_in_sections_are_hidden_and_an_empty_custom_one_shows_its_hint() {
+        let sp = vec![view("sp", 0, &["a", "empty"]), view("empty", 1, &["empty"])];
+        let rs = vec![room("a")];
+        assert_eq!(
+            lines_of(&build(&sp[0], &sp, &rs, None)),
+            ["# Channels", "a"]
+        );
+        let mut layout = SpaceLayout::new(rid("sp"));
+        layout.custom = vec![CustomSection {
+            id: 3,
+            name: label("Later"),
+            rooms: vec![rid("gone")],
+        }];
+        assert_eq!(
+            lines_of(&build(&sp[0], &sp, &rs, Some(&layout))),
+            ["# Channels", "a", "# Later", "~hint"]
+        );
+        layout.collapsed = vec![SectionKey::Custom(3)];
+        assert_eq!(
+            lines_of(&build(&sp[0], &sp, &rs, Some(&layout))),
+            ["# Channels", "a", "# Later"],
+            "collapsed, the hint goes with the rooms"
+        );
+    }
+
+    #[test]
+    fn a_space_with_no_rooms_has_no_lines() {
+        let sp = vec![view("sp", 0, &[])];
+        assert!(build(&sp[0], &sp, &[], None).is_empty());
+    }
+
+    #[test]
+    fn the_stored_order_is_kept_and_missing_keys_take_their_default_place() {
+        let mut layout = SpaceLayout::new(rid("sp"));
+        layout.order = vec![
+            SectionKey::Direct,
+            SectionKey::SubSpace(rid("voice")),
+            SectionKey::Channels,
+        ];
+        let heads: Vec<String> = built(Some(&layout))
+            .into_iter()
+            .filter(|l| l.starts_with('#'))
+            .collect();
+        // `tech` is missing from the stored order: it goes right after the
+        // section that precedes it by default (Channels).
+        assert_eq!(
+            heads,
+            ["# Direct messages", "# voice", "# Channels", "# tech"]
+        );
+    }
+
+    #[test]
+    fn unknown_stored_keys_are_not_drawn_and_not_a_problem() {
+        let mut layout = SpaceLayout::new(rid("sp"));
+        layout.order = vec![
+            SectionKey::Custom(99),
+            SectionKey::SubSpace(rid("nowhere")),
+            SectionKey::Starred,
+            SectionKey::Direct,
+        ];
+        let heads: Vec<String> = built(Some(&layout))
+            .into_iter()
+            .filter(|l| l.starts_with('#'))
+            .collect();
+        assert_eq!(
+            heads,
+            ["# Channels", "# tech", "# voice", "# Direct messages"],
+            "empty Starred is hidden even when stored first; the one stored key \
+             is where it is by default"
+        );
+    }
+
+    #[test]
+    fn a_collapsed_section_keeps_its_header_and_drops_its_rooms() {
+        let mut layout = SpaceLayout::new(rid("sp"));
+        layout.collapsed = vec![SectionKey::SubSpace(rid("tech")), SectionKey::Channels];
+        let out = built(Some(&layout));
+        assert_eq!(
+            out,
+            [
+                "# Channels",
+                "# tech",
+                "# voice",
+                "v1",
+                "# Direct messages",
+                "dm1"
+            ]
+        );
+    }
+
+    // ---- badges ----
+
+    fn counted(n: &str, notifications: u64, highlights: u64) -> RoomSummary {
+        let mut r = room(n);
+        r.unread_notifications = notifications;
+        r.highlights = highlights;
+        r
+    }
+
+    #[test]
+    fn a_section_badge_follows_badge_for_over_the_summed_counts() {
+        let a = counted("a", 3, 1);
+        let b = counted("b", 2, 1);
+        assert_eq!(section_badge(&[&a, &b]), Badge::Highlight(2));
+        let c = counted("c", 4, 0);
+        let d = counted("d", 1, 0);
+        assert_eq!(section_badge(&[&c, &d]), Badge::Count(5));
+        let mut marked = room("m");
+        marked.marked_unread = true;
+        assert_eq!(section_badge(&[&room("q"), &marked]), Badge::Dot);
+        let mut quiet = room("u");
+        quiet.unread_messages = 3;
+        assert_eq!(section_badge(&[&quiet]), Badge::Dot);
+        assert_eq!(section_badge(&[&room("z")]), Badge::None);
+        assert_eq!(section_badge(&[]), Badge::None);
+    }
+
+    #[test]
+    fn highlights_2_and_notifications_5_make_highlight_2() {
+        let a = counted("a", 3, 2);
+        let b = counted("b", 2, 0);
+        assert_eq!(section_badge(&[&a, &b]), Badge::Highlight(2));
+    }
+
+    #[test]
+    fn muted_rooms_are_left_out_of_the_sums_like_the_core_does() {
+        let mut loud = counted("a", 0, 0);
+        loud.unread_notifications = 2;
+        let mut muted = counted("b", 9, 4);
+        muted.notification_mode = Some(RoomNotificationModeView::Mute);
+        assert_eq!(section_badge(&[&loud, &muted]), Badge::Count(2));
+        assert_eq!(section_badge(&[&muted]), Badge::None);
+    }
+
+    #[test]
+    fn sums_saturate() {
+        let a = counted("a", u64::MAX, 0);
+        let b = counted("b", 5, 0);
+        assert_eq!(section_badge(&[&a, &b]), Badge::Count(u64::MAX));
+    }
+
+    #[test]
+    fn only_a_collapsed_header_carries_a_badge() {
+        let sp = vec![view("sp", 0, &["a", "b"])];
+        let rs = vec![counted("a", 5, 2), counted("b", 0, 0)];
+        let mut layout = SpaceLayout::new(rid("sp"));
+        let badge_of = |layout: &SpaceLayout| -> Badge {
+            match &build(&sp[0], &sp, &rs, Some(layout))[0] {
+                Line::Header(h) => h.badge,
+                other => panic!("not a header: {other:?}"),
+            }
+        };
+        assert_eq!(badge_of(&layout), Badge::None, "expanded: no header badge");
+        layout.collapsed = vec![SectionKey::Channels];
+        assert_eq!(badge_of(&layout), Badge::Highlight(2));
+    }
+
+    // ---- windowing ----
+
+    fn mixed_lines() -> Vec<RoomSummary> {
+        (0..20).map(|i| room(&format!("r{i}"))).collect()
+    }
+
+    /// Header, 3 rooms, header, hint, header, 3 rooms ... in comfortable
+    /// heights: 32, 64, 64, 64, 32, 36, 32, 64, ...
+    fn mixed<'a>(rooms: &'a [RoomSummary]) -> Vec<Line<'a>> {
+        let header = |key| {
+            Line::Header(Header {
+                key,
+                name: "h",
+                collapsed: false,
+                badge: Badge::None,
+            })
+        };
+        let mut out = vec![header(SectionKey::Channels)];
+        out.extend(rooms[0..3].iter().map(Line::Room));
+        out.push(header(SectionKey::Custom(1)));
+        out.push(Line::EmptyHint(SectionKey::Custom(1)));
+        out.push(header(SectionKey::Direct));
+        out.extend(rooms[3..8].iter().map(Line::Room));
+        out
+    }
+
+    #[test]
+    fn heights_follow_the_density() {
+        let rooms = mixed_lines();
+        let lines = mixed(&rooms);
+        let heights: Vec<f32> = lines
+            .iter()
+            .map(|l| line_height(l, Density::Comfortable))
+            .collect();
+        assert_eq!(&heights[..7], [32.0, 64.0, 64.0, 64.0, 32.0, 36.0, 32.0]);
+        let compact: Vec<f32> = lines
+            .iter()
+            .map(|l| line_height(l, Density::Compact))
+            .collect();
+        assert_eq!(&compact[..7], [28.0, 44.0, 44.0, 44.0, 28.0, 32.0, 28.0]);
+    }
+
+    #[test]
+    fn offsets_are_prefix_sums_ending_with_the_total() {
+        let rooms = mixed_lines();
+        let lines = mixed(&rooms);
+        let offsets = line_offsets(&lines, Density::Comfortable);
+        assert_eq!(offsets.len(), lines.len() + 1);
+        assert_eq!(&offsets[..5], [0.0, 32.0, 96.0, 160.0, 224.0]);
+        let total: f32 = lines
+            .iter()
+            .map(|l| line_height(l, Density::Comfortable))
+            .sum();
+        assert_eq!(*offsets.last().expect("a total"), total);
+        assert_eq!(line_offsets(&[], Density::Comfortable), [0.0]);
+    }
+
+    /// Offsets of lines 32, 64, 64, 36, 32, 64: 0, 32, 96, 160, 196, 228, 292.
+    const OFFSETS: [f32; 7] = [0.0, 32.0, 96.0, 160.0, 196.0, 228.0, 292.0];
+
+    #[test]
+    fn visible_lines_returns_exactly_the_lines_that_cross_the_viewport() {
+        // 50..150 crosses line 1 (32..96) and line 2 (96..160), not 0 or 3.
+        assert_eq!(visible_lines(&OFFSETS, 50.0, 100.0, 0), 1..3);
+        // Exactly line 2 fills 96..160: neighbours touch but do not cross.
+        assert_eq!(visible_lines(&OFFSETS, 96.0, 64.0, 0), 2..3);
+        // One pixel more at the bottom brings line 3 in.
+        assert_eq!(visible_lines(&OFFSETS, 96.0, 65.0, 0), 2..4);
+        // One pixel more at the top brings line 1 in.
+        assert_eq!(visible_lines(&OFFSETS, 95.0, 64.0, 0), 1..3);
+        // The first page.
+        assert_eq!(visible_lines(&OFFSETS, 0.0, 33.0, 0), 0..2);
+    }
+
+    #[test]
+    fn overscan_adds_lines_on_both_sides_and_stops_at_the_ends() {
+        assert_eq!(visible_lines(&OFFSETS, 96.0, 64.0, 1), 1..4);
+        assert_eq!(visible_lines(&OFFSETS, 96.0, 64.0, 10), 0..6);
+        assert_eq!(visible_lines(&OFFSETS, 0.0, 10.0, 2), 0..3);
+    }
+
+    #[test]
+    fn nan_negative_and_stale_offsets_are_clamped() {
+        let first = visible_lines(&OFFSETS, 0.0, 100.0, 0);
+        assert_eq!(visible_lines(&OFFSETS, f32::NAN, 100.0, 0), first);
+        assert_eq!(visible_lines(&OFFSETS, -500.0, 100.0, 0), first);
+        assert_eq!(visible_lines(&OFFSETS, f32::NEG_INFINITY, 100.0, 0), first);
+        // The list shrank under the offset: the last page.
+        let last = visible_lines(&OFFSETS, 1.0e9, 100.0, 0);
+        assert_eq!(last, 3..6, "line 3 still crosses the last page");
+        assert_eq!(visible_lines(&OFFSETS, f32::INFINITY, 100.0, 0), last);
+        // A bad viewport counts as zero high.
+        assert_eq!(visible_lines(&OFFSETS, 0.0, f32::NAN, 0), 0..0);
+        assert_eq!(visible_lines(&OFFSETS, 0.0, f32::INFINITY, 0), 0..0);
+        assert_eq!(visible_lines(&OFFSETS, 0.0, -3.0, 0), 0..0);
+        assert_eq!(visible_lines(&[0.0], 5.0, 100.0, 3), 0..0);
+        assert_eq!(visible_lines(&[], 5.0, 100.0, 3), 0..0);
+    }
+
+    #[test]
+    fn spacers_and_built_lines_add_up_to_the_total() {
+        let total = *OFFSETS.last().expect("a total");
+        for (offset, viewport, overscan) in [
+            (0.0, 100.0, 0),
+            (50.0, 100.0, 1),
+            (96.0, 64.0, 0),
+            (1.0e9, 100.0, 0),
+            (f32::NAN, 100.0, 2),
+            (100.0, 1000.0, 0),
+        ] {
+            let range = visible_lines(&OFFSETS, offset, viewport, overscan);
+            let (top, bottom) = line_spacers(&OFFSETS, &range);
+            let built = OFFSETS[range.end] - OFFSETS[range.start];
+            assert_eq!(
+                top + built + bottom,
+                total,
+                "{offset} {viewport} {overscan}"
+            );
+        }
+        // The same over real lines.
+        let rooms = mixed_lines();
+        let lines = mixed(&rooms);
+        let offsets = line_offsets(&lines, Density::Compact);
+        let range = visible_lines(&offsets, 100.0, 120.0, 1);
+        let (top, bottom) = line_spacers(&offsets, &range);
+        let built: f32 = lines[range.clone()]
+            .iter()
+            .map(|l| line_height(l, Density::Compact))
+            .sum();
+        let total: f32 = lines.iter().map(|l| line_height(l, Density::Compact)).sum();
+        assert!((top + built + bottom - total).abs() < 0.01);
+    }
+
+    #[test]
+    fn equal_heights_give_what_visible_range_gives() {
+        let offsets: Vec<f32> = (0..=1000).map(|i| i as f32 * 64.0).collect();
+        for (offset, viewport) in [
+            (0.0, 800.0),
+            (63.0, 800.0),
+            (64.0, 800.0),
+            (12_345.0, 640.0),
+            (1.0e9, 800.0),
+            (f32::NAN, 800.0),
+            (-4.0, 800.0),
+        ] {
+            assert_eq!(
+                visible_lines(&offsets, offset, viewport, OVERSCAN_ROWS),
+                visible_range(offset, viewport, 64.0, 1000, OVERSCAN_ROWS),
+                "{offset} {viewport}"
+            );
+        }
+    }
+
+    // ---- the app ----
+
+    fn app() -> (App, mpsc::Receiver<Command>) {
+        let (tx, rx) = mpsc::channel(4096);
+        let (_events_tx, events_rx) = mpsc::channel(1);
+        let (mut app, _boot) = App::new(Startup {
+            sink: Box::new(tx),
+            events: EventsSlot::new(events_rx),
+        });
+        app.set_sidebar_store(Box::new(MemorySidebar::default()));
+        (app, rx)
+    }
+
+    fn feed(app: &mut App, event: CoreEvent) {
+        let _ = app.update(Message::Core(Box::new(event)));
+    }
+
+    /// An app logged in as `@a:x` with its layout loaded, the spaces and the
+    /// rooms of the fixtures, and the space `sp` selected.
+    fn space_app(total: Option<u32>) -> (App, mpsc::Receiver<Command>) {
+        let (mut app, rx) = app();
+        feed(
+            &mut app,
+            CoreEvent::LoggedIn {
+                user_id: UserId::from("@a:x"),
+                device_id: DeviceId::from("D"),
+                restored: false,
+            },
+        );
+        let _ = app.update(Message::SidebarLoaded(SidebarAnswer::new(
+            UserId::from("@a:x"),
+            SidebarLoad::Layout(SidebarLayout::new(UserId::from("@a:x"))),
+        )));
+        feed(&mut app, CoreEvent::Spaces(spaces()));
+        feed(
+            &mut app,
+            CoreEvent::RoomListChanged(vec![ListDiff::Reset { values: rooms() }]),
+        );
+        feed(&mut app, CoreEvent::RoomListLoaded { total_rooms: total });
+        let _ = app.update(Message::Spaces(SpacesMessage::Select(Some(rid("sp")))));
+        (app, rx)
+    }
+
+    fn drain(rx: &mut mpsc::Receiver<Command>) -> Vec<Command> {
+        let mut out = Vec::new();
+        while let Ok(c) = rx.try_recv() {
+            out.push(c);
+        }
+        out
+    }
+
+    fn drawn_names(app: &App) -> Vec<String> {
+        lines_of(&app.section_lines().expect("sections show"))
+    }
+
+    // ---- when sections show ----
+
+    #[test]
+    fn sections_show_with_a_space_the_all_tab_a_blank_search_and_the_expanded_list() {
+        let (mut app, _rx) = space_app(None);
+        assert!(app.sections_shown());
+        assert!(app.section_lines().is_some());
+        // A blank search of spaces only is still blank.
+        let _ = app.update(Message::SearchChanged("   ".to_owned()));
+        assert!(app.sections_shown());
+    }
+
+    #[test]
+    fn home_a_search_another_tab_or_the_rail_keep_the_flat_list() {
+        let flat = |app: &App| !app.sections_shown() && app.section_lines().is_none();
+        let (mut app, _rx) = space_app(None);
+        let _ = app.update(Message::SearchChanged("t1".to_owned()));
+        assert!(flat(&app), "a search");
+        let _ = app.update(Message::SearchChanged(String::new()));
+        assert!(app.sections_shown());
+        for tab in [RoomListTab::People, RoomListTab::Rooms, RoomListTab::Spaces] {
+            let _ = app.update(Message::TabSelected(tab));
+            assert!(flat(&app), "{tab:?}");
+        }
+        let _ = app.update(Message::TabSelected(RoomListTab::All));
+        assert!(app.sections_shown());
+        app.ui_settings.room_list = RoomListChoice::Rail;
+        assert!(flat(&app), "the rail");
+        app.ui_settings.room_list = RoomListChoice::Expanded;
+        let _ = app.update(Message::Spaces(SpacesMessage::Select(None)));
+        assert!(flat(&app), "Home");
+    }
+
+    #[test]
+    fn the_flat_list_is_the_rooms_in_their_order_as_before() {
+        let (mut app, _rx) = space_app(None);
+        let _ = app.update(Message::Spaces(SpacesMessage::Select(None)));
+        let names: Vec<String> = app
+            .rooms_as_drawn()
+            .iter()
+            .map(|r| r.name.clone())
+            .collect();
+        let want: Vec<String> = app.rooms.iter().map(|r| r.name.clone()).collect();
+        assert_eq!(names, want);
+    }
+
+    // ---- keyboard ----
+
+    fn press(app: &mut App, shortcut: crate::keys::Shortcut) {
+        let _ = app.update(Message::Shortcut {
+            shortcut,
+            captured: false,
+        });
+    }
+
+    fn collapse(app: &mut App, key: SectionKey) {
+        assert!(
+            app.apply_sidebar(Op::ToggleSection {
+                space: rid("sp"),
+                key,
+            })
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn alt_down_goes_from_the_last_room_of_a_section_to_the_first_of_the_next_drawn_one() {
+        use crate::keys::Shortcut;
+        let (mut app, _rx) = space_app(None);
+        collapse(&mut app, SectionKey::SubSpace(rid("tech")));
+        assert_eq!(
+            drawn_names(&app),
+            [
+                "# Channels",
+                "chan1",
+                "chan2",
+                "starred1",
+                "# tech",
+                "# voice",
+                "v1",
+                "# Direct messages",
+                "dm1"
+            ]
+        );
+        let _ = app.update(Message::SelectRoom(rid("starred1")));
+        press(&mut app, Shortcut::NextRoom);
+        assert_eq!(app.selected, Some(rid("v1")), "Tech is collapsed: skipped");
+        press(&mut app, Shortcut::NextRoom);
+        assert_eq!(app.selected, Some(rid("dm1")));
+        press(&mut app, Shortcut::NextRoom);
+        assert_eq!(app.selected, Some(rid("chan1")), "wraps to the first drawn");
+        press(&mut app, Shortcut::PreviousRoom);
+        assert_eq!(app.selected, Some(rid("dm1")), "and back");
+        press(&mut app, Shortcut::PreviousRoom);
+        press(&mut app, Shortcut::PreviousRoom);
+        assert_eq!(app.selected, Some(rid("starred1")));
+    }
+
+    #[test]
+    fn ctrl_shift_arrows_walk_the_drawn_rooms_too() {
+        use crate::keys::Shortcut;
+        let (mut app, _rx) = space_app(None);
+        collapse(&mut app, SectionKey::SubSpace(rid("tech")));
+        let mut unread = room("v1");
+        unread.unread_messages = 2;
+        let mut hidden = room("t1");
+        hidden.unread_messages = 2;
+        feed(
+            &mut app,
+            CoreEvent::RoomListChanged(vec![
+                ListDiff::Set {
+                    index: 3,
+                    value: unread,
+                },
+                ListDiff::Set {
+                    index: 0,
+                    value: hidden,
+                },
+            ]),
+        );
+        let _ = app.update(Message::SelectRoom(rid("chan1")));
+        press(&mut app, Shortcut::NextUnread);
+        assert_eq!(app.selected, Some(rid("v1")));
+        press(&mut app, Shortcut::NextUnread);
+        assert_eq!(
+            app.selected,
+            Some(rid("v1")),
+            "t1 is in a collapsed section"
+        );
+    }
+
+    #[test]
+    fn the_keys_walk_the_flat_list_when_sections_do_not_show() {
+        use crate::keys::Shortcut;
+        let (mut app, _rx) = space_app(None);
+        let _ = app.update(Message::SearchChanged("x".to_owned()));
+        let _ = app.update(Message::SelectRoom(rid("t1")));
+        press(&mut app, Shortcut::NextRoom);
+        assert_eq!(app.selected, Some(rid("chan1")), "the list's own order");
+    }
+
+    // ---- load all ----
+
+    #[test]
+    fn the_load_all_rule() {
+        assert!(!must_load_all(10, None));
+        assert!(!must_load_all(10, Some(10)));
+        assert!(!must_load_all(10, Some(3)));
+        assert!(must_load_all(10, Some(11)));
+        assert!(must_load_all(0, Some(1)));
+    }
+
+    #[test]
+    fn sectioned_mode_asks_for_a_page_per_loaded_page_until_everything_is_in() {
+        let (mut app, mut rx) = space_app(Some(40));
+        let loads = |rx: &mut mpsc::Receiver<Command>| {
+            drain(rx)
+                .into_iter()
+                .filter(|c| matches!(c, Command::LoadMoreRooms))
+                .count()
+        };
+        // Selecting the space asks the core for its rooms; its answer
+        // arrives as a list and a total. 12 loaded of 40, and the viewport is
+        // nowhere near the end: the next page is still asked for.
+        let _ = drain(&mut rx);
+        feed(
+            &mut app,
+            CoreEvent::RoomListLoaded {
+                total_rooms: Some(40),
+            },
+        );
+        assert_eq!(loads(&mut rx), 1);
+        // The same length again: not asked twice.
+        feed(
+            &mut app,
+            CoreEvent::RoomListLoaded {
+                total_rooms: Some(40),
+            },
+        );
+        assert_eq!(loads(&mut rx), 0);
+        // A page arrives: asked once more.
+        let page: Vec<RoomSummary> = (0..20).map(|i| room(&format!("p{i}"))).collect();
+        feed(
+            &mut app,
+            CoreEvent::RoomListChanged(vec![ListDiff::Append { values: page }]),
+        );
+        assert_eq!(loads(&mut rx), 1);
+        let page: Vec<RoomSummary> = (20..28).map(|i| room(&format!("p{i}"))).collect();
+        feed(
+            &mut app,
+            CoreEvent::RoomListChanged(vec![ListDiff::Append { values: page }]),
+        );
+        assert_eq!(app.rooms.len(), 40);
+        assert_eq!(loads(&mut rx), 0, "len == total: done");
+    }
+
+    #[test]
+    fn sectioned_mode_pages_even_with_the_viewport_far_from_the_end() {
+        let (mut app, mut rx) = space_app(Some(1500));
+        let _ = drain(&mut rx);
+        let many: Vec<RoomSummary> = (0..500).map(|i| room(&format!("m{i}"))).collect();
+        feed(
+            &mut app,
+            CoreEvent::RoomListChanged(vec![ListDiff::Reset { values: many }]),
+        );
+
+        feed(
+            &mut app,
+            CoreEvent::RoomListLoaded {
+                total_rooms: Some(1500),
+            },
+        );
+        assert_eq!(
+            drain(&mut rx)
+                .iter()
+                .filter(|c| matches!(c, Command::LoadMoreRooms))
+                .count(),
+            1,
+            "500 of 1500 loaded, the viewport is at the top, and one page is asked for \
+             once per loaded length"
+        );
+    }
+
+    #[test]
+    fn the_flat_list_still_pages_only_near_its_end() {
+        let (mut app, mut rx) = space_app(Some(5000));
+        let _ = app.update(Message::Spaces(SpacesMessage::Select(None)));
+        let _ = drain(&mut rx);
+        let many: Vec<RoomSummary> = (0..500).map(|i| room(&format!("m{i}"))).collect();
+        feed(
+            &mut app,
+            CoreEvent::RoomListChanged(vec![ListDiff::Reset { values: many }]),
+        );
+        feed(
+            &mut app,
+            CoreEvent::RoomListLoaded {
+                total_rooms: Some(5000),
+            },
+        );
+        assert!(
+            drain(&mut rx)
+                .iter()
+                .all(|c| !matches!(c, Command::LoadMoreRooms)),
+            "the viewport is at the top of 500 rooms"
+        );
+    }
+
+    #[test]
+    fn expanding_a_section_asks_for_the_avatars_of_the_rooms_it_shows() {
+        use twicecat_core::api::AvatarId;
+        let (mut app, mut rx) = space_app(None);
+        let tech = SectionKey::SubSpace(rid("tech"));
+        collapse(&mut app, tech.clone());
+        let mut with_avatar = room("t1");
+        with_avatar.avatar = Some(AvatarId::from("mxc://x/t1"));
+        feed(
+            &mut app,
+            CoreEvent::RoomListChanged(vec![ListDiff::Set {
+                index: 0,
+                value: with_avatar,
+            }]),
+        );
+        let asked = |rx: &mut mpsc::Receiver<Command>| {
+            drain(rx)
+                .into_iter()
+                .any(|c| matches!(c, Command::FetchAvatars(ids) if ids.contains(&AvatarId::from("mxc://x/t1"))))
+        };
+        assert!(!asked(&mut rx), "t1 is in a collapsed section: not in view");
+        let _ = app.update(Message::Spaces(SpacesMessage::ToggleSection(tech)));
+        assert!(asked(&mut rx), "expanded: now in view");
+    }
+
+    // ---- toggling ----
+
+    #[test]
+    fn a_header_click_toggles_the_section_and_saves() {
+        let (mut app, _rx) = space_app(None);
+        let key = SectionKey::SubSpace(rid("voice"));
+        let _ = app.update(Message::Spaces(SpacesMessage::ToggleSection(key.clone())));
+        assert!(drawn_names(&app).iter().all(|l| l != "v1"));
+        let layout = app.sidebar.layout().expect("a layout");
+        assert_eq!(layout.spaces[0].collapsed, vec![key.clone()]);
+        let _ = app.update(Message::Spaces(SpacesMessage::ToggleSection(key)));
+        assert!(drawn_names(&app).iter().any(|l| l == "v1"));
+    }
+}
