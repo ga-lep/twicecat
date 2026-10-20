@@ -401,6 +401,8 @@ fn the_fixture_reaches_every_screen_it_names() {
         "rail-folder-name",
         "space-sections",
         "space-sections-collapsed",
+        "space-sections-custom",
+        "section-menu",
         "verification-requested",
         "verification-emojis",
         "verification-done",
@@ -1415,7 +1417,11 @@ fn space_sections_draw_every_line_whole_and_apart_in_both_densities_and_themes()
         COMPACT_HEADER_HEIGHT, HEADER_HEIGHT, Line, line_height, line_offsets,
     };
     let renderer = renderer();
-    for name in ["space-sections", "space-sections-collapsed"] {
+    for name in [
+        "space-sections",
+        "space-sections-collapsed",
+        "space-sections-custom",
+    ] {
         let scenario = fixture::scenarios()
             .into_iter()
             .find(|s| s.name == name)
@@ -1592,21 +1598,27 @@ fn ctrl_wheel_over_the_room_header_never_changes_the_notification_mode() {
     }
 }
 
-/// The same for the options card of the rail: its "Move to folder" list takes
-/// Ctrl + wheel as "pick the next folder" unless it is behind `kit::menu`, and
-/// that would move a space into a folder while the user only zooms.
+/// The same for the options cards of the rail and of a room row: their "Move
+/// to folder" and "Move to section" lists take Ctrl + wheel as "pick the
+/// next one" unless they are behind `kit::menu`, and that would move a space
+/// into a folder, or a room into a section, while the user only zooms.
 #[test]
-fn ctrl_wheel_over_the_rail_options_card_never_picks_a_folder() {
+fn ctrl_wheel_over_the_options_cards_never_picks_a_folder_or_a_section() {
     use iced::keyboard::{self, Modifiers};
     use iced::{Point, mouse::ScrollDelta};
     let renderer = renderer();
-    for width in [1280.0, 720.0] {
+    for (scenario, width) in [
+        ("rail-menu", 1280.0),
+        ("rail-menu", 720.0),
+        ("section-menu", 1280.0),
+        ("section-menu", 720.0),
+    ] {
         let size = Size::new(width, 800.0);
         let mut app = fixture::scenarios()
             .into_iter()
-            .find(|s| s.name == "rail-menu")
+            .find(|s| s.name == scenario)
             .map(|s| (s.build)())
-            .expect("the rail-menu scenario");
+            .expect("the menu scenario");
         app.set_ui_settings(variants(false)[0].settings());
         app.window_width = width;
         let mut laid = Laid::new(&app, &renderer, size);
@@ -1642,7 +1654,10 @@ fn ctrl_wheel_over_the_rail_options_card_never_picks_a_folder() {
             .iter()
             .filter(|m| matches!(m, Message::SidebarMenu(_)))
             .count();
-        assert_eq!(picks, 0, "Ctrl + wheel acted on the rail card at {width}");
+        assert_eq!(
+            picks, 0,
+            "Ctrl + wheel acted on the {scenario} card at {width}"
+        );
     }
 }
 
@@ -4624,7 +4639,7 @@ mod dialogs {
     }
 
     /// `(scenario, card width, what the close button in the header sends)`.
-    const CARDS: [(&str, f32, &str); 10] = [
+    const CARDS: [(&str, f32, &str); 11] = [
         ("create-room", 460.0, "Rooms(CloseDialog)"),
         ("join-room", 460.0, "Rooms(CloseDialog)"),
         ("start-dm", 460.0, "Rooms(CloseDialog)"),
@@ -4635,6 +4650,7 @@ mod dialogs {
         ("upload-single", 520.0, "UploadCancelled"),
         ("rail-menu", 380.0, "SidebarMenu(Close)"),
         ("rail-folder-name", 380.0, "SidebarMenu(Close)"),
+        ("section-menu", 380.0, "SidebarMenu(Close)"),
     ];
 
     #[test]
@@ -4680,6 +4696,7 @@ mod dialogs {
             "upload-wrong-room",
             "rail-menu",
             "rail-folder-name",
+            "section-menu",
         ];
         for name in names {
             for size in [WIDE, NARROW, SHORT] {
@@ -4688,7 +4705,7 @@ mod dialogs {
                 let width = match name {
                     n if n.starts_with("room-") || n.starts_with("members") => 520.0,
                     n if n.starts_with("upload") => 520.0,
-                    n if n.starts_with("rail-") => 380.0,
+                    n if n.starts_with("rail-") || n.starts_with("section-") => 380.0,
                     _ => 460.0,
                 };
                 let card = card_rect(&laid, width);
@@ -4931,6 +4948,7 @@ mod dialogs {
             "switcher",
             "rail-menu",
             "rail-folder-name",
+            "section-menu",
         ] {
             let app = dialog_app(name, WIDE);
             let mut laid = Laid::new(&app, &renderer, WIDE);

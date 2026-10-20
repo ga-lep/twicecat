@@ -13,7 +13,8 @@ use std::fmt;
 
 use iced::Task;
 use twicecat_core::api::{
-    FolderLayout, RailEntry, RoomId, SectionKey, SidebarLabel, SidebarLayout, SpaceLayout, UserId,
+    CustomSection, FolderLayout, RailEntry, RoomId, SectionKey, SidebarLabel, SidebarLayout,
+    SpaceLayout, UserId,
 };
 
 use crate::sidebar_store::{SidebarLoad, SidebarStore};
@@ -122,6 +123,94 @@ pub enum Op {
         /// Which way.
         dir: Dir,
     },
+    /// Stars a room in a space: it goes to the end of Starred and leaves any
+    /// section of the user's (a room has one place per space). Starred is
+    /// local and per space; the Matrix `m.favourite` tag is not used.
+    Star {
+        /// The space.
+        space: RoomId,
+        /// The room.
+        room: RoomId,
+    },
+    /// Takes a room out of Starred: it goes back to its default section.
+    Unstar {
+        /// The space.
+        space: RoomId,
+        /// The room.
+        room: RoomId,
+    },
+    /// Makes a section of the user's own, last among theirs, under the lowest
+    /// free ID, and puts `room` in it when there is one. The section takes its
+    /// default place in the order.
+    NewSection {
+        /// The space.
+        space: RoomId,
+        /// The name.
+        name: SidebarLabel,
+        /// A room to put in it, taken out of its other place.
+        room: Option<RoomId>,
+    },
+    /// Gives a section of the user's own a new name. Its rooms stay.
+    RenameSection {
+        /// The space.
+        space: RoomId,
+        /// The section.
+        id: u16,
+        /// The new name.
+        name: SidebarLabel,
+    },
+    /// Deletes a section of the user's own. Its rooms are in no list any
+    /// more, so each goes back to its default section; its keys leave `order`
+    /// and `collapsed`.
+    DeleteSection {
+        /// The space.
+        space: RoomId,
+        /// The section.
+        id: u16,
+    },
+    /// Swaps a section with its neighbour among the sections drawn now.
+    MoveSection {
+        /// The space.
+        space: RoomId,
+        /// The section.
+        key: SectionKey,
+        /// Which way.
+        dir: Dir,
+        /// The sections the list draws, in order (hidden ones are not in it,
+        /// and are stepped over).
+        drawn: Vec<SectionKey>,
+    },
+    /// Puts a room at the end of a section of the user's own, taking it out
+    /// of Starred and of any other section of theirs.
+    MoveRoomToSection {
+        /// The space.
+        space: RoomId,
+        /// The room.
+        room: RoomId,
+        /// The section.
+        section: u16,
+    },
+    /// Moves a room one place up or down inside the section of the user's own
+    /// that holds it, over the rooms drawn now; other sections are not
+    /// touched.
+    MoveRoomInSection {
+        /// The space.
+        space: RoomId,
+        /// The room.
+        room: RoomId,
+        /// Which way.
+        dir: Dir,
+        /// The rooms of that section as drawn, in order.
+        drawn: Vec<RoomId>,
+    },
+    /// Takes a room out of Starred and of every section of the user's own, so
+    /// it goes back to its default section.
+    RoomToDefault {
+        /// The space.
+        space: RoomId,
+        /// The room.
+        room: RoomId,
+    },
 }
 
 impl fmt::Debug for Op {
@@ -146,6 +235,32 @@ impl fmt::Debug for Op {
                 .field("id", id)
                 .field("dir", dir)
                 .finish(),
+            Self::Star { .. } => f.write_str("Star { .. }"),
+            Self::Unstar { .. } => f.write_str("Unstar { .. }"),
+            Self::NewSection { room, .. } => f
+                .debug_struct("NewSection")
+                .field("with_room", &room.is_some())
+                .finish(),
+            Self::RenameSection { id, .. } => {
+                f.debug_struct("RenameSection").field("id", id).finish()
+            }
+            Self::DeleteSection { id, .. } => {
+                f.debug_struct("DeleteSection").field("id", id).finish()
+            }
+            Self::MoveSection { key, dir, .. } => f
+                .debug_struct("MoveSection")
+                .field("key", key)
+                .field("dir", dir)
+                .finish(),
+            Self::MoveRoomToSection { section, .. } => f
+                .debug_struct("MoveRoomToSection")
+                .field("section", section)
+                .finish(),
+            Self::MoveRoomInSection { dir, .. } => f
+                .debug_struct("MoveRoomInSection")
+                .field("dir", dir)
+                .finish(),
+            Self::RoomToDefault { .. } => f.write_str("RoomToDefault { .. }"),
         }
     }
 }
@@ -395,6 +510,124 @@ fn change(layout: &mut SidebarLayout, op: Op, known: &[RoomId]) -> Result<Change
             }
             folder.name = name;
         }
+        Op::Star { space, room } => {
+            let record = record_mut(layout, space);
+            if record.starred.contains(&room) {
+                return Ok(Change::Nothing);
+            }
+            take_room_out(record, &room);
+            record.starred.push(room);
+        }
+        Op::Unstar { space, room } => {
+            let Some(record) = existing_record_mut(layout, &space) else {
+                return Ok(Change::Nothing);
+            };
+            let Some(at) = record.starred.iter().position(|r| *r == room) else {
+                return Ok(Change::Nothing);
+            };
+            record.starred.remove(at);
+        }
+        Op::NewSection { space, name, room } => {
+            let record = record_mut(layout, space);
+            let id = (0..=u16::MAX)
+                .find(|n| record.custom.iter().all(|c| c.id != *n))
+                .ok_or(Refused::Full)?;
+            let rooms = match room {
+                Some(room) => {
+                    take_room_out(record, &room);
+                    vec![room]
+                }
+                None => Vec::new(),
+            };
+            record.custom.push(CustomSection { id, name, rooms });
+        }
+        Op::RenameSection { space, id, name } => {
+            let section = section_mut(layout, &space, id).ok_or(Refused::Unknown)?;
+            if section.name == name {
+                return Ok(Change::Nothing);
+            }
+            section.name = name;
+        }
+        Op::DeleteSection { space, id } => {
+            let record = existing_record_mut(layout, &space).ok_or(Refused::Unknown)?;
+            let at = record
+                .custom
+                .iter()
+                .position(|c| c.id == id)
+                .ok_or(Refused::Unknown)?;
+            record.custom.remove(at);
+            let key = SectionKey::Custom(id);
+            record.order.retain(|k| *k != key);
+            record.collapsed.retain(|k| *k != key);
+        }
+        Op::MoveSection {
+            space,
+            key,
+            dir,
+            drawn,
+        } => {
+            let at = drawn
+                .iter()
+                .position(|k| *k == key)
+                .ok_or(Refused::Unknown)?;
+            let Some(to) = step(&drawn, at, dir, |_| true) else {
+                return Ok(Change::Nothing);
+            };
+            let record = record_mut(layout, space);
+            let mut swapped = drawn;
+            swapped.swap(at, to);
+            record.order = merge_order(swapped, &record.order);
+        }
+        Op::MoveRoomToSection {
+            space,
+            room,
+            section,
+        } => {
+            let record = existing_record_mut(layout, &space).ok_or(Refused::Unknown)?;
+            let target = record
+                .custom
+                .iter()
+                .find(|c| c.id == section)
+                .ok_or(Refused::Unknown)?;
+            if target.rooms.contains(&room) {
+                return Ok(Change::Nothing);
+            }
+            take_room_out(record, &room);
+            if let Some(target) = record.custom.iter_mut().find(|c| c.id == section) {
+                target.rooms.push(room);
+            }
+        }
+        Op::MoveRoomInSection {
+            space,
+            room,
+            dir,
+            drawn,
+        } => {
+            let record = existing_record_mut(layout, &space).ok_or(Refused::Unknown)?;
+            let section = record
+                .custom
+                .iter_mut()
+                .find(|c| c.rooms.contains(&room))
+                .ok_or(Refused::Unknown)?;
+            let at = section
+                .rooms
+                .iter()
+                .position(|r| *r == room)
+                .ok_or(Refused::Unknown)?;
+            let Some(to) = step(&section.rooms, at, dir, |r| drawn.contains(r)) else {
+                return Ok(Change::Nothing);
+            };
+            let moved = section.rooms.remove(at);
+            section.rooms.insert(to, moved);
+        }
+        Op::RoomToDefault { space, room } => {
+            let Some(record) = existing_record_mut(layout, &space) else {
+                return Ok(Change::Nothing);
+            };
+            if !take_room_out(record, &room) {
+                return Ok(Change::Nothing);
+            }
+        }
         Op::UngroupFolder(id) => {
             let at = folder_index(layout, id).ok_or(Refused::Unknown)?;
             let RailEntry::Folder(folder) = layout.rail.remove(at) else {
@@ -430,6 +663,66 @@ pub(crate) fn materialized(layout: &SidebarLayout, known: &[RoomId]) -> SidebarL
 /// at least one.
 pub(crate) fn is_drawn(entry: &RailEntry, known: &[RoomId]) -> bool {
     drawn(entry, known)
+}
+
+/// The record of `space`, made empty and added when the layout has none.
+fn record_mut(layout: &mut SidebarLayout, space: RoomId) -> &mut SpaceLayout {
+    let at = match layout.spaces.iter().position(|s| s.space == space) {
+        Some(at) => at,
+        None => {
+            layout.spaces.push(SpaceLayout::new(space));
+            layout.spaces.len() - 1
+        }
+    };
+    &mut layout.spaces[at]
+}
+
+fn existing_record_mut<'a>(
+    layout: &'a mut SidebarLayout,
+    space: &RoomId,
+) -> Option<&'a mut SpaceLayout> {
+    layout.spaces.iter_mut().find(|s| s.space == *space)
+}
+
+fn section_mut<'a>(
+    layout: &'a mut SidebarLayout,
+    space: &RoomId,
+    id: u16,
+) -> Option<&'a mut CustomSection> {
+    existing_record_mut(layout, space)?
+        .custom
+        .iter_mut()
+        .find(|c| c.id == id)
+}
+
+/// Takes `room` out of Starred and out of every section of the user's own, so
+/// a room has one place per space. Says whether it was in any.
+fn take_room_out(record: &mut SpaceLayout, room: &RoomId) -> bool {
+    let before = record.starred.len() + record.custom.iter().map(|c| c.rooms.len()).sum::<usize>();
+    record.starred.retain(|r| r != room);
+    for section in &mut record.custom {
+        section.rooms.retain(|r| r != room);
+    }
+    before != record.starred.len() + record.custom.iter().map(|c| c.rooms.len()).sum::<usize>()
+}
+
+/// The stored order after the drawn sections were rearranged to `drawn`: the
+/// drawn ones in that order, and each stored key that is not drawn (hidden,
+/// or unknown to this device) right after the key that preceded it, so it is
+/// kept where it was.
+fn merge_order(drawn: Vec<SectionKey>, stored: &[SectionKey]) -> Vec<SectionKey> {
+    let mut out = drawn;
+    for (n, key) in stored.iter().enumerate() {
+        if out.contains(key) {
+            continue;
+        }
+        let after = stored[..n]
+            .iter()
+            .rev()
+            .find_map(|earlier| out.iter().position(|k| k == earlier));
+        out.insert(after.map_or(0, |p| p + 1), key.clone());
+    }
+    out
 }
 
 fn folder_mut(layout: &mut SidebarLayout, id: u16) -> Option<&mut FolderLayout> {
@@ -1312,6 +1605,476 @@ mod tests {
             let text = format!("{op:?}");
             for secret in ["!secretroom", "@a:x", "Payroll"] {
                 assert!(!text.contains(secret), "{secret} is in {text}");
+            }
+        }
+    }
+
+    // ---- sections: Starred and the user's own (Task sbc.9) ----
+
+    mod section_ops {
+        use twicecat_core::api::sidebar::limits::{MAX_CUSTOM_SECTIONS, MAX_PLACED_ROOMS};
+        use twicecat_core::api::{CustomSection, SpaceLayout};
+
+        use super::*;
+
+        fn sp_id() -> RoomId {
+            rid("!sp:x")
+        }
+
+        fn r(n: &str) -> RoomId {
+            rid(&format!("!{n}:x"))
+        }
+
+        fn model_with(space: Option<SpaceLayout>) -> (SidebarModel, MemorySidebar) {
+            let store = MemorySidebar::default();
+            let mut layout = SidebarLayout::new(user("@a:x"));
+            layout.spaces.extend(space);
+            (loaded_model(&store, layout), store)
+        }
+
+        fn record(model: &SidebarModel) -> SpaceLayout {
+            model
+                .layout()
+                .expect("a layout")
+                .spaces
+                .iter()
+                .find(|s| s.space == sp_id())
+                .cloned()
+                .expect("a record for the space")
+        }
+
+        fn custom(id: u16, name: &str, rooms: &[&str]) -> CustomSection {
+            CustomSection {
+                id,
+                name: label(name),
+                rooms: rooms.iter().map(|n| r(n)).collect(),
+            }
+        }
+
+        fn names(section: &CustomSection) -> Vec<String> {
+            section
+                .rooms
+                .iter()
+                .map(|id| id.as_str().to_owned())
+                .collect()
+        }
+
+        fn star(room: &str) -> Op {
+            Op::Star {
+                space: sp_id(),
+                room: r(room),
+            }
+        }
+
+        fn unstar(room: &str) -> Op {
+            Op::Unstar {
+                space: sp_id(),
+                room: r(room),
+            }
+        }
+
+        fn new_section(name: &str, room: Option<&str>) -> Op {
+            Op::NewSection {
+                space: sp_id(),
+                name: label(name),
+                room: room.map(r),
+            }
+        }
+
+        fn to_section(room: &str, section: u16) -> Op {
+            Op::MoveRoomToSection {
+                space: sp_id(),
+                room: r(room),
+                section,
+            }
+        }
+
+        #[test]
+        fn star_puts_the_room_in_starred_and_unstar_takes_it_out() {
+            let (mut model, store) = model_with(None);
+            assert!(model.apply(star("a"), &store).is_ok());
+            assert!(model.apply(star("b"), &store).is_ok());
+            assert_eq!(record(&model).starred, [r("a"), r("b")]);
+            assert_eq!(saves(&store), 2);
+            // Starring twice changes nothing and saves nothing.
+            assert!(model.apply(star("a"), &store).is_ok());
+            assert_eq!(saves(&store), 2);
+            assert!(model.apply(unstar("a"), &store).is_ok());
+            assert_eq!(record(&model).starred, [r("b")]);
+            assert_eq!(saves(&store), 3);
+            assert!(model.apply(unstar("a"), &store).is_ok());
+            assert_eq!(saves(&store), 3, "a room that is not starred: no save");
+        }
+
+        #[test]
+        fn a_starred_room_leaves_its_custom_section_so_it_has_one_place() {
+            let mut rec = SpaceLayout::new(sp_id());
+            rec.custom = vec![custom(1, "Work", &["a", "b"])];
+            let (mut model, store) = model_with(Some(rec));
+            assert!(model.apply(star("a"), &store).is_ok());
+            let rec = record(&model);
+            assert_eq!(rec.starred, [r("a")]);
+            assert_eq!(names(&rec.custom[0]), ["!b:x"]);
+            // Unstar returns it to its default section: it is in no list.
+            assert!(model.apply(unstar("a"), &store).is_ok());
+            let rec = record(&model);
+            assert!(rec.starred.is_empty());
+            assert_eq!(names(&rec.custom[0]), ["!b:x"]);
+        }
+
+        #[test]
+        fn a_new_section_is_saved_with_the_lowest_free_id_and_changes_no_order() {
+            let mut rec = SpaceLayout::new(sp_id());
+            rec.custom = vec![custom(0, "Zero", &[]), custom(2, "Two", &[])];
+            rec.order = vec![SectionKey::Direct, SectionKey::Channels];
+            let (mut model, store) = model_with(Some(rec));
+            assert!(model.apply(new_section("Ops", None), &store).is_ok());
+            let rec = record(&model);
+            assert_eq!(rec.custom.len(), 3);
+            assert_eq!(rec.custom[2].id, 1, "the lowest free ID");
+            assert_eq!(rec.custom[2].name.as_str(), "Ops");
+            assert!(rec.custom[2].rooms.is_empty());
+            assert_eq!(rec.order, [SectionKey::Direct, SectionKey::Channels]);
+            assert_eq!(saves(&store), 1);
+        }
+
+        #[test]
+        fn a_new_section_made_from_a_room_holds_that_room_and_only_there() {
+            let mut rec = SpaceLayout::new(sp_id());
+            rec.starred = vec![r("a")];
+            rec.custom = vec![custom(1, "Old", &["a2", "b"])];
+            let (mut model, store) = model_with(Some(rec));
+            assert!(model.apply(new_section("Ops", Some("b")), &store).is_ok());
+            let rec = record(&model);
+            assert_eq!(names(&rec.custom[0]), ["!a2:x"]);
+            assert_eq!(rec.custom[1].id, 0);
+            assert_eq!(names(&rec.custom[1]), ["!b:x"]);
+            // And from a starred room: it leaves Starred.
+            assert!(model.apply(new_section("Two", Some("a")), &store).is_ok());
+            assert!(record(&model).starred.is_empty());
+            assert_eq!(saves(&store), 2);
+        }
+
+        #[test]
+        fn rename_keeps_the_rooms_and_an_unchanged_name_saves_nothing() {
+            let mut rec = SpaceLayout::new(sp_id());
+            rec.custom = vec![custom(3, "Old", &["a", "b"])];
+            let (mut model, store) = model_with(Some(rec));
+            let rename = |name: &str, id: u16| Op::RenameSection {
+                space: sp_id(),
+                id,
+                name: label(name),
+            };
+            assert!(model.apply(rename("New", 3), &store).is_ok());
+            let rec = record(&model);
+            assert_eq!(rec.custom[0].name.as_str(), "New");
+            assert_eq!(names(&rec.custom[0]), ["!a:x", "!b:x"]);
+            assert_eq!(saves(&store), 1);
+            assert!(model.apply(rename("New", 3), &store).is_ok());
+            assert_eq!(saves(&store), 1);
+            assert_eq!(
+                model.apply(rename("X", 9), &store).err(),
+                Some(Refused::Unknown)
+            );
+            assert_eq!(saves(&store), 1);
+        }
+
+        #[test]
+        fn delete_returns_its_rooms_to_their_default_sections_and_drops_its_keys() {
+            let mut rec = SpaceLayout::new(sp_id());
+            rec.custom = vec![custom(1, "Work", &["a", "b"]), custom(2, "Keep", &["c"])];
+            rec.order = vec![
+                SectionKey::Channels,
+                SectionKey::Custom(1),
+                SectionKey::Custom(2),
+            ];
+            rec.collapsed = vec![SectionKey::Custom(1), SectionKey::Direct];
+            let (mut model, store) = model_with(Some(rec));
+            let delete = |id: u16| Op::DeleteSection { space: sp_id(), id };
+            assert!(model.apply(delete(1), &store).is_ok());
+            let rec = record(&model);
+            assert_eq!(rec.custom.len(), 1);
+            assert_eq!(rec.custom[0].id, 2);
+            // Its rooms are in no list any more, so each is placed by default.
+            let placed: Vec<RoomId> = rec
+                .custom
+                .iter()
+                .flat_map(|c| c.rooms.clone())
+                .chain(rec.starred.clone())
+                .collect();
+            assert!(!placed.contains(&r("a")) && !placed.contains(&r("b")));
+            assert_eq!(rec.order, [SectionKey::Channels, SectionKey::Custom(2)]);
+            assert_eq!(rec.collapsed, [SectionKey::Direct]);
+            assert_eq!(saves(&store), 1);
+            assert_eq!(
+                model.apply(delete(1), &store).err(),
+                Some(Refused::Unknown),
+                "deleted twice"
+            );
+        }
+
+        #[test]
+        fn move_room_to_section_takes_it_out_of_every_other_place() {
+            let mut rec = SpaceLayout::new(sp_id());
+            rec.starred = vec![r("s")];
+            rec.custom = vec![custom(1, "A", &["x", "y"]), custom(2, "B", &["z"])];
+            let (mut model, store) = model_with(Some(rec));
+            assert!(model.apply(to_section("x", 2), &store).is_ok());
+            let rec = record(&model);
+            assert_eq!(names(&rec.custom[0]), ["!y:x"]);
+            assert_eq!(names(&rec.custom[1]), ["!z:x", "!x:x"]);
+            // From Starred too.
+            assert!(model.apply(to_section("s", 1), &store).is_ok());
+            let rec = record(&model);
+            assert!(rec.starred.is_empty());
+            assert_eq!(names(&rec.custom[0]), ["!y:x", "!s:x"]);
+            // Into the section it is already in: nothing.
+            assert!(model.apply(to_section("s", 1), &store).is_ok());
+            assert_eq!(saves(&store), 2);
+            assert_eq!(
+                model.apply(to_section("s", 9), &store).err(),
+                Some(Refused::Unknown)
+            );
+        }
+
+        #[test]
+        fn moving_inside_a_custom_section_changes_only_that_section() {
+            let mut rec = SpaceLayout::new(sp_id());
+            rec.starred = vec![r("s1"), r("s2")];
+            rec.order = vec![SectionKey::Custom(2), SectionKey::Custom(1)];
+            rec.custom = vec![
+                custom(1, "A", &["a", "gone", "b", "c"]),
+                custom(2, "B", &["x", "y"]),
+            ];
+            let (mut model, store) = model_with(Some(rec.clone()));
+            let step = |room: &str, dir: Dir, drawn: &[&str]| Op::MoveRoomInSection {
+                space: sp_id(),
+                room: r(room),
+                dir,
+                drawn: drawn.iter().map(|n| r(n)).collect(),
+            };
+            // "gone" is not drawn: b swaps with the drawn neighbour a, and the
+            // room that is not drawn keeps its place after a.
+            assert!(
+                model
+                    .apply(step("b", Dir::Up, &["a", "b", "c"]), &store)
+                    .is_ok()
+            );
+            let now = record(&model);
+            assert_eq!(names(&now.custom[0]), ["!b:x", "!a:x", "!gone:x", "!c:x"]);
+            assert_eq!(names(&now.custom[1]), ["!x:x", "!y:x"], "the other section");
+            assert_eq!(now.starred, rec.starred);
+            assert_eq!(now.order, rec.order);
+            assert_eq!(now.collapsed, rec.collapsed);
+            assert_eq!(saves(&store), 1);
+            // The first drawn room cannot go up, the last cannot go down.
+            assert!(
+                model
+                    .apply(step("b", Dir::Up, &["b", "a", "c"]), &store)
+                    .is_ok()
+            );
+            assert!(
+                model
+                    .apply(step("c", Dir::Down, &["b", "a", "c"]), &store)
+                    .is_ok()
+            );
+            assert_eq!(saves(&store), 1);
+            // A room in no custom section.
+            assert_eq!(
+                model
+                    .apply(step("s1", Dir::Down, &["s1", "s2"]), &store)
+                    .err(),
+                Some(Refused::Unknown)
+            );
+        }
+
+        fn key_text(keys: &[SectionKey]) -> Vec<String> {
+            keys.iter().map(|k| format!("{k:?}")).collect()
+        }
+
+        fn move_section(key: SectionKey, dir: Dir, drawn: &[SectionKey]) -> Op {
+            Op::MoveSection {
+                space: sp_id(),
+                key,
+                dir,
+                drawn: drawn.to_vec(),
+            }
+        }
+
+        #[test]
+        fn moving_a_section_swaps_it_with_its_drawn_neighbour_and_skips_hidden_ones() {
+            use SectionKey::{Channels, Custom, Direct, Starred};
+            let mut rec = SpaceLayout::new(sp_id());
+            rec.custom = vec![custom(1, "A", &["a"])];
+            let (mut model, store) = model_with(Some(rec));
+            // Starred is hidden (empty): the drawn sections are these three.
+            let drawn = [Channels, Custom(1), Direct];
+            assert!(
+                model
+                    .apply(move_section(Custom(1), Dir::Down, &drawn), &store)
+                    .is_ok()
+            );
+            assert_eq!(
+                key_text(&record(&model).order),
+                key_text(&[Channels, Direct, Custom(1)])
+            );
+            assert_eq!(saves(&store), 1);
+            // Up from the first drawn section does nothing.
+            let drawn = [Channels, Direct, Custom(1)];
+            assert!(
+                model
+                    .apply(move_section(Channels, Dir::Up, &drawn), &store)
+                    .is_ok()
+            );
+            assert!(
+                model
+                    .apply(move_section(Custom(1), Dir::Down, &drawn), &store)
+                    .is_ok()
+            );
+            assert_eq!(saves(&store), 1);
+            // A hidden section that the stored order names keeps its place
+            // beside the one it followed.
+            let mut rec = record(&model);
+            rec.order = vec![Starred, Channels, Direct, Custom(1)];
+            let (mut model, store) = model_with(Some(rec));
+            let drawn = [Channels, Direct, Custom(1)];
+            assert!(
+                model
+                    .apply(move_section(Direct, Dir::Up, &drawn), &store)
+                    .is_ok()
+            );
+            assert_eq!(
+                key_text(&record(&model).order),
+                key_text(&[Starred, Direct, Channels, Custom(1)]),
+                "Starred (hidden) stays first; Direct and Channels swap"
+            );
+            // A section that is not drawn cannot be moved.
+            assert_eq!(
+                model
+                    .apply(move_section(Starred, Dir::Down, &drawn), &store)
+                    .err(),
+                Some(Refused::Unknown)
+            );
+        }
+
+        #[test]
+        fn room_to_default_clears_starred_and_custom() {
+            let mut rec = SpaceLayout::new(sp_id());
+            rec.starred = vec![r("s")];
+            rec.custom = vec![custom(1, "A", &["x"])];
+            let (mut model, store) = model_with(Some(rec));
+            let back = |room: &str| Op::RoomToDefault {
+                space: sp_id(),
+                room: r(room),
+            };
+            assert!(model.apply(back("x"), &store).is_ok());
+            assert!(model.apply(back("s"), &store).is_ok());
+            let rec = record(&model);
+            assert!(rec.starred.is_empty() && rec.custom[0].rooms.is_empty());
+            assert_eq!(saves(&store), 2);
+            assert!(model.apply(back("nobody"), &store).is_ok());
+            assert_eq!(saves(&store), 2);
+        }
+
+        #[test]
+        fn passing_a_limit_is_refused_and_saves_nothing() {
+            // Twenty sections: a 21st is refused.
+            let mut rec = SpaceLayout::new(sp_id());
+            rec.custom = (0..MAX_CUSTOM_SECTIONS as u16)
+                .map(|n| custom(n, "S", &[]))
+                .collect();
+            let (mut model, store) = model_with(Some(rec));
+            assert_eq!(
+                model.apply(new_section("One more", None), &store).err(),
+                Some(Refused::Full)
+            );
+            assert_eq!(model.state(), SidebarState::Full);
+            assert_eq!(record(&model).custom.len(), MAX_CUSTOM_SECTIONS);
+            assert_eq!(saves(&store), 0);
+
+            // The room budget of one space: Starred and the sections together.
+            let mut rec = SpaceLayout::new(sp_id());
+            rec.starred = (0..MAX_PLACED_ROOMS - 1)
+                .map(|n| r(&format!("s{n}")))
+                .collect();
+            rec.custom = vec![custom(1, "A", &[])];
+            let (mut model, store) = model_with(Some(rec));
+            assert!(model.apply(star("last"), &store).is_ok(), "the 500th");
+            assert_eq!(saves(&store), 1);
+            assert_eq!(
+                model.apply(to_section("one-too-many", 1), &store).err(),
+                Some(Refused::Full)
+            );
+            assert_eq!(
+                model.apply(star("one-too-many"), &store).err(),
+                Some(Refused::Full)
+            );
+            assert_eq!(
+                model
+                    .apply(new_section("B", Some("one-too-many")), &store)
+                    .err(),
+                Some(Refused::Full)
+            );
+            assert_eq!(saves(&store), 1);
+            assert_eq!(record(&model).starred.len(), MAX_PLACED_ROOMS);
+        }
+
+        #[test]
+        fn the_new_operations_are_refused_while_customizing_is_off() {
+            let store = MemorySidebar::default();
+            let mut model = SidebarModel::default();
+            assert_eq!(
+                model.apply(star("a"), &store).err(),
+                Some(Refused::NotLoaded)
+            );
+            let mut model = SidebarModel::default();
+            let a = user("@a:x");
+            let _ = model.load_for(a.clone(), &store);
+            model.loaded(&a, SidebarLoad::Newer);
+            assert_eq!(
+                model.apply(new_section("X", None), &store).err(),
+                Some(Refused::Protected)
+            );
+            assert_eq!(saves(&store), 0);
+        }
+
+        #[test]
+        fn debug_of_the_new_operations_hides_ids_and_names() {
+            let ops = [
+                star("secretroom"),
+                unstar("secretroom"),
+                new_section("Payroll", Some("secretroom")),
+                Op::RenameSection {
+                    space: r("secretroom"),
+                    id: 1,
+                    name: label("Payroll"),
+                },
+                Op::DeleteSection {
+                    space: r("secretroom"),
+                    id: 1,
+                },
+                move_section(
+                    SectionKey::SubSpace(r("secretroom")),
+                    Dir::Up,
+                    &[SectionKey::SubSpace(r("secretroom"))],
+                ),
+                to_section("secretroom", 1),
+                Op::MoveRoomInSection {
+                    space: r("secretroom"),
+                    room: r("secretroom"),
+                    dir: Dir::Up,
+                    drawn: vec![r("secretroom")],
+                },
+                Op::RoomToDefault {
+                    space: r("secretroom"),
+                    room: r("secretroom"),
+                },
+            ];
+            for op in ops {
+                let text = format!("{op:?}");
+                for secret in ["secretroom", "@a:x", "Payroll"] {
+                    assert!(!text.contains(secret), "{secret} is in {text}");
+                }
             }
         }
     }

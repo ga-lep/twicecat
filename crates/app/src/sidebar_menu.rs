@@ -1,11 +1,20 @@
-//! The options card for the spaces rail and the name dialog (sidebar plan,
-//! Task 6): the way to arrange the rail without dragging.
+//! The options card for the spaces rail, the sections of a space and their
+//! rooms, and the name dialog (sidebar plan, Tasks 6 and 9): the way to
+//! arrange the sidebar without dragging.
 //!
 //! A right-click on a space or a folder opens a card with that item's moves:
 //! Move up, Move down, Move to folder (a pick list: the folders, then "New
 //! folder..."), Remove from folder, and for a folder Rename and Ungroup.
 //! "New folder..." and Rename open a small dialog with one text field, which
 //! takes the focus. Enter in the field saves and Esc cancels.
+//!
+//! In a space's sectioned list a right-click, or the "⋯" button, opens
+//! the card of a section header (Rename and Delete for the user's own
+//! sections, Move up, Move down, Collapse or Expand, New section) or of a room
+//! row (Star or Unstar, Move up and Move down inside a section of the user's
+//! own, Back to its default section, and the "Move to section" list: the
+//! user's sections, then "New section..."). A room has one place per space:
+//! Starred, one section of the user's own, or its default section.
 //!
 //! Every entry maps to one [`SidebarOp`] ([`op_for`] and [`App::pick_folder`]);
 //! the drag and drop of a later task calls the same operations. No keyboard
@@ -19,9 +28,12 @@
 use std::fmt;
 
 use iced::Task;
-use twicecat_core::api::{RailEntry, RoomId, SidebarLabel, SidebarLabelError};
+use twicecat_core::api::{
+    CustomSection, RailEntry, RoomId, SectionKey, SidebarLabel, SidebarLabelError,
+};
 
 use crate::keys::Shortcut;
+use crate::sections::{Spot, drawn_sections, spot_of};
 use crate::sidebar::{Dir, FolderTarget, Op as SidebarOp, SidebarState};
 use crate::spaces::{RailItem, RailKey};
 use crate::state::{App, Message, Screen};
@@ -47,6 +59,20 @@ pub enum Target {
     Space(RoomId),
     /// A folder of the rail, by its ID.
     Folder(u16),
+    /// The header of a section of a space's list.
+    Section {
+        /// The space.
+        space: RoomId,
+        /// The section.
+        key: SectionKey,
+    },
+    /// A room row of a space's sectioned list.
+    Room {
+        /// The space.
+        space: RoomId,
+        /// The room.
+        room: RoomId,
+    },
 }
 
 impl fmt::Debug for Target {
@@ -54,6 +80,8 @@ impl fmt::Debug for Target {
         match self {
             Self::Space(_) => f.write_str("Space(<redacted>)"),
             Self::Folder(id) => f.debug_tuple("Folder").field(id).finish(),
+            Self::Section { key, .. } => f.debug_struct("Section").field("key", key).finish(),
+            Self::Room { .. } => f.write_str("Room(<redacted>)"),
         }
     }
 }
@@ -65,6 +93,29 @@ pub enum Purpose {
     NewFolder(RoomId),
     /// A new name for this folder.
     RenameFolder(u16),
+    /// A new section of the user's own in a space, holding this room when
+    /// there is one.
+    NewSection {
+        /// The space.
+        space: RoomId,
+        /// The room to put in it.
+        room: Option<RoomId>,
+    },
+    /// A new name for this section of the user's own.
+    RenameSection {
+        /// The space.
+        space: RoomId,
+        /// The section.
+        id: u16,
+    },
+}
+
+impl Purpose {
+    /// Whether the name is for a section (which must have one) and not a
+    /// folder (whose name is optional).
+    pub fn is_section(&self) -> bool {
+        matches!(self, Self::NewSection { .. } | Self::RenameSection { .. })
+    }
 }
 
 impl fmt::Debug for Purpose {
@@ -72,6 +123,13 @@ impl fmt::Debug for Purpose {
         match self {
             Self::NewFolder(_) => f.write_str("NewFolder(<redacted>)"),
             Self::RenameFolder(id) => f.debug_tuple("RenameFolder").field(id).finish(),
+            Self::NewSection { room, .. } => f
+                .debug_struct("NewSection")
+                .field("with_room", &room.is_some())
+                .finish(),
+            Self::RenameSection { id, .. } => {
+                f.debug_struct("RenameSection").field("id", id).finish()
+            }
         }
     }
 }
@@ -137,6 +195,21 @@ pub enum Entry {
     Rename,
     /// Dissolve a folder.
     Ungroup,
+    /// Star a room.
+    Star,
+    /// Take a room out of Starred.
+    Unstar,
+    /// Put a room back in its default section.
+    BackToDefault,
+    /// Collapse a section.
+    Collapse,
+    /// Expand a section.
+    Expand,
+    /// Delete a section of the user's own (opens nothing: its rooms go back
+    /// to their default sections).
+    Delete,
+    /// Make a new section (opens the dialog).
+    NewSection,
 }
 
 impl Entry {
@@ -148,6 +221,13 @@ impl Entry {
             Self::RemoveFromFolder => "Remove from folder",
             Self::Rename => "Rename\u{2026}",
             Self::Ungroup => "Ungroup",
+            Self::Star => "Star",
+            Self::Unstar => "Unstar",
+            Self::BackToDefault => "Back to its default section",
+            Self::Collapse => "Collapse",
+            Self::Expand => "Expand",
+            Self::Delete => "Delete section",
+            Self::NewSection => "New section\u{2026}",
         }
     }
 }
@@ -189,11 +269,53 @@ impl fmt::Debug for FolderChoice {
     }
 }
 
+/// A choice of the "Move to section" pick list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SectionPick {
+    /// A section of the user's own.
+    Existing(u16),
+    /// A new section (opens the dialog).
+    New,
+}
+
+/// An option of the "Move to section" list, with the words it shows. `Debug`
+/// hides the words (a section's name is the user's own text).
+#[derive(Clone)]
+pub struct SectionChoice {
+    /// What picking it does.
+    pub pick: SectionPick,
+    /// What the list shows.
+    pub label: String,
+}
+
+impl PartialEq for SectionChoice {
+    fn eq(&self, other: &Self) -> bool {
+        self.pick == other.pick
+    }
+}
+
+impl fmt::Display for SectionChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.label)
+    }
+}
+
+impl fmt::Debug for SectionChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("SectionChoice").field(&self.pick).finish()
+    }
+}
+
 /// The message of the card and the dialog.
 #[derive(Clone, PartialEq, Eq)]
 pub enum SidebarMenuMessage {
     /// A right-click on an item of the rail.
     Open(RailKey),
+    /// A right-click, or the "⋯" button, on a section header.
+    OpenSection(SectionKey),
+    /// A right-click, or the "⋯" button, on a room row of the
+    /// sectioned list.
+    OpenRoom(RoomId),
     /// The close button, Cancel.
     Close,
     /// The Esc key, with the card or the dialog the topmost layer.
@@ -202,6 +324,8 @@ pub enum SidebarMenuMessage {
     Entry(Entry),
     /// A choice of the "Move to folder" pick list.
     Folder(FolderPick),
+    /// A choice of the "Move to section" pick list.
+    Section(SectionPick),
     /// The text field of the dialog changed.
     NameInput(String),
     /// Enter in the field, or the dialog's main button.
@@ -212,10 +336,13 @@ impl fmt::Debug for SidebarMenuMessage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Open(key) => f.debug_tuple("Open").field(key).finish(),
+            Self::OpenSection(key) => f.debug_tuple("OpenSection").field(key).finish(),
+            Self::OpenRoom(_) => f.write_str("OpenRoom(<redacted>)"),
             Self::Close => f.write_str("Close"),
             Self::Escape => f.write_str("Escape"),
             Self::Entry(entry) => f.debug_tuple("Entry").field(entry).finish(),
             Self::Folder(pick) => f.debug_tuple("Folder").field(pick).finish(),
+            Self::Section(pick) => f.debug_tuple("Section").field(pick).finish(),
             // The text is a folder name: only how long it is.
             Self::NameInput(text) => write!(f, "NameInput(<{} chars>)", text.chars().count()),
             Self::NameSubmit => f.write_str("NameSubmit"),
@@ -237,6 +364,9 @@ pub fn entries(target: &Target, in_folder: bool) -> Vec<Entry> {
             Entry::MoveDown,
             Entry::Ungroup,
         ],
+        // The cards of the sectioned list have their own (`section_entries`
+        // and `room_entries`).
+        Target::Section { .. } | Target::Room { .. } => Vec::new(),
     }
 }
 
@@ -264,10 +394,142 @@ pub fn op_for(target: &Target, entry: Entry) -> Option<SidebarOp> {
             dir: Dir::Down,
         }),
         (Target::Folder(id), Entry::Ungroup) => Some(SidebarOp::UngroupFolder(*id)),
-        (Target::Folder(_), Entry::Rename)
-        | (Target::Space(_), Entry::Rename | Entry::Ungroup)
-        | (Target::Folder(_), Entry::RemoveFromFolder) => None,
+        // Everything else is not a rail button: it opens the dialog, or it
+        // belongs to the sections (see `section_op` and `room_op`).
+        _ => None,
     }
+}
+
+/// The buttons of the card of a section header, top to bottom. The user's own
+/// sections can be renamed and deleted; every section can be moved, collapsed
+/// or expanded, and starts a new section.
+pub fn section_entries(key: &SectionKey, collapsed: bool) -> Vec<Entry> {
+    let toggle = if collapsed {
+        Entry::Expand
+    } else {
+        Entry::Collapse
+    };
+    let mut out = Vec::new();
+    if matches!(key, SectionKey::Custom(_)) {
+        out.push(Entry::Rename);
+    }
+    out.extend([Entry::MoveUp, Entry::MoveDown, toggle, Entry::NewSection]);
+    if matches!(key, SectionKey::Custom(_)) {
+        out.push(Entry::Delete);
+    }
+    out
+}
+
+/// The buttons of the card of a room row, top to bottom, for the section
+/// that draws it. ("Move to section" is the pick list under them.) Up and
+/// down are only for the user's own sections, where the order is theirs.
+pub fn room_entries(section: &SectionKey) -> Vec<Entry> {
+    match section {
+        SectionKey::Starred => vec![Entry::Unstar],
+        SectionKey::Custom(_) => vec![
+            Entry::Star,
+            Entry::MoveUp,
+            Entry::MoveDown,
+            Entry::BackToDefault,
+        ],
+        _ => vec![Entry::Star],
+    }
+}
+
+/// The operation a button of a section header's card stands for, or `None`
+/// for the ones that open the dialog (Rename, New section). `drawn` are the
+/// sections the list draws now.
+pub fn section_op(
+    space: &RoomId,
+    key: &SectionKey,
+    entry: Entry,
+    drawn: &[SectionKey],
+) -> Option<SidebarOp> {
+    let space = space.clone();
+    match (entry, key) {
+        (Entry::MoveUp | Entry::MoveDown, key) => Some(SidebarOp::MoveSection {
+            space,
+            key: key.clone(),
+            dir: if entry == Entry::MoveUp {
+                Dir::Up
+            } else {
+                Dir::Down
+            },
+            drawn: drawn.to_vec(),
+        }),
+        (Entry::Collapse | Entry::Expand, key) => Some(SidebarOp::ToggleSection {
+            space,
+            key: key.clone(),
+        }),
+        (Entry::Delete, SectionKey::Custom(id)) => {
+            Some(SidebarOp::DeleteSection { space, id: *id })
+        }
+        _ => None,
+    }
+}
+
+/// The operation a button of a room's card stands for. `spot` is where the
+/// list draws the room now.
+pub fn room_op(space: &RoomId, room: &RoomId, entry: Entry, spot: &Spot) -> Option<SidebarOp> {
+    let (space, room) = (space.clone(), room.clone());
+    match entry {
+        Entry::Star => Some(SidebarOp::Star { space, room }),
+        Entry::Unstar => Some(SidebarOp::Unstar { space, room }),
+        Entry::BackToDefault => Some(SidebarOp::RoomToDefault { space, room }),
+        Entry::MoveUp | Entry::MoveDown => Some(SidebarOp::MoveRoomInSection {
+            space,
+            room,
+            dir: if entry == Entry::MoveUp {
+                Dir::Up
+            } else {
+                Dir::Down
+            },
+            drawn: spot.rooms.clone(),
+        }),
+        _ => None,
+    }
+}
+
+/// The operation a choice of the "Move to section" list stands for, or `None`
+/// for "New section..." (which opens the dialog).
+pub fn op_for_section_pick(space: &RoomId, room: &RoomId, pick: SectionPick) -> Option<SidebarOp> {
+    match pick {
+        SectionPick::Existing(section) => Some(SidebarOp::MoveRoomToSection {
+            space: space.clone(),
+            room: room.clone(),
+            section,
+        }),
+        SectionPick::New => None,
+    }
+}
+
+/// The options of the "Move to section" list for a room: the user's sections
+/// except the one it is in, then "New section...".
+pub fn section_choices(custom: &[CustomSection], current: Option<u16>) -> Vec<SectionChoice> {
+    let mut out: Vec<SectionChoice> = custom
+        .iter()
+        .filter(|section| Some(section.id) != current)
+        .map(|section| SectionChoice {
+            pick: SectionPick::Existing(section.id),
+            label: name_or_placeholder(section.name.as_str(), MAX_NAME_CHARS),
+        })
+        .collect();
+    out.push(SectionChoice {
+        pick: SectionPick::New,
+        label: "New section\u{2026}".to_owned(),
+    });
+    out
+}
+
+/// What the dialog says about a section name that is not valid. A section
+/// must have a name.
+pub const SECTION_NAME_ERROR: &str =
+    "Use 1 to 32 characters, with no control or hidden characters.";
+
+/// A section's name from the dialog's text: unlike a folder's, it cannot be
+/// blank.
+pub fn parse_section_name(text: &str) -> Result<SidebarLabel, SidebarLabelError> {
+    SidebarLabel::try_from(text)
 }
 
 /// The operation a choice of the pick list stands for, or `None` for "New
@@ -282,14 +544,25 @@ pub fn op_for_pick(space: &RoomId, pick: FolderPick) -> Option<SidebarOp> {
     }
 }
 
-/// The operation that saves the dialog with `name` (`None`: no name).
-pub fn op_for_name(purpose: &Purpose, name: Option<SidebarLabel>) -> SidebarOp {
+/// The operation that saves the dialog with `name` (`None`: no name). A
+/// section cannot go without a name, so for one `None` gives no operation.
+pub fn op_for_name(purpose: &Purpose, name: Option<SidebarLabel>) -> Option<SidebarOp> {
     match purpose {
-        Purpose::NewFolder(space) => SidebarOp::MoveToFolder {
+        Purpose::NewFolder(space) => Some(SidebarOp::MoveToFolder {
             id: space.clone(),
             folder: FolderTarget::New(name),
-        },
-        Purpose::RenameFolder(id) => SidebarOp::RenameFolder { id: *id, name },
+        }),
+        Purpose::RenameFolder(id) => Some(SidebarOp::RenameFolder { id: *id, name }),
+        Purpose::NewSection { space, room } => Some(SidebarOp::NewSection {
+            space: space.clone(),
+            name: name?,
+            room: room.clone(),
+        }),
+        Purpose::RenameSection { space, id } => Some(SidebarOp::RenameSection {
+            space: space.clone(),
+            id: *id,
+            name: name?,
+        }),
     }
 }
 
@@ -386,12 +659,15 @@ impl App {
     pub(crate) fn on_sidebar_menu(&mut self, message: SidebarMenuMessage) -> Task<Message> {
         match message {
             SidebarMenuMessage::Open(key) => self.open_sidebar_menu(&key),
+            SidebarMenuMessage::OpenSection(key) => self.open_section_menu(key),
+            SidebarMenuMessage::OpenRoom(room) => self.open_room_menu(room),
             SidebarMenuMessage::Close | SidebarMenuMessage::Escape => {
                 self.sidebar_menu = None;
                 Task::none()
             }
             SidebarMenuMessage::Entry(entry) => self.menu_entry(entry),
             SidebarMenuMessage::Folder(pick) => self.pick_folder(pick),
+            SidebarMenuMessage::Section(pick) => self.pick_section(pick),
             SidebarMenuMessage::NameInput(text) => {
                 if let Some(SidebarMenu::Name(dialog)) = &mut self.sidebar_menu {
                     dialog.text = text.chars().take(MAX_NAME_INPUT).collect();
@@ -431,12 +707,157 @@ impl App {
         Task::none()
     }
 
+    /// Whether a card for the sectioned list can open now: on the main
+    /// screen, with the list showing sections, no other layer over it, and a
+    /// layout that can be changed.
+    fn section_menu_can_open(&self) -> bool {
+        let customizable = matches!(
+            self.sidebar.state(),
+            SidebarState::Loaded | SidebarState::Full
+        );
+        self.screen == Screen::Main
+            && customizable
+            && !self.any_overlay_open()
+            && self.sections_shown()
+    }
+
+    /// A right-click, or the "⋯" button, on a section header.
+    fn open_section_menu(&mut self, key: SectionKey) -> Task<Message> {
+        if !self.section_menu_can_open() {
+            return Task::none();
+        }
+        let (Some(space), Some(lines)) = (self.query.space.clone(), self.section_lines()) else {
+            return Task::none();
+        };
+        if !drawn_sections(&lines).contains(&key) {
+            return Task::none();
+        }
+        self.sidebar_menu = Some(SidebarMenu::Card {
+            target: Target::Section { space, key },
+            error: None,
+        });
+        Task::none()
+    }
+
+    /// A right-click, or the "⋯" button, on a room row of the sectioned
+    /// list.
+    fn open_room_menu(&mut self, room: RoomId) -> Task<Message> {
+        if !self.section_menu_can_open() {
+            return Task::none();
+        }
+        let (Some(space), Some(lines)) = (self.query.space.clone(), self.section_lines()) else {
+            return Task::none();
+        };
+        if spot_of(&lines, &room).is_none() {
+            return Task::none();
+        }
+        self.sidebar_menu = Some(SidebarMenu::Card {
+            target: Target::Room { space, room },
+            error: None,
+        });
+        Task::none()
+    }
+
+    /// The operation and the dialog behind a button of a section or room
+    /// card, worked out from the list as it is drawn now. `None` when what
+    /// the card is about is not drawn any more.
+    fn section_entry(&mut self, target: &Target, entry: Entry) -> Option<Task<Message>> {
+        let lines = self.section_lines()?;
+        match target {
+            Target::Section { space, key } => {
+                let drawn = drawn_sections(&lines);
+                if !drawn.contains(key) {
+                    return None;
+                }
+                if let (Entry::Rename, SectionKey::Custom(id)) = (entry, key) {
+                    let current = self.custom_name(space, *id);
+                    return Some(self.open_name_dialog(
+                        Purpose::RenameSection {
+                            space: space.clone(),
+                            id: *id,
+                        },
+                        current,
+                    ));
+                }
+                if entry == Entry::NewSection {
+                    return Some(self.open_name_dialog(
+                        Purpose::NewSection {
+                            space: space.clone(),
+                            room: None,
+                        },
+                        String::new(),
+                    ));
+                }
+                let op = section_op(space, key, entry, &drawn)?;
+                drop(lines);
+                Some(self.run_section_op(op))
+            }
+            Target::Room { space, room } => {
+                let spot = spot_of(&lines, room)?;
+                let op = room_op(space, room, entry, &spot)?;
+                drop(lines);
+                Some(self.run_section_op(op))
+            }
+            Target::Space(_) | Target::Folder(_) => None,
+        }
+    }
+
+    /// The name of the user's section `id` in `space`, as text for the
+    /// dialog's field.
+    fn custom_name(&self, space: &RoomId, id: u16) -> String {
+        self.sidebar
+            .layout()
+            .and_then(|layout| layout.spaces.iter().find(|s| s.space == *space))
+            .and_then(|record| record.custom.iter().find(|c| c.id == id))
+            .map(|section| section.name.as_str().to_owned())
+            .unwrap_or_default()
+    }
+
+    /// [`Self::run_menu_op`] for an operation that changes what the list
+    /// draws: the rooms in view may need their avatars and pages.
+    fn run_section_op(&mut self, op: SidebarOp) -> Task<Message> {
+        let done = self.run_menu_op(op);
+        Task::batch([done, self.after_list_change()])
+    }
+
+    /// A choice of the "Move to section" list.
+    pub(crate) fn pick_section(&mut self, pick: SectionPick) -> Task<Message> {
+        let Some(SidebarMenu::Card {
+            target: Target::Room { space, room },
+            ..
+        }) = &self.sidebar_menu
+        else {
+            return Task::none();
+        };
+        let (space, room) = (space.clone(), room.clone());
+        match op_for_section_pick(&space, &room, pick) {
+            Some(op) => self.run_section_op(op),
+            None => self.open_name_dialog(
+                Purpose::NewSection {
+                    space,
+                    room: Some(room),
+                },
+                String::new(),
+            ),
+        }
+    }
+
     /// A button of the card.
     fn menu_entry(&mut self, entry: Entry) -> Task<Message> {
         let Some(SidebarMenu::Card { target, .. }) = &self.sidebar_menu else {
             return Task::none();
         };
         let target = target.clone();
+        if matches!(target, Target::Section { .. } | Target::Room { .. }) {
+            return match self.section_entry(&target, entry) {
+                Some(task) => task,
+                None => {
+                    // What the card is about is gone.
+                    self.sidebar_menu = None;
+                    Task::none()
+                }
+            };
+        }
         if let (Target::Folder(id), Entry::Rename) = (&target, entry) {
             let current = self
                 .sidebar
@@ -489,8 +910,23 @@ impl App {
             return Task::none();
         };
         let purpose = dialog.purpose.clone();
+        if purpose.is_section() {
+            return match parse_section_name(&dialog.text) {
+                Ok(name) => match op_for_name(&purpose, Some(name)) {
+                    Some(op) => self.run_section_op(op),
+                    None => Task::none(),
+                },
+                Err(_) => {
+                    self.set_menu_error(SECTION_NAME_ERROR);
+                    Task::none()
+                }
+            };
+        }
         match parse_name(&dialog.text) {
-            Ok(name) => self.run_menu_op(op_for_name(&purpose, name)),
+            Ok(name) => match op_for_name(&purpose, name) {
+                Some(op) => self.run_menu_op(op),
+                None => Task::none(),
+            },
             Err(_) => {
                 self.set_menu_error(NAME_ERROR);
                 Task::none()
@@ -556,16 +992,52 @@ impl App {
         let Some(menu) = &self.sidebar_menu else {
             return;
         };
-        let target = match menu {
-            SidebarMenu::Card { target, .. } => target.clone(),
+        let gone = match menu {
+            SidebarMenu::Card { target, .. } => self.target_gone(target),
             SidebarMenu::Name(dialog) => match &dialog.purpose {
-                Purpose::NewFolder(space) => Target::Space(space.clone()),
-                Purpose::RenameFolder(id) => Target::Folder(*id),
+                Purpose::NewFolder(space) => self.target_gone(&Target::Space(space.clone())),
+                Purpose::RenameFolder(id) => self.target_gone(&Target::Folder(*id)),
+                Purpose::NewSection {
+                    space,
+                    room: Some(room),
+                } => self.target_gone(&Target::Room {
+                    space: space.clone(),
+                    room: room.clone(),
+                }),
+                Purpose::NewSection { space, room: None } => self.lines_of_space(space).is_none(),
+                Purpose::RenameSection { space, id } => self.target_gone(&Target::Section {
+                    space: space.clone(),
+                    key: SectionKey::Custom(*id),
+                }),
             },
         };
-        let items = self.spaces.rail_items(self.sidebar.layout());
-        if place_of(&items, &target).is_none() {
+        if gone {
             self.sidebar_menu = None;
+        }
+    }
+
+    /// The lines of the sectioned list while it is showing `space`.
+    fn lines_of_space(&self, space: &RoomId) -> Option<Vec<crate::sections::Line<'_>>> {
+        if self.query.space.as_ref() == Some(space) {
+            self.section_lines()
+        } else {
+            None
+        }
+    }
+
+    /// Whether what a card is about is no longer drawn.
+    fn target_gone(&self, target: &Target) -> bool {
+        match target {
+            Target::Space(_) | Target::Folder(_) => {
+                let items = self.spaces.rail_items(self.sidebar.layout());
+                place_of(&items, target).is_none()
+            }
+            Target::Section { space, key } => !self
+                .lines_of_space(space)
+                .is_some_and(|lines| drawn_sections(&lines).contains(key)),
+            Target::Room { space, room } => !self
+                .lines_of_space(space)
+                .is_some_and(|lines| spot_of(&lines, room).is_some()),
         }
     }
 }
@@ -637,8 +1109,8 @@ mod tests {
         // The operations the buttons reach, with the pick list's.
         let mut ops: Vec<SidebarOp> = seen.into_iter().filter_map(|(_, op)| op).collect();
         ops.push(op_for_pick(&rid("!a:x"), FolderPick::Existing(2)).expect("an op"));
-        ops.push(op_for_name(&Purpose::NewFolder(rid("!a:x")), None));
-        ops.push(op_for_name(&Purpose::RenameFolder(4), None));
+        ops.push(op_for_name(&Purpose::NewFolder(rid("!a:x")), None).expect("an op"));
+        ops.push(op_for_name(&Purpose::RenameFolder(4), None).expect("an op"));
         let kinds: std::collections::BTreeSet<String> = ops
             .iter()
             .map(|op| {
@@ -697,5 +1169,245 @@ mod tests {
         assert!(parse_name(&"w".repeat(32)).is_ok());
         assert!(parse_name("\u{202E}x").is_err());
         assert!(parse_name("a\nb").is_err());
+    }
+
+    // ---- the cards of the sectioned list (Task sbc.9) ----
+
+    fn kind(op: &SidebarOp) -> String {
+        format!("{op:?}")
+            .split([' ', '(', '{'])
+            .next()
+            .unwrap_or("")
+            .to_owned()
+    }
+
+    /// Where a room is drawn: section `key`, the second of three rooms.
+    fn spot(key: SectionKey) -> Spot {
+        Spot {
+            section: key,
+            rooms: vec![rid("!a:x"), rid("!b:x"), rid("!c:x")],
+            index: 1,
+        }
+    }
+
+    #[test]
+    fn every_button_of_every_section_and_room_card_maps_to_an_operation_or_the_dialog() {
+        let space = rid("!sp:x");
+        let drawn = [
+            SectionKey::Starred,
+            SectionKey::Channels,
+            SectionKey::Custom(4),
+            SectionKey::Direct,
+        ];
+        let mut kinds = std::collections::BTreeSet::new();
+        // The cards of the section headers: built-in and the user's own,
+        // expanded and collapsed.
+        for key in [
+            SectionKey::Starred,
+            SectionKey::Channels,
+            SectionKey::Direct,
+            SectionKey::SubSpace(rid("!sub:x")),
+            SectionKey::Custom(4),
+        ] {
+            for collapsed in [false, true] {
+                let entries = section_entries(&key, collapsed);
+                let custom = matches!(key, SectionKey::Custom(_));
+                assert_eq!(entries.contains(&Entry::Rename), custom, "{key:?}");
+                assert_eq!(entries.contains(&Entry::Delete), custom, "{key:?}");
+                assert_eq!(entries.contains(&Entry::Collapse), !collapsed);
+                assert_eq!(entries.contains(&Entry::Expand), collapsed);
+                for entry in entries {
+                    let op = section_op(&space, &key, entry, &drawn);
+                    match entry {
+                        Entry::Rename | Entry::NewSection => assert_eq!(op, None, "dialog"),
+                        _ => {
+                            let op = op
+                                .unwrap_or_else(|| panic!("{key:?} {entry:?} stands for nothing"));
+                            kinds.insert(kind(&op));
+                        }
+                    }
+                }
+            }
+        }
+        // The cards of the room rows, by the section that draws the room.
+        for key in [
+            SectionKey::Starred,
+            SectionKey::Channels,
+            SectionKey::Direct,
+            SectionKey::SubSpace(rid("!sub:x")),
+            SectionKey::Custom(4),
+        ] {
+            let spot = spot(key.clone());
+            for entry in room_entries(&key) {
+                let op = room_op(&space, &rid("!b:x"), entry, &spot)
+                    .unwrap_or_else(|| panic!("{key:?} {entry:?} stands for nothing"));
+                kinds.insert(kind(&op));
+            }
+        }
+        // The pick list and the dialog.
+        let pick = op_for_section_pick(&space, &rid("!b:x"), SectionPick::Existing(4));
+        kinds.insert(kind(&pick.expect("an op")));
+        assert_eq!(
+            op_for_section_pick(&space, &rid("!b:x"), SectionPick::New),
+            None
+        );
+        let label = SidebarLabel::try_from("Ops").expect("a name");
+        for purpose in [
+            Purpose::NewSection {
+                space: space.clone(),
+                room: None,
+            },
+            Purpose::NewSection {
+                space: space.clone(),
+                room: Some(rid("!b:x")),
+            },
+            Purpose::RenameSection {
+                space: space.clone(),
+                id: 4,
+            },
+        ] {
+            kinds.insert(kind(&op_for_name(&purpose, Some(label)).expect("an op")));
+            assert_eq!(op_for_name(&purpose, None), None, "a section needs a name");
+        }
+        // Every section and room operation has a way in from a card.
+        for want in [
+            "Star",
+            "Unstar",
+            "NewSection",
+            "RenameSection",
+            "DeleteSection",
+            "MoveSection",
+            "MoveRoomToSection",
+            "MoveRoomInSection",
+            "RoomToDefault",
+            "ToggleSection",
+        ] {
+            assert!(kinds.contains(want), "no card reaches {want}: {kinds:?}");
+        }
+    }
+
+    #[test]
+    fn a_room_card_offers_up_and_down_only_in_the_users_own_sections() {
+        assert_eq!(room_entries(&SectionKey::Channels), [Entry::Star]);
+        assert_eq!(room_entries(&SectionKey::Direct), [Entry::Star]);
+        assert_eq!(
+            room_entries(&SectionKey::SubSpace(rid("!s:x"))),
+            [Entry::Star]
+        );
+        assert_eq!(room_entries(&SectionKey::Starred), [Entry::Unstar]);
+        assert_eq!(
+            room_entries(&SectionKey::Custom(1)),
+            [
+                Entry::Star,
+                Entry::MoveUp,
+                Entry::MoveDown,
+                Entry::BackToDefault
+            ]
+        );
+    }
+
+    #[test]
+    fn the_move_to_section_list_has_the_other_sections_then_new_section() {
+        let label = |n: &str| SidebarLabel::try_from(n).expect("a name");
+        let custom = [
+            CustomSection {
+                id: 1,
+                name: label("Work"),
+                rooms: Vec::new(),
+            },
+            CustomSection {
+                id: 2,
+                name: label("Fun"),
+                rooms: Vec::new(),
+            },
+        ];
+        let picks = |current| -> Vec<SectionPick> {
+            section_choices(&custom, current)
+                .into_iter()
+                .map(|c| c.pick)
+                .collect()
+        };
+        assert_eq!(
+            picks(None),
+            [
+                SectionPick::Existing(1),
+                SectionPick::Existing(2),
+                SectionPick::New
+            ]
+        );
+        assert_eq!(picks(Some(1)), [SectionPick::Existing(2), SectionPick::New]);
+        assert_eq!(picks(Some(1)).len(), 2);
+        let shown: Vec<String> = section_choices(&custom, None)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(shown, ["Work", "Fun", "New section\u{2026}"]);
+        assert_eq!(section_choices(&[], None).len(), 1, "only New section");
+    }
+
+    #[test]
+    fn a_section_name_cannot_be_blank_and_follows_the_label_rules() {
+        assert!(parse_section_name("").is_err());
+        assert!(parse_section_name("   ").is_err());
+        assert_eq!(
+            parse_section_name("  Ops ").expect("a name").as_str(),
+            "Ops"
+        );
+        assert!(parse_section_name(&"s".repeat(33)).is_err());
+        assert!(parse_section_name(&"s".repeat(32)).is_ok());
+        assert!(parse_section_name("\u{202E}x").is_err());
+        assert!(parse_section_name("a\nb").is_err());
+    }
+
+    #[test]
+    fn debug_of_the_section_cards_and_messages_hides_ids_and_names() {
+        let texts = [
+            format!(
+                "{:?}",
+                Target::Section {
+                    space: rid("!secretroom:x"),
+                    key: SectionKey::SubSpace(rid("!secretroom:x"))
+                }
+            ),
+            format!(
+                "{:?}",
+                Target::Room {
+                    space: rid("!secretroom:x"),
+                    room: rid("!secretroom:x")
+                }
+            ),
+            format!(
+                "{:?}",
+                Purpose::NewSection {
+                    space: rid("!secretroom:x"),
+                    room: Some(rid("!secretroom:x"))
+                }
+            ),
+            format!(
+                "{:?}",
+                Purpose::RenameSection {
+                    space: rid("!secretroom:x"),
+                    id: 3
+                }
+            ),
+            format!("{:?}", SidebarMenuMessage::OpenRoom(rid("!secretroom:x"))),
+            format!(
+                "{:?}",
+                SidebarMenuMessage::OpenSection(SectionKey::SubSpace(rid("!secretroom:x")))
+            ),
+            format!(
+                "{:?}",
+                SectionChoice {
+                    pick: SectionPick::Existing(1),
+                    label: "Payroll".to_owned()
+                }
+            ),
+            format!("{:?}", spot(SectionKey::SubSpace(rid("!secretroom:x")))),
+        ];
+        for text in texts {
+            for secret in ["!secretroom", "@a:x", "Payroll"] {
+                assert!(!text.contains(secret), "{secret} is in {text}");
+            }
+        }
     }
 }

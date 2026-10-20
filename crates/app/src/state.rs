@@ -1118,6 +1118,15 @@ impl App {
 
     /// Applies a message.
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        let task = self.apply_message(message);
+        // Whatever the message was (a room that left, another space, a
+        // search), a card or dialog of the sidebar that is about something no
+        // longer drawn goes away.
+        self.close_sidebar_menu_if_gone();
+        task
+    }
+
+    fn apply_message(&mut self, message: Message) -> Task<Message> {
         let touches_composer = matches!(
             message,
             Message::Composer(_)

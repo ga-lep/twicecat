@@ -312,7 +312,7 @@ mod tests {
             Menu::Down(key) => op_for(&card(key), Entry::MoveDown),
             Menu::Remove(id) => op_for(&MenuTarget::Space(rid(id)), Entry::RemoveFromFolder),
             Menu::ToFolder(id, folder) => op_for_pick(&rid(id), FolderPick::Existing(*folder)),
-            Menu::NewFolder(id) => Some(op_for_name(&Purpose::NewFolder(rid(id)), None)),
+            Menu::NewFolder(id) => op_for_name(&Purpose::NewFolder(rid(id)), None),
         }
         .expect("the card offers it")
     }

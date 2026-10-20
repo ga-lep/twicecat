@@ -117,14 +117,26 @@ fn every_pick_list_is_wrapped_by_the_wheel_guard() {
 }
 
 #[test]
-fn the_rails_folder_list_is_a_pick_list_behind_the_wheel_guard() {
+fn the_sidebar_cards_lists_are_pick_lists_behind_the_wheel_guard() {
     let own: Vec<(String, String)> = app_sources()
         .into_iter()
         .filter(|(name, _)| name.ends_with("screens/sidebar_menu.rs"))
         .collect();
     let (seen, bare) = unwrapped(&own, "pick_list");
-    assert_eq!(seen, 1, "the Move to folder list is in the scan");
+    assert_eq!(
+        seen, 2,
+        "the Move to folder and the Move to section lists are in the scan"
+    );
     assert!(bare.is_empty(), "unwrapped: {bare:?}");
+    // And the second one is the section list, wrapped on its own: a card that
+    // moved a room into a section on Ctrl + wheel would rearrange the sidebar.
+    let code = code_of(&own[0].1);
+    let at = code.find("\"Move to section\"").expect("the section list");
+    let wrapped = code[at..]
+        .find("kit::menu(")
+        .zip(code[at..].find("pick_list("))
+        .is_some_and(|(menu, list)| menu < list);
+    assert!(wrapped, "the Move to section list is not inside kit::menu");
 }
 
 #[test]

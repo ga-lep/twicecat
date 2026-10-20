@@ -14,7 +14,8 @@ use chrono::{Local, TimeZone};
 use iced::widget::text::Wrapping;
 use iced::widget::tooltip::{Position, Tooltip};
 use iced::widget::{
-    Column, button, column, container, image, row, scrollable, space, stack, text, text_input,
+    Column, button, column, container, image, mouse_area, row, scrollable, space, stack, text,
+    text_input,
 };
 use iced::{Background, Color, Element, Fill, Length, border};
 use twicecat_core::api::{
@@ -35,6 +36,7 @@ use crate::sections::{
     EMPTY_HINT, Header, Line, line_height, line_offsets, line_spacers, visible_lines,
 };
 use crate::settings::SettingsMessage;
+use crate::sidebar_menu::SidebarMenuMessage;
 use crate::spaces::SpacesMessage;
 use crate::state::{App, Message};
 use crate::theme;
@@ -479,7 +481,12 @@ fn sectioned_list<'a>(app: &'a App, lines: &[Line<'a>]) -> Element<'a, Message> 
             let selected = app.selected.as_ref() == Some(&room.id);
             let mode = app.effective_room_mode(&room.id);
             let call = app.calls.pill(&room.id);
-            room_row(room, &env, selected, mode, call)
+            sectioned_room_row(
+                room_row(room, &env, selected, mode, call),
+                room,
+                selected,
+                density,
+            )
         }
         Line::EmptyHint(_) => container(text(EMPTY_HINT).size(tokens::CAPTION).style(kit::muted))
             .padding([0.0, tokens::S])
@@ -489,8 +496,32 @@ fn sectioned_list<'a>(app: &'a App, lines: &[Line<'a>]) -> Element<'a, Message> 
     scroller(top, rows, bottom)
 }
 
-/// The header of a section: a chevron, the name, "personal" on Starred, and
-/// the rolled-up badge while it is collapsed. A click collapses or expands it.
+/// A room row of the sectioned list with its options: a right-click opens the
+/// room's card, and the selected row also has the "⋯" button at its right.
+fn sectioned_room_row<'a>(
+    row_view: Element<'a, Message>,
+    room: &RoomSummary,
+    selected: bool,
+    density: Density,
+) -> Element<'a, Message> {
+    let open = Message::SidebarMenu(SidebarMenuMessage::OpenRoom(room.id.clone()));
+    let content: Element<'a, Message> = if selected {
+        row![
+            row_view,
+            container(kit::compact_icon_button(Icon::More, open.clone()))
+                .center_y(Length::Fixed(row_height(density)))
+        ]
+        .into()
+    } else {
+        row_view
+    };
+    mouse_area(content).on_right_press(open).into()
+}
+
+/// The header of a section: a chevron, the name, "personal" on Starred, the
+/// rolled-up badge while it is collapsed, and the "⋯" button. A click on
+/// the name collapses or expands it; a right-click or the button opens the
+/// section's card.
 fn section_header<'a>(header: &Header<'a>, density: Density) -> Element<'a, Message> {
     let chevron = if header.collapsed {
         Icon::SectionClosed
@@ -527,15 +558,23 @@ fn section_header<'a>(header: &Header<'a>, density: Density) -> Element<'a, Mess
         content = content.push(badge_view(header.badge, false));
     }
     let height = line_height(&Line::Header(header.clone()), density);
-    button(content)
+    let open = Message::SidebarMenu(SidebarMenuMessage::OpenSection(header.key.clone()));
+    let toggle = button(content)
         .on_press(Message::Spaces(SpacesMessage::ToggleSection(
             header.key.clone(),
         )))
         .width(Fill)
         .height(Length::Fixed(height))
         .padding([0.0, tokens::S])
-        .style(kit::ghost_style)
-        .into()
+        .style(kit::ghost_style);
+    let line = row![
+        toggle,
+        container(kit::compact_icon_button(Icon::More, open.clone()))
+            .center_y(Length::Fixed(height))
+    ]
+    .align_y(iced::Center)
+    .height(Length::Fixed(height));
+    mouse_area(line).on_right_press(open).into()
 }
 
 /// The 3 px bar at the left of a row: the accent colour while selected,

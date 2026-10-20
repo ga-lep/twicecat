@@ -22,8 +22,9 @@ use crate::room_list::{Badge, clamp_window, row_height};
 use crate::state::App;
 use crate::ui::tokens::Density;
 
-/// One line of the sectioned list.
-#[derive(Debug, Clone, PartialEq)]
+/// One line of the sectioned list. `Debug` shows no room: a room's ID and name
+/// belong to people and must not reach a log.
+#[derive(Clone, PartialEq)]
 pub enum Line<'a> {
     /// The header of a section.
     Header(Header<'a>),
@@ -31,6 +32,16 @@ pub enum Line<'a> {
     Room(&'a RoomSummary),
     /// The hint under an empty custom section.
     EmptyHint(SectionKey),
+}
+
+impl std::fmt::Debug for Line<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Header(header) => f.debug_tuple("Header").field(header).finish(),
+            Self::Room(_) => f.write_str("Room(..)"),
+            Self::EmptyHint(key) => f.debug_tuple("EmptyHint").field(key).finish(),
+        }
+    }
 }
 
 /// The header of a section. `Debug` of the key hides a room ID; the name is
@@ -272,6 +283,72 @@ pub fn section_badge(rooms: &[&RoomSummary]) -> Badge {
     }
 }
 
+/// The sections the lines draw, in order: what a move up or down swaps among.
+pub fn drawn_sections(lines: &[Line<'_>]) -> Vec<SectionKey> {
+    lines
+        .iter()
+        .filter_map(|line| match line {
+            Line::Header(header) => Some(header.key.clone()),
+            Line::Room(_) | Line::EmptyHint(_) => None,
+        })
+        .collect()
+}
+
+/// Where a room is drawn.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Spot {
+    /// The section that holds it.
+    pub section: SectionKey,
+    /// The rooms drawn in that section, in order.
+    pub rooms: Vec<RoomId>,
+    /// Its place among them.
+    pub index: usize,
+}
+
+impl std::fmt::Debug for Spot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Spot")
+            .field("section", &self.section)
+            .field("rooms", &self.rooms.len())
+            .field("index", &self.index)
+            .finish()
+    }
+}
+
+/// Where `room` is drawn, or `None` when no line shows it (its section is
+/// collapsed, or it is not in the list).
+pub fn spot_of(lines: &[Line<'_>], room: &RoomId) -> Option<Spot> {
+    let mut section: Option<&SectionKey> = None;
+    let mut rooms: Vec<RoomId> = Vec::new();
+    let mut found: Option<(SectionKey, usize)> = None;
+    for line in lines {
+        match line {
+            Line::Header(header) => {
+                if found.is_some() {
+                    break;
+                }
+                section = Some(&header.key);
+                rooms.clear();
+            }
+            Line::Room(r) => {
+                if r.id == *room
+                    && let Some(key) = section
+                {
+                    found = Some((key.clone(), rooms.len()));
+                }
+                rooms.push(r.id.clone());
+            }
+            Line::EmptyHint(_) => {}
+        }
+    }
+    let (section, index) = found?;
+    Some(Spot {
+        section,
+        rooms,
+        index,
+    })
+}
+
 /// The height of `line` in `density`.
 pub fn line_height(line: &Line<'_>, density: Density) -> f32 {
     match (line, density) {
@@ -494,6 +571,87 @@ mod tests {
 
     fn label(s: &str) -> SidebarLabel {
         SidebarLabel::try_from(s).expect("a valid name")
+    }
+
+    // ---- the options card's questions about the lines (Task sbc.9) ----
+
+    #[test]
+    fn debug_of_a_line_shows_no_room_id_and_no_room_name() {
+        let mut secret = RoomSummary::new(RoomId::from("!secretroom:x"), "Payroll team".to_owned());
+        secret.is_dm = true;
+        let lines = [
+            Line::Room(&secret),
+            Line::Header(Header {
+                key: SectionKey::SubSpace(RoomId::from("!secretroom:x")),
+                name: "Payroll team",
+                collapsed: true,
+                badge: Badge::Dot,
+            }),
+            Line::EmptyHint(SectionKey::SubSpace(RoomId::from("!secretroom:x"))),
+        ];
+        for line in &lines {
+            let text = format!("{line:?}");
+            for hidden in ["secretroom", "Payroll"] {
+                assert!(!text.contains(hidden), "{hidden} is in {text}");
+            }
+        }
+        assert_eq!(format!("{:?}", lines[0]), "Room(..)");
+        assert!(format!("{:?}", lines[1]).starts_with("Header"));
+        assert!(format!("{:?}", lines[2]).starts_with("EmptyHint"));
+        let all = format!("{lines:?}");
+        assert!(
+            !all.contains("secretroom") && !all.contains("Payroll"),
+            "{all}"
+        );
+    }
+
+    #[test]
+    fn the_drawn_sections_and_a_rooms_spot_come_from_the_lines() {
+        let mut layout = SpaceLayout::new(rid("sp"));
+        layout.custom = vec![
+            CustomSection {
+                id: 4,
+                name: label("Mine"),
+                rooms: vec![rid("chan2"), rid("t1")],
+            },
+            CustomSection {
+                id: 5,
+                name: label("Empty"),
+                rooms: Vec::new(),
+            },
+        ];
+        layout.collapsed = vec![SectionKey::Direct];
+        let sp = spaces();
+        let rs = rooms();
+        let lines = build(&sp[0], &sp, &rs, Some(&layout));
+        assert_eq!(
+            drawn_sections(&lines),
+            [
+                SectionKey::Channels,
+                SectionKey::SubSpace(rid("tech")),
+                SectionKey::SubSpace(rid("voice")),
+                SectionKey::Custom(4),
+                SectionKey::Custom(5),
+                SectionKey::Direct,
+            ]
+        );
+        let spot = spot_of(&lines, &rid("t1")).expect("drawn");
+        assert_eq!(spot.section, SectionKey::Custom(4));
+        assert_eq!(spot.rooms, [rid("chan2"), rid("t1")]);
+        assert_eq!(spot.index, 1);
+        assert_eq!(spot_of(&lines, &rid("chan2")).map(|s| s.index), Some(0));
+        // In a collapsed section, or not in the list: not drawn.
+        assert_eq!(spot_of(&lines, &rid("dm1")), None);
+        assert_eq!(spot_of(&lines, &rid("nobody")), None);
+        // The first section's room, and the last section's.
+        assert_eq!(
+            spot_of(&lines, &rid("chan1")).map(|s| s.section),
+            Some(SectionKey::Channels)
+        );
+        assert_eq!(
+            spot_of(&lines, &rid("v1")).map(|s| s.section),
+            Some(SectionKey::SubSpace(rid("voice")))
+        );
     }
 
     // ---- placement ----
@@ -1291,5 +1449,372 @@ mod tests {
         assert_eq!(layout.spaces[0].collapsed, vec![key.clone()]);
         let _ = app.update(Message::Spaces(SpacesMessage::ToggleSection(key)));
         assert!(drawn_names(&app).iter().any(|l| l == "v1"));
+    }
+
+    // ---- the options cards: right-click, "⋯" and the menu flows (Task sbc.9) ----
+
+    mod menu {
+        use twicecat_core::api::sidebar::limits::MAX_CUSTOM_SECTIONS;
+
+        use super::*;
+        use crate::keys::Shortcut;
+        use crate::sidebar_menu::{
+            Entry, Purpose, SectionPick, SidebarMenu, SidebarMenuMessage as M, Target,
+        };
+        use crate::sidebar_store::Call;
+
+        fn menu_app() -> (App, MemorySidebar, mpsc::Receiver<Command>) {
+            let (mut app, rx) = space_app(None);
+            let store = MemorySidebar::default();
+            app.set_sidebar_store(Box::new(store.clone()));
+            (app, store, rx)
+        }
+
+        fn send(app: &mut App, message: M) {
+            let _ = app.update(Message::SidebarMenu(message));
+        }
+
+        fn saves(store: &MemorySidebar) -> usize {
+            store
+                .calls()
+                .iter()
+                .filter(|c| matches!(c, Call::Save(..)))
+                .count()
+        }
+
+        fn record(app: &App) -> SpaceLayout {
+            app.sidebar
+                .layout()
+                .and_then(|l| l.spaces.iter().find(|s| s.space == rid("sp")))
+                .cloned()
+                .expect("a record for the space")
+        }
+
+        fn entry(app: &mut App, entry: Entry) {
+            send(app, M::Entry(entry));
+        }
+
+        fn name(app: &mut App, text: &str) {
+            send(app, M::NameInput(text.to_owned()));
+            send(app, M::NameSubmit);
+        }
+
+        fn make_section(app: &mut App, section: &str, rooms: &[&str]) {
+            send(app, M::OpenRoom(rid(rooms[0])));
+            send(app, M::Section(SectionPick::New));
+            name(app, section);
+            for room in &rooms[1..] {
+                let id = record(app).custom.last().expect("a section").id;
+                send(app, M::OpenRoom(rid(room)));
+                send(app, M::Section(SectionPick::Existing(id)));
+            }
+            assert!(app.sidebar_menu.is_none());
+        }
+
+        #[test]
+        fn a_right_click_or_the_dots_open_the_card_of_a_drawn_room_or_header() {
+            let (mut app, _store, _rx) = menu_app();
+            send(&mut app, M::OpenRoom(rid("chan1")));
+            assert_eq!(
+                app.sidebar_menu,
+                Some(SidebarMenu::Card {
+                    target: Target::Room {
+                        space: rid("sp"),
+                        room: rid("chan1")
+                    },
+                    error: None
+                })
+            );
+            send(&mut app, M::Close);
+            send(&mut app, M::OpenSection(SectionKey::SubSpace(rid("tech"))));
+            assert_eq!(
+                app.sidebar_menu,
+                Some(SidebarMenu::Card {
+                    target: Target::Section {
+                        space: rid("sp"),
+                        key: SectionKey::SubSpace(rid("tech"))
+                    },
+                    error: None
+                })
+            );
+            send(&mut app, M::Close);
+            // Not drawn: a section that is hidden, a room that is not here.
+            send(&mut app, M::OpenSection(SectionKey::Starred));
+            send(&mut app, M::OpenRoom(rid("nobody")));
+            assert!(app.sidebar_menu.is_none());
+            // A room in a collapsed section is not drawn.
+            collapse(&mut app, SectionKey::Direct);
+            send(&mut app, M::OpenRoom(rid("dm1")));
+            assert!(app.sidebar_menu.is_none());
+        }
+
+        #[test]
+        fn no_card_opens_in_the_flat_list_or_while_customizing_is_off_or_a_layer_is_up() {
+            let (mut app, _store, _rx) = menu_app();
+            let _ = app.update(Message::SearchChanged("chan".to_owned()));
+            send(&mut app, M::OpenRoom(rid("chan1")));
+            send(&mut app, M::OpenSection(SectionKey::Channels));
+            assert!(app.sidebar_menu.is_none(), "a search keeps the flat list");
+            let _ = app.update(Message::SearchChanged(String::new()));
+            let (mut app2, _store2, _rx2) = menu_app();
+            app2.switcher.open = true;
+            send(&mut app2, M::OpenRoom(rid("chan1")));
+            assert!(app2.sidebar_menu.is_none(), "the switcher is over the list");
+            let (mut app3, _store3, _rx3) = menu_app();
+            let _ = app3.update(Message::SidebarLoaded(SidebarAnswer::new(
+                UserId::from("@a:x"),
+                SidebarLoad::Newer,
+            )));
+            app3.sidebar.unload();
+            send(&mut app3, M::OpenRoom(rid("chan1")));
+            assert!(app3.sidebar_menu.is_none(), "no layout loaded");
+        }
+
+        #[test]
+        fn star_on_a_rooms_card_toggles_its_star_and_saves_once() {
+            let (mut app, store, _rx) = menu_app();
+            send(&mut app, M::OpenRoom(rid("chan2")));
+            entry(&mut app, Entry::Star);
+            assert!(app.sidebar_menu.is_none(), "the card closes");
+            assert_eq!(saves(&store), 1);
+            assert_eq!(
+                &drawn_names(&app)[..3],
+                ["# Starred", "chan2", "# Channels"]
+            );
+            // The card of a starred room offers Unstar.
+            send(&mut app, M::OpenRoom(rid("chan2")));
+            entry(&mut app, Entry::Unstar);
+            assert_eq!(saves(&store), 2);
+            assert_eq!(drawn_names(&app)[0], "# Channels");
+            assert!(drawn_names(&app).iter().all(|l| l != "# Starred"));
+        }
+
+        #[test]
+        fn a_new_section_from_a_room_holds_the_room_and_survives_in_the_layout() {
+            let (mut app, store, _rx) = menu_app();
+            send(&mut app, M::OpenRoom(rid("chan2")));
+            send(&mut app, M::Section(SectionPick::New));
+            assert!(matches!(
+                &app.sidebar_menu,
+                Some(SidebarMenu::Name(d)) if matches!(d.purpose, Purpose::NewSection { room: Some(_), .. })
+            ));
+            name(&mut app, "  Ops ");
+            assert!(app.sidebar_menu.is_none());
+            assert_eq!(saves(&store), 1);
+            let out = drawn_names(&app);
+            let at = out.iter().position(|l| l == "# Ops").expect("Ops header");
+            assert_eq!(out[at + 1], "chan2");
+            let saved = record(&app);
+            assert_eq!(saved.custom[0].name.as_str(), "Ops");
+            assert_eq!(saved.custom[0].rooms, [rid("chan2")]);
+            // Ops sits before Direct messages (its default place).
+            assert!(
+                at < out
+                    .iter()
+                    .position(|l| l == "# Direct messages")
+                    .unwrap_or(usize::MAX)
+            );
+        }
+
+        #[test]
+        fn a_new_section_from_a_header_is_empty_and_shows_its_hint() {
+            let (mut app, store, _rx) = menu_app();
+            send(&mut app, M::OpenSection(SectionKey::Channels));
+            entry(&mut app, Entry::NewSection);
+            name(&mut app, "Later");
+            assert_eq!(saves(&store), 1);
+            let out = drawn_names(&app);
+            let at = out.iter().position(|l| l == "# Later").expect("header");
+            assert_eq!(out[at + 1], "~hint");
+        }
+
+        #[test]
+        fn a_blank_or_bad_section_name_keeps_the_dialog_open_with_the_reason() {
+            let (mut app, store, _rx) = menu_app();
+            send(&mut app, M::OpenSection(SectionKey::Channels));
+            entry(&mut app, Entry::NewSection);
+            for bad in ["", "   ", &"x".repeat(33), "a\nb"] {
+                name(&mut app, bad);
+                match &app.sidebar_menu {
+                    Some(SidebarMenu::Name(d)) => assert!(d.error.is_some(), "{bad:?}"),
+                    other => panic!("the dialog closed: {other:?}"),
+                }
+            }
+            assert_eq!(saves(&store), 0);
+            send(&mut app, M::Escape);
+            assert!(app.sidebar_menu.is_none());
+        }
+
+        #[test]
+        fn rename_keeps_the_rooms_and_move_down_in_a_section_moves_only_inside_it() {
+            let (mut app, store, _rx) = menu_app();
+            make_section(&mut app, "Ops", &["chan1", "chan2"]);
+            assert_eq!(saves(&store), 2);
+            let before = record(&app);
+            // Move down on chan1 (the first of the section).
+            send(&mut app, M::OpenRoom(rid("chan1")));
+            entry(&mut app, Entry::MoveDown);
+            assert_eq!(saves(&store), 3);
+            let after = record(&app);
+            assert_eq!(after.custom[0].rooms, [rid("chan2"), rid("chan1")]);
+            assert_eq!(after.order, before.order);
+            assert_eq!(after.starred, before.starred);
+            assert_eq!(after.collapsed, before.collapsed);
+            // The last room cannot go down: no save.
+            send(&mut app, M::OpenRoom(rid("chan1")));
+            entry(&mut app, Entry::MoveDown);
+            assert_eq!(saves(&store), 3);
+            // Rename: the rooms stay.
+            send(&mut app, M::OpenSection(SectionKey::Custom(0)));
+            entry(&mut app, Entry::Rename);
+            match &app.sidebar_menu {
+                Some(SidebarMenu::Name(d)) => assert_eq!(d.text, "Ops", "the field has the name"),
+                other => panic!("no dialog: {other:?}"),
+            }
+            name(&mut app, "Work");
+            assert_eq!(record(&app).custom[0].name.as_str(), "Work");
+            assert_eq!(record(&app).custom[0].rooms, [rid("chan2"), rid("chan1")]);
+        }
+
+        #[test]
+        fn move_down_on_a_headers_card_moves_the_section_over_the_drawn_ones() {
+            let (mut app, store, _rx) = menu_app();
+            make_section(&mut app, "Ops", &["chan1"]);
+            let heads = |app: &App| -> Vec<String> {
+                drawn_names(app)
+                    .into_iter()
+                    .filter(|l| l.starts_with('#'))
+                    .collect()
+            };
+            // Channels, tech, voice, Ops, Direct messages.
+            assert_eq!(
+                heads(&app),
+                [
+                    "# Channels",
+                    "# tech",
+                    "# voice",
+                    "# Ops",
+                    "# Direct messages"
+                ]
+            );
+            let saved = saves(&store);
+            send(&mut app, M::OpenSection(SectionKey::Custom(0)));
+            entry(&mut app, Entry::MoveUp);
+            assert_eq!(saves(&store), saved + 1);
+            assert_eq!(
+                heads(&app),
+                [
+                    "# Channels",
+                    "# tech",
+                    "# Ops",
+                    "# voice",
+                    "# Direct messages"
+                ]
+            );
+            // Down from the last drawn section does nothing and saves nothing.
+            send(&mut app, M::OpenSection(SectionKey::Direct));
+            entry(&mut app, Entry::MoveDown);
+            assert_eq!(saves(&store), saved + 1);
+            // Starred is hidden while empty: Ops moved to the top steps over
+            // it and a later star puts Starred where the order says.
+            for _ in 0..3 {
+                send(&mut app, M::OpenSection(SectionKey::Custom(0)));
+                entry(&mut app, Entry::MoveUp);
+            }
+            assert_eq!(heads(&app)[0], "# Ops");
+        }
+
+        #[test]
+        fn delete_returns_the_rooms_to_their_default_sections() {
+            let (mut app, store, _rx) = menu_app();
+            make_section(&mut app, "Ops", &["chan1", "t1"]);
+            send(&mut app, M::OpenSection(SectionKey::Custom(0)));
+            entry(&mut app, Entry::Collapse);
+            send(&mut app, M::OpenSection(SectionKey::Custom(0)));
+            entry(&mut app, Entry::MoveUp);
+            let saved = saves(&store);
+            send(&mut app, M::OpenSection(SectionKey::Custom(0)));
+            entry(&mut app, Entry::Delete);
+            assert_eq!(saves(&store), saved + 1);
+            let out = drawn_names(&app);
+            assert!(out.iter().all(|l| l != "# Ops"));
+            let at = |name: &str| out.iter().position(|l| l == name).expect("drawn");
+            assert!(at("# Channels") < at("chan1") && at("chan1") < at("# tech"));
+            assert!(at("# tech") < at("t1") && at("t1") < at("# voice"));
+            let rec = record(&app);
+            assert!(rec.custom.is_empty());
+            assert!(!rec.order.contains(&SectionKey::Custom(0)));
+            assert!(!rec.collapsed.contains(&SectionKey::Custom(0)));
+        }
+
+        #[test]
+        fn back_to_default_and_collapse_and_expand_work_from_the_cards() {
+            let (mut app, _store, _rx) = menu_app();
+            make_section(&mut app, "Ops", &["chan1"]);
+            send(&mut app, M::OpenRoom(rid("chan1")));
+            entry(&mut app, Entry::BackToDefault);
+            assert!(record(&app).custom[0].rooms.is_empty());
+            assert_eq!(
+                drawn_names(&app).iter().filter(|l| *l == "~hint").count(),
+                1
+            );
+            send(&mut app, M::OpenSection(SectionKey::Channels));
+            entry(&mut app, Entry::Collapse);
+            assert!(record(&app).collapsed.contains(&SectionKey::Channels));
+            send(&mut app, M::OpenSection(SectionKey::Channels));
+            entry(&mut app, Entry::Expand);
+            assert!(!record(&app).collapsed.contains(&SectionKey::Channels));
+        }
+
+        #[test]
+        fn a_21st_section_is_refused_with_the_reason_and_the_dialog_stays() {
+            let (mut app, store, _rx) = menu_app();
+            for n in 0..MAX_CUSTOM_SECTIONS {
+                send(&mut app, M::OpenSection(SectionKey::Channels));
+                entry(&mut app, Entry::NewSection);
+                name(&mut app, &format!("S{n}"));
+                assert!(app.sidebar_menu.is_none(), "section {n}");
+            }
+            let saved = saves(&store);
+            send(&mut app, M::OpenSection(SectionKey::Channels));
+            entry(&mut app, Entry::NewSection);
+            name(&mut app, "One more");
+            match &app.sidebar_menu {
+                Some(SidebarMenu::Name(d)) => {
+                    assert_eq!(d.error, Some("The sidebar layout is full"));
+                }
+                other => panic!("the dialog closed: {other:?}"),
+            }
+            assert_eq!(saves(&store), saved);
+            assert_eq!(record(&app).custom.len(), MAX_CUSTOM_SECTIONS);
+        }
+
+        #[test]
+        fn esc_closes_the_card_and_a_card_for_a_room_that_left_closes_itself() {
+            let (mut app, _store, _rx) = menu_app();
+            send(&mut app, M::OpenRoom(rid("chan1")));
+            assert!(app.sidebar_menu.is_some());
+            let _ = app.update(Message::Shortcut {
+                shortcut: Shortcut::Escape,
+                captured: false,
+            });
+            assert!(app.sidebar_menu.is_none());
+            send(&mut app, M::OpenRoom(rid("chan1")));
+            let rest: Vec<RoomSummary> = rooms()
+                .into_iter()
+                .filter(|r| r.id != rid("chan1"))
+                .collect();
+            feed(
+                &mut app,
+                CoreEvent::RoomListChanged(vec![ListDiff::Reset { values: rest }]),
+            );
+            assert!(app.sidebar_menu.is_none(), "the room is not in the list");
+            // A card of a section closes when its section is collapsed away
+            // by a search that makes the list flat.
+            send(&mut app, M::OpenSection(SectionKey::Channels));
+            let _ = app.update(Message::SearchChanged("x".to_owned()));
+            let _ = app.update(Message::Spaces(SpacesMessage::Select(None)));
+            assert!(app.sidebar_menu.is_none());
+        }
     }
 }

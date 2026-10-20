@@ -598,6 +598,64 @@ fn space_sections_expanded() -> App {
     space_sections(false)
 }
 
+/// The sections space with two sections of the user's own: "Reading list",
+/// holding two rooms, and "Later", empty (it shows its hint). Both were moved
+/// up, with the options card, to sit right after Channels, so they show in the
+/// first screen of the list.
+fn space_sections_custom() -> App {
+    use twicecat_app::sidebar::Op;
+    use twicecat_app::sidebar_menu::{Entry, SidebarMenuMessage};
+    use twicecat_core::api::{SectionKey, SidebarLabel};
+
+    let mut app = space_sections(false);
+    let hq = sec_space("hq");
+    let label = |text: &str| SidebarLabel::try_from(text).expect("a name");
+    let rid = |name: &str| room(&format!("sec-r-{name}"));
+    for op in [
+        Op::NewSection {
+            space: hq.clone(),
+            name: label("Reading list"),
+            room: Some(rid("random")),
+        },
+        Op::MoveRoomToSection {
+            space: hq.clone(),
+            room: rid("news"),
+            section: 0,
+        },
+        Op::NewSection {
+            space: hq,
+            name: label("Later"),
+            room: None,
+        },
+    ] {
+        assert!(app.apply_sidebar(op).is_ok(), "the fixture's layout fits");
+    }
+    // Reading list up past Voice, Hobbies and Tech; then Later the same way.
+    for id in [0, 1] {
+        for _ in 0..3 {
+            for message in [
+                SidebarMenuMessage::OpenSection(SectionKey::Custom(id)),
+                SidebarMenuMessage::Entry(Entry::MoveUp),
+            ] {
+                press(&mut app, Message::SidebarMenu(message));
+            }
+        }
+    }
+    app
+}
+
+/// The options card of a room that sits in a section of the user's own.
+fn section_menu() -> App {
+    use twicecat_app::sidebar_menu::SidebarMenuMessage;
+
+    let mut app = space_sections_custom();
+    press(
+        &mut app,
+        Message::SidebarMenu(SidebarMenuMessage::OpenRoom(room("sec-r-random"))),
+    );
+    app
+}
+
 fn space_sections_collapsed() -> App {
     space_sections(true)
 }
@@ -3579,6 +3637,24 @@ pub fn scenarios() -> Vec<Scenario> {
             space_sections_collapsed,
             |a| in_main(a) && a.sections_shown() && a.selected.is_some(),
         ),
+        s("space-sections-custom", true, space_sections_custom, |a| {
+            in_main(a)
+                && a.sections_shown()
+                && a.selected.is_some()
+                && a.sidebar
+                    .layout()
+                    .is_some_and(|l| l.spaces.iter().any(|s| s.custom.len() == 2))
+        }),
+        s("section-menu", true, section_menu, |a| {
+            in_main(a)
+                && matches!(
+                    &a.sidebar_menu,
+                    Some(twicecat_app::sidebar_menu::SidebarMenu::Card {
+                        target: twicecat_app::sidebar_menu::Target::Room { .. },
+                        ..
+                    })
+                )
+        }),
         s("main-no-room", true, main_no_room, |a| {
             in_main(a) && a.selected.is_none() && a.rooms.len() > 10
         }),
