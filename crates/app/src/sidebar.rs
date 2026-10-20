@@ -12,6 +12,7 @@ use std::collections::HashSet;
 use std::fmt;
 
 use iced::Task;
+use twicecat_core::api::sidebar::limits::MAX_SECTION_KEYS;
 use twicecat_core::api::{
     CustomSection, FolderLayout, RailEntry, RoomId, SectionKey, SidebarLabel, SidebarLayout,
     SpaceLayout, UserId,
@@ -576,7 +577,15 @@ fn change(layout: &mut SidebarLayout, op: Op, known: &[RoomId]) -> Result<Change
             let record = record_mut(layout, space);
             let mut swapped = drawn;
             swapped.swap(at, to);
-            record.order = merge_order(swapped, &record.order);
+            let order = merge_order(swapped, &record.order);
+            // `order` holds every drawn key. More than it can hold is a
+            // key-count limit, not a placement limit: refuse the move here,
+            // before the layout is checked, so the state does not become
+            // `Full` and other changes stay possible.
+            if order.len() > MAX_SECTION_KEYS {
+                return Err(Refused::Full);
+            }
+            record.order = order;
         }
         Op::MoveRoomToSection {
             space,
@@ -1955,6 +1964,29 @@ mod tests {
                     .err(),
                 Some(Refused::Unknown)
             );
+        }
+
+        #[test]
+        fn moving_a_section_among_more_than_256_drawn_ones_is_refused_without_full() {
+            use twicecat_core::api::sidebar::limits::MAX_SECTION_KEYS;
+            // A huge space gives many sub-space sections. The order cannot
+            // hold them all, which is a key-count limit and not a placement
+            // limit: the move is refused and the state stays as it was.
+            let drawn: Vec<SectionKey> = (0..MAX_SECTION_KEYS + 44)
+                .map(|n| SectionKey::SubSpace(r(&format!("sub{n}"))))
+                .collect();
+            let (mut model, store) = model_with(None);
+            assert_eq!(
+                model
+                    .apply(move_section(drawn[5].clone(), Dir::Down, &drawn), &store)
+                    .err(),
+                Some(Refused::Full)
+            );
+            assert_eq!(model.state(), SidebarState::Loaded, "not Full");
+            assert_eq!(saves(&store), 0);
+            // The model still takes other changes.
+            assert!(model.apply(star("a"), &store).is_ok());
+            assert_eq!(saves(&store), 1);
         }
 
         #[test]

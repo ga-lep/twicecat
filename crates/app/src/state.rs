@@ -32,6 +32,7 @@ use crate::drag::Drag;
 use crate::emoji;
 use crate::keys;
 use crate::links::{self, LinkBar};
+use crate::list_drop::ListKey;
 use crate::media::{self, Decoded, MediaModel, SavePath};
 use crate::notifications::{self, Folding, ModeChoice, NoNotifier, Notifier};
 use crate::ptt::{PttMessage, PttModel, PttStarter, ServiceStarter};
@@ -562,6 +563,12 @@ pub struct App {
     /// The one tracker of the left button on the rail: a press that is a
     /// click, or becomes a drag of a space or folder (see `drag.rs`).
     pub rail_drag: Drag<RailKey>,
+    /// The room row or section header of the sectioned list under the pointer.
+    pub list_hover: Option<ListKey>,
+    /// The same state machine (`drag.rs`) for the sectioned room list: a
+    /// press on a row or header that is a click, or becomes a drag. At most
+    /// one of this and `rail_drag` is active, as there is one pointer.
+    pub list_drag: Drag<ListKey>,
     /// The thread panel.
     pub threads: ThreadsModel,
     /// The room switcher (Ctrl+K).
@@ -730,6 +737,8 @@ impl App {
             sidebar_menu: None,
             rail_hover: None,
             rail_drag: Drag::default(),
+            list_hover: None,
+            list_drag: Drag::default(),
             threads: ThreadsModel::default(),
             switcher: crate::switcher::SwitcherModel::default(),
             escape_spent: false,
@@ -1118,11 +1127,31 @@ impl App {
 
     /// Applies a message.
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        // Pointer, hover and scroll messages cannot change what is drawn:
+        // settling would rebuild every line for nothing.
+        let settles = !matches!(
+            message,
+            Message::RoomListScrolled { .. }
+                | Message::Spaces(
+                    SpacesMessage::PointerMoved(_)
+                        | SpacesMessage::ListOver(..)
+                        | SpacesMessage::ListEnter(_)
+                        | SpacesMessage::ListExit(_)
+                        | SpacesMessage::ListPress(_)
+                        | SpacesMessage::Over(..)
+                        | SpacesMessage::Enter(_)
+                        | SpacesMessage::Exit(_)
+                        | SpacesMessage::Press(_)
+                )
+        );
         let task = self.apply_message(message);
         // Whatever the message was (a room that left, another space, a
         // search), a card or dialog of the sidebar that is about something no
         // longer drawn goes away.
         self.close_sidebar_menu_if_gone();
+        if settles {
+            self.settle_list_drag();
+        }
         task
     }
 
@@ -1349,6 +1378,7 @@ impl App {
                 if !focused {
                     // A button released outside the window is never seen.
                     let _ = self.rail_drag.cancel();
+                    let _ = self.list_drag.cancel();
                     self.ptt.window_unfocused();
                     self.stop_capture();
                 }
@@ -1781,6 +1811,8 @@ impl App {
             CoreEvent::SyncState(state) => self.sync_state = state,
             CoreEvent::RoomListChanged(diffs) => {
                 room_list::apply_room_diffs(&mut self.rooms, &diffs);
+                // The sections under a drag were placed anew.
+                self.list_drag.forget_seen();
                 self.reconcile_room_modes();
                 // A search or tab filters the list, so an open room missing
                 // from it is only hidden: keep it and its draft. Without a
@@ -2691,6 +2723,8 @@ impl App {
         self.spaces.clear();
         self.rail_hover = None;
         self.rail_drag = Drag::default();
+        self.list_hover = None;
+        self.list_drag = Drag::default();
         self.sidebar_menu = None;
         // Memory only: no sidebar file is touched at logout.
         self.sidebar.unload();

@@ -402,6 +402,10 @@ fn the_fixture_reaches_every_screen_it_names() {
         "space-sections",
         "space-sections-collapsed",
         "space-sections-custom",
+        "space-sections-dragging",
+        "space-sections-dragging-line",
+        "space-sections-dragging-refused",
+        "space-sections-dragging-header",
         "section-menu",
         "verification-requested",
         "verification-emojis",
@@ -1421,6 +1425,10 @@ fn space_sections_draw_every_line_whole_and_apart_in_both_densities_and_themes()
         "space-sections",
         "space-sections-collapsed",
         "space-sections-custom",
+        "space-sections-dragging",
+        "space-sections-dragging-line",
+        "space-sections-dragging-refused",
+        "space-sections-dragging-header",
     ] {
         let scenario = fixture::scenarios()
             .into_iter()
@@ -6864,6 +6872,162 @@ mod video_stage {
         assert!(
             sent.iter().all(|m| !matches!(m, Message::SelectRoom(_))),
             "{sent:?}"
+        );
+    }
+}
+
+/// A real pointer drag through the widgets, as the window does it: events go
+/// to a view that is rebuilt after every message, the window listener's
+/// messages are fed back while the app asks for it.
+mod real_drag {
+    use super::*;
+    use twicecat_app::spaces::SpacesMessage;
+
+    fn pointer_message(event: Event) -> Option<Message> {
+        Some(Message::Spaces(match event {
+            Event::Mouse(mouse::Event::CursorMoved { position }) => {
+                SpacesMessage::PointerMoved(position)
+            }
+            Event::Mouse(mouse::Event::ButtonReleased(_)) => SpacesMessage::PointerReleased,
+            _ => return None,
+        }))
+    }
+
+    fn feed(app: &mut App, renderer: &Renderer, tree: &mut Tree, event: Event, at: iced::Point) {
+        let mut messages: Vec<Message> = Vec::new();
+        {
+            let mut element = app.view();
+            tree.diff(element.as_widget());
+            let node =
+                element
+                    .as_widget_mut()
+                    .layout(tree, renderer, &Limits::new(Size::ZERO, WIDE));
+            let mut shell = Shell::new(&mut messages);
+            element.as_widget_mut().update(
+                tree,
+                &event,
+                Layout::new(&node),
+                mouse::Cursor::Available(at),
+                renderer,
+                &mut clipboard::Null,
+                &mut shell,
+                &Rectangle::with_size(WIDE),
+            );
+        }
+        for message in messages {
+            let _ = app.update(message);
+        }
+    }
+
+    fn find(app: &App, renderer: &Renderer, tree: &mut Tree, word: &str) -> Rectangle {
+        let mut element = app.view();
+        tree.diff(element.as_widget());
+        let node = element
+            .as_widget_mut()
+            .layout(tree, renderer, &Limits::new(Size::ZERO, WIDE));
+        let mut op = Texts(Vec::new());
+        element
+            .as_widget_mut()
+            .operate(tree, Layout::new(&node), renderer, &mut op);
+        op.0.into_iter()
+            .find(|(t, _)| t.contains(word))
+            .unwrap_or_else(|| panic!("no text {word}"))
+            .1
+    }
+
+    #[test]
+    fn a_room_dragged_onto_a_section_header_moves() {
+        let renderer = renderer();
+        let mut app = scenario_app("space-sections-custom");
+        let mut tree = Tree::empty();
+        let before = app.section_lines().map(|l| l.len());
+        let from = find(&app, &renderer, &mut tree, "General").center();
+        let to = find(&app, &renderer, &mut tree, "Reading list").center();
+        let steps = [
+            from,
+            iced::Point::new(from.x, from.y + 6.0),
+            iced::Point::new(from.x, from.y + 12.0),
+            to,
+            iced::Point::new(to.x + 1.0, to.y),
+            iced::Point::new(to.x + 2.0, to.y),
+        ];
+        feed(
+            &mut app,
+            &renderer,
+            &mut tree,
+            Event::Mouse(mouse::Event::CursorMoved { position: from }),
+            from,
+        );
+        let press = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+        feed(&mut app, &renderer, &mut tree, press.clone(), from);
+        let mut seen = vec![];
+        for at in steps {
+            let ev = Event::Mouse(mouse::Event::CursorMoved { position: at });
+            if app.list_drag.is_active()
+                && let Some(m) = pointer_message(ev.clone())
+            {
+                let _ = app.update(m);
+            }
+            feed(&mut app, &renderer, &mut tree, ev, at);
+            seen.push(format!("{:?}", app.list_drag));
+        }
+        let up = Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left));
+        let to = iced::Point::new(to.x + 2.0, to.y);
+        feed(&mut app, &renderer, &mut tree, up.clone(), to);
+        if let Some(m) = pointer_message(up) {
+            let _ = app.update(m);
+        }
+        assert!(!app.list_drag.is_active(), "{seen:?}");
+        assert_ne!(app.section_lines().map(|l| l.len()), before, "{seen:?}");
+    }
+
+    #[test]
+    fn a_space_dragged_onto_another_in_the_rail() {
+        let renderer = renderer();
+        let mut app = scenario_app("rail-states");
+        let mut tree = Tree::empty();
+        let before = app.sidebar.layout().map(|l| l.rail.len());
+        let from = find(&app, &renderer, &mut tree, "Q").center();
+        let to = find(&app, &renderer, &mut tree, "B").center();
+        let steps = [
+            from,
+            iced::Point::new(from.x, from.y + 6.0),
+            iced::Point::new(from.x, from.y + 12.0),
+            to,
+            iced::Point::new(to.x + 1.0, to.y),
+            iced::Point::new(to.x + 2.0, to.y),
+        ];
+        feed(
+            &mut app,
+            &renderer,
+            &mut tree,
+            Event::Mouse(mouse::Event::CursorMoved { position: from }),
+            from,
+        );
+        let press = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+        feed(&mut app, &renderer, &mut tree, press.clone(), from);
+        let mut seen = vec![];
+        for at in steps {
+            let ev = Event::Mouse(mouse::Event::CursorMoved { position: at });
+            if app.rail_drag.is_active()
+                && let Some(m) = pointer_message(ev.clone())
+            {
+                let _ = app.update(m);
+            }
+            feed(&mut app, &renderer, &mut tree, ev, at);
+            seen.push(format!("{:?}", app.rail_drag));
+        }
+        let up = Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left));
+        let to = iced::Point::new(to.x + 2.0, to.y);
+        feed(&mut app, &renderer, &mut tree, up.clone(), to);
+        if let Some(m) = pointer_message(up) {
+            let _ = app.update(m);
+        }
+        assert!(!app.rail_drag.is_active(), "{seen:?}");
+        assert_ne!(
+            app.sidebar.layout().map(|l| l.rail.len()),
+            before,
+            "{seen:?}"
         );
     }
 }

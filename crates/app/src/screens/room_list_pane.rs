@@ -17,7 +17,7 @@ use iced::widget::{
     Column, button, column, container, image, mouse_area, row, scrollable, space, stack, text,
     text_input,
 };
-use iced::{Background, Color, Element, Fill, Length, border};
+use iced::{Background, Color, Element, Fill, Length, border, mouse};
 use twicecat_core::api::{
     RoomListChoice, RoomListTab, RoomNotificationModeView, RoomSummary, SectionKey,
 };
@@ -25,6 +25,8 @@ use twicecat_core::api::{
 use crate::avatars::{AvatarState, Avatars, NEUTRAL_INITIALS, initials, placeholder_color};
 use crate::calls::CallPill;
 use crate::dates::{day_label, time_label};
+use crate::drag::Zone;
+use crate::list_drop::{self, ListKey};
 use crate::notifications::muted_mark;
 use crate::room_list::{
     Badge, OVERSCAN_ROWS, RAIL_ROW_HEIGHT, badge_for, empty_label, preview_line, row_height,
@@ -36,6 +38,7 @@ use crate::sections::{
     EMPTY_HINT, Header, Line, line_height, line_offsets, line_spacers, visible_lines,
 };
 use crate::settings::SettingsMessage;
+use crate::sidebar::SidebarState;
 use crate::sidebar_menu::SidebarMenuMessage;
 use crate::spaces::SpacesMessage;
 use crate::state::{App, Message};
@@ -476,33 +479,227 @@ fn sectioned_list<'a>(app: &'a App, lines: &[Line<'a>]) -> Element<'a, Message> 
         now_ms: u64::try_from(Local::now().timestamp_millis()).unwrap_or(0),
     };
     let rows = lines[range].iter().map(|line| match line {
-        Line::Header(header) => section_header(header, density),
+        Line::Header(header) => section_header(app, header, density),
         Line::Room(room) => {
             let selected = app.selected.as_ref() == Some(&room.id);
             let mode = app.effective_room_mode(&room.id);
             let call = app.calls.pill(&room.id);
+            let cue = list_cue(app, &ListKey::Room(room.id.clone()));
+            let pointer = Pointer::Area {
+                hovered: cue.hovered,
+                dragged: cue.dragged,
+            };
             sectioned_room_row(
-                room_row(room, &env, selected, mode, call),
+                room_row_in(room, &env, selected, mode, call, pointer),
                 room,
                 selected,
                 density,
+                cue,
             )
         }
-        Line::EmptyHint(_) => container(text(EMPTY_HINT).size(tokens::CAPTION).style(kit::muted))
-            .padding([0.0, tokens::S])
-            .center_y(Length::Fixed(line_height(line, density)))
-            .into(),
+        Line::EmptyHint(key) => {
+            let target = ListKey::Header(key.clone());
+            let cue = list_cue(app, &target);
+            let height = line_height(line, density);
+            let hint = container(text(EMPTY_HINT).size(tokens::CAPTION).style(kit::muted))
+                .width(Fill)
+                .padding([0.0, tokens::S])
+                .center_y(Length::Fixed(height))
+                .style(move |t: &iced::Theme| mark_style(t, cue.mark, false));
+            // A drop target only: a press on the hint does nothing, and the
+            // section's own header is what clicks and drags.
+            let mut area = mouse_area(hint)
+                .on_enter(Message::Spaces(SpacesMessage::ListEnter(target.clone())))
+                .on_exit(Message::Spaces(SpacesMessage::ListExit(target.clone())));
+            if cue.dragging {
+                let at = target;
+                area = area.interaction(cue.cursor).on_move(move |point| {
+                    Message::Spaces(SpacesMessage::ListOver(
+                        at.clone(),
+                        list_drop::halves(point.y, height),
+                    ))
+                });
+            }
+            area.into()
+        }
     });
     scroller(top, rows, bottom)
 }
 
+/// Thickness of the line that shows where a drop would put the dragged item.
+const DROP_LINE: f32 = 3.0;
+
+/// Width of the ring around a header that takes a drop, or refuses it.
+const MARK_RING: f32 = 2.0;
+
+/// What dragging shows on one row or header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mark {
+    /// Nothing.
+    None,
+    /// A line above: a drop would put the item before this one.
+    Before,
+    /// A line below.
+    After,
+    /// A ring: a drop would put the item into this section.
+    Into,
+    /// A red ring and the words "Not allowed": the item may not go here.
+    Refused,
+}
+
+/// What dragging shows on and does to one row or header.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ListCue {
+    /// Where a drop here would land, while a drag runs.
+    mark: Mark,
+    /// The cursor: `Grab` for what can be dragged, `Grabbing` during a drag,
+    /// `NotAllowed` over a refused place.
+    cursor: mouse::Interaction,
+    /// A drag runs: the area reports the pointer's place in it.
+    dragging: bool,
+    /// The pointer is over it, and no drag runs.
+    hovered: bool,
+    /// It is the one being dragged.
+    dragged: bool,
+}
+
+/// The cue of the row or header `key`.
+fn list_cue(app: &App, key: &ListKey) -> ListCue {
+    let dragging = app.list_drag.is_dragging();
+    let may_drag = matches!(
+        app.sidebar.state(),
+        SidebarState::Loaded | SidebarState::Full
+    );
+    let refused = app.list_drag.refused().is_some_and(|t| t.item == *key);
+    let mark = if refused {
+        Mark::Refused
+    } else {
+        match app.list_drag.target().filter(|t| t.item == *key) {
+            Some(t) if t.zone == Zone::Before => Mark::Before,
+            Some(t) if t.zone == Zone::After => Mark::After,
+            Some(_) => Mark::Into,
+            None => Mark::None,
+        }
+    };
+    let cursor = if refused {
+        mouse::Interaction::NotAllowed
+    } else if dragging {
+        mouse::Interaction::Grabbing
+    } else if may_drag {
+        mouse::Interaction::Grab
+    } else {
+        mouse::Interaction::Pointer
+    };
+    ListCue {
+        mark,
+        cursor,
+        dragging,
+        hovered: !dragging && app.list_hover.as_ref() == Some(key),
+        dragged: app.list_drag.dragged() == Some(key),
+    }
+}
+
+/// The look of a row or header under the pointer or a drag. The colours are
+/// the theme's: the selection, the hover and the focus ring of a target, the
+/// danger colour of a refused place.
+fn mark_style(t: &iced::Theme, mark: Mark, hovered: bool) -> container::Style {
+    let sem = theme::semantic(t);
+    match mark {
+        Mark::Into => container::Style {
+            background: Some(Background::Color(sem.selection)),
+            border: border::rounded(tokens::SMALL)
+                .color(sem.focus)
+                .width(MARK_RING),
+            ..container::Style::default()
+        },
+        Mark::Refused => container::Style {
+            background: Some(Background::Color(sem.danger_soft)),
+            border: border::rounded(tokens::SMALL)
+                .color(t.palette().danger)
+                .width(MARK_RING),
+            ..container::Style::default()
+        },
+        Mark::None | Mark::Before | Mark::After => container::Style {
+            background: hovered.then_some(Background::Color(sem.message_hover)),
+            border: border::rounded(tokens::SMALL),
+            ..container::Style::default()
+        },
+    }
+}
+
+/// `content`, `height` tall, with the line of a before or after mark over its
+/// top or bottom edge. Always a stack, so the widget tree keeps its shape
+/// when a mark comes and goes.
+fn with_mark<'a>(content: Element<'a, Message>, mark: Mark, height: f32) -> Element<'a, Message> {
+    let line = |top: bool| -> Element<'a, Message> {
+        let bar = container(space().width(Fill).height(DROP_LINE)).style(|t: &iced::Theme| {
+            container::Style {
+                background: Some(Background::Color(theme::semantic(t).focus)),
+                border: border::rounded(DROP_LINE / 2.0),
+                ..container::Style::default()
+            }
+        });
+        // Clear of the accent bar at the left of a row.
+        let layer = container(bar)
+            .width(Fill)
+            .height(Length::Fixed(height))
+            .padding(iced::Padding {
+                left: ACCENT_BAR,
+                ..iced::Padding::ZERO
+            });
+        if top {
+            layer.align_top(Length::Fixed(height)).into()
+        } else {
+            layer.align_bottom(Length::Fixed(height)).into()
+        }
+    };
+    let mut layers = stack![content].width(Fill).height(Length::Fixed(height));
+    match mark {
+        Mark::Before => layers = layers.push(line(true)),
+        Mark::After => layers = layers.push(line(false)),
+        Mark::None | Mark::Into | Mark::Refused => {}
+    }
+    layers.into()
+}
+
+/// The area that makes a row or header a click and a drag: one press that is
+/// a click if the pointer stays and a drag if it goes (`drag.rs`), a
+/// right-click for the options card, and while a drag runs the pointer's
+/// place in it.
+fn list_area<'a>(
+    content: Element<'a, Message>,
+    key: ListKey,
+    cue: ListCue,
+    height: f32,
+    open: Message,
+) -> Element<'a, Message> {
+    let mut area = mouse_area(with_mark(content, cue.mark, height))
+        .interaction(cue.cursor)
+        .on_enter(Message::Spaces(SpacesMessage::ListEnter(key.clone())))
+        .on_exit(Message::Spaces(SpacesMessage::ListExit(key.clone())))
+        .on_press(Message::Spaces(SpacesMessage::ListPress(key.clone())))
+        .on_release(Message::Spaces(SpacesMessage::ListRelease(key.clone())))
+        .on_right_press(open);
+    if cue.dragging {
+        area = area.on_move(move |point| {
+            Message::Spaces(SpacesMessage::ListOver(
+                key.clone(),
+                list_drop::halves(point.y, height),
+            ))
+        });
+    }
+    area.into()
+}
+
 /// A room row of the sectioned list with its options: a right-click opens the
-/// room's card, and the selected row also has the "⋯" button at its right.
+/// room's card, and the selected row also has the "⋯" button at its right. A
+/// click opens the room and a drag moves it (see [`list_area`]).
 fn sectioned_room_row<'a>(
     row_view: Element<'a, Message>,
     room: &RoomSummary,
     selected: bool,
     density: Density,
+    cue: ListCue,
 ) -> Element<'a, Message> {
     let open = Message::SidebarMenu(SidebarMenuMessage::OpenRoom(room.id.clone()));
     let content: Element<'a, Message> = if selected {
@@ -515,14 +712,22 @@ fn sectioned_room_row<'a>(
     } else {
         row_view
     };
-    mouse_area(content).on_right_press(open).into()
+    list_area(
+        content,
+        ListKey::Room(room.id.clone()),
+        cue,
+        row_height(density),
+        open,
+    )
 }
 
 /// The header of a section: a chevron, the name, "personal" on Starred, the
 /// rolled-up badge while it is collapsed, and the "⋯" button. A click on
 /// the name collapses or expands it; a right-click or the button opens the
 /// section's card.
-fn section_header<'a>(header: &Header<'a>, density: Density) -> Element<'a, Message> {
+fn section_header<'a>(app: &App, header: &Header<'a>, density: Density) -> Element<'a, Message> {
+    let key = ListKey::Header(header.key.clone());
+    let cue = list_cue(app, &key);
     let chevron = if header.collapsed {
         Icon::SectionClosed
     } else {
@@ -557,16 +762,25 @@ fn section_header<'a>(header: &Header<'a>, density: Density) -> Element<'a, Mess
     if header.collapsed {
         content = content.push(badge_view(header.badge, false));
     }
+    if cue.mark == Mark::Refused {
+        // Not by colour alone.
+        content = content.push(
+            text(NOT_ALLOWED)
+                .size(tokens::CAPTION)
+                .style(iced::widget::text::danger)
+                .wrapping(Wrapping::None),
+        );
+    }
     let height = line_height(&Line::Header(header.clone()), density);
     let open = Message::SidebarMenu(SidebarMenuMessage::OpenSection(header.key.clone()));
-    let toggle = button(content)
-        .on_press(Message::Spaces(SpacesMessage::ToggleSection(
-            header.key.clone(),
-        )))
+    let (mark, hovered) = (cue.mark, cue.hovered || cue.dragged);
+    // A click on the name collapses or expands it; a drag moves the section.
+    // No button: it would swallow the press (see `list_area`).
+    let toggle = container(content)
         .width(Fill)
-        .height(Length::Fixed(height))
+        .center_y(Length::Fixed(height))
         .padding([0.0, tokens::S])
-        .style(kit::ghost_style);
+        .style(move |t: &iced::Theme| mark_style(t, mark, hovered));
     let line = row![
         toggle,
         container(kit::compact_icon_button(Icon::More, open.clone()))
@@ -574,8 +788,11 @@ fn section_header<'a>(header: &Header<'a>, density: Density) -> Element<'a, Mess
     ]
     .align_y(iced::Center)
     .height(Length::Fixed(height));
-    mouse_area(line).on_right_press(open).into()
+    list_area(line.into(), key, cue, height, open)
 }
+
+/// What a refused header says, besides its red ring.
+pub const NOT_ALLOWED: &str = "Not allowed";
 
 /// The 3 px bar at the left of a row: the accent colour while selected,
 /// clear otherwise, so the row keeps its shape.
@@ -614,6 +831,33 @@ fn room_row<'a>(
     selected: bool,
     mode: Option<RoomNotificationModeView>,
     call: Option<CallPill>,
+) -> Element<'a, Message> {
+    room_row_in(room, env, selected, mode, call, Pointer::Button)
+}
+
+/// How a row takes the pointer.
+#[derive(Debug, Clone, Copy)]
+enum Pointer {
+    /// A button: a click opens the room. The flat list, where nothing drags.
+    Button,
+    /// A plain box inside the sectioned list's `mouse_area`, which decides
+    /// between a click and a drag. A button would swallow the press.
+    Area {
+        /// The pointer is over it.
+        hovered: bool,
+        /// It is being dragged.
+        dragged: bool,
+    },
+}
+
+/// [`room_row`] for the way the row takes the pointer.
+fn room_row_in<'a>(
+    room: &'a RoomSummary,
+    env: &RowEnv<'_>,
+    selected: bool,
+    mode: Option<RoomNotificationModeView>,
+    call: Option<CallPill>,
+    pointer: Pointer,
 ) -> Element<'a, Message> {
     let comfortable = shows_preview(env.density);
     let name = row_name(&room.name);
@@ -687,18 +931,47 @@ fn room_row<'a>(
     };
     let content = row![avatar, body].spacing(tokens::S).align_y(iced::Center);
     let height = row_height(env.density);
-    row![
-        accent_bar(selected),
-        button(content)
+    let body: Element<'a, Message> = match pointer {
+        Pointer::Button => button(content)
             .on_press(Message::SelectRoom(room.id.clone()))
             .width(Fill)
             .height(Length::Fixed(height))
             .padding([tokens::XS, tokens::S])
             .clip(true)
-            .style(row_style(selected)),
-    ]
-    .height(Length::Fixed(height))
-    .into()
+            .style(row_style(selected))
+            .into(),
+        Pointer::Area { hovered, dragged } => container(content)
+            .width(Fill)
+            .height(Length::Fixed(height))
+            .padding([tokens::XS, tokens::S])
+            .clip(true)
+            .style(row_box_style(selected, hovered || dragged))
+            .into(),
+    };
+    row![accent_bar(selected), body]
+        .height(Length::Fixed(height))
+        .into()
+}
+
+/// The look of a row that is a box, not a button: the selection colour while
+/// the room is open, the hover colour under the pointer (as [`row_style`]).
+fn row_box_style(selected: bool, hovered: bool) -> impl Fn(&iced::Theme) -> container::Style {
+    move |t| {
+        let sem = theme::semantic(t);
+        let fill = if selected {
+            Some(sem.selection)
+        } else if hovered {
+            Some(sem.message_hover)
+        } else {
+            None
+        };
+        container::Style {
+            text_color: Some(t.palette().text),
+            background: fill.map(Background::Color),
+            border: border::rounded(tokens::SMALL),
+            ..container::Style::default()
+        }
+    }
 }
 
 /// One row of the rail: the avatar with an unread dot and, in a call, a

@@ -22,6 +22,18 @@ use crate::room_list::{Badge, clamp_window, row_height};
 use crate::state::App;
 use crate::ui::tokens::Density;
 
+#[cfg(test)]
+thread_local! {
+    /// How many times [`build`] ran on this thread (tests count rebuilds).
+    static BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times [`build`] ran on this thread.
+#[cfg(test)]
+pub(crate) fn build_runs() -> usize {
+    BUILDS.with(std::cell::Cell::get)
+}
+
 /// One line of the sectioned list. `Debug` shows no room: a room's ID and name
 /// belong to people and must not reach a log.
 #[derive(Clone, PartialEq)]
@@ -110,6 +122,8 @@ pub fn build<'a>(
     rooms: &'a [RoomSummary],
     layout: Option<&'a SpaceLayout>,
 ) -> Vec<Line<'a>> {
+    #[cfg(test)]
+    BUILDS.with(|n| n.set(n.get() + 1));
     let own = &space.id;
     // The sub-spaces: level 1 children of a level 0 space. A level 1 space
     // has none, whatever its list holds.
@@ -441,6 +455,18 @@ impl App {
             .layout()
             .and_then(|layout| layout.spaces.iter().find(|s| s.space == *id));
         Some(build(space, self.spaces.spaces(), &self.rooms, stored))
+    }
+
+    /// The lines of the sectioned list with no layout: every room in its
+    /// default section, and every section open. A drop uses it to tell which
+    /// section is a room's own default one; `None` while the list is flat.
+    pub(crate) fn default_section_lines(&self) -> Option<Vec<Line<'_>>> {
+        if !self.sections_shown() {
+            return None;
+        }
+        let id = self.query.space.as_ref()?;
+        let space = self.spaces.spaces().iter().find(|s| s.id == *id)?;
+        Some(build(space, self.spaces.spaces(), &self.rooms, None))
     }
 
     /// The rooms as the list draws them, in order: the list itself while it
@@ -1815,6 +1841,595 @@ mod tests {
             let _ = app.update(Message::SearchChanged("x".to_owned()));
             let _ = app.update(Message::Spaces(SpacesMessage::Select(None)));
             assert!(app.sidebar_menu.is_none());
+        }
+    }
+
+    // ---- dragging rooms and sections (Task sbc.10) ----
+
+    mod dragging {
+        use iced::Point;
+
+        use super::*;
+        use crate::drag::Zone;
+        use crate::keys::Shortcut;
+        use crate::list_drop::ListKey;
+        use crate::sidebar_menu::{Entry, SectionPick, SidebarMenuMessage as M};
+        use crate::sidebar_store::Call;
+        use crate::spaces::SpacesMessage as S;
+
+        fn drag_app() -> (App, MemorySidebar, mpsc::Receiver<Command>) {
+            let (mut app, rx) = space_app(None);
+            let store = MemorySidebar::default();
+            app.set_sidebar_store(Box::new(store.clone()));
+            (app, store, rx)
+        }
+
+        /// An app whose layout has "Ops" (0) holding chan1 and t2 in that order,
+        /// "Later" (1) empty, and starred1 starred. chan2 and t1 are free.
+        fn arranged() -> (App, MemorySidebar, mpsc::Receiver<Command>) {
+            let (mut app, store, rx) = drag_app();
+            let label = |t: &str| SidebarLabel::try_from(t).expect("a name");
+            for op in [
+                Op::NewSection {
+                    space: rid("sp"),
+                    name: label("Ops"),
+                    room: Some(rid("chan1")),
+                },
+                Op::MoveRoomToSection {
+                    space: rid("sp"),
+                    room: rid("t2"),
+                    section: 0,
+                },
+                Op::NewSection {
+                    space: rid("sp"),
+                    name: label("Later"),
+                    room: None,
+                },
+                Op::Star {
+                    space: rid("sp"),
+                    room: rid("starred1"),
+                },
+            ] {
+                assert!(app.apply_sidebar(op).is_ok());
+            }
+            (app, store, rx)
+        }
+
+        fn saves(store: &MemorySidebar) -> usize {
+            store
+                .calls()
+                .iter()
+                .filter(|c| matches!(c, Call::Save(..)))
+                .count()
+        }
+
+        fn record(app: &App) -> SpaceLayout {
+            app.sidebar
+                .layout()
+                .and_then(|l| l.spaces.iter().find(|s| s.space == rid("sp")))
+                .cloned()
+                .expect("a record for the space")
+        }
+
+        fn send(app: &mut App, message: S) {
+            let _ = app.update(Message::Spaces(message));
+        }
+
+        fn menu(app: &mut App, message: M) {
+            let _ = app.update(Message::SidebarMenu(message));
+        }
+
+        fn room(n: &str) -> ListKey {
+            ListKey::Room(rid(n))
+        }
+
+        fn head(key: SectionKey) -> ListKey {
+            ListKey::Header(key)
+        }
+
+        /// Presses `item` and moves 30 px: a drag is running.
+        fn start(app: &mut App, item: &ListKey) {
+            send(app, S::ListEnter(item.clone()));
+            send(app, S::ListPress(item.clone()));
+            send(app, S::PointerMoved(Point::new(10.0, 10.0)));
+            send(app, S::PointerMoved(Point::new(40.0, 10.0)));
+            assert!(app.list_drag.is_dragging());
+        }
+
+        /// Drags `item` to `target` and lets go.
+        fn drag(app: &mut App, item: &ListKey, target: &ListKey, zone: Zone) {
+            start(app, item);
+            send(app, S::ListOver(target.clone(), zone));
+            send(app, S::PointerReleased);
+            assert!(!app.list_drag.is_active());
+        }
+
+        /// How the drop of every kind of target compares with the card.
+        #[test]
+        fn every_kind_of_drop_gives_the_layout_of_the_matching_card_operation() {
+            type Cards = fn(&mut App);
+            type Row = (&'static str, ListKey, ListKey, Zone, Cards);
+            let up_to_first = |app: &mut App| {
+                // Direct messages up, one card Move up at a time.
+                for _ in 0..8 {
+                    menu(app, M::OpenSection(SectionKey::Direct));
+                    menu(app, M::Entry(Entry::MoveUp));
+                }
+            };
+            let table: Vec<Row> = vec![
+                (
+                    "a room onto Starred",
+                    room("chan2"),
+                    head(SectionKey::Starred),
+                    Zone::Into,
+                    |app| {
+                        menu(app, M::OpenRoom(rid("chan2")));
+                        menu(app, M::Entry(Entry::Star));
+                    },
+                ),
+                (
+                    "a room onto a section of the user's own",
+                    room("t1"),
+                    head(SectionKey::Custom(0)),
+                    Zone::Into,
+                    |app| {
+                        menu(app, M::OpenRoom(rid("t1")));
+                        menu(app, M::Section(SectionPick::Existing(0)));
+                    },
+                ),
+                (
+                    "a starred room onto a section of the user's own",
+                    room("starred1"),
+                    head(SectionKey::Custom(1)),
+                    Zone::Into,
+                    |app| {
+                        menu(app, M::OpenRoom(rid("starred1")));
+                        menu(app, M::Section(SectionPick::Existing(1)));
+                    },
+                ),
+                (
+                    "a room onto an empty section's hint (its header)",
+                    room("chan2"),
+                    head(SectionKey::Custom(1)),
+                    Zone::Into,
+                    |app| {
+                        menu(app, M::OpenRoom(rid("chan2")));
+                        menu(app, M::Section(SectionPick::Existing(1)));
+                    },
+                ),
+                (
+                    "a room of a section back onto Channels",
+                    room("chan1"),
+                    head(SectionKey::Channels),
+                    Zone::Into,
+                    |app| {
+                        menu(app, M::OpenRoom(rid("chan1")));
+                        menu(app, M::Entry(Entry::BackToDefault));
+                    },
+                ),
+                (
+                    "a starred room back onto its default section",
+                    room("starred1"),
+                    head(SectionKey::Channels),
+                    Zone::Into,
+                    |app| {
+                        menu(app, M::OpenRoom(rid("starred1")));
+                        menu(app, M::Entry(Entry::Unstar));
+                    },
+                ),
+                (
+                    "a room of a section back onto its sub-space",
+                    room("t2"),
+                    head(SectionKey::SubSpace(rid("tech"))),
+                    Zone::Into,
+                    |app| {
+                        menu(app, M::OpenRoom(rid("t2")));
+                        menu(app, M::Entry(Entry::BackToDefault));
+                    },
+                ),
+                (
+                    "a room before the first row of a section of the user's own",
+                    room("chan2"),
+                    room("chan1"),
+                    Zone::Before,
+                    |app| {
+                        menu(app, M::OpenRoom(rid("chan2")));
+                        menu(app, M::Section(SectionPick::Existing(0)));
+                        for _ in 0..2 {
+                            menu(app, M::OpenRoom(rid("chan2")));
+                            menu(app, M::Entry(Entry::MoveUp));
+                        }
+                    },
+                ),
+                (
+                    "a room between two rows of a section of the user's own",
+                    room("chan2"),
+                    room("chan1"),
+                    Zone::After,
+                    |app| {
+                        menu(app, M::OpenRoom(rid("chan2")));
+                        menu(app, M::Section(SectionPick::Existing(0)));
+                        menu(app, M::OpenRoom(rid("chan2")));
+                        menu(app, M::Entry(Entry::MoveUp));
+                    },
+                ),
+                (
+                    "a room of a section after the last row of the section",
+                    room("chan1"),
+                    room("t2"),
+                    Zone::After,
+                    |app| {
+                        menu(app, M::OpenRoom(rid("chan1")));
+                        menu(app, M::Entry(Entry::MoveDown));
+                    },
+                ),
+                (
+                    "a section header before the first header",
+                    head(SectionKey::Direct),
+                    head(SectionKey::Starred),
+                    Zone::Before,
+                    up_to_first,
+                ),
+                (
+                    "a section header after the next one",
+                    head(SectionKey::Custom(0)),
+                    head(SectionKey::Custom(1)),
+                    Zone::After,
+                    |app| {
+                        menu(app, M::OpenSection(SectionKey::Custom(0)));
+                        menu(app, M::Entry(Entry::MoveDown));
+                    },
+                ),
+            ];
+            for (what, item, target, zone, cards) in table {
+                let by_drag = {
+                    let (mut app, store, _rx) = arranged();
+                    let before = record(&app);
+                    let saved = saves(&store);
+                    drag(&mut app, &item, &target, zone);
+                    assert_ne!(record(&app), before, "{what}: the drop did something");
+                    assert_eq!(saves(&store), saved + 1, "{what}: one change, one save");
+                    record(&app)
+                };
+                let by_card = {
+                    let (mut app, store, _rx) = arranged();
+                    let saved = saves(&store);
+                    cards(&mut app);
+                    assert!(saves(&store) > saved, "{what}: the card changed it");
+                    record(&app)
+                };
+                assert_eq!(by_drag, by_card, "{what}");
+            }
+        }
+
+        #[test]
+        fn a_target_that_is_not_the_rooms_default_section_is_refused_and_drops_nothing() {
+            let (mut app, store, _rx) = arranged();
+            let before = record(&app);
+            let saved = saves(&store);
+            start(&mut app, &room("chan1"));
+            send(&mut app, S::ListOver(head(SectionKey::Direct), Zone::Into));
+            assert!(app.list_drag.target().is_none(), "no target");
+            assert_eq!(
+                app.list_drag.refused().map(|t| t.item.clone()),
+                Some(head(SectionKey::Direct)),
+                "drawn as not allowed"
+            );
+            send(&mut app, S::PointerReleased);
+            assert_eq!(record(&app), before);
+            assert_eq!(saves(&store), saved);
+            assert!(!app.list_drag.is_active());
+            // Leaving the place takes the refusal away.
+            start(&mut app, &room("chan1"));
+            send(&mut app, S::ListOver(head(SectionKey::Direct), Zone::Into));
+            send(&mut app, S::ListExit(head(SectionKey::Direct)));
+            assert!(app.list_drag.refused().is_none());
+            // The sub-space header is refused for a Channels room too.
+            send(
+                &mut app,
+                S::ListOver(head(SectionKey::SubSpace(rid("tech"))), Zone::Into),
+            );
+            assert!(app.list_drag.refused().is_some());
+            send(&mut app, S::PointerReleased);
+            assert_eq!(saves(&store), saved);
+        }
+
+        #[test]
+        fn a_press_and_release_with_no_movement_is_still_a_click() {
+            let (mut app, store, mut rx) = arranged();
+            drain(&mut rx);
+            // A row: opens the room, even after a wobble under 4 px.
+            send(&mut app, S::ListEnter(room("chan2")));
+            send(&mut app, S::ListPress(room("chan2")));
+            send(&mut app, S::PointerMoved(Point::new(10.0, 10.0)));
+            send(&mut app, S::PointerMoved(Point::new(12.0, 11.0)));
+            send(&mut app, S::ListRelease(room("chan2")));
+            send(&mut app, S::PointerReleased);
+            assert_eq!(app.selected, Some(rid("chan2")));
+            assert!(
+                drain(&mut rx)
+                    .iter()
+                    .any(|c| matches!(c, Command::SelectRoom(id) if *id == rid("chan2")))
+            );
+            // A header: collapses it, and again expands it.
+            let saved = saves(&store);
+            for expect in [true, false] {
+                let key = head(SectionKey::Direct);
+                send(&mut app, S::ListPress(key.clone()));
+                send(&mut app, S::ListRelease(key));
+                send(&mut app, S::PointerReleased);
+                assert_eq!(record(&app).collapsed.contains(&SectionKey::Direct), expect);
+            }
+            assert_eq!(saves(&store), saved + 2);
+        }
+
+        #[test]
+        fn a_drag_is_no_click() {
+            let (mut app, store, mut rx) = arranged();
+            drain(&mut rx);
+            start(&mut app, &room("chan2"));
+            send(&mut app, S::ListRelease(room("chan2")));
+            send(&mut app, S::PointerReleased);
+            assert_ne!(app.selected, Some(rid("chan2")), "nothing opened");
+            assert!(drain(&mut rx).is_empty());
+            let saved = saves(&store);
+            let key = head(SectionKey::Direct);
+            start(&mut app, &key);
+            send(&mut app, S::ListRelease(key));
+            send(&mut app, S::PointerReleased);
+            assert!(!record(&app).collapsed.contains(&SectionKey::Direct));
+            assert_eq!(saves(&store), saved);
+        }
+
+        #[test]
+        fn in_the_flat_list_or_without_a_layout_nothing_is_draggable() {
+            // A search makes the list flat.
+            let (mut app, _store, _rx) = arranged();
+            let _ = app.update(Message::SearchChanged("chan".to_owned()));
+            assert!(!app.sections_shown());
+            send(&mut app, S::ListPress(room("chan2")));
+            send(&mut app, S::PointerMoved(Point::new(0.0, 0.0)));
+            send(&mut app, S::PointerMoved(Point::new(50.0, 50.0)));
+            assert!(!app.list_drag.is_dragging());
+            // So does the People tab.
+            let (mut app, _store, _rx) = arranged();
+            let _ = app.update(Message::TabSelected(RoomListTab::People));
+            send(&mut app, S::ListPress(room("dm1")));
+            send(&mut app, S::PointerMoved(Point::new(0.0, 0.0)));
+            send(&mut app, S::PointerMoved(Point::new(50.0, 50.0)));
+            assert!(!app.list_drag.is_dragging());
+            // A layout that is protected cannot be arranged.
+            let (mut app, _store, _rx) = drag_app();
+            let _ = app.update(Message::SidebarLoaded(SidebarAnswer::new(
+                UserId::from("@a:x"),
+                SidebarLoad::Newer,
+            )));
+            app.sidebar.unload();
+            send(&mut app, S::ListPress(room("chan2")));
+            send(&mut app, S::PointerMoved(Point::new(0.0, 0.0)));
+            send(&mut app, S::PointerMoved(Point::new(50.0, 50.0)));
+            assert!(!app.list_drag.is_dragging());
+        }
+
+        #[test]
+        fn esc_and_losing_the_focus_cancel_and_save_nothing() {
+            for cancel in ["esc", "focus", "second press"] {
+                let (mut app, store, _rx) = arranged();
+                let saved = saves(&store);
+                start(&mut app, &room("chan2"));
+                send(
+                    &mut app,
+                    S::ListOver(head(SectionKey::Custom(0)), Zone::Into),
+                );
+                assert!(app.list_drag.target().is_some());
+                match cancel {
+                    "esc" => {
+                        let _ = app.update(Message::Shortcut {
+                            shortcut: Shortcut::Escape,
+                            captured: false,
+                        });
+                    }
+                    "focus" => {
+                        let _ = app.update(Message::WindowFocus(false));
+                    }
+                    _ => send(&mut app, S::PointerPressed),
+                }
+                assert!(!app.list_drag.is_active(), "{cancel}");
+                send(&mut app, S::PointerReleased);
+                assert_eq!(saves(&store), saved, "{cancel}");
+            }
+        }
+
+        #[test]
+        fn a_release_with_no_target_or_off_the_target_saves_nothing() {
+            let (mut app, store, _rx) = arranged();
+            let saved = saves(&store);
+            start(&mut app, &room("chan2"));
+            send(&mut app, S::PointerReleased);
+            start(&mut app, &room("chan2"));
+            send(
+                &mut app,
+                S::ListOver(head(SectionKey::Custom(0)), Zone::Into),
+            );
+            send(&mut app, S::ListExit(head(SectionKey::Custom(0))));
+            send(&mut app, S::PointerReleased);
+            // Onto itself, and to where it already is.
+            start(&mut app, &room("chan1"));
+            send(&mut app, S::ListOver(room("chan1"), Zone::Before));
+            assert!(app.list_drag.target().is_none());
+            send(
+                &mut app,
+                S::ListOver(head(SectionKey::Custom(0)), Zone::Into),
+            );
+            assert!(app.list_drag.target().is_none(), "it is already there");
+            send(&mut app, S::PointerReleased);
+            assert_eq!(saves(&store), saved);
+        }
+
+        #[test]
+        fn the_same_target_is_planned_once_until_the_pointer_leaves_or_things_change() {
+            use crate::list_drop::plan_runs;
+            let (mut app, _store, _rx) = arranged();
+            start(&mut app, &room("chan2"));
+            let runs = plan_runs();
+            let over = |app: &mut App| {
+                send(app, S::ListOver(head(SectionKey::Custom(0)), Zone::Into));
+            };
+            for _ in 0..5 {
+                over(&mut app);
+            }
+            assert_eq!(plan_runs() - runs, 1, "five moves over it, one plan");
+            send(&mut app, S::ListExit(head(SectionKey::Custom(0))));
+            over(&mut app);
+            assert_eq!(plan_runs() - runs, 2, "after leaving and coming back");
+            // A change of the list forgets what was worked out.
+            feed(
+                &mut app,
+                CoreEvent::RoomListChanged(vec![ListDiff::Reset { values: rooms() }]),
+            );
+            over(&mut app);
+            assert_eq!(plan_runs() - runs, 3, "after the rooms changed");
+        }
+
+        #[test]
+        fn the_window_listener_runs_only_while_the_button_is_down_on_a_row_or_header() {
+            use iced::advanced::subscription::into_recipes;
+            let (mut app, _store, _rx) = arranged();
+            let count = |app: &App| into_recipes(app.rail_drag_subscription()).len();
+            assert_eq!(count(&app), 0, "idle");
+            send(&mut app, S::ListEnter(room("chan2")));
+            assert_eq!(count(&app), 0, "hover alone");
+            send(&mut app, S::ListPress(room("chan2")));
+            assert_eq!(count(&app), 1, "pressed");
+            send(&mut app, S::PointerReleased);
+            assert_eq!(count(&app), 0, "released");
+        }
+
+        #[test]
+        fn a_row_that_leaves_the_list_ends_its_drag_and_hover() {
+            let (mut app, store, _rx) = arranged();
+            let saved = saves(&store);
+            send(&mut app, S::ListEnter(room("chan2")));
+            start(&mut app, &room("chan2"));
+            send(
+                &mut app,
+                S::ListOver(head(SectionKey::Custom(0)), Zone::Into),
+            );
+            let rest: Vec<RoomSummary> = rooms()
+                .into_iter()
+                .filter(|r| r.id != rid("chan2"))
+                .collect();
+            feed(
+                &mut app,
+                CoreEvent::RoomListChanged(vec![ListDiff::Reset { values: rest }]),
+            );
+            assert!(!app.list_drag.is_active());
+            assert!(app.list_hover.is_none());
+            send(&mut app, S::PointerReleased);
+            assert_eq!(saves(&store), saved);
+        }
+
+        #[test]
+        fn a_card_that_opens_during_a_press_ends_it_and_a_list_press_ends_a_rail_press() {
+            let (mut app, _store, _rx) = arranged();
+            send(&mut app, S::ListPress(room("chan2")));
+            menu(&mut app, M::OpenRoom(rid("chan2")));
+            assert!(app.sidebar_menu.is_some());
+            assert!(!app.list_drag.is_active());
+            menu(&mut app, M::Close);
+            send(&mut app, S::Press(crate::spaces::RailKey::Space(rid("sp"))));
+            send(&mut app, S::ListPress(room("chan2")));
+            assert!(!app.rail_drag.is_active());
+            assert!(app.list_drag.is_active());
+        }
+
+        #[test]
+        fn pointer_moves_over_an_unchanged_list_rebuild_nothing_but_a_real_change_settles() {
+            let (mut app, _store, _rx) = arranged();
+            send(&mut app, S::ListEnter(room("chan2")));
+            start(&mut app, &room("chan2"));
+            send(
+                &mut app,
+                S::ListOver(head(SectionKey::Custom(0)), Zone::Into),
+            );
+            let builds = build_runs();
+            for n in 0..50 {
+                send(&mut app, S::PointerMoved(Point::new(40.0 + n as f32, 10.0)));
+                send(&mut app, S::ListEnter(room("chan1")));
+                send(&mut app, S::ListExit(room("chan1")));
+                send(&mut app, S::Exit(crate::spaces::RailKey::Home));
+            }
+            assert_eq!(
+                build_runs(),
+                builds,
+                "no rebuild for pointer moves or hover"
+            );
+            assert!(app.list_drag.is_dragging());
+            // A scroll asks for avatars (its own build) and is not settled.
+            let _ = app.update(Message::RoomListScrolled {
+                offset_y: 10.0,
+                viewport_h: 500.0,
+            });
+            // A room that leaves still ends the drag.
+            let rest: Vec<RoomSummary> = rooms()
+                .into_iter()
+                .filter(|r| r.id != rid("chan2"))
+                .collect();
+            feed(
+                &mut app,
+                CoreEvent::RoomListChanged(vec![ListDiff::Reset { values: rest }]),
+            );
+            assert!(build_runs() > builds, "a change of the list settles");
+            assert!(!app.list_drag.is_active());
+        }
+
+        #[test]
+        fn a_rail_press_ends_a_tracked_list_press() {
+            let (mut app, _store, _rx) = arranged();
+            send(&mut app, S::ListPress(room("chan2")));
+            send(&mut app, S::Press(crate::spaces::RailKey::Space(rid("sp"))));
+            assert!(!app.list_drag.is_active());
+            assert!(app.rail_drag.is_active());
+        }
+
+        #[test]
+        fn a_click_works_again_after_a_cancelled_drag_and_after_the_window_press_cancel() {
+            let (mut app, store, mut rx) = arranged();
+            let click_room = |app: &mut App| {
+                send(app, S::ListEnter(room("chan2")));
+                send(app, S::ListPress(room("chan2")));
+                send(app, S::ListRelease(room("chan2")));
+                send(app, S::PointerReleased);
+            };
+            for cancel in ["esc", "focus", "second press"] {
+                app.selected = None;
+                drain(&mut rx);
+                start(&mut app, &room("chan2"));
+                match cancel {
+                    "esc" => {
+                        let _ = app.update(Message::Shortcut {
+                            shortcut: Shortcut::Escape,
+                            captured: false,
+                        });
+                    }
+                    "focus" => {
+                        let _ = app.update(Message::WindowFocus(false));
+                    }
+                    _ => send(&mut app, S::PointerPressed),
+                }
+                assert!(!app.list_drag.is_active(), "{cancel}");
+                click_room(&mut app);
+                assert_eq!(app.selected, Some(rid("chan2")), "{cancel}: the row opens");
+            }
+            // A press cancelled by the window press, then a header click.
+            send(&mut app, S::ListPress(head(SectionKey::Direct)));
+            send(&mut app, S::PointerPressed);
+            let saved = saves(&store);
+            send(&mut app, S::ListPress(head(SectionKey::Direct)));
+            send(&mut app, S::ListRelease(head(SectionKey::Direct)));
+            send(&mut app, S::PointerReleased);
+            assert!(record(&app).collapsed.contains(&SectionKey::Direct));
+            assert_eq!(saves(&store), saved + 1);
         }
     }
 }

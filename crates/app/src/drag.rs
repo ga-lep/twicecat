@@ -8,8 +8,10 @@
 //! plain events, so it is tested without a window. The only iced type it uses
 //! is [`Point`].
 //!
-//! One tracker serves the rail: the press that may become a click is the same
-//! press that may become a drag, so a click and a drag can never both happen.
+//! One machine serves the rail and the sectioned room list (each with its own
+//! item type, as `Drag<RailKey>` and `Drag<ListKey>`): the press that may
+//! become a click is the same press that may become a drag, so a click and a
+//! drag can never both happen.
 
 use iced::Point;
 
@@ -101,6 +103,9 @@ pub enum Drag<I> {
         /// The last target worked out, so the same one is not worked out
         /// again on every pointer move.
         seen: Option<Target<I>>,
+        /// A place the pointer is over where the dragged item may not go
+        /// (drawn as not allowed). Never a target: a release there cancels.
+        refused: Option<Target<I>>,
     },
 }
 
@@ -169,6 +174,7 @@ impl<I: Clone + PartialEq> Drag<I> {
             item: item.clone(),
             target: None,
             seen: None,
+            refused: None,
         };
         Outcome::Started
     }
@@ -179,10 +185,36 @@ impl<I: Clone + PartialEq> Drag<I> {
         if let Self::Dragging {
             item,
             target: current,
+            refused,
             ..
         } = self
         {
             *current = target.filter(|t| t.item != *item);
+            *refused = None;
+        }
+    }
+
+    /// The pointer is over `target`, which the dragged item may not be dropped
+    /// on: there is no drop target, and the place is remembered so it can be
+    /// drawn as not allowed.
+    pub fn refuse(&mut self, place: Target<I>) {
+        if let Self::Dragging {
+            item,
+            target,
+            refused,
+            ..
+        } = self
+        {
+            *target = None;
+            *refused = Some(place).filter(|t| t.item != *item);
+        }
+    }
+
+    /// The place the pointer is over where the dragged item may not go.
+    pub fn refused(&self) -> Option<&Target<I>> {
+        match self {
+            Self::Dragging { refused, .. } => refused.as_ref(),
+            Self::Idle | Self::Pressed { .. } => None,
         }
     }
 
@@ -211,9 +243,17 @@ impl<I: Clone + PartialEq> Drag<I> {
     pub fn leave(&mut self, item: &I) {
         match self {
             Self::Pressed { left, .. } => *left = true,
-            Self::Dragging { target, seen, .. } => {
+            Self::Dragging {
+                target,
+                seen,
+                refused,
+                ..
+            } => {
                 if target.as_ref().is_some_and(|t| t.item == *item) {
                     *target = None;
+                }
+                if refused.as_ref().is_some_and(|t| t.item == *item) {
+                    *refused = None;
                 }
                 if seen.as_ref().is_some_and(|t| t.item == *item) {
                     *seen = None;
@@ -272,12 +312,20 @@ impl<I: Clone + PartialEq> Drag<I> {
                     *self = Self::Idle;
                 }
             }
-            Self::Dragging { item, target, seen } => {
+            Self::Dragging {
+                item,
+                target,
+                seen,
+                refused,
+            } => {
                 if !keep(item) {
                     *self = Self::Idle;
                 } else {
                     if target.as_ref().is_some_and(|t| !keep(&t.item)) {
                         *target = None;
+                    }
+                    if refused.as_ref().is_some_and(|t| !keep(&t.item)) {
+                        *refused = None;
                     }
                     if seen.as_ref().is_some_and(|t| !keep(&t.item)) {
                         *seen = None;
@@ -496,5 +544,52 @@ mod tests {
         d.press("a", true);
         d.retain(|i| *i != "a");
         assert!(!d.is_active());
+    }
+
+    #[test]
+    fn a_refused_place_is_no_target_and_a_release_there_cancels() {
+        let mut d = dragging();
+        d.hover(before("b"));
+        d.refuse(Target {
+            item: "c",
+            zone: Zone::Into,
+        });
+        assert_eq!(d.target(), None, "a refused place is no target");
+        assert_eq!(
+            d.refused(),
+            Some(&Target {
+                item: "c",
+                zone: Zone::Into
+            })
+        );
+        assert_eq!(d.end(), Outcome::Cancelled, "nothing is dropped");
+        assert_eq!(d.refused(), None);
+        // A good target, leaving the place, or an item that vanishes clears it.
+        let mut d = dragging();
+        d.refuse(Target {
+            item: "c",
+            zone: Zone::Into,
+        });
+        d.hover(before("b"));
+        assert_eq!(d.refused(), None, "a target replaces the refusal");
+        d.refuse(Target {
+            item: "c",
+            zone: Zone::Into,
+        });
+        d.leave(&"c");
+        assert_eq!(d.refused(), None, "leaving the place");
+        d.refuse(Target {
+            item: "c",
+            zone: Zone::Into,
+        });
+        d.retain(|i| *i != "c");
+        assert_eq!(d.refused(), None, "the place is gone");
+        // Not dragging: nothing is kept.
+        let mut idle = D::default();
+        idle.refuse(Target {
+            item: "c",
+            zone: Zone::Into,
+        });
+        assert_eq!(idle.refused(), None);
     }
 }

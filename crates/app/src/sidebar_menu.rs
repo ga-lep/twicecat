@@ -700,6 +700,7 @@ impl App {
         }
         self.rail_hover = None;
         self.rail_drag.cancel();
+        self.list_drag.cancel();
         self.sidebar_menu = Some(SidebarMenu::Card {
             target,
             error: None,
@@ -732,6 +733,7 @@ impl App {
         if !drawn_sections(&lines).contains(&key) {
             return Task::none();
         }
+        self.list_drag.cancel();
         self.sidebar_menu = Some(SidebarMenu::Card {
             target: Target::Section { space, key },
             error: None,
@@ -751,6 +753,7 @@ impl App {
         if spot_of(&lines, &room).is_none() {
             return Task::none();
         }
+        self.list_drag.cancel();
         self.sidebar_menu = Some(SidebarMenu::Card {
             target: Target::Room { space, room },
             error: None,

@@ -644,6 +644,79 @@ fn space_sections_custom() -> App {
     app
 }
 
+/// A drag in the sectioned list in progress: `item` pressed and moved, with
+/// the pointer then put `over` a row or header in `zone`.
+fn list_drag_over(
+    item: twicecat_app::list_drop::ListKey,
+    over: twicecat_app::list_drop::ListKey,
+    zone: twicecat_app::drag::Zone,
+) -> App {
+    use twicecat_app::spaces::SpacesMessage;
+
+    let mut app = space_sections_custom();
+    for message in [
+        SpacesMessage::ListEnter(item.clone()),
+        SpacesMessage::ListPress(item),
+        SpacesMessage::PointerMoved(iced::Point::new(30.0, 30.0)),
+        SpacesMessage::PointerMoved(iced::Point::new(60.0, 90.0)),
+        SpacesMessage::ListOver(over, zone),
+    ] {
+        press(&mut app, Message::Spaces(message));
+    }
+    app
+}
+
+fn list_room(name: &str) -> twicecat_app::list_drop::ListKey {
+    twicecat_app::list_drop::ListKey::Room(room(&format!("sec-r-{name}")))
+}
+
+fn list_head(key: twicecat_core::api::SectionKey) -> twicecat_app::list_drop::ListKey {
+    twicecat_app::list_drop::ListKey::Header(key)
+}
+
+/// A room dragged onto the header of "Reading list": the ring shows (it would
+/// go to the end of the section).
+fn space_sections_dragging() -> App {
+    use twicecat_core::api::SectionKey;
+    list_drag_over(
+        list_room("general"),
+        list_head(SectionKey::Custom(0)),
+        twicecat_app::drag::Zone::Into,
+    )
+}
+
+/// A room dragged over the upper half of a row of "Reading list": the line
+/// shows above that row.
+fn space_sections_dragging_line() -> App {
+    list_drag_over(
+        list_room("rust"),
+        list_room("news"),
+        twicecat_app::drag::Zone::Before,
+    )
+}
+
+/// A room of Channels dragged onto the Tech header: it may only go back to
+/// its own default section, so the header is drawn as not allowed.
+fn space_sections_dragging_refused() -> App {
+    use twicecat_core::api::SectionKey;
+    list_drag_over(
+        list_room("general"),
+        list_head(SectionKey::SubSpace(sec_space("tech"))),
+        twicecat_app::drag::Zone::Into,
+    )
+}
+
+/// A section header dragged over the lower half of another: the line shows
+/// under it.
+fn space_sections_dragging_header() -> App {
+    use twicecat_core::api::SectionKey;
+    list_drag_over(
+        list_head(SectionKey::Custom(1)),
+        list_head(SectionKey::Custom(0)),
+        twicecat_app::drag::Zone::Before,
+    )
+}
+
 /// The options card of a room that sits in a section of the user's own.
 fn section_menu() -> App {
     use twicecat_app::sidebar_menu::SidebarMenuMessage;
@@ -3645,6 +3718,45 @@ pub fn scenarios() -> Vec<Scenario> {
                     .layout()
                     .is_some_and(|l| l.spaces.iter().any(|s| s.custom.len() == 2))
         }),
+        s(
+            "space-sections-dragging",
+            true,
+            space_sections_dragging,
+            |a| {
+                in_main(a)
+                    && a.sections_shown()
+                    && a.list_drag.target().map(|t| t.zone) == Some(twicecat_app::drag::Zone::Into)
+            },
+        ),
+        s(
+            "space-sections-dragging-line",
+            true,
+            space_sections_dragging_line,
+            |a| {
+                in_main(a)
+                    && a.list_drag.target().map(|t| t.zone)
+                        == Some(twicecat_app::drag::Zone::Before)
+            },
+        ),
+        s(
+            "space-sections-dragging-refused",
+            true,
+            space_sections_dragging_refused,
+            |a| in_main(a) && a.list_drag.target().is_none() && a.list_drag.refused().is_some(),
+        ),
+        s(
+            "space-sections-dragging-header",
+            true,
+            space_sections_dragging_header,
+            |a| {
+                in_main(a)
+                    && matches!(
+                        a.list_drag.dragged(),
+                        Some(twicecat_app::list_drop::ListKey::Header(_))
+                    )
+                    && a.list_drag.target().is_some()
+            },
+        ),
         s("section-menu", true, section_menu, |a| {
             in_main(a)
                 && matches!(

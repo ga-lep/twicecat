@@ -21,7 +21,9 @@ use twicecat_core::api::{
 
 use crate::drag::{Outcome, Target, Zone};
 use crate::keys::Shortcut;
+use crate::list_drop::{self, ListKey, Verdict};
 use crate::rail_drop;
+use crate::sections::Line;
 use crate::sidebar::{Op as SidebarOp, SidebarState};
 use crate::state::{App, Message};
 
@@ -294,6 +296,20 @@ pub enum SpacesMessage {
     Release(RailKey),
     /// While a drag runs: the pointer moved over an item, in this part of it.
     Over(RailKey, Zone),
+    /// The pointer entered a room row or a section header of the sectioned
+    /// list.
+    ListEnter(ListKey),
+    /// The pointer left a room row or a section header.
+    ListExit(ListKey),
+    /// The left button went down on a room row or a section header.
+    ListPress(ListKey),
+    /// The left button came up over a room row or a section header: a click
+    /// when it went down on the same one and the pointer has not left it
+    /// since (the row opens, the header collapses or expands).
+    ListRelease(ListKey),
+    /// While a drag runs in the list: the pointer moved over a row or a
+    /// header, in this part of it.
+    ListOver(ListKey, Zone),
     /// While the button is down: the pointer moved (window coordinates).
     PointerMoved(Point),
     /// The left button, or a finger, went down anywhere in the window while a
@@ -353,6 +369,8 @@ impl App {
                         self.sidebar.state(),
                         SidebarState::Loaded | SidebarState::Full
                     );
+                // One pointer: a press here ends any press tracked in the list.
+                let _ = self.list_drag.cancel();
                 self.rail_drag.press(key, draggable);
                 Task::none()
             }
@@ -364,21 +382,145 @@ impl App {
                 self.rail_over(key, zone);
                 Task::none()
             }
+            SpacesMessage::ListEnter(key) => {
+                self.list_hover = Some(key);
+                Task::none()
+            }
+            SpacesMessage::ListExit(key) => {
+                if self.list_hover.as_ref() == Some(&key) {
+                    self.list_hover = None;
+                }
+                self.list_drag.leave(&key);
+                Task::none()
+            }
+            SpacesMessage::ListPress(key) => {
+                let draggable = self.sections_shown()
+                    && matches!(
+                        self.sidebar.state(),
+                        SidebarState::Loaded | SidebarState::Full
+                    );
+                // One pointer: a press here ends any press tracked on the rail.
+                let _ = self.rail_drag.cancel();
+                self.list_drag.press(key, draggable);
+                Task::none()
+            }
+            SpacesMessage::ListRelease(key) => match self.list_drag.release_on(&key) {
+                Outcome::Click(ListKey::Room(id)) => self.update(Message::SelectRoom(id)),
+                Outcome::Click(ListKey::Header(key)) => {
+                    self.on_rail(SpacesMessage::ToggleSection(key))
+                }
+                _ => Task::none(),
+            },
+            SpacesMessage::ListOver(key, zone) => {
+                self.list_over(key, zone);
+                Task::none()
+            }
             SpacesMessage::PointerMoved(at) => {
                 let _ = self.rail_drag.moved(at);
+                let _ = self.list_drag.moved(at);
                 Task::none()
             }
             SpacesMessage::PointerPressed => {
                 // A button is down again: the release of the one tracked was
                 // missed. Nothing is dropped.
                 let _ = self.rail_drag.cancel();
+                let _ = self.list_drag.cancel();
                 Task::none()
             }
-            SpacesMessage::PointerReleased => match self.rail_drag.end() {
-                Outcome::Drop { item, target } => self.rail_drop(&item, &target),
-                _ => Task::none(),
-            },
+            SpacesMessage::PointerReleased => {
+                let rail = match self.rail_drag.end() {
+                    Outcome::Drop { item, target } => self.rail_drop(&item, &target),
+                    _ => Task::none(),
+                };
+                let list = match self.list_drag.end() {
+                    Outcome::Drop { item, target } => self.list_drop(&item, &target),
+                    _ => Task::none(),
+                };
+                Task::batch([rail, list])
+            }
         }
+    }
+
+    /// What dropping `item` on `target` would do in the sectioned list.
+    fn list_verdict(&self, item: &ListKey, target: &Target<ListKey>) -> Verdict {
+        let (Some(space), Some(layout), Some(lines), Some(defaults)) = (
+            self.query.space.as_ref(),
+            self.sidebar.layout(),
+            self.section_lines(),
+            self.default_section_lines(),
+        ) else {
+            return Verdict::Nothing;
+        };
+        list_drop::plan(space, layout, &lines, &defaults, item, target)
+    }
+
+    /// The pointer is over `key`, in `zone`, during a drag in the list: a
+    /// target if dropping there would change something, refused (drawn as not
+    /// allowed) if it may not be done, and nothing otherwise.
+    fn list_over(&mut self, key: ListKey, zone: Zone) {
+        let Some(item) = self.list_drag.dragged().cloned() else {
+            return;
+        };
+        // Onto a header a room has no before or after: it goes into it.
+        let zone = match (&item, &key) {
+            (ListKey::Room(_), ListKey::Header(_)) => Zone::Into,
+            _ => zone,
+        };
+        let target = Target { item: key, zone };
+        if self.list_drag.seen(&target) {
+            return;
+        }
+        match self.list_verdict(&item, &target) {
+            Verdict::Ops(_) => self.list_drag.hover(Some(target)),
+            Verdict::Refused => self.list_drag.refuse(target),
+            Verdict::Nothing => self.list_drag.hover(None),
+        }
+    }
+
+    /// The drag in the list ended on a target: the same operations the cards
+    /// offer, done as one change and saved once. A refused change leaves the
+    /// layout as it was.
+    fn list_drop(&mut self, item: &ListKey, target: &Target<ListKey>) -> Task<Message> {
+        self.list_hover = None;
+        let Verdict::Ops(ops) = self.list_verdict(item, target) else {
+            return Task::none();
+        };
+        match self.sidebar.apply_all_known(ops, &[], &*self.sidebar_store) {
+            // The rooms in view changed: their avatars and the pages are due
+            // as after any change of the list.
+            Ok(save) => Task::batch([save.discard(), self.after_list_change()]),
+            Err(_) => Task::none(),
+        }
+    }
+
+    /// Forgets the hover, press and drag of a row or header the list no
+    /// longer draws (a room that left, a section collapsed away, a search
+    /// that made the list flat): its pointer-exit would never come.
+    pub(crate) fn settle_list_drag(&mut self) {
+        if !self.list_drag.is_active() && self.list_hover.is_none() {
+            return;
+        }
+        let drawn: HashSet<ListKey> = self
+            .section_lines()
+            .map(|lines| {
+                lines
+                    .iter()
+                    .filter_map(|line| match line {
+                        Line::Header(header) => Some(ListKey::Header(header.key.clone())),
+                        Line::Room(room) => Some(ListKey::Room(room.id.clone())),
+                        Line::EmptyHint(_) => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if self
+            .list_hover
+            .as_ref()
+            .is_some_and(|key| !drawn.contains(key))
+        {
+            self.list_hover = None;
+        }
+        self.list_drag.retain(|key| drawn.contains(key));
     }
 
     /// The top-level spaces the core reports, for the drop planner.
@@ -430,10 +572,13 @@ impl App {
     /// Esc during a drag cancels it. The key is used here, so nothing else
     /// closes. `None` when no drag runs.
     pub(crate) fn rail_escape(&mut self, shortcut: Shortcut) -> Option<Task<Message>> {
-        if shortcut != Shortcut::Escape || !self.rail_drag.is_dragging() {
+        if shortcut != Shortcut::Escape
+            || !(self.rail_drag.is_dragging() || self.list_drag.is_dragging())
+        {
             return None;
         }
         let _ = self.rail_drag.cancel();
+        let _ = self.list_drag.cancel();
         // The composer's copy of the key must not close another layer.
         self.escape_spent = false;
         Some(Task::none())
@@ -443,7 +588,7 @@ impl App {
     /// on an item of the rail (the end of a drag is often outside every
     /// `mouse_area`, which only sees a release over itself).
     pub fn rail_drag_subscription(&self) -> Subscription<Message> {
-        if self.rail_drag.is_active() {
+        if self.rail_drag.is_active() || self.list_drag.is_active() {
             iced::event::listen_with(listener)
         } else {
             Subscription::none()
@@ -470,6 +615,7 @@ impl App {
     pub(crate) fn clear_stale_rail_keys(&mut self) {
         // The layout or the spaces changed: what was worked out is stale.
         self.rail_drag.forget_seen();
+        self.list_drag.forget_seen();
         let mut drawn: HashSet<RailKey> = HashSet::from([RailKey::Home]);
         for item in self.spaces.rail_items(self.sidebar.layout()) {
             match item {
