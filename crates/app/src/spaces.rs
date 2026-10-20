@@ -13,13 +13,16 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use iced::Task;
+use iced::{Point, Subscription, Task, mouse, touch};
 use twicecat_core::api::{
     Command, RailEntry, RoomId, RoomListQuery, SidebarLayout, SpaceUnreadView, SpaceView,
     UnreadCountsView,
 };
 
-use crate::sidebar::Op as SidebarOp;
+use crate::drag::{Outcome, Target, Zone};
+use crate::keys::Shortcut;
+use crate::rail_drop;
+use crate::sidebar::{Op as SidebarOp, SidebarState};
 use crate::state::{App, Message};
 
 /// Most spaces kept; the sidebar is not a place for thousands of buttons.
@@ -242,8 +245,38 @@ impl SpacesModel {
     }
 }
 
+/// The window event for the rail's drag: the cursor, and the left button
+/// coming up.
+pub(crate) fn pointer_message(event: iced::Event) -> Option<Message> {
+    match event {
+        iced::Event::Mouse(mouse::Event::CursorMoved { position }) => {
+            Some(Message::Spaces(SpacesMessage::PointerMoved(position)))
+        }
+        iced::Event::Touch(touch::Event::FingerMoved { position, .. }) => {
+            Some(Message::Spaces(SpacesMessage::PointerMoved(position)))
+        }
+        iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+        | iced::Event::Touch(touch::Event::FingerPressed { .. }) => {
+            Some(Message::Spaces(SpacesMessage::PointerPressed))
+        }
+        iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
+        | iced::Event::Touch(touch::Event::FingerLifted { .. } | touch::Event::FingerLost { .. }) => {
+            Some(Message::Spaces(SpacesMessage::PointerReleased))
+        }
+        _ => None,
+    }
+}
+
+fn listener(
+    event: iced::Event,
+    _status: iced::event::Status,
+    _window: iced::window::Id,
+) -> Option<Message> {
+    pointer_message(event)
+}
+
 /// The message of the sidebar.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SpacesMessage {
     /// A space button, or **Home** (`None`).
     Select(Option<RoomId>),
@@ -256,6 +289,15 @@ pub enum SpacesMessage {
     /// The left button came up over an item of the rail: a click when it
     /// went down on the same item and the pointer has not left it since.
     Release(RailKey),
+    /// While a drag runs: the pointer moved over an item, in this part of it.
+    Over(RailKey, Zone),
+    /// While the button is down: the pointer moved (window coordinates).
+    PointerMoved(Point),
+    /// The left button, or a finger, went down anywhere in the window while a
+    /// press or drag was tracked: its release was missed, so it is cancelled.
+    PointerPressed,
+    /// The left button, or the finger, came up anywhere in the window.
+    PointerReleased,
 }
 
 impl App {
@@ -286,22 +328,109 @@ impl App {
                 if self.rail_hover.as_ref() == Some(&key) {
                     self.rail_hover = None;
                 }
-                if self.rail_pressed.as_ref() == Some(&key) {
-                    self.rail_pressed = None;
-                }
+                self.rail_drag.leave(&key);
                 Task::none()
             }
             SpacesMessage::Press(key) => {
-                self.rail_pressed = Some(key);
+                let draggable = key != RailKey::Home
+                    && matches!(
+                        self.sidebar.state(),
+                        SidebarState::Loaded | SidebarState::Full
+                    );
+                self.rail_drag.press(key, draggable);
                 Task::none()
             }
-            SpacesMessage::Release(key) => {
-                if self.rail_pressed.take().as_ref() == Some(&key) {
-                    self.rail_click(key)
-                } else {
-                    Task::none()
-                }
+            SpacesMessage::Release(key) => match self.rail_drag.release_on(&key) {
+                Outcome::Click(key) => self.rail_click(key),
+                _ => Task::none(),
+            },
+            SpacesMessage::Over(key, zone) => {
+                self.rail_over(key, zone);
+                Task::none()
             }
+            SpacesMessage::PointerMoved(at) => {
+                let _ = self.rail_drag.moved(at);
+                Task::none()
+            }
+            SpacesMessage::PointerPressed => {
+                // A button is down again: the release of the one tracked was
+                // missed. Nothing is dropped.
+                let _ = self.rail_drag.cancel();
+                Task::none()
+            }
+            SpacesMessage::PointerReleased => match self.rail_drag.end() {
+                Outcome::Drop { item, target } => self.rail_drop(&item, &target),
+                _ => Task::none(),
+            },
+        }
+    }
+
+    /// The top-level spaces the core reports, for the drop planner.
+    fn known_spaces(&self) -> Vec<RoomId> {
+        self.spaces.entries().iter().map(|s| s.id.clone()).collect()
+    }
+
+    /// The pointer is over `key`, in `zone`, during a drag: it is a target
+    /// only if dropping there would change something.
+    fn rail_over(&mut self, key: RailKey, zone: Zone) {
+        let Some(item) = self.rail_drag.dragged().cloned() else {
+            return;
+        };
+        let target = Target { item: key, zone };
+        if self.rail_drag.seen(&target) {
+            return;
+        }
+        let known = self.known_spaces();
+        let does_something = self
+            .sidebar
+            .layout()
+            .is_some_and(|layout| !rail_drop::plan(layout, &known, &item, &target).is_empty());
+        self.rail_drag.hover(does_something.then_some(target));
+    }
+
+    /// The drag ended on a target: the same operations the options card
+    /// offers, done as one change and saved once. A refused change leaves the
+    /// layout as it was.
+    fn rail_drop(&mut self, item: &RailKey, target: &Target<RailKey>) -> Task<Message> {
+        let known = self.known_spaces();
+        let Some(layout) = self.sidebar.layout() else {
+            return Task::none();
+        };
+        let ops = rail_drop::plan(layout, &known, item, target);
+        if ops.is_empty() {
+            return Task::none();
+        }
+        let task = match self
+            .sidebar
+            .apply_all_known(ops, &known, &*self.sidebar_store)
+        {
+            Ok(task) => task.discard(),
+            Err(_) => Task::none(),
+        };
+        self.clear_stale_rail_keys();
+        task
+    }
+
+    /// Esc during a drag cancels it. The key is used here, so nothing else
+    /// closes. `None` when no drag runs.
+    pub(crate) fn rail_escape(&mut self, shortcut: Shortcut) -> Option<Task<Message>> {
+        if shortcut != Shortcut::Escape || !self.rail_drag.is_dragging() {
+            return None;
+        }
+        let _ = self.rail_drag.cancel();
+        // The composer's copy of the key must not close another layer.
+        self.escape_spent = false;
+        Some(Task::none())
+    }
+
+    /// The window's pointer, listened to only while the left button is down
+    /// on an item of the rail (the end of a drag is often outside every
+    /// `mouse_area`, which only sees a release over itself).
+    pub fn rail_drag_subscription(&self) -> Subscription<Message> {
+        if self.rail_drag.is_active() {
+            iced::event::listen_with(listener)
+        } else {
+            Subscription::none()
         }
     }
 
@@ -323,6 +452,8 @@ impl App {
     /// gone, dissolved or has none of its spaces reported. Its pointer-exit
     /// would never come.
     pub(crate) fn clear_stale_rail_keys(&mut self) {
+        // The layout or the spaces changed: what was worked out is stale.
+        self.rail_drag.forget_seen();
         let mut drawn: HashSet<RailKey> = HashSet::from([RailKey::Home]);
         for item in self.spaces.rail_items(self.sidebar.layout()) {
             match item {
@@ -337,11 +468,14 @@ impl App {
                 }
             }
         }
-        for slot in [&mut self.rail_hover, &mut self.rail_pressed] {
-            if slot.as_ref().is_some_and(|key| !drawn.contains(key)) {
-                *slot = None;
-            }
+        if self
+            .rail_hover
+            .as_ref()
+            .is_some_and(|key| !drawn.contains(key))
+        {
+            self.rail_hover = None;
         }
+        self.rail_drag.retain(|key| drawn.contains(key));
         self.close_sidebar_menu_if_gone();
     }
 

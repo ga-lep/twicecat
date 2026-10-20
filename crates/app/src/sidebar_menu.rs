@@ -423,7 +423,7 @@ impl App {
             return Task::none();
         }
         self.rail_hover = None;
-        self.rail_pressed = None;
+        self.rail_drag.cancel();
         self.sidebar_menu = Some(SidebarMenu::Card {
             target,
             error: None,

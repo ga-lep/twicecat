@@ -374,6 +374,35 @@ fn rail_states() -> App {
     app
 }
 
+/// A drag of a space in progress on the rail, with the pointer over `over`
+/// in `zone`.
+fn rail_drag_over(over: &str, zone: twicecat_app::drag::Zone) -> App {
+    use twicecat_app::spaces::{RailKey, SpacesMessage};
+
+    let mut app = rail_states();
+    let key = |id: &str| RailKey::Space(rail_space(id));
+    for message in [
+        SpacesMessage::Press(key("default")),
+        SpacesMessage::PointerMoved(iced::Point::new(30.0, 30.0)),
+        SpacesMessage::PointerMoved(iced::Point::new(40.0, 90.0)),
+        SpacesMessage::Over(key(over), zone),
+    ] {
+        press(&mut app, Message::Spaces(message));
+    }
+    app
+}
+
+/// A space dragged to just before another one: the line shows above it.
+fn rail_dragging() -> App {
+    rail_drag_over("mention", twicecat_app::drag::Zone::Before)
+}
+
+/// A space dragged onto the middle of another: the ring shows (a folder
+/// would be made).
+fn rail_dragging_into() -> App {
+    rail_drag_over("unread", twicecat_app::drag::Zone::Into)
+}
+
 /// The options card open on a space of the rail (right-click).
 fn rail_menu() -> App {
     use twicecat_app::sidebar_menu::SidebarMenuMessage;
@@ -3347,6 +3376,16 @@ pub fn scenarios() -> Vec<Scenario> {
                 && a.rail_hover.is_some()
                 && a.query.space.is_some()
                 && a.sidebar.layout().is_some()
+        }),
+        s("rail-dragging", true, rail_dragging, |a| {
+            in_main(a)
+                && a.rail_drag.is_dragging()
+                && a.rail_drag.target().map(|t| t.zone) == Some(twicecat_app::drag::Zone::Before)
+        }),
+        s("rail-dragging-into", true, rail_dragging_into, |a| {
+            in_main(a)
+                && a.rail_drag.is_dragging()
+                && a.rail_drag.target().map(|t| t.zone) == Some(twicecat_app::drag::Zone::Into)
         }),
         s("rail-menu", true, rail_menu, |a| {
             in_main(a)

@@ -395,6 +395,8 @@ fn the_fixture_reaches_every_screen_it_names() {
         "switcher",
         "switcher-empty",
         "switcher-long",
+        "rail-dragging",
+        "rail-dragging-into",
         "rail-menu",
         "rail-folder-name",
         "verification-requested",

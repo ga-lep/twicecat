@@ -28,6 +28,7 @@ use crate::bridge::{self, Bridge, EventsSlot};
 use crate::calls::{self, CallMessage, CallModel};
 use crate::composer::{self, Composer, ComposerKey, EditorAction, SearchStep};
 use crate::dialogs::{self, Clipboard, ClipboardContent, Dialogs, SystemClipboard, SystemDialogs};
+use crate::drag::Drag;
 use crate::emoji;
 use crate::keys;
 use crate::links::{self, LinkBar};
@@ -557,10 +558,9 @@ pub struct App {
     pub sidebar_menu: Option<SidebarMenu>,
     /// The rail item under the pointer.
     pub rail_hover: Option<RailKey>,
-    /// The rail item the left button went down on, until it comes up or the
-    /// pointer leaves the item (a click is a press and a release with no
-    /// movement off the item).
-    pub(crate) rail_pressed: Option<RailKey>,
+    /// The one tracker of the left button on the rail: a press that is a
+    /// click, or becomes a drag of a space or folder (see `drag.rs`).
+    pub rail_drag: Drag<RailKey>,
     /// The thread panel.
     pub threads: ThreadsModel,
     /// The room switcher (Ctrl+K).
@@ -728,7 +728,7 @@ impl App {
             spaces: SpacesModel::default(),
             sidebar_menu: None,
             rail_hover: None,
-            rail_pressed: None,
+            rail_drag: Drag::default(),
             threads: ThreadsModel::default(),
             switcher: crate::switcher::SwitcherModel::default(),
             escape_spent: false,
@@ -1337,6 +1337,8 @@ impl App {
                 // A key release may happen where this window does not see it.
                 self.calls.chord_held = false;
                 if !focused {
+                    // A button released outside the window is never seen.
+                    let _ = self.rail_drag.cancel();
                     self.ptt.window_unfocused();
                     self.stop_capture();
                 }
@@ -1506,7 +1508,10 @@ impl App {
                 // The rail's card and dialog are not in `keys.rs`'s list of
                 // layers (that file is not changed for them): Esc and the
                 // room-stepping chords are settled here, before it.
-                match self.sidebar_menu_shortcut(shortcut) {
+                match self
+                    .rail_escape(shortcut)
+                    .or_else(|| self.sidebar_menu_shortcut(shortcut))
+                {
                     Some(task) => task,
                     None => self.on_shortcut(shortcut, captured),
                 }
@@ -2649,7 +2654,7 @@ impl App {
         self.notification_settings = None;
         self.spaces.clear();
         self.rail_hover = None;
-        self.rail_pressed = None;
+        self.rail_drag = Drag::default();
         self.sidebar_menu = None;
         // Memory only: no sidebar file is touched at logout.
         self.sidebar.unload();
@@ -3105,6 +3110,7 @@ impl App {
             window::resize_events().map(|(_, size)| Message::WindowResized(size.width)),
             tray::subscription(),
             self.ptt.subscription(),
+            self.rail_drag_subscription(),
         ])
     }
 
@@ -3627,7 +3633,7 @@ mod tests {
         use crate::spaces::RailKey;
         use twicecat_core::api::{FolderLayout, RailEntry, SidebarLabel, SidebarLayout, SpaceView};
 
-        fn rid(id: &str) -> RoomId {
+        pub(super) fn rid(id: &str) -> RoomId {
             RoomId::from(id)
         }
 
@@ -3635,7 +3641,7 @@ mod tests {
             EventId::from(format!("${n}:x"))
         }
 
-        fn top_space(id: &str) -> SpaceView {
+        pub(super) fn top_space(id: &str) -> SpaceView {
             SpaceView {
                 id: rid(id),
                 name: id.to_owned(),
@@ -3661,7 +3667,7 @@ mod tests {
 
         /// A main screen for `@a:x` with these spaces reported and this rail
         /// stored, and the store that records the saves.
-        fn menu_app(spaces: &[&str], rail: Vec<RailEntry>) -> (App, MemorySidebar) {
+        pub(super) fn menu_app(spaces: &[&str], rail: Vec<RailEntry>) -> (App, MemorySidebar) {
             let (mut app, _rx) = main_app();
             let store = MemorySidebar::default();
             app.set_sidebar_store(Box::new(store.clone()));
@@ -3683,7 +3689,7 @@ mod tests {
             (app, store)
         }
 
-        fn saves(store: &MemorySidebar) -> Vec<SidebarLayout> {
+        pub(super) fn saves(store: &MemorySidebar) -> Vec<SidebarLayout> {
             store
                 .calls()
                 .into_iter()
@@ -4042,7 +4048,7 @@ mod tests {
                     .is_ok()
             );
             assert_eq!(app.rail_hover, None);
-            assert_eq!(app.rail_pressed, None);
+            assert!(!app.rail_drag.is_active());
         }
 
         #[test]
@@ -4067,6 +4073,303 @@ mod tests {
             open_on(&mut app, RailKey::Space(rid("!a:x")));
             let _ = app.update(core(CoreEvent::LoggedOut));
             assert!(app.sidebar_menu.is_none());
+        }
+    }
+
+    mod rail_dragging {
+        use super::sidebar_menu_flow::{menu_app, rid, saves, top_space};
+        use super::*;
+        use crate::drag::Zone;
+        use crate::keys::Shortcut;
+        use crate::spaces::SpacesMessage as S;
+        use iced::Point;
+        use twicecat_core::api::RailEntry;
+
+        fn send(app: &mut App, message: S) {
+            let _ = app.update(Message::Spaces(message));
+        }
+
+        fn key(id: &str) -> RailKey {
+            RailKey::Space(rid(id))
+        }
+
+        /// Presses `from` and moves 30 px: a drag is running.
+        fn start(app: &mut App, from: &str) {
+            send(app, S::Enter(key(from)));
+            send(app, S::Press(key(from)));
+            send(app, S::PointerMoved(Point::new(10.0, 10.0)));
+            send(app, S::PointerMoved(Point::new(40.0, 10.0)));
+            assert!(app.rail_drag.is_dragging());
+        }
+
+        fn order(app: &App) -> Vec<String> {
+            app.sidebar
+                .layout()
+                .expect("a layout")
+                .rail
+                .iter()
+                .map(|e| match e {
+                    RailEntry::Space(id) => id.as_str().to_owned(),
+                    RailEntry::Folder(f) => format!("[{}]", f.spaces.len()),
+                })
+                .collect()
+        }
+
+        #[test]
+        fn a_drop_before_another_space_moves_it_and_saves_once() {
+            let (mut app, store) = menu_app(&["!a:x", "!b:x", "!c:x"], Vec::new());
+            start(&mut app, "!a:x");
+            send(&mut app, S::Over(key("!c:x"), Zone::Before));
+            assert_eq!(app.rail_drag.target().map(|t| t.zone), Some(Zone::Before));
+            assert!(saves(&store).is_empty(), "nothing is saved before the drop");
+            send(&mut app, S::PointerReleased);
+            assert_eq!(order(&app), ["!b:x", "!a:x", "!c:x"]);
+            assert_eq!(saves(&store).len(), 1);
+            assert!(!app.rail_drag.is_active());
+        }
+
+        #[test]
+        fn a_drop_into_a_space_makes_a_folder_of_the_two() {
+            let (mut app, store) = menu_app(&["!a:x", "!b:x", "!c:x"], Vec::new());
+            start(&mut app, "!a:x");
+            send(&mut app, S::Over(key("!c:x"), Zone::Into));
+            send(&mut app, S::PointerReleased);
+            assert_eq!(order(&app), ["!b:x", "[2]"]);
+            assert_eq!(saves(&store).len(), 1);
+        }
+
+        #[test]
+        fn a_drop_with_no_target_or_onto_itself_or_to_where_it_is_saves_nothing() {
+            let (mut app, store) = menu_app(&["!a:x", "!b:x"], Vec::new());
+            start(&mut app, "!a:x");
+            send(&mut app, S::PointerReleased);
+            start(&mut app, "!a:x");
+            send(&mut app, S::Over(key("!a:x"), Zone::Into));
+            assert!(app.rail_drag.target().is_none(), "no target on itself");
+            send(&mut app, S::PointerReleased);
+            start(&mut app, "!a:x");
+            send(&mut app, S::Over(key("!b:x"), Zone::Before));
+            assert!(app.rail_drag.target().is_none(), "it is already there");
+            send(&mut app, S::Over(RailKey::Home, Zone::After));
+            assert!(app.rail_drag.target().is_none(), "Home is no target");
+            send(&mut app, S::PointerReleased);
+            assert!(saves(&store).is_empty());
+            assert_eq!(order(&app), Vec::<String>::new(), "the layout is untouched");
+        }
+
+        #[test]
+        fn leaving_the_target_drops_nothing() {
+            let (mut app, store) = menu_app(&["!a:x", "!b:x", "!c:x"], Vec::new());
+            start(&mut app, "!a:x");
+            send(&mut app, S::Over(key("!c:x"), Zone::After));
+            send(&mut app, S::Exit(key("!c:x")));
+            send(&mut app, S::PointerReleased);
+            assert!(saves(&store).is_empty());
+        }
+
+        #[test]
+        fn esc_and_losing_the_focus_cancel_and_save_nothing() {
+            for cancel in ["esc", "focus"] {
+                let (mut app, store) = menu_app(&["!a:x", "!b:x", "!c:x"], Vec::new());
+                start(&mut app, "!a:x");
+                send(&mut app, S::Over(key("!c:x"), Zone::After));
+                match cancel {
+                    "esc" => {
+                        let _ = app.update(Message::Shortcut {
+                            shortcut: Shortcut::Escape,
+                            captured: false,
+                        });
+                    }
+                    _ => {
+                        let _ = app.update(Message::WindowFocus(false));
+                    }
+                }
+                assert!(!app.rail_drag.is_active(), "{cancel}");
+                // The release that follows drops nothing.
+                send(&mut app, S::PointerReleased);
+                assert!(saves(&store).is_empty(), "{cancel}");
+            }
+        }
+
+        #[test]
+        fn esc_with_no_drag_is_not_taken_by_the_rail() {
+            let (mut app, _store) = menu_app(&["!a:x", "!b:x"], Vec::new());
+            assert!(app.rail_escape(Shortcut::Escape).is_none());
+            send(&mut app, S::Press(key("!a:x")));
+            assert!(
+                app.rail_escape(Shortcut::Escape).is_none(),
+                "a press is no drag"
+            );
+        }
+
+        #[test]
+        fn a_second_press_during_a_drag_is_ignored() {
+            let (mut app, _store) = menu_app(&["!a:x", "!b:x", "!c:x"], Vec::new());
+            start(&mut app, "!a:x");
+            send(&mut app, S::Press(key("!b:x")));
+            assert_eq!(app.rail_drag.dragged(), Some(&key("!a:x")));
+        }
+
+        #[test]
+        fn a_press_that_wobbles_is_a_click_and_a_drag_is_not() {
+            let (mut app, store) = menu_app(&["!a:x", "!b:x"], Vec::new());
+            send(&mut app, S::Press(key("!a:x")));
+            send(&mut app, S::PointerMoved(Point::new(10.0, 10.0)));
+            send(&mut app, S::PointerMoved(Point::new(12.0, 11.0)));
+            send(&mut app, S::Release(key("!a:x")));
+            send(&mut app, S::PointerReleased);
+            assert_eq!(app.query.space, Some(rid("!a:x")), "a click selects");
+            assert!(saves(&store).is_empty());
+            // The same press moved 30 px is a drag and selects nothing.
+            let (mut app, _store) = menu_app(&["!a:x", "!b:x"], Vec::new());
+            start(&mut app, "!b:x");
+            send(&mut app, S::Release(key("!b:x")));
+            send(&mut app, S::PointerReleased);
+            assert_eq!(app.query.space, None, "a drag is no click");
+        }
+
+        #[test]
+        fn home_and_a_layout_that_cannot_change_are_not_dragged() {
+            let (mut app, _store) = menu_app(&["!a:x", "!b:x"], Vec::new());
+            send(&mut app, S::Press(RailKey::Home));
+            send(&mut app, S::PointerMoved(Point::new(0.0, 0.0)));
+            send(&mut app, S::PointerMoved(Point::new(50.0, 50.0)));
+            assert!(!app.rail_drag.is_dragging());
+            // No layout loaded: arranging is off.
+            let (mut app, _rx) = main_app();
+            let _ = app.update(core(CoreEvent::Spaces(vec![top_space("!a:x")])));
+            send(&mut app, S::Press(key("!a:x")));
+            send(&mut app, S::PointerMoved(Point::new(0.0, 0.0)));
+            send(&mut app, S::PointerMoved(Point::new(50.0, 50.0)));
+            assert!(!app.rail_drag.is_dragging());
+        }
+
+        #[test]
+        fn the_window_listener_runs_only_while_the_button_is_down_on_an_item() {
+            // Iced subscriptions are opaque; their count is what can be seen.
+            use iced::advanced::subscription::into_recipes;
+            let (mut app, _store) = menu_app(&["!a:x", "!b:x"], Vec::new());
+            let count = |app: &App| into_recipes(app.rail_drag_subscription()).len();
+            assert_eq!(count(&app), 0, "idle");
+            send(&mut app, S::Enter(key("!a:x")));
+            assert_eq!(count(&app), 0, "hover alone");
+            send(&mut app, S::Press(key("!a:x")));
+            assert_eq!(count(&app), 1, "pressed");
+            send(&mut app, S::PointerMoved(Point::new(0.0, 0.0)));
+            send(&mut app, S::PointerMoved(Point::new(50.0, 0.0)));
+            assert_eq!(count(&app), 1, "dragging");
+            send(&mut app, S::PointerReleased);
+            assert_eq!(count(&app), 0, "dropped");
+        }
+
+        #[test]
+        fn the_listener_turns_the_cursor_and_the_left_button_into_messages() {
+            use iced::mouse::{Button, Event as M};
+            let ev = |m| crate::spaces::pointer_message(iced::Event::Mouse(m));
+            assert!(matches!(
+                ev(M::CursorMoved {
+                    position: Point::new(1.0, 2.0)
+                }),
+                Some(Message::Spaces(S::PointerMoved(_)))
+            ));
+            assert!(matches!(
+                ev(M::ButtonReleased(Button::Left)),
+                Some(Message::Spaces(S::PointerReleased))
+            ));
+            assert!(ev(M::ButtonReleased(Button::Right)).is_none());
+            assert!(ev(M::ButtonPressed(Button::Right)).is_none());
+        }
+
+        #[test]
+        fn the_listener_handles_touch_and_a_left_press_too() {
+            use iced::mouse::{Button, Event as M};
+            use iced::touch::{Event as T, Finger};
+            let p = Point::new(1.0, 2.0);
+            let f = Finger(1);
+            let ev = |e| crate::spaces::pointer_message(e);
+            let touch = |t| ev(iced::Event::Touch(t));
+            assert!(matches!(
+                touch(T::FingerMoved { id: f, position: p }),
+                Some(Message::Spaces(S::PointerMoved(_)))
+            ));
+            for t in [
+                T::FingerLifted { id: f, position: p },
+                T::FingerLost { id: f, position: p },
+            ] {
+                assert!(matches!(
+                    touch(t),
+                    Some(Message::Spaces(S::PointerReleased))
+                ));
+            }
+            assert!(matches!(
+                touch(T::FingerPressed { id: f, position: p }),
+                Some(Message::Spaces(S::PointerPressed))
+            ));
+            assert!(matches!(
+                ev(iced::Event::Mouse(M::ButtonPressed(Button::Left))),
+                Some(Message::Spaces(S::PointerPressed))
+            ));
+        }
+
+        #[test]
+        fn a_lifted_finger_leaves_no_press_behind_to_start_a_drag_later() {
+            let (mut app, store) = menu_app(&["!a:x", "!b:x", "!c:x"], Vec::new());
+            // A finger goes down on an item and is lifted off it: the item's
+            // own release never comes, the window's does.
+            send(&mut app, S::Press(key("!a:x")));
+            send(&mut app, S::Exit(key("!a:x")));
+            let lifted = crate::spaces::pointer_message(iced::Event::Touch(
+                iced::touch::Event::FingerLifted {
+                    id: iced::touch::Finger(1),
+                    position: Point::new(200.0, 200.0),
+                },
+            ))
+            .expect("a message");
+            let _ = app.update(lifted);
+            // A later mouse move of 50 px starts no drag, and no drop saves.
+            send(&mut app, S::PointerMoved(Point::new(10.0, 10.0)));
+            send(&mut app, S::PointerMoved(Point::new(60.0, 10.0)));
+            assert!(!app.rail_drag.is_active());
+            send(&mut app, S::Over(key("!c:x"), Zone::Before));
+            send(&mut app, S::PointerReleased);
+            assert!(saves(&store).is_empty());
+        }
+
+        #[test]
+        fn a_press_seen_by_the_window_while_one_is_tracked_cancels_it() {
+            // Its release was missed (outside the window, say): the button is
+            // down again, so what was tracked is stale.
+            let (mut app, store) = menu_app(&["!a:x", "!b:x", "!c:x"], Vec::new());
+            send(&mut app, S::Press(key("!a:x")));
+            send(&mut app, S::PointerPressed);
+            send(&mut app, S::PointerMoved(Point::new(10.0, 10.0)));
+            send(&mut app, S::PointerMoved(Point::new(60.0, 10.0)));
+            assert!(!app.rail_drag.is_active());
+            start(&mut app, "!a:x");
+            send(&mut app, S::Over(key("!c:x"), Zone::Before));
+            send(&mut app, S::PointerPressed);
+            send(&mut app, S::PointerReleased);
+            assert!(saves(&store).is_empty());
+            assert!(!app.rail_drag.is_active());
+        }
+
+        #[test]
+        fn the_same_item_and_zone_is_planned_once_while_the_pointer_moves_in_it() {
+            let (mut app, _store) = menu_app(&["!a:x", "!b:x", "!c:x"], Vec::new());
+            start(&mut app, "!a:x");
+            let before = crate::rail_drop::plan_runs();
+            for _ in 0..20 {
+                send(&mut app, S::Over(key("!c:x"), Zone::After));
+            }
+            assert_eq!(crate::rail_drop::plan_runs() - before, 1);
+            assert!(app.rail_drag.target().is_some());
+            send(&mut app, S::Over(key("!c:x"), Zone::Before));
+            assert_eq!(crate::rail_drop::plan_runs() - before, 2, "a new zone");
+            // Leaving and coming back shows the target again.
+            send(&mut app, S::Exit(key("!c:x")));
+            assert!(app.rail_drag.target().is_none());
+            send(&mut app, S::Over(key("!c:x"), Zone::Before));
+            assert!(app.rail_drag.target().is_some());
         }
     }
 
@@ -4138,11 +4441,11 @@ mod tests {
             let _ = app.update(Message::Spaces(SpacesMessage::Enter(key.clone())));
             let _ = app.update(Message::Spaces(SpacesMessage::Press(key.clone())));
             assert_eq!(app.rail_hover, Some(key.clone()));
-            assert_eq!(app.rail_pressed, Some(key));
+            assert!(app.rail_drag.is_active());
             // The core no longer reports its spaces: the folder is not drawn.
             let _ = app.update(core(CoreEvent::Spaces(vec![top_space("!other:x")])));
             assert_eq!(app.rail_hover, None);
-            assert_eq!(app.rail_pressed, None);
+            assert!(!app.rail_drag.is_active());
         }
 
         #[test]

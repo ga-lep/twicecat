@@ -285,12 +285,29 @@ impl SidebarModel {
         known: &[RoomId],
         store: &dyn SidebarStore,
     ) -> Result<Task<bool>, Refused> {
+        self.apply_all_known(vec![op], known, store)
+    }
+
+    /// [`Self::apply_known`] for several operations that make one change: the
+    /// steps of a drop. They are done in order on a copy; if any is refused
+    /// nothing changes, and the result is saved once, or not at all when no
+    /// step changed anything.
+    pub fn apply_all_known(
+        &mut self,
+        ops: Vec<Op>,
+        known: &[RoomId],
+        store: &dyn SidebarStore,
+    ) -> Result<Task<bool>, Refused> {
         self.check_open()?;
         let (Some(account), Some(current)) = (self.account.clone(), self.layout.as_ref()) else {
             return Err(Refused::NotLoaded);
         };
         let mut next = current.clone();
-        if change(&mut next, op, known)? == Change::Nothing {
+        let mut changed = false;
+        for op in ops {
+            changed |= change(&mut next, op, known)? == Change::Done;
+        }
+        if !changed {
             return Ok(Task::none());
         }
         if !next.fits() {
@@ -389,6 +406,30 @@ fn change(layout: &mut SidebarLayout, op: Op, known: &[RoomId]) -> Result<Change
         }
     }
     Ok(Change::Done)
+}
+
+/// Does `op` on `layout` and says whether it changed anything: how a drop is
+/// worked out step by step on a copy (see `rail_drop`).
+pub(crate) fn simulate(
+    layout: &mut SidebarLayout,
+    op: Op,
+    known: &[RoomId],
+) -> Result<bool, Refused> {
+    Ok(change(layout, op, known)? == Change::Done)
+}
+
+/// A copy of `layout` with the rail written down as it is drawn (see
+/// `materialize`).
+pub(crate) fn materialized(layout: &SidebarLayout, known: &[RoomId]) -> SidebarLayout {
+    let mut copy = layout.clone();
+    materialize(&mut copy, known);
+    copy
+}
+
+/// Whether the rail draws `entry`: a space the core reports, or a folder with
+/// at least one.
+pub(crate) fn is_drawn(entry: &RailEntry, known: &[RoomId]) -> bool {
+    drawn(entry, known)
 }
 
 fn folder_mut(layout: &mut SidebarLayout, id: u16) -> Option<&mut FolderLayout> {

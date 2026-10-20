@@ -22,6 +22,8 @@ use iced::{Background, Color, Element, Padding, border, mouse};
 use twicecat_core::api::{SpaceView, UnreadCountsView};
 
 use crate::avatars::{AvatarState, Avatars, NEUTRAL_INITIALS, initials, placeholder_color};
+use crate::drag::Zone;
+use crate::sidebar::SidebarState;
 use crate::sidebar_menu::SidebarMenuMessage;
 use crate::spaces::{RailFolder, RailItem, RailKey, SpacesMessage};
 use crate::state::{App, Message};
@@ -157,6 +159,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
     let mut items: Column<'_, Message> = Column::new().spacing(4).padding([6, 0]);
     let home = home_counts(app);
     items = items.push(slot(Slot {
+        cue: cue(app, &RailKey::Home),
         key: RailKey::Home,
         icon: round(Icon::Home.glyph().to_owned(), None, ICON / 2.0),
         state: ItemState::of(
@@ -199,8 +202,50 @@ fn folder_name(folder: &RailFolder<'_>) -> String {
     }
 }
 
+/// Thickness of the line that shows where a drop would put the item.
+const DROP_LINE: f32 = 3.0;
+
+/// What dragging shows on and does to one slot.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Cue {
+    /// Where a drop on this slot would land, while a drag runs.
+    mark: Option<Zone>,
+    /// The cursor over the slot: `Grab` for what can be dragged, `Grabbing`
+    /// during a drag, `Pointer` otherwise.
+    cursor: mouse::Interaction,
+    /// A drag runs: the slot reports the pointer's place in it.
+    dragging: bool,
+}
+
+/// The cue of the slot of `key`.
+fn cue(app: &App, key: &RailKey) -> Cue {
+    let dragging = app.rail_drag.is_dragging();
+    let may_drag = *key != RailKey::Home
+        && matches!(
+            app.sidebar.state(),
+            SidebarState::Loaded | SidebarState::Full
+        );
+    let cursor = if dragging {
+        mouse::Interaction::Grabbing
+    } else if may_drag {
+        mouse::Interaction::Grab
+    } else {
+        mouse::Interaction::Pointer
+    };
+    Cue {
+        mark: app
+            .rail_drag
+            .target()
+            .filter(|target| target.item == *key)
+            .map(|target| target.zone),
+        cursor,
+        dragging,
+    }
+}
+
 /// Everything one slot needs.
 struct Slot<'a> {
+    cue: Cue,
     key: RailKey,
     icon: Element<'a, Message>,
     state: ItemState,
@@ -218,6 +263,7 @@ fn space_slot<'a>(app: &'a App, space: &'a SpaceView, width: f32) -> Element<'a,
         is_unread(&counts),
     );
     slot(Slot {
+        cue: cue(app, &key),
         key,
         icon: space_icon(space, ICON, icon_radius(state), &app.avatars),
         state,
@@ -243,6 +289,7 @@ fn folder_view<'a>(app: &'a App, folder: &RailFolder<'a>) -> Element<'a, Message
         is_unread(&counts),
     );
     let head = slot(Slot {
+        cue: cue(app, &key),
         key,
         icon: folder_icon(folder, icon_radius(state), &app.avatars),
         state,
@@ -281,6 +328,7 @@ fn band_style(t: &iced::Theme) -> container::Style {
 /// the bottom right, in a `mouse_area` and a tooltip.
 fn slot(slot: Slot<'_>) -> Element<'_, Message> {
     let Slot {
+        cue,
         key,
         icon,
         state,
@@ -316,12 +364,33 @@ fn slot(slot: Slot<'_>) -> Element<'_, Message> {
                 }),
         );
     }
+    match cue.mark {
+        Some(Zone::Before) => layers = layers.push(drop_line(width, true)),
+        Some(Zone::After) => layers = layers.push(drop_line(width, false)),
+        Some(Zone::Into) => {
+            layers = layers.push(
+                container(ring(icon_radius(state)))
+                    .center_x(width)
+                    .center_y(SLOT_HEIGHT),
+            );
+        }
+        None => {}
+    }
     let mut area = mouse_area(layers)
-        .interaction(mouse::Interaction::Pointer)
+        .interaction(cue.cursor)
         .on_enter(Message::Spaces(SpacesMessage::Enter(key.clone())))
         .on_exit(Message::Spaces(SpacesMessage::Exit(key.clone())))
         .on_press(Message::Spaces(SpacesMessage::Press(key.clone())))
         .on_release(Message::Spaces(SpacesMessage::Release(key.clone())));
+    if cue.dragging {
+        let at = key.clone();
+        area = area.on_move(move |point| {
+            Message::Spaces(SpacesMessage::Over(
+                at.clone(),
+                Zone::of(point.y, SLOT_HEIGHT),
+            ))
+        });
+    }
     // A right-click opens the item's options card (Home has none).
     if key != RailKey::Home {
         area = area.on_right_press(Message::SidebarMenu(SidebarMenuMessage::Open(key)));
@@ -335,6 +404,26 @@ fn slot(slot: Slot<'_>) -> Element<'_, Message> {
     )
     .delay(TOOLTIP_DELAY)
     .into()
+}
+
+/// The line at the top or bottom of a slot where a drop would put the
+/// dragged item: the focus colour, as wide as the slot less a margin.
+fn drop_line<'a>(width: f32, top: bool) -> Element<'a, Message> {
+    let line =
+        container(space().width(width - 16.0).height(DROP_LINE)).style(|t| container::Style {
+            background: Some(Background::Color(theme::semantic(t).focus)),
+            border: border::rounded(DROP_LINE / 2.0),
+            ..container::Style::default()
+        });
+    let slot = container(line)
+        .width(width)
+        .height(SLOT_HEIGHT)
+        .center_x(width);
+    if top {
+        slot.align_top(SLOT_HEIGHT).into()
+    } else {
+        slot.align_bottom(SLOT_HEIGHT).into()
+    }
 }
 
 /// The pill: the text colour, round on its right side only.
