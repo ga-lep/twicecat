@@ -12,6 +12,7 @@ mod diff;
 mod media;
 mod rooms;
 mod security;
+pub mod sidebar;
 mod types;
 mod updates;
 mod video;
@@ -41,6 +42,10 @@ pub use security::{
     CancelReason, CrossSigning, DeviceSummary, DeviceTrust, DeviceVerification, QrImage,
     ReauthAction, RecoveryKey, RecoveryProgress, RecoveryStatus, SasEmoji, SecurityStatus, Shield,
     ShieldCode, UserTrust, UtdReason, VerificationId, VerificationPeer, VerificationPhase,
+};
+pub use sidebar::{
+    CustomSection, FolderLayout, RailEntry, SectionKey, SidebarLabel, SidebarLabelError,
+    SidebarLayout, SidebarRead, SpaceLayout,
 };
 pub use types::{
     ActionKind, AuthUrl, AvatarId, AvatarImage, Block, CoreError, DeviceId, Draft, EventId, Inline,
