@@ -1329,6 +1329,77 @@ fn the_slots_follow_the_layout_at_every_width_and_the_room_pane_keeps_its_place(
     }
 }
 
+/// The 72 px slots of the spaces rail, in window coordinates: the outermost
+/// nodes that are 48 px high and as wide as the rail (or 4 px less, inside an
+/// open folder).
+fn rail_slots<'n>(node: &'n Node, at: iced::Point, out: &mut Vec<(Rectangle, &'n Node)>) {
+    let b = node.bounds();
+    let here = iced::Point::new(at.x + b.x, at.y + b.y);
+    if b.height == 48.0 && (b.width == 72.0 || b.width == 68.0) {
+        out.push((Rectangle::new(here, b.size()), node));
+        return;
+    }
+    for child in node.children() {
+        rail_slots(child, here, out);
+    }
+}
+
+#[test]
+fn rail_states_draws_every_slot_whole_and_apart_at_every_width() {
+    let renderer = renderer();
+    let scenario = fixture::scenarios()
+        .into_iter()
+        .find(|s| s.name == "rail-states")
+        .expect("the rail-states scenario");
+    for variant in variants(true) {
+        let mut app = (scenario.build)();
+        apply(&mut app, variant);
+        for width in [1280.0, 1000.0, 720.0] {
+            let size = Size::new(width, 800.0);
+            app.window_width = width;
+            let shown = app.pane_layout().sidebar;
+            let laid = Laid::new(&app, &renderer, size);
+            let what = format!("{} at {width}", variant.tag());
+            let pane = &panes_row(&laid).children()[0];
+            let mut slots = Vec::new();
+            rail_slots(pane, iced::Point::ORIGIN, &mut slots);
+            if !shown {
+                assert_eq!(pane.bounds().width, 0.0, "{what}: the rail is hidden");
+                assert!(slots.is_empty(), "{what}");
+                continue;
+            }
+            // Home, five spaces, a closed folder, an open folder and its two
+            // spaces.
+            assert_eq!(slots.len(), 10, "{what}");
+            for (i, (a, _)) in slots.iter().enumerate() {
+                assert!(
+                    a.x >= -0.5 && a.x + a.width <= 72.5,
+                    "{what}: slot {i} is outside the rail: {a:?}"
+                );
+                for (b, _) in &slots[i + 1..] {
+                    assert!(!overlap(a, b), "{what}: {a:?} overlaps {b:?}");
+                }
+            }
+            // Every part of a slot (icon, pill, badge) is inside it.
+            for (i, (rect, node)) in slots.iter().enumerate() {
+                let origin = iced::Point::new(rect.x - node.bounds().x, rect.y - node.bounds().y);
+                let mut leaves = Vec::new();
+                painted_leaves(node, origin, &mut leaves);
+                assert!(!leaves.is_empty(), "{what}: slot {i} draws nothing");
+                for leaf in leaves {
+                    assert!(
+                        leaf.x >= rect.x - 0.5
+                            && leaf.y >= rect.y - 0.5
+                            && leaf.x + leaf.width <= rect.x + rect.width + 0.5
+                            && leaf.y + leaf.height <= rect.y + rect.height + 0.5,
+                        "{what}: slot {i}: {leaf:?} is outside {rect:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Ctrl + wheel is the zoom gesture, and a `pick_list` with a value takes it
 /// as "pick the next option": over the header's notification menu that would
 /// silently mute a room. Sweep the top of the window, wide and narrow.

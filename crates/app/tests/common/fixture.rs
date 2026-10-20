@@ -267,6 +267,113 @@ fn main_no_room() -> App {
     app
 }
 
+// ---- The spaces rail ----------------------------------------------------
+
+/// The ID of a space of the rail scenario.
+pub fn rail_space(name: &str) -> RoomId {
+    room(&format!("rail-{name}"))
+}
+
+/// The rail with every state side by side: default, hover, unread, mentions
+/// and selected spaces, Home with a count, a collapsed folder (2 x 2
+/// preview) and an open one with a mention inside.
+fn rail_states() -> App {
+    use twicecat_app::sidebar_store::SidebarLoad;
+    use twicecat_app::spaces::{RailKey, SpacesMessage};
+    use twicecat_core::api::{
+        FolderLayout, RailEntry, SidebarLabel, SidebarLayout, SpaceUnreadView, UnreadCountsView,
+    };
+
+    let mut app = main_no_room();
+    let names = [
+        ("default", "Homelab"),
+        ("hover", "Hover Hall"),
+        ("unread", "Quiet Lab"),
+        ("mention", "Boredlabs"),
+        ("selected", "Selected Hub"),
+        ("fa", "Rust"),
+        ("fb", "Vue"),
+        ("fc", "Go"),
+        ("fd", "Zig"),
+        ("ga", "Garden"),
+        ("gb", "Kitchen"),
+    ];
+    let spaces = names
+        .iter()
+        .map(|(id, name)| SpaceView {
+            id: rail_space(id),
+            name: (*name).to_owned(),
+            avatar: None,
+            level: 0,
+            children: 3,
+            rooms: Vec::new(),
+        })
+        .collect();
+    feed(&mut app, CoreEvent::Spaces(spaces));
+    let counts = |notifications, highlights, unread| UnreadCountsView {
+        notifications,
+        highlights,
+        unread,
+    };
+    feed(
+        &mut app,
+        CoreEvent::SpaceUnread {
+            spaces: vec![
+                SpaceUnreadView {
+                    space: rail_space("unread"),
+                    counts: counts(0, 0, true),
+                },
+                SpaceUnreadView {
+                    space: rail_space("mention"),
+                    counts: counts(12, 3, true),
+                },
+                SpaceUnreadView {
+                    space: rail_space("fb"),
+                    counts: counts(130, 0, true),
+                },
+                SpaceUnreadView {
+                    space: rail_space("gb"),
+                    counts: counts(4, 1, true),
+                },
+            ],
+            outside: counts(7, 0, true),
+        },
+    );
+    let mut layout = SidebarLayout::new(user("me"));
+    layout.rail = vec![
+        RailEntry::Space(rail_space("default")),
+        RailEntry::Space(rail_space("hover")),
+        RailEntry::Space(rail_space("unread")),
+        RailEntry::Space(rail_space("mention")),
+        RailEntry::Space(rail_space("selected")),
+        RailEntry::Folder(FolderLayout {
+            id: 1,
+            name: Some(SidebarLabel::try_from("Languages").expect("a valid name")),
+            open: false,
+            spaces: ["fa", "fb", "fc", "fd"].map(rail_space).to_vec(),
+        }),
+        RailEntry::Folder(FolderLayout {
+            id: 2,
+            name: None,
+            open: true,
+            spaces: ["ga", "gb"].map(rail_space).to_vec(),
+        }),
+    ];
+    press(
+        &mut app,
+        Message::SidebarLoaded(user("me"), SidebarLoad::Layout(layout)),
+    );
+    press(
+        &mut app,
+        Message::Spaces(SpacesMessage::Select(Some(rail_space("selected")))),
+    );
+    press(
+        &mut app,
+        Message::Spaces(SpacesMessage::Enter(RailKey::Space(rail_space("hover")))),
+    );
+    app
+}
+
 // ---- Timeline -----------------------------------------------------------
 
 fn run(text: &str, style: TextStyle) -> Inline {
@@ -3202,6 +3309,13 @@ pub fn scenarios() -> Vec<Scenario> {
         }),
         s("stopped", false, stopped, |a| {
             a.screen == Screen::Disconnected
+        }),
+        s("rail-states", true, rail_states, |a| {
+            in_main(a)
+                && a.spaces.entries().len() == 11
+                && a.rail_hover.is_some()
+                && a.query.space.is_some()
+                && a.sidebar.layout().is_some()
         }),
         s("main-no-room", true, main_no_room, |a| {
             in_main(a) && a.selected.is_none() && a.rooms.len() > 10

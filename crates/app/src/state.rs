@@ -44,7 +44,7 @@ use crate::sessions::{SessionsMessage, SessionsModel, logout_needs_warning};
 use crate::settings::{NoSettingsStore, SettingsMessage, SettingsModel, SettingsStore};
 use crate::sidebar::{Op as SidebarOp, Refused as SidebarRefused, SidebarModel};
 use crate::sidebar_store::{NoSidebarStore, SidebarLoad, SidebarStore};
-use crate::spaces::{SpacesMessage, SpacesModel};
+use crate::spaces::{RailKey, SpacesMessage, SpacesModel};
 use crate::text_safety;
 use crate::themes::Loaded;
 use crate::threads::{ThreadsMessage, ThreadsModel};
@@ -545,11 +545,17 @@ pub struct App {
     /// The Settings screen.
     pub settings_ui: SettingsModel,
     pub(crate) settings_store: Box<dyn SettingsStore>,
-    /// The logged-in account's sidebar layout (no screen shows it yet).
+    /// The logged-in account's sidebar layout (the rail shows its order and folders).
     pub sidebar: SidebarModel,
     pub(crate) sidebar_store: Box<dyn SidebarStore>,
     /// The spaces the user is in (the sidebar).
     pub spaces: SpacesModel,
+    /// The rail item under the pointer.
+    pub rail_hover: Option<RailKey>,
+    /// The rail item the left button went down on, until it comes up or the
+    /// pointer leaves the item (a click is a press and a release with no
+    /// movement off the item).
+    pub(crate) rail_pressed: Option<RailKey>,
     /// The thread panel.
     pub threads: ThreadsModel,
     /// The room switcher (Ctrl+K).
@@ -715,6 +721,8 @@ impl App {
             sidebar: SidebarModel::default(),
             sidebar_store: Box::new(NoSidebarStore),
             spaces: SpacesModel::default(),
+            rail_hover: None,
+            rail_pressed: None,
             threads: ThreadsModel::default(),
             switcher: crate::switcher::SwitcherModel::default(),
             escape_spent: false,
@@ -1474,7 +1482,7 @@ impl App {
                 }
                 Task::none()
             }
-            Message::Spaces(SpacesMessage::Select(space)) => self.select_space(space),
+            Message::Spaces(message) => self.on_rail(message),
             Message::Threads(message) => self.on_threads(message),
             Message::Shortcut { shortcut, captured } => self.on_shortcut(shortcut, captured),
             Message::Switcher(message) => self.on_switcher(message),
@@ -1958,8 +1966,7 @@ impl App {
                 self.tray
                     .set_unread(notifications, self.ui_settings.tray_badge);
             }
-            // The rail's badges read this in a later step; nothing uses it yet.
-            CoreEvent::SpaceUnread { .. } => {}
+            CoreEvent::SpaceUnread { spaces, outside } => self.on_space_unread(spaces, outside),
             CoreEvent::RoomCreated { room_id } => task = self.on_room_created(room_id),
             CoreEvent::RoomJoined { room_id } => task = self.on_room_joined(room_id),
             CoreEvent::RoomDetails(details) => task = self.on_room_details(details),
@@ -2613,6 +2620,8 @@ impl App {
         self.settings_ui = SettingsModel::default();
         self.notification_settings = None;
         self.spaces.clear();
+        self.rail_hover = None;
+        self.rail_pressed = None;
         // Memory only: no sidebar file is touched at logout.
         self.sidebar.unload();
         self.reset_threads();
@@ -3465,6 +3474,36 @@ mod tests {
             // A refused change saves nothing.
             assert!(app.apply_sidebar(Op::ToggleFolder(9)).is_err());
             assert_eq!(saves(&store).len(), 1);
+        }
+
+        #[test]
+        fn a_click_on_a_folder_toggles_it_and_saves_once() {
+            use crate::spaces::{RailKey, SpacesMessage};
+            let (mut app, store) = sidebar_app();
+            log_in(&mut app, "@a:x");
+            answer(&mut app, "@a:x", SidebarLoad::Layout(layout_for("@a:x")));
+            let open = |app: &App| match &app.sidebar.layout().expect("a layout").rail[0] {
+                RailEntry::Folder(f) => f.open,
+                RailEntry::Space(_) => unreachable!(),
+            };
+            let key = RailKey::Folder(1);
+            // A press alone, or a release alone, does nothing.
+            let _ = app.update(Message::Spaces(SpacesMessage::Press(key.clone())));
+            assert!(saves(&store).is_empty());
+            let _ = app.update(Message::Spaces(SpacesMessage::Release(key.clone())));
+            assert!(open(&app));
+            assert_eq!(saves(&store).len(), 1);
+            let _ = app.update(Message::Spaces(SpacesMessage::Release(key.clone())));
+            assert_eq!(saves(&store).len(), 1, "a release alone is no click");
+            let _ = app.update(Message::Spaces(SpacesMessage::Press(key.clone())));
+            let _ = app.update(Message::Spaces(SpacesMessage::Release(key)));
+            assert!(!open(&app));
+            assert_eq!(saves(&store).len(), 2);
+            // A folder the layout does not have saves nothing.
+            let ghost = RailKey::Folder(9);
+            let _ = app.update(Message::Spaces(SpacesMessage::Press(ghost.clone())));
+            let _ = app.update(Message::Spaces(SpacesMessage::Release(ghost)));
+            assert_eq!(saves(&store).len(), 2);
         }
 
         #[test]
@@ -10561,6 +10600,93 @@ mod tests {
             };
             assert_eq!((q.space.clone(), q.tab), (None, RoomListTab::Rooms));
             assert_eq!(app.query.space, None);
+        }
+
+        #[test]
+        fn space_unread_updates_the_badges_and_home_shows_what_is_outside() {
+            use crate::screens::spaces_sidebar::home_counts;
+            use twicecat_core::api::{SpaceUnreadView, UnreadCountsView};
+            let (mut app, _rx) = spaces_app();
+            let c = |n, h| UnreadCountsView {
+                notifications: n,
+                highlights: h,
+                unread: n > 0,
+            };
+            let _ = app.update(core(CoreEvent::SpaceUnread {
+                spaces: vec![SpaceUnreadView {
+                    space: RoomId::from("!s1:x"),
+                    counts: c(4, 2),
+                }],
+                outside: c(7, 0),
+            }));
+            assert_eq!(app.spaces.unread_for(&RoomId::from("!s1:x")), c(4, 2));
+            assert_eq!(app.spaces.unread_for(&RoomId::from("!s2:x")), c(0, 0));
+            assert_eq!(app.spaces.outside(), c(7, 0));
+            assert_eq!(home_counts(&app), c(7, 0), "Home shows the rooms outside");
+            // The next event replaces the last one.
+            let _ = app.update(core(CoreEvent::SpaceUnread {
+                spaces: Vec::new(),
+                outside: c(0, 0),
+            }));
+            assert_eq!(app.spaces.unread_for(&RoomId::from("!s1:x")), c(0, 0));
+            assert_eq!(home_counts(&app), c(0, 0));
+        }
+
+        #[test]
+        fn a_click_is_a_press_and_a_release_on_one_item_with_no_leaving() {
+            use crate::spaces::RailKey;
+            let (mut app, mut rx) = spaces_app();
+            let s1 = RailKey::Space(RoomId::from("!s1:x"));
+            let s2 = RailKey::Space(RoomId::from("!s2:x"));
+            let msg = |m: SpacesMessage| Message::Spaces(m);
+            // A release with no press selects nothing.
+            let _ = app.update(msg(SpacesMessage::Release(s1.clone())));
+            assert!(drain(&mut rx).is_empty());
+            // Pressed on one item, released over another: no click.
+            let _ = app.update(msg(SpacesMessage::Press(s1.clone())));
+            let _ = app.update(msg(SpacesMessage::Release(s2.clone())));
+            assert!(drain(&mut rx).is_empty());
+            // Pressed, left the item, came back: the movement ends the click.
+            let _ = app.update(msg(SpacesMessage::Press(s1.clone())));
+            let _ = app.update(msg(SpacesMessage::Exit(s1.clone())));
+            let _ = app.update(msg(SpacesMessage::Enter(s1.clone())));
+            let _ = app.update(msg(SpacesMessage::Release(s1.clone())));
+            assert!(drain(&mut rx).is_empty());
+            // A click selects, as `Select` did.
+            let _ = app.update(msg(SpacesMessage::Press(s1.clone())));
+            let _ = app.update(msg(SpacesMessage::Release(s1)));
+            let sent = drain(&mut rx);
+            let [q] = queries(&sent)[..] else {
+                panic!("one query expected: {sent:?}")
+            };
+            assert_eq!(q.space, Some(RoomId::from("!s1:x")));
+            // And a click on Home goes back.
+            let _ = app.update(msg(SpacesMessage::Press(RailKey::Home)));
+            let _ = app.update(msg(SpacesMessage::Release(RailKey::Home)));
+            let sent = drain(&mut rx);
+            let [q] = queries(&sent)[..] else {
+                panic!("one query expected: {sent:?}")
+            };
+            assert_eq!(q.space, None);
+        }
+
+        #[test]
+        fn hover_follows_enter_and_exit_and_a_vanished_space_is_forgotten() {
+            use crate::spaces::RailKey;
+            let (mut app, _rx) = spaces_app();
+            let s1 = RailKey::Space(RoomId::from("!s1:x"));
+            let s2 = RailKey::Space(RoomId::from("!s2:x"));
+            let _ = app.update(Message::Spaces(SpacesMessage::Enter(s1.clone())));
+            assert_eq!(app.rail_hover, Some(s1.clone()));
+            let _ = app.update(Message::Spaces(SpacesMessage::Enter(s2.clone())));
+            // A late exit of the item left earlier does not clear the new one.
+            let _ = app.update(Message::Spaces(SpacesMessage::Exit(s1)));
+            assert_eq!(app.rail_hover, Some(s2.clone()));
+            let _ = app.update(Message::Spaces(SpacesMessage::Exit(s2.clone())));
+            assert_eq!(app.rail_hover, None);
+            let _ = app.update(Message::Spaces(SpacesMessage::Enter(s2)));
+            let _ = app.update(core(CoreEvent::Spaces(vec![space("!s1:x", 0)])));
+            assert_eq!(app.rail_hover, None, "its space is gone");
         }
 
         #[test]
