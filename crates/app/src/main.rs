@@ -13,6 +13,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use twicecat_app::settings::DiskSettings;
+use twicecat_app::sidebar_store::DiskSidebar;
 use twicecat_app::state::App;
 use twicecat_app::ui;
 use twicecat_app::{Bridge, Startup, TITLE};
@@ -130,6 +131,7 @@ fn run(options: Options) -> Result<(), String> {
     // Read before the window opens so the stored choices apply from the start.
     let ui_settings = data.read_settings();
     let settings_store = DiskSettings::new(data.clone());
+    let sidebar_store = DiskSidebar::new(data.clone());
     // An earlier run's report first, then this run's hook (Task 10).
     let crash_dir = data.root().to_path_buf();
     let crash = (crash_dir.clone(), twicecat_app::crash::newest(&crash_dir));
@@ -156,7 +158,14 @@ fn run(options: Options) -> Result<(), String> {
     // The app (and with it the bridge and the core's runtime) is dropped when
     // `run` returns, before the temporary directory is removed.
     let application = iced::application(
-        App::booter(startup, ui_settings, settings_store, crash, data_for_themes),
+        App::booter(
+            startup,
+            ui_settings,
+            settings_store,
+            sidebar_store,
+            crash,
+            data_for_themes,
+        ),
         App::update,
         App::view,
     );

@@ -42,6 +42,8 @@ use crate::screens::{self, loading, main_view};
 use crate::security::{Busy, SecurityMessage, SecurityModel};
 use crate::sessions::{SessionsMessage, SessionsModel, logout_needs_warning};
 use crate::settings::{NoSettingsStore, SettingsMessage, SettingsModel, SettingsStore};
+use crate::sidebar::{Op as SidebarOp, Refused as SidebarRefused, SidebarModel};
+use crate::sidebar_store::{NoSidebarStore, SidebarLoad, SidebarStore};
 use crate::spaces::{SpacesMessage, SpacesModel};
 use crate::text_safety;
 use crate::themes::Loaded;
@@ -200,6 +202,9 @@ pub enum Message {
     Core(Box<CoreEvent>),
     /// The core's event channel closed.
     CoreClosed,
+    /// A sidebar layout was read for this account (the answer to the load a
+    /// login starts). Its `Debug` shows counts only.
+    SidebarLoaded(UserId, SidebarLoad),
     /// The system theme mode, at boot or after a change.
     ThemeMode(theme::Mode),
     /// The server field changed.
@@ -540,6 +545,9 @@ pub struct App {
     /// The Settings screen.
     pub settings_ui: SettingsModel,
     pub(crate) settings_store: Box<dyn SettingsStore>,
+    /// The logged-in account's sidebar layout (no screen shows it yet).
+    pub sidebar: SidebarModel,
+    pub(crate) sidebar_store: Box<dyn SidebarStore>,
     /// The spaces the user is in (the sidebar).
     pub spaces: SpacesModel,
     /// The thread panel.
@@ -704,6 +712,8 @@ impl App {
             rooms_ui: RoomsModel::default(),
             settings_ui: SettingsModel::default(),
             settings_store: Box::new(NoSettingsStore),
+            sidebar: SidebarModel::default(),
+            sidebar_store: Box::new(NoSidebarStore),
             spaces: SpacesModel::default(),
             threads: ThreadsModel::default(),
             switcher: crate::switcher::SwitcherModel::default(),
@@ -763,6 +773,7 @@ impl App {
         startup: Startup,
         ui_settings: UiSettings,
         store: impl SettingsStore + Clone + 'static,
+        sidebar_store: impl SidebarStore + Clone + 'static,
         crash: (std::path::PathBuf, Option<crate::crash::PendingReport>),
         paths: DataPaths,
     ) -> impl Fn() -> (App, Task<Message>) {
@@ -779,6 +790,7 @@ impl App {
             app.updates.mechanism = twicecat_core::api::UpdateMechanism::current();
             let task = Task::batch([task, app.start_update_checks()]);
             app.set_settings_store(Box::new(store.clone()));
+            app.set_sidebar_store(Box::new(sidebar_store.clone()));
             app.data_paths = paths.clone();
             // The first read of the themes folder runs off the UI thread; the
             // window shows Twicecat until it is done.
@@ -804,6 +816,20 @@ impl App {
     /// Replaces where the local settings are written (tests use a fake).
     pub fn set_settings_store(&mut self, store: Box<dyn SettingsStore>) {
         self.settings_store = store;
+    }
+
+    /// Replaces where the sidebar layout is kept (tests use a fake).
+    pub fn set_sidebar_store(&mut self, store: Box<dyn SidebarStore>) {
+        self.sidebar_store = store;
+    }
+
+    /// Does a change of the sidebar layout and saves it. Refused (and nothing
+    /// saved) when no layout is loaded, when the stored file is protected or
+    /// when the layout would pass a limit.
+    pub fn apply_sidebar(&mut self, op: SidebarOp) -> Result<Task<Message>, SidebarRefused> {
+        self.sidebar
+            .apply(op, &*self.sidebar_store)
+            .map(Task::discard)
     }
 
     /// The loaded looks of the stored theme name (ASCII capitals do not
@@ -1412,6 +1438,10 @@ impl App {
             },
             Message::Security(message) => self.on_security(message),
             Message::Update(message) => self.on_update(message),
+            Message::SidebarLoaded(account, load) => {
+                self.sidebar.loaded(&account, load);
+                Task::none()
+            }
             Message::Crash(message) => self.on_crash(message),
             Message::Verification(message) => self.on_verification(message),
             Message::Sessions(message) => self.on_sessions(message),
@@ -1662,6 +1692,13 @@ impl App {
                 self.security.fresh_login = !restored;
                 self.room_modes.clear();
                 self.folding.clear();
+                // The layout of this account only; nothing is written.
+                let account = user_id.clone();
+                let load = self
+                    .sidebar
+                    .load_for(user_id.clone(), &*self.sidebar_store)
+                    .map(move |load| Message::SidebarLoaded(account.clone(), load));
+                task = Task::batch([task, load]);
                 self.user_id = Some(user_id);
                 self.notice = None;
                 self.end_login_attempt();
@@ -2574,6 +2611,8 @@ impl App {
         self.settings_ui = SettingsModel::default();
         self.notification_settings = None;
         self.spaces.clear();
+        // Memory only: no sidebar file is touched at logout.
+        self.sidebar.unload();
         self.reset_threads();
         self.notice = Some(notice.to_owned());
         self.end_login_attempt();
@@ -3329,6 +3368,172 @@ mod tests {
         logged_in(&mut app);
         let _ = app.update(core(CoreEvent::SessionExpired));
         assert_ne!(first, app.notice, "the two notices differ");
+    }
+
+    // ---- the sidebar layout (Task sbc.2) ----
+
+    mod sidebar_layout {
+        use super::*;
+        use crate::sidebar::{Op, Refused, SidebarState};
+        use crate::sidebar_store::{Call, MemorySidebar};
+        use twicecat_core::api::{FolderLayout, RailEntry, SidebarLayout};
+
+        fn sidebar_app() -> (App, MemorySidebar) {
+            let (mut app, _rx) = login_app();
+            let store = MemorySidebar::default();
+            app.set_sidebar_store(Box::new(store.clone()));
+            (app, store)
+        }
+
+        fn log_in(app: &mut App, user: &str) {
+            let _ = app.update(core(CoreEvent::LoggedIn {
+                user_id: UserId::from(user),
+                device_id: DeviceId::from("D"),
+                restored: false,
+            }));
+        }
+
+        fn layout_for(user: &str) -> SidebarLayout {
+            let mut layout = SidebarLayout::new(UserId::from(user));
+            layout.rail = vec![RailEntry::Folder(FolderLayout {
+                id: 1,
+                name: None,
+                open: false,
+                spaces: vec![RoomId::from("!secretin1:x"), RoomId::from("!secretin2:x")],
+            })];
+            layout
+        }
+
+        fn saves(store: &MemorySidebar) -> Vec<(UserId, SidebarLayout)> {
+            store
+                .calls()
+                .into_iter()
+                .filter_map(|c| match c {
+                    Call::Save(user, layout) => Some((user, layout)),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn answer(app: &mut App, user: &str, load: SidebarLoad) {
+            let _ = app.update(Message::SidebarLoaded(UserId::from(user), load));
+        }
+
+        #[test]
+        fn logging_in_loads_once_for_that_account() {
+            let (mut app, store) = sidebar_app();
+            assert_eq!(app.sidebar.state(), SidebarState::NotLoaded);
+            log_in(&mut app, "@a:x");
+            assert_eq!(store.calls(), vec![Call::Load(UserId::from("@a:x"))]);
+            answer(&mut app, "@a:x", SidebarLoad::Layout(layout_for("@a:x")));
+            assert_eq!(app.sidebar.state(), SidebarState::Loaded);
+            assert_eq!(app.sidebar.layout(), Some(&layout_for("@a:x")));
+            assert_eq!(store.calls().len(), 1, "no second load");
+        }
+
+        #[test]
+        fn newer_and_other_account_refuse_every_change_without_a_save() {
+            for (load, state) in [
+                (SidebarLoad::Newer, SidebarState::Newer),
+                (SidebarLoad::OtherAccount, SidebarState::OtherAccount),
+            ] {
+                let (mut app, store) = sidebar_app();
+                log_in(&mut app, "@a:x");
+                answer(&mut app, "@a:x", load);
+                assert_eq!(app.sidebar.state(), state);
+                assert_eq!(
+                    app.apply_sidebar(Op::ToggleFolder(1)).err(),
+                    Some(Refused::Protected)
+                );
+                assert!(saves(&store).is_empty());
+            }
+        }
+
+        #[test]
+        fn a_change_saves_once_for_the_logged_in_account() {
+            let (mut app, store) = sidebar_app();
+            log_in(&mut app, "@a:x");
+            answer(&mut app, "@a:x", SidebarLoad::Layout(layout_for("@a:x")));
+            assert!(app.apply_sidebar(Op::ToggleFolder(1)).is_ok());
+            let saved = saves(&store);
+            assert_eq!(saved.len(), 1);
+            assert_eq!(saved[0].0, UserId::from("@a:x"));
+            assert_eq!(saved[0].1.account, UserId::from("@a:x"));
+            assert_eq!(Some(&saved[0].1), app.sidebar.layout());
+            // A refused change saves nothing.
+            assert!(app.apply_sidebar(Op::ToggleFolder(9)).is_err());
+            assert_eq!(saves(&store).len(), 1);
+        }
+
+        #[test]
+        fn logout_and_session_expiry_call_no_store_and_drop_the_layout() {
+            for event in [CoreEvent::LoggedOut, CoreEvent::SessionExpired] {
+                let (mut app, store) = sidebar_app();
+                log_in(&mut app, "@a:x");
+                answer(&mut app, "@a:x", SidebarLoad::Layout(layout_for("@a:x")));
+                let before = store.calls();
+                let _ = app.update(core(event));
+                assert_eq!(store.calls(), before, "no save, no reset, no load");
+                assert_eq!(app.sidebar.state(), SidebarState::NotLoaded);
+                assert!(app.sidebar.layout().is_none());
+                // A change between logout and the next login is refused.
+                assert_eq!(
+                    app.apply_sidebar(Op::ToggleFolder(1)).err(),
+                    Some(Refused::NotLoaded)
+                );
+                assert_eq!(store.calls(), before);
+            }
+        }
+
+        #[test]
+        fn another_account_logging_in_loads_and_saves_for_itself_only() {
+            let (mut app, store) = sidebar_app();
+            log_in(&mut app, "@a:x");
+            answer(&mut app, "@a:x", SidebarLoad::Layout(layout_for("@a:x")));
+            let _ = app.update(core(CoreEvent::LoggedOut));
+            let mark = store.calls().len();
+            log_in(&mut app, "@b:x");
+            // A late answer for the first account changes nothing.
+            answer(&mut app, "@a:x", SidebarLoad::Layout(layout_for("@a:x")));
+            assert_eq!(app.sidebar.state(), SidebarState::NotLoaded);
+            answer(&mut app, "@b:x", SidebarLoad::Default);
+            assert!(
+                app.apply_sidebar(Op::ToggleSection {
+                    space: RoomId::from("!sp:x"),
+                    key: twicecat_core::api::SectionKey::Direct,
+                })
+                .is_ok()
+            );
+            let after = store.calls()[mark..].to_vec();
+            let b = UserId::from("@b:x");
+            assert_eq!(after.len(), 2, "{after:?}");
+            assert_eq!(after[0], Call::Load(b.clone()));
+            assert!(matches!(&after[1], Call::Save(user, layout)
+                if *user == b && layout.account == b));
+            assert!(
+                after.iter().all(|c| match c {
+                    Call::Load(u) | Call::Save(u, _) | Call::Reset(u) => *u != UserId::from("@a:x"),
+                }),
+                "no call names the first account after the logout"
+            );
+        }
+
+        #[test]
+        fn debug_of_the_app_sidebar_holds_no_room_id() {
+            let (mut app, _store) = sidebar_app();
+            log_in(&mut app, "@a:x");
+            answer(&mut app, "@a:x", SidebarLoad::Layout(layout_for("@a:x")));
+            let text = format!("{:?}", app.sidebar);
+            assert!(!text.contains("secretin"), "{text}");
+            let message = format!(
+                "{:?}",
+                Message::SidebarLoaded(
+                    UserId::from("@a:x"),
+                    SidebarLoad::Layout(layout_for("@a:x"))
+                )
+            );
+            assert!(!message.contains("secretin"), "{message}");
+        }
     }
 
     #[test]
