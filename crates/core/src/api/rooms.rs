@@ -9,7 +9,7 @@ use std::fmt;
 use super::{AvatarId, EventId, MessageText, RoomId, UserId};
 
 /// A name or text field printed as its length only.
-struct Hidden(usize);
+pub(super) struct Hidden(usize);
 
 impl fmt::Debug for Hidden {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -17,11 +17,11 @@ impl fmt::Debug for Hidden {
     }
 }
 
-fn hide(s: &str) -> Hidden {
+pub(super) fn hide(s: &str) -> Hidden {
     Hidden(s.len())
 }
 
-fn hide_opt(s: &Option<String>) -> Option<Hidden> {
+pub(super) fn hide_opt(s: &Option<String>) -> Option<Hidden> {
     s.as_deref().map(hide)
 }
 

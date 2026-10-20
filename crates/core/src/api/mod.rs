@@ -24,8 +24,8 @@ pub use audio::{
     RemoteCleaning, SkipCleaned, VirtualAudio, VoiceCleaning, limits,
 };
 pub use call::{
-    CallEndReason, CallIntent, CallState, CleaningStatus, Participant, ParticipantId, SkipReason,
-    SoundSource,
+    CallEndReason, CallIntent, CallMemberView, CallState, CleaningStatus, MAX_CALL_MEMBERS,
+    Participant, ParticipantId, SkipReason, SoundSource,
 };
 pub use diff::ListDiff;
 pub use media::{
@@ -1205,13 +1205,18 @@ pub enum CoreEvent {
         /// Changes, in order.
         diffs: Vec<ListDiff<Participant>>,
     },
-    /// How many devices are in a room's call; sent when it changes, for the
-    /// room list (voice rooms). Zero means the call ended.
+    /// Who is in a room's call; sent when the device count or the set of
+    /// people changes, for the room list (voice rooms). Zero means the call
+    /// ended.
     ActiveCall {
         /// Room.
         room_id: RoomId,
         /// Devices in the call.
         participants: u32,
+        /// The distinct users in the call, in join order, at most
+        /// [`MAX_CALL_MEMBERS`]. Not who speaks or is muted: that is known
+        /// only for the call this device is in ([`CoreEvent::CallParticipants`]).
+        members: Vec<CallMemberView>,
     },
     /// Someone rings this user, or (with `ring: false`) lets them know a
     /// call started in a group room.
@@ -1399,6 +1404,22 @@ mod tests {
             image: Some(img),
         };
         assert!(format!("{ev:?}").contains("mxc://x/y"));
+    }
+
+    #[test]
+    fn active_call_debug_shows_user_ids_but_not_names() {
+        let ev = CoreEvent::ActiveCall {
+            room_id: RoomId::from("!r:x"),
+            participants: 1,
+            members: vec![CallMemberView {
+                user_id: UserId::from("@bob:x"),
+                display_name: Some("Secret Bob".into()),
+                avatar: None,
+            }],
+        };
+        let dbg = format!("{ev:?}");
+        assert!(dbg.contains("@bob:x"), "{dbg}");
+        assert!(!dbg.contains("Secret"), "{dbg}");
     }
 
     #[test]

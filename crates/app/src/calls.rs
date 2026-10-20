@@ -730,6 +730,7 @@ impl CallModel {
             CoreEvent::ActiveCall {
                 room_id,
                 participants,
+                ..
             } => {
                 if participants == 0 {
                     self.counts.remove(&room_id);
@@ -1605,6 +1606,7 @@ mod tests {
             let _ = app.update(core(CoreEvent::ActiveCall {
                 room_id: room(n),
                 participants: count,
+                members: Vec::new(),
             }));
         }
         assert_eq!(app.calls.count(&room("a")), 3);
@@ -1612,6 +1614,7 @@ mod tests {
         let _ = app.update(core(CoreEvent::ActiveCall {
             room_id: room("a"),
             participants: 0,
+            members: Vec::new(),
         }));
         assert_eq!(app.calls.count(&room("a")), 0);
         assert!(!app.calls.counts.contains_key(&room("a")));
@@ -1796,6 +1799,7 @@ mod tests {
         let _ = app.update(core(CoreEvent::ActiveCall {
             room_id: room("a"),
             participants: 2,
+            members: Vec::new(),
         }));
         let _ = app.update(core(CoreEvent::AudioSettings(AudioSettings::default())));
         let _ = app.update(core(CoreEvent::LoggedOut));
@@ -1854,6 +1858,7 @@ mod tests {
         let _ = app.update(core(CoreEvent::ActiveCall {
             room_id: room("a"),
             participants: 3,
+            members: Vec::new(),
         }));
         assert_eq!(
             button_of(&app, &a),
@@ -1902,6 +1907,7 @@ mod tests {
         let _ = app.update(core(CoreEvent::ActiveCall {
             room_id: room("a"),
             participants: 2,
+            members: Vec::new(),
         }));
         assert_eq!(
             button_of(&app, &voice).map(|b| b.0),
@@ -2021,6 +2027,7 @@ mod tests {
         let _ = app.update(core(CoreEvent::ActiveCall {
             room_id: room("a"),
             participants: 2,
+            members: Vec::new(),
         }));
         let pill = app.calls.pill(&room("a")).expect("a call");
         assert_eq!((pill.count, pill.ringing), (2, false));
@@ -2041,6 +2048,7 @@ mod tests {
         let _ = app.update(core(CoreEvent::ActiveCall {
             room_id: room("a"),
             participants: 2,
+            members: Vec::new(),
         }));
         incoming(&mut app, "b", "c", true);
         let _ = app.view();

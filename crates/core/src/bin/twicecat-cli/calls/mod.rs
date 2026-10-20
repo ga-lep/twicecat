@@ -409,14 +409,19 @@ impl Calls {
             CoreEvent::ActiveCall {
                 room_id,
                 participants,
+                members,
             } => {
+                let line = format!(
+                    "active-call participants={participants} members={}",
+                    members.len()
+                );
                 if participants == 0 {
                     self.counts.remove(room_id.as_str());
                 } else {
                     self.counts
                         .insert(room_id.as_str().to_owned(), participants);
                 }
-                Vec::new()
+                vec![line]
             }
             CoreEvent::IncomingCall {
                 room_id,

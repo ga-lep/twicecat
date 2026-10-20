@@ -262,6 +262,7 @@ fn main_no_room() -> App {
         CoreEvent::ActiveCall {
             room_id: room("hangout"),
             participants: 2,
+            members: Vec::new(),
         },
     );
     app
@@ -1156,6 +1157,7 @@ pub fn crowded_room_list(body: &str) -> App {
         CoreEvent::ActiveCall {
             room_id: room("counted"),
             participants: 12,
+            members: Vec::new(),
         },
     );
     app
@@ -3036,6 +3038,7 @@ fn switcher_long() -> App {
         CoreEvent::ActiveCall {
             room_id: room("design"),
             participants: 3,
+            members: Vec::new(),
         },
     );
     press(
