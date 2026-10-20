@@ -278,7 +278,7 @@ pub fn rail_space(name: &str) -> RoomId {
 /// and selected spaces, Home with a count, a collapsed folder (2 x 2
 /// preview) and an open one with a mention inside.
 fn rail_states() -> App {
-    use twicecat_app::sidebar_store::SidebarLoad;
+    use twicecat_app::sidebar_store::{SidebarAnswer, SidebarLoad};
     use twicecat_app::spaces::{RailKey, SpacesMessage};
     use twicecat_core::api::{
         FolderLayout, RailEntry, SidebarLabel, SidebarLayout, SpaceUnreadView, UnreadCountsView,
@@ -361,7 +361,7 @@ fn rail_states() -> App {
     ];
     press(
         &mut app,
-        Message::SidebarLoaded(user("me"), SidebarLoad::Layout(layout)),
+        Message::SidebarLoaded(SidebarAnswer::new(user("me"), SidebarLoad::Layout(layout))),
     );
     press(
         &mut app,
@@ -371,6 +371,37 @@ fn rail_states() -> App {
         &mut app,
         Message::Spaces(SpacesMessage::Enter(RailKey::Space(rail_space("hover")))),
     );
+    app
+}
+
+/// The options card open on a space of the rail (right-click).
+fn rail_menu() -> App {
+    use twicecat_app::sidebar_menu::SidebarMenuMessage;
+    use twicecat_app::spaces::RailKey;
+
+    let mut app = rail_states();
+    press(
+        &mut app,
+        Message::SidebarMenu(SidebarMenuMessage::Open(RailKey::Space(rail_space(
+            "mention",
+        )))),
+    );
+    app
+}
+
+/// The name dialog of "New folder" after a name that is too long was
+/// submitted: the error line shows.
+fn rail_folder_name() -> App {
+    use twicecat_app::sidebar_menu::{FolderPick, SidebarMenuMessage};
+
+    let mut app = rail_menu();
+    for message in [
+        SidebarMenuMessage::Folder(FolderPick::New),
+        SidebarMenuMessage::NameInput("w".repeat(33)),
+        SidebarMenuMessage::NameSubmit,
+    ] {
+        press(&mut app, Message::SidebarMenu(message));
+    }
     app
 }
 
@@ -3316,6 +3347,21 @@ pub fn scenarios() -> Vec<Scenario> {
                 && a.rail_hover.is_some()
                 && a.query.space.is_some()
                 && a.sidebar.layout().is_some()
+        }),
+        s("rail-menu", true, rail_menu, |a| {
+            in_main(a)
+                && matches!(
+                    a.sidebar_menu,
+                    Some(twicecat_app::sidebar_menu::SidebarMenu::Card { .. })
+                )
+        }),
+        s("rail-folder-name", true, rail_folder_name, |a| {
+            in_main(a)
+                && matches!(
+                    &a.sidebar_menu,
+                    Some(twicecat_app::sidebar_menu::SidebarMenu::Name(d))
+                        if d.error.is_some() && d.text.chars().count() == 33
+                )
         }),
         s("main-no-room", true, main_no_room, |a| {
             in_main(a) && a.selected.is_none() && a.rooms.len() > 10

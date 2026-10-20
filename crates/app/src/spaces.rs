@@ -6,8 +6,9 @@
 //! under a space says nothing about who may join the room or who is in it,
 //! and the UI never presents it that way.
 //!
-//! Space names belong to people: nothing here logs them and `Debug` shows
-//! counts only.
+//! Space names belong to people: nothing here logs them, and no `Debug` of a
+//! type here (the model, `RailKey`, `RailItem`, `RailFolder`) shows a room ID or
+//! a name.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -68,7 +69,9 @@ impl fmt::Debug for SpacesModel {
 }
 
 /// A folder of the rail, with the spaces of it that the core reports.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `Debug` shows its number, whether it is open and how many spaces it
+/// draws, never its name or a room ID.
+#[derive(Clone, PartialEq, Eq)]
 pub struct RailFolder<'a> {
     /// Its ID in the layout.
     pub id: u16,
@@ -81,13 +84,34 @@ pub struct RailFolder<'a> {
     pub spaces: Vec<&'a SpaceView>,
 }
 
-/// One item of the rail below **Home**.
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl fmt::Debug for RailFolder<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RailFolder")
+            .field("id", &self.id)
+            .field("named", &self.name.is_some())
+            .field("open", &self.open)
+            .field("spaces", &self.spaces.len())
+            .finish()
+    }
+}
+
+/// One item of the rail below **Home**. `Debug` hides the room ID and the
+/// folder's name.
+#[derive(Clone, PartialEq, Eq)]
 pub enum RailItem<'a> {
     /// A top-level space on the rail itself.
     Space(&'a SpaceView),
     /// A folder.
     Folder(RailFolder<'a>),
+}
+
+impl fmt::Debug for RailItem<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Space(_) => f.write_str("Space(<redacted>)"),
+            Self::Folder(folder) => f.debug_tuple("Folder").field(folder).finish(),
+        }
+    }
 }
 
 /// The sum of `counts`, saturating; unread when any of them is.
@@ -293,6 +317,34 @@ impl App {
         }
     }
 
+    /// Forgets the hover and press of an item the rail no longer draws (and
+    /// closes the options card or dialog about it): a
+    /// space that is gone or inside a closed folder, and a folder that is
+    /// gone, dissolved or has none of its spaces reported. Its pointer-exit
+    /// would never come.
+    pub(crate) fn clear_stale_rail_keys(&mut self) {
+        let mut drawn: HashSet<RailKey> = HashSet::from([RailKey::Home]);
+        for item in self.spaces.rail_items(self.sidebar.layout()) {
+            match item {
+                RailItem::Space(space) => {
+                    drawn.insert(RailKey::Space(space.id.clone()));
+                }
+                RailItem::Folder(folder) => {
+                    drawn.insert(RailKey::Folder(folder.id));
+                    if folder.open {
+                        drawn.extend(folder.spaces.iter().map(|s| RailKey::Space(s.id.clone())));
+                    }
+                }
+            }
+        }
+        for slot in [&mut self.rail_hover, &mut self.rail_pressed] {
+            if slot.as_ref().is_some_and(|key| !drawn.contains(key)) {
+                *slot = None;
+            }
+        }
+        self.close_sidebar_menu_if_gone();
+    }
+
     /// The core's unread counts per space and outside spaces.
     pub(crate) fn on_space_unread(
         &mut self,
@@ -306,12 +358,7 @@ impl App {
     /// selected space that is gone resets the filter to Home.
     pub(crate) fn on_spaces(&mut self, spaces: Vec<SpaceView>) -> Task<Message> {
         self.spaces.set(spaces);
-        // An item that is gone cannot be hovered or pressed any more.
-        for slot in [&mut self.rail_hover, &mut self.rail_pressed] {
-            if matches!(slot, Some(RailKey::Space(id)) if !self.spaces.contains(id)) {
-                *slot = None;
-            }
-        }
+        self.clear_stale_rail_keys();
         let ids = self.avatars.take_unrequested(
             self.spaces
                 .spaces()
@@ -513,6 +560,27 @@ mod tests {
         );
         assert_eq!(sum_counts([]), UnreadCountsView::default());
         assert_eq!(m.unread_for(&RoomId::from("!nope:x")), counts(0, 0, false));
+    }
+
+    #[test]
+    fn debug_of_the_rail_items_shows_no_room_id_and_no_folder_name() {
+        let m = model(vec![space("!secretroom:x", 0), space("!secretroom2:x", 0)]);
+        let mut l = layout(vec![folder(1, true, &["!secretroom:x", "!secretroom2:x"])]);
+        let RailEntry::Folder(f) = &mut l.rail[0] else {
+            unreachable!()
+        };
+        f.name = Some(SidebarLabel::try_from("Payroll").expect("a valid name"));
+        let items = m.rail_items(Some(&l));
+        let mut texts = vec![format!("{items:?}")];
+        if let RailItem::Folder(f) = &items[0] {
+            texts.push(format!("{f:?}"));
+        }
+        texts.push(format!("{:?}", RailItem::Space(&m.spaces()[0])));
+        for text in texts {
+            for secret in ["!secretroom", "@a:x", "Payroll"] {
+                assert!(!text.contains(secret), "{secret} is in {text}");
+            }
+        }
     }
 
     #[test]

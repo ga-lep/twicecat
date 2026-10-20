@@ -7,6 +7,7 @@
 //! this module scans for it).
 
 use std::collections::HashMap;
+use std::fmt;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 
@@ -41,6 +42,33 @@ impl From<SidebarRead> for SidebarLoad {
             SidebarRead::Newer(_) => Self::Newer,
             SidebarRead::OtherAccount => Self::OtherAccount,
         }
+    }
+}
+
+/// The answer to a load, with the account it was asked for (a late answer
+/// for another account is ignored). `Debug` hides the account.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SidebarAnswer {
+    /// The account the load was for.
+    pub account: UserId,
+    /// What it found.
+    pub load: SidebarLoad,
+}
+
+impl SidebarAnswer {
+    /// The answer `load` for `account`.
+    pub fn new(account: UserId, load: SidebarLoad) -> Self {
+        Self { account, load }
+    }
+}
+
+impl fmt::Debug for SidebarAnswer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SidebarAnswer")
+            .field("account", &"<redacted>")
+            // A layout's own `Debug` shows counts only.
+            .field("load", &self.load)
+            .finish()
     }
 }
 
@@ -79,17 +107,66 @@ fn unpoisoned<T>(result: std::sync::LockResult<T>) -> T {
     result.unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// What an account's file is to become, as the newest request asked.
+#[derive(Clone)]
+enum Pending {
+    /// Write this layout.
+    Write(SidebarLayout),
+    /// Remove the file (Reset).
+    Remove,
+}
+
+/// What the last request that ran did to an account's file.
+#[derive(Clone, Copy)]
+struct Applied {
+    /// The file was removed (else a layout was written).
+    removed: bool,
+    /// The disk work worked.
+    ok: bool,
+}
+
+/// What the store knows about one account's file.
+#[derive(Default)]
+struct Account {
+    /// The newest request that has not run yet. Requests are coalesced: the
+    /// newest one decides how the file ends, because a write replaces the
+    /// whole file and a removal deletes it.
+    pending: Option<Pending>,
+    /// The last request that ran.
+    applied: Option<Applied>,
+}
+
 /// The sidebar files in the data root, one per account.
 ///
 /// Reads and writes run on [`blocking`] threads, which can overtake one
-/// another: each write job writes the newest layout handed to the store for
-/// its account, under one lock, so the file always ends up with the last
-/// change.
-#[derive(Debug, Clone)]
+/// another. So a request does not carry its own work: it records what the
+/// account's file is to become (`Write(layout)` or `Remove`, the newest
+/// request wins) and each job, under one lock, applies whatever is recorded
+/// when its turn comes. The file therefore always ends the way the last
+/// request asked, whichever job runs first. A load that finds a request
+/// waiting answers from it (the file on disk is older); otherwise it reads
+/// the file under the same lock, after any write in progress.
+///
+/// `Debug` shows how many accounts have something waiting and no path, ID or
+/// name.
+#[derive(Clone)]
 pub struct DiskSidebar {
     paths: DataPaths,
-    latest: Arc<Mutex<HashMap<UserId, SidebarLayout>>>,
+    accounts: Arc<Mutex<HashMap<UserId, Account>>>,
     writing: Arc<Mutex<()>>,
+}
+
+impl fmt::Debug for DiskSidebar {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let accounts = unpoisoned(self.accounts.lock());
+        f.debug_struct("DiskSidebar")
+            .field("accounts", &accounts.len())
+            .field(
+                "waiting",
+                &accounts.values().filter(|a| a.pending.is_some()).count(),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl DiskSidebar {
@@ -97,20 +174,70 @@ impl DiskSidebar {
     pub fn new(paths: DataPaths) -> Self {
         Self {
             paths,
-            latest: Arc::new(Mutex::new(HashMap::new())),
+            accounts: Arc::new(Mutex::new(HashMap::new())),
             writing: Arc::new(Mutex::new(())),
         }
+    }
+
+    /// Records what the account's file is to become.
+    fn request(&self, account: &UserId, pending: Pending) {
+        unpoisoned(self.accounts.lock())
+            .entry(account.clone())
+            .or_default()
+            .pending = Some(pending);
+    }
+
+    /// Runs what is recorded for `account`, under the write lock, and says
+    /// what happened. When nothing is recorded, a job that ran later already
+    /// covered this request: `None`.
+    fn run_pending(
+        paths: &DataPaths,
+        accounts: &Mutex<HashMap<UserId, Account>>,
+        account: &UserId,
+    ) -> Option<Applied> {
+        let pending = unpoisoned(accounts.lock())
+            .get_mut(account)
+            .and_then(|a| a.pending.take())?;
+        // The disk work runs with only the write lock held, so a request from
+        // the UI never waits for the disk.
+        let applied = match pending {
+            Pending::Write(layout) => Applied {
+                removed: false,
+                ok: paths.write_sidebar(&layout).is_ok(),
+            },
+            Pending::Remove => Applied {
+                removed: true,
+                ok: paths.remove_sidebar(account).is_ok(),
+            },
+        };
+        unpoisoned(accounts.lock())
+            .entry(account.clone())
+            .or_default()
+            .applied = Some(applied);
+        Some(applied)
     }
 
     pub(crate) fn load_job(
         &self,
         account: &UserId,
     ) -> impl Future<Output = SidebarLoad> + Send + 'static {
-        let (paths, account) = (self.paths.clone(), account.clone());
+        // A request still waiting is newer than the file.
+        let waiting = unpoisoned(self.accounts.lock())
+            .get(account)
+            .and_then(|a| a.pending.clone());
+        let (paths, writing, account) = (self.paths.clone(), self.writing.clone(), account.clone());
         async move {
-            blocking::run(move || SidebarLoad::from(paths.read_sidebar(&account)))
+            match waiting {
+                Some(Pending::Write(layout)) => SidebarLoad::Layout(layout),
+                Some(Pending::Remove) => SidebarLoad::Default,
+                None => blocking::run(move || {
+                    // After any write in progress, so the file is current.
+                    let _guard = unpoisoned(writing.lock());
+                    SidebarLoad::from(paths.read_sidebar(&account))
+                })
                 .await
-                .unwrap_or(SidebarLoad::Unavailable)
+                .unwrap_or(SidebarLoad::Unavailable),
+            }
         }
     }
 
@@ -122,11 +249,11 @@ impl DiskSidebar {
         // A layout of another account is never written to this account's file.
         let ours = layout.account == *account;
         if ours {
-            unpoisoned(self.latest.lock()).insert(account.clone(), layout);
+            self.request(account, Pending::Write(layout));
         }
-        let (paths, latest, writing, account) = (
+        let (paths, accounts, writing, account) = (
             self.paths.clone(),
-            self.latest.clone(),
+            self.accounts.clone(),
             self.writing.clone(),
             account.clone(),
         );
@@ -136,8 +263,16 @@ impl DiskSidebar {
             }
             blocking::run(move || {
                 let _guard = unpoisoned(writing.lock());
-                let newest = unpoisoned(latest.lock()).get(&account).cloned();
-                newest.is_some_and(|layout| paths.write_sidebar(&layout).is_ok())
+                match Self::run_pending(&paths, &accounts, &account) {
+                    Some(applied) => !applied.removed && applied.ok,
+                    // A later request ran first and covered this one. A later
+                    // write holds this layout or a newer one; a later reset
+                    // cancelled it.
+                    None => unpoisoned(accounts.lock())
+                        .get(&account)
+                        .and_then(|a| a.applied)
+                        .is_some_and(|applied| !applied.removed && applied.ok),
+                }
             })
             .await
             .unwrap_or(false)
@@ -148,13 +283,23 @@ impl DiskSidebar {
         &self,
         account: &UserId,
     ) -> impl Future<Output = bool> + Send + 'static {
-        // A save still waiting for its turn finds nothing to write.
-        unpoisoned(self.latest.lock()).remove(account);
-        let (paths, writing, account) = (self.paths.clone(), self.writing.clone(), account.clone());
+        self.request(account, Pending::Remove);
+        let (paths, accounts, writing, account) = (
+            self.paths.clone(),
+            self.accounts.clone(),
+            self.writing.clone(),
+            account.clone(),
+        );
         async move {
             blocking::run(move || {
                 let _guard = unpoisoned(writing.lock());
-                paths.remove_sidebar(&account).is_ok()
+                match Self::run_pending(&paths, &accounts, &account) {
+                    Some(applied) => applied.ok,
+                    None => unpoisoned(accounts.lock())
+                        .get(&account)
+                        .and_then(|a| a.applied)
+                        .is_some_and(|applied| applied.ok),
+                }
             })
             .await
             .unwrap_or(false)
@@ -442,6 +587,128 @@ mod tests {
         assert!(block_on(store.reset_job(&a)));
         assert!(!block_on(waiting), "nothing left to write");
         assert_eq!(dir.paths().read_sidebar(&a), SidebarRead::Missing);
+    }
+
+    // ---- Debug shows counts only ----
+
+    fn secret_layout(account: &UserId) -> SidebarLayout {
+        use twicecat_core::api::{FolderLayout, SidebarLabel};
+        let mut layout = layout_of(account, &["!secretroom:x"]);
+        layout.rail.push(RailEntry::Folder(FolderLayout {
+            id: 3,
+            name: Some(SidebarLabel::try_from("Payroll").expect("a valid name")),
+            open: true,
+            spaces: vec![RoomId::from("!secretroom2:x")],
+        }));
+        layout
+    }
+
+    fn assert_no_secret(text: &str) {
+        for secret in ["!secretroom", "@a:x", "Payroll", "Payroll-root"] {
+            assert!(!text.contains(secret), "{secret} is in {text}");
+        }
+    }
+
+    #[test]
+    fn the_stores_debug_shows_counts_only() {
+        let dir = Dir::new();
+        let root = dir.0.join("Payroll-root");
+        std::fs::create_dir_all(&root).expect("dir");
+        let store = DiskSidebar::new(DataPaths::at(&root));
+        let a = user("@a:x");
+        // A write is waiting: the store holds the layout, the account and a path.
+        let _queued = store.save_job(&a, secret_layout(&a));
+        assert_no_secret(&format!("{store:?}"));
+        assert_no_secret(&format!("{:?}", SidebarLoad::Layout(secret_layout(&a))));
+    }
+
+    // ---- ordering ----
+
+    #[test]
+    fn a_load_after_a_queued_save_gets_the_queued_layout_not_the_old_file() {
+        let dir = Dir::new();
+        let store = DiskSidebar::new(dir.paths());
+        let a = user("@a:x");
+        assert!(block_on(store.save_job(&a, layout_of(&a, &["!old:x"]))));
+        // The newer save has been handed over but has not run yet.
+        let queued = store.save_job(&a, layout_of(&a, &["!old:x", "!new:x"]));
+        assert_eq!(
+            block_on(store.load_job(&a)),
+            SidebarLoad::Layout(layout_of(&a, &["!old:x", "!new:x"]))
+        );
+        assert!(block_on(queued));
+        assert_eq!(
+            block_on(store.load_job(&a)),
+            SidebarLoad::Layout(layout_of(&a, &["!old:x", "!new:x"]))
+        );
+    }
+
+    #[test]
+    fn a_load_after_a_queued_reset_finds_the_default() {
+        let dir = Dir::new();
+        let store = DiskSidebar::new(dir.paths());
+        let a = user("@a:x");
+        assert!(block_on(store.save_job(&a, layout_of(&a, &["!old:x"]))));
+        let queued = store.reset_job(&a);
+        assert_eq!(block_on(store.load_job(&a)), SidebarLoad::Default);
+        assert!(block_on(queued));
+    }
+
+    #[test]
+    fn a_load_queued_for_another_account_is_not_answered_from_this_ones_save() {
+        let dir = Dir::new();
+        let store = DiskSidebar::new(dir.paths());
+        let (a, b) = (user("@a:x"), user("@b:x"));
+        let _queued = store.save_job(&a, layout_of(&a, &["!one:x"]));
+        assert_eq!(block_on(store.load_job(&b)), SidebarLoad::Default);
+    }
+
+    #[test]
+    fn a_reset_then_a_save_leave_the_save_whichever_finishes_first() {
+        let a = user("@a:x");
+        for save_first in [false, true] {
+            let dir = Dir::new();
+            let store = DiskSidebar::new(dir.paths());
+            assert!(block_on(store.save_job(&a, layout_of(&a, &["!old:x"]))));
+            let reset = store.reset_job(&a);
+            let save = store.save_job(&a, layout_of(&a, &["!new:x"]));
+            if save_first {
+                assert!(block_on(save));
+                let _ = block_on(reset);
+            } else {
+                let _ = block_on(reset);
+                assert!(block_on(save));
+            }
+            assert_eq!(
+                dir.paths().read_sidebar(&a),
+                SidebarRead::Layout(layout_of(&a, &["!new:x"])),
+                "save_first={save_first}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_save_then_a_reset_leave_no_file_whichever_finishes_first() {
+        let a = user("@a:x");
+        for reset_first in [false, true] {
+            let dir = Dir::new();
+            let store = DiskSidebar::new(dir.paths());
+            assert!(block_on(store.save_job(&a, layout_of(&a, &["!old:x"]))));
+            let save = store.save_job(&a, layout_of(&a, &["!new:x"]));
+            let reset = store.reset_job(&a);
+            if reset_first {
+                assert!(block_on(reset));
+                let _ = block_on(save);
+            } else {
+                let _ = block_on(save);
+                assert!(block_on(reset));
+            }
+            assert_eq!(
+                dir.paths().read_sidebar(&a),
+                SidebarRead::Missing,
+                "reset_first={reset_first}"
+            );
+        }
     }
 
     #[test]

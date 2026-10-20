@@ -580,8 +580,6 @@ async fn space_unread_follows_a_message_in_a_room_of_the_space() {
         s.space_counts(&space).is_some_and(|c| c.notifications >= 1)
     })
     .await;
-    let counts = f.seen.space_counts(&space).unwrap();
-    assert!(counts.unread || counts.notifications >= 1);
     // The room is in the space, so the Home badge does not hold it.
     assert_eq!(f.seen.space_unread.last().unwrap().1.notifications, 0);
 

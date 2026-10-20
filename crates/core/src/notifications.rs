@@ -1566,11 +1566,13 @@ mod tests {
         }
     }
 
-    /// What was sent: the totals, and how many `SpaceUnread` events.
+    /// What was sent: the totals.
     fn sent(rx: &mut mpsc::Receiver<CoreEvent>) -> Vec<Totals> {
         sent_both(rx).0
     }
 
+    /// What was sent: the totals, and the Home counts (`outside`) of each
+    /// `SpaceUnread` event.
     fn sent_both(rx: &mut mpsc::Receiver<CoreEvent>) -> (Vec<Totals>, Vec<UnreadCountsView>) {
         let (mut totals, mut outside) = (Vec::new(), Vec::new());
         while let Ok(event) = rx.try_recv() {

@@ -17,6 +17,7 @@ pub mod room_settings;
 pub mod security;
 pub mod sessions;
 pub mod settings;
+pub mod sidebar_menu;
 pub mod spaces_sidebar;
 pub mod stage;
 pub mod switcher;

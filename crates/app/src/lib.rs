@@ -28,6 +28,7 @@ pub mod security;
 pub mod sessions;
 pub mod settings;
 pub mod sidebar;
+pub mod sidebar_menu;
 pub mod sidebar_store;
 #[cfg(test)]
 mod source_scan;

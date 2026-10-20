@@ -43,7 +43,8 @@ use crate::security::{Busy, SecurityMessage, SecurityModel};
 use crate::sessions::{SessionsMessage, SessionsModel, logout_needs_warning};
 use crate::settings::{NoSettingsStore, SettingsMessage, SettingsModel, SettingsStore};
 use crate::sidebar::{Op as SidebarOp, Refused as SidebarRefused, SidebarModel};
-use crate::sidebar_store::{NoSidebarStore, SidebarLoad, SidebarStore};
+use crate::sidebar_menu::{SidebarMenu, SidebarMenuMessage};
+use crate::sidebar_store::{NoSidebarStore, SidebarAnswer, SidebarStore};
 use crate::spaces::{RailKey, SpacesMessage, SpacesModel};
 use crate::text_safety;
 use crate::themes::Loaded;
@@ -202,9 +203,11 @@ pub enum Message {
     Core(Box<CoreEvent>),
     /// The core's event channel closed.
     CoreClosed,
-    /// A sidebar layout was read for this account (the answer to the load a
-    /// login starts). Its `Debug` shows counts only.
-    SidebarLoaded(UserId, SidebarLoad),
+    /// A sidebar layout was read for an account (the answer to the load a
+    /// login starts). Its `Debug` hides the account and shows counts only.
+    SidebarLoaded(SidebarAnswer),
+    /// The options card of the spaces rail and its name dialog.
+    SidebarMenu(SidebarMenuMessage),
     /// The system theme mode, at boot or after a change.
     ThemeMode(theme::Mode),
     /// The server field changed.
@@ -550,6 +553,8 @@ pub struct App {
     pub(crate) sidebar_store: Box<dyn SidebarStore>,
     /// The spaces the user is in (the sidebar).
     pub spaces: SpacesModel,
+    /// The options card or the name dialog of the rail, when one is open.
+    pub sidebar_menu: Option<SidebarMenu>,
     /// The rail item under the pointer.
     pub rail_hover: Option<RailKey>,
     /// The rail item the left button went down on, until it comes up or the
@@ -721,6 +726,7 @@ impl App {
             sidebar: SidebarModel::default(),
             sidebar_store: Box::new(NoSidebarStore),
             spaces: SpacesModel::default(),
+            sidebar_menu: None,
             rail_hover: None,
             rail_pressed: None,
             threads: ThreadsModel::default(),
@@ -835,9 +841,19 @@ impl App {
     /// saved) when no layout is loaded, when the stored file is protected or
     /// when the layout would pass a limit.
     pub fn apply_sidebar(&mut self, op: SidebarOp) -> Result<Task<Message>, SidebarRefused> {
-        self.sidebar
-            .apply(op, &*self.sidebar_store)
-            .map(Task::discard)
+        let known: Vec<RoomId> = self
+            .spaces
+            .entries()
+            .iter()
+            .map(|space| space.id.clone())
+            .collect();
+        let task = self
+            .sidebar
+            .apply_known(op, &known, &*self.sidebar_store)
+            .map(Task::discard)?;
+        // A folder may have dissolved, or a space gone into a closed one.
+        self.clear_stale_rail_keys();
+        Ok(task)
     }
 
     /// The loaded looks of the stored theme name (ASCII capitals do not
@@ -1446,8 +1462,9 @@ impl App {
             },
             Message::Security(message) => self.on_security(message),
             Message::Update(message) => self.on_update(message),
-            Message::SidebarLoaded(account, load) => {
+            Message::SidebarLoaded(SidebarAnswer { account, load }) => {
                 self.sidebar.loaded(&account, load);
+                self.clear_stale_rail_keys();
                 Task::none()
             }
             Message::Crash(message) => self.on_crash(message),
@@ -1483,8 +1500,17 @@ impl App {
                 Task::none()
             }
             Message::Spaces(message) => self.on_rail(message),
+            Message::SidebarMenu(message) => self.on_sidebar_menu(message),
             Message::Threads(message) => self.on_threads(message),
-            Message::Shortcut { shortcut, captured } => self.on_shortcut(shortcut, captured),
+            Message::Shortcut { shortcut, captured } => {
+                // The rail's card and dialog are not in `keys.rs`'s list of
+                // layers (that file is not changed for them): Esc and the
+                // room-stepping chords are settled here, before it.
+                match self.sidebar_menu_shortcut(shortcut) {
+                    Some(task) => task,
+                    None => self.on_shortcut(shortcut, captured),
+                }
+            }
             Message::Switcher(message) => self.on_switcher(message),
             // Ctrl+U and drops are for the room: with its pane hidden behind
             // a panel the user would pick files for a room they cannot see.
@@ -1705,7 +1731,9 @@ impl App {
                 let load = self
                     .sidebar
                     .load_for(user_id.clone(), &*self.sidebar_store)
-                    .map(move |load| Message::SidebarLoaded(account.clone(), load));
+                    .map(move |load| {
+                        Message::SidebarLoaded(SidebarAnswer::new(account.clone(), load))
+                    });
                 task = Task::batch([task, load]);
                 self.user_id = Some(user_id);
                 self.notice = None;
@@ -2307,7 +2335,7 @@ impl App {
     fn composer_key_at(&mut self, key: ComposerKey, now: Instant) -> Task<Message> {
         // A dialog, card or screen is over the room: the editor may still
         // have the keyboard focus, but its keys are not for it.
-        if self.any_overlay_open() {
+        if self.any_overlay_open() || self.sidebar_menu_open() {
             return Task::none();
         }
         match key {
@@ -2622,6 +2650,7 @@ impl App {
         self.spaces.clear();
         self.rail_hover = None;
         self.rail_pressed = None;
+        self.sidebar_menu = None;
         // Memory only: no sidebar file is touched at logout.
         self.sidebar.unload();
         self.reset_threads();
@@ -2998,12 +3027,18 @@ impl App {
                 screens::stage::sharing_layer(
                     screens::verification::layer(
                         screens::switcher::layer(
-                            screens::upload_dialog::layer(
-                                screens::media_viewer::layer(
-                                    screens::audio_settings::layer(
-                                        screens::settings::layer(
-                                            screens::room_dialogs::layer(
-                                                screens::stage::layers(main_view::view(self), self),
+                            screens::sidebar_menu::layer(
+                                screens::upload_dialog::layer(
+                                    screens::media_viewer::layer(
+                                        screens::audio_settings::layer(
+                                            screens::settings::layer(
+                                                screens::room_dialogs::layer(
+                                                    screens::stage::layers(
+                                                        main_view::view(self),
+                                                        self,
+                                                    ),
+                                                    self,
+                                                ),
                                                 self,
                                             ),
                                             self,
@@ -3386,7 +3421,7 @@ mod tests {
     mod sidebar_layout {
         use super::*;
         use crate::sidebar::{Op, Refused, SidebarState};
-        use crate::sidebar_store::{Call, MemorySidebar};
+        use crate::sidebar_store::{Call, MemorySidebar, SidebarLoad};
         use twicecat_core::api::{FolderLayout, RailEntry, SidebarLayout};
 
         fn sidebar_app() -> (App, MemorySidebar) {
@@ -3427,7 +3462,10 @@ mod tests {
         }
 
         fn answer(app: &mut App, user: &str, load: SidebarLoad) {
-            let _ = app.update(Message::SidebarLoaded(UserId::from(user), load));
+            let _ = app.update(Message::SidebarLoaded(SidebarAnswer::new(
+                UserId::from(user),
+                load,
+            )));
         }
 
         #[test]
@@ -3568,12 +3606,556 @@ mod tests {
             assert!(!text.contains("secretin"), "{text}");
             let message = format!(
                 "{:?}",
-                Message::SidebarLoaded(
+                Message::SidebarLoaded(SidebarAnswer::new(
                     UserId::from("@a:x"),
                     SidebarLoad::Layout(layout_for("@a:x"))
-                )
+                ))
             );
             assert!(!message.contains("secretin"), "{message}");
+        }
+    }
+
+    mod sidebar_menu_flow {
+        use super::*;
+        use crate::keys::Shortcut;
+        use crate::sidebar::SidebarState;
+        use crate::sidebar_menu::{
+            Entry, FolderPick, NAME_ERROR, NameDialog, Purpose, SidebarMenu,
+            SidebarMenuMessage as M, Target,
+        };
+        use crate::sidebar_store::{Call, MemorySidebar, SidebarLoad};
+        use crate::spaces::RailKey;
+        use twicecat_core::api::{FolderLayout, RailEntry, SidebarLabel, SidebarLayout, SpaceView};
+
+        fn rid(id: &str) -> RoomId {
+            RoomId::from(id)
+        }
+
+        fn root(n: &str) -> EventId {
+            EventId::from(format!("${n}:x"))
+        }
+
+        fn top_space(id: &str) -> SpaceView {
+            SpaceView {
+                id: rid(id),
+                name: id.to_owned(),
+                avatar: None,
+                level: 0,
+                children: 0,
+                rooms: Vec::new(),
+            }
+        }
+
+        fn sp(id: &str) -> RailEntry {
+            RailEntry::Space(rid(id))
+        }
+
+        fn folder(id: u16, open: bool, spaces: &[&str]) -> RailEntry {
+            RailEntry::Folder(FolderLayout {
+                id,
+                name: None,
+                open,
+                spaces: spaces.iter().map(|s| rid(s)).collect(),
+            })
+        }
+
+        /// A main screen for `@a:x` with these spaces reported and this rail
+        /// stored, and the store that records the saves.
+        fn menu_app(spaces: &[&str], rail: Vec<RailEntry>) -> (App, MemorySidebar) {
+            let (mut app, _rx) = main_app();
+            let store = MemorySidebar::default();
+            app.set_sidebar_store(Box::new(store.clone()));
+            let mut layout = SidebarLayout::new(UserId::from("@a:x"));
+            layout.rail = rail;
+            let _ = app.update(Message::SidebarLoaded(SidebarAnswer::new(
+                UserId::from("@a:x"),
+                SidebarLoad::Default,
+            )));
+            // `main_app` logged in before the store was set: load now.
+            let _ = app.sidebar.load_for(UserId::from("@a:x"), &store);
+            app.sidebar
+                .loaded(&UserId::from("@a:x"), SidebarLoad::Layout(layout));
+            let _ = app.update(core(CoreEvent::Spaces(
+                spaces.iter().map(|s| top_space(s)).collect(),
+            )));
+            assert_eq!(app.screen, Screen::Main);
+            assert_eq!(app.sidebar.state(), SidebarState::Loaded);
+            (app, store)
+        }
+
+        fn saves(store: &MemorySidebar) -> Vec<SidebarLayout> {
+            store
+                .calls()
+                .into_iter()
+                .filter_map(|c| match c {
+                    Call::Save(_, layout) => Some(layout),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn send(app: &mut App, message: M) {
+            let _ = app.update(Message::SidebarMenu(message));
+        }
+
+        fn shape(app: &App) -> Vec<String> {
+            app.sidebar
+                .layout()
+                .expect("a layout")
+                .rail
+                .iter()
+                .map(|entry| match entry {
+                    RailEntry::Space(id) => id.as_str().to_owned(),
+                    RailEntry::Folder(f) => {
+                        let ids: Vec<&str> = f.spaces.iter().map(|s| s.as_str()).collect();
+                        format!("[{}: {}]", f.id, ids.join(" "))
+                    }
+                })
+                .collect()
+        }
+
+        fn open_on(app: &mut App, key: RailKey) {
+            send(app, M::Open(key));
+        }
+
+        fn dialog(app: &App) -> &NameDialog {
+            match &app.sidebar_menu {
+                Some(SidebarMenu::Name(dialog)) => dialog,
+                other => panic!("the name dialog is not open: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn a_right_click_opens_the_card_of_a_space_or_a_folder_and_not_of_home() {
+            let (mut app, _store) = menu_app(
+                &["!a:x", "!b:x", "!c:x"],
+                vec![sp("!a:x"), folder(1, false, &["!b:x", "!c:x"])],
+            );
+            open_on(&mut app, RailKey::Home);
+            assert!(app.sidebar_menu.is_none());
+            open_on(&mut app, RailKey::Space(rid("!a:x")));
+            assert_eq!(
+                app.sidebar_menu,
+                Some(SidebarMenu::Card {
+                    target: Target::Space(rid("!a:x")),
+                    error: None
+                })
+            );
+            send(&mut app, M::Close);
+            assert!(app.sidebar_menu.is_none());
+            open_on(&mut app, RailKey::Folder(1));
+            assert_eq!(
+                app.sidebar_menu,
+                Some(SidebarMenu::Card {
+                    target: Target::Folder(1),
+                    error: None
+                })
+            );
+            send(&mut app, M::Close);
+            // Items the rail does not draw have no card.
+            open_on(&mut app, RailKey::Space(rid("!nope:x")));
+            open_on(&mut app, RailKey::Folder(9));
+            assert!(app.sidebar_menu.is_none());
+        }
+
+        #[test]
+        fn no_card_opens_when_customizing_is_off_or_another_layer_is_up() {
+            let (mut app, _store) = menu_app(&["!a:x", "!b:x"], Vec::new());
+            let _ = app.update(core(CoreEvent::LoggedOut));
+            open_on(&mut app, RailKey::Space(rid("!a:x")));
+            assert!(app.sidebar_menu.is_none());
+
+            for load in [SidebarLoad::Newer, SidebarLoad::OtherAccount] {
+                let (mut app, store) = menu_app(&["!a:x", "!b:x"], Vec::new());
+                app.sidebar.unload();
+                let _ = app.sidebar.load_for(UserId::from("@a:x"), &store);
+                app.sidebar.loaded(&UserId::from("@a:x"), load);
+                open_on(&mut app, RailKey::Space(rid("!a:x")));
+                assert!(app.sidebar_menu.is_none());
+            }
+
+            let (mut app, _store) = menu_app(&["!a:x", "!b:x"], Vec::new());
+            let _ = app.update(Message::Shortcut {
+                shortcut: Shortcut::Switcher,
+                captured: false,
+            });
+            assert!(app.switcher.open);
+            open_on(&mut app, RailKey::Space(rid("!a:x")));
+            assert!(app.sidebar_menu.is_none(), "not over the switcher");
+        }
+
+        #[test]
+        fn move_down_on_a_space_moves_it_one_item_saves_once_and_closes_the_card() {
+            let (mut app, store) = menu_app(&["!a:x", "!b:x", "!c:x"], Vec::new());
+            open_on(&mut app, RailKey::Space(rid("!b:x")));
+            send(&mut app, M::Entry(Entry::MoveDown));
+            assert_eq!(shape(&app), ["!a:x", "!c:x", "!b:x"]);
+            assert_eq!(saves(&store).len(), 1);
+            assert!(app.sidebar_menu.is_none());
+            // Up on the first item changes nothing, saves nothing and closes.
+            open_on(&mut app, RailKey::Space(rid("!a:x")));
+            send(&mut app, M::Entry(Entry::MoveUp));
+            assert_eq!(shape(&app), ["!a:x", "!c:x", "!b:x"]);
+            assert_eq!(saves(&store).len(), 1);
+            assert!(app.sidebar_menu.is_none());
+        }
+
+        #[test]
+        fn inside_an_open_folder_it_moves_within_it_and_a_folders_own_card_moves_the_folder() {
+            let (mut app, store) = menu_app(
+                &["!a:x", "!b:x", "!c:x", "!d:x"],
+                vec![folder(1, true, &["!a:x", "!b:x"]), sp("!c:x"), sp("!d:x")],
+            );
+            open_on(&mut app, RailKey::Space(rid("!a:x")));
+            send(&mut app, M::Entry(Entry::MoveDown));
+            assert_eq!(shape(&app), ["[1: !b:x !a:x]", "!c:x", "!d:x"]);
+            // The folder's own card moves the folder as a whole.
+            open_on(&mut app, RailKey::Folder(1));
+            send(&mut app, M::Entry(Entry::MoveDown));
+            assert_eq!(shape(&app), ["!c:x", "[1: !b:x !a:x]", "!d:x"]);
+            assert_eq!(saves(&store).len(), 2);
+        }
+
+        #[test]
+        fn new_folder_opens_the_dialog_and_enter_saves_the_trimmed_name() {
+            let (mut app, store) = menu_app(&["!a:x", "!b:x", "!c:x"], Vec::new());
+            open_on(&mut app, RailKey::Space(rid("!b:x")));
+            send(&mut app, M::Folder(FolderPick::New));
+            assert_eq!(dialog(&app).purpose, Purpose::NewFolder(rid("!b:x")));
+            assert_eq!(dialog(&app).text, "");
+            send(&mut app, M::NameInput("  Work  ".to_owned()));
+            assert_eq!(saves(&store).len(), 0, "typing saves nothing");
+            send(&mut app, M::NameSubmit);
+            assert!(app.sidebar_menu.is_none());
+            assert_eq!(shape(&app), ["!a:x", "[0: !b:x]", "!c:x"]);
+            let saved = saves(&store);
+            assert_eq!(saved.len(), 1);
+            let RailEntry::Folder(f) = &saved[0].rail[1] else {
+                panic!("a folder")
+            };
+            assert_eq!(f.name.as_ref().map(SidebarLabel::as_str), Some("Work"));
+        }
+
+        #[test]
+        fn a_blank_name_makes_an_unnamed_folder_and_a_pick_moves_into_an_existing_one() {
+            let (mut app, store) = menu_app(
+                &["!a:x", "!b:x", "!c:x"],
+                vec![sp("!a:x"), folder(1, false, &["!b:x", "!c:x"])],
+            );
+            open_on(&mut app, RailKey::Space(rid("!a:x")));
+            send(&mut app, M::Folder(FolderPick::New));
+            send(&mut app, M::NameInput("   ".to_owned()));
+            send(&mut app, M::NameSubmit);
+            assert_eq!(shape(&app), ["[0: !a:x]", "[1: !b:x !c:x]"]);
+            // Into the existing folder.
+            open_on(&mut app, RailKey::Space(rid("!a:x")));
+            let _ = &store;
+            send(&mut app, M::Folder(FolderPick::Existing(1)));
+            assert_eq!(shape(&app), ["[1: !b:x !c:x !a:x]"]);
+            assert!(app.sidebar_menu.is_none());
+        }
+
+        #[test]
+        fn a_name_that_is_not_valid_shows_the_error_saves_nothing_and_esc_cancels() {
+            for bad in ["w".repeat(33), "\u{202E}x".to_owned()] {
+                let (mut app, store) = menu_app(&["!a:x", "!b:x"], Vec::new());
+                open_on(&mut app, RailKey::Space(rid("!b:x")));
+                send(&mut app, M::Folder(FolderPick::New));
+                send(&mut app, M::NameInput(bad));
+                send(&mut app, M::NameSubmit);
+                assert_eq!(dialog(&app).error, Some(NAME_ERROR));
+                assert!(saves(&store).is_empty());
+                assert_eq!(shape(&app), Vec::<String>::new());
+                // Typing again clears the line.
+                send(&mut app, M::NameInput("ok".to_owned()));
+                assert_eq!(dialog(&app).error, None);
+                // Esc cancels: nothing saved.
+                let _ = app.update(Message::Shortcut {
+                    shortcut: Shortcut::Escape,
+                    captured: true,
+                });
+                assert!(app.sidebar_menu.is_none());
+                assert!(saves(&store).is_empty());
+            }
+        }
+
+        #[test]
+        fn the_field_keeps_at_most_128_characters() {
+            let (mut app, _store) = menu_app(&["!a:x", "!b:x"], Vec::new());
+            open_on(&mut app, RailKey::Space(rid("!b:x")));
+            send(&mut app, M::Folder(FolderPick::New));
+            send(&mut app, M::NameInput("n".repeat(5000)));
+            assert_eq!(
+                dialog(&app).text.chars().count(),
+                crate::sidebar_menu::MAX_NAME_INPUT
+            );
+        }
+
+        #[test]
+        fn rename_opens_the_dialog_with_the_current_name_and_saves_the_new_one() {
+            let (mut app, store) = menu_app(
+                &["!a:x", "!b:x"],
+                vec![RailEntry::Folder(FolderLayout {
+                    id: 4,
+                    name: Some(SidebarLabel::try_from("Old").expect("valid")),
+                    open: false,
+                    spaces: vec![rid("!a:x"), rid("!b:x")],
+                })],
+            );
+            open_on(&mut app, RailKey::Folder(4));
+            send(&mut app, M::Entry(Entry::Rename));
+            assert_eq!(dialog(&app).purpose, Purpose::RenameFolder(4));
+            assert_eq!(dialog(&app).text, "Old");
+            send(&mut app, M::NameInput(" New ".to_owned()));
+            send(&mut app, M::NameSubmit);
+            let saved = saves(&store);
+            let RailEntry::Folder(f) = &saved[0].rail[0] else {
+                panic!("a folder")
+            };
+            assert_eq!(f.name.as_ref().map(SidebarLabel::as_str), Some("New"));
+            assert!(app.sidebar_menu.is_none());
+        }
+
+        #[test]
+        fn ungroup_and_remove_from_folder_go_through_the_card() {
+            let (mut app, store) = menu_app(
+                &["!a:x", "!b:x", "!c:x"],
+                vec![folder(1, true, &["!a:x", "!b:x", "!c:x"])],
+            );
+            open_on(&mut app, RailKey::Space(rid("!b:x")));
+            send(&mut app, M::Entry(Entry::RemoveFromFolder));
+            assert_eq!(shape(&app), ["[1: !a:x !c:x]", "!b:x"]);
+            open_on(&mut app, RailKey::Folder(1));
+            send(&mut app, M::Entry(Entry::Ungroup));
+            assert_eq!(shape(&app), ["!a:x", "!c:x", "!b:x"]);
+            assert_eq!(saves(&store).len(), 2);
+        }
+
+        #[test]
+        fn a_full_layout_keeps_the_card_open_with_the_line_and_saves_nothing() {
+            use twicecat_core::api::sidebar::limits::MAX_FOLDERS;
+            let ids: Vec<String> = (0..=MAX_FOLDERS).map(|n| format!("!s{n}:x")).collect();
+            let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+            let mut rail: Vec<RailEntry> = refs[..MAX_FOLDERS]
+                .iter()
+                .enumerate()
+                .map(|(n, id)| folder(u16::try_from(n).expect("small"), false, &[id]))
+                .collect();
+            rail.push(sp(refs[MAX_FOLDERS]));
+            let (mut app, store) = menu_app(&refs, rail);
+            open_on(&mut app, RailKey::Space(rid(refs[MAX_FOLDERS])));
+            send(&mut app, M::Folder(FolderPick::New));
+            send(&mut app, M::NameSubmit);
+            // The dialog stays, with the line.
+            assert_eq!(
+                dialog(&app).error,
+                Some("The sidebar layout is full"),
+                "{:?}",
+                app.sidebar_menu
+            );
+            assert!(saves(&store).is_empty());
+        }
+
+        #[test]
+        fn esc_closes_the_dialog_or_the_card_and_nothing_under_it() {
+            let (mut app, _store) = menu_app(&["!a:x", "!b:x"], Vec::new());
+            let _ = app.update(Message::Threads(ThreadsMessage::Open(root("r"))));
+            let esc = |app: &mut App| {
+                let _ = app.update(Message::Shortcut {
+                    shortcut: Shortcut::Escape,
+                    captured: false,
+                });
+            };
+            open_on(&mut app, RailKey::Space(rid("!a:x")));
+            esc(&mut app);
+            assert!(app.sidebar_menu.is_none());
+            assert!(
+                app.threads.panel.is_some(),
+                "the thread panel is not closed"
+            );
+            open_on(&mut app, RailKey::Space(rid("!a:x")));
+            send(&mut app, M::Folder(FolderPick::New));
+            esc(&mut app);
+            assert!(app.sidebar_menu.is_none());
+            assert!(app.threads.panel.is_some());
+            // With nothing of the rail open, Esc is as before.
+            esc(&mut app);
+            assert!(app.threads.panel.is_none());
+        }
+
+        #[test]
+        fn the_switcher_is_over_the_card_and_takes_esc_first() {
+            let (mut app, _store) = menu_app(&["!a:x", "!b:x"], Vec::new());
+            open_on(&mut app, RailKey::Space(rid("!a:x")));
+            let _ = app.update(Message::Shortcut {
+                shortcut: Shortcut::Switcher,
+                captured: false,
+            });
+            assert!(app.switcher.open && app.sidebar_menu.is_some());
+            let esc = Message::Shortcut {
+                shortcut: Shortcut::Escape,
+                captured: false,
+            };
+            let _ = app.update(esc.clone());
+            assert!(!app.switcher.open);
+            assert!(app.sidebar_menu.is_some(), "the card is still there");
+            let _ = app.update(esc);
+            assert!(app.sidebar_menu.is_none());
+        }
+
+        #[test]
+        fn the_room_stepping_chords_and_the_composer_wait_under_the_card() {
+            let (mut app, mut rx) = main_app();
+            let store = MemorySidebar::default();
+            app.set_sidebar_store(Box::new(store.clone()));
+            let _ = app.sidebar.load_for(UserId::from("@a:x"), &store);
+            app.sidebar
+                .loaded(&UserId::from("@a:x"), SidebarLoad::Default);
+            let _ = app.update(core(CoreEvent::Spaces(vec![top_space("!s:x")])));
+            type_in(&mut app, "hello");
+            while rx.try_recv().is_ok() {}
+            open_on(&mut app, RailKey::Space(rid("!s:x")));
+            assert!(app.sidebar_menu.is_some());
+            let selected = app.selected.clone();
+            let _ = app.update(Message::Shortcut {
+                shortcut: Shortcut::NextRoom,
+                captured: false,
+            });
+            assert_eq!(app.selected, selected, "the room did not change");
+            let _ = app.update(Message::ComposerKey(crate::composer::ComposerKey::Send));
+            assert!(rx.try_recv().is_err(), "the draft is not sent");
+        }
+
+        #[test]
+        fn hover_and_press_of_a_folder_go_when_a_change_dissolves_it() {
+            let (mut app, _store) =
+                menu_app(&["!a:x", "!b:x"], vec![folder(1, false, &["!a:x", "!b:x"])]);
+            let key = RailKey::Folder(1);
+            let _ = app.update(Message::Spaces(crate::spaces::SpacesMessage::Enter(
+                key.clone(),
+            )));
+            let _ = app.update(Message::Spaces(crate::spaces::SpacesMessage::Press(
+                key.clone(),
+            )));
+            assert!(
+                app.apply_sidebar(crate::sidebar::Op::UngroupFolder(1))
+                    .is_ok()
+            );
+            assert_eq!(app.rail_hover, None);
+            assert_eq!(app.rail_pressed, None);
+        }
+
+        #[test]
+        fn the_card_closes_when_its_item_is_gone_and_at_logout() {
+            let (mut app, _store) =
+                menu_app(&["!a:x", "!b:x"], vec![folder(1, false, &["!a:x", "!b:x"])]);
+            open_on(&mut app, RailKey::Folder(1));
+            assert!(app.sidebar_menu.is_some());
+            let _ = app.update(core(CoreEvent::Spaces(vec![top_space("!other:x")])));
+            assert!(
+                app.sidebar_menu.is_none(),
+                "the folder is not drawn any more"
+            );
+
+            let (mut app, _store) = menu_app(&["!a:x", "!b:x"], Vec::new());
+            open_on(&mut app, RailKey::Space(rid("!a:x")));
+            send(&mut app, M::Folder(FolderPick::New));
+            let _ = app.update(core(CoreEvent::Spaces(vec![top_space("!b:x")])));
+            assert!(app.sidebar_menu.is_none(), "the space is gone");
+
+            let (mut app, _store) = menu_app(&["!a:x", "!b:x"], Vec::new());
+            open_on(&mut app, RailKey::Space(rid("!a:x")));
+            let _ = app.update(core(CoreEvent::LoggedOut));
+            assert!(app.sidebar_menu.is_none());
+        }
+    }
+
+    mod sidebar_findings {
+        use super::*;
+        use crate::sidebar_store::{MemorySidebar, SidebarLoad};
+        use crate::spaces::{RailKey, SpacesMessage};
+        use twicecat_core::api::{FolderLayout, RailEntry, SidebarLabel, SidebarLayout, SpaceView};
+
+        fn folder_layout() -> SidebarLayout {
+            let mut layout = SidebarLayout::new(UserId::from("@a:x"));
+            layout.rail = vec![RailEntry::Folder(FolderLayout {
+                id: 1,
+                name: Some(SidebarLabel::try_from("Payroll").expect("a valid name")),
+                open: false,
+                spaces: vec![RoomId::from("!s1:x"), RoomId::from("!s2:x")],
+            })];
+            layout
+        }
+
+        fn top_space(id: &str) -> SpaceView {
+            SpaceView {
+                id: RoomId::from(id),
+                name: id.to_owned(),
+                avatar: None,
+                level: 0,
+                children: 0,
+                rooms: Vec::new(),
+            }
+        }
+
+        fn app_with_folder() -> App {
+            let (mut app, _rx) = login_app();
+            app.set_sidebar_store(Box::new(MemorySidebar::default()));
+            let _ = app.update(core(CoreEvent::LoggedIn {
+                user_id: UserId::from("@a:x"),
+                device_id: DeviceId::from("D"),
+                restored: false,
+            }));
+            let _ = app.update(Message::SidebarLoaded(SidebarAnswer::new(
+                UserId::from("@a:x"),
+                SidebarLoad::Layout(folder_layout()),
+            )));
+            let _ = app.update(core(CoreEvent::Spaces(vec![
+                top_space("!s1:x"),
+                top_space("!s2:x"),
+            ])));
+            app
+        }
+
+        #[test]
+        fn the_debug_of_the_loaded_message_holds_no_account_room_or_name() {
+            let text = format!(
+                "{:?}",
+                Message::SidebarLoaded(SidebarAnswer::new(
+                    UserId::from("@a:x"),
+                    SidebarLoad::Layout(folder_layout())
+                ))
+            );
+            for secret in ["@a:x", "!s1", "Payroll"] {
+                assert!(!text.contains(secret), "{secret} is in {text}");
+            }
+        }
+
+        #[test]
+        fn a_folder_that_stops_being_drawn_loses_its_hover_and_press_keys() {
+            let mut app = app_with_folder();
+            let key = RailKey::Folder(1);
+            let _ = app.update(Message::Spaces(SpacesMessage::Enter(key.clone())));
+            let _ = app.update(Message::Spaces(SpacesMessage::Press(key.clone())));
+            assert_eq!(app.rail_hover, Some(key.clone()));
+            assert_eq!(app.rail_pressed, Some(key));
+            // The core no longer reports its spaces: the folder is not drawn.
+            let _ = app.update(core(CoreEvent::Spaces(vec![top_space("!other:x")])));
+            assert_eq!(app.rail_hover, None);
+            assert_eq!(app.rail_pressed, None);
+        }
+
+        #[test]
+        fn a_folder_that_is_still_drawn_keeps_its_keys() {
+            let mut app = app_with_folder();
+            let key = RailKey::Folder(1);
+            let _ = app.update(Message::Spaces(SpacesMessage::Enter(key.clone())));
+            let _ = app.update(core(CoreEvent::Spaces(vec![
+                top_space("!s1:x"),
+                top_space("!s2:x"),
+                top_space("!more:x"),
+            ])));
+            assert_eq!(app.rail_hover, Some(key));
         }
     }
 

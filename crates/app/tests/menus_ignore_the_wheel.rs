@@ -117,6 +117,17 @@ fn every_pick_list_is_wrapped_by_the_wheel_guard() {
 }
 
 #[test]
+fn the_rails_folder_list_is_a_pick_list_behind_the_wheel_guard() {
+    let own: Vec<(String, String)> = app_sources()
+        .into_iter()
+        .filter(|(name, _)| name.ends_with("screens/sidebar_menu.rs"))
+        .collect();
+    let (seen, bare) = unwrapped(&own, "pick_list");
+    assert_eq!(seen, 1, "the Move to folder list is in the scan");
+    assert!(bare.is_empty(), "unwrapped: {bare:?}");
+}
+
+#[test]
 fn every_slider_is_wrapped_by_the_wheel_guard() {
     let files = app_sources();
     for widget in ["slider", "vertical_slider"] {

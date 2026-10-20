@@ -395,6 +395,8 @@ fn the_fixture_reaches_every_screen_it_names() {
         "switcher",
         "switcher-empty",
         "switcher-long",
+        "rail-menu",
+        "rail-folder-name",
         "verification-requested",
         "verification-emojis",
         "verification-done",
@@ -1450,6 +1452,60 @@ fn ctrl_wheel_over_the_room_header_never_changes_the_notification_mode() {
             changes, 0,
             "Ctrl + wheel changed a room's notification mode at {width}"
         );
+    }
+}
+
+/// The same for the options card of the rail: its "Move to folder" list takes
+/// Ctrl + wheel as "pick the next folder" unless it is behind `kit::menu`, and
+/// that would move a space into a folder while the user only zooms.
+#[test]
+fn ctrl_wheel_over_the_rail_options_card_never_picks_a_folder() {
+    use iced::keyboard::{self, Modifiers};
+    use iced::{Point, mouse::ScrollDelta};
+    let renderer = renderer();
+    for width in [1280.0, 720.0] {
+        let size = Size::new(width, 800.0);
+        let mut app = fixture::scenarios()
+            .into_iter()
+            .find(|s| s.name == "rail-menu")
+            .map(|s| (s.build)())
+            .expect("the rail-menu scenario");
+        app.set_ui_settings(variants(false)[0].settings());
+        app.window_width = width;
+        let mut laid = Laid::new(&app, &renderer, size);
+        laid.settle(&renderer, size);
+        let mut messages: Vec<Message> = Vec::new();
+        let mut deliver = |laid: &mut Laid<'_>, event: Event, at: Point| {
+            let mut shell = Shell::new(&mut messages);
+            laid.element.as_widget_mut().update(
+                &mut laid.tree,
+                &event,
+                Layout::new(&laid.node),
+                mouse::Cursor::Available(at),
+                &renderer,
+                &mut clipboard::Null,
+                &mut shell,
+                &Rectangle::with_size(size),
+            );
+        };
+        let ctrl = Event::Keyboard(keyboard::Event::ModifiersChanged(Modifiers::CTRL));
+        deliver(&mut laid, ctrl, Point::new(1.0, 1.0));
+        for y in (0..800).step_by(4) {
+            for x in (0..width as i32).step_by(6) {
+                let at = Point::new(x as f32, y as f32);
+                for dy in [1.0, -1.0] {
+                    let wheel = Event::Mouse(mouse::Event::WheelScrolled {
+                        delta: ScrollDelta::Lines { x: 0.0, y: dy },
+                    });
+                    deliver(&mut laid, wheel, at);
+                }
+            }
+        }
+        let picks = messages
+            .iter()
+            .filter(|m| matches!(m, Message::SidebarMenu(_)))
+            .count();
+        assert_eq!(picks, 0, "Ctrl + wheel acted on the rail card at {width}");
     }
 }
 
@@ -4431,7 +4487,7 @@ mod dialogs {
     }
 
     /// `(scenario, card width, what the close button in the header sends)`.
-    const CARDS: [(&str, f32, &str); 8] = [
+    const CARDS: [(&str, f32, &str); 10] = [
         ("create-room", 460.0, "Rooms(CloseDialog)"),
         ("join-room", 460.0, "Rooms(CloseDialog)"),
         ("start-dm", 460.0, "Rooms(CloseDialog)"),
@@ -4440,6 +4496,8 @@ mod dialogs {
         ("members", 520.0, "Rooms(CloseMembers)"),
         ("upload", 520.0, "UploadCancelled"),
         ("upload-single", 520.0, "UploadCancelled"),
+        ("rail-menu", 380.0, "SidebarMenu(Close)"),
+        ("rail-folder-name", 380.0, "SidebarMenu(Close)"),
     ];
 
     #[test]
@@ -4483,6 +4541,8 @@ mod dialogs {
             "upload-single",
             "upload-long",
             "upload-wrong-room",
+            "rail-menu",
+            "rail-folder-name",
         ];
         for name in names {
             for size in [WIDE, NARROW, SHORT] {
@@ -4491,6 +4551,7 @@ mod dialogs {
                 let width = match name {
                     n if n.starts_with("room-") || n.starts_with("members") => 520.0,
                     n if n.starts_with("upload") => 520.0,
+                    n if n.starts_with("rail-") => 380.0,
                     _ => 460.0,
                 };
                 let card = card_rect(&laid, width);
@@ -4530,6 +4591,7 @@ mod dialogs {
             ("upload-single", 520.0, "UploadConfirmed"),
             ("upload-long", 520.0, "UploadConfirmed"),
             ("user-card", 460.0, "Rooms(CardMessage)"),
+            ("rail-folder-name", 380.0, "SidebarMenu(NameSubmit)"),
         ] {
             let app = dialog_app(name, SHORT);
             let laid = Laid::new(&app, &renderer, SHORT);
@@ -4730,6 +4792,8 @@ mod dialogs {
             "upload-single",
             "viewer",
             "switcher",
+            "rail-menu",
+            "rail-folder-name",
         ] {
             let app = dialog_app(name, WIDE);
             let mut laid = Laid::new(&app, &renderer, WIDE);

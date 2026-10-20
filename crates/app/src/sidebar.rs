@@ -5,12 +5,16 @@
 //! to each method, and it saves the layout of its own account after every
 //! successful [`Op`]. A file the app may not touch (`Newer`, `OtherAccount`)
 //! turns customizing off: every operation is then refused and nothing is
-//! saved. Room IDs, names and the account never appear in `Debug`.
+//! saved. `Debug` of the model, of an [`Op`] and of the store's types shows
+//! counts and kinds only: no room ID, account, folder name or path.
 
+use std::collections::HashSet;
 use std::fmt;
 
 use iced::Task;
-use twicecat_core::api::{RailEntry, RoomId, SectionKey, SidebarLayout, SpaceLayout, UserId};
+use twicecat_core::api::{
+    FolderLayout, RailEntry, RoomId, SectionKey, SidebarLabel, SidebarLayout, SpaceLayout, UserId,
+};
 
 use crate::sidebar_store::{SidebarLoad, SidebarStore};
 
@@ -33,8 +37,43 @@ pub enum SidebarState {
     Full,
 }
 
+/// Which way a move goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dir {
+    /// Towards the start of the rail (the top).
+    Up,
+    /// Towards the end of the rail (the bottom).
+    Down,
+}
+
+/// The folder a space is moved into.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FolderTarget {
+    /// A folder of the rail, by its ID.
+    Existing(u16),
+    /// A new folder, with the name the user gave it (if any), made at the
+    /// place of the space. The lowest free ID is used.
+    New(Option<SidebarLabel>),
+}
+
+impl fmt::Debug for FolderTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Existing(id) => f.debug_tuple("Existing").field(id).finish(),
+            // The name is the user's own text: only whether there is one.
+            Self::New(name) => f
+                .debug_struct("New")
+                .field("named", &name.is_some())
+                .finish(),
+        }
+    }
+}
+
 /// A change of the layout.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` shows what kind of change it is and a folder's number, never a room
+/// ID or a name.
+#[derive(Clone, PartialEq, Eq)]
 pub enum Op {
     /// Opens or closes the folder with this ID.
     ToggleFolder(u16),
@@ -45,6 +84,70 @@ pub enum Op {
         /// The section.
         key: SectionKey,
     },
+    /// Moves a space one item up or down the rail as drawn. Inside a folder it
+    /// moves within the folder and never leaves it. At the end it does
+    /// nothing.
+    MoveSpace {
+        /// The space.
+        id: RoomId,
+        /// Which way.
+        dir: Dir,
+    },
+    /// Takes a space out of where it is and puts it in a folder: at the end of
+    /// an existing one, or alone in a new one made at its place. A folder it
+    /// leaves with fewer than 2 spaces dissolves.
+    MoveToFolder {
+        /// The space.
+        id: RoomId,
+        /// The folder.
+        folder: FolderTarget,
+    },
+    /// Takes a space out of its folder and puts it on the rail right after the
+    /// folder. A folder left with fewer than 2 spaces dissolves.
+    RemoveFromFolder(RoomId),
+    /// Gives a folder a name, or clears it (`None`).
+    RenameFolder {
+        /// The folder.
+        id: u16,
+        /// The new name.
+        name: Option<SidebarLabel>,
+    },
+    /// Dissolves a folder: its spaces go back on the rail, in order, at its
+    /// place.
+    UngroupFolder(u16),
+    /// Moves a folder one item up or down the rail as drawn.
+    MoveFolder {
+        /// The folder.
+        id: u16,
+        /// Which way.
+        dir: Dir,
+    },
+}
+
+impl fmt::Debug for Op {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ToggleFolder(id) => f.debug_tuple("ToggleFolder").field(id).finish(),
+            Self::ToggleSection { .. } => f.write_str("ToggleSection { .. }"),
+            Self::MoveSpace { dir, .. } => f.debug_struct("MoveSpace").field("dir", dir).finish(),
+            Self::MoveToFolder { folder, .. } => f
+                .debug_struct("MoveToFolder")
+                .field("folder", folder)
+                .finish(),
+            Self::RemoveFromFolder(_) => f.write_str("RemoveFromFolder(..)"),
+            Self::RenameFolder { id, name } => f
+                .debug_struct("RenameFolder")
+                .field("id", id)
+                .field("named", &name.is_some())
+                .finish(),
+            Self::UngroupFolder(id) => f.debug_tuple("UngroupFolder").field(id).finish(),
+            Self::MoveFolder { id, dir } => f
+                .debug_struct("MoveFolder")
+                .field("id", id)
+                .field("dir", dir)
+                .finish(),
+        }
+    }
 }
 
 /// Why an [`Op`] (or a reset) was not done. Nothing was saved.
@@ -56,8 +159,20 @@ pub enum Refused {
     Protected,
     /// The layout would pass a limit.
     Full,
-    /// The folder or section the change names does not exist.
+    /// The folder, section or space the change names does not exist.
     Unknown,
+}
+
+impl Refused {
+    /// The line to show for it.
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::NotLoaded => "The sidebar layout is not loaded yet",
+            Self::Protected => "The sidebar layout cannot be changed on this device",
+            Self::Full => "The sidebar layout is full",
+            Self::Unknown => "That item is not on the sidebar any more",
+        }
+    }
 }
 
 /// The logged-in account's sidebar layout.
@@ -150,14 +265,34 @@ impl SidebarModel {
     }
 
     /// Does `op` and saves the new layout for the model's own account. The
-    /// task yields whether the save worked.
+    /// task yields whether the save worked. A change that changes nothing
+    /// (a move past the end, a name set to itself) succeeds without a save.
+    ///
+    /// Rail moves need to know which spaces the rail draws: use
+    /// [`Self::apply_known`].
     pub fn apply(&mut self, op: Op, store: &dyn SidebarStore) -> Result<Task<bool>, Refused> {
+        self.apply_known(op, &[], store)
+    }
+
+    /// [`Self::apply`], where `known` are the top-level spaces the core
+    /// reports, in its order. The rail draws those, in the layout's order,
+    /// with the ones the layout does not name after them, so a move is
+    /// relative to the neighbours that are drawn: stored spaces the core does
+    /// not report are stepped over and kept.
+    pub fn apply_known(
+        &mut self,
+        op: Op,
+        known: &[RoomId],
+        store: &dyn SidebarStore,
+    ) -> Result<Task<bool>, Refused> {
         self.check_open()?;
         let (Some(account), Some(current)) = (self.account.clone(), self.layout.as_ref()) else {
             return Err(Refused::NotLoaded);
         };
         let mut next = current.clone();
-        change(&mut next, op)?;
+        if change(&mut next, op, known)? == Change::Nothing {
+            return Ok(Task::none());
+        }
         if !next.fits() {
             self.state = SidebarState::Full;
             return Err(Refused::Full);
@@ -182,15 +317,18 @@ impl SidebarModel {
     }
 }
 
+/// Whether an operation changed the layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Change {
+    Done,
+    Nothing,
+}
+
 /// Does `op` on `layout`. The caller checks the limits afterwards.
-fn change(layout: &mut SidebarLayout, op: Op) -> Result<(), Refused> {
+fn change(layout: &mut SidebarLayout, op: Op, known: &[RoomId]) -> Result<Change, Refused> {
     match op {
         Op::ToggleFolder(id) => {
-            let folder = layout.rail.iter_mut().find_map(|entry| match entry {
-                RailEntry::Folder(folder) if folder.id == id => Some(folder),
-                _ => None,
-            });
-            let folder = folder.ok_or(Refused::Unknown)?;
+            let folder = folder_mut(layout, id).ok_or(Refused::Unknown)?;
             folder.open = !folder.open;
         }
         Op::ToggleSection { space, key } => {
@@ -209,13 +347,219 @@ fn change(layout: &mut SidebarLayout, op: Op) -> Result<(), Refused> {
                 None => collapsed.push(key),
             }
         }
+        Op::MoveSpace { id, dir } => {
+            materialize(layout, known);
+            return move_space(layout, &id, dir, known);
+        }
+        Op::MoveFolder { id, dir } => {
+            materialize(layout, known);
+            let at = folder_index(layout, id).ok_or(Refused::Unknown)?;
+            let Some(to) = step(&layout.rail, at, dir, |e| drawn(e, known)) else {
+                return Ok(Change::Nothing);
+            };
+            let entry = layout.rail.remove(at);
+            layout.rail.insert(to, entry);
+        }
+        Op::MoveToFolder { id, folder } => {
+            materialize(layout, known);
+            return move_to_folder(layout, id, folder);
+        }
+        Op::RemoveFromFolder(id) => {
+            if !in_a_folder(layout, &id) {
+                return Err(Refused::Unknown);
+            }
+            let at = take_out(layout, &id).ok_or(Refused::Unknown)?;
+            layout.rail.insert(at, RailEntry::Space(id));
+        }
+        Op::RenameFolder { id, name } => {
+            let folder = folder_mut(layout, id).ok_or(Refused::Unknown)?;
+            if folder.name == name {
+                return Ok(Change::Nothing);
+            }
+            folder.name = name;
+        }
+        Op::UngroupFolder(id) => {
+            let at = folder_index(layout, id).ok_or(Refused::Unknown)?;
+            let RailEntry::Folder(folder) = layout.rail.remove(at) else {
+                return Err(Refused::Unknown);
+            };
+            for (n, space) in folder.spaces.into_iter().enumerate() {
+                layout.rail.insert(at + n, RailEntry::Space(space));
+            }
+        }
     }
-    Ok(())
+    Ok(Change::Done)
+}
+
+fn folder_mut(layout: &mut SidebarLayout, id: u16) -> Option<&mut FolderLayout> {
+    layout.rail.iter_mut().find_map(|entry| match entry {
+        RailEntry::Folder(folder) if folder.id == id => Some(folder),
+        _ => None,
+    })
+}
+
+fn folder_index(layout: &SidebarLayout, id: u16) -> Option<usize> {
+    layout
+        .rail
+        .iter()
+        .position(|entry| matches!(entry, RailEntry::Folder(f) if f.id == id))
+}
+
+fn in_a_folder(layout: &SidebarLayout, id: &RoomId) -> bool {
+    layout
+        .rail
+        .iter()
+        .any(|entry| matches!(entry, RailEntry::Folder(f) if f.spaces.contains(id)))
+}
+
+/// Adds the spaces the core reports and the layout does not name to the end of
+/// the rail, in the core's order: the rail as it is drawn, written down.
+fn materialize(layout: &mut SidebarLayout, known: &[RoomId]) {
+    let mut placed: HashSet<RoomId> = HashSet::new();
+    for entry in &layout.rail {
+        match entry {
+            RailEntry::Space(id) => {
+                placed.insert(id.clone());
+            }
+            RailEntry::Folder(folder) => placed.extend(folder.spaces.iter().cloned()),
+        }
+    }
+    for id in known {
+        if placed.insert(id.clone()) {
+            layout.rail.push(RailEntry::Space(id.clone()));
+        }
+    }
+}
+
+/// Whether the rail draws `entry`: a space the core reports, or a folder with
+/// at least one.
+fn drawn(entry: &RailEntry, known: &[RoomId]) -> bool {
+    match entry {
+        RailEntry::Space(id) => known.contains(id),
+        RailEntry::Folder(folder) => folder.spaces.iter().any(|id| known.contains(id)),
+    }
+}
+
+/// The index of the nearest item to `from` in direction `dir` that
+/// `visible` accepts.
+fn step<T>(items: &[T], from: usize, dir: Dir, visible: impl Fn(&T) -> bool) -> Option<usize> {
+    match dir {
+        Dir::Up => (0..from).rev().find(|&n| visible(&items[n])),
+        Dir::Down => (from + 1..items.len()).find(|&n| visible(&items[n])),
+    }
+}
+
+fn move_space(
+    layout: &mut SidebarLayout,
+    id: &RoomId,
+    dir: Dir,
+    known: &[RoomId],
+) -> Result<Change, Refused> {
+    if let Some(at) = layout
+        .rail
+        .iter()
+        .position(|entry| matches!(entry, RailEntry::Space(s) if s == id))
+    {
+        let Some(to) = step(&layout.rail, at, dir, |e| drawn(e, known)) else {
+            return Ok(Change::Nothing);
+        };
+        let entry = layout.rail.remove(at);
+        layout.rail.insert(to, entry);
+        return Ok(Change::Done);
+    }
+    for entry in &mut layout.rail {
+        let RailEntry::Folder(folder) = entry else {
+            continue;
+        };
+        let Some(at) = folder.spaces.iter().position(|s| s == id) else {
+            continue;
+        };
+        let Some(to) = step(&folder.spaces, at, dir, |s| known.contains(s)) else {
+            return Ok(Change::Nothing);
+        };
+        let space = folder.spaces.remove(at);
+        folder.spaces.insert(to, space);
+        return Ok(Change::Done);
+    }
+    Err(Refused::Unknown)
+}
+
+/// Takes `id` out of the rail, from the top level or from a folder, and says
+/// where on the rail something that replaces it goes. A folder that is left
+/// with fewer than 2 spaces dissolves into the rail.
+fn take_out(layout: &mut SidebarLayout, id: &RoomId) -> Option<usize> {
+    if let Some(at) = layout
+        .rail
+        .iter()
+        .position(|entry| matches!(entry, RailEntry::Space(s) if s == id))
+    {
+        layout.rail.remove(at);
+        return Some(at);
+    }
+    let at = layout
+        .rail
+        .iter()
+        .position(|entry| matches!(entry, RailEntry::Folder(f) if f.spaces.contains(id)))?;
+    let RailEntry::Folder(folder) = &mut layout.rail[at] else {
+        return None;
+    };
+    folder.spaces.retain(|s| s != id);
+    if folder.spaces.len() >= 2 {
+        return Some(at + 1);
+    }
+    // The folder dissolves: what is left of it takes its place.
+    let RailEntry::Folder(folder) = layout.rail.remove(at) else {
+        return None;
+    };
+    let left = folder.spaces.len();
+    for (n, space) in folder.spaces.into_iter().enumerate() {
+        layout.rail.insert(at + n, RailEntry::Space(space));
+    }
+    Some(at + left)
+}
+
+fn move_to_folder(
+    layout: &mut SidebarLayout,
+    id: RoomId,
+    target: FolderTarget,
+) -> Result<Change, Refused> {
+    match target {
+        FolderTarget::Existing(folder) => {
+            let into = folder_index(layout, folder).ok_or(Refused::Unknown)?;
+            let RailEntry::Folder(f) = &layout.rail[into] else {
+                return Err(Refused::Unknown);
+            };
+            if f.spaces.contains(&id) {
+                return Ok(Change::Nothing);
+            }
+            take_out(layout, &id).ok_or(Refused::Unknown)?;
+            // The folder may have moved if the space's own folder dissolved.
+            let folder = folder_mut(layout, folder).ok_or(Refused::Unknown)?;
+            folder.spaces.push(id);
+        }
+        FolderTarget::New(name) => {
+            let new_id = (0..=u16::MAX)
+                .find(|n| folder_index(layout, *n).is_none())
+                .ok_or(Refused::Full)?;
+            let at = take_out(layout, &id).ok_or(Refused::Unknown)?;
+            layout.rail.insert(
+                at,
+                RailEntry::Folder(FolderLayout {
+                    id: new_id,
+                    name,
+                    // Closed, so the rail shows its preview.
+                    open: false,
+                    spaces: vec![id],
+                }),
+            );
+        }
+    }
+    Ok(Change::Done)
 }
 
 #[cfg(test)]
 mod tests {
-    use twicecat_core::api::FolderLayout;
+    use twicecat_core::api::{FolderLayout, SidebarLabel};
 
     use super::*;
     use crate::sidebar_store::{Call, MemorySidebar};
@@ -453,6 +797,481 @@ mod tests {
         let text = format!("{model:?}");
         for secret in ["!solo", "!in1", "!secretspace", "@secretme"] {
             assert!(!text.contains(secret), "{text}");
+        }
+    }
+
+    // ---- arranging the rail (Task sbc.6) ----
+
+    fn label(name: &str) -> SidebarLabel {
+        SidebarLabel::try_from(name).expect("a valid name")
+    }
+
+    fn sp(id: &str) -> RailEntry {
+        RailEntry::Space(rid(id))
+    }
+
+    fn folder(id: u16, spaces: &[&str]) -> RailEntry {
+        RailEntry::Folder(FolderLayout {
+            id,
+            name: None,
+            open: false,
+            spaces: spaces.iter().map(|s| rid(s)).collect(),
+        })
+    }
+
+    /// The rail as text: `a`, or `[1: a b]` for a folder.
+    fn shape(layout: &SidebarLayout) -> Vec<String> {
+        layout
+            .rail
+            .iter()
+            .map(|entry| match entry {
+                RailEntry::Space(id) => id.as_str().to_owned(),
+                RailEntry::Folder(f) => {
+                    let ids: Vec<&str> = f.spaces.iter().map(|s| s.as_str()).collect();
+                    format!("[{}: {}]", f.id, ids.join(" "))
+                }
+            })
+            .collect()
+    }
+
+    fn known(ids: &[&str]) -> Vec<RoomId> {
+        ids.iter().map(|s| rid(s)).collect()
+    }
+
+    /// A loaded model whose layout has `rail`, and the store it saves to.
+    fn rail_model(rail: Vec<RailEntry>) -> (SidebarModel, MemorySidebar) {
+        let store = MemorySidebar::default();
+        let mut layout = SidebarLayout::new(user("@a:x"));
+        layout.rail = rail;
+        (loaded_model(&store, layout), store)
+    }
+
+    fn saves(store: &MemorySidebar) -> usize {
+        store
+            .calls()
+            .iter()
+            .filter(|c| matches!(c, Call::Save(..)))
+            .count()
+    }
+
+    fn rail_of(model: &SidebarModel) -> Vec<String> {
+        shape(model.layout().expect("a layout"))
+    }
+
+    fn move_space(id: &str, dir: Dir) -> Op {
+        Op::MoveSpace { id: rid(id), dir }
+    }
+
+    #[test]
+    fn move_up_on_the_first_item_and_down_on_the_last_change_nothing_and_save_nothing() {
+        let all = known(&["!a:x", "!b:x", "!c:x"]);
+        let (mut model, store) = rail_model(vec![sp("!a:x"), sp("!b:x"), sp("!c:x")]);
+        for op in [move_space("!a:x", Dir::Up), move_space("!c:x", Dir::Down)] {
+            assert!(model.apply_known(op, &all, &store).is_ok());
+        }
+        assert_eq!(rail_of(&model), ["!a:x", "!b:x", "!c:x"]);
+        assert_eq!(saves(&store), 0, "no save for a move that goes nowhere");
+        // The same at the ends of an unwritten layout (the core's order).
+        let (mut model, store) = rail_model(Vec::new());
+        assert!(
+            model
+                .apply_known(move_space("!a:x", Dir::Up), &all, &store)
+                .is_ok()
+        );
+        assert_eq!(saves(&store), 0);
+        assert!(model.layout().expect("a layout").rail.is_empty());
+        // And moving the only folder of the rail.
+        let (mut model, store) = rail_model(vec![folder(1, &["!a:x", "!b:x"])]);
+        let both = known(&["!a:x", "!b:x"]);
+        let up = Op::MoveFolder {
+            id: 1,
+            dir: Dir::Up,
+        };
+        assert!(model.apply_known(up, &both, &store).is_ok());
+        assert_eq!(saves(&store), 0);
+    }
+
+    #[test]
+    fn move_down_moves_a_space_one_item_and_saves_once() {
+        let all = known(&["!a:x", "!b:x", "!c:x"]);
+        let (mut model, store) = rail_model(vec![sp("!a:x"), sp("!b:x"), sp("!c:x")]);
+        assert!(
+            model
+                .apply_known(move_space("!b:x", Dir::Down), &all, &store)
+                .is_ok()
+        );
+        assert_eq!(rail_of(&model), ["!a:x", "!c:x", "!b:x"]);
+        assert_eq!(saves(&store), 1);
+        assert!(
+            model
+                .apply_known(move_space("!b:x", Dir::Up), &all, &store)
+                .is_ok()
+        );
+        assert_eq!(rail_of(&model), ["!a:x", "!b:x", "!c:x"]);
+        assert_eq!(saves(&store), 2);
+    }
+
+    #[test]
+    fn a_move_starts_from_the_rail_as_drawn_including_spaces_the_layout_does_not_name() {
+        // The layout names only `c`; the core's other spaces are drawn after it.
+        let all = known(&["!a:x", "!b:x", "!c:x"]);
+        let (mut model, store) = rail_model(vec![sp("!c:x")]);
+        assert!(
+            model
+                .apply_known(move_space("!a:x", Dir::Up), &all, &store)
+                .is_ok()
+        );
+        assert_eq!(rail_of(&model), ["!a:x", "!c:x", "!b:x"]);
+        assert_eq!(saves(&store), 1);
+    }
+
+    #[test]
+    fn a_move_steps_over_entries_that_are_not_drawn() {
+        // `!gone` is stored but the core does not report it.
+        let all = known(&["!a:x", "!b:x"]);
+        let (mut model, store) = rail_model(vec![sp("!a:x"), sp("!gone:x"), sp("!b:x")]);
+        assert!(
+            model
+                .apply_known(move_space("!a:x", Dir::Down), &all, &store)
+                .is_ok()
+        );
+        assert_eq!(rail_of(&model), ["!gone:x", "!b:x", "!a:x"]);
+        // The stored one stays stored.
+        let (mut model, store) = rail_model(vec![sp("!gone:x"), sp("!a:x")]);
+        assert!(
+            model
+                .apply_known(move_space("!a:x", Dir::Up), &all, &store)
+                .is_ok()
+        );
+        assert_eq!(saves(&store), 0, "nothing drawn above it");
+    }
+
+    #[test]
+    fn inside_an_open_folder_a_move_stays_in_the_folder() {
+        let all = known(&["!a:x", "!b:x", "!c:x", "!d:x"]);
+        let (mut model, store) = rail_model(vec![sp("!a:x"), folder(1, &["!b:x", "!c:x", "!d:x"])]);
+        assert!(
+            model
+                .apply_known(move_space("!b:x", Dir::Down), &all, &store)
+                .is_ok()
+        );
+        assert_eq!(rail_of(&model), ["!a:x", "[1: !c:x !b:x !d:x]"]);
+        assert_eq!(saves(&store), 1);
+        // At the end of the folder it does not leave it, and saves nothing.
+        assert!(
+            model
+                .apply_known(move_space("!d:x", Dir::Down), &all, &store)
+                .is_ok()
+        );
+        assert!(
+            model
+                .apply_known(move_space("!c:x", Dir::Up), &all, &store)
+                .is_ok()
+        );
+        assert_eq!(rail_of(&model), ["!a:x", "[1: !c:x !b:x !d:x]"]);
+        assert_eq!(saves(&store), 1);
+    }
+
+    #[test]
+    fn move_down_on_a_folders_own_card_moves_the_folder() {
+        let all = known(&["!a:x", "!b:x", "!c:x", "!d:x"]);
+        let (mut model, store) =
+            rail_model(vec![folder(1, &["!a:x", "!b:x"]), sp("!c:x"), sp("!d:x")]);
+        let down = Op::MoveFolder {
+            id: 1,
+            dir: Dir::Down,
+        };
+        assert!(model.apply_known(down, &all, &store).is_ok());
+        assert_eq!(rail_of(&model), ["!c:x", "[1: !a:x !b:x]", "!d:x"]);
+        assert_eq!(saves(&store), 1);
+        let up = Op::MoveFolder {
+            id: 1,
+            dir: Dir::Up,
+        };
+        assert!(model.apply_known(up, &all, &store).is_ok());
+        assert_eq!(rail_of(&model), ["[1: !a:x !b:x]", "!c:x", "!d:x"]);
+    }
+
+    #[test]
+    fn moving_a_space_into_a_new_folder_makes_the_folder_at_its_place() {
+        let all = known(&["!a:x", "!b:x", "!c:x"]);
+        let (mut model, store) = rail_model(vec![sp("!a:x"), sp("!b:x"), sp("!c:x")]);
+        let op = Op::MoveToFolder {
+            id: rid("!b:x"),
+            folder: FolderTarget::New(Some(label("Work"))),
+        };
+        assert!(model.apply_known(op, &all, &store).is_ok());
+        assert_eq!(rail_of(&model), ["!a:x", "[0: !b:x]", "!c:x"]);
+        let RailEntry::Folder(f) = &model.layout().expect("a layout").rail[1] else {
+            panic!("a folder")
+        };
+        assert_eq!(f.name, Some(label("Work")));
+        assert!(!f.open, "the folder shows its preview");
+        assert_eq!(saves(&store), 1);
+    }
+
+    #[test]
+    fn folder_ids_are_the_lowest_free_one() {
+        let all = known(&["!a:x", "!b:x", "!c:x", "!d:x", "!e:x"]);
+        let (mut model, store) = rail_model(vec![
+            folder(0, &["!a:x", "!b:x"]),
+            folder(2, &["!c:x", "!d:x"]),
+            sp("!e:x"),
+        ]);
+        let op = Op::MoveToFolder {
+            id: rid("!e:x"),
+            folder: FolderTarget::New(None),
+        };
+        assert!(model.apply_known(op, &all, &store).is_ok());
+        assert_eq!(
+            rail_of(&model),
+            ["[0: !a:x !b:x]", "[2: !c:x !d:x]", "[1: !e:x]"]
+        );
+    }
+
+    #[test]
+    fn moving_a_space_into_an_existing_folder_appends_it() {
+        let all = known(&["!a:x", "!b:x", "!c:x"]);
+        let (mut model, store) = rail_model(vec![sp("!a:x"), folder(1, &["!b:x", "!c:x"])]);
+        let into = |id: &str| Op::MoveToFolder {
+            id: rid(id),
+            folder: FolderTarget::Existing(1),
+        };
+        assert!(model.apply_known(into("!a:x"), &all, &store).is_ok());
+        assert_eq!(rail_of(&model), ["[1: !b:x !c:x !a:x]"]);
+        assert_eq!(saves(&store), 1);
+        // Already there: nothing to do, nothing saved.
+        assert!(model.apply_known(into("!a:x"), &all, &store).is_ok());
+        assert_eq!(saves(&store), 1);
+        // A folder that does not exist is refused.
+        let bad = Op::MoveToFolder {
+            id: rid("!a:x"),
+            folder: FolderTarget::Existing(9),
+        };
+        assert_eq!(
+            model.apply_known(bad, &all, &store).err(),
+            Some(Refused::Unknown)
+        );
+        assert_eq!(saves(&store), 1);
+    }
+
+    #[test]
+    fn moving_the_second_to_last_space_out_of_a_folder_dissolves_it() {
+        let all = known(&["!a:x", "!b:x", "!c:x"]);
+        // Out to the top level.
+        let (mut model, store) = rail_model(vec![folder(1, &["!a:x", "!b:x"]), sp("!c:x")]);
+        let out = Op::RemoveFromFolder(rid("!b:x"));
+        assert!(model.apply_known(out, &all, &store).is_ok());
+        assert_eq!(rail_of(&model), ["!a:x", "!b:x", "!c:x"]);
+        assert_eq!(saves(&store), 1);
+        // Into another folder.
+        let (mut model, store) = rail_model(vec![
+            folder(1, &["!a:x", "!b:x"]),
+            folder(2, &["!c:x", "!d:x"]),
+        ]);
+        let all = known(&["!a:x", "!b:x", "!c:x", "!d:x"]);
+        let across = Op::MoveToFolder {
+            id: rid("!b:x"),
+            folder: FolderTarget::Existing(2),
+        };
+        assert!(model.apply_known(across, &all, &store).is_ok());
+        assert_eq!(rail_of(&model), ["!a:x", "[2: !c:x !d:x !b:x]"]);
+        // A folder with three keeps its shape and loses one.
+        let (mut model, store) = rail_model(vec![folder(1, &["!a:x", "!b:x", "!c:x"])]);
+        let out = Op::RemoveFromFolder(rid("!b:x"));
+        assert!(model.apply_known(out, &all, &store).is_ok());
+        assert_eq!(rail_of(&model), ["[1: !a:x !c:x]", "!b:x"]);
+        // A space that is not in a folder is refused.
+        let top = Op::RemoveFromFolder(rid("!b:x"));
+        assert_eq!(
+            model.apply_known(top, &all, &store).err(),
+            Some(Refused::Unknown)
+        );
+    }
+
+    #[test]
+    fn moving_a_space_from_a_folder_into_a_new_folder_dissolves_the_old_one() {
+        let all = known(&["!a:x", "!b:x"]);
+        let (mut model, store) = rail_model(vec![folder(1, &["!a:x", "!b:x"])]);
+        let op = Op::MoveToFolder {
+            id: rid("!b:x"),
+            folder: FolderTarget::New(None),
+        };
+        assert!(model.apply_known(op, &all, &store).is_ok());
+        assert_eq!(rail_of(&model), ["!a:x", "[0: !b:x]"]);
+    }
+
+    #[test]
+    fn ungroup_puts_the_spaces_back_in_their_order() {
+        let all = known(&["!a:x", "!b:x", "!c:x", "!d:x"]);
+        let (mut model, store) = rail_model(vec![sp("!a:x"), folder(1, &["!c:x", "!b:x", "!d:x"])]);
+        assert!(
+            model
+                .apply_known(Op::UngroupFolder(1), &all, &store)
+                .is_ok()
+        );
+        assert_eq!(rail_of(&model), ["!a:x", "!c:x", "!b:x", "!d:x"]);
+        assert_eq!(saves(&store), 1);
+        assert_eq!(
+            model.apply_known(Op::UngroupFolder(1), &all, &store).err(),
+            Some(Refused::Unknown)
+        );
+    }
+
+    #[test]
+    fn renaming_a_folder_sets_or_clears_its_name_and_saves_only_a_change() {
+        let all = known(&["!a:x", "!b:x"]);
+        let (mut model, store) = rail_model(vec![folder(1, &["!a:x", "!b:x"])]);
+        let rename = |name| Op::RenameFolder { id: 1, name };
+        let name_of = |m: &SidebarModel| match &m.layout().expect("a layout").rail[0] {
+            RailEntry::Folder(f) => f.name,
+            RailEntry::Space(_) => None,
+        };
+        assert!(model.apply_known(rename(None), &all, &store).is_ok());
+        assert_eq!(saves(&store), 0, "no name to no name");
+        assert!(
+            model
+                .apply_known(rename(Some(label("Work"))), &all, &store)
+                .is_ok()
+        );
+        assert_eq!(name_of(&model), Some(label("Work")));
+        assert_eq!(saves(&store), 1);
+        assert!(
+            model
+                .apply_known(rename(Some(label("Work"))), &all, &store)
+                .is_ok()
+        );
+        assert_eq!(saves(&store), 1);
+        assert!(model.apply_known(rename(None), &all, &store).is_ok());
+        assert_eq!(name_of(&model), None);
+        assert_eq!(saves(&store), 2);
+        let ghost = Op::RenameFolder { id: 9, name: None };
+        assert_eq!(
+            model.apply_known(ghost, &all, &store).err(),
+            Some(Refused::Unknown)
+        );
+    }
+
+    #[test]
+    fn a_move_of_a_space_the_layout_does_not_have_is_refused() {
+        let all = known(&["!a:x"]);
+        let (mut model, store) = rail_model(vec![sp("!a:x")]);
+        assert_eq!(
+            model
+                .apply_known(move_space("!nope:x", Dir::Up), &all, &store)
+                .err(),
+            Some(Refused::Unknown)
+        );
+        let down = Op::MoveFolder {
+            id: 4,
+            dir: Dir::Down,
+        };
+        assert_eq!(
+            model.apply_known(down, &all, &store).err(),
+            Some(Refused::Unknown)
+        );
+        assert_eq!(saves(&store), 0);
+    }
+
+    #[test]
+    fn an_edit_that_would_pass_max_folders_is_refused_as_full_and_saves_nothing() {
+        use twicecat_core::api::sidebar::limits::MAX_FOLDERS;
+        let ids: Vec<String> = (0..=MAX_FOLDERS).map(|n| format!("!s{n}:x")).collect();
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let all = known(&refs);
+        // MAX_FOLDERS folders of one space each, and one space left over.
+        let mut rail: Vec<RailEntry> = refs[..MAX_FOLDERS]
+            .iter()
+            .enumerate()
+            .map(|(n, id)| folder(u16::try_from(n).expect("small"), &[id]))
+            .collect();
+        rail.push(sp(refs[MAX_FOLDERS]));
+        let (mut model, store) = rail_model(rail.clone());
+        assert!(model.layout().expect("a layout").fits());
+        let op = Op::MoveToFolder {
+            id: rid(refs[MAX_FOLDERS]),
+            folder: FolderTarget::New(None),
+        };
+        assert_eq!(
+            model.apply_known(op, &all, &store).err(),
+            Some(Refused::Full)
+        );
+        assert_eq!(model.state(), SidebarState::Full);
+        assert_eq!(model.layout().expect("a layout").rail, rail, "unchanged");
+        assert_eq!(saves(&store), 0);
+        assert_eq!(Refused::Full.message(), "The sidebar layout is full");
+    }
+
+    #[test]
+    fn in_the_newer_state_every_rail_operation_is_refused() {
+        let all = known(&["!a:x", "!b:x"]);
+        let ops = [
+            move_space("!a:x", Dir::Down),
+            Op::MoveToFolder {
+                id: rid("!a:x"),
+                folder: FolderTarget::New(None),
+            },
+            Op::RemoveFromFolder(rid("!a:x")),
+            Op::RenameFolder { id: 1, name: None },
+            Op::UngroupFolder(1),
+            Op::MoveFolder {
+                id: 1,
+                dir: Dir::Up,
+            },
+        ];
+        for load in [SidebarLoad::Newer, SidebarLoad::OtherAccount] {
+            let store = MemorySidebar::default();
+            let a = user("@a:x");
+            let mut model = SidebarModel::default();
+            let _ = model.load_for(a.clone(), &store);
+            model.loaded(&a, load);
+            for op in &ops {
+                assert_eq!(
+                    model.apply_known(op.clone(), &all, &store).err(),
+                    Some(Refused::Protected),
+                    "{op:?}"
+                );
+            }
+            assert_eq!(saves(&store), 0);
+        }
+    }
+
+    #[test]
+    fn debug_of_an_op_shows_no_room_id_and_no_folder_name() {
+        let ops = [
+            Op::ToggleFolder(7),
+            Op::ToggleSection {
+                space: rid("!secretroom:x"),
+                key: SectionKey::SubSpace(rid("!secretroom:x")),
+            },
+            Op::MoveSpace {
+                id: rid("!secretroom:x"),
+                dir: Dir::Up,
+            },
+            Op::MoveToFolder {
+                id: rid("!secretroom:x"),
+                folder: FolderTarget::New(Some(label("Payroll"))),
+            },
+            Op::MoveToFolder {
+                id: rid("!secretroom:x"),
+                folder: FolderTarget::Existing(2),
+            },
+            Op::RemoveFromFolder(rid("!secretroom:x")),
+            Op::RenameFolder {
+                id: 3,
+                name: Some(label("Payroll")),
+            },
+            Op::UngroupFolder(3),
+            Op::MoveFolder {
+                id: 3,
+                dir: Dir::Down,
+            },
+        ];
+        for op in ops {
+            let text = format!("{op:?}");
+            for secret in ["!secretroom", "@a:x", "Payroll"] {
+                assert!(!text.contains(secret), "{secret} is in {text}");
+            }
         }
     }
 

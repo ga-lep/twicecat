@@ -22,6 +22,7 @@ use iced::{Background, Color, Element, Padding, border, mouse};
 use twicecat_core::api::{SpaceView, UnreadCountsView};
 
 use crate::avatars::{AvatarState, Avatars, NEUTRAL_INITIALS, initials, placeholder_color};
+use crate::sidebar_menu::SidebarMenuMessage;
 use crate::spaces::{RailFolder, RailItem, RailKey, SpacesMessage};
 use crate::state::{App, Message};
 use crate::text_safety::{MAX_NAME_CHARS, name_or_placeholder};
@@ -315,12 +316,16 @@ fn slot(slot: Slot<'_>) -> Element<'_, Message> {
                 }),
         );
     }
-    let area = mouse_area(layers)
+    let mut area = mouse_area(layers)
         .interaction(mouse::Interaction::Pointer)
         .on_enter(Message::Spaces(SpacesMessage::Enter(key.clone())))
         .on_exit(Message::Spaces(SpacesMessage::Exit(key.clone())))
         .on_press(Message::Spaces(SpacesMessage::Press(key.clone())))
-        .on_release(Message::Spaces(SpacesMessage::Release(key)));
+        .on_release(Message::Spaces(SpacesMessage::Release(key.clone())));
+    // A right-click opens the item's options card (Home has none).
+    if key != RailKey::Home {
+        area = area.on_right_press(Message::SidebarMenu(SidebarMenuMessage::Open(key)));
+    }
     tooltip(
         area,
         container(text(name).size(tokens::CAPTION))
