@@ -14,10 +14,11 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 use twicecat_core::api::{
-    RoomId, RoomListChoice, RoomListTab, RoomNotificationModeView, RoomSummary, SectionKey,
-    SpaceLayout, SpaceView,
+    CallMemberView, RoomId, RoomListChoice, RoomListTab, RoomNotificationModeView, RoomSummary,
+    SectionKey, SpaceLayout, SpaceView,
 };
 
+use crate::calls::CallModel;
 use crate::room_list::{Badge, clamp_window, row_height};
 use crate::state::App;
 use crate::ui::tokens::Density;
@@ -44,6 +45,10 @@ pub enum Line<'a> {
     Room(&'a RoomSummary),
     /// The hint under an empty custom section.
     EmptyHint(SectionKey),
+    /// A person in a voice room's call, under the room.
+    Participant(Person<'a>),
+    /// "and N more" after [`MAX_PEOPLE_SHOWN`] people of a voice room.
+    More(More<'a>),
 }
 
 impl std::fmt::Debug for Line<'_> {
@@ -52,9 +57,62 @@ impl std::fmt::Debug for Line<'_> {
             Self::Header(header) => f.debug_tuple("Header").field(header).finish(),
             Self::Room(_) => f.write_str("Room(..)"),
             Self::EmptyHint(key) => f.debug_tuple("EmptyHint").field(key).finish(),
+            Self::Participant(person) => f.debug_tuple("Participant").field(person).finish(),
+            Self::More(more) => f.debug_tuple("More").field(more).finish(),
         }
     }
 }
+
+/// How many people of a voice room's call are drawn under it; the rest are
+/// "and N more".
+pub const MAX_PEOPLE_SHOWN: usize = 8;
+
+/// One person in a voice room's call. `Debug` shows only the marks: a user
+/// ID, a name and a room ID belong to people.
+#[derive(Clone, PartialEq)]
+pub struct Person<'a> {
+    /// The voice room.
+    pub room: &'a RoomId,
+    /// Who: the core's view (the user ID is a remote server's raw string and
+    /// the name may be missing, so both pass through
+    /// [`crate::calls::member_name`] where they are drawn).
+    pub member: &'a CallMemberView,
+    /// Speaking now: known only for the call this device is in.
+    pub speaking: bool,
+    /// Muted: known only for the call this device is in.
+    pub muted: bool,
+}
+
+impl std::fmt::Debug for Person<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Person")
+            .field("speaking", &self.speaking)
+            .field("muted", &self.muted)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The "and N more" line of a voice room. `Debug` shows only the number.
+#[derive(Clone, PartialEq)]
+pub struct More<'a> {
+    /// The voice room (a click selects it).
+    pub room: &'a RoomId,
+    /// How many people are not drawn.
+    pub hidden: usize,
+}
+
+impl std::fmt::Debug for More<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("More")
+            .field("hidden", &self.hidden)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Height of a person's line under a voice room, comfortable.
+pub const PERSON_HEIGHT: f32 = 28.0;
+/// Height of a person's line under a voice room, compact.
+pub const COMPACT_PERSON_HEIGHT: f32 = 26.0;
 
 /// The header of a section. `Debug` of the key hides a room ID; the name is
 /// not shown by `Debug`.
@@ -121,6 +179,22 @@ pub fn build<'a>(
     spaces: &'a [SpaceView],
     rooms: &'a [RoomSummary],
     layout: Option<&'a SpaceLayout>,
+) -> Vec<Line<'a>> {
+    build_with(space, spaces, rooms, layout, None)
+}
+
+/// [`build`] that also lists, under each voice room (`is_call_room`) of an
+/// expanded section, the people `calls` knows are in its call: one
+/// [`Line::Participant`] each, at most [`MAX_PEOPLE_SHOWN`], then a
+/// [`Line::More`]. Their marks come from `calls` for the call this device is
+/// in only. A collapsed section hides them with its rooms. `None` draws no
+/// people (the drop planner's defaults).
+pub fn build_with<'a>(
+    space: &'a SpaceView,
+    spaces: &'a [SpaceView],
+    rooms: &'a [RoomSummary],
+    layout: Option<&'a SpaceLayout>,
+    calls: Option<&'a CallModel>,
 ) -> Vec<Line<'a>> {
     #[cfg(test)]
     BUILDS.with(|n| n.set(n.get() + 1));
@@ -238,10 +312,38 @@ pub fn build<'a>(
         if bucket.rooms.is_empty() {
             lines.push(Line::EmptyHint(key));
         } else {
-            lines.extend(bucket.rooms.iter().map(|(_, r)| Line::Room(r)));
+            for (_, room) in &bucket.rooms {
+                lines.push(Line::Room(room));
+                if let Some(calls) = calls.filter(|_| room.is_call_room) {
+                    push_people(&mut lines, room, calls);
+                }
+            }
         }
     }
     lines
+}
+
+/// The people of `room`'s call under its line: at most [`MAX_PEOPLE_SHOWN`]
+/// and then "and N more".
+fn push_people<'a>(lines: &mut Vec<Line<'a>>, room: &'a RoomSummary, calls: &'a CallModel) {
+    let Some(members) = calls.members.get(&room.id) else {
+        return;
+    };
+    for member in members.iter().take(MAX_PEOPLE_SHOWN) {
+        let (speaking, muted) = calls.member_marks(&room.id, &member.user_id);
+        lines.push(Line::Participant(Person {
+            room: &room.id,
+            member,
+            speaking,
+            muted,
+        }));
+    }
+    if members.len() > MAX_PEOPLE_SHOWN {
+        lines.push(Line::More(More {
+            room: &room.id,
+            hidden: members.len() - MAX_PEOPLE_SHOWN,
+        }));
+    }
 }
 
 /// The sections to draw, in order: the stored order for the keys it names
@@ -303,7 +405,7 @@ pub fn drawn_sections(lines: &[Line<'_>]) -> Vec<SectionKey> {
         .iter()
         .filter_map(|line| match line {
             Line::Header(header) => Some(header.key.clone()),
-            Line::Room(_) | Line::EmptyHint(_) => None,
+            Line::Room(_) | Line::EmptyHint(_) | Line::Participant(_) | Line::More(_) => None,
         })
         .collect()
 }
@@ -352,7 +454,7 @@ pub fn spot_of(lines: &[Line<'_>], room: &RoomId) -> Option<Spot> {
                 }
                 rooms.push(r.id.clone());
             }
-            Line::EmptyHint(_) => {}
+            Line::EmptyHint(_) | Line::Participant(_) | Line::More(_) => {}
         }
     }
     let (section, index) = found?;
@@ -371,6 +473,8 @@ pub fn line_height(line: &Line<'_>, density: Density) -> f32 {
         (Line::Room(_), density) => row_height(density),
         (Line::EmptyHint(_), Density::Comfortable) => HINT_HEIGHT,
         (Line::EmptyHint(_), Density::Compact) => COMPACT_HINT_HEIGHT,
+        (Line::Participant(_) | Line::More(_), Density::Comfortable) => PERSON_HEIGHT,
+        (Line::Participant(_) | Line::More(_), Density::Compact) => COMPACT_PERSON_HEIGHT,
     }
 }
 
@@ -454,7 +558,13 @@ impl App {
             .sidebar
             .layout()
             .and_then(|layout| layout.spaces.iter().find(|s| s.space == *id));
-        Some(build(space, self.spaces.spaces(), &self.rooms, stored))
+        Some(build_with(
+            space,
+            self.spaces.spaces(),
+            &self.rooms,
+            stored,
+            Some(&self.calls),
+        ))
     }
 
     /// The lines of the sectioned list with no layout: every room in its
@@ -480,7 +590,10 @@ impl App {
                     .into_iter()
                     .filter_map(|line| match line {
                         Line::Room(room) => Some(room.clone()),
-                        Line::Header(_) | Line::EmptyHint(_) => None,
+                        Line::Header(_)
+                        | Line::EmptyHint(_)
+                        | Line::Participant(_)
+                        | Line::More(_) => None,
                     })
                     .collect(),
             ),
@@ -585,6 +698,13 @@ mod tests {
                 Line::Header(h) => format!("# {}", h.name),
                 Line::Room(r) => r.name.clone(),
                 Line::EmptyHint(_) => "~hint".to_owned(),
+                Line::Participant(p) => format!(
+                    "  - {}{}{}",
+                    crate::calls::member_name(p.member),
+                    if p.speaking { " *speaking" } else { "" },
+                    if p.muted { " !muted" } else { "" }
+                ),
+                Line::More(m) => format!("  - and {} more", m.hidden),
             })
             .collect()
     }
@@ -2431,5 +2551,256 @@ mod tests {
             assert!(record(&app).collapsed.contains(&SectionKey::Direct));
             assert_eq!(saves(&store), saved + 1);
         }
+    }
+
+    // ---- people under voice rooms (Task sbc.12) ----
+
+    fn cmember(n: &str, name: Option<&str>) -> CallMemberView {
+        CallMemberView {
+            user_id: UserId::from(format!("@{n}:x")),
+            display_name: name.map(str::to_owned),
+            avatar: None,
+        }
+    }
+
+    fn calls_with(room_n: &str, members: Vec<CallMemberView>) -> CallModel {
+        let mut calls = CallModel::default();
+        calls.members.insert(rid(room_n), members);
+        calls
+    }
+
+    fn built_with_calls(calls: &CallModel, layout: Option<&SpaceLayout>) -> Vec<String> {
+        let sp = spaces();
+        let rs = rooms();
+        lines_of(&build_with(&sp[0], &sp, &rs, layout, Some(calls)))
+    }
+
+    #[test]
+    fn people_are_drawn_under_their_room_in_order() {
+        let calls = calls_with(
+            "v1",
+            vec![
+                cmember("rhae", Some("Rhaenyra")),
+                cmember("sept", Some("Septimus")),
+                cmember("galep", None),
+            ],
+        );
+        let lines = built_with_calls(&calls, None);
+        let at = lines.iter().position(|l| l == "v1").expect("the room");
+        assert_eq!(
+            &lines[at..at + 5],
+            [
+                "v1",
+                "  - Rhaenyra",
+                "  - Septimus",
+                "  - galep",
+                "# Direct messages"
+            ]
+        );
+        // Without a call model (or with none for the room) nothing is added.
+        assert_eq!(built(None), built_with_calls(&CallModel::default(), None));
+    }
+
+    #[test]
+    fn the_ninth_member_onward_becomes_and_n_more() {
+        let many = |n: usize| -> Vec<CallMemberView> {
+            (0..n).map(|i| cmember(&format!("u{i}"), None)).collect()
+        };
+        let count_people =
+            |lines: &[String]| lines.iter().filter(|l| l.starts_with("  - u")).count();
+        let lines = built_with_calls(&calls_with("v1", many(8)), None);
+        assert_eq!(count_people(&lines), 8);
+        assert!(!lines.iter().any(|l| l.contains(" more")), "eight fit");
+        let lines = built_with_calls(&calls_with("v1", many(9)), None);
+        assert_eq!(count_people(&lines), 8);
+        assert!(lines.contains(&"  - and 1 more".to_owned()), "{lines:?}");
+        let lines = built_with_calls(&calls_with("v1", many(25)), None);
+        assert_eq!(count_people(&lines), 8);
+        assert!(lines.contains(&"  - and 17 more".to_owned()), "{lines:?}");
+        // The first eight are the first eight, in order.
+        let at = lines.iter().position(|l| l == "  - u0").expect("first");
+        assert_eq!(lines[at + 7], "  - u7");
+        assert_eq!(lines[at + 8], "  - and 17 more");
+    }
+
+    #[test]
+    fn only_a_voice_room_lists_its_people() {
+        // `chan1` is not a voice room: a DM call's members are not listed.
+        let calls = calls_with("chan1", vec![cmember("x", None)]);
+        assert_eq!(built_with_calls(&calls, None), built(None));
+    }
+
+    #[test]
+    fn a_collapsed_section_hides_the_people_with_its_rooms() {
+        let calls = calls_with("v1", vec![cmember("x", Some("Xavier"))]);
+        let layout = SpaceLayout {
+            collapsed: vec![SectionKey::SubSpace(rid("voice"))],
+            ..SpaceLayout::new(rid("sp"))
+        };
+        let lines = built_with_calls(&calls, Some(&layout));
+        assert!(
+            !lines.iter().any(|l| l.contains("Xavier") || l == "v1"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn marks_are_drawn_only_for_the_call_this_device_is_in() {
+        use crate::calls::CurrentCall;
+        use twicecat_core::api::{CleaningStatus, DeviceId as Dev, Participant, ParticipantId};
+        let person = |n: &str, speaking: bool, muted: bool| Participant {
+            id: ParticipantId::from(format!("{n}-dev")),
+            user_id: UserId::from(format!("@{n}:x")),
+            device_id: Dev::from("DEV"),
+            display_name: None,
+            is_local: false,
+            muted,
+            speaking,
+            volume_percent: 100,
+            share_volume_percent: 100,
+            cleaning: CleaningStatus::Off,
+        };
+        let mut calls = calls_with(
+            "v1",
+            vec![
+                cmember("rhae", None),
+                cmember("sept", None),
+                cmember("quiet", None),
+            ],
+        );
+        // The same people are in a second voice room's call.
+        calls.members.insert(
+            rid("t1"),
+            vec![cmember("rhae", None), cmember("sept", None)],
+        );
+        // This device is in `t1`, not in `v1`.
+        let mut ours = CurrentCall::new(rid("t1"), crate::calls::CallPhase::Joining);
+        ours.participants = vec![person("rhae", true, false), person("sept", false, true)];
+        calls.call = Some(ours);
+        let lines = built_with_calls(&calls, None);
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("*speaking") || l.contains("!muted")),
+            "marks leaked to a room that is not our call: {lines:?}"
+        );
+        // Now `v1` is our call: the marks show there.
+        let mut ours = CurrentCall::new(rid("v1"), crate::calls::CallPhase::Joining);
+        ours.participants = vec![person("rhae", true, false), person("sept", false, true)];
+        calls.call = Some(ours);
+        let lines = built_with_calls(&calls, None);
+        assert!(
+            lines.contains(&"  - rhae *speaking".to_owned()),
+            "{lines:?}"
+        );
+        assert!(lines.contains(&"  - sept !muted".to_owned()), "{lines:?}");
+        assert!(lines.contains(&"  - quiet".to_owned()), "{lines:?}");
+    }
+
+    #[test]
+    fn debug_of_the_people_lines_shows_no_user_name_or_room() {
+        let secret = CallMemberView {
+            user_id: UserId::from("@secretuser:x"),
+            display_name: Some("Secret Name".to_owned()),
+            avatar: None,
+        };
+        let room = RoomId::from("!secretroom:x");
+        let lines = [
+            Line::Participant(Person {
+                room: &room,
+                member: &secret,
+                speaking: true,
+                muted: false,
+            }),
+            Line::More(More {
+                room: &room,
+                hidden: 3,
+            }),
+        ];
+        let all = format!("{lines:?}");
+        for hidden in ["secretuser", "Secret", "secretroom"] {
+            assert!(!all.contains(hidden), "{hidden} is in {all}");
+        }
+        assert!(
+            all.contains("speaking: true") && all.contains("hidden: 3"),
+            "{all}"
+        );
+    }
+
+    #[test]
+    fn people_lines_have_their_own_heights_and_are_not_rooms() {
+        let calls = calls_with("v1", vec![cmember("x", None)]);
+        let sp = spaces();
+        let rs = rooms();
+        let lines = build_with(&sp[0], &sp, &rs, None, Some(&calls));
+        let person = lines
+            .iter()
+            .find(|l| matches!(l, Line::Participant(_)))
+            .expect("a person");
+        assert_eq!(line_height(person, Density::Comfortable), PERSON_HEIGHT);
+        assert_eq!(line_height(person, Density::Compact), COMPACT_PERSON_HEIGHT);
+        // The room's spot does not count the person as a room.
+        let spot = spot_of(&lines, &rid("v1")).expect("drawn");
+        assert_eq!(spot.rooms, vec![rid("v1")]);
+        assert_eq!(
+            drawn_sections(&lines).len(),
+            drawn_sections(&build(&sp[0], &sp, &rs, None)).len()
+        );
+    }
+
+    fn active_call(app: &mut App, room_n: &str, members: Vec<CallMemberView>) {
+        feed(
+            app,
+            CoreEvent::ActiveCall {
+                room_id: rid(room_n),
+                participants: u32::try_from(members.len()).expect("few"),
+                members,
+            },
+        );
+    }
+
+    #[test]
+    fn the_app_lists_people_from_active_call_and_removes_them_at_zero() {
+        let (mut app, _rx) = space_app(None);
+        active_call(&mut app, "v1", vec![cmember("bob", Some("Bob"))]);
+        assert!(drawn_names(&app).contains(&"  - Bob".to_owned()));
+        active_call(&mut app, "v1", Vec::new());
+        assert!(!drawn_names(&app).iter().any(|l| l.starts_with("  - ")));
+    }
+
+    #[test]
+    fn the_flat_list_shows_no_people() {
+        let (mut app, _rx) = space_app(None);
+        active_call(&mut app, "v1", vec![cmember("bob", Some("Bob"))]);
+        let _ = app.update(Message::SearchChanged("v".to_owned()));
+        assert!(app.section_lines().is_none());
+        assert!(app.rooms_as_drawn().iter().all(|r| !r.name.contains("Bob")));
+        // The flat list still has the call pill's count.
+        assert_eq!(app.calls.count(&rid("v1")), 1);
+    }
+
+    #[test]
+    fn the_avatars_of_the_people_are_asked_for_once() {
+        use twicecat_core::api::AvatarId;
+        let (mut app, mut rx) = space_app(None);
+        app.list_viewport_h = 2000.0;
+        let _ = drain(&mut rx);
+        let mut bob = cmember("bob", Some("Bob"));
+        bob.avatar = Some(AvatarId::from("mxc://x/bobpic"));
+        active_call(&mut app, "v1", vec![bob.clone()]);
+        let asked: Vec<Command> = drain(&mut rx);
+        let fetches = |cmds: &[Command]| {
+            cmds.iter()
+                .filter(|c| matches!(c, Command::FetchAvatars(ids) if ids.contains(&AvatarId::from("mxc://x/bobpic"))))
+                .count()
+        };
+        assert_eq!(fetches(&asked), 1, "{asked:?}");
+        // The same set again, and a scroll: not asked again.
+        active_call(&mut app, "v1", vec![bob]);
+        let _ = app.update(Message::RoomListScrolled {
+            offset_y: 0.0,
+            viewport_h: 2000.0,
+        });
+        assert_eq!(fetches(&drain(&mut rx)), 0);
     }
 }

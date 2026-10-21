@@ -262,8 +262,12 @@ pub(crate) fn pointer_message(event: iced::Event) -> Option<Message> {
             Some(Message::Spaces(SpacesMessage::PointerPressed))
         }
         iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
-        | iced::Event::Touch(touch::Event::FingerLifted { .. } | touch::Event::FingerLost { .. }) => {
+        | iced::Event::Touch(touch::Event::FingerLifted { .. }) => {
             Some(Message::Spaces(SpacesMessage::PointerReleased))
+        }
+        // The system took the touch away: not a release, so no drop.
+        iced::Event::Touch(touch::Event::FingerLost { .. }) => {
+            Some(Message::Spaces(SpacesMessage::PointerCancelled))
         }
         _ => None,
     }
@@ -317,6 +321,9 @@ pub enum SpacesMessage {
     PointerPressed,
     /// The left button, or the finger, came up anywhere in the window.
     PointerReleased,
+    /// The system cancelled the touch (`FingerLost`): what was tracked is
+    /// forgotten and nothing is dropped.
+    PointerCancelled,
 }
 
 impl App {
@@ -420,9 +427,9 @@ impl App {
                 let _ = self.list_drag.moved(at);
                 Task::none()
             }
-            SpacesMessage::PointerPressed => {
-                // A button is down again: the release of the one tracked was
-                // missed. Nothing is dropped.
+            SpacesMessage::PointerPressed | SpacesMessage::PointerCancelled => {
+                // A button is down again (the release of the one tracked was
+                // missed), or the touch was cancelled. Nothing is dropped.
                 let _ = self.rail_drag.cancel();
                 let _ = self.list_drag.cancel();
                 Task::none()
@@ -508,7 +515,7 @@ impl App {
                     .filter_map(|line| match line {
                         Line::Header(header) => Some(ListKey::Header(header.key.clone())),
                         Line::Room(room) => Some(ListKey::Room(room.id.clone())),
-                        Line::EmptyHint(_) => None,
+                        Line::EmptyHint(_) | Line::Participant(_) | Line::More(_) => None,
                     })
                     .collect()
             })

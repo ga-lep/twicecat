@@ -401,6 +401,7 @@ fn the_fixture_reaches_every_screen_it_names() {
         "rail-folder-name",
         "space-sections",
         "space-sections-collapsed",
+        "voice-channel",
         "space-sections-custom",
         "space-sections-dragging",
         "space-sections-dragging-line",
@@ -1424,6 +1425,7 @@ fn space_sections_draw_every_line_whole_and_apart_in_both_densities_and_themes()
     for name in [
         "space-sections",
         "space-sections-collapsed",
+        "voice-channel",
         "space-sections-custom",
         "space-sections-dragging",
         "space-sections-dragging-line",

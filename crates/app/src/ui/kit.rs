@@ -1149,10 +1149,19 @@ pub fn speaking_ring<'a, M: 'a>(
     content: impl Into<Element<'a, M>>,
     speaking: bool,
 ) -> Element<'a, M> {
+    speaking_ring_sized(content, PERSON_SLOT, speaking)
+}
+
+/// [`speaking_ring`] around a round picture `size` pixels wide.
+pub fn speaking_ring_sized<'a, M: 'a>(
+    content: impl Into<Element<'a, M>>,
+    size: f32,
+    speaking: bool,
+) -> Element<'a, M> {
     container(content)
         .padding(SPEAKING_RING)
         .style(move |theme: &Theme| container::Style {
-            border: border::rounded(PERSON_SLOT / 2.0 + SPEAKING_RING)
+            border: border::rounded(size / 2.0 + SPEAKING_RING)
                 .width(SPEAKING_RING)
                 .color(if speaking {
                     theme::semantic(theme).speaking

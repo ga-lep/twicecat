@@ -19,11 +19,11 @@ use iced::widget::{
 };
 use iced::{Background, Color, Element, Fill, Length, border, mouse};
 use twicecat_core::api::{
-    RoomListChoice, RoomListTab, RoomNotificationModeView, RoomSummary, SectionKey,
+    RoomId, RoomListChoice, RoomListTab, RoomNotificationModeView, RoomSummary, SectionKey,
 };
 
 use crate::avatars::{AvatarState, Avatars, NEUTRAL_INITIALS, initials, placeholder_color};
-use crate::calls::CallPill;
+use crate::calls::{CallPill, member_name};
 use crate::dates::{day_label, time_label};
 use crate::drag::Zone;
 use crate::list_drop::{self, ListKey};
@@ -34,8 +34,9 @@ use crate::room_list::{
 };
 use crate::rooms::RoomsMessage;
 use crate::screens::{call, main_view};
+use crate::sections;
 use crate::sections::{
-    EMPTY_HINT, Header, Line, line_height, line_offsets, line_spacers, visible_lines,
+    EMPTY_HINT, Header, Line, More, Person, line_height, line_offsets, line_spacers, visible_lines,
 };
 use crate::settings::SettingsMessage;
 use crate::sidebar::SidebarState;
@@ -497,6 +498,8 @@ fn sectioned_list<'a>(app: &'a App, lines: &[Line<'a>]) -> Element<'a, Message> 
                 cue,
             )
         }
+        Line::Participant(person) => person_line(app, person, density),
+        Line::More(more) => more_line(more, density),
         Line::EmptyHint(key) => {
             let target = ListKey::Header(key.clone());
             let cue = list_cue(app, &target);
@@ -789,6 +792,87 @@ fn section_header<'a>(app: &App, header: &Header<'a>, density: Density) -> Eleme
     .align_y(iced::Center)
     .height(Length::Fixed(height));
     list_area(line.into(), key, cue, height, open)
+}
+
+/// Width of a person's picture under a voice room.
+pub const PERSON_AVATAR: f32 = 20.0;
+
+/// How far a person's line is moved in, so it sits under the room's name.
+const PERSON_INDENT: f32 = ACCENT_BAR + tokens::S + tokens::XL;
+
+/// The words of the "and N more" line.
+pub fn more_label(hidden: usize) -> String {
+    format!("and {hidden} more")
+}
+
+/// A person in a voice room's call: a 20 px picture (ringed while they
+/// speak), the name and, when muted, the muted icon in the danger colour. A
+/// click opens the voice room. Speaking and muted are known only for the call
+/// this device is in, so the other rooms' people carry neither mark.
+fn person_line<'a>(app: &App, person: &Person<'a>, density: Density) -> Element<'a, Message> {
+    let name = member_name(person.member);
+    let picture = kit::speaking_ring_sized(
+        kit::avatar_sized(
+            &person.member.user_id,
+            &name,
+            person.member.avatar.as_ref(),
+            &app.avatars,
+            PERSON_AVATAR,
+        ),
+        PERSON_AVATAR,
+        person.speaking,
+    );
+    let mut content = row![
+        picture,
+        container(text(name).size(tokens::CAPTION).wrapping(Wrapping::None))
+            .width(Fill)
+            .clip(true),
+    ]
+    .spacing(tokens::S)
+    .align_y(iced::Center);
+    if person.muted {
+        content = content.push(
+            text(Icon::Muted.glyph())
+                .size(tokens::BODY)
+                .wrapping(Wrapping::None)
+                .style(iced::widget::text::danger),
+        );
+    }
+    person_button(content.into(), person.room, density)
+}
+
+/// "and N more" under a voice room.
+fn more_line<'a>(more: &More<'a>, density: Density) -> Element<'a, Message> {
+    let content = text(more_label(more.hidden))
+        .size(tokens::CAPTION)
+        .wrapping(Wrapping::None)
+        .style(kit::muted);
+    person_button(content.into(), more.room, density)
+}
+
+/// A line under a voice room: indented, quiet, and a click selects the room.
+fn person_button<'a>(
+    content: Element<'a, Message>,
+    room: &RoomId,
+    density: Density,
+) -> Element<'a, Message> {
+    let height = match density {
+        Density::Comfortable => sections::PERSON_HEIGHT,
+        Density::Compact => sections::COMPACT_PERSON_HEIGHT,
+    };
+    button(content)
+        .on_press(Message::SelectRoom(room.clone()))
+        .width(Fill)
+        .height(Length::Fixed(height))
+        .padding(iced::Padding {
+            top: 0.0,
+            right: tokens::S,
+            bottom: 0.0,
+            left: PERSON_INDENT,
+        })
+        .clip(true)
+        .style(kit::ghost_style)
+        .into()
 }
 
 /// What a refused header says, besides its red ring.
@@ -1307,6 +1391,32 @@ mod tests {
         ] {
             let _: Element<'_, Message> = room_row(&room, &env(&avatars), false, None, call);
         }
+    }
+
+    #[test]
+    fn the_speaking_ring_stands_out_from_every_row_background_in_every_theme() {
+        // A person's line sits on the pane (the sidebar colour), takes the
+        // hover colour under the pointer, and the selection colour is the
+        // neighbouring room's: the ring (non-text, 3:1) must show on all.
+        for t in theme::test_themes() {
+            let sem = theme::semantic(&t);
+            for (name, bg) in [
+                ("sidebar", sem.sidebar),
+                ("surface", sem.surface),
+                ("surface-raised", sem.surface_raised),
+                ("hover", sem.message_hover),
+                ("selection", sem.selection),
+            ] {
+                let ratio = theme::contrast(sem.speaking, bg);
+                assert!(ratio >= 3.0, "speaking ring on {name}: {ratio}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_more_line_says_how_many_are_not_shown() {
+        assert_eq!(more_label(1), "and 1 more");
+        assert_eq!(more_label(17), "and 17 more");
     }
 
     #[test]

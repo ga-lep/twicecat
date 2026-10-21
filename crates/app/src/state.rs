@@ -2269,7 +2269,7 @@ impl App {
     /// requested this session (plan Q11): one `FetchAvatars`, or nothing when
     /// the set is empty. An ID is requested once per session whatever the
     /// answer, so a failing homeserver is not hit again by scrolling.
-    fn request_avatars(&mut self) -> Task<Message> {
+    pub(crate) fn request_avatars(&mut self) -> Task<Message> {
         let avatars: Vec<twicecat_core::api::AvatarId> = if let Some(lines) = self.section_lines() {
             let offsets = sections::line_offsets(&lines, self.density());
             let range = sections::visible_lines(
@@ -2282,6 +2282,7 @@ impl App {
                 .iter()
                 .filter_map(|line| match line {
                     sections::Line::Room(room) => room.avatar.clone(),
+                    sections::Line::Participant(person) => person.member.avatar.clone(),
                     _ => None,
                 })
                 .collect()
@@ -4362,15 +4363,15 @@ mod tests {
                 touch(T::FingerMoved { id: f, position: p }),
                 Some(Message::Spaces(S::PointerMoved(_)))
             ));
-            for t in [
-                T::FingerLifted { id: f, position: p },
-                T::FingerLost { id: f, position: p },
-            ] {
-                assert!(matches!(
-                    touch(t),
-                    Some(Message::Spaces(S::PointerReleased))
-                ));
-            }
+            assert!(matches!(
+                touch(T::FingerLifted { id: f, position: p }),
+                Some(Message::Spaces(S::PointerReleased))
+            ));
+            // A cancelled touch is not a release: it must never drop.
+            assert!(matches!(
+                touch(T::FingerLost { id: f, position: p }),
+                Some(Message::Spaces(S::PointerCancelled))
+            ));
             assert!(matches!(
                 touch(T::FingerPressed { id: f, position: p }),
                 Some(Message::Spaces(S::PointerPressed))
@@ -4403,6 +4404,27 @@ mod tests {
             send(&mut app, S::Over(key("!c:x"), Zone::Before));
             send(&mut app, S::PointerReleased);
             assert!(saves(&store).is_empty());
+        }
+
+        #[test]
+        fn a_lost_finger_cancels_a_rail_drag_and_saves_nothing() {
+            let (mut app, store) = menu_app(&["!a:x", "!b:x", "!c:x"], Vec::new());
+            start(&mut app, "!a:x");
+            send(&mut app, S::Over(key("!c:x"), Zone::Before));
+            assert!(app.rail_drag.target().is_some());
+            let lost = crate::spaces::pointer_message(iced::Event::Touch(
+                iced::touch::Event::FingerLost {
+                    id: iced::touch::Finger(1),
+                    position: Point::new(200.0, 200.0),
+                },
+            ))
+            .expect("a message");
+            let _ = app.update(lost);
+            assert!(!app.rail_drag.is_active(), "the drag ended");
+            assert!(!app.list_drag.is_active());
+            // A release that follows has nothing to drop.
+            send(&mut app, S::PointerReleased);
+            assert!(saves(&store).is_empty(), "a cancelled touch dropped");
         }
 
         #[test]

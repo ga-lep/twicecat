@@ -9,13 +9,14 @@ use std::time::Duration;
 
 use iced::Task;
 use twicecat_core::api::{
-    AudioDevices, AudioSettings, AudioStats, CallEndReason, CallIntent, CallState, CleaningStatus,
-    Command, CoreError, CoreEvent, GpuEnhancement, InputLevel, Participant, RoomId, RoomMemberView,
-    RoomSummary, SkipReason, SoundSource, UserId, VoiceCleaning,
+    AudioDevices, AudioSettings, AudioStats, CallEndReason, CallIntent, CallMemberView, CallState,
+    CleaningStatus, Command, CoreError, CoreEvent, GpuEnhancement, InputLevel, MAX_CALL_MEMBERS,
+    Participant, RoomId, RoomMemberView, RoomSummary, SkipReason, SoundSource, UserId,
+    VoiceCleaning,
 };
 
 use crate::state::{App, Message};
-use crate::text_safety::one_line_capped;
+use crate::text_safety::{name_or_placeholder, one_line_capped};
 use crate::ui::icons::Icon;
 
 /// How many ringing rooms are kept; the oldest goes first.
@@ -381,6 +382,9 @@ pub struct CallModel {
     /// Devices in each room's call, for the room list; rooms without a call
     /// are not kept.
     pub counts: HashMap<RoomId, u32>,
+    /// The people in each room's call, for the voice rooms of the room list;
+    /// rooms with nobody are not kept (cleared with [`Self::counts`]).
+    pub members: HashMap<RoomId, Vec<CallMemberView>>,
     /// Rooms that ring, oldest first, one entry per room; at most
     /// [`MAX_RINGS`].
     pub rings: Vec<Ring>,
@@ -429,6 +433,7 @@ impl fmt::Debug for CallModel {
             .field("call", &self.call)
             .field("pending", &self.pending.is_some())
             .field("counts", &self.counts.len())
+            .field("members", &self.members.len())
             .field("rings", &self.rings.len())
             .field("notice", &self.notice.is_some())
             .field("panel_open", &self.panel_open)
@@ -438,10 +443,57 @@ impl fmt::Debug for CallModel {
     }
 }
 
+/// How many characters of a call member's name a line may show.
+pub const MEMBER_NAME_CHARS: usize = 64;
+
+/// The name drawn for a call member: its display name, else the localpart of
+/// its user ID, cleaned to one line and capped. The user ID is the raw
+/// `sender` of a remote server, so it is cleaned like any name; an empty
+/// result is the placeholder.
+pub fn member_name(member: &CallMemberView) -> String {
+    let named = member
+        .display_name
+        .as_deref()
+        .filter(|name| !name.trim().is_empty());
+    let text = named.unwrap_or_else(|| {
+        member
+            .user_id
+            .as_str()
+            .trim_start_matches('@')
+            .split(':')
+            .next()
+            .unwrap_or_default()
+    });
+    name_or_placeholder(text, MEMBER_NAME_CHARS)
+}
+
 impl CallModel {
     /// Devices in `room`'s call; 0 without a call.
     pub fn count(&self, room: &RoomId) -> u32 {
         self.counts.get(room).copied().unwrap_or(0)
+    }
+
+    /// Whether `user` speaks and whether they are muted, as the call this
+    /// device is in reports it. Only that call is known (the membership state
+    /// carries neither): any other room gives `(false, false)`.
+    pub fn member_marks(&self, room: &RoomId, user: &UserId) -> (bool, bool) {
+        let Some(call) = self.call_in(room) else {
+            return (false, false);
+        };
+        let mut devices = call.participants.iter().filter(|p| p.user_id == *user);
+        let Some(first) = devices.next() else {
+            return (false, false);
+        };
+        let mut speaking = first.speaking;
+        // Muted when every device of the user is (as the panel's row says
+        // for one device); our own mute and deafen are ours alone.
+        let muted_of = |p: &Participant| p.muted || (p.is_local && (call.muted || call.deafened));
+        let mut muted = muted_of(first);
+        for p in devices {
+            speaking |= p.speaking;
+            muted &= muted_of(p);
+        }
+        (speaking, muted)
     }
 
     /// The ring of `room`, if it rings.
@@ -730,12 +782,19 @@ impl CallModel {
             CoreEvent::ActiveCall {
                 room_id,
                 participants,
-                ..
+                mut members,
             } => {
                 if participants == 0 {
                     self.counts.remove(&room_id);
                 } else {
-                    self.counts.insert(room_id, participants);
+                    self.counts.insert(room_id.clone(), participants);
+                }
+                // The core caps the set; a longer one is cut here too.
+                members.truncate(MAX_CALL_MEMBERS);
+                if participants == 0 || members.is_empty() {
+                    self.members.remove(&room_id);
+                } else {
+                    self.members.insert(room_id, members);
                 }
             }
             CoreEvent::IncomingCall {
@@ -1124,6 +1183,7 @@ impl App {
             _ => None,
         };
         let participants = matches!(event, CoreEvent::CallParticipants { .. });
+        let active = matches!(event, CoreEvent::ActiveCall { .. });
         let incoming = match &event {
             CoreEvent::IncomingCall { room_id, .. } if self.calls.ring(room_id).is_none() => {
                 Some(room_id.clone())
@@ -1146,6 +1206,11 @@ impl App {
         }
         if participants {
             return self.call_people_changed();
+        }
+        if active {
+            // The people of a voice room are drawn in the room list: their
+            // pictures are due as for any new row.
+            return self.request_avatars();
         }
         if let Some(room) = incoming {
             return self.announce_ring(&room);
@@ -1618,6 +1683,198 @@ mod tests {
         }));
         assert_eq!(app.calls.count(&room("a")), 0);
         assert!(!app.calls.counts.contains_key(&room("a")));
+    }
+
+    fn call_member(n: &str, name: Option<&str>) -> CallMemberView {
+        CallMemberView {
+            user_id: user(n),
+            display_name: name.map(str::to_owned),
+            avatar: None,
+        }
+    }
+
+    fn active(app: &mut App, n: &str, members: Vec<CallMemberView>) {
+        let _ = app.update(core(CoreEvent::ActiveCall {
+            room_id: room(n),
+            participants: u32::try_from(members.len()).expect("few"),
+            members,
+        }));
+    }
+
+    #[test]
+    fn call_members_are_kept_per_room_and_dropped_when_empty() {
+        let (mut app, _rx) = main_app();
+        active(
+            &mut app,
+            "a",
+            vec![call_member("x", None), call_member("y", None)],
+        );
+        active(&mut app, "b", vec![call_member("z", None)]);
+        assert_eq!(app.calls.members[&room("a")].len(), 2);
+        assert_eq!(app.calls.members[&room("b")].len(), 1);
+        // A new set replaces the old one.
+        active(&mut app, "a", vec![call_member("y", None)]);
+        assert_eq!(app.calls.members[&room("a")], vec![call_member("y", None)]);
+        // Zero members removes the room.
+        active(&mut app, "a", Vec::new());
+        assert!(!app.calls.members.contains_key(&room("a")));
+        // Members with a zero count are not kept either.
+        let _ = app.update(core(CoreEvent::ActiveCall {
+            room_id: room("b"),
+            participants: 0,
+            members: vec![call_member("z", None)],
+        }));
+        assert!(app.calls.members.is_empty());
+    }
+
+    #[test]
+    fn logging_out_clears_the_call_members_with_the_counts() {
+        let (mut app, _rx) = main_app();
+        active(&mut app, "a", vec![call_member("x", None)]);
+        let _ = app.update(core(CoreEvent::LoggedOut));
+        assert!(app.calls.counts.is_empty());
+        assert!(app.calls.members.is_empty());
+    }
+
+    fn in_room_call_with_marks(app: &mut App) {
+        joining(app, "a");
+        let mut b = person("b");
+        b.speaking = true;
+        let mut c = person("c");
+        c.muted = true;
+        participants(
+            app,
+            "a",
+            vec![ListDiff::Reset {
+                values: vec![person("a"), b, c],
+            }],
+        );
+    }
+
+    #[test]
+    fn speaking_and_muted_come_only_from_this_devices_call() {
+        let (mut app, _rx) = main_app();
+        in_room_call_with_marks(&mut app);
+        // The same people are listed in another room's call: no marks there.
+        active(
+            &mut app,
+            "other",
+            vec![call_member("b", None), call_member("c", None)],
+        );
+        let marks = |n: &str, u: &str| app.calls.member_marks(&room(n), &user(u));
+        assert_eq!(marks("a", "b"), (true, false));
+        assert_eq!(marks("a", "c"), (false, true));
+        assert_eq!(marks("a", "a"), (false, false));
+        assert_eq!(marks("other", "b"), (false, false), "not our call");
+        assert_eq!(marks("other", "c"), (false, false), "not our call");
+        assert_eq!(marks("a", "nobody"), (false, false));
+    }
+
+    #[test]
+    fn our_own_mute_and_deafen_show_on_our_own_line() {
+        let (mut app, _rx) = main_app();
+        in_room_call_with_marks(&mut app);
+        app.calls.call.as_mut().expect("in a call").muted = true;
+        assert_eq!(
+            app.calls.member_marks(&room("a"), &user("a")),
+            (false, true)
+        );
+        app.calls.call.as_mut().expect("in a call").muted = false;
+        app.calls.call.as_mut().expect("in a call").deafened = true;
+        assert_eq!(
+            app.calls.member_marks(&room("a"), &user("a")),
+            (false, true)
+        );
+        // Not someone else.
+        assert_eq!(
+            app.calls.member_marks(&room("a"), &user("b")),
+            (true, false)
+        );
+    }
+
+    #[test]
+    fn leaving_the_call_removes_the_marks_at_once() {
+        let (mut app, _rx) = main_app();
+        in_room_call_with_marks(&mut app);
+        assert_eq!(
+            app.calls.member_marks(&room("a"), &user("b")),
+            (true, false)
+        );
+        state(
+            &mut app,
+            CallState::Left {
+                room_id: room("a"),
+                reason: CallEndReason::Hangup,
+            },
+        );
+        assert_eq!(
+            app.calls.member_marks(&room("a"), &user("b")),
+            (false, false)
+        );
+        assert_eq!(
+            app.calls.member_marks(&room("a"), &user("c")),
+            (false, false)
+        );
+    }
+
+    #[test]
+    fn a_member_is_named_by_its_name_else_by_its_localpart_cleaned() {
+        let name = |m: &CallMemberView| member_name(m);
+        assert_eq!(name(&call_member("alice", Some("Alice A"))), "Alice A");
+        // No name, a blank name: the localpart, not the whole user ID.
+        assert_eq!(name(&call_member("alice", None)), "alice");
+        assert_eq!(name(&call_member("alice", Some("   "))), "alice");
+        // A name with bidi controls and a newline is cleaned.
+        let cleaned = name(&call_member("alice", Some("Al\u{202E}ice\nB")));
+        assert!(
+            !cleaned.contains('\u{202E}') && !cleaned.contains('\n'),
+            "{cleaned:?}"
+        );
+        // The user ID is the raw `sender` of a remote server: a bidi override
+        // in it never reaches the screen.
+        let evil = CallMemberView {
+            user_id: UserId::from("@evil\u{202E}gnp.exe:x"),
+            display_name: None,
+            avatar: None,
+        };
+        let shown = name(&evil);
+        assert!(!shown.contains('\u{202E}'), "{shown:?}");
+        assert!(shown.starts_with("evil"), "{shown:?}");
+        // Nothing at all: the placeholder, never an empty line.
+        let empty = CallMemberView {
+            user_id: UserId::from("@:x"),
+            display_name: None,
+            avatar: None,
+        };
+        assert_eq!(name(&empty), crate::text_safety::NAME_PLACEHOLDER);
+        let bare = CallMemberView {
+            user_id: UserId::from(""),
+            display_name: None,
+            avatar: None,
+        };
+        assert_eq!(name(&bare), crate::text_safety::NAME_PLACEHOLDER);
+        // A very long one is capped.
+        let long = CallMemberView {
+            user_id: UserId::from(format!("@{}:x", "w".repeat(500))),
+            display_name: None,
+            avatar: None,
+        };
+        assert!(name(&long).chars().count() <= MEMBER_NAME_CHARS);
+    }
+
+    #[test]
+    fn the_debug_output_hides_call_member_names_and_rooms() {
+        let (mut app, _rx) = main_app();
+        active(
+            &mut app,
+            "secretroom",
+            vec![call_member("bob", Some("Secret Bob"))],
+        );
+        let dbg = format!("{:?}", app.calls);
+        for secret in ["secretroom", "Secret", "bob"] {
+            assert!(!dbg.contains(secret), "{dbg}");
+        }
+        assert!(dbg.contains("members: 1"), "{dbg}");
     }
 
     #[test]

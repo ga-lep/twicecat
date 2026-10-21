@@ -734,6 +734,84 @@ fn space_sections_collapsed() -> App {
     space_sections(true)
 }
 
+/// Board 6: the Voice section with "vocal" (three people: one speaking, one
+/// muted, this device among them in the call) and "coworking" (one person
+/// whose name is unknown, so the localpart shows, and no marks: this device
+/// is not in that call).
+fn voice_channel() -> App {
+    use twicecat_app::spaces::SpacesMessage;
+    use twicecat_core::api::CallMemberView;
+    use twicecat_core::api::SectionKey;
+    let mut app = space_sections(false);
+    // The sections above Voice are shut, so the Voice section is in the
+    // first screen of the list.
+    for key in [
+        SectionKey::Starred,
+        SectionKey::Channels,
+        SectionKey::SubSpace(sec_space("tech")),
+        SectionKey::SubSpace(sec_space("hobbies")),
+    ] {
+        press(&mut app, Message::Spaces(SpacesMessage::ToggleSection(key)));
+    }
+    let (vocal, coworking) = (room("sec-r-lounge"), room("sec-r-pair"));
+    for r in &mut app.rooms {
+        if r.id == vocal {
+            r.name = "vocal".to_owned();
+        } else if r.id == coworking {
+            r.name = "coworking".to_owned();
+        }
+    }
+    let member = |name: &str, shown: Option<&str>| CallMemberView {
+        user_id: user(name),
+        display_name: shown.map(str::to_owned),
+        avatar: None,
+    };
+    feed(
+        &mut app,
+        CoreEvent::ActiveCall {
+            room_id: vocal.clone(),
+            participants: 3,
+            members: vec![
+                member("rhaenyra", Some("Rhaenyra")),
+                member("septimus", Some("Septimus")),
+                member("galep", Some("galep")),
+            ],
+        },
+    );
+    feed(
+        &mut app,
+        CoreEvent::ActiveCall {
+            room_id: coworking,
+            participants: 1,
+            members: vec![member("corin", None)],
+        },
+    );
+    call_events(
+        &mut app,
+        CallState::Connected {
+            room_id: vocal.clone(),
+            encrypted: true,
+        },
+    );
+    let mut people = vec![
+        person("galep", true, false, false, CleaningStatus::Off),
+        person("rhaenyra", false, false, true, CleaningStatus::Off),
+        person("septimus", false, true, false, CleaningStatus::Off),
+    ];
+    for p in &mut people {
+        p.display_name = None;
+    }
+    feed(
+        &mut app,
+        CoreEvent::CallParticipants {
+            room_id: vocal.clone(),
+            diffs: vec![ListDiff::Reset { values: people }],
+        },
+    );
+    press(&mut app, Message::SelectRoom(vocal));
+    app
+}
+
 // ---- Timeline -----------------------------------------------------------
 
 fn run(text: &str, style: TextStyle) -> Inline {
@@ -3713,6 +3791,19 @@ pub fn scenarios() -> Vec<Scenario> {
             space_sections_collapsed,
             |a| in_main(a) && a.sections_shown() && a.selected.is_some(),
         ),
+        s("voice-channel", true, voice_channel, |a| {
+            in_main(a)
+                && a.sections_shown()
+                && a.selected.is_some()
+                && a.calls.call.is_some()
+                && a.section_lines().is_some_and(|lines| {
+                    lines.iter().any(
+                        |l| matches!(l, twicecat_app::sections::Line::Participant(p) if p.speaking),
+                    ) && lines.iter().any(
+                        |l| matches!(l, twicecat_app::sections::Line::Participant(p) if p.muted),
+                    )
+                })
+        }),
         s("space-sections-custom", true, space_sections_custom, |a| {
             in_main(a)
                 && a.sections_shown()
