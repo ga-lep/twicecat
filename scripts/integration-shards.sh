@@ -21,7 +21,7 @@ set -euo pipefail
 
 SHARD_1="twicecat-app:bridge twicecat-core:call_signalling twicecat-core:e2ee_verification twicecat-core:lib twicecat-core:timeline_actions twicecat-core:timeline_live"
 SHARD_2="twicecat-core:call_video twicecat-core:cli twicecat-core:e2ee_devices twicecat-core:e2ee_recovery twicecat-core:log_hygiene twicecat-core:oauth twicecat-core:timeline"
-SHARD_3="twicecat-core:call_ringing twicecat-app:calls twicecat-core:login twicecat-core:media twicecat-core:notifications twicecat-core:rooms twicecat-core:rtc_stack"
+SHARD_3="twicecat-core:call_ringing twicecat-app:calls twicecat-core:login twicecat-core:media twicecat-core:notifications twicecat-core:rooms twicecat-core:rtc_stack twicecat-core:spaces"
 SHARD_4="twicecat-core:avatars twicecat-core:call_log_hygiene twicecat-core:call_media twicecat-core:e2ee_identity twicecat-core:e2ee_rooms twicecat-core:room_list twicecat-core:threads twicecat-core:timeline_items"
 # Their ignored tests are all keyring/hardware_ ones (skipped) or none runs;
 # ui_gallery's one writes PNGs for review and needs no homeserver; call_camera's

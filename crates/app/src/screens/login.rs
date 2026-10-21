@@ -645,6 +645,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
         .push(kit::field(
             "User name",
             text_input("alice or @alice:example.org", &form.username)
+                .style(kit::text_input_style)
                 .id(USER_ID)
                 .on_input_maybe((!busy).then_some(Message::UsernameChanged))
                 .on_submit_maybe(enter.clone())
@@ -654,6 +655,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
             "Password",
             // Secure: the dots are drawn, the text is never shown or copied.
             text_input("Password", form.password.expose())
+                .style(kit::text_input_style)
                 .id(PASSWORD_ID)
                 .secure(true)
                 .on_input_maybe(
@@ -705,6 +707,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
                 kit::field(
                     "Server",
                     text_input("matrix.example.org", &form.server)
+                        .style(kit::text_input_style)
                         .id(SERVER_ID)
                         .on_input_maybe((!busy).then_some(Message::ServerChanged))
                         .on_submit_maybe(enter)

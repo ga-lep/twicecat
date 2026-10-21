@@ -1,0 +1,31 @@
+{
+ "color": {
+  "void": {
+   "$value": "NaN"
+  },
+  "surface": {
+   "$value": "#zzzzzz"
+  },
+  "surface-raised": {
+   "$value": "#fff"
+  },
+  "surface-overlay": {
+   "$value": "rgb(1,2,3)"
+  },
+  "accent-wash": {
+   "$value": ""
+  },
+  "line-strong": {
+   "$value": 12345
+  },
+  "ink": {
+   "$value": null
+  },
+  "ink-muted": {
+   "$value": "{color.ink}"
+  },
+  "accent": {
+   "$value": "#\uff26\uff26\uff26\uff26\uff26\uff26"
+  }
+ }
+}

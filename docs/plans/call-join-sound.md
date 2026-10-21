@@ -1,6 +1,8 @@
 # Call Sounds Plan
 Status: APPROVED
 
+Note (later change): the call sounds volume range was capped at 100 % (it was 0-200 below); a stored higher value loads as 100.
+
 ## Goal
 Play short, quiet sounds for three call moments, so the user hears what happened without looking:
 - **Own join:** a rising two-note chime when this device joins a call in a room. That covers both joining a call that is going and starting a new one, because both are `Command::JoinCall` ("Join (or start) the MatrixRTC session of a room", `crates/core/src/api/mod.rs:424`).
@@ -100,6 +102,8 @@ The work goes on the existing branch `feat/ui-ux-rework`, after the `ui.*` commi
   - "Also when others join";
   - "Also when I leave";
   - a "Call sounds volume" slider.
+
+  **Deviation (labels, recorded after Task 4):** the shipped control names are "Play a sound when you join a call", "Also when someone else joins the call", "Also when you leave the call" and "Sounds volume" (`crates/app/src/screens/audio_settings.rs`), to match the wording of the neighbouring ringtone controls. Behaviour is as planned.
 
   The two sub-boxes and the slider are disabled while the master is off. There is no preview button and no preview command (Q7).
 
@@ -291,6 +295,6 @@ Evidence: `cargo test -p twicecat-app --test ui_gallery` writes `audio-ringtone.
 - **Q5 (resolved):** quiet, about −24 dBFS at the default 60 %, gentle fades, a volume setting.
 - **Q6 (resolved):** the page stays "Ringtone", with a "Call sounds" section on it.
 - **Q7 (resolved):** no preview button and no preview command.
-- **Q8 (open): another person leaving.** Not included by default. Adding it is small (a `Departures` twin of `Arrivals`, a falling soft blip, an "Also when others leave" box). It needs care with expiries, because a membership that times out looks like a departure. Include it, or leave it as a follow-up?
-- **Q9 (open): the dead `crates/core/src/engine/calls.rs`.** It is not compiled and holds stale copies of `join_call` and `leave_call`. Delete it in Task 2, which is recommended so that nobody edits the wrong file, or leave it?
-- **Q10 (open): the other-join blip when I am alone.** When you started a call and are waiting, the first person to join is the moment the blip helps most. The plan plays it. Should it play only when you are alone, or always (the plan's default)?
+- **Q8 (resolved): another person leaving.** Not included; a follow-up. The human approved the plan defaults (plan approved 2026-10-14). Original question: Not included by default. Adding it is small (a `Departures` twin of `Arrivals`, a falling soft blip, an "Also when others leave" box). It needs care with expiries, because a membership that times out looks like a departure. Include it, or leave it as a follow-up?
+- **Q9 (resolved): the dead `crates/core/src/engine/calls.rs`.** Deleted in Task 2, with the human's approval of the plan defaults (2026-10-14). Original question: It is not compiled and holds stale copies of `join_call` and `leave_call`. Delete it in Task 2, which is recommended so that nobody edits the wrong file, or leave it?
+- **Q10 (resolved): the other-join blip when I am alone.** It plays always, with the human's approval of the plan defaults (2026-10-14). Original question: When you started a call and are waiting, the first person to join is the moment the blip helps most. The plan plays it. Should it play only when you are alone, or always (the plan's default)?

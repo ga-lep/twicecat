@@ -68,6 +68,8 @@ pub enum Slider {
     Threshold,
     /// How long push-to-talk keeps sending after a release, ms.
     ReleaseDelay,
+    /// The volume of the call sounds, percent (0 to 100: a cue plays at 100 at most).
+    CallSoundsVolume,
 }
 
 impl Slider {
@@ -78,6 +80,7 @@ impl Slider {
             Self::MicCleaningLimit | Self::AutoGainMax | Self::Threshold => AudioPage::Microphone,
             Self::OthersCleaningLimit => AudioPage::OtherVoices,
             Self::ReleaseDelay => AudioPage::Talking,
+            Self::CallSoundsVolume => AudioPage::Ringtone,
         }
     }
 
@@ -105,6 +108,7 @@ impl Slider {
                 } => release_delay_ms as f32,
                 InputMode::VoiceActivity { .. } => DEFAULT_RELEASE_MS as f32,
             },
+            Self::CallSoundsVolume => f32::from(settings.call_sounds.volume_percent),
         }
     }
 
@@ -113,6 +117,7 @@ impl Slider {
         match self {
             Self::InputGain => limits::INPUT_GAIN_DB,
             Self::MasterVolume => (0.0, f32::from(limits::VOLUME_PERCENT)),
+            Self::CallSoundsVolume => (0.0, f32::from(limits::CALL_SOUNDS_VOLUME_PERCENT)),
             Self::MicCleaningLimit | Self::OthersCleaningLimit => limits::DF_ATTENUATION_DB,
             Self::AutoGainMax => limits::AUTO_GAIN_MAX_DB,
             Self::Threshold => limits::VAD_THRESHOLD_DB,
@@ -125,6 +130,7 @@ impl Slider {
         match self {
             Self::InputGain => 1.0,
             Self::MasterVolume => 10.0,
+            Self::CallSoundsVolume => 5.0,
             Self::MicCleaningLimit | Self::OthersCleaningLimit | Self::AutoGainMax => 5.0,
             Self::Threshold => 1.0,
             Self::ReleaseDelay => 50.0,
@@ -161,6 +167,12 @@ impl Slider {
                 {
                     *release_delay_ms = value.round().max(0.0) as u32;
                 }
+            }
+            Self::CallSoundsVolume => {
+                settings.call_sounds.volume_percent = value
+                    .round()
+                    .clamp(0.0, f32::from(limits::CALL_SOUNDS_VOLUME_PERCENT))
+                    as u16;
             }
         }
     }
@@ -1194,7 +1206,16 @@ impl AudioPage {
             ],
             Self::Levels => &["Bitrate", "Slide", "SlideReleased", "Step", "SlideDue"],
             Self::MicTest => &["MicTest", "Loopback"],
-            Self::Ringtone => &["Ringtone"],
+            Self::Ringtone => &[
+                "Ringtone",
+                "CallSounds",
+                "OthersJoining",
+                "LeavingSound",
+                "Slide",
+                "SlideReleased",
+                "Step",
+                "SlideDue",
+            ],
             Self::OtherVoices => &[
                 "CleanOthers",
                 "Skip",
@@ -1309,6 +1330,12 @@ pub enum AudioMessage {
     Loopback(bool),
     /// The ringtone.
     Ringtone(bool),
+    /// The call sounds, as a whole.
+    CallSounds(bool),
+    /// A soft cue when someone else joins the call.
+    OthersJoining(bool),
+    /// A cue when we leave the call.
+    LeavingSound(bool),
     /// Clean other voices.
     CleanOthers(bool),
     /// Which voices cleaning leaves alone.
@@ -1369,6 +1396,9 @@ impl AudioMessage {
             Self::MicTest => "MicTest",
             Self::Loopback(_) => "Loopback",
             Self::Ringtone(_) => "Ringtone",
+            Self::CallSounds(_) => "CallSounds",
+            Self::OthersJoining(_) => "OthersJoining",
+            Self::LeavingSound(_) => "LeavingSound",
             Self::CleanOthers(_) => "CleanOthers",
             Self::Skip(_) => "Skip",
             Self::CleanOthersGpu(_) => "CleanOthersGpu",
@@ -1483,6 +1513,19 @@ impl App {
                 }
             }
             M::Ringtone(on) => self.edit_audio(|s| s.ringtone = on),
+            M::CallSounds(on) => self.edit_audio(|s| s.call_sounds.enabled = on),
+            // The two extras only add to the master switch: off, they stay
+            // as they are.
+            M::OthersJoining(on) => self.edit_audio(|s| {
+                if s.call_sounds.enabled {
+                    s.call_sounds.others_joining = on;
+                }
+            }),
+            M::LeavingSound(on) => self.edit_audio(|s| {
+                if s.call_sounds.enabled {
+                    s.call_sounds.leaving = on;
+                }
+            }),
             M::CleanOthers(on) => self.edit_audio(|s| s.remote_cleaning.enabled = on),
             M::Skip(SkipChoice(skip)) => self.edit_audio(|s| s.remote_cleaning.skip_cleaned = skip),
             M::CleanOthersGpu(on) => self.edit_audio(|s| s.remote_cleaning.gpu = on),
@@ -1898,6 +1941,24 @@ mod tests {
                 s.voice_bitrate_kbps == 32
             }),
             (AudioMessage::Ringtone(false), |s| !s.ringtone),
+            (AudioMessage::CallSounds(false), |s| {
+                !s.call_sounds.enabled
+                    && s.call_sounds.others_joining
+                    && s.call_sounds.leaving
+                    && s.call_sounds.volume_percent == 60
+            }),
+            (AudioMessage::OthersJoining(false), |s| {
+                s.call_sounds.enabled
+                    && !s.call_sounds.others_joining
+                    && s.call_sounds.leaving
+                    && s.call_sounds.volume_percent == 60
+            }),
+            (AudioMessage::LeavingSound(false), |s| {
+                s.call_sounds.enabled
+                    && s.call_sounds.others_joining
+                    && !s.call_sounds.leaving
+                    && s.call_sounds.volume_percent == 60
+            }),
             (AudioMessage::CleanOthers(true), |s| {
                 s.remote_cleaning.enabled
             }),
@@ -2023,6 +2084,46 @@ mod tests {
         assert_eq!(sent_settings(&mut rx).input_gain_db, 4.0);
         let _ = app.update(audio(AudioMessage::SlideReleased));
         assert!(drain(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn the_call_sounds_volume_follows_its_slider_and_steps_by_five() {
+        let (mut app, mut rx) = card();
+        assert_eq!(Slider::CallSoundsVolume.page(), AudioPage::Ringtone);
+        assert_eq!(Slider::CallSoundsVolume.range(), (0.0, 100.0));
+        assert_eq!(Slider::CallSoundsVolume.step(), 5.0);
+        let _ = app.update(audio(AudioMessage::Slide(Slider::CallSoundsVolume, 35.0)));
+        assert!(drain(&mut rx).is_empty(), "nothing while it moves");
+        let _ = app.update(audio(AudioMessage::SlideReleased));
+        let sent = sent_settings(&mut rx);
+        assert_eq!(sent.call_sounds.volume_percent, 35);
+        let mut rest = sent.clone();
+        rest.call_sounds.volume_percent = stored().call_sounds.volume_percent;
+        assert_eq!(rest, stored(), "only the volume changed");
+        let _ = app.update(core(CoreEvent::AudioSettings(sent)));
+        let _ = app.update(audio(AudioMessage::Step(Slider::CallSoundsVolume, true)));
+        assert_eq!(sent_settings(&mut rx).call_sounds.volume_percent, 40);
+        let mut edge = stored();
+        edge.call_sounds.volume_percent = 3;
+        let _ = app.update(core(CoreEvent::AudioSettings(edge)));
+        let _ = app.update(audio(AudioMessage::Step(Slider::CallSoundsVolume, false)));
+        assert_eq!(sent_settings(&mut rx).call_sounds.volume_percent, 0);
+        let mut top = stored();
+        top.call_sounds.volume_percent = 98;
+        let _ = app.update(core(CoreEvent::AudioSettings(top)));
+        let _ = app.update(audio(AudioMessage::Step(Slider::CallSoundsVolume, true)));
+        assert_eq!(sent_settings(&mut rx).call_sounds.volume_percent, 100);
+    }
+
+    #[test]
+    fn the_sub_options_of_the_call_sounds_need_the_master_switch() {
+        let (mut app, mut rx) = card();
+        let mut off = stored();
+        off.call_sounds.enabled = false;
+        let _ = app.update(core(CoreEvent::AudioSettings(off)));
+        let _ = app.update(audio(AudioMessage::OthersJoining(false)));
+        let _ = app.update(audio(AudioMessage::LeavingSound(false)));
+        assert!(drain(&mut rx).is_empty(), "off while the master is off");
     }
 
     #[test]
@@ -3019,6 +3120,7 @@ mod tests {
                 Slider::AutoGainMax,
                 Slider::Threshold,
                 Slider::ReleaseDelay,
+                Slider::CallSoundsVolume,
             ] {
                 assert!(
                     slider.page().sends().contains(&"Slide"),
@@ -3060,6 +3162,9 @@ mod tests {
                 AudioMessage::MicTest,
                 AudioMessage::Loopback(true),
                 AudioMessage::Ringtone(true),
+                AudioMessage::CallSounds(true),
+                AudioMessage::OthersJoining(true),
+                AudioMessage::LeavingSound(true),
                 AudioMessage::CleanOthers(true),
                 AudioMessage::Skip(SkipChoice::ALL[0]),
                 AudioMessage::CleanOthersGpu(true),

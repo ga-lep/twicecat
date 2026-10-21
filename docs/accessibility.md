@@ -3,9 +3,9 @@
 What Twicecat does for keyboard use, contrast, zoom and assistive technology
 after the UI/UX rework, and what it does not do yet. Checked against iced
 0.14.0 (pinned). The sections are: the keyboard map, Settings and Sessions,
-Calls, Screen readers, Drag and drop on Wayland, Colour sets and contrast,
-Zoom, Icons and tooltips, Narrow windows, How calls show state, Room dialogs,
-and the Known limits of iced 0.14.
+Calls, Screen readers, Drag and drop on Wayland, Theme and contrast,
+Zoom, Icons and tooltips, Narrow windows, How calls show state, The sidebar,
+Room dialogs, and the Known limits of iced 0.14.
 
 ## Keyboard map
 
@@ -164,6 +164,43 @@ after a close.
   Session names and IDs come from the server: they are cleaned, capped and
   wrapped inside the row, and the end of an ID is never cut off.
 
+## Settings and Sessions
+
+Settings is a card with a list of pages at its left (Profile, Appearance,
+Notifications, Voice & audio, Keyboard, Sessions, About) and one page at its
+right. Ctrl+, always opens it on Profile, and so does opening it again after
+a close.
+
+- Esc closes Settings, as before (one layer per press).
+- Tab and Shift+Tab walk the text fields of the page on show, in the order of
+  the widget tree: the display name on Profile, the keyword field on
+  Notifications, and no field on the other pages. This iced gives only text
+  fields the keyboard focus; buttons, checkboxes, radio buttons and the list
+  of pages never take it, so they are reached with the pointer. This is a
+  limit of the pinned iced, not a choice; it is on the human checkpoint list.
+  A page change keeps the text typed in the fields of the other pages.
+- The Sessions page of Settings has one button, **Manage sessions...**, which
+  closes Settings and opens the Sessions card. That card closes with its
+  **Close** button or with Esc. Esc closes one thing per press, topmost
+  first: the logout warning, the password prompt, the sign-out question, then
+  the card. It only ever cancels or closes, never confirms a sign-out or a
+  log-out, and while the card or one of its prompts is open it never reaches
+  the room behind it (reply or edit, thread panel, call panel). While the
+  password is on its way to the server the prompt cannot be cancelled, and
+  Esc does nothing. A session named like a tag ("Verified", "This device") or
+  like a device ID is shown in quotes. The rename field and the password prompt
+  are text fields; the prompt takes the focus when it opens.
+- The destructive buttons of Sessions (Sign out, Sign out of all other
+  sessions, Sign out anyway) are red, say what they do in words, sit at least
+  12 px from every other control, and each asks first: the button that asks is
+  not where the one that confirms appears. No key presses a button, so Enter
+  cannot confirm one; Enter in the password field sends it only when the field
+  is not empty.
+- Whether a session is verified is shown in words (**This device**,
+  **Verified**, **Not verified**, **No encryption keys**) and in colour.
+  Session names and IDs come from the server: they are cleaned, capped and
+  wrapped inside the row, and the end of an ID is never cut off.
+
 ## Calls
 
 Every call control is a button, a menu or a slider in the widget tree's
@@ -182,7 +219,11 @@ order, so Tab reaches it:
   Its Talking section sets voice activity, push-to-talk or toggle-to-talk,
   the key (**Set key…**, **Clear**), the mouse button and the gamepad
   button (menus, so no mouse button or pad is needed to pick one) and the
-  release delay;
+  release delay. Its Ringtone page has the
+  call sounds: a checkbox for the sound when you join, two for the extras
+  (someone else joins, you leave) and a volume slider with **−** and **+**.
+  With the first off, the extras and the slider stay in place but take no
+  input; the volume slider runs from 0 to 100 %;
 - the incoming-call card, a modal layer above everything else: **Decline**
   then **Accept**, side by side with a gap, and Esc to hide it. iced 0.14's
   buttons take no keys, so the card also answers to **Ctrl+Shift+A** (accept)
@@ -215,7 +256,7 @@ iced 0.14's slider takes no keyboard focus: its arrow keys work only while
 the mouse is over it (`iced_widget` 0.14.2 `src/slider.rs:393-405`), which
 is why **−** and **+** sit beside every slider (the people's volumes, the
 microphone gain, the volume, the cleaning limits, the voice level, the
-release delay). A slider moved by the wheel or the
+release delay, the call sounds volume). A slider moved by the wheel or the
 keys, which never reports a release, sends its value after a 400 ms pause.
 Speaking is shown by a ring around the picture and by the word "Speaking",
 muted by a mark and the word "Muted", so neither relies on colour alone.
@@ -269,45 +310,110 @@ iced 0.14 / winit stack delivers no file-drop events there (works on X11 and
 XWayland). Use **Attach...** or Ctrl+U, or paste with Ctrl+V. Settings shows
 the same note under the shortcut list.
 
-## Colour sets and contrast
+## Theme and contrast
 
-- There are four colour sets ("families"): Twicecat, Frost, Ember and High
-  contrast, each with a light and a dark palette (`theme::Family`). Settings,
-  Appearance picks the family (four swatches, the one in use is outlined and
-  has a check) and the mode (System, Light or Dark). **Use the default** goes
-  back to the app's default set (`theme::DEFAULT_FAMILY`), which is **Frost**
-  (the swatch marked "(default)"). People who never picked a set see Frost,
-  including existing users after upgrading from a version whose default was
-  Twicecat; anyone who picked a set, Twicecat included, keeps it.
-- Text: all eight palettes are tested for a contrast of at least **4.5:1**
-  (WCAG AA) for text on background, muted text, badge and highlight text,
-  text on selection, message highlight, hover, surface, raised surface and
-  sidebar, the error text on its soft background, and the primary and focus
-  colours on the background. The tightest pair per palette, as the test
-  computes them:
-
-  | Family | Light | Dark |
-  |--------|-------|------|
-  | Twicecat | 4.67:1 (error text on its soft background) | 4.87:1 (muted text on a highlighted message) |
-  | Frost (default) | 4.69:1 (muted text on the sidebar) | 5.22:1 (muted text on a highlighted message) |
-  | Ember | 4.68:1 (muted text on the sidebar) | 4.64:1 (muted text on a highlighted message) |
-  | High contrast | 7.70:1 (muted text on the sidebar) | 7.07:1 (error text on its soft background) |
-
-- **High contrast** (black on white, white on black, saturated accents) is
-  tested for **7:1** (WCAG AAA) on all of those pairs. Choose it in Settings,
-  Appearance, Colours, with Light or Dark mode.
-- Non-text: the ring around a person who is talking (`speaking`) reaches
-  **3:1** against the background in all eight palettes (WCAG 1.4.11). The
-  tested values are 5.08 (Twicecat light), 6.49 (Twicecat dark), 5.04 (Frost
-  light), 9.57 (Frost dark), 5.02 (Ember light), 8.39 (Ember dark), 7.44
-  (High contrast light) and 16.04 (High contrast dark). Panel borders only
-  have to differ from the background; the words and marks next to them carry
-  the meaning.
-- Sender names take a colour derived from the user ID and are lightened or
-  darkened until they reach 4.5:1 on the current background, in all eight.
+- There is one built-in theme, **Twicecat**, with the colours of the project's
+  design (`theme::BUILT_IN`, 15 colours from the design's `tokens.json`; the
+  table that maps them to the app's colours is in the docs of
+  `crates/app/src/theme.rs`). It has one look, which is shown whatever the
+  system's light/dark setting or the stored System / Light / Dark choice is.
+  Settings, Appearance shows a "Theme" menu with "Twicecat (default)" and the
+  custom themes found in the themes folder. The stored System / Light / Dark
+  choice applies to a theme that comes as a light file and a dark file of one
+  name (`<Name>.light.json` and `<Name>.dark.json`), and only to that: the page
+  shows the three radios under the menu for such a theme and nothing for a
+  theme with one look.
+- **The earlier light mode and the High contrast set are gone.** The four
+  colour sets of earlier versions (Twicecat, Frost, Ember, High contrast) and
+  the swatches were removed. Anyone who had picked one of them sees Twicecat
+  after upgrading, and the old setting is ignored. Light themes, light and
+  dark pairs and a high contrast theme come as **custom theme files** in the
+  themes folder; see [themes.md](themes.md) for where it is, the file format
+  and the 15 colours. **Daylight**, a light theme, is given there in full and
+  is the light option: save it, press **Reload themes** and pick it.
+- **Every theme that is shown passes the same rules**, not only the built-in
+  one (rules V1 to V5 in [themes.md](themes.md)): all text colours reach
+  **4.5:1** on every background they are drawn on (a colour that is too faint
+  is lifted just enough, and the page says so), the focus ring, the accent and
+  the borders reach **3:1**, the error, success, warning and accent colours are
+  at least **20** apart in CIELAB from each other and from the text colours
+  (otherwise the theme is refused and Twicecat is used, with a note on the
+  Appearance page), and selected and hovered rows differ visibly from the
+  surfaces. A custom theme is a way to get a higher contrast than the built-in
+  one; it cannot get lower than these floors. The checks do not cover the
+  colours iced derives for radio buttons, sliders, scrollbars and text
+  selection.
+- Two departures from the design's own components, both on purpose: the
+  **primary button** is filled with `accent-bright` (the design uses
+  `accent`), because the app also uses that colour as accent text and the
+  label on it is black (8.69:1); and the **mention badge** is `accent-bright`,
+  so that a mention differs by colour from the unread count (`accent`).
+- Text: the built-in theme is tested for a contrast of at least **4.5:1**
+  (WCAG AA) for text on the background, the surfaces, the selected and hovered
+  rows and the error banner's tint. That covers `ink`, `ink-muted`,
+  `accent-bright`, and the error (`live`), success (`ok`) and warning (`warn`)
+  colours on all five backgrounds; `ink`, `ink-muted` and the error colour on
+  the banner's tint; and the black label on both accent fills. The tightest text
+  pair is the label on the unread pill, **4.85:1**; the tightest of the rest
+  is the error colour on the banner's tint, 5.29:1. The kit's own tests check
+  every button style in every status, the danger icon, the focus surface, the
+  meter zones and the tags.
+- Non-text: the keyboard focus colour reaches at least **7.5:1** on the five
+  backgrounds, the ring around a person who is talking (`accent`) at least
+  **4.38:1** on the window, panel and card backgrounds, and the `line-strong`
+  colour at least **3.22:1** on panels and cards (WCAG 1.4.11).
+- Form controls: iced's own checkbox and text field are too faint on this
+  theme (an unchecked checkbox and a text field have an outline of about
+  1.3:1 to 1.4:1, and a disabled checkbox that is ticked looks unticked), so
+  the app styles both (`kit::checkbox_style`, `kit::text_input_style`) and a
+  source scan fails on any checkbox or text field built without them. Their
+  outline is `line-strong`: **3.56:1** on the window, 3.41:1 on a panel and
+  **3.22:1** on a card. A ticked checkbox is filled with `accent-bright` (at
+  least 7.4:1 on the card, with a black check mark at 8.2:1); a disabled
+  ticked one is filled with `accent` (4.4:1 on the card, check mark 4.85:1), so
+  it still reads as ticked, and a disabled unticked one is a greyed box; its
+  label is muted. A focused text field has a 2 px ring in the focus colour
+  (at least 9.39:1), and its placeholder is `ink-muted` (4.5:1 or more). The
+  composer's editor sits in a field outlined with `line-strong` and draws the
+  focus colour round the editor itself. Still derived by iced from the
+  palette, and not tested for contrast: radio buttons, sliders, scrollbars
+  and the selection colour in a text field.
+- Trust and warning colours are told apart by their distance, not only by
+  being different: the error, success, warning and info colours, and each of
+  them against the text colours, are at least **20** apart in CIELAB (the
+  closest pair is about 39), and a test asserts it. Each state also carries
+  words or its own mark, so colour is never the only cue.
+- Colours that a sender sets on message text (the `data-mx-color` or `<font
+  color>` of a message) are drawn through `theme::sender_colour`: kept as sent
+  when they already reach 4.5:1 on every surface a message can be drawn on
+  (the window, the panel and card surfaces, the selected, mentioned and hovered
+  rows, the error tint, and a code pill; `theme::sender_surfaces`), otherwise
+  mixed toward white (toward black on light surfaces) until they do. The
+  colour is computed for the worst of the surfaces, so it does not change when
+  a row is selected or hovered. Sender names are not coloured by user ID; they
+  use the text colour. A test checks the colours through the same function the
+  timeline uses. A sender can still choose a colour that passes 4.5:1 and looks
+  like a status colour (a red or a green), so colour alone is never a trust
+  signal: the shield, the error banner and the tags carry words or a mark.
+- The authenticity shield on a message has colours of its own, not the accent
+  (`accent`, which is the unread pill and the speaking ring). The red shield
+  (authenticity can't be guaranteed, sent by an unverified device) is filled
+  with the error colour `live` and has a `!` in `on-accent`, **7.29:1** on its
+  fill; the fill is at least **5.88:1** against the window, panels, hovered,
+  selected and mentioned rows. The grey shield (unknown or deleted device,
+  unverified user, unsigned device, sent in clear) is filled with `ink-muted`
+  and has the same dark `!`, **7.93:1**; its fill is at least **6.40:1**
+  against those rows. They are **58** apart from each other in CIELAB, the grey
+  is **74** from the accent and **39** from the mention badge, and the red is
+  **89** from the accent; tests assert at least 20, 4.5:1 for the `!` and 3:1
+  for the fill. The tooltip words are unchanged, so the colour is never the
+  only cue.
 - Not tested by code (on the human checklist): that the keyboard focus is
-  visible on every control in both themes, since it depends on iced's widget
-  styles, and how each set looks in a real window.
+  visible on every control, how iced's own widgets that the app does not
+  style (radio buttons, sliders and scrollbars, which iced colours from the
+  palette) look in the Twicecat colours, how the styled checkboxes and text fields
+  look, that the error banner's tint can be seen, and how
+  the theme looks in a real window.
 
 ## Zoom
 
@@ -382,6 +488,40 @@ State is never colour alone:
   Yes, They match) arm the same way.
 - Call notices (failures) are a red banner with words; their close button is
   separate and clicking the words does nothing.
+
+## The sidebar: spaces, folders and sections
+
+Arranging the sidebar (see [sidebar.md](sidebar.md)) adds **no keyboard
+chord**: `SHORTCUTS` and the keyboard map above are unchanged, and every
+existing shortcut keeps its meaning.
+
+- **The options menus are the alternative to dragging.** Every move a drag can
+  make is also an entry of an options menu: Move up and Move down, Move to
+  folder, Remove from folder, Ungroup, Move to section, Back to its default
+  section, Star and Unstar, Collapse and Expand, Rename and Delete section.
+  The menu opens with a right-click on a space, a folder, a room or a section
+  header, or with the "⋯" button on a header or on the open room's row. It is a
+  centred card, not a menu at the pointer.
+- **Those menus need a pointer.** In iced 0.14 buttons take no keyboard focus
+  (see Known limits below), and no chord opens the card. Keyboard-only users
+  therefore **keep the arrangement but cannot change it**: they get the
+  default sidebar, or the one made earlier with a pointer, and they still
+  reach every drawn room with Ctrl+K and with Alt+Up / Alt+Down and
+  Ctrl+Shift+Up / Ctrl+Shift+Down. They cannot expand a section that was
+  collapsed, though Ctrl+K still opens its rooms. Once a name dialog is open
+  (New folder, New section, Rename), its field, Enter and Esc work from the
+  keyboard.
+- **Rows and headers are pointer-only in the sectioned room list.** A room row
+  and a section header there are a box that answers the pointer, not a button,
+  so opening a room and collapsing or expanding a header need a click. Buttons
+  took no focus in iced 0.14 either, so no keyboard access was lost, only the
+  button's own look states. The flat list (a search, the DMs or Rooms tab,
+  Home, the narrow rail) and the rail keep their buttons. A person listed
+  under a voice room is a click target too.
+- **No auto-scroll while dragging.** A drag does not scroll the rail or the
+  list when the pointer is near an edge, so a target that is out of view
+  cannot be reached by dragging. Use the options menu: it works on any item,
+  in view or not.
 
 ## Known limits of iced 0.14
 

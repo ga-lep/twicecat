@@ -8521,6 +8521,7 @@ dependencies = [
  "notify-rust",
  "open",
  "rfd",
+ "serde_json",
  "tokio",
  "tray-icon",
  "twicecat-core",

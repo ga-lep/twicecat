@@ -40,6 +40,7 @@ use crate::avatars::{Avatars, SdkFetcher, answer_unavailable};
 use crate::call::watcher::CallWatch;
 use crate::call::{CallAudio, CallSession, MediaNotice, UserVolumes};
 use crate::call_settings;
+use crate::call_sounds::{self, Cue};
 use crate::client::{
     ServerSpec, WRONG_ACCOUNT, account_bound, build_client, discover_homeserver_url,
     ensure_homeserver_after_login, map_login_error, same_origin,
@@ -152,6 +153,7 @@ impl Core {
             deafened: false,
             call_reconnects: 0,
             ring_gate: watch::channel(RingGate::default()).0,
+            closing: None,
             captures: video::Captures::default(),
             update_checks: None,
         };
@@ -525,6 +527,13 @@ pub(crate) async fn forward_timeline(
 /// giving up on it.
 const OAUTH_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long the devices stay open after a leave cue has played, so the
+/// device's own buffers drain.
+const CUE_TAIL: Duration = Duration::from_millis(50);
+/// The longest the devices of a left call take to close before they are let
+/// go of (their reporting task still closes them when dropped).
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+
 struct Engine {
     config: CoreConfig,
     secrets: Arc<dyn SecretStore>,
@@ -557,6 +566,10 @@ struct Engine {
     /// Whether the ringtone may play, and where; each session's ringer
     /// follows it.
     ring_gate: watch::Sender<RingGate>,
+    /// The devices of the call just left, closing once its leave cue has
+    /// played (see [`Engine::close_after_cue`]). Awaited before anything
+    /// opens devices again, so two sessions never overlap.
+    closing: Option<JoinHandle<()>>,
     /// Screen captures: their ends, and a portal picker that is up.
     captures: video::Captures,
     /// The daily update checks, while the user has them on.
@@ -1034,6 +1047,7 @@ impl Engine {
             }
         }
         self.leave_call().await;
+        self.finish_closing().await;
         if let Some(session) = self.audio_session.take() {
             session.stop().await;
         }
@@ -1443,8 +1457,10 @@ impl Engine {
             Command::JoinCall { room_id, intent } => self.join_call(room_id, intent).await,
             Command::LeaveCall => {
                 if self.call.is_some() {
-                    self.leave_call().await;
+                    // The only leave that plays the leave cue.
+                    self.end_call(false, true).await;
                 } else {
+                    // No call, no cue: a repeated leave is silent.
                     self.emit(CoreEvent::Error(CoreError::NotInCall)).await;
                 }
             }
@@ -1794,6 +1810,7 @@ impl Engine {
         }
         if let Some(call) = &self.call {
             call.set_cleaning(&settings);
+            call.set_sounds(&settings.call_sounds);
         }
         if let Err(e) = saved {
             self.emit(CoreEvent::Error(e)).await;
@@ -1826,6 +1843,7 @@ impl Engine {
         let client = active.client.clone();
         if let Some(call) = &self.call {
             if call.room_id == room_id {
+                // Already in this call: `Connected` again, and no join cue.
                 let encrypted = call.encrypted;
                 self.emit(CoreEvent::CallState(CallState::Connected {
                     room_id,
@@ -1838,7 +1856,8 @@ impl Engine {
             // one being answered) must not play while one call ends and
             // the next begins.
             self.update_ring_gate(true);
-            self.end_call(true).await;
+            // No leave cue when switching: the new room's join cue follows.
+            self.end_call(true, false).await;
         }
         // Participants carry the per-user volumes.
         let volumes = crate::call::volumes_of(self.audio_settings().await);
@@ -1878,6 +1897,9 @@ impl Engine {
                     }
                 }
                 self.call = Some(session);
+                // The one place the join cue plays: a join that worked, not
+                // a repeat join, a reconnect or a failure.
+                self.play_call_cue(Cue::Joined);
                 self.emit(CoreEvent::CallState(CallState::Connected {
                     room_id,
                     encrypted,
@@ -1885,6 +1907,7 @@ impl Engine {
                 .await;
             }
             Err(e) => {
+                // A failed join is silent: no join cue, no leave cue.
                 self.stop_call_audio().await;
                 self.update_ring_gate(false);
                 self.emit(CoreEvent::CallState(CallState::Left {
@@ -1900,6 +1923,7 @@ impl Engine {
     /// Opens the audio devices for a call (replacing a mic test). Without
     /// usable devices the call still joins, silent, and the error is shown.
     async fn start_call_audio(&mut self) -> CallAudio {
+        self.finish_closing().await;
         if let Some(session) = self.audio_session.take() {
             session.stop().await;
         }
@@ -1921,6 +1945,7 @@ impl Engine {
                 self.audio_session = Some(session);
                 CallAudio {
                     voice,
+                    sounds: settings.call_sounds,
                     outgoing,
                     bitrate_kbps,
                     cleaning,
@@ -1932,6 +1957,7 @@ impl Engine {
                 self.emit(CoreEvent::Error(e)).await;
                 CallAudio {
                     voice: None,
+                    sounds: settings.call_sounds,
                     outgoing: None,
                     bitrate_kbps,
                     cleaning,
@@ -1944,6 +1970,7 @@ impl Engine {
 
     /// Closes the call's audio devices, if they are open.
     async fn stop_call_audio(&mut self) {
+        self.finish_closing().await;
         if self
             .audio_session
             .as_ref()
@@ -1982,6 +2009,7 @@ impl Engine {
                 .await;
             }
             MediaNotice::Reconnected => {
+                // Back in the same call: no join cue.
                 self.call_reconnects = 0;
                 let encrypted = self.call.as_ref().is_some_and(|c| c.encrypted);
                 self.emit(CoreEvent::CallState(CallState::Connected {
@@ -1991,6 +2019,7 @@ impl Engine {
                 .await;
             }
             MediaNotice::Disconnected => {
+                // The call was lost, not left: no leave cue.
                 if let Some(call) = self.call.take() {
                     if let Some(calls) = self.calls() {
                         calls.set_sent(&call.room_id, None);
@@ -2067,14 +2096,17 @@ impl Engine {
         }
     }
 
-    /// Leaves the current call, if any.
+    /// Leaves the current call, if any, silently: for shutdown, the end of a
+    /// session and logout (the user's own leave is `end_call(false, true)`).
     async fn leave_call(&mut self) {
-        self.end_call(false).await;
+        self.end_call(false, false).await;
     }
 
     /// Leaves the current call, if any; `joining_next` keeps the ringtone's
-    /// gate closed for the call joined right after.
-    async fn end_call(&mut self, joining_next: bool) {
+    /// gate closed for the call joined right after. With `leave_sound` the
+    /// leave cue plays (when the settings allow it) and the devices close
+    /// once it has played, without delaying `Left`.
+    async fn end_call(&mut self, joining_next: bool, leave_sound: bool) {
         if let Some(call) = self.call.take() {
             let room_id = call.room_id.clone();
             if let Some(calls) = self.calls() {
@@ -2083,13 +2115,67 @@ impl Engine {
             let video = (call.has_video(), call.local_video());
             call.leave().await;
             self.video_ended(room_id.clone(), video).await;
-            self.stop_call_audio().await;
+            match leave_sound.then(|| self.play_call_cue(Cue::Left)).flatten() {
+                Some(length) => self.close_after_cue(length),
+                None => self.stop_call_audio().await,
+            }
             self.update_ring_gate(joining_next);
             self.emit(CoreEvent::CallState(CallState::Left {
                 room_id,
                 reason: CallEndReason::Hangup,
             }))
             .await;
+        }
+    }
+
+    /// Plays `cue` in the call's audio if the settings allow it. Returns how
+    /// long it lasts when it was queued. A cue logs only its kind.
+    fn play_call_cue(&self, cue: Cue) -> Option<Duration> {
+        let sounds = self.audio_settings.as_ref()?.call_sounds;
+        let volume = call_sounds::playable_volume(&sounds, cue)?;
+        let session = self
+            .audio_session
+            .as_ref()
+            .filter(|s| s.mode() == Mode::Call)?;
+        let samples = call_sounds::samples(cue);
+        if !session.play_cue(samples, volume) {
+            return None;
+        }
+        tracing::debug!(cue = cue.name(), "call sound");
+        let micros = samples.len() as u64 * 1_000_000 / u64::from(twicecat_audio::SAMPLE_RATE);
+        Some(Duration::from_micros(micros))
+    }
+
+    /// Closes the call's devices once a cue of `length` has played, in a
+    /// task, so the call's `Left` does not wait for it. The task is bounded
+    /// (`CUE_TAIL` after the cue, then `CLOSE_TIMEOUT` to close), and
+    /// everything that opens or ends audio awaits it first
+    /// ([`Engine::finish_closing`]).
+    fn close_after_cue(&mut self, length: Duration) {
+        let Some(session) = self.audio_session.take() else {
+            return;
+        };
+        // The devices linger for the cue, but the microphone sends nothing
+        // and no level or stats are reported meanwhile.
+        session.begin_closing();
+        self.closing = Some(tokio::spawn(async move {
+            tokio::time::sleep(length + CUE_TAIL).await;
+            if tokio::time::timeout(CLOSE_TIMEOUT, session.stop())
+                .await
+                .is_err()
+            {
+                // Dropping the session ends its reporting task, which closes
+                // the devices.
+                warn!("the call's audio devices were slow to close");
+            }
+        }));
+    }
+
+    /// Waits for the devices of a call just left to close (at most the cue's
+    /// length plus the closing bounds).
+    async fn finish_closing(&mut self) {
+        if let Some(task) = self.closing.take() {
+            let _ = task.await;
         }
     }
 
@@ -2130,6 +2216,7 @@ impl Engine {
             .await;
             return;
         }
+        self.finish_closing().await;
         if let Some(session) = self.audio_session.take() {
             session.stop().await;
         }
@@ -2175,8 +2262,9 @@ impl Engine {
     async fn start_security(&mut self) {
         if let Some(active) = self.active.as_mut() {
             // Before the sync starts, so that no notification is missed.
+            let spaces = active.rooms.subscribe_children();
             active.notifications =
-                Some(NotificationTasks::start(&active.client, &self.events).await);
+                Some(NotificationTasks::start(&active.client, &self.events, spaces).await);
             active.security.start(&active.client, &self.events);
             active.rooms.start(&active.client, &self.events);
             active.media.send_limits(&active.client, &self.events);
@@ -3149,6 +3237,7 @@ impl Engine {
     /// Leaves the call and stops the mic test, when the session ends.
     async fn end_session_audio(&mut self) {
         self.leave_call().await;
+        self.finish_closing().await;
         if let Some(session) = self.audio_session.take() {
             session.stop().await;
         }
@@ -3195,6 +3284,9 @@ impl Engine {
     async fn logout(&mut self) {
         // The call needs the session to remove its membership.
         self.leave_call().await;
+        // No leave cue on logout; one still playing from an earlier leave
+        // is waited for (bounded) before the session goes.
+        self.finish_closing().await;
         let Some(mut active) = self.active.take() else {
             self.emit(CoreEvent::Error(CoreError::NotLoggedIn)).await;
             return;
@@ -3245,6 +3337,7 @@ mod tests {
             deafened: false,
             call_reconnects: 0,
             ring_gate: watch::channel(RingGate::default()).0,
+            closing: None,
             captures: video::Captures::default(),
             update_checks: None,
         }
@@ -3403,11 +3496,185 @@ mod tests {
         // Joining closes it; the call's end opens it again.
         engine.update_ring_gate(true);
         assert!(gate.borrow().in_call);
-        engine.end_call(false).await;
+        engine.end_call(false, false).await;
         // No call to end: the gate is left as it was.
         assert!(gate.borrow().in_call);
         engine.update_ring_gate(false);
         assert!(!gate.borrow().in_call);
+    }
+
+    /// A virtual speaker recording what the call plays.
+    #[derive(Default)]
+    struct Speaker {
+        played: std::sync::Mutex<Vec<f32>>,
+    }
+
+    impl crate::api::VirtualAudio for Speaker {
+        fn capture(&self, frame: &mut [f32; crate::api::AUDIO_FRAME_LEN]) {
+            frame.fill(0.0);
+        }
+        fn playback(&self, frame: &[f32; crate::api::AUDIO_FRAME_LEN]) {
+            self.played.lock().unwrap().extend_from_slice(frame);
+        }
+    }
+
+    /// An engine whose call audio opens on a recording virtual speaker.
+    fn engine_with_speaker(
+        dir: &std::path::Path,
+    ) -> (Engine, Arc<Speaker>, tokio::task::JoinHandle<()>) {
+        let (mut engine, mut rx) = oauth_engine(dir);
+        let speaker = Arc::new(Speaker::default());
+        engine.config.audio = AudioBackend::Virtual(speaker.clone());
+        // The session reports levels; nobody else reads them here.
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        (engine, speaker, drain)
+    }
+
+    /// Energy of `played` against the cue played at `volume` (percent).
+    fn cue_energy_ratio(played: &[f32], cue: Cue, volume: f32) -> f32 {
+        let heard: f32 = played.iter().map(|s| s * s).sum();
+        let gain = volume / 100.0;
+        let sent: f32 = call_sounds::samples(cue)
+            .iter()
+            .map(|s| (s * gain) * (s * gain))
+            .sum();
+        heard / sent
+    }
+
+    #[tokio::test]
+    async fn the_leave_cue_plays_in_full_and_the_devices_close_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, speaker, drain) = engine_with_speaker(dir.path());
+        let _ = engine.start_call_audio().await;
+        let length = engine.play_call_cue(Cue::Left).expect("queued");
+        assert!((length.as_secs_f32() - 0.24).abs() < 0.02, "{length:?}");
+
+        // Closing does not wait for the cue: the devices are handed to a
+        // task at once, so `Left` is not delayed.
+        let started = std::time::Instant::now();
+        engine.close_after_cue(length);
+        assert!(started.elapsed() < length / 2);
+        assert!(engine.audio_session.is_none(), "taken out of the engine");
+        assert!(engine.closing.is_some());
+
+        // Anything that opens or ends audio waits for the close first.
+        engine.finish_closing().await;
+        assert!(engine.closing.is_none());
+        let ratio = cue_energy_ratio(&speaker.played.lock().unwrap(), Cue::Left, 60.0);
+        assert!(
+            (0.98..=1.02).contains(&ratio),
+            "the whole cue at 60 % played, ratio {ratio}"
+        );
+        drain.abort();
+    }
+
+    #[tokio::test]
+    async fn a_closing_session_reports_no_levels_or_stats() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, mut rx) = oauth_engine(dir.path());
+        engine.config.audio = AudioBackend::Virtual(Arc::new(Speaker::default()));
+        let _ = engine.start_call_audio().await;
+        let length = engine.play_call_cue(Cue::Left).expect("queued");
+
+        // Levels flow while the call runs.
+        let saw = |event: &CoreEvent| {
+            matches!(event, CoreEvent::InputLevel(_) | CoreEvent::AudioStats(_))
+        };
+        let first = tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(event) = rx.recv().await {
+                if saw(&event) {
+                    return true;
+                }
+            }
+            false
+        })
+        .await;
+        assert_eq!(first, Ok(true), "levels flow before the leave");
+
+        engine.close_after_cue(length);
+        // Whatever was already in flight is dropped; then nothing arrives
+        // until the devices close.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        while rx.try_recv().is_ok() {}
+        let mut late = Vec::new();
+        let closing = tokio::time::timeout(Duration::from_secs(2), engine.finish_closing());
+        tokio::pin!(closing);
+        loop {
+            tokio::select! {
+                done = &mut closing => {
+                    done.expect("closes in time");
+                    break;
+                }
+                Some(event) = rx.recv() => late.push(event),
+            }
+        }
+        while let Ok(event) = rx.try_recv() {
+            late.push(event);
+        }
+        assert!(
+            !late.iter().any(saw),
+            "no levels or stats while closing: {late:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_call_waits_for_the_closing_devices_and_never_overlaps_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, _speaker, drain) = engine_with_speaker(dir.path());
+        let _ = engine.start_call_audio().await;
+        let length = engine.play_call_cue(Cue::Left).expect("queued");
+        engine.close_after_cue(length);
+        let started = std::time::Instant::now();
+        let _ = engine.start_call_audio().await;
+        assert!(
+            started.elapsed() >= length,
+            "the new session opened after the old one's cue: {:?}",
+            started.elapsed()
+        );
+        assert!(engine.closing.is_none());
+        assert!(engine.audio_session.is_some());
+        engine.stop_call_audio().await;
+        drain.abort();
+    }
+
+    #[tokio::test]
+    async fn a_cue_plays_while_deafened_and_stays_silent_when_the_settings_say_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, speaker, drain) = engine_with_speaker(dir.path());
+        let _ = engine.start_call_audio().await;
+        engine.deafened = true;
+        engine.apply_mute();
+        let length = engine.play_call_cue(Cue::Joined).expect("queued");
+        tokio::time::sleep(length + Duration::from_millis(100)).await;
+        let ratio = cue_energy_ratio(&speaker.played.lock().unwrap(), Cue::Joined, 60.0);
+        assert!((0.98..=1.02).contains(&ratio), "deafened, ratio {ratio}");
+
+        // Each setting that turns a cue off plays nothing.
+        let mut off = engine.audio_settings.clone().unwrap();
+        off.call_sounds.leaving = false;
+        engine.audio_settings = Some(off.clone());
+        assert!(engine.play_call_cue(Cue::Left).is_none());
+        off.call_sounds.leaving = true;
+        off.call_sounds.volume_percent = 0;
+        engine.audio_settings = Some(off.clone());
+        assert!(engine.play_call_cue(Cue::Joined).is_none(), "0 % is silent");
+        off.call_sounds.volume_percent = 60;
+        off.call_sounds.enabled = false;
+        engine.audio_settings = Some(off);
+        assert!(engine.play_call_cue(Cue::Joined).is_none());
+        engine.stop_call_audio().await;
+        drain.abort();
+    }
+
+    #[tokio::test]
+    async fn no_audio_session_means_no_cue_and_nothing_to_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, _rx) = oauth_engine(dir.path());
+        let _ = engine.audio_settings().await;
+        assert!(engine.play_call_cue(Cue::Joined).is_none());
+        engine.close_after_cue(Duration::from_millis(10));
+        assert!(engine.closing.is_none());
+        engine.finish_closing().await;
     }
 
     fn oauth_engine(dir: &std::path::Path) -> (Engine, mpsc::Receiver<CoreEvent>) {
@@ -3438,6 +3705,7 @@ mod tests {
             deafened: false,
             call_reconnects: 0,
             ring_gate: watch::channel(RingGate::default()).0,
+            closing: None,
             captures: video::Captures::default(),
             update_checks: None,
         };

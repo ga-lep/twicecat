@@ -1112,7 +1112,7 @@ mod tests {
 
     /// The fill and glyph of a look's button, on the default theme.
     fn look_signature(look: MicLook) -> (Icon, Option<iced::Background>, iced::Color, u32) {
-        let theme = crate::theme::theme_for_family(crate::theme::Family::Twicecat, true);
+        let theme = crate::theme::built_in();
         let style = (look.button_style())(&theme, Status::Active);
         (
             look.icon(),
@@ -1124,15 +1124,16 @@ mod tests {
 
     #[test]
     fn an_open_microphone_is_outlined_and_not_filled_like_muted() {
-        let theme = crate::theme::theme_for_family(crate::theme::Family::Twicecat, true);
-        let open = (MicLook::Plain.button_style())(&theme, Status::Active);
-        let muted = (MicLook::Muted.button_style())(&theme, Status::Active);
-        assert!(open.border.width >= 1.0, "an outline");
-        assert_ne!(open.border.color, muted.border.color);
-        assert_ne!(open.background, muted.background);
-        // Not the quiet ghost: it must carry weight of its own.
-        let ghost = ghost_style(&theme, Status::Active);
-        assert_ne!(open.border.width, ghost.border.width);
+        for theme in crate::theme::test_themes() {
+            let open = (MicLook::Plain.button_style())(&theme, Status::Active);
+            let muted = (MicLook::Muted.button_style())(&theme, Status::Active);
+            assert!(open.border.width >= 1.0, "an outline");
+            assert_ne!(open.border.color, muted.border.color);
+            assert_ne!(open.background, muted.background);
+            // Not the quiet ghost: it must carry weight of its own.
+            let ghost = ghost_style(&theme, Status::Active);
+            assert_ne!(open.border.width, ghost.border.width);
+        }
     }
 
     #[test]

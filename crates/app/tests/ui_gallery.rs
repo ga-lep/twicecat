@@ -28,31 +28,38 @@ use iced::{Element, Event, Pixels, Rectangle, Renderer, Size, window};
 use twicecat_app::ui::fonts;
 use twicecat_app::{App, Message};
 use twicecat_core::api::{
-    DensityChoice, PaletteChoice, RoomListChoice, ThemeChoice, UiSettings, UpdateCheckChoice,
+    DensityChoice, RoomListChoice, ThemeChoice, ThemeName, UiSettings, UpdateCheckChoice,
 };
 
 const WIDE: Size = Size::new(1280.0, 800.0);
 const NARROW: Size = Size::new(720.0, 800.0);
 const SIZES: [Size; 2] = [WIDE, NARROW];
 
-const FAMILIES: [(PaletteChoice, &str); 4] = [
-    (PaletteChoice::Twicecat, "twicecat"),
-    (PaletteChoice::Frost, "frost"),
-    (PaletteChoice::Ember, "ember"),
-    (PaletteChoice::HighContrast, "high-contrast"),
+/// The themes the gallery draws, as (stored mode choice, tag): the built-in
+/// Twicecat and the light example Daylight, which is read from
+/// `tests/fixtures/themes`. Both have one look, so the choice does not change
+/// what is drawn.
+const THEMES: [(ThemeChoice, &str); 2] = [
+    (ThemeChoice::System, "twicecat"),
+    (ThemeChoice::System, "daylight"),
 ];
-const MODES: [(ThemeChoice, &str); 2] =
-    [(ThemeChoice::Light, "light"), (ThemeChoice::Dark, "dark")];
+
+/// The folder of the example themes.
+const THEME_FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/themes");
+
+/// The stored theme name a theme tag stands for; Twicecat is no name.
+fn stored_theme(tag: &str) -> Option<ThemeName> {
+    (tag == "daylight").then(|| ThemeName::try_from("Daylight").expect("a valid name"))
+}
 const DENSITIES: [(DensityChoice, &str); 2] = [
     (DensityChoice::Comfortable, "comfortable"),
     (DensityChoice::Compact, "compact"),
 ];
 
-/// One combination of colour set, mode, density and room list.
+/// One combination of theme, density and room list.
 #[derive(Clone, Copy)]
 struct Variant {
-    family: (PaletteChoice, &'static str),
-    mode: (ThemeChoice, &'static str),
+    theme: (ThemeChoice, &'static str),
     density: (DensityChoice, &'static str),
     list: RoomListChoice,
 }
@@ -63,14 +70,26 @@ fn apply(app: &mut App, variant: Variant) {
     settings.advanced_settings = app.ui_settings.advanced_settings;
     // The scenario's answer to the update question (its bar or none).
     settings.update_check = app.ui_settings.update_check;
+    // A scenario that picked a theme of its own keeps it; the theme variants
+    // only replace Twicecat and Daylight.
+    if let Some(own) = app.ui_settings.theme_name
+        && stored_theme("daylight") != Some(own)
+    {
+        settings.theme_name = Some(own);
+    }
+    if app.themes.is_none() {
+        app.set_themes(twicecat_app::themes::load_dir(std::path::Path::new(
+            THEME_FIXTURES,
+        )));
+    }
     app.set_ui_settings(settings);
 }
 
 impl Variant {
     fn settings(self) -> UiSettings {
         UiSettings {
-            theme: self.mode.0,
-            palette: Some(self.family.0),
+            theme: self.theme.0,
+            theme_name: stored_theme(self.theme.1),
             density: self.density.0,
             room_list: self.list,
             // Answered: no update question bar over the screens.
@@ -79,19 +98,19 @@ impl Variant {
         }
     }
 
-    /// `<family>-<mode>-<density>` plus `-rail` for the collapsed room list.
+    /// `<theme>-<density>` plus `-rail` for the collapsed room list.
     fn tag(self) -> String {
         let rail = if self.list == RoomListChoice::Rail {
             "-rail"
         } else {
             ""
         };
-        format!("{}-{}-{}{rail}", self.family.1, self.mode.1, self.density.1)
+        format!("{}-{}{rail}", self.theme.1, self.density.1)
     }
 }
 
-/// Every variant of a screen: all 16, and 16 more with the rail for the
-/// screens that show the room list.
+/// Every variant of a screen: each theme at both densities, and again with
+/// the rail for the screens that show the room list.
 fn variants(room_list: bool) -> Vec<Variant> {
     let lists: &[RoomListChoice] = if room_list {
         &[RoomListChoice::Expanded, RoomListChoice::Rail]
@@ -100,16 +119,13 @@ fn variants(room_list: bool) -> Vec<Variant> {
     };
     let mut all = Vec::new();
     for &list in lists {
-        for mode in MODES {
-            for density in DENSITIES {
-                for family in FAMILIES {
-                    all.push(Variant {
-                        family,
-                        mode,
-                        density,
-                        list,
-                    });
-                }
+        for density in DENSITIES {
+            for theme in THEMES {
+                all.push(Variant {
+                    theme,
+                    density,
+                    list,
+                });
             }
         }
     }
@@ -206,7 +222,7 @@ fn gallery_dir() -> PathBuf {
     }
 }
 
-/// `index.html`: a plain `<img>` grid, one column per colour set, no scripts
+/// `index.html`: a plain `<img>` grid, one column per theme, no scripts
 /// and nothing remote. `shots` are `(screen, [(variant tag, file)])`.
 fn index_html(shots: &[(&str, Vec<(String, String)>)]) -> String {
     let mut html = String::from(
@@ -224,30 +240,28 @@ fn index_html(shots: &[(&str, Vec<(String, String)>)]) -> String {
         html.push_str(&format!(
             "<h2 id=\"{screen}\">{screen}</h2>\n<table>\n<tr class=\"families\"><th></th>"
         ));
-        for (_, name) in FAMILIES {
+        for (_, name) in THEMES {
             html.push_str(&format!("<th>{name}</th>"));
         }
         html.push_str("</tr>\n");
-        for mode in MODES {
-            for density in DENSITIES {
-                for rail in [false, true] {
-                    let suffix = if rail { "-rail" } else { "" };
-                    let row = format!("{}-{}{suffix}", mode.1, density.1);
-                    let cells: Vec<String> = FAMILIES
-                        .iter()
-                        .filter_map(|(_, family)| {
-                            let tag = format!("{family}-{row}");
-                            files.iter().find(|(t, _)| *t == tag).map(|(_, file)| {
-                                format!(
-                                    "<td><a href=\"{file}\"><img src=\"{file}\" \
-                                     alt=\"{screen} {tag}\" loading=\"lazy\"></a></td>"
-                                )
-                            })
+        for density in DENSITIES {
+            for rail in [false, true] {
+                let suffix = if rail { "-rail" } else { "" };
+                let row = format!("{}{suffix}", density.1);
+                let cells: Vec<String> = THEMES
+                    .iter()
+                    .filter_map(|(_, theme)| {
+                        let tag = format!("{theme}-{row}");
+                        files.iter().find(|(t, _)| *t == tag).map(|(_, file)| {
+                            format!(
+                                "<td><a href=\"{file}\"><img src=\"{file}\" \
+                                 alt=\"{screen} {tag}\" loading=\"lazy\"></a></td>"
+                            )
                         })
-                        .collect();
-                    if cells.len() == FAMILIES.len() {
-                        html.push_str(&format!("<tr><th>{row}</th>{}</tr>\n", cells.concat()));
-                    }
+                    })
+                    .collect();
+                if cells.len() == THEMES.len() {
+                    html.push_str(&format!("<tr><th>{row}</th>{}</tr>\n", cells.concat()));
                 }
             }
         }
@@ -328,11 +342,21 @@ fn the_fixture_reaches_every_screen_it_names() {
         "audio-levels",
         "audio-mic-test",
         "audio-ringtone",
+        "audio-ringtone-sounds-off",
         "audio-other-voices",
         "audio-announce",
         "audio-diagnostics",
         "settings",
         "settings-appearance",
+        "settings-appearance-themes",
+        "settings-appearance-pair",
+        "settings-appearance-pair-dark",
+        "settings-appearance-fallback",
+        "settings-appearance-loading",
+        "settings-appearance-sidebar",
+        "settings-appearance-sidebar-ask",
+        "settings-appearance-sidebar-newer",
+        "settings-appearance-sidebar-other",
         "settings-notifications",
         "settings-voice-audio",
         "settings-video",
@@ -375,6 +399,19 @@ fn the_fixture_reaches_every_screen_it_names() {
         "switcher",
         "switcher-empty",
         "switcher-long",
+        "rail-dragging",
+        "rail-dragging-into",
+        "rail-menu",
+        "rail-folder-name",
+        "space-sections",
+        "space-sections-collapsed",
+        "voice-channel",
+        "space-sections-custom",
+        "space-sections-dragging",
+        "space-sections-dragging-line",
+        "space-sections-dragging-refused",
+        "space-sections-dragging-header",
+        "section-menu",
         "verification-requested",
         "verification-emojis",
         "verification-done",
@@ -550,27 +587,24 @@ fn the_index_is_a_plain_image_grid() {
     assert!(!html.contains("<script"));
     assert!(!html.contains("http"));
     assert!(!html.contains("javascript"));
-    for (_, family) in FAMILIES {
-        assert!(html.contains(&format!("<th>{family}</th>")), "{family}");
+    for (_, theme) in THEMES {
+        assert!(html.contains(&format!("<th>{theme}</th>")), "{theme}");
     }
-    assert_eq!(html.matches("<img ").count(), 16);
-    assert_eq!(
-        html.matches("<tr><th>").count(),
-        4,
-        "one row per mode x density"
-    );
+    assert_eq!(html.matches("<img ").count(), 4);
+    assert_eq!(html.matches("<tr><th>").count(), 2, "one row per density");
 }
 
 #[test]
 fn variant_tags_are_file_name_safe() {
     let all = variants(true);
-    assert_eq!(all.len(), 32);
+    assert_eq!(all.len(), 8);
     let mut tags: Vec<String> = all.iter().map(|v| v.tag()).collect();
     tags.sort_unstable();
     tags.dedup();
-    assert_eq!(tags.len(), 32);
-    assert!(tags.contains(&"frost-dark-compact-rail".to_owned()));
-    assert!(tags.contains(&"high-contrast-light-comfortable".to_owned()));
+    assert_eq!(tags.len(), 8);
+    assert!(tags.contains(&"daylight-comfortable-rail".to_owned()));
+    assert!(tags.contains(&"twicecat-compact-rail".to_owned()));
+    assert!(tags.contains(&"twicecat-comfortable".to_owned()));
 }
 
 /// Writes the gallery. Run on purpose:
@@ -1312,6 +1346,219 @@ fn the_slots_follow_the_layout_at_every_width_and_the_room_pane_keeps_its_place(
     }
 }
 
+/// The 72 px slots of the spaces rail, in window coordinates: the outermost
+/// nodes that are 48 px high and as wide as the rail (or 4 px less, inside an
+/// open folder).
+fn rail_slots<'n>(node: &'n Node, at: iced::Point, out: &mut Vec<(Rectangle, &'n Node)>) {
+    let b = node.bounds();
+    let here = iced::Point::new(at.x + b.x, at.y + b.y);
+    if b.height == 48.0 && (b.width == 72.0 || b.width == 68.0) {
+        out.push((Rectangle::new(here, b.size()), node));
+        return;
+    }
+    for child in node.children() {
+        rail_slots(child, here, out);
+    }
+}
+
+#[test]
+fn rail_states_draws_every_slot_whole_and_apart_at_every_width() {
+    let renderer = renderer();
+    let scenario = fixture::scenarios()
+        .into_iter()
+        .find(|s| s.name == "rail-states")
+        .expect("the rail-states scenario");
+    for variant in variants(true) {
+        let mut app = (scenario.build)();
+        apply(&mut app, variant);
+        for width in [1280.0, 1000.0, 720.0] {
+            let size = Size::new(width, 800.0);
+            app.window_width = width;
+            let shown = app.pane_layout().sidebar;
+            let laid = Laid::new(&app, &renderer, size);
+            let what = format!("{} at {width}", variant.tag());
+            let pane = &panes_row(&laid).children()[0];
+            let mut slots = Vec::new();
+            rail_slots(pane, iced::Point::ORIGIN, &mut slots);
+            if !shown {
+                assert_eq!(pane.bounds().width, 0.0, "{what}: the rail is hidden");
+                assert!(slots.is_empty(), "{what}");
+                continue;
+            }
+            // Home, five spaces, a closed folder, an open folder and its two
+            // spaces.
+            assert_eq!(slots.len(), 10, "{what}");
+            for (i, (a, _)) in slots.iter().enumerate() {
+                assert!(
+                    a.x >= -0.5 && a.x + a.width <= 72.5,
+                    "{what}: slot {i} is outside the rail: {a:?}"
+                );
+                for (b, _) in &slots[i + 1..] {
+                    assert!(!overlap(a, b), "{what}: {a:?} overlaps {b:?}");
+                }
+            }
+            // Every part of a slot (icon, pill, badge) is inside it.
+            for (i, (rect, node)) in slots.iter().enumerate() {
+                let origin = iced::Point::new(rect.x - node.bounds().x, rect.y - node.bounds().y);
+                let mut leaves = Vec::new();
+                painted_leaves(node, origin, &mut leaves);
+                assert!(!leaves.is_empty(), "{what}: slot {i} draws nothing");
+                for leaf in leaves {
+                    assert!(
+                        leaf.x >= rect.x - 0.5
+                            && leaf.y >= rect.y - 0.5
+                            && leaf.x + leaf.width <= rect.x + rect.width + 0.5
+                            && leaf.y + leaf.height <= rect.y + rect.height + 0.5,
+                        "{what}: slot {i}: {leaf:?} is outside {rect:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+// ---- Sections inside a space (sidebar plan, Task 8) -----------------------
+
+#[test]
+fn space_sections_draw_every_line_whole_and_apart_in_both_densities_and_themes() {
+    use twicecat_app::screens::room_list_pane::SCROLLBAR_GUTTER;
+    use twicecat_app::sections::{
+        COMPACT_HEADER_HEIGHT, HEADER_HEIGHT, Line, line_height, line_offsets,
+    };
+    let renderer = renderer();
+    for name in [
+        "space-sections",
+        "space-sections-collapsed",
+        "voice-channel",
+        "space-sections-custom",
+        "space-sections-dragging",
+        "space-sections-dragging-line",
+        "space-sections-dragging-refused",
+        "space-sections-dragging-header",
+    ] {
+        let scenario = fixture::scenarios()
+            .into_iter()
+            .find(|s| s.name == name)
+            .expect("the scenario");
+        for variant in variants(true) {
+            let mut app = (scenario.build)();
+            apply(&mut app, variant);
+            for size in SIZES {
+                app.window_width = size.width;
+                let what = format!("{name} {} at {}", variant.tag(), size.width);
+                let sectioned = variant.list == RoomListChoice::Expanded && size.width >= 800.0;
+                assert_eq!(app.sections_shown(), sectioned, "{what}");
+                let laid = Laid::new(&app, &renderer, size);
+                if !sectioned {
+                    // The rail, or a window under 800 px: the flat list, whose
+                    // rows are all the rail's 56 px.
+                    let (rows, _) = list_rows(&laid);
+                    assert!(!rows.is_empty(), "{what}");
+                    assert!(
+                        rows.iter().all(|(r, _)| (r.height - 56.0).abs() < 0.5),
+                        "{what}: the rail stays flat"
+                    );
+                    continue;
+                }
+                let lines = app.section_lines().expect("sections show");
+                let density = app.density();
+                let offsets = line_offsets(&lines, density);
+                let (rows, content_width) = list_rows(&laid);
+                // The list is short enough to be built whole.
+                assert_eq!(rows.len(), lines.len(), "{what}: every line is built");
+                let mut y = rows[0].0.y;
+                for (i, ((rect, node), line)) in rows.iter().zip(&lines).enumerate() {
+                    let at = format!("{what}, line {i}");
+                    assert!(
+                        (rect.height - line_height(line, density)).abs() < 0.5,
+                        "{at}: {} high",
+                        rect.height
+                    );
+                    assert!(
+                        (rect.y - (rows[0].0.y + offsets[i])).abs() < 0.5
+                            && (rect.y - y).abs() < 0.5,
+                        "{at}: lines follow one another with no gap or overlap"
+                    );
+                    y = rect.y + rect.height;
+                    if matches!(line, Line::Header(_)) {
+                        let header = if density == twicecat_app::ui::tokens::Density::Comfortable {
+                            HEADER_HEIGHT
+                        } else {
+                            COMPACT_HEADER_HEIGHT
+                        };
+                        assert!((rect.height - header).abs() < 0.5, "{at}");
+                    }
+                    assert!(
+                        rect.x + rect.width
+                            <= rect.x - node.bounds().x + content_width - SCROLLBAR_GUTTER + 0.5,
+                        "{at}: reaches into the scrollbar's gutter"
+                    );
+                    let mut leaves = Vec::new();
+                    painted_leaves(
+                        node,
+                        iced::Point::new(rect.x - node.bounds().x, rect.y - node.bounds().y),
+                        &mut leaves,
+                    );
+                    for leaf in &leaves {
+                        assert!(
+                            leaf.x >= rect.x - 0.5
+                                && leaf.y >= rect.y - 0.5
+                                && leaf.x + leaf.width <= rect.x + rect.width + 0.5
+                                && leaf.y + leaf.height <= rect.y + rect.height + 0.5,
+                            "{at}: {leaf:?} sticks out of {rect:?}"
+                        );
+                    }
+                    for (a, first) in leaves.iter().enumerate() {
+                        for second in &leaves[a + 1..] {
+                            assert!(
+                                !overlap(first, second),
+                                "{at}: {first:?} overlaps {second:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_big_sectioned_space_builds_only_the_lines_in_view() {
+    use twicecat_core::api::{RoomId, RoomSummary};
+    let renderer = renderer();
+    let scenario = fixture::scenarios()
+        .into_iter()
+        .find(|s| s.name == "space-sections")
+        .expect("the scenario");
+    let mut app = (scenario.build)();
+    app.rooms = (0..10_000)
+        .map(|i| {
+            RoomSummary::new(
+                RoomId::from(format!("!big{i}:example.org")),
+                format!("Room {i}"),
+            )
+        })
+        .collect();
+    app.list_viewport_h = 700.0;
+    for density in DENSITIES {
+        let mut settings = variants(false)[0].settings();
+        settings.density = density.0;
+        app.set_ui_settings(settings);
+        assert!(app.sections_shown());
+        for offset in [0.0, 100_000.0, f32::MAX] {
+            app.list_offset_y = offset;
+            let laid = Laid::new(&app, &renderer, WIDE);
+            let (rows, _) = list_rows(&laid);
+            assert!(
+                (1..100).contains(&rows.len()),
+                "{} at {offset}: {} lines built",
+                density.1,
+                rows.len()
+            );
+        }
+    }
+}
+
 /// Ctrl + wheel is the zoom gesture, and a `pick_list` with a value takes it
 /// as "pick the next option": over the header's notification menu that would
 /// silently mute a room. Sweep the top of the window, wide and narrow.
@@ -1361,6 +1608,69 @@ fn ctrl_wheel_over_the_room_header_never_changes_the_notification_mode() {
         assert_eq!(
             changes, 0,
             "Ctrl + wheel changed a room's notification mode at {width}"
+        );
+    }
+}
+
+/// The same for the options cards of the rail and of a room row: their "Move
+/// to folder" and "Move to section" lists take Ctrl + wheel as "pick the
+/// next one" unless they are behind `kit::menu`, and that would move a space
+/// into a folder, or a room into a section, while the user only zooms.
+#[test]
+fn ctrl_wheel_over_the_options_cards_never_picks_a_folder_or_a_section() {
+    use iced::keyboard::{self, Modifiers};
+    use iced::{Point, mouse::ScrollDelta};
+    let renderer = renderer();
+    for (scenario, width) in [
+        ("rail-menu", 1280.0),
+        ("rail-menu", 720.0),
+        ("section-menu", 1280.0),
+        ("section-menu", 720.0),
+    ] {
+        let size = Size::new(width, 800.0);
+        let mut app = fixture::scenarios()
+            .into_iter()
+            .find(|s| s.name == scenario)
+            .map(|s| (s.build)())
+            .expect("the menu scenario");
+        app.set_ui_settings(variants(false)[0].settings());
+        app.window_width = width;
+        let mut laid = Laid::new(&app, &renderer, size);
+        laid.settle(&renderer, size);
+        let mut messages: Vec<Message> = Vec::new();
+        let mut deliver = |laid: &mut Laid<'_>, event: Event, at: Point| {
+            let mut shell = Shell::new(&mut messages);
+            laid.element.as_widget_mut().update(
+                &mut laid.tree,
+                &event,
+                Layout::new(&laid.node),
+                mouse::Cursor::Available(at),
+                &renderer,
+                &mut clipboard::Null,
+                &mut shell,
+                &Rectangle::with_size(size),
+            );
+        };
+        let ctrl = Event::Keyboard(keyboard::Event::ModifiersChanged(Modifiers::CTRL));
+        deliver(&mut laid, ctrl, Point::new(1.0, 1.0));
+        for y in (0..800).step_by(4) {
+            for x in (0..width as i32).step_by(6) {
+                let at = Point::new(x as f32, y as f32);
+                for dy in [1.0, -1.0] {
+                    let wheel = Event::Mouse(mouse::Event::WheelScrolled {
+                        delta: ScrollDelta::Lines { x: 0.0, y: dy },
+                    });
+                    deliver(&mut laid, wheel, at);
+                }
+            }
+        }
+        let picks = messages
+            .iter()
+            .filter(|m| matches!(m, Message::SidebarMenu(_)))
+            .count();
+        assert_eq!(
+            picks, 0,
+            "Ctrl + wheel acted on the {scenario} card at {width}"
         );
     }
 }
@@ -1433,9 +1743,13 @@ fn ctrl_wheel_over_the_menus_of_the_settings_and_call_screens_changes_nothing() 
         "audio-microphone-gpu-found",
         "audio-levels",
         "audio-mic-test",
+        "audio-ringtone",
+        "audio-ringtone-sounds-off",
         "audio-other-voices",
         "settings",
         "settings-appearance",
+        "settings-appearance-themes",
+        "settings-appearance-pair",
         "settings-notifications",
         "sessions",
         "sessions-confirm-all",
@@ -1535,6 +1849,7 @@ fn dock_lines(dock: &Node) -> &[Node] {
 
 fn with_settings(app: &mut App, density: (DensityChoice, &str), list: RoomListChoice) {
     let mut settings = variants(false)[0].settings();
+    settings.theme_name = app.ui_settings.theme_name;
     settings.density = density.0;
     settings.room_list = list;
     settings.advanced_settings = app.ui_settings.advanced_settings;
@@ -2063,7 +2378,7 @@ fn leave_sends_once_and_is_off_while_a_leave_or_join_waits() {
 
 mod audio {
     use super::*;
-    use twicecat_app::audio_settings::{AudioMessage, AudioPage};
+    use twicecat_app::audio_settings::{AudioMessage, AudioPage, Slider};
     use twicecat_app::screens::audio_settings::NAV_WIDTH;
     use twicecat_core::api::{AudioSettings, CoreEvent, InputMode};
 
@@ -2124,7 +2439,7 @@ mod audio {
         }
     }
 
-    const PAGE_SCENARIOS: [&str; 16] = [
+    const PAGE_SCENARIOS: [&str; 17] = [
         "audio-devices",
         "audio-talking",
         "audio-talking-capturing",
@@ -2137,6 +2452,7 @@ mod audio {
         "audio-levels-loud",
         "audio-mic-test",
         "audio-ringtone",
+        "audio-ringtone-sounds-off",
         "audio-other-voices",
         "audio-announce",
         "audio-diagnostics",
@@ -2369,6 +2685,7 @@ mod audio {
             (AudioPage::Levels, "audio-levels"),
             (AudioPage::MicTest, "audio-mic-test"),
             (AudioPage::Ringtone, "audio-ringtone"),
+            (AudioPage::Ringtone, "audio-ringtone-sounds-off"),
             (AudioPage::OtherVoices, "audio-other-voices"),
             (AudioPage::Announce, "audio-announce"),
             (AudioPage::Diagnostics, "audio-diagnostics"),
@@ -2433,6 +2750,47 @@ mod audio {
             missing.is_empty(),
             "no click sent {missing:?}; saw {seen:?}"
         );
+    }
+
+    #[test]
+    fn the_call_sounds_controls_are_live_only_while_the_master_switch_is_on() {
+        let renderer = renderer();
+        let volume = |m: &AudioMessage| {
+            matches!(
+                m,
+                AudioMessage::Slide(Slider::CallSoundsVolume, _)
+                    | AudioMessage::Step(Slider::CallSoundsVolume, _)
+            )
+        };
+        let on = clicked(&page_app("audio-ringtone"), &renderer);
+        for (what, found) in [
+            ("master", on.contains(&AudioMessage::CallSounds(false))),
+            (
+                "others joining",
+                on.contains(&AudioMessage::OthersJoining(false)),
+            ),
+            ("leaving", on.contains(&AudioMessage::LeavingSound(false))),
+            ("volume", on.iter().any(volume)),
+        ] {
+            assert!(found, "{what} sends nothing with the sounds on: {on:?}");
+        }
+        assert!(
+            on.iter()
+                .filter(|m| matches!(m, AudioMessage::Step(Slider::CallSoundsVolume, _)))
+                .count()
+                >= 1
+        );
+        let off = clicked(&page_app("audio-ringtone-sounds-off"), &renderer);
+        assert!(off.contains(&AudioMessage::CallSounds(true)), "{off:?}");
+        for message in &off {
+            assert!(
+                !matches!(
+                    message,
+                    AudioMessage::OthersJoining(_) | AudioMessage::LeavingSound(_)
+                ) && !volume(message),
+                "a disabled control sends {message:?}"
+            );
+        }
     }
 
     #[test]
@@ -2997,7 +3355,7 @@ mod settings_pages {
     use super::*;
 
     /// Every page at the simple level, then at the advanced one.
-    const PAGE_SCENARIOS: [(&str, SettingsPage); 15] = [
+    const PAGE_SCENARIOS: [(&str, SettingsPage); 24] = [
         ("settings", SettingsPage::Profile),
         ("settings-appearance", SettingsPage::Appearance),
         ("settings-notifications", SettingsPage::Notifications),
@@ -3016,6 +3374,21 @@ mod settings_pages {
         ("settings-video-advanced", SettingsPage::Video),
         ("settings-video-advanced-call", SettingsPage::Video),
         ("settings-notifications-long", SettingsPage::Notifications),
+        ("settings-appearance-themes", SettingsPage::Appearance),
+        ("settings-appearance-pair", SettingsPage::Appearance),
+        ("settings-appearance-pair-dark", SettingsPage::Appearance),
+        ("settings-appearance-fallback", SettingsPage::Appearance),
+        ("settings-appearance-loading", SettingsPage::Appearance),
+        ("settings-appearance-sidebar", SettingsPage::Appearance),
+        ("settings-appearance-sidebar-ask", SettingsPage::Appearance),
+        (
+            "settings-appearance-sidebar-newer",
+            SettingsPage::Appearance,
+        ),
+        (
+            "settings-appearance-sidebar-other",
+            SettingsPage::Appearance,
+        ),
     ];
 
     /// A scenario with the switch on.
@@ -3033,6 +3406,7 @@ mod settings_pages {
     fn page_app(name: &str) -> App {
         let mut app = scenario_app(name);
         let mut settings = variants(false)[0].settings();
+        settings.theme_name = app.ui_settings.theme_name;
         settings.advanced_settings = is_advanced(name);
         app.set_ui_settings(settings);
         app.window_width = WIDE.width;
@@ -3123,73 +3497,91 @@ mod settings_pages {
         assert!(tall >= 2, "only {tall} tall pages: the check did not run");
     }
 
-    #[test]
-    fn the_four_colour_sets_fit_the_page_without_spilling() {
-        // The swatches are two by two: all four are on screen, none past the
-        // page, in the narrowest card.
-        let renderer = renderer();
-        let mut app = page_app("settings-appearance");
-        app.window_width = NARROW.width;
-        let mut laid = Laid::new(&app, &renderer, NARROW);
-        let shown = texts(&mut laid, &renderer);
-        for label in ["Twicecat", "Frost", "Ember", "High contrast"] {
-            assert!(
-                shown.iter().any(|(t, _)| t.starts_with(label)),
-                "no swatch named {label}"
-            );
-        }
-    }
-
-    fn swatch_names(app: &App) -> Vec<String> {
+    /// What the Appearance page says, at the narrowest card.
+    fn appearance_texts(app: &App) -> Vec<String> {
         let renderer = renderer();
         let mut laid = Laid::new(app, &renderer, NARROW);
         texts(&mut laid, &renderer)
             .into_iter()
             .map(|(t, _)| t)
-            .filter(|t| {
-                ["Twicecat", "Frost", "Ember", "High contrast"]
-                    .iter()
-                    .any(|l| t.starts_with(l))
-            })
             .collect()
     }
 
     #[test]
-    fn the_swatch_marked_default_is_frost() {
-        let mut app = page_app("settings-appearance");
-        app.window_width = NARROW.width;
-        let mut settings = app.ui_settings;
-        settings.palette = None;
-        app.set_ui_settings(settings);
-        let names = swatch_names(&app);
-        assert!(names.contains(&"Frost (default)".to_owned()), "{names:?}");
-        assert_eq!(
-            names.iter().filter(|n| n.contains("(default)")).count(),
-            1,
-            "{names:?}"
-        );
+    fn the_appearance_page_names_the_theme_and_has_no_swatches_or_mode_radios() {
+        for choice in [ThemeChoice::System, ThemeChoice::Light, ThemeChoice::Dark] {
+            let mut app = page_app("settings-appearance");
+            app.window_width = NARROW.width;
+            let mut settings = app.ui_settings;
+            settings.theme = choice;
+            app.set_ui_settings(settings);
+            let shown = appearance_texts(&app);
+            assert!(shown.contains(&"Theme".to_owned()), "{shown:?}");
+            assert_eq!(
+                app.selected_theme_option().to_string(),
+                "Twicecat (default)"
+            );
+            assert!(
+                !shown.iter().any(|t| t.to_lowercase().contains("dark")),
+                "{choice:?}: the page says something about dark: {shown:?}"
+            );
+            assert!(
+                !shown.iter().any(|t| t.starts_with("This theme")),
+                "{choice:?}: a note for a single-look theme: {shown:?}"
+            );
+            for gone in [
+                "Frost",
+                "Ember",
+                "High contrast",
+                "Colours",
+                "Use the default",
+                "Follow the system",
+                "Light",
+                "Dark",
+            ] {
+                assert!(
+                    !shown.iter().any(|t| t.starts_with(gone)),
+                    "{choice:?}: {gone:?} is still on the page: {shown:?}"
+                );
+            }
+            // The radios are not drawn, so nothing sends a Theme message.
+            let renderer = renderer();
+            for message in clicked(&app, &renderer) {
+                assert_ne!(message.name(), "Theme", "{choice:?}");
+            }
+        }
     }
 
     #[test]
-    fn a_settings_file_with_an_explicit_twicecat_palette_still_shows_twicecat() {
-        let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("ui17-explicit-palette");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let paths = twicecat_core::paths::DataPaths::at(&dir);
-        std::fs::write(paths.settings_file(), r#"{"palette":"Twicecat"}"#).expect("write");
-        let read = paths.read_settings();
-        let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(read.palette, Some(PaletteChoice::Twicecat));
-        let mut app = page_app("settings-appearance");
-        app.window_width = NARROW.width;
-        app.set_ui_settings(read);
-        assert_eq!(
-            twicecat_app::theme::resolve_family(read.palette),
-            twicecat_app::theme::Family::Twicecat
-        );
-        let names = swatch_names(&app);
-        assert!(names.contains(&"Twicecat".to_owned()), "{names:?}");
-        assert!(names.contains(&"Frost (default)".to_owned()), "{names:?}");
+    fn a_settings_file_with_an_older_palette_shows_twicecat() {
+        for palette in ["Twicecat", "Frost", "Ember", "HighContrast", "Bogus"] {
+            let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+                .join(format!("thm1-old-palette-{palette}"));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            let paths = twicecat_core::paths::DataPaths::at(&dir);
+            std::fs::write(
+                paths.settings_file(),
+                format!(r#"{{"palette":"{palette}","theme":"Light"}}"#),
+            )
+            .expect("write");
+            let read = paths.read_settings();
+            let _ = std::fs::remove_dir_all(&dir);
+            let mut app = page_app("settings-appearance");
+            app.window_width = NARROW.width;
+            app.set_ui_settings(read);
+            let theme = app.current_theme();
+            assert_eq!(theme.to_string(), "Twicecat", "{palette}");
+            assert_eq!(
+                theme.palette(),
+                twicecat_app::theme::built_in().palette(),
+                "{palette}"
+            );
+            assert_eq!(
+                app.selected_theme_option().to_string(),
+                "Twicecat (default)"
+            );
+        }
     }
 
     #[test]
@@ -3293,6 +3685,80 @@ mod settings_pages {
         shown.iter().any(|t| t.starts_with(wanted))
     }
 
+    /// The light/dark choices a click on the page's radios sends. A radio
+    /// hides its label from the text walk, so the radios are found by their
+    /// clicks.
+    fn radio_choices(name: &str) -> Vec<ThemeChoice> {
+        let renderer = renderer();
+        let mut found: Vec<ThemeChoice> = clicked(&page_app(name), &renderer)
+            .into_iter()
+            .filter_map(|m| match m {
+                SettingsMessage::Theme(choice) => Some(choice),
+                _ => None,
+            })
+            .collect();
+        found.dedup();
+        found
+    }
+
+    /// The three light/dark radios are there for a paired theme and nowhere
+    /// else.
+    #[test]
+    fn the_radios_are_shown_for_the_pair_only() {
+        for name in ["settings-appearance-pair", "settings-appearance-pair-dark"] {
+            let found = radio_choices(name);
+            for want in [ThemeChoice::System, ThemeChoice::Light, ThemeChoice::Dark] {
+                assert!(found.contains(&want), "{name} lacks {want:?}: {found:?}");
+            }
+        }
+        for name in [
+            "settings-appearance",
+            "settings-appearance-themes",
+            "settings-appearance-fallback",
+            "settings-appearance-loading",
+        ] {
+            assert!(radio_choices(name).is_empty(), "{name} shows radios");
+        }
+        // Faint has one look, dark: no radios either.
+        let renderer = renderer();
+        let mut faint = page_app("settings-appearance-themes");
+        let mut settings = faint.ui_settings;
+        settings.theme_name = ThemeName::try_from("Faint").ok();
+        faint.set_ui_settings(settings);
+        assert!(!faint.selected_is_paired());
+        let sent = clicked(&faint, &renderer);
+        assert!(!sent.iter().any(|m| m.name() == "Theme"));
+    }
+
+    #[test]
+    fn the_pair_is_drawn_light_and_dark_by_the_system_mode() {
+        let light = page_app("settings-appearance-pair");
+        let dark = page_app("settings-appearance-pair-dark");
+        assert_ne!(
+            light.current_theme().palette().background,
+            dark.current_theme().palette().background
+        );
+        assert_eq!(light.ui_settings.theme, ThemeChoice::System);
+    }
+
+    #[test]
+    fn the_page_says_when_the_folder_is_being_read() {
+        assert!(has(
+            &card_texts("settings-appearance-loading"),
+            "Reading the themes folder"
+        ));
+        assert!(!has(
+            &card_texts("settings-appearance-themes"),
+            "Reading the themes folder"
+        ));
+        let fallback = card_texts("settings-appearance-fallback");
+        assert!(
+            has(&fallback, "Theme \"Mixed\" could not be used"),
+            "{fallback:?}"
+        );
+        assert!(has(&card_texts("settings-appearance-themes"), "Mixed: "));
+    }
+
     /// What only the advanced level shows, page by page: nothing of it is on
     /// the simple page, all of it is on the advanced one.
     #[test]
@@ -3339,7 +3805,7 @@ mod settings_pages {
         }
         // The simple pages keep what a person needs.
         let appearance = card_texts("settings-appearance");
-        for wanted in ["Colours", "Text size"] {
+        for wanted in ["Theme", "Reload themes", "Open themes folder", "Text size"] {
             assert!(has(&appearance, wanted), "Appearance lacks {wanted:?}");
         }
         let notifications = card_texts("settings-notifications");
@@ -3456,7 +3922,7 @@ mod settings_pages {
             "word".to_owned().into(),
         )));
         apps.push((SettingsPage::Notifications, "typed".to_owned(), typed));
-        // Appearance with a non-default colour set and a larger text: every
+        // Appearance with a larger text: every
         // button of the row is on.
         let mut zoomed = page_app("settings-appearance");
         let _ = zoomed.update(Message::Settings(SettingsMessage::Zoom(
@@ -3472,9 +3938,12 @@ mod settings_pages {
             }
         }
         // Menus open an overlay this harness does not drive; typing makes
-        // the text messages.
+        // the text messages. "Theme" is the System/Light/Dark radio, which
+        // is drawn only for a theme that comes as a light and a dark file.
         let unreachable_by_click = [
             "DefaultMode",
+            "ThemePicked",
+            "Theme",
             "Density",
             "RoomList",
             "NameInput",
@@ -3507,6 +3976,74 @@ mod settings_pages {
         }
         let wanted: BTreeSet<String> = SettingsPage::ALL.iter().map(|p| format!("{p:?}")).collect();
         assert_eq!(pages, wanted);
+    }
+
+    /// The Reset sidebar layout button, its question and its notes.
+    #[test]
+    fn reset_sidebar_layout_is_on_only_for_a_layout_that_can_be_reset() {
+        use twicecat_app::screens::settings::{
+            SIDEBAR_NEWER_NOTE, SIDEBAR_OTHER_ACCOUNT_NOTE, SIDEBAR_RESET_QUESTION,
+        };
+        let renderer = renderer();
+        let sent = |name: &str| -> Vec<String> {
+            senders(&page_app(name), &renderer, WIDE)
+                .into_iter()
+                .map(|(_, t)| t)
+                .filter(|t| t.contains("ResetSidebar"))
+                .collect()
+        };
+        // Not loaded yet (the fixture's default), a newer file and another
+        // account's file: the button is drawn and off.
+        for off in [
+            "settings-appearance",
+            "settings-appearance-sidebar-newer",
+            "settings-appearance-sidebar-other",
+        ] {
+            assert!(sent(off).is_empty(), "{off}: {:?}", sent(off));
+            assert!(
+                has(&card_texts(off), "Reset sidebar layout"),
+                "{off}: the button is drawn"
+            );
+        }
+        assert_eq!(
+            sent("settings-appearance-sidebar"),
+            ["Settings(ResetSidebarAsk)"]
+        );
+        // The question: Cancel and the reset, and the asking button is gone.
+        let mut ask = sent("settings-appearance-sidebar-ask");
+        ask.sort();
+        assert_eq!(
+            ask,
+            [
+                "Settings(ResetSidebarCancel)",
+                "Settings(ResetSidebarConfirm)"
+            ]
+        );
+        // The notes, and nowhere else.
+        let note = |name: &str, wanted: &str| has(&card_texts(name), &wanted[..40]);
+        assert!(note(
+            "settings-appearance-sidebar-newer",
+            SIDEBAR_NEWER_NOTE
+        ));
+        assert!(note(
+            "settings-appearance-sidebar-other",
+            SIDEBAR_OTHER_ACCOUNT_NOTE
+        ));
+        assert!(note(
+            "settings-appearance-sidebar-ask",
+            SIDEBAR_RESET_QUESTION
+        ));
+        assert!(!note("settings-appearance-sidebar", SIDEBAR_NEWER_NOTE));
+        assert!(!note(
+            "settings-appearance-sidebar",
+            SIDEBAR_OTHER_ACCOUNT_NOTE
+        ));
+        assert!(!note("settings-appearance-sidebar", SIDEBAR_RESET_QUESTION));
+        // The page says where the layout is kept.
+        assert!(has(
+            &card_texts("settings-appearance-sidebar"),
+            "The sidebar layout (folders, sections, starred rooms) is kept on this device only"
+        ));
     }
 
     /// Sessions has the one button that opens its screen, apart from the
@@ -4194,7 +4731,7 @@ mod dialogs {
     }
 
     /// `(scenario, card width, what the close button in the header sends)`.
-    const CARDS: [(&str, f32, &str); 8] = [
+    const CARDS: [(&str, f32, &str); 11] = [
         ("create-room", 460.0, "Rooms(CloseDialog)"),
         ("join-room", 460.0, "Rooms(CloseDialog)"),
         ("start-dm", 460.0, "Rooms(CloseDialog)"),
@@ -4203,6 +4740,9 @@ mod dialogs {
         ("members", 520.0, "Rooms(CloseMembers)"),
         ("upload", 520.0, "UploadCancelled"),
         ("upload-single", 520.0, "UploadCancelled"),
+        ("rail-menu", 380.0, "SidebarMenu(Close)"),
+        ("rail-folder-name", 380.0, "SidebarMenu(Close)"),
+        ("section-menu", 380.0, "SidebarMenu(Close)"),
     ];
 
     #[test]
@@ -4246,6 +4786,9 @@ mod dialogs {
             "upload-single",
             "upload-long",
             "upload-wrong-room",
+            "rail-menu",
+            "rail-folder-name",
+            "section-menu",
         ];
         for name in names {
             for size in [WIDE, NARROW, SHORT] {
@@ -4254,6 +4797,7 @@ mod dialogs {
                 let width = match name {
                     n if n.starts_with("room-") || n.starts_with("members") => 520.0,
                     n if n.starts_with("upload") => 520.0,
+                    n if n.starts_with("rail-") || n.starts_with("section-") => 380.0,
                     _ => 460.0,
                 };
                 let card = card_rect(&laid, width);
@@ -4293,6 +4837,7 @@ mod dialogs {
             ("upload-single", 520.0, "UploadConfirmed"),
             ("upload-long", 520.0, "UploadConfirmed"),
             ("user-card", 460.0, "Rooms(CardMessage)"),
+            ("rail-folder-name", 380.0, "SidebarMenu(NameSubmit)"),
         ] {
             let app = dialog_app(name, SHORT);
             let laid = Laid::new(&app, &renderer, SHORT);
@@ -4392,7 +4937,7 @@ mod dialogs {
     #[test]
     fn the_buttons_that_confirm_a_question_are_drawn_red_and_the_others_are_not() {
         let renderer = renderer();
-        for variant in variants(false).iter().step_by(5) {
+        for variant in variants(false).iter() {
             for (asking, _, confirm, cancel, _) in QUESTIONS {
                 let mut app = scenario_app(asking);
                 apply(&mut app, *variant);
@@ -4493,6 +5038,9 @@ mod dialogs {
             "upload-single",
             "viewer",
             "switcher",
+            "rail-menu",
+            "rail-folder-name",
+            "section-menu",
         ] {
             let app = dialog_app(name, WIDE);
             let mut laid = Laid::new(&app, &renderer, WIDE);
@@ -5469,7 +6017,7 @@ mod security_screens {
     #[test]
     fn the_red_buttons_are_red_and_cancel_is_not() {
         let renderer = renderer();
-        for variant in variants(false).iter().step_by(5) {
+        for variant in variants(false).iter() {
             for (asking, _, confirm, cancel, _) in QUESTIONS {
                 let mut app = scenario_app(asking);
                 apply(&mut app, *variant);
@@ -6408,6 +6956,162 @@ mod video_stage {
         assert!(
             sent.iter().all(|m| !matches!(m, Message::SelectRoom(_))),
             "{sent:?}"
+        );
+    }
+}
+
+/// A real pointer drag through the widgets, as the window does it: events go
+/// to a view that is rebuilt after every message, the window listener's
+/// messages are fed back while the app asks for it.
+mod real_drag {
+    use super::*;
+    use twicecat_app::spaces::SpacesMessage;
+
+    fn pointer_message(event: Event) -> Option<Message> {
+        Some(Message::Spaces(match event {
+            Event::Mouse(mouse::Event::CursorMoved { position }) => {
+                SpacesMessage::PointerMoved(position)
+            }
+            Event::Mouse(mouse::Event::ButtonReleased(_)) => SpacesMessage::PointerReleased,
+            _ => return None,
+        }))
+    }
+
+    fn feed(app: &mut App, renderer: &Renderer, tree: &mut Tree, event: Event, at: iced::Point) {
+        let mut messages: Vec<Message> = Vec::new();
+        {
+            let mut element = app.view();
+            tree.diff(element.as_widget());
+            let node =
+                element
+                    .as_widget_mut()
+                    .layout(tree, renderer, &Limits::new(Size::ZERO, WIDE));
+            let mut shell = Shell::new(&mut messages);
+            element.as_widget_mut().update(
+                tree,
+                &event,
+                Layout::new(&node),
+                mouse::Cursor::Available(at),
+                renderer,
+                &mut clipboard::Null,
+                &mut shell,
+                &Rectangle::with_size(WIDE),
+            );
+        }
+        for message in messages {
+            let _ = app.update(message);
+        }
+    }
+
+    fn find(app: &App, renderer: &Renderer, tree: &mut Tree, word: &str) -> Rectangle {
+        let mut element = app.view();
+        tree.diff(element.as_widget());
+        let node = element
+            .as_widget_mut()
+            .layout(tree, renderer, &Limits::new(Size::ZERO, WIDE));
+        let mut op = Texts(Vec::new());
+        element
+            .as_widget_mut()
+            .operate(tree, Layout::new(&node), renderer, &mut op);
+        op.0.into_iter()
+            .find(|(t, _)| t.contains(word))
+            .unwrap_or_else(|| panic!("no text {word}"))
+            .1
+    }
+
+    #[test]
+    fn a_room_dragged_onto_a_section_header_moves() {
+        let renderer = renderer();
+        let mut app = scenario_app("space-sections-custom");
+        let mut tree = Tree::empty();
+        let before = app.section_lines().map(|l| l.len());
+        let from = find(&app, &renderer, &mut tree, "General").center();
+        let to = find(&app, &renderer, &mut tree, "Reading list").center();
+        let steps = [
+            from,
+            iced::Point::new(from.x, from.y + 6.0),
+            iced::Point::new(from.x, from.y + 12.0),
+            to,
+            iced::Point::new(to.x + 1.0, to.y),
+            iced::Point::new(to.x + 2.0, to.y),
+        ];
+        feed(
+            &mut app,
+            &renderer,
+            &mut tree,
+            Event::Mouse(mouse::Event::CursorMoved { position: from }),
+            from,
+        );
+        let press = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+        feed(&mut app, &renderer, &mut tree, press.clone(), from);
+        let mut seen = vec![];
+        for at in steps {
+            let ev = Event::Mouse(mouse::Event::CursorMoved { position: at });
+            if app.list_drag.is_active()
+                && let Some(m) = pointer_message(ev.clone())
+            {
+                let _ = app.update(m);
+            }
+            feed(&mut app, &renderer, &mut tree, ev, at);
+            seen.push(format!("{:?}", app.list_drag));
+        }
+        let up = Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left));
+        let to = iced::Point::new(to.x + 2.0, to.y);
+        feed(&mut app, &renderer, &mut tree, up.clone(), to);
+        if let Some(m) = pointer_message(up) {
+            let _ = app.update(m);
+        }
+        assert!(!app.list_drag.is_active(), "{seen:?}");
+        assert_ne!(app.section_lines().map(|l| l.len()), before, "{seen:?}");
+    }
+
+    #[test]
+    fn a_space_dragged_onto_another_in_the_rail() {
+        let renderer = renderer();
+        let mut app = scenario_app("rail-states");
+        let mut tree = Tree::empty();
+        let before = app.sidebar.layout().map(|l| l.rail.len());
+        let from = find(&app, &renderer, &mut tree, "Q").center();
+        let to = find(&app, &renderer, &mut tree, "B").center();
+        let steps = [
+            from,
+            iced::Point::new(from.x, from.y + 6.0),
+            iced::Point::new(from.x, from.y + 12.0),
+            to,
+            iced::Point::new(to.x + 1.0, to.y),
+            iced::Point::new(to.x + 2.0, to.y),
+        ];
+        feed(
+            &mut app,
+            &renderer,
+            &mut tree,
+            Event::Mouse(mouse::Event::CursorMoved { position: from }),
+            from,
+        );
+        let press = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+        feed(&mut app, &renderer, &mut tree, press.clone(), from);
+        let mut seen = vec![];
+        for at in steps {
+            let ev = Event::Mouse(mouse::Event::CursorMoved { position: at });
+            if app.rail_drag.is_active()
+                && let Some(m) = pointer_message(ev.clone())
+            {
+                let _ = app.update(m);
+            }
+            feed(&mut app, &renderer, &mut tree, ev, at);
+            seen.push(format!("{:?}", app.rail_drag));
+        }
+        let up = Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left));
+        let to = iced::Point::new(to.x + 2.0, to.y);
+        feed(&mut app, &renderer, &mut tree, up.clone(), to);
+        if let Some(m) = pointer_message(up) {
+            let _ = app.update(m);
+        }
+        assert!(!app.rail_drag.is_active(), "{seen:?}");
+        assert_ne!(
+            app.sidebar.layout().map(|l| l.rail.len()),
+            before,
+            "{seen:?}"
         );
     }
 }

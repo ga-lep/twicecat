@@ -17,7 +17,7 @@ use twicecat_core::api::{
     SoundSource, UserId,
 };
 
-pub(crate) use self::parse::{CallCmd, CleanArg, GateArg, parse};
+pub(crate) use self::parse::{CallCmd, CleanArg, GateArg, SoundsArg, parse};
 use self::show::{person, room_label};
 use super::{resolve_room, sanitize};
 
@@ -212,6 +212,15 @@ impl Calls {
             }),
             CallCmd::Ringtone(on) => self.edit(|s| s.ringtone = on.unwrap_or(!s.ringtone)),
             CallCmd::Silence => Reply::send(Command::SilenceRinging, "Ringtone silenced."),
+            CallCmd::Sounds(arg) => self.edit(|s| {
+                let sounds = &mut s.call_sounds;
+                match arg {
+                    SoundsArg::Switch(on) => sounds.enabled = on.unwrap_or(!sounds.enabled),
+                    SoundsArg::Others(on) => sounds.others_joining = on,
+                    SoundsArg::Leave(on) => sounds.leaving = on,
+                    SoundsArg::Volume(percent) => sounds.volume_percent = percent,
+                }
+            }),
             CallCmd::Gate(arg) => self.edit(|s| {
                 s.input_mode = match (arg, s.input_mode) {
                     (GateArg::Auto, InputMode::VoiceActivity { threshold_db, .. }) => {
@@ -400,14 +409,19 @@ impl Calls {
             CoreEvent::ActiveCall {
                 room_id,
                 participants,
+                members,
             } => {
+                let line = format!(
+                    "active-call participants={participants} members={}",
+                    members.len()
+                );
                 if participants == 0 {
                     self.counts.remove(room_id.as_str());
                 } else {
                     self.counts
                         .insert(room_id.as_str().to_owned(), participants);
                 }
-                Vec::new()
+                vec![line]
             }
             CoreEvent::IncomingCall {
                 room_id,
@@ -864,7 +878,19 @@ mod tests {
             toggle: false,
         };
         type Check = fn(&AudioSettings) -> bool;
-        let cases: [(CallCmd, Check); 16] = [
+        let cases: [(CallCmd, Check); 20] = [
+            (CallCmd::Sounds(SoundsArg::Switch(None)), |s| {
+                !s.call_sounds.enabled
+            }),
+            (CallCmd::Sounds(SoundsArg::Others(false)), |s| {
+                !s.call_sounds.others_joining
+            }),
+            (CallCmd::Sounds(SoundsArg::Leave(false)), |s| {
+                !s.call_sounds.leaving
+            }),
+            (CallCmd::Sounds(SoundsArg::Volume(40)), |s| {
+                s.call_sounds.volume_percent == 40
+            }),
             (CallCmd::Ringtone(None), |s| !s.ringtone),
             (CallCmd::Ringtone(Some(true)), |s| s.ringtone),
             (CallCmd::Ns(NoiseSuppression::Off), |s| {

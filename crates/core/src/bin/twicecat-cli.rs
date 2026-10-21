@@ -76,6 +76,10 @@ CALLS (voice, MatrixRTC; joining opens the microphone and speakers):
     /decline [n|id]       Decline the ring (the last one by default)
     /silence              Stop the ringtone (the call still rings)
     /ringtone [on|off]    Play a ringtone for direct calls
+    /sounds [on|off|others on|off|leave on|off|<0-100>]
+                          Call sounds: a chime when you join or leave a call
+                          and a blip when others join; volume in percent
+                          (0-100)
     /who                  List the call's participants
     /mute [on|off]        Mute the microphone (toggles without an argument)
     /deafen [on|off]      Hear nothing and mute the microphone
@@ -327,6 +331,12 @@ fn phase5_line(event: &CoreEvent) -> Option<String> {
             notifications,
             highlights,
         } => format!("[unread] {notifications} notifications, {highlights} highlights"),
+        CoreEvent::SpaceUnread { spaces, outside } => format!(
+            "[space-unread] spaces={} outside=(n={},h={})",
+            spaces.len(),
+            outside.notifications,
+            outside.highlights
+        ),
         CoreEvent::RoomCreated { .. } => "[rooms] created".to_owned(),
         CoreEvent::RoomJoined { .. } => "[rooms] joined".to_owned(),
         CoreEvent::RoomDetails(details) => {
@@ -338,7 +348,13 @@ fn phase5_line(event: &CoreEvent) -> Option<String> {
         CoreEvent::OwnProfile(profile) => {
             format!("[profile] avatar: {}", profile.avatar.is_some())
         }
-        CoreEvent::Spaces(spaces) => format!("[spaces] {} spaces", spaces.len()),
+        CoreEvent::Spaces(spaces) => {
+            let counts: Vec<String> = spaces
+                .iter()
+                .map(|s| format!("space level={} rooms={}", s.level, s.rooms.len()))
+                .collect();
+            format!("[spaces] {} spaces: {}", spaces.len(), counts.join(", "))
+        }
         CoreEvent::ThreadDiff { diffs, .. } => format!("[thread] {} changes", diffs.len()),
         CoreEvent::ThreadPagination { state, .. } => format!("[thread] pagination {state:?}"),
         _ => return None,
@@ -892,6 +908,7 @@ impl Cli {
             | CoreEvent::Notification(_)
             | CoreEvent::NotificationSettings(_)
             | CoreEvent::UnreadTotals { .. }
+            | CoreEvent::SpaceUnread { .. }
             | CoreEvent::RoomCreated { .. }
             | CoreEvent::RoomJoined { .. }
             | CoreEvent::RoomDetails(_)
@@ -1437,6 +1454,21 @@ mod tests {
                 notifications: 3,
                 highlights: 1,
             },
+            CoreEvent::SpaceUnread {
+                spaces: vec![twicecat_core::api::SpaceUnreadView {
+                    space: room(),
+                    counts: twicecat_core::api::UnreadCountsView {
+                        notifications: 4,
+                        highlights: 2,
+                        unread: true,
+                    },
+                }],
+                outside: twicecat_core::api::UnreadCountsView {
+                    notifications: 1,
+                    highlights: 0,
+                    unread: true,
+                },
+            },
             CoreEvent::RoomCreated { room_id: room() },
             CoreEvent::RoomJoined { room_id: room() },
             CoreEvent::RoomDetails(twicecat_core::api::RoomDetailsView {
@@ -1463,6 +1495,7 @@ mod tests {
                 avatar: None,
                 level: 0,
                 children: 1,
+                rooms: Vec::new(),
             }]),
             CoreEvent::ThreadDiff {
                 room_id: room(),
@@ -1490,6 +1523,18 @@ mod tests {
             })
             .as_deref(),
             Some("[unread] 3 notifications, 1 highlights")
+        );
+        let line = phase5_line(&CoreEvent::SpaceUnread {
+            spaces: Vec::new(),
+            outside: twicecat_core::api::UnreadCountsView {
+                notifications: 1,
+                highlights: 0,
+                unread: true,
+            },
+        });
+        assert_eq!(
+            line.as_deref(),
+            Some("[space-unread] spaces=0 outside=(n=1,h=0)")
         );
         assert!(phase5_line(&CoreEvent::LoggedOut).is_none());
     }

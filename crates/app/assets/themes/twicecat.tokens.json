@@ -1,0 +1,580 @@
+{
+  "$schema": "https://www.designtokens.org/schemas/2025.10/format.json",
+  "$description": "twicecat design tokens — single source of truth. Edit here, then run `python3 design/scripts/gen_tokens.py`.",
+  "color": {
+    "$type": "color",
+    "void": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.0392,
+          0.0314,
+          0.0706
+        ],
+        "hex": "#0a0812"
+      },
+      "$description": "Deepest background: app window, banners, icons, avatar. Ink of mono marks on light backgrounds."
+    },
+    "surface": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.0667,
+          0.0549,
+          0.1098
+        ],
+        "hex": "#110e1c"
+      },
+      "$description": "Main panels (timeline, room list)."
+    },
+    "surface-raised": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.0941,
+          0.0784,
+          0.1569
+        ],
+        "hex": "#181428"
+      },
+      "$description": "Message bubbles, call tiles, secondary buttons, menus. Also the scanline colour on void."
+    },
+    "surface-overlay": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.1294,
+          0.1059,
+          0.2118
+        ],
+        "hex": "#211b36"
+      },
+      "$description": "Row hover, popovers, modals above surface-raised."
+    },
+    "violet-wash": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.1412,
+          0.102,
+          0.2706
+        ],
+        "hex": "#241a45"
+      },
+      "$description": "Selected row (active room), text selection. Never a decorative fill."
+    },
+    "line": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.1804,
+          0.1529,
+          0.2824
+        ],
+        "hex": "#2e2748"
+      },
+      "$description": "Dividers and non-interactive card outlines (decorative, no contrast floor)."
+    },
+    "line-strong": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.4196,
+          0.3804,
+          0.5804
+        ],
+        "hex": "#6b6194"
+      },
+      "$description": "Control outlines (inputs, secondary buttons) and unplayed waveform bars; >= 3:1 on surface and surface-raised."
+    },
+    "ink": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.9373,
+          0.9216,
+          0.9804
+        ],
+        "hex": "#efebfa"
+      },
+      "$description": "Primary text on void, surface, surface-raised, surface-overlay, violet-wash (>= 13.7:1)."
+    },
+    "ink-muted": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.651,
+          0.6235,
+          0.7686
+        ],
+        "hex": "#a69fc4"
+      },
+      "$description": "Secondary text: last-message preview, timestamps, captions. >= 6.4:1 on every surface."
+    },
+    "ink-faint": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.5412,
+          0.5137,
+          0.6588
+        ],
+        "hex": "#8a83a8"
+      },
+      "$description": "Tertiary metadata (read receipts, Matrix IDs). >= 4.5:1 on every surface; never below 12px."
+    },
+    "phosphor": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.9529,
+          0.9333,
+          1.0
+        ],
+        "hex": "#f3eeff"
+      },
+      "$description": "The foreground cat of the logo. Brand only, not UI text."
+    },
+    "violet": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.5569,
+          0.3608,
+          1.0
+        ],
+        "hex": "#8e5cff"
+      },
+      "$description": "The accent: logo echo, primary button, unread badge, playhead, speaking ring. Text on it: on-violet. Never a text colour on surfaces (only 4.4:1 on surface-raised)."
+    },
+    "on-violet": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.0392,
+          0.0314,
+          0.0706
+        ],
+        "hex": "#0a0812"
+      },
+      "$description": "Text and icons on violet (4.85:1)."
+    },
+    "violet-bright": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.7176,
+          0.5804,
+          1.0
+        ],
+        "hex": "#b794ff"
+      },
+      "$description": "Accent as text: links, mentions, the 'cat' of the wordmark, played part of the waveform. >= 6.6:1 on every surface."
+    },
+    "violet-deep": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.2941,
+          0.1373,
+          0.7216
+        ],
+        "hex": "#4b23b8"
+      },
+      "$description": "Echo on light backgrounds, role badge fill. Text on it: ink (9.4:1)."
+    },
+    "focus": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.7882,
+          0.6824,
+          1.0
+        ],
+        "hex": "#c9aeff"
+      },
+      "$description": "Keyboard focus ring: 2px solid, 2px offset. >= 8.3:1 on every surface."
+    },
+    "live": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          1.0,
+          0.4196,
+          0.5255
+        ],
+        "hex": "#ff6b86"
+      },
+      "$description": "Recording, mic muted, error, leave call. Always with a word or icon ('REC', 'muted'). >= 5.8:1 on every surface."
+    },
+    "ok": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.3686,
+          0.8784,
+          0.7843
+        ],
+        "hex": "#5ee0c8"
+      },
+      "$description": "Connected, verified, stable call. Teal (off the red-green axis), always with a word or icon."
+    },
+    "warn": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          1.0,
+          0.7098,
+          0.2784
+        ],
+        "hex": "#ffb547"
+      },
+      "$description": "Unverified device, unstable connection, high latency. Always with a word or icon."
+    }
+  },
+  "space": {
+    "$type": "dimension",
+    "1": {
+      "$value": {
+        "value": 4,
+        "unit": "px"
+      },
+      "$description": "Icon-label gap, waveform bar pitch."
+    },
+    "2": {
+      "$value": {
+        "value": 8,
+        "unit": "px"
+      },
+      "$description": "Vertical button padding, gap between grouped messages."
+    },
+    "3": {
+      "$value": {
+        "value": 12,
+        "unit": "px"
+      },
+      "$description": "Bubble and room-row padding."
+    },
+    "4": {
+      "$value": {
+        "value": 16,
+        "unit": "px"
+      },
+      "$description": "Panel padding, timeline gutter."
+    },
+    "6": {
+      "$value": {
+        "value": 24,
+        "unit": "px"
+      },
+      "$description": "Gap between message groups, call tile margin."
+    },
+    "8": {
+      "$value": {
+        "value": 32,
+        "unit": "px"
+      },
+      "$description": "Section margins, banners."
+    },
+    "12": {
+      "$value": {
+        "value": 48,
+        "unit": "px"
+      },
+      "$description": "Empty states and onboarding."
+    }
+  },
+  "radius": {
+    "$type": "dimension",
+    "xs": {
+      "$value": {
+        "value": 2,
+        "unit": "px"
+      },
+      "$description": "Waveform bars, mono tags, glitch slices."
+    },
+    "sm": {
+      "$value": {
+        "value": 6,
+        "unit": "px"
+      },
+      "$description": "Buttons, inputs, role badges."
+    },
+    "md": {
+      "$value": {
+        "value": 10,
+        "unit": "px"
+      },
+      "$description": "Message bubbles, menus, call tiles."
+    },
+    "lg": {
+      "$value": {
+        "value": 16,
+        "unit": "px"
+      },
+      "$description": "Modals, floating panels."
+    },
+    "pill": {
+      "$value": {
+        "value": 999,
+        "unit": "px"
+      },
+      "$description": "Unread counter, play button, round avatars."
+    }
+  },
+  "font": {
+    "family": {
+      "$type": "fontFamily",
+      "display": {
+        "$value": [
+          "Chakra Petch",
+          "ui-sans-serif",
+          "system-ui",
+          "sans-serif"
+        ],
+        "$description": "Titles, wordmark, banners. Never paragraphs."
+      },
+      "sans": {
+        "$value": [
+          "IBM Plex Sans",
+          "system-ui",
+          "sans-serif"
+        ],
+        "$description": "All UI text."
+      },
+      "mono": {
+        "$value": [
+          "JetBrains Mono",
+          "ui-monospace",
+          "monospace"
+        ],
+        "$description": "Code, durations, timestamps, Matrix IDs, bitrates."
+      }
+    }
+  },
+  "type": {
+    "$type": "typography",
+    "display-xl": {
+      "$value": {
+        "fontFamily": "{font.family.display}",
+        "fontSize": {
+          "value": 56,
+          "unit": "px"
+        },
+        "fontWeight": 700,
+        "lineHeight": 1.0,
+        "letterSpacing": {
+          "value": -0.01,
+          "unit": "em"
+        }
+      },
+      "$description": "Website and banner titles. Never in the app."
+    },
+    "display-l": {
+      "$value": {
+        "fontFamily": "{font.family.display}",
+        "fontSize": {
+          "value": 36,
+          "unit": "px"
+        },
+        "fontWeight": 700,
+        "lineHeight": 1.111,
+        "letterSpacing": {
+          "value": 0,
+          "unit": "px"
+        }
+      },
+      "$description": "Welcome and onboarding titles."
+    },
+    "title": {
+      "$value": {
+        "fontFamily": "{font.family.display}",
+        "fontSize": {
+          "value": 20,
+          "unit": "px"
+        },
+        "fontWeight": 600,
+        "lineHeight": 1.3,
+        "letterSpacing": {
+          "value": 0,
+          "unit": "px"
+        }
+      },
+      "$description": "Room name in the header, panel titles."
+    },
+    "body": {
+      "$value": {
+        "fontFamily": "{font.family.sans}",
+        "fontSize": {
+          "value": 15,
+          "unit": "px"
+        },
+        "fontWeight": 400,
+        "lineHeight": 1.467,
+        "letterSpacing": {
+          "value": 0,
+          "unit": "px"
+        }
+      },
+      "$description": "Message body and UI text."
+    },
+    "body-strong": {
+      "$value": {
+        "fontFamily": "{font.family.sans}",
+        "fontSize": {
+          "value": 15,
+          "unit": "px"
+        },
+        "fontWeight": 600,
+        "lineHeight": 1.467,
+        "letterSpacing": {
+          "value": 0,
+          "unit": "px"
+        }
+      },
+      "$description": "Sender name, room name in the list, button labels."
+    },
+    "small": {
+      "$value": {
+        "fontFamily": "{font.family.sans}",
+        "fontSize": {
+          "value": 13,
+          "unit": "px"
+        },
+        "fontWeight": 400,
+        "lineHeight": 1.385,
+        "letterSpacing": {
+          "value": 0,
+          "unit": "px"
+        }
+      },
+      "$description": "Previews, field help, tile subtitles."
+    },
+    "code": {
+      "$value": {
+        "fontFamily": "{font.family.mono}",
+        "fontSize": {
+          "value": 13,
+          "unit": "px"
+        },
+        "fontWeight": 400,
+        "lineHeight": 1.538,
+        "letterSpacing": {
+          "value": 0,
+          "unit": "px"
+        }
+      },
+      "$description": "Code, preformatted blocks."
+    },
+    "meta": {
+      "$value": {
+        "fontFamily": "{font.family.mono}",
+        "fontSize": {
+          "value": 12,
+          "unit": "px"
+        },
+        "fontWeight": 500,
+        "lineHeight": 1.333,
+        "letterSpacing": {
+          "value": 0.04,
+          "unit": "em"
+        }
+      },
+      "$description": "Durations, timestamps, bitrates, Matrix IDs, counters. Tabular figures."
+    }
+  },
+  "shadow": {
+    "$type": "shadow",
+    "glow-speaking": {
+      "$value": [
+        {
+          "color": {
+            "colorSpace": "srgb",
+            "components": [
+              0.5569,
+              0.3608,
+              1.0
+            ],
+            "hex": "#8e5cff"
+          },
+          "offsetX": {
+            "value": 0,
+            "unit": "px"
+          },
+          "offsetY": {
+            "value": 0,
+            "unit": "px"
+          },
+          "blur": {
+            "value": 0,
+            "unit": "px"
+          },
+          "spread": {
+            "value": 2,
+            "unit": "px"
+          }
+        },
+        {
+          "color": {
+            "colorSpace": "srgb",
+            "components": [
+              0.5569,
+              0.3608,
+              1.0
+            ],
+            "alpha": 0.45,
+            "hex": "#8e5cff"
+          },
+          "offsetX": {
+            "value": 0,
+            "unit": "px"
+          },
+          "offsetY": {
+            "value": 0,
+            "unit": "px"
+          },
+          "blur": {
+            "value": 24,
+            "unit": "px"
+          },
+          "spread": {
+            "value": 0,
+            "unit": "px"
+          }
+        }
+      ],
+      "$description": "Tile or avatar of whoever is speaking; intensity follows the audio level (attack 60ms, release 240ms)."
+    },
+    "overlay": {
+      "$value": {
+        "color": {
+          "colorSpace": "srgb",
+          "components": [
+            0,
+            0,
+            0
+          ],
+          "alpha": 0.55,
+          "hex": "#000000"
+        },
+        "offsetX": {
+          "value": 0,
+          "unit": "px"
+        },
+        "offsetY": {
+          "value": 12,
+          "unit": "px"
+        },
+        "blur": {
+          "value": 32,
+          "unit": "px"
+        },
+        "spread": {
+          "value": 0,
+          "unit": "px"
+        }
+      },
+      "$description": "Menus and modals above the timeline."
+    }
+  }
+}

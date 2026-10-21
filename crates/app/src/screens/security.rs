@@ -308,6 +308,7 @@ fn restore_screen(model: &SecurityModel) -> Parts<'_> {
         words("Type or paste your recovery key, or your recovery passphrase."),
         notice_slot(model),
         text_input("Recovery key or passphrase", model.restore_input.expose())
+            .style(crate::ui::kit::text_input_style)
             .id(RESTORE_INPUT_ID)
             .secure(true)
             .on_input_maybe(
@@ -410,6 +411,7 @@ fn reauth_screen(model: &SecurityModel) -> Parts<'_> {
         words("Your homeserver needs your account password to go on."),
         notice_slot(model),
         text_input("Password", prompt.password.expose())
+            .style(crate::ui::kit::text_input_style)
             .id(REAUTH_INPUT_ID)
             .secure(true)
             .on_input_maybe(
@@ -508,6 +510,7 @@ fn key_screen(model: &SecurityModel) -> Parts<'_> {
         .spacing(tokens::M),
         words(CLIPBOARD_NOTE).size(tokens::CAPTION).style(muted),
         checkbox(setup.saved_ticked)
+            .style(crate::ui::kit::checkbox_style)
             .label("I've saved my recovery key")
             .text_wrapping(kit::BANNER_WRAPPING)
             .on_toggle_maybe(toggle),

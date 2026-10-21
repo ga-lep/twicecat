@@ -6,13 +6,13 @@
 //! follow the theme, and the tests check their contrast in both palettes.
 
 use iced::widget::button::{Button, Status};
-use iced::widget::pick_list;
 use iced::widget::text::{IntoFragment, Wrapping};
 use iced::widget::tooltip::Position;
 use iced::widget::{
     Column, button, column, container, image, opaque, progress_bar, row, rule, scrollable, space,
     text, tooltip,
 };
+use iced::widget::{checkbox, pick_list, text_input};
 use iced::{Background, Border, Color, Element, Fill, Theme, border};
 use twicecat_core::api::{AvatarId, RoomId, UserId};
 
@@ -411,6 +411,106 @@ pub fn menu_style(theme: &Theme, status: pick_list::Status) -> pick_list::Style 
             width: 1.0,
             ..shape()
         },
+    }
+}
+
+// ---- form controls -------------------------------------------------------
+
+/// Width of a control's outline.
+const OUTLINE: f32 = 1.5;
+
+/// A checkbox that reads as on or off in every state.
+///
+/// iced derives its checkbox from the palette: an unchecked box has an outline
+/// of about 1.3:1 and a disabled checked one looks unchecked. Here the
+/// outline is the theme's `border` colour (3:1 or more on the cards); a
+/// checked box is filled with the accent (the dimmer `badge` colour while it
+/// is disabled, never the card's colour) and carries a check mark that reads
+/// on that fill; a disabled box is greyed and its label muted.
+pub fn checkbox_style(theme: &Theme, status: checkbox::Status) -> checkbox::Style {
+    let palette = theme.palette();
+    let sem = theme::semantic(theme);
+    // A hovered fill moves away from the background, so that it keeps its
+    // distance from the card on a light theme as well as on a dark one.
+    let away = if theme.extended_palette().is_dark {
+        Color::WHITE
+    } else {
+        Color::BLACK
+    };
+    let (checked, hovered, disabled) = match status {
+        checkbox::Status::Active { is_checked } => (is_checked, false, false),
+        checkbox::Status::Hovered { is_checked } => (is_checked, true, false),
+        checkbox::Status::Disabled { is_checked } => (is_checked, false, true),
+    };
+    let outline = |color| Border {
+        color,
+        width: OUTLINE,
+        radius: border::radius(tokens::SMALL),
+    };
+    if checked {
+        let fill = if disabled {
+            sem.badge
+        } else if hovered {
+            mix(sem.highlight, away, 0.2)
+        } else {
+            sem.highlight
+        };
+        checkbox::Style {
+            background: Background::Color(fill),
+            icon_color: if disabled {
+                sem.badge_text
+            } else {
+                sem.highlight_text
+            },
+            // A disabled box keeps the outline colour, so that it differs from
+            // an enabled one even in a theme whose two accents are one colour.
+            border: outline(if disabled { sem.border } else { fill }),
+            text_color: disabled.then_some(sem.muted),
+        }
+    } else {
+        checkbox::Style {
+            background: Background::Color(if disabled {
+                mix(sem.surface_raised, sem.border, 0.35)
+            } else if hovered {
+                sem.message_hover
+            } else {
+                Color::TRANSPARENT
+            }),
+            icon_color: palette.text,
+            border: outline(if hovered { palette.primary } else { sem.border }),
+            text_color: disabled.then_some(sem.muted),
+        }
+    }
+}
+
+/// A text field with an outline that is seen (the theme's `border` colour,
+/// 3:1 or more on the cards; iced's own is about 1.3:1), the focus colour
+/// around it while it has the keyboard, and a placeholder that reads (the
+/// muted text colour, 4.5:1 or more).
+pub fn text_input_style(theme: &Theme, status: text_input::Status) -> text_input::Style {
+    let palette = theme.palette();
+    let sem = theme::semantic(theme);
+    let (color, width) = match status {
+        text_input::Status::Active | text_input::Status::Disabled => (sem.border, 1.0),
+        text_input::Status::Hovered => (palette.text, 1.0),
+        text_input::Status::Focused { .. } => (sem.focus, 2.0),
+    };
+    let disabled = matches!(status, text_input::Status::Disabled);
+    text_input::Style {
+        background: Background::Color(if disabled {
+            sem.surface
+        } else {
+            palette.background
+        }),
+        border: Border {
+            color,
+            width,
+            radius: border::radius(tokens::SMALL),
+        },
+        icon: sem.muted,
+        placeholder: sem.muted,
+        value: if disabled { sem.muted } else { palette.text },
+        selection: theme.extended_palette().primary.weak.color,
     }
 }
 
@@ -830,6 +930,27 @@ pub fn meter_bar<'a, M: 'a>(fill: f32, zone: Severity) -> Element<'a, M> {
         .into()
 }
 
+/// A bar that stands where a control is switched off, such as a slider whose
+/// switch is off: `fill` from 0 to 1, drawn in the quiet border colour. It
+/// takes no input.
+pub fn disabled_bar<'a, M: 'a>(fill: f32) -> Element<'a, M> {
+    progress_bar(0.0..=1.0, fill.clamp(0.0, 1.0))
+        .girth(tokens::M)
+        .style(|theme: &Theme| {
+            let sem = theme::semantic(theme);
+            progress_bar::Style {
+                background: Background::Color(sem.surface),
+                bar: Background::Color(sem.border),
+                border: Border {
+                    color: sem.border,
+                    width: 1.0,
+                    ..border::rounded(tokens::SMALL)
+                },
+            }
+        })
+        .into()
+}
+
 /// A [`tag`] that starts with an icon, such as the call pill. With
 /// `highlight` it is drawn in the highlight colours.
 pub fn icon_tag<'a, M: 'a>(icon: Icon, label: String, highlight: bool) -> Element<'a, M> {
@@ -1028,10 +1149,19 @@ pub fn speaking_ring<'a, M: 'a>(
     content: impl Into<Element<'a, M>>,
     speaking: bool,
 ) -> Element<'a, M> {
+    speaking_ring_sized(content, PERSON_SLOT, speaking)
+}
+
+/// [`speaking_ring`] around a round picture `size` pixels wide.
+pub fn speaking_ring_sized<'a, M: 'a>(
+    content: impl Into<Element<'a, M>>,
+    size: f32,
+    speaking: bool,
+) -> Element<'a, M> {
     container(content)
         .padding(SPEAKING_RING)
         .style(move |theme: &Theme| container::Style {
-            border: border::rounded(PERSON_SLOT / 2.0 + SPEAKING_RING)
+            border: border::rounded(size / 2.0 + SPEAKING_RING)
                 .width(SPEAKING_RING)
                 .color(if speaking {
                     theme::semantic(theme).speaking
@@ -1070,8 +1200,7 @@ pub fn page_nav<'a, M: Clone + 'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::theme::{contrast, theme_for};
-    use iced::theme::Mode;
+    use crate::theme::contrast;
     use iced::widget::button::Status;
     use iced::{Background, Color, Theme};
 
@@ -1089,11 +1218,12 @@ mod tests {
         Severity::Danger,
     ];
 
-    fn themes() -> [(&'static str, Theme); 2] {
-        [
-            ("light", theme_for(Mode::Light)),
-            ("dark", theme_for(Mode::Dark)),
-        ]
+    /// Twicecat and every fixture theme (`theme::test_themes()`).
+    fn themes() -> Vec<(String, Theme)> {
+        theme::test_themes()
+            .into_iter()
+            .map(|t| (t.to_string(), t))
+            .collect()
     }
 
     /// The colour a style's text sits on: its own background, or the window's.
@@ -1105,35 +1235,26 @@ mod tests {
     }
 
     #[test]
-    fn the_danger_icon_glyph_is_readable_in_all_eight_palettes_and_every_status() {
-        for family in theme::Family::ALL {
-            for dark in [false, true] {
-                let theme = theme::theme_for_family(family, dark);
-                let card = theme::semantic(&theme).surface_raised;
-                for status in STATUSES {
-                    let s = danger_icon_style(&theme, status);
-                    let back = if status == Status::Active {
-                        card
-                    } else {
-                        behind(&s, &theme)
-                    };
-                    let need = match (status, family == theme::Family::HighContrast) {
-                        (Status::Disabled, _) => 3.0,
-                        (_, true) => 7.0,
-                        _ => 4.5,
-                    };
-                    let ratio = contrast(s.text_color, back);
-                    assert!(
-                        ratio >= need,
-                        "{family:?} dark={dark} {status:?}: {ratio} < {need}"
-                    );
-                }
+    fn the_danger_icon_glyph_is_readable_in_every_status() {
+        for (theme_name, theme) in themes() {
+            let _ = &theme_name;
+            let card = theme::semantic(&theme).surface_raised;
+            for status in STATUSES {
+                let s = danger_icon_style(&theme, status);
+                let back = if status == Status::Active {
+                    card
+                } else {
+                    behind(&s, &theme)
+                };
+                let need = if status == Status::Disabled { 3.0 } else { 4.5 };
+                let ratio = contrast(s.text_color, back);
+                assert!(ratio >= need, "{status:?}: {ratio} < {need}");
             }
         }
     }
 
     #[test]
-    fn every_button_style_is_readable_in_both_palettes_and_every_status() {
+    fn every_button_style_is_readable_in_every_status() {
         type StyleFn = fn(&Theme, Status) -> button::Style;
         let styles: [(&str, StyleFn); 6] = [
             ("primary", primary_style),
@@ -1159,64 +1280,52 @@ mod tests {
     }
 
     #[test]
-    fn the_focus_surface_and_the_outline_tag_are_readable_in_all_eight_palettes() {
-        for family in theme::Family::ALL {
-            for dark in [false, true] {
-                let theme = theme::theme_for_family(family, dark);
-                let sem = theme::semantic(&theme);
-                let need = if family == theme::Family::HighContrast {
-                    7.0
-                } else {
-                    4.5
-                };
-                let style = focus_surface_style(&theme);
-                let Some(Background::Color(back)) = style.background else {
-                    panic!("a fill");
-                };
-                let text = style.text_color.expect("a text colour");
-                assert!(
-                    contrast(text, back) >= need,
-                    "{family:?} dark={dark}: text on the focus surface"
-                );
-                // The outline is a non-text mark (WCAG 1.4.11).
-                assert!(
-                    contrast(style.border.color, back) >= 3.0
-                        && contrast(style.border.color, sem.surface_raised) >= 3.0,
-                    "{family:?} dark={dark}: the focus outline"
-                );
-                assert!(
-                    contrast(sem.muted, sem.surface_raised) >= need,
-                    "{family:?} dark={dark}: muted words on the card"
-                );
-            }
+    fn the_focus_surface_and_the_outline_tag_are_readable() {
+        for (theme_name, theme) in themes() {
+            let _ = &theme_name;
+            let sem = theme::semantic(&theme);
+            let style = focus_surface_style(&theme);
+            let Some(Background::Color(back)) = style.background else {
+                panic!("a fill");
+            };
+            let text = style.text_color.expect("a text colour");
+            assert!(contrast(text, back) >= 4.5, "text on the focus surface");
+            // The outline is a non-text mark (WCAG 1.4.11).
+            assert!(
+                contrast(style.border.color, back) >= 3.0
+                    && contrast(style.border.color, sem.surface_raised) >= 3.0,
+                "the focus outline"
+            );
+            assert!(
+                contrast(sem.muted, sem.surface_raised) >= 4.5,
+                "muted words on the card"
+            );
         }
     }
 
     #[test]
-    fn the_meter_zones_are_visible_on_the_card_in_all_eight_palettes() {
-        for family in theme::Family::ALL {
-            for dark in [false, true] {
-                let theme = theme::theme_for_family(family, dark);
-                let sem = theme::semantic(&theme);
-                for zone in [Severity::Success, Severity::Warning, Severity::Danger] {
-                    let style = meter_bar_style(zone)(&theme);
-                    let Background::Color(bar) = style.bar else {
-                        panic!("a colour");
-                    };
-                    let Background::Color(track) = style.background else {
-                        panic!("a colour");
-                    };
-                    // A non-text mark: the bar against its track (WCAG 1.4.11).
-                    assert!(
-                        contrast(bar, track) >= 3.0,
-                        "{family:?} dark={dark} {zone:?}: bar on track {}",
-                        contrast(bar, track)
-                    );
-                    assert!(
-                        contrast(style.border.color, sem.surface_raised) >= 1.2,
-                        "{family:?} dark={dark}: the track has an outline"
-                    );
-                }
+    fn the_meter_zones_are_visible_on_the_card() {
+        for (theme_name, theme) in themes() {
+            let _ = &theme_name;
+            let sem = theme::semantic(&theme);
+            for zone in [Severity::Success, Severity::Warning, Severity::Danger] {
+                let style = meter_bar_style(zone)(&theme);
+                let Background::Color(bar) = style.bar else {
+                    panic!("a colour");
+                };
+                let Background::Color(track) = style.background else {
+                    panic!("a colour");
+                };
+                // A non-text mark: the bar against its track (WCAG 1.4.11).
+                assert!(
+                    contrast(bar, track) >= 3.0,
+                    "{zone:?}: bar on track {}",
+                    contrast(bar, track)
+                );
+                assert!(
+                    contrast(style.border.color, sem.surface_raised) >= 1.2,
+                    "the track has an outline"
+                );
             }
         }
     }
@@ -1239,20 +1348,23 @@ mod tests {
         }
     }
 
+    /// The test themes and 40 random accepted ones (fewer than the registry holds): the form controls read
+    /// the outline and accent colours directly, so they are checked over
+    /// everything `resolve` lets through.
+    fn form_themes() -> Vec<(String, Theme)> {
+        let random = theme::random_accepted_themes(0xf0f0_0001, 40);
+        themes()
+            .into_iter()
+            .chain(random.into_iter().map(|t| (t.to_string(), t)))
+            .collect()
+    }
+
     fn all_themes() -> Vec<(String, Theme)> {
-        let mut out = Vec::new();
-        for family in crate::theme::Family::ALL {
-            for dark in [false, true] {
-                let name = format!("{} {}", family.label(), if dark { "dark" } else { "light" });
-                out.push((name, crate::theme::theme_for_family(family, dark)));
-            }
-        }
-        assert_eq!(out.len(), 8);
-        out
+        themes()
     }
 
     #[test]
-    fn an_icon_tag_is_readable_in_all_eight_palettes_and_highlights_with_the_highlight() {
+    fn an_icon_tag_is_readable_and_highlights_with_the_highlight() {
         for (name, theme) in all_themes() {
             for highlight in [false, true] {
                 let style = icon_tag_style(highlight)(&theme);
@@ -1269,7 +1381,7 @@ mod tests {
     }
 
     #[test]
-    fn a_severity_tag_is_readable_and_in_its_severity_colour_in_all_eight_palettes() {
+    fn a_severity_tag_is_readable_and_in_its_severity_colour() {
         for (name, theme) in all_themes() {
             for severity in SEVERITIES {
                 let style = severity_tag_style(severity)(&theme);
@@ -1302,18 +1414,16 @@ mod tests {
     }
 
     #[test]
-    fn the_severity_colours_differ_so_trust_states_do_not_look_alike() {
+    fn the_severity_colours_are_far_apart_so_trust_states_do_not_look_alike() {
         for (name, theme) in all_themes() {
-            let styles: Vec<_> = [Severity::Success, Severity::Info, Severity::Danger]
+            let colours: Vec<_> = SEVERITIES
                 .into_iter()
-                .map(|s| {
-                    let st = severity_tag_style(s)(&theme);
-                    (st.text_color, st.border.color)
-                })
+                .map(|s| (s, severity_tag_style(s)(&theme).border.color))
                 .collect();
-            for (i, a) in styles.iter().enumerate() {
-                for b in &styles[i + 1..] {
-                    assert_ne!(a, b, "{name}");
+            for (i, (a, ac)) in colours.iter().enumerate() {
+                for (b, bc) in &colours[i + 1..] {
+                    let d = theme::delta_e76(*ac, *bc);
+                    assert!(d >= 20.0, "{name}: {a:?} and {b:?} only dE {d} apart");
                 }
             }
         }
@@ -1464,5 +1574,271 @@ mod tests {
             assert_eq!(quote_bar_style(&theme).color, theme.palette().primary);
         }
         assert_eq!(QUOTE_BAR_WIDTH, 3.0);
+    }
+
+    /// What a control's box looks like on `card`: its fill if opaque, else
+    /// the card showing through.
+    fn shown(background: Background, card: Color) -> Color {
+        match background {
+            Background::Color(c) if c.a >= 1.0 => c,
+            _ => card,
+        }
+    }
+
+    fn cards(theme: &Theme) -> [(&'static str, Color); 3] {
+        let sem = theme::semantic(theme);
+        [
+            ("background", theme.palette().background),
+            ("surface", sem.surface),
+            ("surface-raised", sem.surface_raised),
+        ]
+    }
+
+    #[test]
+    fn a_checkbox_shows_whether_it_is_checked_in_every_status() {
+        for (theme_name, theme) in form_themes() {
+            let _ = &theme_name;
+            for (card_name, card) in cards(&theme) {
+                for checked in [false, true] {
+                    for status in [
+                        checkbox::Status::Active {
+                            is_checked: checked,
+                        },
+                        checkbox::Status::Hovered {
+                            is_checked: checked,
+                        },
+                        checkbox::Status::Disabled {
+                            is_checked: checked,
+                        },
+                    ] {
+                        let style = checkbox_style(&theme, status);
+                        let what = format!("{card_name} {status:?}");
+                        // Its outline is seen (WCAG 1.4.11).
+                        assert!(
+                            contrast(style.border.color, card) >= 3.0,
+                            "{what}: border {:.2}",
+                            contrast(style.border.color, card)
+                        );
+                        if checked {
+                            // A filled box that stands out from the card, with a
+                            // glyph that stands out from the fill.
+                            let fill = shown(style.background, card);
+                            assert!(
+                                contrast(fill, card) >= 3.0,
+                                "{what}: fill {:.2}",
+                                contrast(fill, card)
+                            );
+                            assert!(
+                                contrast(style.icon_color, fill) >= 3.0,
+                                "{what}: check mark {:.2}",
+                                contrast(style.icon_color, fill)
+                            );
+                            // Not the look of the same status unchecked.
+                            let off = checkbox_style(
+                                &theme,
+                                match status {
+                                    checkbox::Status::Active { .. } => {
+                                        checkbox::Status::Active { is_checked: false }
+                                    }
+                                    checkbox::Status::Hovered { .. } => {
+                                        checkbox::Status::Hovered { is_checked: false }
+                                    }
+                                    checkbox::Status::Disabled { .. } => {
+                                        checkbox::Status::Disabled { is_checked: false }
+                                    }
+                                },
+                            );
+                            let unchecked = shown(off.background, card);
+                            assert!(
+                                contrast(fill, unchecked) >= 3.0,
+                                "{what}: checked vs unchecked {:.2}",
+                                contrast(fill, unchecked)
+                            );
+                        }
+                    }
+                }
+                // A disabled box does not look like an enabled one.
+                for checked in [false, true] {
+                    let on = checkbox_style(
+                        &theme,
+                        checkbox::Status::Active {
+                            is_checked: checked,
+                        },
+                    );
+                    let off = checkbox_style(
+                        &theme,
+                        checkbox::Status::Disabled {
+                            is_checked: checked,
+                        },
+                    );
+                    assert!(
+                        on.background != off.background || on.border.color != off.border.color,
+                        "{card_name}: disabled looks enabled (checked: {checked})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_text_field_has_a_visible_outline_and_a_focus_ring_in_every_status() {
+        for (theme_name, theme) in form_themes() {
+            let _ = &theme_name;
+            let sem = theme::semantic(&theme);
+            let statuses = [
+                text_input::Status::Active,
+                text_input::Status::Hovered,
+                text_input::Status::Focused { is_hovered: false },
+                text_input::Status::Focused { is_hovered: true },
+                text_input::Status::Disabled,
+            ];
+            for (card_name, card) in cards(&theme) {
+                for status in statuses {
+                    let style = text_input_style(&theme, status);
+                    let what = format!("{card_name} {status:?}");
+                    assert!(
+                        contrast(style.border.color, card) >= 3.0,
+                        "{what}: border {:.2}",
+                        contrast(style.border.color, card)
+                    );
+                    let Background::Color(fill) = style.background else {
+                        panic!("{what}: no fill");
+                    };
+                    assert!(contrast(style.value, fill) >= 4.5, "{what}: value");
+                    assert!(
+                        contrast(style.placeholder, fill) >= 4.5,
+                        "{what}: placeholder {:.2}",
+                        contrast(style.placeholder, fill)
+                    );
+                }
+            }
+            for status in [
+                text_input::Status::Focused { is_hovered: false },
+                text_input::Status::Focused { is_hovered: true },
+            ] {
+                assert_eq!(text_input_style(&theme, status).border.color, sem.focus);
+            }
+            let idle = text_input_style(&theme, text_input::Status::Active);
+            assert_eq!(idle.border.color, sem.border);
+            assert_ne!(
+                idle.border.color,
+                text_input_style(&theme, text_input::Status::Focused { is_hovered: false })
+                    .border
+                    .color
+            );
+        }
+    }
+
+    /// The lines of `code` that build a form control without the kit style.
+    fn unstyled_controls(code: &str) -> Vec<String> {
+        use crate::source_scan::{calls, renamed_imports};
+        let mut bad = Vec::new();
+        for (line, name) in renamed_imports(
+            code,
+            &[
+                "checkbox",
+                "Checkbox",
+                "text_input",
+                "TextInput",
+                "text_editor",
+            ],
+        ) {
+            bad.push(format!("line {line}: {name} renamed with `as`"));
+        }
+        for (name, style) in [
+            ("checkbox", "checkbox_style"),
+            ("Checkbox::new", "checkbox_style"),
+            ("text_input", "text_input_style"),
+            ("TextInput::new", "text_input_style"),
+            ("text_editor", ""),
+        ] {
+            for call in calls(code, name) {
+                // The LAST `.style(..)` of the chain is the one that counts.
+                let styled = call
+                    .methods
+                    .iter()
+                    .rev()
+                    .find(|(method, _)| method == "style")
+                    .is_some_and(|(_, args)| args.contains(style));
+                if !styled {
+                    bad.push(format!("line {}: {name}(..) without {style}", call.line));
+                }
+            }
+        }
+        bad
+    }
+
+    #[test]
+    fn the_control_scan_flags_a_bare_control_and_passes_a_styled_one() {
+        let bare = "let a = checkbox(on)\n    .label(\"x (y)\")\n    .on_toggle(f);\n";
+        assert_eq!(unstyled_controls(bare).len(), 1);
+        let wrong = "let a = text_input(\"p\", v).style(button::primary);\n";
+        assert_eq!(unstyled_controls(wrong).len(), 1);
+        let styled = "let a = checkbox(on).label(\"x\")\n    .style(kit::checkbox_style);\n\
+                      let b = text_input(\"p\", v)\n    .on_input(f)\n    .style(kit::text_input_style);\n\
+                      let c = a_checkbox(on);\n";
+        assert!(
+            unstyled_controls(styled).is_empty(),
+            "{:?}",
+            unstyled_controls(styled)
+        );
+        let editor = "let e = text_editor(c).placeholder(p);\n";
+        assert_eq!(unstyled_controls(editor).len(), 1);
+    }
+
+    #[test]
+    fn the_control_scan_has_no_holes() {
+        // A later `.style(..)` replaces the kit one.
+        let restyled =
+            "let a = checkbox(on)\n    .style(kit::checkbox_style)\n    .style(button::primary);\n";
+        assert_eq!(unstyled_controls(restyled).len(), 1, "later style wins");
+        // The kit style on a nested widget is not the control's own.
+        let nested = "let a = checkbox(on).label(text(\"x\").style(kit::checkbox_style));\n";
+        assert_eq!(unstyled_controls(nested).len(), 1, "nested style");
+        // The kit style last is fine, even after other styles.
+        let ok = "let a = checkbox(on).style(muted).style(kit::checkbox_style);\n";
+        assert!(unstyled_controls(ok).is_empty());
+        // Renamed imports hide the call from the scan: flag the rename.
+        for rename in [
+            "use iced::widget::checkbox as cb;\n",
+            "use iced::widget::{text_input as ti, button};\n",
+            "use iced::widget::text_editor as te;\n",
+        ] {
+            assert_eq!(unstyled_controls(rename).len(), 1, "{rename}");
+        }
+        // A `//` in a string does not hide the control that follows it.
+        let url = "let a = [\"https://x\", checkbox(on)];\n";
+        assert_eq!(unstyled_controls(url).len(), 1, "comment in string");
+        // A raw string with a paren does not end the call early.
+        let raw = "let a = checkbox(on).label(r#\")\"#).style(button::primary);\n";
+        assert_eq!(unstyled_controls(raw).len(), 1, "raw string");
+        // The production cut does not hide what follows an out-of-line
+        // test module.
+        let after = crate::source_scan::production_part(
+            "#[cfg(test)]\nmod helpers;\nfn f() { let a = checkbox(on); }\n",
+        );
+        assert_eq!(unstyled_controls(&after).len(), 1, "code after mod x;");
+    }
+
+    #[test]
+    fn every_checkbox_and_text_field_in_the_app_takes_the_kit_style() {
+        let mut bad = Vec::new();
+        let mut scanned = 0;
+        let mut controls = 0;
+        for (path, text) in crate::source_scan::sources() {
+            let code = crate::source_scan::production_part(&text);
+            scanned += 1;
+            controls += ["checkbox", "text_input"]
+                .iter()
+                .map(|n| crate::source_scan::calls(&code, n).len())
+                .sum::<usize>();
+            for what in unstyled_controls(&code) {
+                bad.push(format!("{}: {what}", path.display()));
+            }
+        }
+        // The scan did look at the screens.
+        assert!(scanned >= 40, "only {scanned} files scanned");
+        assert!(controls >= 25, "only {controls} controls found");
+        assert!(bad.is_empty(), "controls without the kit style: {bad:#?}");
     }
 }

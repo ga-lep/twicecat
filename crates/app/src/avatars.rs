@@ -149,9 +149,17 @@ pub fn decode_avatar(bytes: &[u8]) -> Option<Handle> {
     limits.max_image_height = Some(MAX_AVATAR_SIDE);
     limits.max_alloc = Some(MAX_DECODE_ALLOC);
     reader.limits(limits);
-    let rgba = reader.decode().ok()?.into_rgba8();
+    let mut rgba = reader.decode().ok()?.into_rgba8();
+    // A centered square, so the round clip of the picture covers the circle
+    // and not only the smaller rectangle a wide or tall picture would fill.
     let (width, height) = rgba.dimensions();
-    Some(Handle::from_rgba(width, height, rgba.into_raw()))
+    let side = width.min(height);
+    if width != height {
+        rgba =
+            image::imageops::crop_imm(&rgba, (width - side) / 2, (height - side) / 2, side, side)
+                .to_image();
+    }
+    Some(Handle::from_rgba(side, side, rgba.into_raw()))
 }
 
 /// Up to two uppercase initials for the placeholder, from the first two words
@@ -257,7 +265,8 @@ mod tests {
     #[test]
     fn a_tiny_valid_png_decodes() {
         let handle = decode_avatar(&encode(2, 3, ImageFormat::Png)).expect("valid png");
-        assert_eq!(dims(&handle), (2, 3));
+        // Cropped to a centered square (the shorter side).
+        assert_eq!(dims(&handle), (2, 2));
     }
 
     #[test]
