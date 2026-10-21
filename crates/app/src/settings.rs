@@ -80,6 +80,8 @@ pub enum SettingsError {
     SaveFailed,
     /// The themes folder could not be created or opened.
     ThemesFolderFailed,
+    /// The saved sidebar layout could not be removed from this device.
+    SidebarResetFailed,
 }
 
 impl SettingsError {
@@ -97,6 +99,9 @@ impl SettingsError {
             Self::NotificationFailed => "The notification setting could not be changed.",
             Self::SaveFailed => "The settings could not be saved on this device.",
             Self::ThemesFolderFailed => "The themes folder could not be opened.",
+            Self::SidebarResetFailed => {
+                "The saved sidebar layout could not be removed from this device."
+            }
         }
     }
 }
@@ -259,6 +264,8 @@ pub struct SettingsModel {
     pub pending_dm: Option<PendingMode>,
     /// The line shown under the sections.
     pub error: Option<SettingsError>,
+    /// **Reset sidebar layout...** was pressed and its question is showing.
+    pub reset_sidebar_ask: bool,
 }
 
 impl Default for SettingsModel {
@@ -275,6 +282,7 @@ impl Default for SettingsModel {
             pending_group: None,
             pending_dm: None,
             error: None,
+            reset_sidebar_ask: false,
         }
     }
 }
@@ -290,6 +298,7 @@ impl fmt::Debug for SettingsModel {
             .field("avatar_busy", &self.avatar_busy)
             .field("profile_pending", &self.profile_pending)
             .field("error", &self.error)
+            .field("reset_sidebar_ask", &self.reset_sidebar_ask)
             .finish_non_exhaustive()
     }
 }
@@ -552,6 +561,9 @@ impl SettingsPage {
                 "Density",
                 "RoomList",
                 "Zoom",
+                "ResetSidebarAsk",
+                "ResetSidebarCancel",
+                "ResetSidebarConfirm",
             ],
             Self::Notifications => &[
                 "DefaultMode",
@@ -636,6 +648,15 @@ pub enum SettingsMessage {
     Zoom(Zoom),
     /// The settings file was written (`true`) or not.
     Saved(bool),
+    /// **Reset sidebar layout...** on the Appearance page: shows the question.
+    ResetSidebarAsk,
+    /// **Cancel** in the question.
+    ResetSidebarCancel,
+    /// **Reset** in the question.
+    ResetSidebarConfirm,
+    /// What the reset did to the account's sidebar file (an answer for
+    /// another account is ignored).
+    SidebarReset(crate::sidebar_store::ResetAnswer),
 }
 
 impl SettingsMessage {
@@ -672,12 +693,16 @@ impl SettingsMessage {
             Self::RoomList(_) => "RoomList",
             Self::Zoom(_) => "Zoom",
             Self::Saved(_) => "Saved",
+            Self::ResetSidebarAsk => "ResetSidebarAsk",
+            Self::ResetSidebarCancel => "ResetSidebarCancel",
+            Self::ResetSidebarConfirm => "ResetSidebarConfirm",
+            Self::SidebarReset(_) => "SidebarReset",
         }
     }
 
     /// The names of every message (kept by hand beside [`Self::name`]; a test
     /// checks that each belongs to a page, the card or [`Self::NOT_FROM_A_CONTROL`]).
-    pub const ALL_NAMES: [&'static str; 29] = [
+    pub const ALL_NAMES: [&'static str; 33] = [
         "Open",
         "Close",
         "Page",
@@ -707,6 +732,10 @@ impl SettingsMessage {
         "RoomList",
         "Zoom",
         "Saved",
+        "ResetSidebarAsk",
+        "ResetSidebarCancel",
+        "ResetSidebarConfirm",
+        "SidebarReset",
     ];
 
     /// The messages of the card itself, on every page: its Close button, its
@@ -715,13 +744,14 @@ impl SettingsMessage {
 
     /// Messages that no control of a page sends: the account area and
     /// Ctrl+, open the card, a dialog and a task answer, a write ends.
-    pub const NOT_FROM_A_CONTROL: [&'static str; 6] = [
+    pub const NOT_FROM_A_CONTROL: [&'static str; 7] = [
         "Open",
         "AvatarPicked",
         "AvatarReady",
         "ThemesLoaded",
         "ThemesFolderOpened",
         "Saved",
+        "SidebarReset",
     ];
 }
 
@@ -736,6 +766,16 @@ impl App {
             || self.media.viewer.is_some()
             || self.rooms_ui.overlay_open()
             || self.security.visible() != crate::security::Visible::Nothing
+    }
+
+    /// Whether the sidebar layout can be reset now: it is loaded. A file made
+    /// by a newer Twicecat or for another account is never touched, so its
+    /// Reset is off.
+    pub fn sidebar_reset_allowed(&self) -> bool {
+        matches!(
+            self.sidebar.state(),
+            crate::sidebar::SidebarState::Loaded | crate::sidebar::SidebarState::Full
+        )
     }
 
     /// Whether the Settings screen covers the window.
@@ -866,6 +906,30 @@ impl App {
                 self.ui_settings.theme_name = name;
                 self.save_local()
             }
+            M::ResetSidebarAsk => {
+                if self.settings_ui.open && self.sidebar_reset_allowed() {
+                    self.settings_ui.reset_sidebar_ask = true;
+                    self.settings_ui.error = None;
+                }
+                Task::none()
+            }
+            M::ResetSidebarCancel => {
+                self.settings_ui.reset_sidebar_ask = false;
+                Task::none()
+            }
+            M::ResetSidebarConfirm => self.reset_sidebar(),
+            M::SidebarReset(answer) => {
+                use crate::sidebar_store::ResetOutcome;
+                // A late answer of a session that is over says nothing about
+                // this one. An overtaken reset failed at nothing: the file
+                // correctly holds the newer layout.
+                if self.user_id.as_ref() == Some(&answer.account)
+                    && answer.outcome == ResetOutcome::Failed
+                {
+                    self.settings_ui.error = Some(SettingsError::SidebarResetFailed);
+                }
+                Task::none()
+            }
             M::ReloadThemes => self.reload_themes(),
             M::ThemesLoaded(loaded) => {
                 self.themes_loading = false;
@@ -967,12 +1031,43 @@ impl App {
     /// The page on screen changed (or Settings closed): the pages that hold
     /// live controls start or stop being live.
     pub(crate) fn after_settings_page(&mut self) -> Task<Message> {
+        // A question left on a page is gone with the page.
+        self.settings_ui.reset_sidebar_ask = false;
         let ui = &self.settings_ui;
         let (open, page) = (ui.open, ui.page);
         Task::batch([
             self.audio_inline(open && page == SettingsPage::VoiceAudio),
             self.video_inline(open && page == SettingsPage::Video),
         ])
+    }
+
+    /// **Reset** in the question: the logged-in account's layout goes back to
+    /// the default and its file is removed. Only the question can confirm,
+    /// and nothing happens for a layout that is not loaded or a protected
+    /// file. The rail and the sections redraw from the default layout.
+    fn reset_sidebar(&mut self) -> Task<Message> {
+        if !std::mem::take(&mut self.settings_ui.reset_sidebar_ask) {
+            return Task::none();
+        }
+        match self.sidebar.reset(&*self.sidebar_store) {
+            Ok(done) => {
+                self.settings_ui.error = None;
+                let account = self.user_id.clone();
+                // Folders and sections are gone: forget what was worked out
+                // from them (hover, drags, a card about one of them).
+                self.sidebar_menu = None;
+                self.clear_stale_rail_keys();
+                match account {
+                    Some(account) => done.map(move |outcome| {
+                        Message::Settings(SettingsMessage::SidebarReset(
+                            crate::sidebar_store::ResetAnswer::new(account.clone(), outcome),
+                        ))
+                    }),
+                    None => Task::none(),
+                }
+            }
+            Err(_) => Task::none(),
+        }
     }
 
     fn save_display_name(&mut self) -> Task<Message> {

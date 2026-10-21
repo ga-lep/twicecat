@@ -23,7 +23,7 @@ use twicecat_core::api::{
 };
 
 use crate::avatars::{AvatarState, Avatars, NEUTRAL_INITIALS, initials, placeholder_color};
-use crate::calls::{CallPill, member_name};
+use crate::calls::CallPill;
 use crate::dates::{day_label, time_label};
 use crate::drag::Zone;
 use crate::list_drop::{self, ListKey};
@@ -810,7 +810,7 @@ pub fn more_label(hidden: usize) -> String {
 /// click opens the voice room. Speaking and muted are known only for the call
 /// this device is in, so the other rooms' people carry neither mark.
 fn person_line<'a>(app: &App, person: &Person<'a>, density: Density) -> Element<'a, Message> {
-    let name = member_name(person.member);
+    let name = person.name.clone();
     let picture = kit::speaking_ring_sized(
         kit::avatar_sized(
             &person.member.user_id,

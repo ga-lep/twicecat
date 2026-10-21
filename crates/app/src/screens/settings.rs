@@ -368,6 +368,8 @@ fn appearance_page(app: &App) -> Element<'_, Message> {
     parts.push(note(
         "Ctrl+= and Ctrl+- change the text size, Ctrl+0 resets it.",
     ));
+    parts.push(kit::divider());
+    parts.extend(sidebar_reset(app));
     if app.ui_settings.advanced_settings {
         parts.push(kit::divider());
         parts.push(
@@ -394,6 +396,63 @@ fn appearance_page(app: &App) -> Element<'_, Message> {
         );
     }
     page_of("Appearance", parts)
+}
+
+/// What Reset sidebar layout says on the Appearance page when the layout
+/// cannot be reset: the stored file is left as it is.
+pub const SIDEBAR_NEWER_NOTE: &str = "The saved sidebar layout was made by a newer Twicecat, so \
+     it is left as it is and cannot be reset here.";
+/// The same for a file that belongs to another account.
+pub const SIDEBAR_OTHER_ACCOUNT_NOTE: &str = "The saved sidebar layout belongs to another \
+     account, so it is left as it is and cannot be reset here.";
+/// The question before a reset.
+pub const SIDEBAR_RESET_QUESTION: &str = "Reset the sidebar layout? The folders, sections and \
+     starred rooms you arranged on this device are removed, and the rail and the room lists \
+     go back to the default.";
+
+/// Reset sidebar layout: the button, or its question, with a note when the
+/// layout cannot be reset. Reset is off for a file made by a newer Twicecat
+/// or for another account (they are never changed), and until the layout is
+/// loaded.
+fn sidebar_reset(app: &App) -> Vec<Element<'_, Message>> {
+    use crate::sidebar::SidebarState;
+    let mut parts = vec![note(
+        "The sidebar layout (folders, sections, starred rooms) is kept on this device only.",
+    )];
+    if app.settings_ui.reset_sidebar_ask && app.sidebar_reset_allowed() {
+        // The question, then Cancel at the left and the reset far from it at
+        // the right, on a row below the words: the button that asked was
+        // somewhere else, so a second click on it cannot confirm.
+        parts.push(banner(Severity::Warning, SIDEBAR_RESET_QUESTION));
+        parts.push(
+            row![
+                secondary_button("Cancel", Some(msg(SettingsMessage::ResetSidebarCancel))),
+                space().width(Fill),
+                kit::danger_button(
+                    "Reset sidebar layout",
+                    Some(msg(SettingsMessage::ResetSidebarConfirm)),
+                ),
+            ]
+            .spacing(tokens::M)
+            .align_y(iced::Center)
+            .into(),
+        );
+        return parts;
+    }
+    parts.push(
+        row![secondary_button(
+            "Reset sidebar layout\u{2026}",
+            app.sidebar_reset_allowed()
+                .then(|| msg(SettingsMessage::ResetSidebarAsk)),
+        ),]
+        .into(),
+    );
+    match app.sidebar.state() {
+        SidebarState::Newer => parts.push(note(SIDEBAR_NEWER_NOTE)),
+        SidebarState::OtherAccount => parts.push(note(SIDEBAR_OTHER_ACCOUNT_NOTE)),
+        SidebarState::NotLoaded | SidebarState::Loaded | SidebarState::Full => {}
+    }
+    parts
 }
 
 fn voice_audio_page(app: &App) -> Element<'_, Message> {

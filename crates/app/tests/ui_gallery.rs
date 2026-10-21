@@ -353,6 +353,10 @@ fn the_fixture_reaches_every_screen_it_names() {
         "settings-appearance-pair-dark",
         "settings-appearance-fallback",
         "settings-appearance-loading",
+        "settings-appearance-sidebar",
+        "settings-appearance-sidebar-ask",
+        "settings-appearance-sidebar-newer",
+        "settings-appearance-sidebar-other",
         "settings-notifications",
         "settings-voice-audio",
         "settings-video",
@@ -3351,7 +3355,7 @@ mod settings_pages {
     use super::*;
 
     /// Every page at the simple level, then at the advanced one.
-    const PAGE_SCENARIOS: [(&str, SettingsPage); 20] = [
+    const PAGE_SCENARIOS: [(&str, SettingsPage); 24] = [
         ("settings", SettingsPage::Profile),
         ("settings-appearance", SettingsPage::Appearance),
         ("settings-notifications", SettingsPage::Notifications),
@@ -3375,6 +3379,16 @@ mod settings_pages {
         ("settings-appearance-pair-dark", SettingsPage::Appearance),
         ("settings-appearance-fallback", SettingsPage::Appearance),
         ("settings-appearance-loading", SettingsPage::Appearance),
+        ("settings-appearance-sidebar", SettingsPage::Appearance),
+        ("settings-appearance-sidebar-ask", SettingsPage::Appearance),
+        (
+            "settings-appearance-sidebar-newer",
+            SettingsPage::Appearance,
+        ),
+        (
+            "settings-appearance-sidebar-other",
+            SettingsPage::Appearance,
+        ),
     ];
 
     /// A scenario with the switch on.
@@ -3962,6 +3976,74 @@ mod settings_pages {
         }
         let wanted: BTreeSet<String> = SettingsPage::ALL.iter().map(|p| format!("{p:?}")).collect();
         assert_eq!(pages, wanted);
+    }
+
+    /// The Reset sidebar layout button, its question and its notes.
+    #[test]
+    fn reset_sidebar_layout_is_on_only_for_a_layout_that_can_be_reset() {
+        use twicecat_app::screens::settings::{
+            SIDEBAR_NEWER_NOTE, SIDEBAR_OTHER_ACCOUNT_NOTE, SIDEBAR_RESET_QUESTION,
+        };
+        let renderer = renderer();
+        let sent = |name: &str| -> Vec<String> {
+            senders(&page_app(name), &renderer, WIDE)
+                .into_iter()
+                .map(|(_, t)| t)
+                .filter(|t| t.contains("ResetSidebar"))
+                .collect()
+        };
+        // Not loaded yet (the fixture's default), a newer file and another
+        // account's file: the button is drawn and off.
+        for off in [
+            "settings-appearance",
+            "settings-appearance-sidebar-newer",
+            "settings-appearance-sidebar-other",
+        ] {
+            assert!(sent(off).is_empty(), "{off}: {:?}", sent(off));
+            assert!(
+                has(&card_texts(off), "Reset sidebar layout"),
+                "{off}: the button is drawn"
+            );
+        }
+        assert_eq!(
+            sent("settings-appearance-sidebar"),
+            ["Settings(ResetSidebarAsk)"]
+        );
+        // The question: Cancel and the reset, and the asking button is gone.
+        let mut ask = sent("settings-appearance-sidebar-ask");
+        ask.sort();
+        assert_eq!(
+            ask,
+            [
+                "Settings(ResetSidebarCancel)",
+                "Settings(ResetSidebarConfirm)"
+            ]
+        );
+        // The notes, and nowhere else.
+        let note = |name: &str, wanted: &str| has(&card_texts(name), &wanted[..40]);
+        assert!(note(
+            "settings-appearance-sidebar-newer",
+            SIDEBAR_NEWER_NOTE
+        ));
+        assert!(note(
+            "settings-appearance-sidebar-other",
+            SIDEBAR_OTHER_ACCOUNT_NOTE
+        ));
+        assert!(note(
+            "settings-appearance-sidebar-ask",
+            SIDEBAR_RESET_QUESTION
+        ));
+        assert!(!note("settings-appearance-sidebar", SIDEBAR_NEWER_NOTE));
+        assert!(!note(
+            "settings-appearance-sidebar",
+            SIDEBAR_OTHER_ACCOUNT_NOTE
+        ));
+        assert!(!note("settings-appearance-sidebar", SIDEBAR_RESET_QUESTION));
+        // The page says where the layout is kept.
+        assert!(has(
+            &card_texts("settings-appearance-sidebar"),
+            "The sidebar layout (folders, sections, starred rooms) is kept on this device only"
+        ));
     }
 
     /// Sessions has the one button that opens its screen, apart from the

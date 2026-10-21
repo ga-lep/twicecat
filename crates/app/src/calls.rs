@@ -16,7 +16,7 @@ use twicecat_core::api::{
 };
 
 use crate::state::{App, Message};
-use crate::text_safety::{name_or_placeholder, one_line_capped};
+use crate::text_safety::{NAME_PLACEHOLDER, has_visible_char, one_line_capped};
 use crate::ui::icons::Icon;
 
 /// How many ringing rooms are kept; the oldest goes first.
@@ -446,25 +446,192 @@ impl fmt::Debug for CallModel {
 /// How many characters of a call member's name a line may show.
 pub const MEMBER_NAME_CHARS: usize = 64;
 
-/// The name drawn for a call member: its display name, else the localpart of
-/// its user ID, cleaned to one line and capped. The user ID is the raw
-/// `sender` of a remote server, so it is cleaned like any name; an empty
-/// result is the placeholder.
+/// The localpart of a member's user ID, cleaned, or the placeholder when
+/// nothing of it can be seen. The user ID is the raw `sender` of a remote
+/// server, so it is cleaned like any name.
+fn localpart_name(member: &CallMemberView) -> String {
+    let local = member
+        .user_id
+        .as_str()
+        .trim_start_matches('@')
+        .split(':')
+        .next()
+        .unwrap_or_default();
+    let clean = one_line_capped(local, MEMBER_NAME_CHARS);
+    if has_visible_char(&clean) {
+        clean
+    } else {
+        NAME_PLACEHOLDER.to_owned()
+    }
+}
+
+/// The name drawn for a call member: its display name, cleaned to one line
+/// and capped, else the localpart of its user ID. A display name with no
+/// visible character once cleaned (only bidi controls, fillers or blanks)
+/// counts as none, so it never shows as a row of replacement marks. When
+/// nothing can be seen in either, the placeholder.
+///
+/// Two members of one room can have the same name: use [`member_names`] for
+/// the names of a room's people.
 pub fn member_name(member: &CallMemberView) -> String {
-    let named = member
+    member
         .display_name
         .as_deref()
-        .filter(|name| !name.trim().is_empty());
-    let text = named.unwrap_or_else(|| {
-        member
-            .user_id
-            .as_str()
-            .trim_start_matches('@')
-            .split(':')
-            .next()
-            .unwrap_or_default()
-    });
-    name_or_placeholder(text, MEMBER_NAME_CHARS)
+        .map(|name| one_line_capped(name, MEMBER_NAME_CHARS))
+        .filter(|name| has_visible_char(name))
+        .unwrap_or_else(|| localpart_name(member))
+}
+
+/// The most characters of the tag ("localpart" or full user ID) added to a
+/// repeated name. The name is cut to what is left, never the tag.
+const TAG_CHARS: usize = 40;
+/// The fewest characters of a repeated name that are kept.
+const MIN_NAME_CHARS: usize = 8;
+
+/// `clean` cut to at most `max` characters in the MIDDLE (the start and the
+/// end around an ellipsis), so the server at the end of a user ID survives.
+fn shorten_middle(clean: &str, max: usize) -> String {
+    let count = clean.chars().count();
+    if count <= max {
+        return clean.to_owned();
+    }
+    let keep = max.saturating_sub(1);
+    let end = keep / 2;
+    let start = keep - end;
+    let mut out: String = clean.chars().take(start).collect();
+    out.push(crate::text_safety::ELLIPSIS);
+    out.extend(clean.chars().skip(count - end));
+    out
+}
+
+/// The whole user ID, cleaned and shortened in the middle to at most `max`
+/// characters, or the placeholder when nothing of it can be seen.
+fn full_id_within(member: &CallMemberView, max: usize) -> String {
+    let clean = crate::text_safety::one_line(member.user_id.as_str());
+    if has_visible_char(&clean) {
+        shorten_middle(&clean, max)
+    } else {
+        NAME_PLACEHOLDER.to_owned()
+    }
+}
+
+/// `name (tag)`, the name cut so that the tag (already short) survives.
+fn with_tag(name: &str, tag: &str) -> String {
+    let room = MEMBER_NAME_CHARS
+        .saturating_sub(tag.chars().count() + 3)
+        .max(MIN_NAME_CHARS);
+    let shown = one_line_capped(name, room);
+    format!("{shown} ({tag})")
+}
+
+/// The rows that more than one different user has.
+fn shared_among_users(members: &[CallMemberView], rows: &[String]) -> HashSet<String> {
+    let mut seen: HashMap<&str, &UserId> = HashMap::new();
+    let mut shared = HashSet::new();
+    for (member, row) in members.iter().zip(rows) {
+        let first = *seen.entry(row.as_str()).or_insert(&member.user_id);
+        if first != &member.user_id {
+            shared.insert(row.clone());
+        }
+    }
+    shared
+}
+
+/// The names drawn for the people of one room's call, one per member, in the
+/// same order, so that no two different users have the same row:
+///
+/// 1. A name that different users share also shows the localpart ("Name
+///    (localpart)"), the name cut first so the localpart is always whole.
+/// 2. When those users also share a localpart (two servers), the full user ID
+///    is shown instead.
+/// 3. Finally the rows are compared with each other (a raw display name can
+///    look like a composed row): any still shared by different users falls
+///    back to the full user ID.
+///
+/// The same user listed twice is one person.
+pub fn member_names(members: &[CallMemberView]) -> Vec<String> {
+    let names: Vec<String> = members.iter().map(member_name).collect();
+    let shared_names = shared_among_users(members, &names);
+    let locals: Vec<String> = members.iter().map(localpart_name).collect();
+    // Within the users that share a name, which localparts are shared.
+    let mut by_name_and_local: HashMap<(&str, &str), (&UserId, bool)> = HashMap::new();
+    for ((member, name), local) in members.iter().zip(&names).zip(&locals) {
+        by_name_and_local
+            .entry((name.as_str(), local.as_str()))
+            .and_modify(|(first, shared)| *shared |= *first != &member.user_id)
+            .or_insert((&member.user_id, false));
+    }
+    let first_pass: Vec<String> = members
+        .iter()
+        .zip(&names)
+        .zip(&locals)
+        .map(|((member, name), local)| {
+            if !shared_names.contains(name.as_str()) {
+                return name.clone();
+            }
+            let local_shared = by_name_and_local
+                .get(&(name.as_str(), local.as_str()))
+                .is_some_and(|(_, shared)| *shared);
+            if local_shared {
+                with_tag(name, &full_id_within(member, TAG_CHARS))
+            } else if local == name {
+                name.clone()
+            } else {
+                with_tag(name, &one_line_capped(local, TAG_CHARS))
+            }
+        })
+        .collect();
+    let mut rows = first_pass;
+    // Rows that different users share, raw names included, fall back to the
+    // full user ID. A fallback can itself equal another row (a raw name made
+    // to look like it), so this repeats until nothing changes.
+    for _ in 0..4 {
+        let shared = shared_among_users(members, &rows);
+        let mut changed = false;
+        for (member, row) in members.iter().zip(rows.iter_mut()) {
+            if shared.contains(row.as_str()) {
+                let id = full_id_within(member, MEMBER_NAME_CHARS);
+                if *row != id {
+                    *row = id;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    make_distinct(members, &mut rows);
+    rows
+}
+
+/// The guarantee: after this no two different users share a row. The first
+/// user keeps a row; a later one with the same row gets " #2", " #3", ...
+/// (the row cut to leave room), the first number whose row nobody has.
+fn make_distinct(members: &[CallMemberView], rows: &mut [String]) {
+    let mut owner: HashMap<String, UserId> = HashMap::new();
+    for (member, row) in members.iter().zip(rows.iter()) {
+        owner
+            .entry(row.clone())
+            .or_insert_with(|| member.user_id.clone());
+    }
+    for (member, row) in members.iter().zip(rows.iter_mut()) {
+        if owner.get(row.as_str()) == Some(&member.user_id) {
+            continue;
+        }
+        let mut k = 2_usize;
+        loop {
+            let suffix = format!(" #{k}");
+            let room = MEMBER_NAME_CHARS.saturating_sub(suffix.chars().count());
+            let candidate = format!("{}{suffix}", one_line_capped(row, room));
+            if !owner.contains_key(&candidate) {
+                owner.insert(candidate.clone(), member.user_id.clone());
+                *row = candidate;
+                break;
+            }
+            k += 1;
+        }
+    }
 }
 
 impl CallModel {
@@ -1860,6 +2027,260 @@ mod tests {
             avatar: None,
         };
         assert!(name(&long).chars().count() <= MEMBER_NAME_CHARS);
+    }
+
+    #[test]
+    fn a_name_of_only_filler_characters_shows_the_localpart() {
+        let name = |m: &CallMemberView| member_name(m);
+        // Not empty, but nothing of it can be seen once cleaned: the cleaned
+        // string would be replacement marks, so the localpart is drawn.
+        for filler in [
+            "\u{202E}",
+            "\u{202E}\u{202D}\u{2066}",
+            "\u{3164}",
+            "\u{3164} \u{FFA0}\u{2800}",
+            "\u{200E}\u{200F}\u{061C}",
+            "\n",
+            "\u{200B}\u{202E}",
+        ] {
+            let shown = name(&call_member("alice", Some(filler)));
+            assert_eq!(shown, "alice", "{filler:?} gave {shown:?}");
+        }
+        // The localpart is cleaned the same way: nothing visible at all is
+        // the placeholder, never a row of replacement marks.
+        let both = CallMemberView {
+            user_id: UserId::from("@\u{202E}\u{202E}:x"),
+            display_name: Some("\u{3164}".to_owned()),
+            avatar: None,
+        };
+        assert_eq!(name(&both), crate::text_safety::NAME_PLACEHOLDER);
+        // A name with something visible keeps it, marks and all.
+        let mixed = name(&call_member("alice", Some("\u{202E}Al")));
+        assert!(mixed.contains("Al"), "{mixed:?}");
+    }
+
+    #[test]
+    fn members_whose_cleaned_names_are_equal_also_show_their_localparts() {
+        let members = vec![
+            call_member("sam1", Some("Sam")),
+            call_member("sam2", Some("Sam")),
+            call_member("alice", Some("Alice")),
+            // Equal after cleaning, though not byte for byte.
+            call_member("sam3", Some("Sa\u{200B}m")),
+            // No name: its localpart; another member's display name equal to
+            // that localpart makes the two alike.
+            call_member("bob", None),
+            call_member("bobby", Some("bob")),
+        ];
+        let shown = member_names(&members);
+        assert_eq!(
+            shown,
+            [
+                "Sam (sam1)",
+                "Sam (sam2)",
+                "Alice",
+                "Sam (sam3)",
+                "bob",
+                "bob (bobby)"
+            ]
+        );
+        // One name per member, each within the cap.
+        assert_eq!(shown.len(), members.len());
+        assert!(shown.iter().all(|n| n.chars().count() <= MEMBER_NAME_CHARS));
+    }
+
+    #[test]
+    fn the_localpart_added_to_a_repeated_name_is_cleaned_and_capped() {
+        let long = "w".repeat(500);
+        let members = vec![
+            CallMemberView {
+                user_id: UserId::from(format!("@{long}:x")),
+                display_name: Some("Sam".to_owned()),
+                avatar: None,
+            },
+            CallMemberView {
+                user_id: UserId::from("@evil\u{202E}gnp:x"),
+                display_name: Some("Sam".to_owned()),
+                avatar: None,
+            },
+            CallMemberView {
+                user_id: UserId::from("@\u{202E}:x"),
+                display_name: Some("Sam".to_owned()),
+                avatar: None,
+            },
+        ];
+        let shown = member_names(&members);
+        assert!(shown.iter().all(|n| n.chars().count() <= MEMBER_NAME_CHARS));
+        assert!(shown.iter().all(|n| !n.contains('\u{202E}')), "{shown:?}");
+        assert!(shown[1].starts_with("Sam (evil"), "{shown:?}");
+        assert_eq!(
+            shown[2],
+            format!("Sam ({})", crate::text_safety::NAME_PLACEHOLDER)
+        );
+    }
+
+    fn member_on(user_id: &str, name: &str) -> CallMemberView {
+        CallMemberView {
+            user_id: UserId::from(user_id),
+            display_name: Some(name.to_owned()),
+            avatar: None,
+        }
+    }
+
+    /// No two different people of one call get the same row.
+    fn all_distinct(members: &[CallMemberView], shown: &[String]) {
+        for i in 0..members.len() {
+            for j in i + 1..members.len() {
+                if members[i].user_id != members[j].user_id {
+                    assert_ne!(shown[i], shown[j], "{i} and {j}: {shown:?}");
+                }
+            }
+        }
+        assert!(shown.iter().all(|n| n.chars().count() <= MEMBER_NAME_CHARS));
+    }
+
+    #[test]
+    fn one_localpart_on_two_servers_is_told_apart_by_the_full_user_id() {
+        let members = vec![
+            member_on("@sam1:evil.org", "Sam"),
+            member_on("@sam1:matrix.org", "Sam"),
+        ];
+        let shown = member_names(&members);
+        all_distinct(&members, &shown);
+        assert!(shown[0].contains("evil.org"), "{shown:?}");
+        assert!(shown[1].contains("matrix.org"), "{shown:?}");
+    }
+
+    #[test]
+    fn a_shared_name_of_the_full_length_keeps_the_whole_suffix() {
+        let name = "N".repeat(MEMBER_NAME_CHARS);
+        let members = vec![
+            member_on("@alice:x", &name),
+            member_on("@alicf:x", &name),
+            member_on("@alicg:x", &name),
+        ];
+        let shown = member_names(&members);
+        all_distinct(&members, &shown);
+        for (member, row) in members.iter().zip(&shown) {
+            let local = member.user_id.as_str().trim_start_matches('@');
+            let local = local.split(':').next().expect("a localpart");
+            assert!(row.ends_with(&format!("({local})")), "{row:?}");
+        }
+    }
+
+    #[test]
+    fn a_raw_name_that_looks_like_a_composed_one_does_not_pass_for_it() {
+        let members = vec![
+            member_on("@sam1:x", "Sam"),
+            member_on("@sam2:x", "Sam"),
+            // Looks exactly like the first row.
+            member_on("@mallory:x", "Sam (sam1)"),
+        ];
+        let shown = member_names(&members);
+        all_distinct(&members, &shown);
+    }
+
+    #[test]
+    fn a_raw_name_equal_to_a_fallback_row_does_not_pass_for_a_real_user() {
+        for set in [
+            vec![
+                member_on("@sam1:x", "Sam"),
+                member_on("@sam2:x", "Sam"),
+                member_on("@mal:x", "Sam (sam1)"),
+                member_on("@mal2:x", "@sam1:x"),
+            ],
+            vec![
+                member_on("@s:x", "Sam"),
+                member_on("@s:y", "Sam"),
+                member_on("@m:x", "Sam (@s:x)"),
+                member_on("@m2:x", "@s:x"),
+            ],
+        ] {
+            let shown = member_names(&set);
+            all_distinct(&set, &shown);
+        }
+    }
+
+    #[test]
+    fn very_long_user_ids_keep_their_server() {
+        let local = "l".repeat(70);
+        let members = vec![
+            member_on(&format!("@{local}:one.org"), "Sam"),
+            member_on(&format!("@{local}:two.org"), "Sam"),
+        ];
+        let shown = member_names(&members);
+        all_distinct(&members, &shown);
+        assert!(shown[0].contains("one.org"), "{shown:?}");
+        assert!(shown[1].contains("two.org"), "{shown:?}");
+        // The same with ids that differ only at the very end.
+        let members = vec![
+            member_on(&format!("@{}a:x", "q".repeat(200)), "Sam"),
+            member_on(&format!("@{}b:x", "q".repeat(200)), "Sam"),
+        ];
+        let shown = member_names(&members);
+        all_distinct(&members, &shown);
+    }
+
+    /// Whatever the names and IDs, no two different people share a row.
+    #[test]
+    fn a_sweep_of_generated_calls_never_makes_two_people_alike() {
+        let names = [
+            "Sam",
+            "Sam (sam1)",
+            "Sam (@s:x)",
+            "@sam1:x",
+            "@s:x",
+            "sam1",
+            "s",
+            "\u{202E}",
+            "",
+            "Sam (s)",
+        ];
+        let long = "l".repeat(70);
+        let locals = ["sam1", "s", "m", "sam2", long.as_str()];
+        let servers = ["x", "y", "one.org"];
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = |n: usize| {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            usize::try_from((seed >> 33) % n as u64).expect("small")
+        };
+        for round in 0..3000 {
+            let count = 2 + next(6);
+            let members: Vec<CallMemberView> = (0..count)
+                .map(|_| {
+                    let id = format!(
+                        "@{}:{}",
+                        locals[next(locals.len())],
+                        servers[next(servers.len())]
+                    );
+                    let name = names[next(names.len())];
+                    if name.is_empty() {
+                        CallMemberView {
+                            user_id: UserId::from(id),
+                            display_name: None,
+                            avatar: None,
+                        }
+                    } else {
+                        member_on(&id, name)
+                    }
+                })
+                .collect();
+            let shown = member_names(&members);
+            assert_eq!(shown.len(), members.len());
+            assert!(shown.iter().all(|n| !n.is_empty()), "round {round}");
+            all_distinct(&members, &shown);
+        }
+    }
+
+    #[test]
+    fn one_user_twice_is_not_two_people_with_one_name() {
+        let members = vec![
+            call_member("sam1", Some("Sam")),
+            call_member("sam1", Some("Sam")),
+        ];
+        assert_eq!(member_names(&members), ["Sam", "Sam"]);
     }
 
     #[test]

@@ -73,10 +73,12 @@ pub const MAX_PEOPLE_SHOWN: usize = 8;
 pub struct Person<'a> {
     /// The voice room.
     pub room: &'a RoomId,
-    /// Who: the core's view (the user ID is a remote server's raw string and
-    /// the name may be missing, so both pass through
-    /// [`crate::calls::member_name`] where they are drawn).
+    /// Who: the core's view.
     pub member: &'a CallMemberView,
+    /// The name to draw: [`crate::calls::member_names`] of the room's people
+    /// (the user ID is a remote server's raw string and the name may be
+    /// missing or shared, so it is worked out once for the whole room).
+    pub name: String,
     /// Speaking now: known only for the call this device is in.
     pub speaking: bool,
     /// Muted: known only for the call this device is in.
@@ -329,11 +331,15 @@ fn push_people<'a>(lines: &mut Vec<Line<'a>>, room: &'a RoomSummary, calls: &'a 
     let Some(members) = calls.members.get(&room.id) else {
         return;
     };
-    for member in members.iter().take(MAX_PEOPLE_SHOWN) {
+    // Over everyone in the call, not only those drawn, so a name does not
+    // change when someone behind "and N more" joins or leaves.
+    let names = crate::calls::member_names(members);
+    for (member, name) in members.iter().zip(names).take(MAX_PEOPLE_SHOWN) {
         let (speaking, muted) = calls.member_marks(&room.id, &member.user_id);
         lines.push(Line::Participant(Person {
             room: &room.id,
             member,
+            name,
             speaking,
             muted,
         }));
@@ -700,7 +706,7 @@ mod tests {
                 Line::EmptyHint(_) => "~hint".to_owned(),
                 Line::Participant(p) => format!(
                     "  - {}{}{}",
-                    crate::calls::member_name(p.member),
+                    p.name,
                     if p.speaking { " *speaking" } else { "" },
                     if p.muted { " !muted" } else { "" }
                 ),
@@ -2631,6 +2637,41 @@ mod tests {
     }
 
     #[test]
+    fn two_people_with_one_name_are_told_apart_by_their_localparts() {
+        let calls = calls_with(
+            "v1",
+            vec![
+                cmember("sam1", Some("Sam")),
+                cmember("sam2", Some("Sam")),
+                cmember("alice", Some("Alice")),
+                cmember("ghost", Some("\u{202E}")),
+            ],
+        );
+        let lines = built_with_calls(&calls, None);
+        let at = lines.iter().position(|l| l == "v1").expect("the room");
+        assert_eq!(
+            &lines[at + 1..at + 5],
+            ["  - Sam (sam1)", "  - Sam (sam2)", "  - Alice", "  - ghost"],
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn people_beyond_the_ninth_still_count_for_telling_names_apart() {
+        // The ninth person is not drawn, but a name shared with a drawn one
+        // is told apart all the same, so the list does not change as people
+        // join or leave behind the "and N more" line.
+        let mut members: Vec<_> = (0..MAX_PEOPLE_SHOWN)
+            .map(|i| cmember(&format!("p{i}"), Some(&format!("Person {i}"))))
+            .collect();
+        members[0] = cmember("first", Some("Twin"));
+        members.push(cmember("second", Some("Twin")));
+        let calls = calls_with("v1", members);
+        let lines = built_with_calls(&calls, None);
+        assert!(lines.contains(&"  - Twin (first)".to_owned()), "{lines:?}");
+    }
+
+    #[test]
     fn a_collapsed_section_hides_the_people_with_its_rooms() {
         let calls = calls_with("v1", vec![cmember("x", Some("Xavier"))]);
         let layout = SpaceLayout {
@@ -2709,6 +2750,7 @@ mod tests {
             Line::Participant(Person {
                 room: &room,
                 member: &secret,
+                name: "Secret Name".to_owned(),
                 speaking: true,
                 muted: false,
             }),

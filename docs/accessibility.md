@@ -4,8 +4,8 @@ What Twicecat does for keyboard use, contrast, zoom and assistive technology
 after the UI/UX rework, and what it does not do yet. Checked against iced
 0.14.0 (pinned). The sections are: the keyboard map, Settings and Sessions,
 Calls, Screen readers, Drag and drop on Wayland, Theme and contrast,
-Zoom, Icons and tooltips, Narrow windows, How calls show state, Room dialogs,
-and the Known limits of iced 0.14.
+Zoom, Icons and tooltips, Narrow windows, How calls show state, The sidebar,
+Room dialogs, and the Known limits of iced 0.14.
 
 ## Keyboard map
 
@@ -488,6 +488,40 @@ State is never colour alone:
   Yes, They match) arm the same way.
 - Call notices (failures) are a red banner with words; their close button is
   separate and clicking the words does nothing.
+
+## The sidebar: spaces, folders and sections
+
+Arranging the sidebar (see [sidebar.md](sidebar.md)) adds **no keyboard
+chord**: `SHORTCUTS` and the keyboard map above are unchanged, and every
+existing shortcut keeps its meaning.
+
+- **The options menus are the alternative to dragging.** Every move a drag can
+  make is also an entry of an options menu: Move up and Move down, Move to
+  folder, Remove from folder, Ungroup, Move to section, Back to its default
+  section, Star and Unstar, Collapse and Expand, Rename and Delete section.
+  The menu opens with a right-click on a space, a folder, a room or a section
+  header, or with the "⋯" button on a header or on the open room's row. It is a
+  centred card, not a menu at the pointer.
+- **Those menus need a pointer.** In iced 0.14 buttons take no keyboard focus
+  (see Known limits below), and no chord opens the card. Keyboard-only users
+  therefore **keep the arrangement but cannot change it**: they get the
+  default sidebar, or the one made earlier with a pointer, and they still
+  reach every drawn room with Ctrl+K and with Alt+Up / Alt+Down and
+  Ctrl+Shift+Up / Ctrl+Shift+Down. They cannot expand a section that was
+  collapsed, though Ctrl+K still opens its rooms. Once a name dialog is open
+  (New folder, New section, Rename), its field, Enter and Esc work from the
+  keyboard.
+- **Rows and headers are pointer-only in the sectioned room list.** A room row
+  and a section header there are a box that answers the pointer, not a button,
+  so opening a room and collapsing or expanding a header need a click. Buttons
+  took no focus in iced 0.14 either, so no keyboard access was lost, only the
+  button's own look states. The flat list (a search, the DMs or Rooms tab,
+  Home, the narrow rail) and the rail keep their buttons. A person listed
+  under a voice room is a click target too.
+- **No auto-scroll while dragging.** A drag does not scroll the rail or the
+  list when the pointer is near an edge, so a target that is out of view
+  cannot be reached by dragging. Use the options menu: it works on any item,
+  in view or not.
 
 ## Known limits of iced 0.14
 

@@ -72,6 +72,44 @@ impl fmt::Debug for SidebarAnswer {
     }
 }
 
+/// What a reset did to an account's file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetOutcome {
+    /// The file was removed (or was not there).
+    Removed,
+    /// The file could not be removed (or the request could not run).
+    Failed,
+    /// A later change of the layout ran first, so the file holds that
+    /// layout: nothing failed, and nothing was removed.
+    Overtaken,
+}
+
+/// The outcome of a reset, with the account it was for (a late answer after
+/// another account logged in is ignored). `Debug` hides the account.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ResetAnswer {
+    /// The account the reset was for.
+    pub account: UserId,
+    /// What happened.
+    pub outcome: ResetOutcome,
+}
+
+impl ResetAnswer {
+    /// The answer `outcome` for `account`.
+    pub fn new(account: UserId, outcome: ResetOutcome) -> Self {
+        Self { account, outcome }
+    }
+}
+
+impl fmt::Debug for ResetAnswer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ResetAnswer")
+            .field("account", &"<redacted>")
+            .field("outcome", &self.outcome)
+            .finish()
+    }
+}
+
 /// Where the sidebar layout is kept, one layout per account.
 pub trait SidebarStore: Send {
     /// The stored layout for `account`.
@@ -81,7 +119,7 @@ pub trait SidebarStore: Send {
     /// file is protected, `Newer` or `OtherAccount`).
     fn save(&self, account: &UserId, layout: SidebarLayout) -> Task<bool>;
     /// Removes `account`'s file (Reset only; never called at logout).
-    fn reset(&self, account: &UserId) -> Task<bool>;
+    fn reset(&self, account: &UserId) -> Task<ResetOutcome>;
 }
 
 /// A store that does nothing; `App::new` installs it so tests never touch the
@@ -98,7 +136,7 @@ impl SidebarStore for NoSidebarStore {
         Task::none()
     }
 
-    fn reset(&self, _account: &UserId) -> Task<bool> {
+    fn reset(&self, _account: &UserId) -> Task<ResetOutcome> {
         Task::none()
     }
 }
@@ -282,7 +320,7 @@ impl DiskSidebar {
     pub(crate) fn reset_job(
         &self,
         account: &UserId,
-    ) -> impl Future<Output = bool> + Send + 'static {
+    ) -> impl Future<Output = ResetOutcome> + Send + 'static {
         self.request(account, Pending::Remove);
         let (paths, accounts, writing, account) = (
             self.paths.clone(),
@@ -293,16 +331,27 @@ impl DiskSidebar {
         async move {
             blocking::run(move || {
                 let _guard = unpoisoned(writing.lock());
+                // Reset worked only if the file was removed. When a later
+                // save ran first and covered this request, the file holds
+                // that layout: that save's success is not the reset's, and
+                // it is not a failure either.
+                let outcome = |applied: Applied| match (applied.removed, applied.ok) {
+                    (true, true) => ResetOutcome::Removed,
+                    (true, false) => ResetOutcome::Failed,
+                    (false, true) => ResetOutcome::Overtaken,
+                    // The later write failed too: the old layout is still there.
+                    (false, false) => ResetOutcome::Failed,
+                };
                 match Self::run_pending(&paths, &accounts, &account) {
-                    Some(applied) => applied.ok,
+                    Some(applied) => outcome(applied),
                     None => unpoisoned(accounts.lock())
                         .get(&account)
                         .and_then(|a| a.applied)
-                        .is_some_and(|applied| applied.ok),
+                        .map_or(ResetOutcome::Failed, outcome),
                 }
             })
             .await
-            .unwrap_or(false)
+            .unwrap_or(ResetOutcome::Failed)
         }
     }
 }
@@ -316,7 +365,7 @@ impl SidebarStore for DiskSidebar {
         Task::future(self.save_job(account, layout))
     }
 
-    fn reset(&self, account: &UserId) -> Task<bool> {
+    fn reset(&self, account: &UserId) -> Task<ResetOutcome> {
         Task::future(self.reset_job(account))
     }
 }
@@ -382,12 +431,12 @@ mod fake {
             Task::done(true)
         }
 
-        fn reset(&self, account: &UserId) -> Task<bool> {
+        fn reset(&self, account: &UserId) -> Task<ResetOutcome> {
             self.calls
                 .lock()
                 .expect("test mutex")
                 .push(Call::Reset(account.clone()));
-            Task::done(true)
+            Task::done(ResetOutcome::Removed)
         }
     }
 }
@@ -572,7 +621,7 @@ mod tests {
             std::fs::write(&file, text).expect("plant");
             assert_eq!(block_on(store.load_job(&a)), expected);
             assert!(!block_on(store.save_job(&a, layout_of(&a, &["!one:x"]))));
-            assert!(!block_on(store.reset_job(&a)));
+            assert_ne!(block_on(store.reset_job(&a)), ResetOutcome::Removed);
             assert_eq!(std::fs::read(&file).expect("file"), text.as_bytes());
         }
     }
@@ -584,7 +633,7 @@ mod tests {
         let a = user("@a:x");
         assert!(block_on(store.save_job(&a, layout_of(&a, &["!one:x"]))));
         let waiting = store.save_job(&a, layout_of(&a, &["!two:x"]));
-        assert!(block_on(store.reset_job(&a)));
+        assert_eq!(block_on(store.reset_job(&a)), ResetOutcome::Removed);
         assert!(!block_on(waiting), "nothing left to write");
         assert_eq!(dir.paths().read_sidebar(&a), SidebarRead::Missing);
     }
@@ -651,7 +700,7 @@ mod tests {
         assert!(block_on(store.save_job(&a, layout_of(&a, &["!old:x"]))));
         let queued = store.reset_job(&a);
         assert_eq!(block_on(store.load_job(&a)), SidebarLoad::Default);
-        assert!(block_on(queued));
+        assert_eq!(block_on(queued), ResetOutcome::Removed);
     }
 
     #[test]
@@ -688,6 +737,62 @@ mod tests {
     }
 
     #[test]
+    fn a_reset_overtaken_by_a_later_save_does_not_report_a_removal() {
+        let a = user("@a:x");
+        for save_first in [false, true] {
+            let dir = Dir::new();
+            let store = DiskSidebar::new(dir.paths());
+            assert!(block_on(store.save_job(&a, layout_of(&a, &["!old:x"]))));
+            let reset = store.reset_job(&a);
+            let save = store.save_job(&a, layout_of(&a, &["!new:x"]));
+            let (reset_ok, save_ok) = if save_first {
+                let save_ok = block_on(save);
+                (block_on(reset), save_ok)
+            } else {
+                let reset_ok = block_on(reset);
+                (reset_ok, block_on(save))
+            };
+            // The save wrote the file, so it succeeded. The reset did not
+            // remove anything that is still there: it must not claim to.
+            assert!(save_ok, "save_first={save_first}");
+            assert_eq!(
+                reset_ok,
+                ResetOutcome::Overtaken,
+                "the file holds the new layout, save_first={save_first}"
+            );
+            assert!(dir.paths().sidebar_file(&a).exists());
+        }
+    }
+
+    #[test]
+    fn a_reset_overtaken_by_a_save_that_fails_is_a_failure() {
+        let a = user("@a:x");
+        for save_first in [false, true] {
+            let dir = Dir::new();
+            // Nothing can be written under a data root that is a file; the
+            // removal of a file that is not there works.
+            let blocked = dir.0.join("file");
+            std::fs::write(&blocked, b"x").expect("write");
+            let store = DiskSidebar::new(DataPaths::at(blocked.join("root")));
+            let reset = store.reset_job(&a);
+            let save = store.save_job(&a, layout_of(&a, &["!new:x"]));
+            let (reset_out, save_ok) = if save_first {
+                let save_ok = block_on(save);
+                (block_on(reset), save_ok)
+            } else {
+                let reset_out = block_on(reset);
+                (reset_out, block_on(save))
+            };
+            assert!(!save_ok, "the write fails");
+            assert_eq!(
+                reset_out,
+                ResetOutcome::Failed,
+                "the old layout is still there, save_first={save_first}"
+            );
+        }
+    }
+
+    #[test]
     fn a_save_then_a_reset_leave_no_file_whichever_finishes_first() {
         let a = user("@a:x");
         for reset_first in [false, true] {
@@ -697,11 +802,11 @@ mod tests {
             let save = store.save_job(&a, layout_of(&a, &["!new:x"]));
             let reset = store.reset_job(&a);
             if reset_first {
-                assert!(block_on(reset));
+                assert_eq!(block_on(reset), ResetOutcome::Removed);
                 let _ = block_on(save);
             } else {
                 let _ = block_on(save);
-                assert!(block_on(reset));
+                assert_eq!(block_on(reset), ResetOutcome::Removed);
             }
             assert_eq!(
                 dir.paths().read_sidebar(&a),

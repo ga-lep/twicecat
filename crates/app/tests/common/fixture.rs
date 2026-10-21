@@ -2086,6 +2086,52 @@ fn settings_notifications() -> App {
     settings_page(SettingsPage::Notifications)
 }
 
+/// Appearance with the account's sidebar layout answered: `load` is what the
+/// local file held.
+fn settings_appearance_sidebar_with(load: twicecat_app::sidebar_store::SidebarLoad) -> App {
+    use twicecat_app::sidebar_store::SidebarAnswer;
+    let mut app = settings_appearance();
+    press(
+        &mut app,
+        Message::SidebarLoaded(SidebarAnswer::new(user("me"), load)),
+    );
+    app
+}
+
+/// A layout the account arranged: Reset sidebar layout is on.
+fn settings_appearance_sidebar() -> App {
+    use twicecat_app::sidebar_store::SidebarLoad;
+    use twicecat_core::api::{FolderLayout, RailEntry, SidebarLayout};
+    let mut layout = SidebarLayout::new(user("me"));
+    layout.rail = vec![RailEntry::Folder(FolderLayout {
+        id: 1,
+        name: None,
+        open: false,
+        spaces: vec![room("fa"), room("fb")],
+    })];
+    settings_appearance_sidebar_with(SidebarLoad::Layout(layout))
+}
+
+/// The question after pressing Reset sidebar layout.
+fn settings_appearance_sidebar_ask() -> App {
+    let mut app = settings_appearance_sidebar();
+    press(
+        &mut app,
+        Message::Settings(SettingsMessage::ResetSidebarAsk),
+    );
+    app
+}
+
+/// The stored file was made by a newer Twicecat: Reset is off, with a note.
+fn settings_appearance_sidebar_newer() -> App {
+    settings_appearance_sidebar_with(twicecat_app::sidebar_store::SidebarLoad::Newer)
+}
+
+/// The stored file belongs to another account: Reset is off, with a note.
+fn settings_appearance_sidebar_other() -> App {
+    settings_appearance_sidebar_with(twicecat_app::sidebar_store::SidebarLoad::OtherAccount)
+}
+
 /// The themes folder the tests share: Daylight, the Duo pair, Faint and Paper.
 fn theme_fixtures() -> twicecat_app::themes::Loaded {
     twicecat_app::themes::load_dir(std::path::Path::new(concat!(
@@ -4145,6 +4191,34 @@ pub fn scenarios() -> Vec<Scenario> {
             false,
             settings_appearance_loading,
             |a| a.themes_loading,
+        ),
+        s(
+            "settings-appearance-sidebar",
+            false,
+            settings_appearance_sidebar,
+            |a| {
+                a.settings_ui.page == SettingsPage::Appearance
+                    && a.sidebar.state() == twicecat_app::sidebar::SidebarState::Loaded
+                    && !a.settings_ui.reset_sidebar_ask
+            },
+        ),
+        s(
+            "settings-appearance-sidebar-ask",
+            false,
+            settings_appearance_sidebar_ask,
+            |a| a.settings_ui.reset_sidebar_ask,
+        ),
+        s(
+            "settings-appearance-sidebar-newer",
+            false,
+            settings_appearance_sidebar_newer,
+            |a| a.sidebar.state() == twicecat_app::sidebar::SidebarState::Newer,
+        ),
+        s(
+            "settings-appearance-sidebar-other",
+            false,
+            settings_appearance_sidebar_other,
+            |a| a.sidebar.state() == twicecat_app::sidebar::SidebarState::OtherAccount,
         ),
         s(
             "settings-notifications",

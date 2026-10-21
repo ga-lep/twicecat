@@ -438,7 +438,10 @@ impl SidebarModel {
 
     /// Removes the account's file and goes back to the default layout (the
     /// Reset button, Task 13). Refused for a protected file.
-    pub fn reset(&mut self, store: &dyn SidebarStore) -> Result<Task<bool>, Refused> {
+    pub fn reset(
+        &mut self,
+        store: &dyn SidebarStore,
+    ) -> Result<Task<crate::sidebar_store::ResetOutcome>, Refused> {
         self.check_open()?;
         let Some(account) = self.account.clone() else {
             return Err(Refused::NotLoaded);
@@ -1128,6 +1131,45 @@ mod tests {
         assert_eq!(store.calls().last(), Some(&Call::Reset(a.clone())));
         assert_eq!(model.layout(), Some(&SidebarLayout::new(a)));
         assert_eq!(model.state(), SidebarState::Loaded);
+    }
+
+    #[test]
+    fn a_full_layout_can_be_reset() {
+        use twicecat_core::api::sidebar::limits::MAX_SPACE_RECORDS;
+        let store = MemorySidebar::default();
+        let a = user("@a:x");
+        let mut layout = SidebarLayout::new(a.clone());
+        layout.spaces = (0..MAX_SPACE_RECORDS)
+            .map(|n| SpaceLayout::new(rid(&format!("!s{n}:x"))))
+            .collect();
+        let mut model = loaded_model(&store, layout);
+        let op = Op::ToggleSection {
+            space: rid("!one-too-many:x"),
+            key: SectionKey::Starred,
+        };
+        assert_eq!(model.apply(op, &store).err(), Some(Refused::Full));
+        assert_eq!(model.state(), SidebarState::Full);
+        assert!(model.reset(&store).is_ok());
+        assert_eq!(store.calls().last(), Some(&Call::Reset(a.clone())));
+        assert_eq!(model.layout(), Some(&SidebarLayout::new(a)));
+        assert_eq!(model.state(), SidebarState::Loaded);
+    }
+
+    #[test]
+    fn reset_is_refused_for_a_protected_file_and_calls_no_store() {
+        for load in [SidebarLoad::Newer, SidebarLoad::OtherAccount] {
+            let store = MemorySidebar::default();
+            let a = user("@a:x");
+            let mut model = SidebarModel::default();
+            let _ = model.load_for(a.clone(), &store);
+            model.loaded(&a, load);
+            assert_eq!(model.reset(&store).err(), Some(Refused::Protected));
+            assert_eq!(store.calls(), vec![Call::Load(a)], "no reset");
+        }
+        let store = MemorySidebar::default();
+        let mut model = SidebarModel::default();
+        assert_eq!(model.reset(&store).err(), Some(Refused::NotLoaded));
+        assert!(store.calls().is_empty());
     }
 
     #[test]
@@ -2126,7 +2168,7 @@ mod tests {
             ))
         }
 
-        fn reset(&self, account: &UserId) -> Task<bool> {
+        fn reset(&self, account: &UserId) -> Task<crate::sidebar_store::ResetOutcome> {
             Task::done(iced::futures::executor::block_on(self.0.reset_job(account)))
         }
     }
@@ -2177,5 +2219,121 @@ mod tests {
             SidebarRead::Layout(model.layout().cloned().expect("a layout"))
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A temp data root with two accounts' files on disk, and a model over
+    /// the real store.
+    fn two_account_root(name: &str) -> (std::path::PathBuf, twicecat_core::paths::DataPaths) {
+        let root = std::env::temp_dir().join(format!(
+            "twicecat-sidebar-reset-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("dir");
+        (root.clone(), twicecat_core::paths::DataPaths::at(&root))
+    }
+
+    fn login_from_disk(
+        model: &mut SidebarModel,
+        account: &UserId,
+        store: &DiskNow,
+        paths: &twicecat_core::paths::DataPaths,
+    ) {
+        let _ = model.load_for(account.clone(), store);
+        model.loaded(account, SidebarLoad::from(paths.read_sidebar(account)));
+    }
+
+    #[test]
+    fn reset_as_b_removes_only_bs_file_and_leaves_as_byte_for_byte() {
+        use twicecat_core::api::SidebarRead;
+
+        let (root, paths) = two_account_root("two");
+        let store = DiskNow(crate::sidebar_store::DiskSidebar::new(paths.clone()));
+        let (a, b) = (user("@a:x"), user("@b:x"));
+        let toggle = |key| Op::ToggleSection {
+            space: rid("!sp:x"),
+            key,
+        };
+        let mut model = SidebarModel::default();
+        for account in [&a, &b] {
+            login_from_disk(&mut model, account, &store, &paths);
+            assert!(model.apply(toggle(SectionKey::Direct), &store).is_ok());
+            model.unload();
+        }
+        let (file_a, file_b) = (paths.sidebar_file(&a), paths.sidebar_file(&b));
+        let bytes_a = std::fs::read(&file_a).expect("a's file");
+        let modified_a = std::fs::metadata(&file_a)
+            .and_then(|m| m.modified())
+            .expect("mtime");
+        assert!(file_b.exists());
+
+        login_from_disk(&mut model, &b, &store, &paths);
+        assert_eq!(model.state(), SidebarState::Loaded);
+        let task = model.reset(&store);
+        assert!(task.is_ok());
+        assert!(!file_b.exists(), "b's file is gone");
+        assert_eq!(model.layout(), Some(&SidebarLayout::new(b.clone())));
+        // a's file: same bytes, same modification time, still a's layout.
+        assert_eq!(std::fs::read(&file_a).expect("a's file"), bytes_a);
+        assert_eq!(
+            std::fs::metadata(&file_a)
+                .and_then(|m| m.modified())
+                .expect("mtime"),
+            modified_a
+        );
+        model.unload();
+        // b logs in again: the default, not the old arrangement. a's own
+        // layout still loads for a.
+        login_from_disk(&mut model, &b, &store, &paths);
+        assert_eq!(model.layout(), Some(&SidebarLayout::new(b)));
+        model.unload();
+        login_from_disk(&mut model, &a, &store, &paths);
+        assert!(matches!(paths.read_sidebar(&a), SidebarRead::Layout(_)));
+        assert_ne!(model.layout(), Some(&SidebarLayout::new(a)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn reset_leaves_a_protected_file_byte_for_byte_the_same() {
+        let planted = [
+            (
+                r#"{"version":1,"account":"@other:x","rail":[],"spaces":[]}"#,
+                SidebarState::OtherAccount,
+            ),
+            (
+                r#"{"version":2,"account":"@a:x","rail":[],"spaces":[]}"#,
+                SidebarState::Newer,
+            ),
+        ];
+        for (n, (text, state)) in planted.into_iter().enumerate() {
+            let (root, paths) = two_account_root(&format!("protected{n}"));
+            let store = DiskNow(crate::sidebar_store::DiskSidebar::new(paths.clone()));
+            let a = user("@a:x");
+            let file = paths.sidebar_file(&a);
+            std::fs::write(&file, text).expect("plant");
+            let modified = std::fs::metadata(&file)
+                .and_then(|m| m.modified())
+                .expect("mtime");
+            let mut model = SidebarModel::default();
+            login_from_disk(&mut model, &a, &store, &paths);
+            assert_eq!(model.state(), state);
+            assert_eq!(model.reset(&store).err(), Some(Refused::Protected));
+            assert_eq!(std::fs::read(&file).expect("kept"), text.as_bytes());
+            assert_eq!(
+                std::fs::metadata(&file)
+                    .and_then(|m| m.modified())
+                    .expect("mtime"),
+                modified
+            );
+            // Even the store itself, asked directly, leaves it alone.
+            assert_ne!(
+                iced::futures::executor::block_on(
+                    crate::sidebar_store::DiskSidebar::new(paths.clone()).reset_job(&a)
+                ),
+                crate::sidebar_store::ResetOutcome::Removed
+            );
+            assert_eq!(std::fs::read(&file).expect("kept"), text.as_bytes());
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 }

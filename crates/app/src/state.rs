@@ -1771,6 +1771,8 @@ impl App {
                 self.security.fresh_login = !restored;
                 self.room_modes.clear();
                 self.folding.clear();
+                // A question about another session's layout is not this one's.
+                self.settings_ui.reset_sidebar_ask = false;
                 // The layout of this account only; nothing is written.
                 let account = user_id.clone();
                 let load = self
@@ -3689,6 +3691,254 @@ mod tests {
                 ))
             );
             assert!(!message.contains("secretin"), "{message}");
+        }
+    }
+
+    // ---- Reset sidebar layout (Task sbc.13) ----
+
+    mod sidebar_reset {
+        use super::*;
+        use crate::settings::SettingsMessage as S;
+        use crate::sidebar::SidebarState;
+        use crate::sidebar_store::{Call, MemorySidebar, ResetAnswer, ResetOutcome, SidebarLoad};
+        use twicecat_core::api::{FolderLayout, RailEntry, SidebarLayout};
+
+        fn layout_for(user: &str) -> SidebarLayout {
+            let mut layout = SidebarLayout::new(UserId::from(user));
+            layout.rail = vec![RailEntry::Folder(FolderLayout {
+                id: 1,
+                name: None,
+                open: false,
+                spaces: vec![RoomId::from("!in1:x"), RoomId::from("!in2:x")],
+            })];
+            layout
+        }
+
+        /// Logged in as `@a:x` with a stored layout, Settings open.
+        fn ready(load: SidebarLoad) -> (App, MemorySidebar) {
+            let (mut app, _rx) = login_app();
+            let store = MemorySidebar::default();
+            app.set_sidebar_store(Box::new(store.clone()));
+            let _ = app.update(core(CoreEvent::LoggedIn {
+                user_id: UserId::from("@a:x"),
+                device_id: DeviceId::from("D"),
+                restored: false,
+            }));
+            let _ = app.update(core(room_event(&["a", "b"])));
+            let _ = app.update(Message::SidebarLoaded(SidebarAnswer::new(
+                UserId::from("@a:x"),
+                load,
+            )));
+            let _ = app.update(Message::Settings(S::Open));
+            assert!(app.settings_ui.open);
+            (app, store)
+        }
+
+        fn stored() -> SidebarLoad {
+            SidebarLoad::Layout(layout_for("@a:x"))
+        }
+
+        fn resets(store: &MemorySidebar) -> Vec<UserId> {
+            store
+                .calls()
+                .into_iter()
+                .filter_map(|c| match c {
+                    Call::Reset(user) => Some(user),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn send(app: &mut App, message: S) {
+            let _ = app.update(Message::Settings(message));
+        }
+
+        #[test]
+        fn asking_opens_the_confirmation_and_changes_nothing() {
+            let (mut app, store) = ready(stored());
+            let before = store.calls();
+            send(&mut app, S::ResetSidebarAsk);
+            assert!(app.settings_ui.reset_sidebar_ask);
+            assert_eq!(store.calls(), before, "asking touches no store");
+            assert_eq!(app.sidebar.layout(), Some(&layout_for("@a:x")));
+        }
+
+        #[test]
+        fn cancel_changes_nothing() {
+            let (mut app, store) = ready(stored());
+            let before = store.calls();
+            send(&mut app, S::ResetSidebarAsk);
+            send(&mut app, S::ResetSidebarCancel);
+            assert!(!app.settings_ui.reset_sidebar_ask);
+            assert_eq!(store.calls(), before);
+            assert_eq!(app.sidebar.layout(), Some(&layout_for("@a:x")));
+        }
+
+        #[test]
+        fn confirming_resets_the_logged_in_account_only() {
+            let (mut app, store) = ready(stored());
+            send(&mut app, S::ResetSidebarAsk);
+            send(&mut app, S::ResetSidebarConfirm);
+            assert_eq!(resets(&store), [UserId::from("@a:x")]);
+            assert!(!app.settings_ui.reset_sidebar_ask);
+            assert_eq!(
+                app.sidebar.layout(),
+                Some(&SidebarLayout::new(UserId::from("@a:x")))
+            );
+            assert_eq!(app.sidebar.state(), SidebarState::Loaded);
+            assert!(app.settings_ui.error.is_none());
+            // Nothing else was saved, and the rail is the default one.
+            assert!(
+                !store.calls().iter().any(|c| matches!(c, Call::Save(..))),
+                "a reset saves nothing"
+            );
+        }
+
+        #[test]
+        fn a_confirm_without_the_ask_does_nothing() {
+            let (mut app, store) = ready(stored());
+            send(&mut app, S::ResetSidebarConfirm);
+            assert!(resets(&store).is_empty());
+            assert_eq!(app.sidebar.layout(), Some(&layout_for("@a:x")));
+        }
+
+        #[test]
+        fn a_second_confirm_does_not_reset_twice() {
+            let (mut app, store) = ready(stored());
+            send(&mut app, S::ResetSidebarAsk);
+            send(&mut app, S::ResetSidebarConfirm);
+            send(&mut app, S::ResetSidebarConfirm);
+            assert_eq!(resets(&store).len(), 1);
+        }
+
+        #[test]
+        fn a_newer_or_other_accounts_file_cannot_be_reset() {
+            for (load, state) in [
+                (SidebarLoad::Newer, SidebarState::Newer),
+                (SidebarLoad::OtherAccount, SidebarState::OtherAccount),
+            ] {
+                let (mut app, store) = ready(load);
+                assert_eq!(app.sidebar.state(), state);
+                assert!(!app.sidebar_reset_allowed());
+                let before = store.calls();
+                send(&mut app, S::ResetSidebarAsk);
+                assert!(!app.settings_ui.reset_sidebar_ask, "{state:?}");
+                // Even a confirm that arrives anyway is refused.
+                app.settings_ui.reset_sidebar_ask = true;
+                send(&mut app, S::ResetSidebarConfirm);
+                assert_eq!(store.calls(), before, "{state:?}: no store call at all");
+                assert!(!app.settings_ui.reset_sidebar_ask, "{state:?}");
+                assert_eq!(app.sidebar.state(), state);
+                assert!(app.sidebar.layout().is_none());
+            }
+        }
+
+        #[test]
+        fn before_the_layout_is_loaded_there_is_nothing_to_reset() {
+            let (mut app, _rx) = login_app();
+            let store = MemorySidebar::default();
+            app.set_sidebar_store(Box::new(store.clone()));
+            assert!(!app.sidebar_reset_allowed());
+            send(&mut app, S::ResetSidebarAsk);
+            assert!(!app.settings_ui.reset_sidebar_ask);
+            assert!(store.calls().is_empty());
+        }
+
+        fn answer_for(user: &str, outcome: ResetOutcome) -> S {
+            S::SidebarReset(ResetAnswer::new(UserId::from(user), outcome))
+        }
+
+        #[test]
+        fn a_failed_removal_says_so_and_an_overtaken_reset_does_not() {
+            let (mut app, _store) = ready(stored());
+            send(&mut app, answer_for("@a:x", ResetOutcome::Removed));
+            assert!(app.settings_ui.error.is_none());
+            send(&mut app, answer_for("@a:x", ResetOutcome::Overtaken));
+            assert!(app.settings_ui.error.is_none(), "nothing failed");
+            send(&mut app, answer_for("@a:x", ResetOutcome::Failed));
+            assert_eq!(
+                app.settings_ui.error,
+                Some(crate::settings::SettingsError::SidebarResetFailed)
+            );
+        }
+
+        #[test]
+        fn a_late_answer_for_another_account_shows_nothing() {
+            let (mut app, _store) = ready(stored());
+            let _ = app.update(core(CoreEvent::LoggedOut));
+            let _ = app.update(core(CoreEvent::LoggedIn {
+                user_id: UserId::from("@b:x"),
+                device_id: DeviceId::from("D"),
+                restored: false,
+            }));
+            send(&mut app, answer_for("@a:x", ResetOutcome::Failed));
+            assert!(app.settings_ui.error.is_none());
+            send(&mut app, answer_for("@b:x", ResetOutcome::Failed));
+            assert!(app.settings_ui.error.is_some());
+        }
+
+        #[test]
+        fn the_answer_carries_its_account_and_debug_hides_it() {
+            let text = format!("{:?}", answer_for("@secretme:x", ResetOutcome::Failed));
+            assert!(!text.contains("secretme"), "{text}");
+        }
+
+        #[test]
+        fn the_question_does_not_survive_a_login_of_another_account() {
+            let (mut app, store) = ready(stored());
+            send(&mut app, S::ResetSidebarAsk);
+            assert!(app.settings_ui.reset_sidebar_ask);
+            // A login for another account with no LoggedOut in between.
+            let _ = app.update(core(CoreEvent::LoggedIn {
+                user_id: UserId::from("@b:x"),
+                device_id: DeviceId::from("D"),
+                restored: false,
+            }));
+            assert!(!app.settings_ui.reset_sidebar_ask);
+            let _ = app.update(core(room_event(&["a", "b"])));
+            let _ = app.update(Message::SidebarLoaded(SidebarAnswer::new(
+                UserId::from("@b:x"),
+                SidebarLoad::Layout(layout_for("@b:x")),
+            )));
+            send(&mut app, S::ResetSidebarConfirm);
+            assert!(resets(&store).is_empty(), "{:?}", resets(&store));
+            assert_eq!(app.sidebar.layout(), Some(&layout_for("@b:x")));
+        }
+
+        #[test]
+        fn leaving_the_page_or_the_card_or_the_account_drops_the_ask() {
+            let (mut app, _store) = ready(stored());
+            send(&mut app, S::ResetSidebarAsk);
+            send(&mut app, S::Page(crate::settings::SettingsPage::About));
+            assert!(!app.settings_ui.reset_sidebar_ask, "page");
+            send(&mut app, S::Page(crate::settings::SettingsPage::Appearance));
+            send(&mut app, S::ResetSidebarAsk);
+            send(&mut app, S::Close);
+            assert!(!app.settings_ui.reset_sidebar_ask, "close");
+            send(&mut app, S::Open);
+            send(&mut app, S::ResetSidebarAsk);
+            let _ = app.update(core(CoreEvent::LoggedOut));
+            assert!(!app.settings_ui.reset_sidebar_ask, "logout");
+        }
+
+        #[test]
+        fn reset_never_names_another_account_after_a_logout_and_login() {
+            let (mut app, store) = ready(stored());
+            let _ = app.update(core(CoreEvent::LoggedOut));
+            let _ = app.update(core(CoreEvent::LoggedIn {
+                user_id: UserId::from("@b:x"),
+                device_id: DeviceId::from("D"),
+                restored: false,
+            }));
+            let _ = app.update(core(room_event(&["a", "b"])));
+            let _ = app.update(Message::SidebarLoaded(SidebarAnswer::new(
+                UserId::from("@b:x"),
+                SidebarLoad::Layout(layout_for("@b:x")),
+            )));
+            send(&mut app, S::Open);
+            send(&mut app, S::ResetSidebarAsk);
+            send(&mut app, S::ResetSidebarConfirm);
+            assert_eq!(resets(&store), [UserId::from("@b:x")]);
         }
     }
 
