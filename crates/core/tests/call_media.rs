@@ -645,6 +645,19 @@ async fn a_screen_share_sound_plays_next_to_the_voice() {
     let dir_a = tempfile::tempdir().unwrap();
     let mut alice = logged_in(dir_a.path(), 1, AudioBackend::Virtual(alice_audio.clone())).await;
     wait_for_room(&mut alice, &room_id).await;
+    // This test measures levels at the speaker: no join cue.
+    alice
+        .commands
+        .send(Command::UpdateAudioSettings(AudioSettings {
+            call_sounds: CallSounds {
+                enabled: false,
+                ..CallSounds::default()
+            },
+            ..AudioSettings::default()
+        }))
+        .await
+        .unwrap();
+    expect_event(&mut alice, |e| matches!(e, CoreEvent::AudioSettings(_))).await;
     join(&mut alice, &room_id).await;
 
     // Carol joins as another client would: alice's membership, as hers.

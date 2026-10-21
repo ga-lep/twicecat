@@ -202,7 +202,7 @@ fn noise_suppression(arg: &str) -> Result<NoiseSuppression, &'static str> {
 }
 
 fn sounds(arg: &str) -> Result<SoundsArg, &'static str> {
-    const USAGE: &str = "/sounds [on|off|others on|off|leave on|off|<0-200>]";
+    const USAGE: &str = "/sounds [on|off|others on|off|leave on|off|<0-100>]";
     let on_off = |word| match word {
         "on" => Ok(true),
         "off" => Ok(false),
@@ -219,7 +219,7 @@ fn sounds(arg: &str) -> Result<SoundsArg, &'static str> {
             .trim_end_matches('%')
             .parse()
             .ok()
-            .filter(|p| *p <= 200)
+            .filter(|p| *p <= 100)
             .map(SoundsArg::Volume)
             .ok_or(USAGE),
         _ => Err(USAGE),
@@ -325,7 +325,7 @@ mod tests {
         assert_eq!(cmd("/ringtone off"), Ok(CallCmd::Ringtone(Some(false))));
         assert_eq!(cmd("/ringtone loud"), Err("/ringtone [on|off]"));
         assert_eq!(cmd("/silence"), Ok(CallCmd::Silence));
-        let usage = "/sounds [on|off|others on|off|leave on|off|<0-200>]";
+        let usage = "/sounds [on|off|others on|off|leave on|off|<0-100>]";
         assert_eq!(cmd("/sounds"), Ok(CallCmd::Sounds(SoundsArg::Switch(None))));
         assert_eq!(
             cmd("/sounds off"),
@@ -348,10 +348,10 @@ mod tests {
             Ok(CallCmd::Sounds(SoundsArg::Volume(40)))
         );
         assert_eq!(
-            cmd("/sounds 200%"),
-            Ok(CallCmd::Sounds(SoundsArg::Volume(200)))
+            cmd("/sounds 100%"),
+            Ok(CallCmd::Sounds(SoundsArg::Volume(100)))
         );
-        assert_eq!(cmd("/sounds 201"), Err(usage));
+        assert_eq!(cmd("/sounds 101"), Err(usage));
         assert_eq!(cmd("/sounds -5"), Err(usage));
         assert_eq!(cmd("/sounds loud"), Err(usage));
         assert_eq!(cmd("/sounds others"), Err(usage));

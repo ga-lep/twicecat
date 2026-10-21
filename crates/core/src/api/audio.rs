@@ -423,7 +423,9 @@ pub struct CallSounds {
     pub others_joining: bool,
     /// Also play a cue when you leave the call.
     pub leaving: bool,
-    /// Cue volume, percent (0..=200), on top of the master volume.
+    /// Cue volume, percent (0..=100, [`limits::CALL_SOUNDS_VOLUME_PERCENT`]),
+    /// on top of the master volume. A higher value is clamped to 100: the
+    /// mixer plays a cue at 100 at most.
     pub volume_percent: u16,
 }
 
@@ -474,6 +476,8 @@ pub mod limits {
     pub const PTT_RELEASE_DELAY_MS: u32 = 2000;
     /// Every volume percentage.
     pub const VOLUME_PERCENT: u16 = 200;
+    /// `CallSounds::volume_percent` (the mixer plays a cue at 100 at most).
+    pub const CALL_SOUNDS_VOLUME_PERCENT: u16 = 100;
     /// `voice_bitrate_kbps` (Opus range for 48 kHz voice).
     pub const VOICE_BITRATE_KBPS: (u16, u16) = (16, 510);
     /// `AudioProcessing::auto_gain_max_db` (AGC2 needs more than 0).
@@ -518,8 +522,10 @@ impl AudioSettings {
             defaults.input_gain_db,
         );
         self.output_volume_percent = self.output_volume_percent.min(limits::VOLUME_PERCENT);
-        self.call_sounds.volume_percent =
-            self.call_sounds.volume_percent.min(limits::VOLUME_PERCENT);
+        self.call_sounds.volume_percent = self
+            .call_sounds
+            .volume_percent
+            .min(limits::CALL_SOUNDS_VOLUME_PERCENT);
         let (lo, hi) = limits::VOICE_BITRATE_KBPS;
         self.voice_bitrate_kbps = self.voice_bitrate_kbps.clamp(lo, hi);
         for volumes in [&mut self.user_volumes, &mut self.user_share_volumes] {
@@ -677,6 +683,10 @@ mod tests {
         let s = AudioSettings {
             input_gain_db: -99.0,
             output_volume_percent: 500,
+            call_sounds: CallSounds {
+                volume_percent: 500,
+                ..CallSounds::default()
+            },
             voice_bitrate_kbps: 2,
             user_volumes,
             user_share_volumes,
@@ -704,6 +714,10 @@ mod tests {
         assert_eq!(s.input_gain_db, -20.0);
         assert_eq!(s.processing.auto_gain_max_db, 1.0, "AGC2 refuses 0");
         assert_eq!(s.output_volume_percent, 200);
+        assert_eq!(
+            s.call_sounds.volume_percent, 100,
+            "a cue never plays above 100"
+        );
         assert_eq!(s.voice_bitrate_kbps, 16);
         assert_eq!(s.user_volume(&UserId::from("@loud:x")), 200);
         assert!(!s.user_volumes.contains_key(&UserId::from("@same:x")));
@@ -766,7 +780,10 @@ mod tests {
             ..AudioSettings::default()
         }
         .validated();
-        assert_eq!(s.call_sounds.volume_percent, limits::VOLUME_PERCENT);
+        assert_eq!(
+            s.call_sounds.volume_percent,
+            limits::CALL_SOUNDS_VOLUME_PERCENT
+        );
     }
 
     #[test]

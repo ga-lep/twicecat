@@ -134,6 +134,9 @@ fn run(options: Options) -> Result<(), String> {
     let crash_dir = data.root().to_path_buf();
     let crash = (crash_dir.clone(), twicecat_app::crash::newest(&crash_dir));
     twicecat_app::crash::install(crash_dir);
+    // Only the path of the themes folder is kept; no theme file is read here
+    // (the app reads the folder off the UI thread once it is running).
+    let data_for_themes = data.clone();
     let config = CoreConfig {
         data,
         homeserver_override: options.homeserver,
@@ -153,7 +156,7 @@ fn run(options: Options) -> Result<(), String> {
     // The app (and with it the bridge and the core's runtime) is dropped when
     // `run` returns, before the temporary directory is removed.
     let application = iced::application(
-        App::booter(startup, ui_settings, settings_store, crash),
+        App::booter(startup, ui_settings, settings_store, crash, data_for_themes),
         App::update,
         App::view,
     );

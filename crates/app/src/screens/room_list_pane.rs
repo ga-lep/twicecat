@@ -306,6 +306,7 @@ fn search_field(app: &App) -> Element<'_, Message> {
     row![
         icons::icon(Icon::Search),
         text_input("Search rooms", &app.search_input)
+            .style(kit::text_input_style)
             .on_input(Message::SearchChanged)
             .padding(tokens::S),
         clear,

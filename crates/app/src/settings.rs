@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use iced::Task;
 use twicecat_core::api::{
     Command, DensityChoice, MediaBytes, MessageText, NotificationSettingsView, OwnProfileView,
-    PaletteChoice, RoomListChoice, RoomNotificationModeView, ThemeChoice, UiSettings,
+    RoomListChoice, RoomNotificationModeView, ThemeChoice, ThemeName, UiSettings,
 };
 use twicecat_core::paths::DataPaths;
 
@@ -25,6 +25,7 @@ use crate::rooms::{AvatarRefusal, AvatarUpload, has_unsafe_char, read_avatar_fil
 use crate::sessions::SessionsMessage;
 use crate::state::{App, Message, Screen};
 use crate::text_safety::one_line_capped;
+use crate::themes::{self, Loaded};
 
 /// Widget ID of the display name field.
 pub const NAME_INPUT_ID: &str = "settings-name-input";
@@ -42,7 +43,7 @@ pub const MAX_KEYWORDS: usize = 50;
 pub const MAX_STALE_EVENTS: u8 = 3;
 
 /// The Voice & audio section of Settings.
-pub const VOICE_AUDIO_LINE: &str = "Every audio option: the processing chain, the noise gate, gain, the voice bitrate, the ringtone, cleaning other voices, announcements and diagnostics.";
+pub const VOICE_AUDIO_LINE: &str = "Every audio option: the processing chain, the noise gate, gain, the voice bitrate, the ringtone and call sounds, cleaning other voices, announcements and diagnostics.";
 /// The line on the Sessions page of Settings.
 pub const SESSIONS_LINE: &str = "See where you are signed in, which sessions are verified, and sign out of the ones you do not use.";
 /// The typeface line on the About page (SIL OFL 1.1 asks for the notice).
@@ -77,6 +78,8 @@ pub enum SettingsError {
     NotificationFailed,
     /// The settings file could not be written.
     SaveFailed,
+    /// The themes folder could not be created or opened.
+    ThemesFolderFailed,
 }
 
 impl SettingsError {
@@ -93,6 +96,7 @@ impl SettingsError {
             Self::ProfileFailed => "Your profile could not be changed.",
             Self::NotificationFailed => "The notification setting could not be changed.",
             Self::SaveFailed => "The settings could not be saved on this device.",
+            Self::ThemesFolderFailed => "The themes folder could not be opened.",
         }
     }
 }
@@ -445,6 +449,19 @@ impl fmt::Display for DensityOption {
     }
 }
 
+/// A theme as a pick-list entry: `None` is the built-in Twicecat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThemeOption(pub Option<ThemeName>);
+
+impl fmt::Display for ThemeOption {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            None => f.write_str("Twicecat (default)"),
+            Some(name) => f.write_str(name.as_str()),
+        }
+    }
+}
+
 /// A room list layout as a pick-list entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RoomListOption(pub RoomListChoice);
@@ -527,7 +544,15 @@ impl SettingsPage {
     pub const fn sends(self) -> &'static [&'static str] {
         match self {
             Self::Profile => &["NameInput", "SaveName", "ChooseAvatar", "RemoveAvatar"],
-            Self::Appearance => &["Theme", "Palette", "Density", "RoomList", "Zoom"],
+            Self::Appearance => &[
+                "ThemePicked",
+                "ReloadThemes",
+                "OpenThemesFolder",
+                "Theme",
+                "Density",
+                "RoomList",
+                "Zoom",
+            ],
             Self::Notifications => &[
                 "DefaultMode",
                 "KeywordInput",
@@ -591,10 +616,18 @@ pub enum SettingsMessage {
     ShowMessageContent(bool),
     /// The tray badge toggle.
     TrayBadge(bool),
-    /// A theme choice.
+    /// A theme picked in the menu; `None` is the built-in Twicecat.
+    ThemePicked(Option<ThemeName>),
+    /// **Reload themes**.
+    ReloadThemes,
+    /// The themes folder was read (`None` when the reading thread failed).
+    ThemesLoaded(Option<Loaded>),
+    /// **Open themes folder**.
+    OpenThemesFolder,
+    /// The file manager was asked for the themes folder; whether it worked.
+    ThemesFolderOpened(bool),
+    /// A choice of light or dark look, for a theme that has both.
     Theme(ThemeChoice),
-    /// A colour set; `None` is the app's default.
-    Palette(Option<PaletteChoice>),
     /// A density choice.
     Density(DensityChoice),
     /// A room list layout choice.
@@ -629,8 +662,12 @@ impl SettingsMessage {
             Self::DesktopNotifications(_) => "DesktopNotifications",
             Self::ShowMessageContent(_) => "ShowMessageContent",
             Self::TrayBadge(_) => "TrayBadge",
+            Self::ThemePicked(_) => "ThemePicked",
+            Self::ReloadThemes => "ReloadThemes",
+            Self::ThemesLoaded(_) => "ThemesLoaded",
+            Self::OpenThemesFolder => "OpenThemesFolder",
+            Self::ThemesFolderOpened(_) => "ThemesFolderOpened",
             Self::Theme(_) => "Theme",
-            Self::Palette(_) => "Palette",
             Self::Density(_) => "Density",
             Self::RoomList(_) => "RoomList",
             Self::Zoom(_) => "Zoom",
@@ -640,7 +677,7 @@ impl SettingsMessage {
 
     /// The names of every message (kept by hand beside [`Self::name`]; a test
     /// checks that each belongs to a page, the card or [`Self::NOT_FROM_A_CONTROL`]).
-    pub const ALL_NAMES: [&'static str; 25] = [
+    pub const ALL_NAMES: [&'static str; 29] = [
         "Open",
         "Close",
         "Page",
@@ -660,8 +697,12 @@ impl SettingsMessage {
         "DesktopNotifications",
         "ShowMessageContent",
         "TrayBadge",
+        "ThemePicked",
+        "ReloadThemes",
+        "ThemesLoaded",
+        "OpenThemesFolder",
+        "ThemesFolderOpened",
         "Theme",
-        "Palette",
         "Density",
         "RoomList",
         "Zoom",
@@ -674,8 +715,14 @@ impl SettingsMessage {
 
     /// Messages that no control of a page sends: the account area and
     /// Ctrl+, open the card, a dialog and a task answer, a write ends.
-    pub const NOT_FROM_A_CONTROL: [&'static str; 4] =
-        ["Open", "AvatarPicked", "AvatarReady", "Saved"];
+    pub const NOT_FROM_A_CONTROL: [&'static str; 6] = [
+        "Open",
+        "AvatarPicked",
+        "AvatarReady",
+        "ThemesLoaded",
+        "ThemesFolderOpened",
+        "Saved",
+    ];
 }
 
 impl App {
@@ -812,18 +859,38 @@ impl App {
                 self.tray.refresh(self.ui_settings.tray_badge);
                 task
             }
+            M::ThemePicked(name) => {
+                if self.ui_settings.theme_name == name {
+                    return Task::none();
+                }
+                self.ui_settings.theme_name = name;
+                self.save_local()
+            }
+            M::ReloadThemes => self.reload_themes(),
+            M::ThemesLoaded(loaded) => {
+                self.themes_loading = false;
+                // A load that failed keeps the list; before any list there is
+                // an empty one, so that the page can say what it has.
+                match loaded {
+                    Some(loaded) => self.themes = Some(loaded),
+                    None => {
+                        self.themes.get_or_insert_with(Loaded::default);
+                    }
+                }
+                Task::none()
+            }
+            M::OpenThemesFolder => self.open_themes_folder(),
+            M::ThemesFolderOpened(ok) => {
+                if !ok {
+                    self.settings_ui.error = Some(SettingsError::ThemesFolderFailed);
+                }
+                Task::none()
+            }
             M::Theme(choice) => {
                 if self.ui_settings.theme == choice {
                     return Task::none();
                 }
                 self.ui_settings.theme = choice;
-                self.save_local()
-            }
-            M::Palette(choice) => {
-                if self.ui_settings.palette == choice {
-                    return Task::none();
-                }
-                self.ui_settings.palette = choice;
                 self.save_local()
             }
             M::Density(choice) => {
@@ -1085,6 +1152,68 @@ impl App {
     }
 
     /// Writes the local settings through the store, in a task.
+    /// The entries of the theme menu: the built-in theme first, then the
+    /// custom themes by name, each once (a light and dark pair is one).
+    pub fn theme_options(&self) -> Vec<ThemeOption> {
+        let mut names: Vec<ThemeName> = self
+            .themes
+            .iter()
+            .flat_map(|loaded| &loaded.themes)
+            .filter_map(|t| ThemeName::try_from(t.name.as_str()).ok())
+            .collect();
+        names.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        names.dedup();
+        std::iter::once(ThemeOption(None))
+            .chain(names.into_iter().map(|n| ThemeOption(Some(n))))
+            .collect()
+    }
+
+    /// The menu entry to show as chosen: the stored theme when it loaded
+    /// (spelled as the file has it), else the built-in one, which is what the
+    /// window shows then.
+    pub fn selected_theme_option(&self) -> ThemeOption {
+        let loaded = self.themes.as_ref().and_then(|loaded| {
+            let stored = self.ui_settings.theme_name?;
+            loaded
+                .themes
+                .iter()
+                .find(|t| t.name.eq_ignore_ascii_case(stored.as_str()))
+                .and_then(|t| ThemeName::try_from(t.name.as_str()).ok())
+        });
+        ThemeOption(loaded)
+    }
+
+    /// Reads the themes folder on a thread of its own, unless a read is
+    /// running.
+    pub(crate) fn reload_themes(&mut self) -> Task<Message> {
+        if self.themes_loading {
+            return Task::none();
+        }
+        self.themes_loading = true;
+        let dir = self.data_paths.themes_dir().to_path_buf();
+        Task::perform(themes::load_off_thread(dir), |loaded| {
+            Message::Settings(SettingsMessage::ThemesLoaded(loaded))
+        })
+    }
+
+    /// Creates the themes folder (private) and shows it in the file manager.
+    /// Both happen in a task, never in `update`.
+    fn open_themes_folder(&mut self) -> Task<Message> {
+        let paths = self.data_paths.clone();
+        Task::perform(
+            async move {
+                blocking::run(move || {
+                    paths
+                        .create_themes_dir()
+                        .is_ok_and(|dir| crate::dialogs::open_folder(&dir))
+                })
+                .await
+                .unwrap_or(false)
+            },
+            |ok| Message::Settings(SettingsMessage::ThemesFolderOpened(ok)),
+        )
+    }
+
     pub(crate) fn save_local(&mut self) -> Task<Message> {
         self.settings_ui.error = None;
         self.settings_store

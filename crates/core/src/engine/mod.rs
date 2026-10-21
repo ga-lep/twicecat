@@ -1810,6 +1810,7 @@ impl Engine {
         }
         if let Some(call) = &self.call {
             call.set_cleaning(&settings);
+            call.set_sounds(&settings.call_sounds);
         }
         if let Err(e) = saved {
             self.emit(CoreEvent::Error(e)).await;
@@ -1944,6 +1945,7 @@ impl Engine {
                 self.audio_session = Some(session);
                 CallAudio {
                     voice,
+                    sounds: settings.call_sounds,
                     outgoing,
                     bitrate_kbps,
                     cleaning,
@@ -1955,6 +1957,7 @@ impl Engine {
                 self.emit(CoreEvent::Error(e)).await;
                 CallAudio {
                     voice: None,
+                    sounds: settings.call_sounds,
                     outgoing: None,
                     bitrate_kbps,
                     cleaning,
@@ -2129,7 +2132,7 @@ impl Engine {
     /// long it lasts when it was queued. A cue logs only its kind.
     fn play_call_cue(&self, cue: Cue) -> Option<Duration> {
         let sounds = self.audio_settings.as_ref()?.call_sounds;
-        let volume = call_sounds::volume(&sounds, cue).filter(|v| *v > 0)?;
+        let volume = call_sounds::playable_volume(&sounds, cue)?;
         let session = self
             .audio_session
             .as_ref()
@@ -2152,6 +2155,9 @@ impl Engine {
         let Some(session) = self.audio_session.take() else {
             return;
         };
+        // The devices linger for the cue, but the microphone sends nothing
+        // and no level or stats are reported meanwhile.
+        session.begin_closing();
         self.closing = Some(tokio::spawn(async move {
             tokio::time::sleep(length + CUE_TAIL).await;
             if tokio::time::timeout(CLOSE_TIMEOUT, session.stop())
@@ -3559,6 +3565,55 @@ mod tests {
             "the whole cue at 60 % played, ratio {ratio}"
         );
         drain.abort();
+    }
+
+    #[tokio::test]
+    async fn a_closing_session_reports_no_levels_or_stats() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, mut rx) = oauth_engine(dir.path());
+        engine.config.audio = AudioBackend::Virtual(Arc::new(Speaker::default()));
+        let _ = engine.start_call_audio().await;
+        let length = engine.play_call_cue(Cue::Left).expect("queued");
+
+        // Levels flow while the call runs.
+        let saw = |event: &CoreEvent| {
+            matches!(event, CoreEvent::InputLevel(_) | CoreEvent::AudioStats(_))
+        };
+        let first = tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(event) = rx.recv().await {
+                if saw(&event) {
+                    return true;
+                }
+            }
+            false
+        })
+        .await;
+        assert_eq!(first, Ok(true), "levels flow before the leave");
+
+        engine.close_after_cue(length);
+        // Whatever was already in flight is dropped; then nothing arrives
+        // until the devices close.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        while rx.try_recv().is_ok() {}
+        let mut late = Vec::new();
+        let closing = tokio::time::timeout(Duration::from_secs(2), engine.finish_closing());
+        tokio::pin!(closing);
+        loop {
+            tokio::select! {
+                done = &mut closing => {
+                    done.expect("closes in time");
+                    break;
+                }
+                Some(event) = rx.recv() => late.push(event),
+            }
+        }
+        while let Ok(event) = rx.try_recv() {
+            late.push(event);
+        }
+        assert!(
+            !late.iter().any(saw),
+            "no levels or stats while closing: {late:?}"
+        );
     }
 
     #[tokio::test]

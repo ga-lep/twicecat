@@ -192,6 +192,13 @@ pub fn open_file(path: &Path) -> bool {
     open::that_detached(path).is_ok()
 }
 
+/// Asks the system to show a folder in the file manager. `true` when the
+/// handler started. Like [`open_file`], this starts a process: run it inside a
+/// `Task`, never in `update`.
+pub fn open_folder(path: &Path) -> bool {
+    open::that_detached(path).is_ok()
+}
+
 #[cfg(test)]
 pub use fake::{RecordingClipboard, RecordingDialogs};
 

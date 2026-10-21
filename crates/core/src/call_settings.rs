@@ -190,7 +190,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stored_call_sounds_volume_of_900_loads_as_200() {
+    fn a_stored_call_sounds_volume_of_900_loads_as_100() {
         let (_dir, paths) = paths();
         paths
             .write_call_settings(
@@ -199,7 +199,7 @@ mod tests {
             .unwrap();
         let loaded = load(&paths);
         assert!(loaded.problem.is_none());
-        assert_eq!(loaded.settings.call_sounds.volume_percent, 200);
+        assert_eq!(loaded.settings.call_sounds.volume_percent, 100);
     }
 
     #[test]

@@ -21,22 +21,20 @@
 
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    Column, Row, checkbox, column, container, pick_list, radio, row, scrollable, space, stack,
-    text, text_input,
+    Column, checkbox, column, container, pick_list, radio, row, scrollable, space, stack, text,
+    text_input,
 };
-use iced::{Background, Border, Element, Fill, Length};
+use iced::{Element, Fill, Length};
 use twicecat_core::api::{ThemeChoice, UpdateCheckChoice, UpdateMechanism};
 
 use crate::screens::{audio_settings, video_settings};
 use crate::settings::{
     DEFAULT_TEXT_SCALE, DRAG_AND_DROP_NOTE, DefaultChoice, DensityOption, INTER_ATTRIBUTION,
     INTER_NOTICES, KEYWORD_INPUT_ID, MAX_TEXT_SCALE, MIN_TEXT_SCALE, NAME_INPUT_ID, RoomListOption,
-    SESSIONS_LINE, SettingsMessage, SettingsPage, VOICE_AUDIO_LINE, Zoom,
+    SESSIONS_LINE, SettingsMessage, SettingsPage, ThemeOption, VOICE_AUDIO_LINE, Zoom,
 };
 use crate::state::{App, Message};
-use crate::theme::{self, Family};
 use crate::ui::fonts;
-use crate::ui::icons::{Icon, icon};
 use crate::ui::kit::{self, Severity, banner, modal, muted, primary_button, secondary_button};
 use crate::ui::tokens;
 use crate::updates::{self, UpdateMessage};
@@ -53,6 +51,8 @@ const CARD_PADDING: f32 = 20.0;
 pub const NAV_WIDTH: f32 = 168.0;
 /// Width of the keys column of the shortcut list.
 const KEYS_WIDTH: f32 = 160.0;
+/// Most report lines about the themes folder shown on the page.
+const MAX_THEME_REPORT_LINES: usize = 5;
 /// How text wraps on this card: a break inside a word when it has none, so a
 /// long keyword is wrapped and its end is never cut off.
 const WRAP: Wrapping = Wrapping::WordOrGlyph;
@@ -94,6 +94,7 @@ fn card(app: &App, window_height: f32) -> Element<'_, Message> {
     let header = row![
         words("Settings").size(tokens::HEADLINE).width(Fill),
         checkbox(app.ui_settings.advanced_settings)
+            .style(kit::checkbox_style)
             .label("Show advanced settings")
             .text_wrapping(WRAP)
             .on_toggle(|on| msg(SettingsMessage::Advanced(on))),
@@ -158,6 +159,7 @@ fn profile_page(app: &App) -> Element<'_, Message> {
     let can_save = ui.name_edited && !ui.profile_pending;
     let name = row![
         text_input("Display name", ui.name.expose())
+            .style(kit::text_input_style)
             .id(NAME_INPUT_ID)
             .on_input(|s| msg(SettingsMessage::NameInput(s.into())))
             .on_submit_maybe(can_save.then(|| msg(SettingsMessage::SaveName)))
@@ -235,6 +237,7 @@ fn notifications_page(app: &App) -> Element<'_, Message> {
     let typed = !ui.keyword_input.expose().trim().is_empty();
     let add = row![
         text_input("Add a keyword", ui.keyword_input.expose())
+            .style(kit::text_input_style)
             .id(KEYWORD_INPUT_ID)
             .on_input(|s| msg(SettingsMessage::KeywordInput(s.into())))
             .on_submit(msg(SettingsMessage::AddKeyword))
@@ -245,6 +248,7 @@ fn notifications_page(app: &App) -> Element<'_, Message> {
     let local = &app.ui_settings;
     let toggle = |label: &'static str, on: bool, change: fn(bool) -> SettingsMessage| {
         checkbox(on)
+            .style(kit::checkbox_style)
             .label(label)
             .text_wrapping(WRAP)
             .on_toggle(move |on| msg(change(on)))
@@ -295,18 +299,6 @@ fn appearance_page(app: &App) -> Element<'_, Message> {
             .text_wrapping(WRAP)
             .into()
     };
-    let dark = app.current_theme().extended_palette().is_dark;
-    let chosen = theme::resolve_family(app.ui_settings.palette);
-    // Two by two: four side by side would not fit the page.
-    let mut swatches = Column::new().spacing(tokens::S);
-    for pair in Family::ALL.chunks(2) {
-        let mut line = Row::new().spacing(tokens::S);
-        for family in pair {
-            line = line.push(swatch(*family, dark, *family == chosen));
-        }
-        swatches = swatches.push(line);
-    }
-    let on_default = app.ui_settings.palette.is_none();
     let scale = app.ui_settings.text_scale_percent;
     let zoom = row![
         words("Text size").width(Fill),
@@ -332,19 +324,50 @@ fn appearance_page(app: &App) -> Element<'_, Message> {
             .align_y(iced::Center)
     };
     let mut parts: Vec<Element<'_, Message>> = vec![
-        choice("Follow the system", ThemeChoice::System),
-        choice("Light", ThemeChoice::Light),
-        choice("Dark", ThemeChoice::Dark),
-        words("Colours").size(tokens::BODY).into(),
-        swatches.into(),
-        secondary_button(
-            "Use the default",
-            (!on_default).then(|| msg(SettingsMessage::Palette(None))),
+        menu_row(
+            "Theme",
+            kit::menu(pick_list(
+                app.theme_options(),
+                Some(app.selected_theme_option()),
+                |o: ThemeOption| msg(SettingsMessage::ThemePicked(o.0)),
+            )),
         )
         .into(),
-        zoom.into(),
-        note("Ctrl+= and Ctrl+- change the text size, Ctrl+0 resets it."),
     ];
+    // The choice applies only to a theme that comes as a light and a dark
+    // file; a theme with one look is shown as it is, with nothing here.
+    if app.selected_is_paired() {
+        parts.push(choice("Follow the system", ThemeChoice::System));
+        parts.push(choice("Light", ThemeChoice::Light));
+        parts.push(choice("Dark", ThemeChoice::Dark));
+    }
+    parts.push(
+        row![
+            secondary_button(
+                "Reload themes",
+                (!app.themes_loading).then(|| msg(SettingsMessage::ReloadThemes)),
+            ),
+            secondary_button(
+                "Open themes folder",
+                Some(msg(SettingsMessage::OpenThemesFolder)),
+            ),
+        ]
+        .spacing(tokens::S)
+        .into(),
+    );
+    if app.themes_loading {
+        parts.push(note("Reading the themes folder\u{2026}"));
+    }
+    if let Some(line) = app.theme_fallback() {
+        parts.push(banner(Severity::Warning, line));
+    }
+    if let Some(loaded) = &app.themes {
+        parts.extend(loaded.shown(MAX_THEME_REPORT_LINES).into_iter().map(note));
+    }
+    parts.push(zoom.into());
+    parts.push(note(
+        "Ctrl+= and Ctrl+- change the text size, Ctrl+0 resets it.",
+    ));
     if app.ui_settings.advanced_settings {
         parts.push(kit::divider());
         parts.push(
@@ -371,60 +394,6 @@ fn appearance_page(app: &App) -> Element<'_, Message> {
         );
     }
     page_of("Appearance", parts)
-}
-
-/// One colour set as a button: samples of its accent, surface and text, the
-/// name, and a check and an outline when it is the one in use.
-fn swatch<'a>(family: Family, dark: bool, selected: bool) -> Element<'a, Message> {
-    let colours = theme::palette(family, dark);
-    let sem = theme::semantic_of(family, dark);
-    let sample = move |color: iced::Color| {
-        container(space().width(18).height(18)).style(move |_: &iced::Theme| container::Style {
-            background: Some(Background::Color(color)),
-            border: Border {
-                color: sem.border,
-                width: 1.0,
-                radius: tokens::SMALL.into(),
-            },
-            ..container::Style::default()
-        })
-    };
-    let name = if family == theme::DEFAULT_FAMILY {
-        format!("{} (default)", family.label())
-    } else {
-        family.label().to_owned()
-    };
-    let mut title = Row::new().spacing(tokens::XS).align_y(iced::Center);
-    if selected {
-        title = title.push(icon::<Message>(Icon::Check));
-    }
-    title = title.push(words(name).size(tokens::CAPTION));
-    let samples = row![
-        sample(colours.primary),
-        sample(sem.surface),
-        sample(colours.text)
-    ]
-    .spacing(tokens::XS);
-    iced::widget::button(column![samples, title].spacing(tokens::XS))
-        .padding(tokens::S)
-        .width(Fill)
-        .on_press(msg(SettingsMessage::Palette(Some(family.choice()))))
-        .style(move |theme: &iced::Theme, status| {
-            let mut style = iced::widget::button::secondary(theme, status);
-            style.background = Some(Background::Color(colours.background));
-            style.text_color = colours.text;
-            style.border = Border {
-                color: if selected {
-                    theme.palette().primary
-                } else {
-                    sem.border
-                },
-                width: if selected { 3.0 } else { 1.0 },
-                radius: tokens::MEDIUM.into(),
-            };
-            style
-        })
-        .into()
 }
 
 fn voice_audio_page(app: &App) -> Element<'_, Message> {
@@ -482,6 +451,7 @@ fn about_page(app: &App) -> Element<'_, Message> {
     let updates: Vec<Element<'_, Message>> = match app.updates.mechanism {
         UpdateMechanism::CheckAndLink | UpdateMechanism::AppImage => vec![
             checkbox(app.ui_settings.update_check == UpdateCheckChoice::On)
+                .style(kit::checkbox_style)
                 .label(updates::TOGGLE)
                 .text_wrapping(WRAP)
                 .on_toggle(|on| Message::Update(UpdateMessage::Choose(on)))

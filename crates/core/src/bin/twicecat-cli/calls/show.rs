@@ -370,6 +370,7 @@ mod tests {
         s.call_sounds.volume_percent = 40;
         let lines = describe(&s, &devices);
         assert_eq!(lines[7], "Call sounds on (others joining, leaving), 40 %.");
+        s.call_sounds.volume_percent = 40;
         s.call_sounds.leaving = false;
         assert_eq!(
             describe(&s, &devices)[7],

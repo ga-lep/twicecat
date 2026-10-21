@@ -1466,6 +1466,12 @@ fn voice_others() -> App {
     })
 }
 
+fn voice_ringtone_sounds_off() -> App {
+    voice_page_with(AudioPage::Ringtone, true, gpu_found(), |settings, _| {
+        settings.call_sounds.enabled = false;
+    })
+}
+
 fn voice_diagnostics() -> App {
     let mut app = voice_page(AudioPage::Diagnostics);
     press(&mut app, Message::Audio(AudioMessage::Diagnostics));
@@ -1530,6 +1536,66 @@ fn settings_appearance() -> App {
 
 fn settings_notifications() -> App {
     settings_page(SettingsPage::Notifications)
+}
+
+/// The themes folder the tests share: Daylight, the Duo pair, Faint and Paper.
+fn theme_fixtures() -> twicecat_app::themes::Loaded {
+    twicecat_app::themes::load_dir(std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/themes"
+    )))
+}
+
+/// A report line for a file that was refused.
+fn refused_line(name: &str) -> twicecat_app::themes::ReportLine {
+    use twicecat_app::theme::Refusal;
+    use twicecat_app::themes::{FileProblem, Note, ReportLine};
+    ReportLine {
+        name: Some(name.to_owned()),
+        note: Note::Problem(FileProblem::Refused(Refusal::MixedBackgrounds)),
+    }
+}
+
+/// The Appearance page with the fixture themes read and `selected` stored.
+fn themes_page(selected: Option<&str>, mode: iced::theme::Mode) -> App {
+    let mut app = settings_appearance();
+    let mut settings = app.ui_settings;
+    settings.theme_name =
+        selected.map(|n| twicecat_core::api::ThemeName::try_from(n).expect("a valid name"));
+    app.set_ui_settings(settings);
+    press(&mut app, Message::ThemeMode(mode));
+    let mut loaded = theme_fixtures();
+    loaded.report.push(refused_line("Mixed"));
+    app.set_themes(loaded);
+    app
+}
+
+/// Daylight selected; the menu lists the four themes; the report has an
+/// adjusted file and a refused one.
+fn settings_appearance_themes() -> App {
+    themes_page(Some("Daylight"), iced::theme::Mode::Dark)
+}
+
+/// Duo selected with the stored choice System, the system in light mode.
+fn settings_appearance_pair() -> App {
+    themes_page(Some("Duo"), iced::theme::Mode::Light)
+}
+
+/// The same pair, the system in dark mode.
+fn settings_appearance_pair_dark() -> App {
+    themes_page(Some("Duo"), iced::theme::Mode::Dark)
+}
+
+/// The selected theme was refused: Twicecat is shown, with the reason.
+fn settings_appearance_fallback() -> App {
+    themes_page(Some("Mixed"), iced::theme::Mode::Dark)
+}
+
+/// A read of the themes folder is running.
+fn settings_appearance_loading() -> App {
+    let mut app = themes_page(Some("Daylight"), iced::theme::Mode::Dark);
+    press(&mut app, Message::Settings(SettingsMessage::ReloadThemes));
+    app
 }
 
 /// Keywords that are long and have no break point, and a save that failed.
@@ -3333,6 +3399,18 @@ pub fn scenarios() -> Vec<Scenario> {
             || voice_page(AudioPage::Ringtone),
             |a| a.audio_ui.page == AudioPage::Ringtone,
         ),
+        s(
+            "audio-ringtone-sounds-off",
+            false,
+            voice_ringtone_sounds_off,
+            |a| {
+                a.audio_ui.page == AudioPage::Ringtone
+                    && a.calls
+                        .settings
+                        .as_ref()
+                        .is_some_and(|s| !s.call_sounds.enabled)
+            },
+        ),
         s("audio-other-voices", false, voice_others, |a| {
             a.audio_ui.page == AudioPage::OtherVoices
                 && a.calls
@@ -3378,6 +3456,36 @@ pub fn scenarios() -> Vec<Scenario> {
         s("settings-appearance", false, settings_appearance, |a| {
             a.settings_ui.open && a.settings_ui.page == SettingsPage::Appearance
         }),
+        s(
+            "settings-appearance-themes",
+            false,
+            settings_appearance_themes,
+            |a| a.settings_ui.page == SettingsPage::Appearance && a.theme_fallback().is_none(),
+        ),
+        s(
+            "settings-appearance-pair",
+            false,
+            settings_appearance_pair,
+            |a| a.selected_is_paired(),
+        ),
+        s(
+            "settings-appearance-pair-dark",
+            false,
+            settings_appearance_pair_dark,
+            |a| a.selected_is_paired(),
+        ),
+        s(
+            "settings-appearance-fallback",
+            false,
+            settings_appearance_fallback,
+            |a| a.theme_fallback().is_some(),
+        ),
+        s(
+            "settings-appearance-loading",
+            false,
+            settings_appearance_loading,
+            |a| a.themes_loading,
+        ),
         s(
             "settings-notifications",
             false,

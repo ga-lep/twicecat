@@ -614,6 +614,7 @@ fn picker(app: &App) -> Option<Element<'_, Message>> {
         .spacing(tokens::S)
         .align_y(iced::Center),
         checkbox(picker.audio)
+            .style(kit::checkbox_style)
             .label("Share the sound of the screen too")
             .text_wrapping(Wrapping::WordOrGlyph)
             .on_toggle(|on| msg(VideoMessage::ShareAudio(on))),

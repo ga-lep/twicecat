@@ -842,6 +842,7 @@ fn picker_panel(picker: &Picker) -> Element<'_, Message> {
         column![
             row![
                 text_input("Search emoji", &picker.query)
+                    .style(kit::text_input_style)
                     .id(actions::PICKER_INPUT_ID)
                     .on_input(|query| Message::PickerQuery(MessageText::from(query)))
                     .on_submit(Message::PickerSubmitted),

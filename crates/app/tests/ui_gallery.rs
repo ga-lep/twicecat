@@ -28,31 +28,38 @@ use iced::{Element, Event, Pixels, Rectangle, Renderer, Size, window};
 use twicecat_app::ui::fonts;
 use twicecat_app::{App, Message};
 use twicecat_core::api::{
-    DensityChoice, PaletteChoice, RoomListChoice, ThemeChoice, UiSettings, UpdateCheckChoice,
+    DensityChoice, RoomListChoice, ThemeChoice, ThemeName, UiSettings, UpdateCheckChoice,
 };
 
 const WIDE: Size = Size::new(1280.0, 800.0);
 const NARROW: Size = Size::new(720.0, 800.0);
 const SIZES: [Size; 2] = [WIDE, NARROW];
 
-const FAMILIES: [(PaletteChoice, &str); 4] = [
-    (PaletteChoice::Twicecat, "twicecat"),
-    (PaletteChoice::Frost, "frost"),
-    (PaletteChoice::Ember, "ember"),
-    (PaletteChoice::HighContrast, "high-contrast"),
+/// The themes the gallery draws, as (stored mode choice, tag): the built-in
+/// Twicecat and the light example Daylight, which is read from
+/// `tests/fixtures/themes`. Both have one look, so the choice does not change
+/// what is drawn.
+const THEMES: [(ThemeChoice, &str); 2] = [
+    (ThemeChoice::System, "twicecat"),
+    (ThemeChoice::System, "daylight"),
 ];
-const MODES: [(ThemeChoice, &str); 2] =
-    [(ThemeChoice::Light, "light"), (ThemeChoice::Dark, "dark")];
+
+/// The folder of the example themes.
+const THEME_FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/themes");
+
+/// The stored theme name a theme tag stands for; Twicecat is no name.
+fn stored_theme(tag: &str) -> Option<ThemeName> {
+    (tag == "daylight").then(|| ThemeName::try_from("Daylight").expect("a valid name"))
+}
 const DENSITIES: [(DensityChoice, &str); 2] = [
     (DensityChoice::Comfortable, "comfortable"),
     (DensityChoice::Compact, "compact"),
 ];
 
-/// One combination of colour set, mode, density and room list.
+/// One combination of theme, density and room list.
 #[derive(Clone, Copy)]
 struct Variant {
-    family: (PaletteChoice, &'static str),
-    mode: (ThemeChoice, &'static str),
+    theme: (ThemeChoice, &'static str),
     density: (DensityChoice, &'static str),
     list: RoomListChoice,
 }
@@ -63,14 +70,26 @@ fn apply(app: &mut App, variant: Variant) {
     settings.advanced_settings = app.ui_settings.advanced_settings;
     // The scenario's answer to the update question (its bar or none).
     settings.update_check = app.ui_settings.update_check;
+    // A scenario that picked a theme of its own keeps it; the theme variants
+    // only replace Twicecat and Daylight.
+    if let Some(own) = app.ui_settings.theme_name
+        && stored_theme("daylight") != Some(own)
+    {
+        settings.theme_name = Some(own);
+    }
+    if app.themes.is_none() {
+        app.set_themes(twicecat_app::themes::load_dir(std::path::Path::new(
+            THEME_FIXTURES,
+        )));
+    }
     app.set_ui_settings(settings);
 }
 
 impl Variant {
     fn settings(self) -> UiSettings {
         UiSettings {
-            theme: self.mode.0,
-            palette: Some(self.family.0),
+            theme: self.theme.0,
+            theme_name: stored_theme(self.theme.1),
             density: self.density.0,
             room_list: self.list,
             // Answered: no update question bar over the screens.
@@ -79,19 +98,19 @@ impl Variant {
         }
     }
 
-    /// `<family>-<mode>-<density>` plus `-rail` for the collapsed room list.
+    /// `<theme>-<density>` plus `-rail` for the collapsed room list.
     fn tag(self) -> String {
         let rail = if self.list == RoomListChoice::Rail {
             "-rail"
         } else {
             ""
         };
-        format!("{}-{}-{}{rail}", self.family.1, self.mode.1, self.density.1)
+        format!("{}-{}{rail}", self.theme.1, self.density.1)
     }
 }
 
-/// Every variant of a screen: all 16, and 16 more with the rail for the
-/// screens that show the room list.
+/// Every variant of a screen: each theme at both densities, and again with
+/// the rail for the screens that show the room list.
 fn variants(room_list: bool) -> Vec<Variant> {
     let lists: &[RoomListChoice] = if room_list {
         &[RoomListChoice::Expanded, RoomListChoice::Rail]
@@ -100,16 +119,13 @@ fn variants(room_list: bool) -> Vec<Variant> {
     };
     let mut all = Vec::new();
     for &list in lists {
-        for mode in MODES {
-            for density in DENSITIES {
-                for family in FAMILIES {
-                    all.push(Variant {
-                        family,
-                        mode,
-                        density,
-                        list,
-                    });
-                }
+        for density in DENSITIES {
+            for theme in THEMES {
+                all.push(Variant {
+                    theme,
+                    density,
+                    list,
+                });
             }
         }
     }
@@ -206,7 +222,7 @@ fn gallery_dir() -> PathBuf {
     }
 }
 
-/// `index.html`: a plain `<img>` grid, one column per colour set, no scripts
+/// `index.html`: a plain `<img>` grid, one column per theme, no scripts
 /// and nothing remote. `shots` are `(screen, [(variant tag, file)])`.
 fn index_html(shots: &[(&str, Vec<(String, String)>)]) -> String {
     let mut html = String::from(
@@ -224,30 +240,28 @@ fn index_html(shots: &[(&str, Vec<(String, String)>)]) -> String {
         html.push_str(&format!(
             "<h2 id=\"{screen}\">{screen}</h2>\n<table>\n<tr class=\"families\"><th></th>"
         ));
-        for (_, name) in FAMILIES {
+        for (_, name) in THEMES {
             html.push_str(&format!("<th>{name}</th>"));
         }
         html.push_str("</tr>\n");
-        for mode in MODES {
-            for density in DENSITIES {
-                for rail in [false, true] {
-                    let suffix = if rail { "-rail" } else { "" };
-                    let row = format!("{}-{}{suffix}", mode.1, density.1);
-                    let cells: Vec<String> = FAMILIES
-                        .iter()
-                        .filter_map(|(_, family)| {
-                            let tag = format!("{family}-{row}");
-                            files.iter().find(|(t, _)| *t == tag).map(|(_, file)| {
-                                format!(
-                                    "<td><a href=\"{file}\"><img src=\"{file}\" \
-                                     alt=\"{screen} {tag}\" loading=\"lazy\"></a></td>"
-                                )
-                            })
+        for density in DENSITIES {
+            for rail in [false, true] {
+                let suffix = if rail { "-rail" } else { "" };
+                let row = format!("{}{suffix}", density.1);
+                let cells: Vec<String> = THEMES
+                    .iter()
+                    .filter_map(|(_, theme)| {
+                        let tag = format!("{theme}-{row}");
+                        files.iter().find(|(t, _)| *t == tag).map(|(_, file)| {
+                            format!(
+                                "<td><a href=\"{file}\"><img src=\"{file}\" \
+                                 alt=\"{screen} {tag}\" loading=\"lazy\"></a></td>"
+                            )
                         })
-                        .collect();
-                    if cells.len() == FAMILIES.len() {
-                        html.push_str(&format!("<tr><th>{row}</th>{}</tr>\n", cells.concat()));
-                    }
+                    })
+                    .collect();
+                if cells.len() == THEMES.len() {
+                    html.push_str(&format!("<tr><th>{row}</th>{}</tr>\n", cells.concat()));
                 }
             }
         }
@@ -328,11 +342,17 @@ fn the_fixture_reaches_every_screen_it_names() {
         "audio-levels",
         "audio-mic-test",
         "audio-ringtone",
+        "audio-ringtone-sounds-off",
         "audio-other-voices",
         "audio-announce",
         "audio-diagnostics",
         "settings",
         "settings-appearance",
+        "settings-appearance-themes",
+        "settings-appearance-pair",
+        "settings-appearance-pair-dark",
+        "settings-appearance-fallback",
+        "settings-appearance-loading",
         "settings-notifications",
         "settings-voice-audio",
         "settings-video",
@@ -550,27 +570,24 @@ fn the_index_is_a_plain_image_grid() {
     assert!(!html.contains("<script"));
     assert!(!html.contains("http"));
     assert!(!html.contains("javascript"));
-    for (_, family) in FAMILIES {
-        assert!(html.contains(&format!("<th>{family}</th>")), "{family}");
+    for (_, theme) in THEMES {
+        assert!(html.contains(&format!("<th>{theme}</th>")), "{theme}");
     }
-    assert_eq!(html.matches("<img ").count(), 16);
-    assert_eq!(
-        html.matches("<tr><th>").count(),
-        4,
-        "one row per mode x density"
-    );
+    assert_eq!(html.matches("<img ").count(), 4);
+    assert_eq!(html.matches("<tr><th>").count(), 2, "one row per density");
 }
 
 #[test]
 fn variant_tags_are_file_name_safe() {
     let all = variants(true);
-    assert_eq!(all.len(), 32);
+    assert_eq!(all.len(), 8);
     let mut tags: Vec<String> = all.iter().map(|v| v.tag()).collect();
     tags.sort_unstable();
     tags.dedup();
-    assert_eq!(tags.len(), 32);
-    assert!(tags.contains(&"frost-dark-compact-rail".to_owned()));
-    assert!(tags.contains(&"high-contrast-light-comfortable".to_owned()));
+    assert_eq!(tags.len(), 8);
+    assert!(tags.contains(&"daylight-comfortable-rail".to_owned()));
+    assert!(tags.contains(&"twicecat-compact-rail".to_owned()));
+    assert!(tags.contains(&"twicecat-comfortable".to_owned()));
 }
 
 /// Writes the gallery. Run on purpose:
@@ -1433,9 +1450,13 @@ fn ctrl_wheel_over_the_menus_of_the_settings_and_call_screens_changes_nothing() 
         "audio-microphone-gpu-found",
         "audio-levels",
         "audio-mic-test",
+        "audio-ringtone",
+        "audio-ringtone-sounds-off",
         "audio-other-voices",
         "settings",
         "settings-appearance",
+        "settings-appearance-themes",
+        "settings-appearance-pair",
         "settings-notifications",
         "sessions",
         "sessions-confirm-all",
@@ -1535,6 +1556,7 @@ fn dock_lines(dock: &Node) -> &[Node] {
 
 fn with_settings(app: &mut App, density: (DensityChoice, &str), list: RoomListChoice) {
     let mut settings = variants(false)[0].settings();
+    settings.theme_name = app.ui_settings.theme_name;
     settings.density = density.0;
     settings.room_list = list;
     settings.advanced_settings = app.ui_settings.advanced_settings;
@@ -2063,7 +2085,7 @@ fn leave_sends_once_and_is_off_while_a_leave_or_join_waits() {
 
 mod audio {
     use super::*;
-    use twicecat_app::audio_settings::{AudioMessage, AudioPage};
+    use twicecat_app::audio_settings::{AudioMessage, AudioPage, Slider};
     use twicecat_app::screens::audio_settings::NAV_WIDTH;
     use twicecat_core::api::{AudioSettings, CoreEvent, InputMode};
 
@@ -2124,7 +2146,7 @@ mod audio {
         }
     }
 
-    const PAGE_SCENARIOS: [&str; 16] = [
+    const PAGE_SCENARIOS: [&str; 17] = [
         "audio-devices",
         "audio-talking",
         "audio-talking-capturing",
@@ -2137,6 +2159,7 @@ mod audio {
         "audio-levels-loud",
         "audio-mic-test",
         "audio-ringtone",
+        "audio-ringtone-sounds-off",
         "audio-other-voices",
         "audio-announce",
         "audio-diagnostics",
@@ -2369,6 +2392,7 @@ mod audio {
             (AudioPage::Levels, "audio-levels"),
             (AudioPage::MicTest, "audio-mic-test"),
             (AudioPage::Ringtone, "audio-ringtone"),
+            (AudioPage::Ringtone, "audio-ringtone-sounds-off"),
             (AudioPage::OtherVoices, "audio-other-voices"),
             (AudioPage::Announce, "audio-announce"),
             (AudioPage::Diagnostics, "audio-diagnostics"),
@@ -2433,6 +2457,47 @@ mod audio {
             missing.is_empty(),
             "no click sent {missing:?}; saw {seen:?}"
         );
+    }
+
+    #[test]
+    fn the_call_sounds_controls_are_live_only_while_the_master_switch_is_on() {
+        let renderer = renderer();
+        let volume = |m: &AudioMessage| {
+            matches!(
+                m,
+                AudioMessage::Slide(Slider::CallSoundsVolume, _)
+                    | AudioMessage::Step(Slider::CallSoundsVolume, _)
+            )
+        };
+        let on = clicked(&page_app("audio-ringtone"), &renderer);
+        for (what, found) in [
+            ("master", on.contains(&AudioMessage::CallSounds(false))),
+            (
+                "others joining",
+                on.contains(&AudioMessage::OthersJoining(false)),
+            ),
+            ("leaving", on.contains(&AudioMessage::LeavingSound(false))),
+            ("volume", on.iter().any(volume)),
+        ] {
+            assert!(found, "{what} sends nothing with the sounds on: {on:?}");
+        }
+        assert!(
+            on.iter()
+                .filter(|m| matches!(m, AudioMessage::Step(Slider::CallSoundsVolume, _)))
+                .count()
+                >= 1
+        );
+        let off = clicked(&page_app("audio-ringtone-sounds-off"), &renderer);
+        assert!(off.contains(&AudioMessage::CallSounds(true)), "{off:?}");
+        for message in &off {
+            assert!(
+                !matches!(
+                    message,
+                    AudioMessage::OthersJoining(_) | AudioMessage::LeavingSound(_)
+                ) && !volume(message),
+                "a disabled control sends {message:?}"
+            );
+        }
     }
 
     #[test]
@@ -2997,7 +3062,7 @@ mod settings_pages {
     use super::*;
 
     /// Every page at the simple level, then at the advanced one.
-    const PAGE_SCENARIOS: [(&str, SettingsPage); 15] = [
+    const PAGE_SCENARIOS: [(&str, SettingsPage); 20] = [
         ("settings", SettingsPage::Profile),
         ("settings-appearance", SettingsPage::Appearance),
         ("settings-notifications", SettingsPage::Notifications),
@@ -3016,6 +3081,11 @@ mod settings_pages {
         ("settings-video-advanced", SettingsPage::Video),
         ("settings-video-advanced-call", SettingsPage::Video),
         ("settings-notifications-long", SettingsPage::Notifications),
+        ("settings-appearance-themes", SettingsPage::Appearance),
+        ("settings-appearance-pair", SettingsPage::Appearance),
+        ("settings-appearance-pair-dark", SettingsPage::Appearance),
+        ("settings-appearance-fallback", SettingsPage::Appearance),
+        ("settings-appearance-loading", SettingsPage::Appearance),
     ];
 
     /// A scenario with the switch on.
@@ -3033,6 +3103,7 @@ mod settings_pages {
     fn page_app(name: &str) -> App {
         let mut app = scenario_app(name);
         let mut settings = variants(false)[0].settings();
+        settings.theme_name = app.ui_settings.theme_name;
         settings.advanced_settings = is_advanced(name);
         app.set_ui_settings(settings);
         app.window_width = WIDE.width;
@@ -3123,73 +3194,91 @@ mod settings_pages {
         assert!(tall >= 2, "only {tall} tall pages: the check did not run");
     }
 
-    #[test]
-    fn the_four_colour_sets_fit_the_page_without_spilling() {
-        // The swatches are two by two: all four are on screen, none past the
-        // page, in the narrowest card.
-        let renderer = renderer();
-        let mut app = page_app("settings-appearance");
-        app.window_width = NARROW.width;
-        let mut laid = Laid::new(&app, &renderer, NARROW);
-        let shown = texts(&mut laid, &renderer);
-        for label in ["Twicecat", "Frost", "Ember", "High contrast"] {
-            assert!(
-                shown.iter().any(|(t, _)| t.starts_with(label)),
-                "no swatch named {label}"
-            );
-        }
-    }
-
-    fn swatch_names(app: &App) -> Vec<String> {
+    /// What the Appearance page says, at the narrowest card.
+    fn appearance_texts(app: &App) -> Vec<String> {
         let renderer = renderer();
         let mut laid = Laid::new(app, &renderer, NARROW);
         texts(&mut laid, &renderer)
             .into_iter()
             .map(|(t, _)| t)
-            .filter(|t| {
-                ["Twicecat", "Frost", "Ember", "High contrast"]
-                    .iter()
-                    .any(|l| t.starts_with(l))
-            })
             .collect()
     }
 
     #[test]
-    fn the_swatch_marked_default_is_frost() {
-        let mut app = page_app("settings-appearance");
-        app.window_width = NARROW.width;
-        let mut settings = app.ui_settings;
-        settings.palette = None;
-        app.set_ui_settings(settings);
-        let names = swatch_names(&app);
-        assert!(names.contains(&"Frost (default)".to_owned()), "{names:?}");
-        assert_eq!(
-            names.iter().filter(|n| n.contains("(default)")).count(),
-            1,
-            "{names:?}"
-        );
+    fn the_appearance_page_names_the_theme_and_has_no_swatches_or_mode_radios() {
+        for choice in [ThemeChoice::System, ThemeChoice::Light, ThemeChoice::Dark] {
+            let mut app = page_app("settings-appearance");
+            app.window_width = NARROW.width;
+            let mut settings = app.ui_settings;
+            settings.theme = choice;
+            app.set_ui_settings(settings);
+            let shown = appearance_texts(&app);
+            assert!(shown.contains(&"Theme".to_owned()), "{shown:?}");
+            assert_eq!(
+                app.selected_theme_option().to_string(),
+                "Twicecat (default)"
+            );
+            assert!(
+                !shown.iter().any(|t| t.to_lowercase().contains("dark")),
+                "{choice:?}: the page says something about dark: {shown:?}"
+            );
+            assert!(
+                !shown.iter().any(|t| t.starts_with("This theme")),
+                "{choice:?}: a note for a single-look theme: {shown:?}"
+            );
+            for gone in [
+                "Frost",
+                "Ember",
+                "High contrast",
+                "Colours",
+                "Use the default",
+                "Follow the system",
+                "Light",
+                "Dark",
+            ] {
+                assert!(
+                    !shown.iter().any(|t| t.starts_with(gone)),
+                    "{choice:?}: {gone:?} is still on the page: {shown:?}"
+                );
+            }
+            // The radios are not drawn, so nothing sends a Theme message.
+            let renderer = renderer();
+            for message in clicked(&app, &renderer) {
+                assert_ne!(message.name(), "Theme", "{choice:?}");
+            }
+        }
     }
 
     #[test]
-    fn a_settings_file_with_an_explicit_twicecat_palette_still_shows_twicecat() {
-        let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("ui17-explicit-palette");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let paths = twicecat_core::paths::DataPaths::at(&dir);
-        std::fs::write(paths.settings_file(), r#"{"palette":"Twicecat"}"#).expect("write");
-        let read = paths.read_settings();
-        let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(read.palette, Some(PaletteChoice::Twicecat));
-        let mut app = page_app("settings-appearance");
-        app.window_width = NARROW.width;
-        app.set_ui_settings(read);
-        assert_eq!(
-            twicecat_app::theme::resolve_family(read.palette),
-            twicecat_app::theme::Family::Twicecat
-        );
-        let names = swatch_names(&app);
-        assert!(names.contains(&"Twicecat".to_owned()), "{names:?}");
-        assert!(names.contains(&"Frost (default)".to_owned()), "{names:?}");
+    fn a_settings_file_with_an_older_palette_shows_twicecat() {
+        for palette in ["Twicecat", "Frost", "Ember", "HighContrast", "Bogus"] {
+            let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+                .join(format!("thm1-old-palette-{palette}"));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            let paths = twicecat_core::paths::DataPaths::at(&dir);
+            std::fs::write(
+                paths.settings_file(),
+                format!(r#"{{"palette":"{palette}","theme":"Light"}}"#),
+            )
+            .expect("write");
+            let read = paths.read_settings();
+            let _ = std::fs::remove_dir_all(&dir);
+            let mut app = page_app("settings-appearance");
+            app.window_width = NARROW.width;
+            app.set_ui_settings(read);
+            let theme = app.current_theme();
+            assert_eq!(theme.to_string(), "Twicecat", "{palette}");
+            assert_eq!(
+                theme.palette(),
+                twicecat_app::theme::built_in().palette(),
+                "{palette}"
+            );
+            assert_eq!(
+                app.selected_theme_option().to_string(),
+                "Twicecat (default)"
+            );
+        }
     }
 
     #[test]
@@ -3293,6 +3382,80 @@ mod settings_pages {
         shown.iter().any(|t| t.starts_with(wanted))
     }
 
+    /// The light/dark choices a click on the page's radios sends. A radio
+    /// hides its label from the text walk, so the radios are found by their
+    /// clicks.
+    fn radio_choices(name: &str) -> Vec<ThemeChoice> {
+        let renderer = renderer();
+        let mut found: Vec<ThemeChoice> = clicked(&page_app(name), &renderer)
+            .into_iter()
+            .filter_map(|m| match m {
+                SettingsMessage::Theme(choice) => Some(choice),
+                _ => None,
+            })
+            .collect();
+        found.dedup();
+        found
+    }
+
+    /// The three light/dark radios are there for a paired theme and nowhere
+    /// else.
+    #[test]
+    fn the_radios_are_shown_for_the_pair_only() {
+        for name in ["settings-appearance-pair", "settings-appearance-pair-dark"] {
+            let found = radio_choices(name);
+            for want in [ThemeChoice::System, ThemeChoice::Light, ThemeChoice::Dark] {
+                assert!(found.contains(&want), "{name} lacks {want:?}: {found:?}");
+            }
+        }
+        for name in [
+            "settings-appearance",
+            "settings-appearance-themes",
+            "settings-appearance-fallback",
+            "settings-appearance-loading",
+        ] {
+            assert!(radio_choices(name).is_empty(), "{name} shows radios");
+        }
+        // Faint has one look, dark: no radios either.
+        let renderer = renderer();
+        let mut faint = page_app("settings-appearance-themes");
+        let mut settings = faint.ui_settings;
+        settings.theme_name = ThemeName::try_from("Faint").ok();
+        faint.set_ui_settings(settings);
+        assert!(!faint.selected_is_paired());
+        let sent = clicked(&faint, &renderer);
+        assert!(!sent.iter().any(|m| m.name() == "Theme"));
+    }
+
+    #[test]
+    fn the_pair_is_drawn_light_and_dark_by_the_system_mode() {
+        let light = page_app("settings-appearance-pair");
+        let dark = page_app("settings-appearance-pair-dark");
+        assert_ne!(
+            light.current_theme().palette().background,
+            dark.current_theme().palette().background
+        );
+        assert_eq!(light.ui_settings.theme, ThemeChoice::System);
+    }
+
+    #[test]
+    fn the_page_says_when_the_folder_is_being_read() {
+        assert!(has(
+            &card_texts("settings-appearance-loading"),
+            "Reading the themes folder"
+        ));
+        assert!(!has(
+            &card_texts("settings-appearance-themes"),
+            "Reading the themes folder"
+        ));
+        let fallback = card_texts("settings-appearance-fallback");
+        assert!(
+            has(&fallback, "Theme \"Mixed\" could not be used"),
+            "{fallback:?}"
+        );
+        assert!(has(&card_texts("settings-appearance-themes"), "Mixed: "));
+    }
+
     /// What only the advanced level shows, page by page: nothing of it is on
     /// the simple page, all of it is on the advanced one.
     #[test]
@@ -3339,7 +3502,7 @@ mod settings_pages {
         }
         // The simple pages keep what a person needs.
         let appearance = card_texts("settings-appearance");
-        for wanted in ["Colours", "Text size"] {
+        for wanted in ["Theme", "Reload themes", "Open themes folder", "Text size"] {
             assert!(has(&appearance, wanted), "Appearance lacks {wanted:?}");
         }
         let notifications = card_texts("settings-notifications");
@@ -3456,7 +3619,7 @@ mod settings_pages {
             "word".to_owned().into(),
         )));
         apps.push((SettingsPage::Notifications, "typed".to_owned(), typed));
-        // Appearance with a non-default colour set and a larger text: every
+        // Appearance with a larger text: every
         // button of the row is on.
         let mut zoomed = page_app("settings-appearance");
         let _ = zoomed.update(Message::Settings(SettingsMessage::Zoom(
@@ -3472,9 +3635,12 @@ mod settings_pages {
             }
         }
         // Menus open an overlay this harness does not drive; typing makes
-        // the text messages.
+        // the text messages. "Theme" is the System/Light/Dark radio, which
+        // is drawn only for a theme that comes as a light and a dark file.
         let unreachable_by_click = [
             "DefaultMode",
+            "ThemePicked",
+            "Theme",
             "Density",
             "RoomList",
             "NameInput",
@@ -4392,7 +4558,7 @@ mod dialogs {
     #[test]
     fn the_buttons_that_confirm_a_question_are_drawn_red_and_the_others_are_not() {
         let renderer = renderer();
-        for variant in variants(false).iter().step_by(5) {
+        for variant in variants(false).iter() {
             for (asking, _, confirm, cancel, _) in QUESTIONS {
                 let mut app = scenario_app(asking);
                 apply(&mut app, *variant);
@@ -5469,7 +5635,7 @@ mod security_screens {
     #[test]
     fn the_red_buttons_are_red_and_cancel_is_not() {
         let renderer = renderer();
-        for variant in variants(false).iter().step_by(5) {
+        for variant in variants(false).iter() {
             for (asking, _, confirm, cancel, _) in QUESTIONS {
                 let mut app = scenario_app(asking);
                 apply(&mut app, *variant);

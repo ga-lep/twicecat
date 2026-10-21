@@ -30,11 +30,15 @@ use twicecat_core::secrets::InMemorySecretStore;
 const RATE: f32 = 48_000.0;
 const E5: f32 = 659.25;
 const A5: f32 = 880.0;
+const G5: f32 = 784.0;
 /// One analysis window: 10 ms.
 const WINDOW: usize = 480;
 /// A note is heard above this amplitude (-38 dBFS; the cue peaks at 0.06 at
 /// the default 60 %).
 const HEARD: f32 = 0.012;
+/// A blip is heard above this amplitude (-48 dBFS; it peaks at 0.03 at the
+/// default 60 %).
+const BLIP_HEARD: f32 = 0.004;
 /// "No cue energy": below -60 dBFS.
 const SILENT: f32 = 0.001;
 
@@ -136,6 +140,33 @@ fn bursts(played: &[f32]) -> Vec<Burst> {
     }
     close(&mut notes);
     out
+}
+
+/// How many separate G5 blips (the cue for another person joining) are in
+/// `played`: runs of 10 ms windows with G5 energy, separated by 100 ms of
+/// none. Only meaningful where no chime plays (A5 leaks into G5).
+fn blips(played: &[f32]) -> usize {
+    let mut count = 0;
+    let mut quiet = 10;
+    for window in played.chunks_exact(WINDOW) {
+        if level(window, G5) > BLIP_HEARD {
+            if quiet >= 10 {
+                count += 1;
+            }
+            quiet = 0;
+        } else {
+            quiet += 1;
+        }
+    }
+    count
+}
+
+/// The loudest G5 amplitude in any 10 ms window of `played`.
+fn blip_level(played: &[f32]) -> f32 {
+    played
+        .chunks_exact(WINDOW)
+        .map(|w| level(w, G5))
+        .fold(0.0, f32::max)
 }
 
 /// The loudest cue note in any 10 ms window of `played`.
@@ -641,6 +672,56 @@ async fn the_cue_never_reaches_the_room() {
         loudest < SILENT,
         "carol heard cue energy {loudest:.5} from the room"
     );
+
+    finish(&[&alice, &carol]).await;
+}
+
+/// Carol is in the call; alice joins. Carol's speaker plays one blip (G5),
+/// alice's plays only her own rising cue, and alice's repeat `JoinCall`
+/// makes no blip for carol. Microphones are silent, so the blip is local.
+#[tokio::test]
+#[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
+async fn other_joins_play_one_blip_to_the_others_only() {
+    let env = TestEnv::load();
+    let room_id = shared_room(&env).await;
+    let (a, c) = (Arc::new(Speaker::default()), Arc::new(Speaker::default()));
+    let (dir_a, dir_c) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let mut alice = logged_in(dir_a.path(), 1, &a, None).await;
+    let mut carol = logged_in(dir_c.path(), 3, &c, None).await;
+    wait_for_room(&mut alice, &room_id).await;
+    wait_for_room(&mut carol, &room_id).await;
+
+    join(&mut carol, &room_id).await;
+    settle().await;
+    assert_eq!(bursts(&c.since(0)), [Burst::Rising], "carol's own cue");
+    let carol_mark = c.len();
+
+    join(&mut alice, &room_id).await;
+    // Carol learns of alice by sync, then the blip plays.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    settle().await;
+    let heard = c.since(carol_mark);
+    assert_eq!(blips(&heard), 1, "carol hears one blip when alice joins");
+    assert!(blip_level(&heard) > 0.01, "and it is audible");
+    assert!(
+        bursts(&heard).is_empty(),
+        "and no chime: {:?}",
+        bursts(&heard)
+    );
+    assert_eq!(
+        bursts(&a.since(0)),
+        [Burst::Rising],
+        "alice hears her own rising cue only"
+    );
+
+    // Alice's repeat join is `Connected` and nothing else: no blip.
+    let carol_mark = c.len();
+    let alice_mark = a.len();
+    join(&mut alice, &room_id).await;
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    assert_eq!(blips(&c.since(carol_mark)), 0, "a repeat join made a blip");
+    assert!(cue_level(&c.since(carol_mark)) < SILENT);
+    assert!(cue_level(&a.since(alice_mark)) < SILENT);
 
     finish(&[&alice, &carol]).await;
 }

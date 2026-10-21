@@ -27,11 +27,14 @@ pub mod screens;
 pub mod security;
 pub mod sessions;
 pub mod settings;
+#[cfg(test)]
+mod source_scan;
 pub mod spaces;
 pub mod state;
 pub mod switcher;
 pub mod text_safety;
 pub mod theme;
+pub mod themes;
 pub mod threads;
 pub mod timeline;
 pub mod tray;

@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::api::{
-    DensityChoice, PaletteChoice, RoomListChoice, ThemeChoice, UiSettings, UpdateCheckChoice,
+    DensityChoice, RoomListChoice, ThemeChoice, ThemeName, UiSettings, UpdateCheckChoice,
 };
 
 /// Largest settings file read (64 KiB); anything bigger is treated as corrupt.
@@ -30,13 +30,9 @@ fn settings_from_map(map: &serde_json::Map<String, serde_json::Value>) -> UiSett
         desktop_notifications: flag("desktop_notifications", defaults.desktop_notifications),
         show_message_content: flag("show_message_content", defaults.show_message_content),
         tray_badge: flag("tray_badge", defaults.tray_badge),
-        palette: match text("palette") {
-            Some("Twicecat") => Some(PaletteChoice::Twicecat),
-            Some("Frost") => Some(PaletteChoice::Frost),
-            Some("Ember") => Some(PaletteChoice::Ember),
-            Some("HighContrast") => Some(PaletteChoice::HighContrast),
-            _ => None,
-        },
+        // The older `palette` key is ignored; a name that fails the rules is
+        // the built-in theme.
+        theme_name: text("theme_name").and_then(|name| ThemeName::try_from(name).ok()),
         density: match text("density") {
             Some("Compact") => DensityChoice::Compact,
             Some("Comfortable") => DensityChoice::Comfortable,
@@ -138,23 +134,43 @@ fn read_capped_regular_file(path: &Path) -> Option<Vec<u8>> {
 #[derive(Debug, Clone)]
 pub struct DataPaths {
     root: PathBuf,
+    themes: PathBuf,
 }
 
 impl DataPaths {
     /// Uses the OS data directory; `None` if it cannot be determined.
     pub fn from_os() -> Option<Self> {
         let dirs = directories::ProjectDirs::from("io.github", "ga_lep", "Twicecat")?;
-        Some(Self::at(dirs.data_dir()))
+        Some(Self {
+            root: dirs.data_dir().to_path_buf(),
+            themes: dirs.config_dir().join("themes"),
+        })
     }
 
     /// Uses `root` as the data directory (tests, `--data-dir`).
     pub fn at(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        let root = root.into();
+        let themes = root.join("themes");
+        Self { root, themes }
     }
 
     /// The data root.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Where custom theme files are read from: `<root>/themes` for
+    /// [`DataPaths::at`], and `themes` in the OS config directory for
+    /// [`DataPaths::from_os`]. Nothing is created by asking.
+    pub fn themes_dir(&self) -> &Path {
+        &self.themes
+    }
+
+    /// Creates the themes folder (and its parents) and returns it. On Unix
+    /// every directory created gets mode 0o700.
+    pub fn create_themes_dir(&self) -> std::io::Result<PathBuf> {
+        create_private_dir_all(&self.themes)?;
+        Ok(self.themes.clone())
     }
 
     /// `<root>/sessions/<session_id>/`.
@@ -289,16 +305,10 @@ impl DataPaths {
             },
             "update_checked_at": settings.update_checked_at,
         });
-        // No key while `None`, so a later change of the app's default reaches
-        // this user.
-        if let (Some(palette), Some(map)) = (settings.palette, json.as_object_mut()) {
-            let name = match palette {
-                PaletteChoice::Twicecat => "Twicecat",
-                PaletteChoice::Frost => "Frost",
-                PaletteChoice::Ember => "Ember",
-                PaletteChoice::HighContrast => "HighContrast",
-            };
-            map.insert("palette".into(), name.into());
+        // No key while `None` (the built-in theme), so a later change of the
+        // app's default reaches this user. `palette` is never written again.
+        if let (Some(name), Some(map)) = (settings.theme_name, json.as_object_mut()) {
+            map.insert("theme_name".into(), name.as_str().into());
         }
         let json = json.to_string();
         let tmp = self.root.join("settings.json.tmp");
@@ -712,7 +722,7 @@ mod tests {
         let p = DataPaths::at(tmp.path().join("root"));
         let s = read_text(&p, r#"{"theme":"Dark"}"#);
         assert_eq!(s.theme, ThemeChoice::Dark);
-        assert_eq!(s.palette, None);
+        assert_eq!(s.theme_name, None);
         assert_eq!(s.density, DensityChoice::Comfortable);
         assert_eq!(s.room_list, RoomListChoice::Expanded);
         assert_eq!(s.text_scale_percent, 100);
@@ -767,10 +777,10 @@ mod tests {
         let p = DataPaths::at(tmp.path().join("root"));
         let s = read_text(
             &p,
-            r#"{"palette":"Nope","theme":"Dark","density":"Huge","room_list":7,"text_scale_percent":"x","tray_badge":false}"#,
+            r#"{"theme_name":"Nope/","theme":"Dark","density":"Huge","room_list":7,"text_scale_percent":"x","tray_badge":false}"#,
         );
         assert_eq!(s.theme, ThemeChoice::Dark);
-        assert_eq!(s.palette, None);
+        assert_eq!(s.theme_name, None);
         assert_eq!(s.density, DensityChoice::Comfortable);
         assert_eq!(s.room_list, RoomListChoice::Expanded);
         assert_eq!(s.text_scale_percent, 100);
@@ -796,12 +806,17 @@ mod tests {
         }
     }
 
+    fn name(text: &str) -> ThemeName {
+        ThemeName::try_from(text).expect("a valid name")
+    }
+
     #[test]
-    fn a_palette_of_none_leaves_no_key_in_the_file() {
+    fn a_theme_name_of_none_leaves_no_key_in_the_file() {
         let tmp = tempfile::tempdir().unwrap();
         let p = DataPaths::at(tmp.path().join("root"));
         p.write_settings(&UiSettings::default()).unwrap();
         let text = std::fs::read_to_string(p.settings_file()).unwrap();
+        assert!(!text.contains("theme_name"), "{text}");
         assert!(!text.contains("palette"), "{text}");
     }
 
@@ -809,30 +824,151 @@ mod tests {
     fn every_appearance_value_round_trips() {
         let tmp = tempfile::tempdir().unwrap();
         let p = DataPaths::at(tmp.path().join("root"));
-        let palettes = [
-            None,
-            Some(PaletteChoice::Twicecat),
-            Some(PaletteChoice::Frost),
-            Some(PaletteChoice::Ember),
-            Some(PaletteChoice::HighContrast),
-        ];
-        for palette in palettes {
-            for density in [DensityChoice::Comfortable, DensityChoice::Compact] {
-                for room_list in [RoomListChoice::Expanded, RoomListChoice::Rail] {
-                    for text_scale_percent in [80, 100, 130, 200] {
-                        let s = UiSettings {
-                            palette,
-                            density,
-                            room_list,
-                            text_scale_percent,
-                            ..UiSettings::default()
-                        };
-                        p.write_settings(&s).unwrap();
-                        assert_eq!(p.read_settings(), s);
+        for theme_name in [None, Some(name("Daylight"))] {
+            for theme in [ThemeChoice::System, ThemeChoice::Light, ThemeChoice::Dark] {
+                for density in [DensityChoice::Comfortable, DensityChoice::Compact] {
+                    for room_list in [RoomListChoice::Expanded, RoomListChoice::Rail] {
+                        for text_scale_percent in [80, 100, 130, 200] {
+                            let s = UiSettings {
+                                theme_name,
+                                theme,
+                                density,
+                                room_list,
+                                text_scale_percent,
+                                ..UiSettings::default()
+                            };
+                            p.write_settings(&s).unwrap();
+                            assert_eq!(p.read_settings(), s);
+                            let text = std::fs::read_to_string(p.settings_file()).unwrap();
+                            assert_eq!(text.contains("theme_name"), theme_name.is_some());
+                            assert!(!text.contains("palette"), "{text}");
+                        }
                     }
                 }
             }
         }
+    }
+
+    #[test]
+    fn an_older_palette_reads_as_the_default_and_is_dropped_on_the_next_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = DataPaths::at(tmp.path().join("root"));
+        for old in ["Frost", "Ember", "HighContrast", "Twicecat", "Bogus"] {
+            let s = read_text(&p, &format!(r#"{{"palette":"{old}","theme":"Light"}}"#));
+            assert_eq!(s.theme_name, None, "{old}");
+            assert_eq!(s.theme, ThemeChoice::Light, "{old}");
+            assert!(p.settings_file().exists());
+            assert!(!p.root().join("settings.json.bad").exists());
+            p.write_settings(&s).unwrap();
+            let text = std::fs::read_to_string(p.settings_file()).unwrap();
+            assert!(!text.contains("palette"), "{text}");
+            assert!(text.contains(r#""theme":"Light""#), "{text}");
+        }
+        let s = read_text(&p, r#"{"palette":"Frost","theme_name":"Daylight"}"#);
+        assert_eq!(s.theme_name, Some(name("Daylight")));
+    }
+
+    #[test]
+    fn a_bad_theme_name_reads_as_none_and_keeps_the_rest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = DataPaths::at(tmp.path().join("root"));
+        let long = "a".repeat(33);
+        let bad = [
+            r#""../x""#,
+            r#""a/b""#,
+            r#""C:\\x""#,
+            r#""""#,
+            r#"" lead""#,
+            &format!("\"{long}\""),
+            r#""\u202e""#,
+            r#""TwiceCat""#,
+            r#""DEFAULT""#,
+            r#""Day.light""#,
+            r#""CON""#,
+            r#""nul""#,
+            r#""Com1""#,
+            r#""LPT9""#,
+            r#""aux""#,
+            r#""PRN""#,
+            "5",
+            "null",
+        ];
+        for value in bad {
+            let s = read_text(
+                &p,
+                &format!(r#"{{"theme_name":{value},"theme":"Dark","tray_badge":false}}"#),
+            );
+            assert_eq!(s.theme_name, None, "{value}");
+            assert_eq!(s.theme, ThemeChoice::Dark, "{value}");
+            assert!(!s.tray_badge, "{value}");
+            assert!(!p.root().join("settings.json.bad").exists());
+        }
+    }
+
+    #[test]
+    fn names_that_only_look_like_device_names_are_fine() {
+        for ok in ["COM0", "COM10", "LPT", "Console", "Nul 1", "com", "AUX2"] {
+            assert!(ThemeName::try_from(ok).is_ok(), "{ok}");
+        }
+    }
+
+    #[test]
+    fn the_themes_folder_is_under_the_root_for_a_given_root() {
+        let p = DataPaths::at("/some/root");
+        assert_eq!(p.themes_dir(), Path::new("/some/root/themes"));
+    }
+
+    #[test]
+    fn the_os_themes_folder_is_next_to_the_config_dir() {
+        let p = DataPaths::from_os().expect("OS dirs available on the test machine");
+        let dirs = directories::ProjectDirs::from("io.github", "ga_lep", "Twicecat").unwrap();
+        assert!(p.themes_dir().ends_with("themes"));
+        assert_eq!(p.themes_dir().parent(), Some(dirs.config_dir()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_themes_folder_follows_xdg_config_home() {
+        // `directories` reads the environment, so check in a child process
+        // (this test binary re-run with a marker) and leave ours untouched.
+        const MARK: &str = "TWICECAT_TEST_XDG_CHILD";
+        if let Ok(want) = std::env::var(MARK) {
+            let p = DataPaths::from_os().expect("OS dirs");
+            assert_eq!(p.themes_dir(), Path::new(&want).join("twicecat/themes"));
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let xdg = tmp.path().join("cfg");
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "paths::tests::the_themes_folder_follows_xdg_config_home",
+                "--nocapture",
+            ])
+            .env("XDG_CONFIG_HOME", &xdg)
+            .env(MARK, &xdg)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn creating_the_themes_folder_is_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let p = DataPaths::at(tmp.path().join("root"));
+        assert!(!p.themes_dir().exists());
+        let dir = p.create_themes_dir().unwrap();
+        assert_eq!(dir, p.themes_dir());
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        // Again: fine.
+        p.create_themes_dir().unwrap();
     }
 
     #[cfg(unix)]

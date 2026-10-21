@@ -1,0 +1,49 @@
+{
+ "color": {
+  "void": {
+   "$value": "#808080"
+  },
+  "surface": {
+   "$value": "#808080"
+  },
+  "surface-raised": {
+   "$value": "#808080"
+  },
+  "surface-overlay": {
+   "$value": "#808080"
+  },
+  "accent-wash": {
+   "$value": "#808080"
+  },
+  "line-strong": {
+   "$value": "#808080"
+  },
+  "ink": {
+   "$value": "#808080"
+  },
+  "ink-muted": {
+   "$value": "#808080"
+  },
+  "accent": {
+   "$value": "#808080"
+  },
+  "on-accent": {
+   "$value": "#808080"
+  },
+  "accent-bright": {
+   "$value": "#808080"
+  },
+  "focus": {
+   "$value": "#808080"
+  },
+  "live": {
+   "$value": "#808080"
+  },
+  "ok": {
+   "$value": "#808080"
+  },
+  "warn": {
+   "$value": "#808080"
+  }
+ }
+}

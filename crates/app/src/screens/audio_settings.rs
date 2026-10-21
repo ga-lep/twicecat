@@ -154,7 +154,7 @@ fn page_view(app: &App) -> Element<'_, Message> {
         AudioPage::Microphone => microphone_page(app, settings),
         AudioPage::Levels => levels_page(app, settings),
         AudioPage::MicTest => mic_test_page(app),
-        AudioPage::Ringtone => ringtone_page(settings),
+        AudioPage::Ringtone => ringtone_page(app, settings),
         AudioPage::OtherVoices => others_page(app, settings),
         AudioPage::Announce => announce_page(settings),
         AudioPage::Diagnostics => diagnostics_page(app),
@@ -177,6 +177,7 @@ fn a_checkbox<'a>(
     toggle: Option<fn(bool) -> Message>,
 ) -> Element<'a, Message> {
     checkbox(on)
+        .style(kit::checkbox_style)
         .label(label)
         .text_wrapping(WRAP)
         .on_toggle_maybe(toggle)
@@ -351,7 +352,7 @@ pub fn basics<'a>(app: &'a App, more: Option<Element<'a, Message>>) -> Element<'
 fn value_text(slider: Slider, value: f32) -> String {
     match slider {
         Slider::InputGain => format!("{value:+.1} dB"),
-        Slider::MasterVolume => format!("{value:.0}\u{a0}%"),
+        Slider::MasterVolume | Slider::CallSoundsVolume => format!("{value:.0}\u{a0}%"),
         Slider::MicCleaningLimit | Slider::OthersCleaningLimit | Slider::AutoGainMax => {
             format!("{value:.0} dB")
         }
@@ -601,8 +602,22 @@ fn a_slider<'a>(
     settings: &AudioSettings,
     which: Slider,
     label: &'a str,
+    range: (f32, f32),
+    step: f32,
+) -> Element<'a, Message> {
+    a_slider_when(ui, settings, which, label, range, step, true)
+}
+
+/// [`a_slider`] that can be switched off: no press handler on − and +, and
+/// a bar with no input in place of the slider.
+fn a_slider_when<'a>(
+    ui: &AudioUi,
+    settings: &AudioSettings,
+    which: Slider,
+    label: &'a str,
     (lo, hi): (f32, f32),
     step: f32,
+    live: bool,
 ) -> Element<'a, Message> {
     let value = ui.shown(which, settings);
     // The slider takes no keyboard focus in iced 0.14: − and + do.
@@ -610,22 +625,28 @@ fn a_slider<'a>(
         button(icon(glyph))
             .padding([tokens::XS, tokens::M])
             .style(kit::secondary_style)
-            .on_press(msg(AudioMessage::Step(which, up)))
+            .on_press_maybe(live.then(|| msg(AudioMessage::Step(which, up))))
     };
+    let control: Element<'a, Message> = if live {
+        // Ctrl + wheel is the zoom gesture, which iced's slider takes as
+        // a step: the - and + buttons are the way to nudge it.
+        crate::ui::guard::no_wheel(
+            slider(lo..=hi, value, move |v| msg(AudioMessage::Slide(which, v)))
+                .step(step)
+                .on_release(msg(AudioMessage::SlideReleased))
+                .width(Fill),
+        )
+    } else {
+        kit::disabled_bar((value - lo) / (hi - lo))
+    };
+    let shown = words(value_text(which, value)).width(Length::Fixed(VALUE_WIDTH));
     labelled(
         label,
         row![
             nudge(Icon::Minus, false),
-            // Ctrl + wheel is the zoom gesture, which iced's slider takes as
-            // a step: the - and + buttons are the way to nudge it.
-            crate::ui::guard::no_wheel(
-                slider(lo..=hi, value, move |v| msg(AudioMessage::Slide(which, v)))
-                    .step(step)
-                    .on_release(msg(AudioMessage::SlideReleased))
-                    .width(Fill)
-            ),
+            control,
             nudge(Icon::Plus, true),
-            words(value_text(which, value)).width(Length::Fixed(VALUE_WIDTH)),
+            if live { shown } else { shown.style(muted) },
         ]
         .spacing(tokens::S)
         .align_y(iced::Center)
@@ -935,7 +956,13 @@ fn mic_test_page(app: &App) -> Element<'_, Message> {
     page.push(level_meter(app)).into()
 }
 
-fn ringtone_page(settings: &AudioSettings) -> Element<'_, Message> {
+fn ringtone_page<'a>(app: &'a App, settings: &'a AudioSettings) -> Element<'a, Message> {
+    let sounds = &settings.call_sounds;
+    // The extras and the volume stay on the page, and are switched off with
+    // the master: the page does not change shape as it is toggled.
+    let extra = |label: &'a str, on: bool, toggle: fn(bool) -> Message| {
+        a_checkbox(label, on, sounds.enabled.then_some(toggle))
+    };
     column![
         heading(AudioPage::Ringtone.label()),
         a_checkbox(
@@ -944,6 +971,33 @@ fn ringtone_page(settings: &AudioSettings) -> Element<'_, Message> {
             Some(|on| msg(AudioMessage::Ringtone(on))),
         ),
         note("It plays on the speakers above, at the volume above, and never during a call."),
+        words("Call sounds").size(tokens::BODY_LARGE),
+        a_checkbox(
+            "Play a sound when you join a call",
+            sounds.enabled,
+            Some(|on| msg(AudioMessage::CallSounds(on))),
+        ),
+        extra(
+            "Also when someone else joins the call",
+            sounds.others_joining,
+            |on| msg(AudioMessage::OthersJoining(on)),
+        ),
+        extra("Also when you leave the call", sounds.leaving, |on| msg(
+            AudioMessage::LeavingSound(on)
+        )),
+        a_slider_when(
+            &app.audio_ui,
+            settings,
+            Slider::CallSoundsVolume,
+            "Sounds volume",
+            (0.0, 100.0),
+            5.0,
+            sounds.enabled,
+        ),
+        note(
+            "Short, quiet sounds in the call, heard even when you are muted or deafened. They \
+             follow the volume under Levels."
+        ),
     ]
     .spacing(tokens::S)
     .into()
@@ -987,6 +1041,7 @@ fn others_page<'a>(app: &'a App, settings: &'a AudioSettings) -> Element<'a, Mes
         if let Some(backend) = gpu_used(app.calls.gpu.as_ref()) {
             page = page.push(
                 checkbox(cleaning.gpu)
+                    .style(kit::checkbox_style)
                     .label(format!("Clean on the GPU ({})", gpu_name(backend)))
                     .text_wrapping(WRAP)
                     .on_toggle(|on| msg(AudioMessage::CleanOthersGpu(on))),

@@ -33,9 +33,9 @@ pub use media::{
 };
 pub use rooms::{
     CreateRoomRequest, DensityChoice, MembershipView, NotificationKind, NotificationSettingsView,
-    NotificationView, OwnProfileView, PaletteChoice, PowerLevelView, Role, RoomDetailsView,
-    RoomListChoice, RoomMemberView, RoomNotificationModeView, RoomPermissions, RoomVisibility,
-    SpaceView, ThemeChoice, ThreadSummaryView, UiSettings, UpdateCheckChoice,
+    NotificationView, OwnProfileView, PowerLevelView, Role, RoomDetailsView, RoomListChoice,
+    RoomMemberView, RoomNotificationModeView, RoomPermissions, RoomVisibility, SpaceView,
+    ThemeChoice, ThemeName, ThemeNameError, ThreadSummaryView, UiSettings, UpdateCheckChoice,
 };
 pub use security::{
     CancelReason, CrossSigning, DeviceSummary, DeviceTrust, DeviceVerification, QrImage,

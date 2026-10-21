@@ -40,9 +40,6 @@ pub(crate) enum Cue {
     /// The user left the call.
     Left,
     /// Another person joined the call.
-    // Played by the participant watcher (call sounds plan, Task 3); until
-    // then only the tests build it.
-    #[cfg_attr(not(test), allow(dead_code))]
     OtherJoined,
 }
 
@@ -139,6 +136,13 @@ pub(crate) fn volume(sounds: &CallSounds, cue: Cue) -> Option<u16> {
             Cue::OtherJoined => sounds.others_joining,
         };
     wanted.then_some(sounds.volume_percent)
+}
+
+/// The volume to queue `cue` at: [`volume`], and 0 % is silent too. The
+/// engine path reads `Engine::audio_settings` and the call path reads the
+/// watch fed from it, so both see the same settings.
+pub(crate) fn playable_volume(sounds: &CallSounds, cue: Cue) -> Option<u16> {
+    volume(sounds, cue).filter(|v| *v > 0)
 }
 
 #[cfg(test)]

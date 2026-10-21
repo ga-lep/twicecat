@@ -264,6 +264,7 @@ fn device_row<'a>(
         body = body.push(
             row![
                 text_input("Session name", &edit.input)
+                    .style(crate::ui::kit::text_input_style)
                     .id(RENAME_INPUT_ID)
                     .on_input(|s| msg(SessionsMessage::RenameInput(s)))
                     .on_submit(msg(SessionsMessage::RenameSubmitted))
@@ -328,6 +329,7 @@ fn reauth_card(model: &SessionsModel) -> Element<'_, Message> {
         banner(Severity::Warning, REAUTH_TEXT),
         failed,
         text_input("Password", prompt.password.expose())
+            .style(crate::ui::kit::text_input_style)
             .id(REAUTH_INPUT_ID)
             .secure(true)
             .on_input_maybe(

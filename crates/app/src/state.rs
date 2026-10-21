@@ -19,6 +19,7 @@ use twicecat_core::api::{
     RoomNotificationModeView, RoomSummary, SyncState, TimelineItem, TimelineItemKind, TypingUser,
     UiSettings, UserId, UserTrust,
 };
+use twicecat_core::paths::DataPaths;
 
 use crate::actions::{self, ActionButtons, ActionState, NOTICE_DURATION, Notice, Picker};
 use crate::avatars::Avatars;
@@ -43,6 +44,7 @@ use crate::sessions::{SessionsMessage, SessionsModel, logout_needs_warning};
 use crate::settings::{NoSettingsStore, SettingsMessage, SettingsModel, SettingsStore};
 use crate::spaces::{SpacesMessage, SpacesModel};
 use crate::text_safety;
+use crate::themes::Loaded;
 use crate::threads::{ThreadsMessage, ThreadsModel};
 use crate::timeline::{self, Effects, TimelineView};
 use crate::tray::{self, NoTrayFactory, SystemTrayFactory, TrayAction, TrayFactory, TrayModel};
@@ -578,6 +580,13 @@ pub struct App {
     pub actions: ActionState,
     /// The system theme mode.
     pub theme_mode: theme::Mode,
+    /// Where the themes folder is, and how to create it.
+    pub(crate) data_paths: DataPaths,
+    /// The custom themes last read from the themes folder; `None` until the
+    /// first load finishes.
+    pub themes: Option<Loaded>,
+    /// A load of the themes folder is running.
+    pub themes_loading: bool,
     /// Spoilers the user revealed in the open room.
     pub revealed: Revealed,
     /// Who is typing in the open room (other users, at most
@@ -715,6 +724,9 @@ impl App {
             send_error: None,
             actions: ActionState::default(),
             theme_mode: theme::Mode::None,
+            data_paths: DataPaths::at(std::env::temp_dir().join("twicecat-no-data-dir")),
+            themes: None,
+            themes_loading: false,
             revealed: Revealed::new(),
             typing: Vec::new(),
             window_focused: true,
@@ -752,6 +764,7 @@ impl App {
         ui_settings: UiSettings,
         store: impl SettingsStore + Clone + 'static,
         crash: (std::path::PathBuf, Option<crate::crash::PendingReport>),
+        paths: DataPaths,
     ) -> impl Fn() -> (App, Task<Message>) {
         let startup = Mutex::new(Some(startup));
         move || {
@@ -766,6 +779,10 @@ impl App {
             app.updates.mechanism = twicecat_core::api::UpdateMechanism::current();
             let task = Task::batch([task, app.start_update_checks()]);
             app.set_settings_store(Box::new(store.clone()));
+            app.data_paths = paths.clone();
+            // The first read of the themes folder runs off the UI thread; the
+            // window shows Twicecat until it is done.
+            let task = Task::batch([task, app.reload_themes()]);
             app.set_notifier(Box::new(notifications::SystemNotifier));
             app.set_tray_factory(Box::new(SystemTrayFactory));
             if let Some(runtime) = app.sink.runtime() {
@@ -789,13 +806,73 @@ impl App {
         self.settings_store = store;
     }
 
-    /// The theme the window uses: the user's override, else the system's.
+    /// The loaded looks of the stored theme name (ASCII capitals do not
+    /// matter: the loader merges names that differ only in them). Empty while
+    /// the folder is not read, when no name is stored, and when the name is not
+    /// among the themes that loaded.
+    fn stored_looks(&self) -> Vec<&crate::theme::Resolved> {
+        let (Some(name), Some(loaded)) = (self.ui_settings.theme_name, self.themes.as_ref()) else {
+            return Vec::new();
+        };
+        loaded
+            .themes
+            .iter()
+            .filter(|t| t.name.eq_ignore_ascii_case(name.as_str()))
+            .collect()
+    }
+
+    /// The theme the window uses: the stored custom theme if it loaded, else
+    /// the built-in Twicecat. A theme with one look is shown as it is, in its
+    /// own mode; `ui_settings.theme` and the system mode are read only for a
+    /// pair (see [`crate::theme::pick_look`]).
     pub fn current_theme(&self) -> Theme {
-        crate::theme::theme_for_choice(
-            self.theme_mode,
-            self.ui_settings.theme,
-            crate::theme::resolve_family(self.ui_settings.palette),
-        )
+        let looks = self.stored_looks();
+        match crate::theme::pick_look(&looks, self.ui_settings.theme, self.theme_mode) {
+            Some(look) => crate::theme::theme_of(look),
+            None => crate::theme::built_in(),
+        }
+    }
+
+    /// Whether the stored theme is loaded and comes as a light and dark pair,
+    /// so that the System/Light/Dark choice applies to it.
+    pub fn selected_is_paired(&self) -> bool {
+        self.stored_looks().iter().any(|look| look.both_modes)
+    }
+
+    /// Why the stored theme is not shown, once the folder is read: a line of
+    /// words fixed by the app and a name that passed the name rules.
+    pub fn theme_fallback(&self) -> Option<String> {
+        let name = self.ui_settings.theme_name?;
+        let loaded = self.themes.as_ref()?;
+        if !self.stored_looks().is_empty() {
+            return None;
+        }
+        let reason = loaded
+            .report
+            .iter()
+            .filter(|line| {
+                line.name.as_deref().is_some_and(|label| {
+                    let label = label
+                        .strip_suffix(" (light)")
+                        .or_else(|| label.strip_suffix(" (dark)"))
+                        .unwrap_or(label);
+                    label.eq_ignore_ascii_case(name.as_str())
+                })
+            })
+            .find_map(|line| match line.note {
+                crate::themes::Note::Problem(problem) => Some(problem.reason()),
+                _ => None,
+            })
+            .unwrap_or("it is not in the themes folder");
+        Some(format!(
+            "Theme \"{}\" could not be used: {reason}. Showing Twicecat.",
+            name.as_str()
+        ))
+    }
+
+    /// Replaces the themes read from the folder (tests use this).
+    pub fn set_themes(&mut self, loaded: Loaded) {
+        self.themes = Some(loaded);
     }
 
     /// Replaces the desktop notification service (tests use a fake).
@@ -3094,19 +3171,40 @@ mod tests {
     }
 
     #[test]
-    fn theme_follows_the_mode() {
+    fn the_single_look_theme_is_shown_whatever_the_system_mode_is() {
         let (mut app, _rx) = app_with(8);
         let name = |app: &App| app.theme().expect("always themed").to_string();
-        let light = crate::theme::theme_for(theme::Mode::Light).to_string();
-        let dark = crate::theme::theme_for(theme::Mode::Dark).to_string();
-        assert_eq!(name(&app), light);
-        let _ = app.update(Message::ThemeMode(theme::Mode::Dark));
-        assert_eq!(name(&app), dark);
-        assert!(app.theme().expect("themed").extended_palette().is_dark);
-        let _ = app.update(Message::ThemeMode(theme::Mode::Light));
-        assert_eq!(name(&app), light);
-        let _ = app.update(Message::ThemeMode(theme::Mode::None));
-        assert_eq!(name(&app), light);
+        for mode in [
+            theme::Mode::None,
+            theme::Mode::Dark,
+            theme::Mode::Light,
+            theme::Mode::None,
+        ] {
+            let _ = app.update(Message::ThemeMode(mode));
+            assert_eq!(app.theme_mode, mode, "the system mode is still tracked");
+            assert_eq!(name(&app), "Twicecat", "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn twicecat_keeps_its_palette_for_every_stored_choice_and_system_mode() {
+        let (mut app, _rx) = app_with(8);
+        let twicecat = crate::theme::built_in().palette();
+        for choice in [
+            twicecat_core::api::ThemeChoice::System,
+            twicecat_core::api::ThemeChoice::Light,
+            twicecat_core::api::ThemeChoice::Dark,
+        ] {
+            app.ui_settings.theme = choice;
+            for mode in [theme::Mode::Light, theme::Mode::Dark, theme::Mode::None] {
+                let _ = app.update(Message::ThemeMode(mode));
+                assert_eq!(
+                    app.current_theme().palette(),
+                    twicecat,
+                    "{choice:?} {mode:?}"
+                );
+            }
+        }
     }
 
     // ---- Task 9: screens ----
@@ -10755,7 +10853,7 @@ mod tests {
 
         use twicecat_core::api::{
             AvatarId, EventId, MediaBytes, NotificationKind, NotificationSettingsView,
-            OwnProfileView, RoomNotificationModeView as Mode, ThemeChoice,
+            OwnProfileView, RoomNotificationModeView as Mode, ThemeChoice, ThemeName,
         };
 
         use super::*;
@@ -11431,53 +11529,308 @@ mod tests {
             assert_eq!(*rig.tray.badges.lock().expect("mutex"), [true, false, true]);
         }
 
-        #[test]
-        fn the_theme_choice_overrides_the_system_mode_live() {
+        // ---- custom themes (Task 4) ----
+
+        const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/themes");
+
+        fn themed() -> Rig {
             let mut rig = rig();
-            let _ = rig.app.update(Message::ThemeMode(theme::Mode::Dark));
-            let dark = |app: &App| app.theme().expect("a theme").extended_palette().is_dark;
-            assert!(dark(&rig.app));
-            st(&mut rig, S::Theme(ThemeChoice::Light));
-            assert!(!dark(&rig.app));
-            st(&mut rig, S::Theme(ThemeChoice::System));
-            assert!(dark(&rig.app));
+            rig.app
+                .set_themes(crate::themes::load_dir(std::path::Path::new(FIXTURES)));
+            rig
         }
 
+        fn pick(rig: &mut Rig, name: Option<&str>) {
+            let name = name.map(|n| ThemeName::try_from(n).expect("a valid name"));
+            st(rig, S::ThemePicked(name));
+        }
+
+        fn background(rig: &Rig) -> iced::Color {
+            rig.app.current_theme().palette().background
+        }
+
+        fn look_of(name: &str, dark: bool) -> iced::Color {
+            crate::themes::load_dir(std::path::Path::new(FIXTURES))
+                .themes
+                .iter()
+                .find(|t| t.name == name && t.dark == dark)
+                .expect("a fixture look")
+                .palette
+                .background
+        }
+
+        const CHOICES: [ThemeChoice; 3] =
+            [ThemeChoice::System, ThemeChoice::Light, ThemeChoice::Dark];
+        const MODES: [theme::Mode; 3] = [theme::Mode::Light, theme::Mode::Dark, theme::Mode::None];
+
         #[test]
-        fn the_colour_set_applies_at_once_is_saved_and_can_go_back_to_the_default() {
-            use twicecat_core::api::PaletteChoice;
-            let mut rig = rig();
-            let name = |app: &App| app.theme().expect("a theme").to_string();
-            let default_name = name(&rig.app);
-            st(&mut rig, S::Palette(Some(PaletteChoice::Frost)));
-            st(&mut rig, S::Palette(Some(PaletteChoice::Frost)));
-            assert!(name(&rig.app).starts_with("Frost"), "{}", name(&rig.app));
+        fn picking_a_theme_applies_it_at_once_and_saves_it_once() {
+            let mut rig = themed();
+            pick(&mut rig, Some("Daylight"));
+            assert_eq!(background(&rig), iced::Color::WHITE);
+            let name = ThemeName::try_from("Daylight").expect("valid");
+            assert_eq!(rig.app.ui_settings.theme_name, Some(name));
+            assert_eq!(writes(&rig).len(), 1);
+            assert_eq!(writes(&rig)[0].theme_name, Some(name));
+            pick(&mut rig, Some("Daylight"));
             assert_eq!(writes(&rig).len(), 1, "an unchanged pick writes nothing");
-            assert_eq!(rig.app.ui_settings.palette, Some(PaletteChoice::Frost));
-            st(&mut rig, S::Palette(None));
-            assert_eq!(name(&rig.app), default_name);
-            let saved = writes(&rig);
-            assert_eq!(saved.len(), 2);
-            assert_eq!(saved[1].palette, None);
         }
 
         #[test]
-        fn the_appearance_section_builds_for_every_set_and_mode() {
-            use twicecat_core::api::PaletteChoice;
+        fn picking_the_default_saves_none() {
+            let mut rig = themed();
+            pick(&mut rig, Some("Daylight"));
+            pick(&mut rig, None);
+            assert_eq!(rig.app.ui_settings.theme_name, None);
+            assert_eq!(writes(&rig).last().map(|s| s.theme_name), Some(None));
+            assert_eq!(
+                background(&rig),
+                crate::theme::built_in().palette().background
+            );
+        }
+
+        #[test]
+        fn single_look_themes_ignore_the_choice_and_the_system_mode() {
+            for (name, want) in [
+                (None, crate::theme::built_in().palette().background),
+                (Some("Daylight"), look_of("Daylight", false)),
+                (Some("Faint"), look_of("Faint", true)),
+            ] {
+                let mut rig = themed();
+                pick(&mut rig, name);
+                for choice in CHOICES {
+                    st(&mut rig, S::Theme(choice));
+                    for mode in MODES {
+                        let _ = rig.app.update(Message::ThemeMode(mode));
+                        assert_eq!(background(&rig), want, "{name:?} {choice:?} {mode:?}");
+                        assert!(!rig.app.selected_is_paired(), "{name:?}");
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn a_paired_theme_follows_the_choice_and_the_system_mode() {
+            let mut rig = themed();
+            pick(&mut rig, Some("Duo"));
+            assert!(rig.app.selected_is_paired());
+            let (light, dark) = (look_of("Duo", false), look_of("Duo", true));
+            assert_ne!(light, dark);
+            for mode in MODES {
+                let _ = rig.app.update(Message::ThemeMode(mode));
+                st(&mut rig, S::Theme(ThemeChoice::Light));
+                assert_eq!(background(&rig), light, "Light {mode:?}");
+                st(&mut rig, S::Theme(ThemeChoice::Dark));
+                assert_eq!(background(&rig), dark, "Dark {mode:?}");
+            }
+            st(&mut rig, S::Theme(ThemeChoice::System));
+            let _ = rig.app.update(Message::ThemeMode(theme::Mode::Dark));
+            assert_eq!(background(&rig), dark);
+            let _ = rig.app.update(Message::ThemeMode(theme::Mode::Light));
+            assert_eq!(background(&rig), light);
+            let _ = rig.app.update(Message::ThemeMode(theme::Mode::None));
+            assert_eq!(background(&rig), light);
+            let _ = rig.app.update(Message::ThemeMode(theme::Mode::Dark));
+            assert_eq!(background(&rig), dark, "a change switches the look at once");
+            st(&mut rig, S::Theme(ThemeChoice::Light));
+            let _ = rig.app.update(Message::ThemeMode(theme::Mode::Dark));
+            let _ = rig.app.update(Message::ThemeMode(theme::Mode::Light));
+            assert_eq!(background(&rig), light, "a forced look ignores the mode");
+        }
+
+        #[test]
+        fn a_radio_saves_the_choice_once_and_leaves_the_name_alone() {
+            let mut rig = themed();
+            pick(&mut rig, Some("Duo"));
+            let before = writes(&rig).len();
+            st(&mut rig, S::Theme(ThemeChoice::Dark));
+            st(&mut rig, S::Theme(ThemeChoice::Dark));
+            let all = writes(&rig);
+            assert_eq!(all.len(), before + 1);
+            let last = all.last().expect("a write");
+            assert_eq!(last.theme, ThemeChoice::Dark);
+            assert_eq!(last.theme_name, ThemeName::try_from("Duo").ok());
+        }
+
+        #[test]
+        fn the_stored_name_is_found_whatever_its_capitals_are() {
+            let mut rig = themed();
+            rig.app.ui_settings.theme_name = ThemeName::try_from("daylight").ok();
+            assert_eq!(background(&rig), iced::Color::WHITE);
+            assert_eq!(rig.app.theme_fallback(), None);
+            rig.app.ui_settings.theme_name = ThemeName::try_from("duo").ok();
+            assert!(rig.app.selected_is_paired());
+        }
+
+        #[test]
+        fn a_missing_or_refused_theme_shows_twicecat_and_says_why() {
+            let tmp = std::env::temp_dir().join(format!("twicecat-state-themes-{}", line!()));
+            let _ = std::fs::remove_dir_all(&tmp);
+            std::fs::create_dir_all(&tmp).expect("temp dir");
+            let bad = std::fs::read(format!("{FIXTURES}/hostile/light_void_dark_surfaces.json"))
+                .expect("fixture");
+            std::fs::write(tmp.join("Mixed.json"), bad).expect("write");
+            let good = std::fs::read(format!("{FIXTURES}/Daylight.light.json")).expect("fixture");
+            // Another theme that loads, so that a refused one cannot be
+            // mistaken for it.
+            std::fs::write(tmp.join("Other.light.json"), &good).expect("write");
+            let mut rig = rig();
+            rig.app.ui_settings.theme_name = ThemeName::try_from("Mixed").ok();
+            rig.app.set_themes(crate::themes::load_dir(&tmp));
+            let twicecat = crate::theme::built_in().palette();
+            assert_eq!(rig.app.current_theme().palette(), twicecat);
+            assert_eq!(
+                rig.app.theme_fallback().as_deref(),
+                Some(
+                    "Theme \"Mixed\" could not be used: backgrounds mix light and dark. \
+                     Showing Twicecat."
+                )
+            );
+            assert!(!rig.app.selected_is_paired());
+            assert_eq!(
+                rig.app.ui_settings.theme_name,
+                ThemeName::try_from("Mixed").ok(),
+                "the stored name is kept"
+            );
+            rig.app.ui_settings.theme_name = ThemeName::try_from("Gone").ok();
+            assert_eq!(
+                rig.app.theme_fallback().as_deref(),
+                Some(
+                    "Theme \"Gone\" could not be used: it is not in the themes folder. \
+                     Showing Twicecat."
+                )
+            );
+            // The file is fixed and the folder read again: the theme applies.
+            std::fs::write(tmp.join("Mixed.json"), good).expect("write");
+            rig.app.ui_settings.theme_name = ThemeName::try_from("Mixed").ok();
+            let _ = rig.app.update(Message::Settings(S::ThemesLoaded(Some(
+                crate::themes::load_dir(&tmp),
+            ))));
+            assert_eq!(rig.app.theme_fallback(), None);
+            assert_eq!(background(&rig), iced::Color::WHITE);
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
+
+        #[test]
+        fn before_the_first_load_a_stored_theme_shows_twicecat_without_a_note() {
+            let mut rig = rig();
+            rig.app.ui_settings.theme_name = ThemeName::try_from("Daylight").ok();
+            assert!(rig.app.themes.is_none());
+            assert_eq!(
+                background(&rig),
+                crate::theme::built_in().palette().background
+            );
+            assert_eq!(rig.app.theme_fallback(), None);
+            assert!(!rig.app.selected_is_paired());
+        }
+
+        #[test]
+        fn reloading_runs_in_a_task_and_only_one_at_a_time() {
+            let mut rig = rig();
+            assert!(!rig.app.themes_loading);
+            let first = rig.app.update(Message::Settings(S::ReloadThemes));
+            assert!(first.units() > 0, "the load runs in a task");
+            assert!(rig.app.themes_loading);
+            let second = rig.app.update(Message::Settings(S::ReloadThemes));
+            assert_eq!(second.units(), 0, "a load is in flight");
+        }
+
+        #[test]
+        fn a_finished_load_clears_the_flag_and_replaces_the_list() {
+            let mut rig = themed();
+            pick(&mut rig, Some("Daylight"));
+            let _ = rig.app.update(Message::Settings(S::ReloadThemes));
+            assert_eq!(
+                background(&rig),
+                iced::Color::WHITE,
+                "unchanged while loading"
+            );
+            let _ = rig
+                .app
+                .update(Message::Settings(S::ThemesLoaded(Some(Loaded::default()))));
+            assert!(!rig.app.themes_loading);
+            assert!(rig.app.themes.as_ref().is_some_and(|l| l.themes.is_empty()));
+            assert!(rig.app.theme_fallback().is_some());
+            // A load that failed keeps the list.
+            let _ = rig.app.update(Message::Settings(S::ReloadThemes));
+            let _ = rig.app.update(Message::Settings(S::ThemesLoaded(None)));
+            assert!(!rig.app.themes_loading);
+            assert!(rig.app.themes.is_some());
+        }
+
+        #[test]
+        fn the_theme_code_loads_only_off_the_ui_thread() {
+            for (file, source) in [
+                ("state.rs", include_str!("state.rs")),
+                ("settings.rs", include_str!("settings.rs")),
+                ("screens/settings.rs", include_str!("screens/settings.rs")),
+            ] {
+                let production = source
+                    .split("#[cfg(test)]")
+                    .next()
+                    .expect("production code");
+                let masked = crate::source_scan::mask(production);
+                assert!(!masked.contains("load_dir("), "{file} calls load_dir");
+                assert!(
+                    masked.contains("load_off_thread") || file != "settings.rs",
+                    "{file}"
+                );
+            }
+            let masked = crate::source_scan::mask(include_str!("settings.rs"));
+            let reload = masked
+                .split("fn reload_themes")
+                .nth(1)
+                .and_then(|rest| rest.split("\n    }\n").next())
+                .expect("the reload handler");
+            assert!(reload.contains("load_off_thread"));
+            assert!(!reload.contains("blocking::run"));
+        }
+
+        #[test]
+        fn opening_the_folder_runs_in_a_task_and_a_failure_is_said() {
+            let mut rig = rig();
+            let task = rig.app.update(Message::Settings(S::OpenThemesFolder));
+            assert!(task.units() > 0, "the launcher runs in a task");
+            st(&mut rig, S::ThemesFolderOpened(true));
+            assert_eq!(rig.app.settings_ui.error, None);
+            st(&mut rig, S::ThemesFolderOpened(false));
+            assert_eq!(
+                rig.app.settings_ui.error,
+                Some(SettingsError::ThemesFolderFailed)
+            );
+        }
+
+        #[test]
+        fn the_theme_choice_is_kept_but_the_single_look_theme_stays_as_it_is() {
+            let mut rig = rig();
+            let _ = rig.app.update(Message::ThemeMode(theme::Mode::Light));
+            let twicecat = crate::theme::built_in().palette();
+            let unchanged = |app: &App| app.theme().expect("a theme").palette() == twicecat;
+            for choice in [
+                ThemeChoice::Light,
+                ThemeChoice::System,
+                ThemeChoice::Dark,
+                ThemeChoice::Light,
+            ] {
+                st(&mut rig, S::Theme(choice));
+                assert!(unchanged(&rig.app), "{choice:?}");
+                assert_eq!(rig.app.ui_settings.theme, choice, "kept for later");
+            }
+            assert_eq!(
+                writes(&rig).last().map(|s| s.theme),
+                Some(ThemeChoice::Light)
+            );
+        }
+
+        #[test]
+        fn a_stored_colour_set_changes_nothing_and_the_appearance_section_builds() {
             let mut rig = rig();
             open(&mut rig);
-            for choice in [
-                None,
-                Some(PaletteChoice::Twicecat),
-                Some(PaletteChoice::Frost),
-                Some(PaletteChoice::Ember),
-                Some(PaletteChoice::HighContrast),
-            ] {
-                for theme in [ThemeChoice::Light, ThemeChoice::Dark] {
-                    st(&mut rig, S::Palette(choice));
-                    st(&mut rig, S::Theme(theme));
-                    let _ = rig.app.view();
-                }
+            let name = |app: &App| app.theme().expect("a theme").to_string();
+            for theme in [ThemeChoice::System, ThemeChoice::Light, ThemeChoice::Dark] {
+                st(&mut rig, S::Theme(theme));
+                assert_eq!(name(&rig.app), "Twicecat", "{theme:?}");
+                let _ = rig.app.view();
             }
         }
 
