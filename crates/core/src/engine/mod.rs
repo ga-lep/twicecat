@@ -2,6 +2,7 @@
 //!
 //! Only plain API types cross the public boundary. SDK types stay in here.
 
+mod typing;
 mod video;
 
 use std::collections::HashMap;
@@ -64,6 +65,7 @@ use crate::threads::{self, OpenThread, Route, route_item};
 use crate::timeline::{map_item, normalize_reaction_key, parse_room_id, rank_members};
 use crate::upload;
 use crate::verification::Target;
+use typing::TypingWatch;
 
 /// Events loaded by one back-pagination.
 pub(crate) const PAGINATION_BATCH: u16 = 20;
@@ -179,6 +181,8 @@ struct Syncing {
     calls: CallWatch,
     /// The ringtone of this session's rings.
     ringer: Ringer,
+    /// Who is typing in each room, for the selected room's forwarder.
+    typing: TypingWatch,
 }
 
 /// The room whose timeline is open, the task forwarding its diffs and the
@@ -944,17 +948,29 @@ fn typing_users(ids: Vec<OwnedUserId>, names: &HashMap<OwnedUserId, String>) -> 
         .collect()
 }
 
-/// Forwards who else is typing in the room as `Typing` events. Ends with the
-/// selection (it is aborted); the SDK event handler goes with the guard.
-async fn forward_typing(room_id: RoomId, timeline: Arc<Timeline>, events: mpsc::Sender<CoreEvent>) {
+/// Forwards who else is typing in the room as `Typing` events: whoever
+/// already is when the room opens, then each change. Ends with the selection
+/// (it is aborted) or the sync.
+async fn forward_typing(
+    room_id: RoomId,
+    timeline: Arc<Timeline>,
+    mut receiver: watch::Receiver<Vec<OwnedUserId>>,
+    events: mpsc::Sender<CoreEvent>,
+) {
     let room = timeline.room();
-    let (_guard, mut receiver) = room.subscribe_to_typing_notifications();
+    // Nobody typing when the room opens needs no event.
+    let current = receiver.borrow_and_update().clone();
+    let mut next = (!current.is_empty()).then_some(current);
     loop {
-        let ids = match receiver.recv().await {
-            Ok(ids) => ids,
-            // Only the latest list matters; wait for the next one.
-            Err(broadcast::error::RecvError::Lagged(_)) => continue,
-            Err(broadcast::error::RecvError::Closed) => return,
+        let ids = match next.take() {
+            Some(ids) => ids,
+            // Only the latest list matters; one replaced meanwhile is skipped.
+            None => {
+                if receiver.changed().await.is_err() {
+                    return;
+                }
+                receiver.borrow_and_update().clone()
+            }
         };
         let mut names = HashMap::new();
         for id in ids.iter().take(MAX_TYPING_USERS) {
@@ -2546,12 +2562,16 @@ impl Engine {
             .map_err(|_| CoreError::Internal("could not open the room timeline".into()))?;
         // Typing and receipts of the open room arrive through sliding sync
         // only when the room is subscribed.
-        if let Some(sync) = active.sync.as_ref() {
-            sync.service
-                .room_list_service()
-                .set_room_subscriptions(&[&sdk_id])
-                .await;
-        }
+        let typing = match active.sync.as_ref() {
+            Some(sync) => {
+                sync.service
+                    .room_list_service()
+                    .set_room_subscriptions(&[&sdk_id])
+                    .await;
+                Some(sync.typing.subscribe(&sdk_id))
+            }
+            None => None,
+        };
         // A store error loses only the draft, never the room.
         let draft = room
             .load_composer_draft(None)
@@ -2589,11 +2609,14 @@ impl Engine {
             timeline.clone(),
             self.events.clone(),
         ));
-        tasks.spawn(forward_typing(
-            room_id.clone(),
-            timeline.clone(),
-            self.events.clone(),
-        ));
+        if let Some(typing) = typing {
+            tasks.spawn(forward_typing(
+                room_id.clone(),
+                timeline.clone(),
+                typing,
+                self.events.clone(),
+            ));
+        }
         active.selected = Some(Selected {
             room_id,
             timeline,
@@ -3111,6 +3134,7 @@ impl Engine {
             self.ring_gate.subscribe(),
             self.config.audio.clone(),
         );
+        let typing = TypingWatch::start(&active.client);
         service.start().await;
         if let Some(active) = self.active.as_mut() {
             active.sync = Some(Syncing {
@@ -3122,6 +3146,7 @@ impl Engine {
                 more_rooms,
                 calls,
                 ringer,
+                typing,
             });
         }
     }

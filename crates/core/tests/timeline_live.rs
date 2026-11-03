@@ -215,8 +215,8 @@ async fn back_pagination_loads_the_whole_room_in_order() {
     logout(&mut alice).await;
 }
 
-/// Alice and carol in a fresh room, each with a running core that has the
-/// room open.
+/// Alice and carol in a fresh room, each with a running core (that has the
+/// room open, from [`pair`]).
 struct Pair {
     room: String,
     alice_raw: matrix_sdk::Client,
@@ -230,6 +230,14 @@ struct Pair {
 }
 
 async fn pair() -> Pair {
+    let mut p = logged_in_pair().await;
+    open_room(&mut p.alice, &p.room).await;
+    open_room(&mut p.carol, &p.room).await;
+    p
+}
+
+/// Like [`pair`], with the room not open yet.
+async fn logged_in_pair() -> Pair {
     let env = TestEnv::load();
     let alice_raw = raw_login(1).await;
     let carol_raw = raw_login(3).await;
@@ -247,8 +255,6 @@ async fn pair() -> Pair {
     let mut carol = start_core(dirs[1].path(), Arc::new(InMemorySecretStore::new()));
     login_and_run(&mut alice, &env, 1).await;
     login_and_run(&mut carol, &env, 3).await;
-    open_room(&mut alice, &room).await;
-    open_room(&mut carol, &room).await;
     Pair {
         room,
         alice_raw,
@@ -309,12 +315,14 @@ async fn typing_notices_reach_the_other_user() {
         room_id: RoomId::from(room.as_str()),
         typing,
     };
-    // Carol's room subscription is applied asynchronously, so a notice sent
-    // right after selecting can pass before she listens: send it again (the server
-    // tells a change, so each try ends with a false before the next true). Four
-    // tries of 8 s at the default timeout, more where CI lengthens it.
+    // Carol is told who is typing even before her room opens, so one notice
+    // does it. A notice that misses her anyway (her room list does not show the
+    // room, and its subscription brings only later changes) is sent again: the
+    // server tells a change only, so each try ends with a false before the next
+    // true, and the SDK sends that false only within 4 s of the true
+    // (`TYPING_NOTICE_TIMEOUT`), so a try waits 3 s.
     let mut typing_users = None;
-    let tries = (common::DEFAULT_TIMEOUT.as_secs() / 8).max(4);
+    let tries = (common::DEFAULT_TIMEOUT.as_secs() / 3).max(10);
     for _ in 0..tries {
         p.alice.commands.send(set(true)).await.unwrap();
         let wait = async {
@@ -327,7 +335,7 @@ async fn typing_notices_reach_the_other_user() {
             }
             None
         };
-        if let Ok(Some(users)) = tokio::time::timeout(Duration::from_secs(8), wait).await {
+        if let Ok(Some(users)) = tokio::time::timeout(Duration::from_secs(3), wait).await {
             typing_users = Some(users);
             break;
         }
@@ -345,6 +353,55 @@ async fn typing_notices_reach_the_other_user() {
     .await;
     // Leave the unused field read.
     let _ = (&p.carol_items, &p.alice_items);
+    p.finish().await;
+}
+
+/// Issue #19: the server tells carol alice is typing once, before carol opens
+/// the room; opening it later must still show alice.
+#[tokio::test]
+#[ignore = "needs local homeserver: docker compose up -d --wait"]
+async fn typing_that_began_before_the_room_opened_is_shown() {
+    let mut p = logged_in_pair().await;
+    open_room(&mut p.alice, &p.room).await;
+    // Synapse sends a room's typing list on a change only, so carol hears of
+    // alice only once the room is in her sliding sync window (her room list
+    // shows it); a room that comes into it later brings no typing.
+    wait_for_room(&mut p.carol, &p.room).await;
+    // Alice keeps typing, as a composer does: the SDK sends a notice of 4 s
+    // again once 3 s have passed, and the server tells no change meanwhile.
+    let commands = p.alice.commands.clone();
+    let room_id = RoomId::from(p.room.as_str());
+    let keep_typing = tokio::spawn(async move {
+        loop {
+            let set = Command::SetTyping {
+                room_id: room_id.clone(),
+                typing: true,
+            };
+            if commands.send(set).await.is_err() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(3_200)).await;
+        }
+    });
+    // Carol's sync gets the notice while her room is closed (it takes tens of
+    // milliseconds locally); opening the room later must still show alice.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    p.carol
+        .commands
+        .send(Command::SelectRoom(RoomId::from(p.room.as_str())))
+        .await
+        .unwrap();
+    let event = expect_event(
+        &mut p.carol,
+        |e| matches!(e, CoreEvent::Typing { users, .. } if !users.is_empty()),
+    )
+    .await;
+    keep_typing.abort();
+    let CoreEvent::Typing { users, .. } = event else {
+        unreachable!()
+    };
+    assert_eq!(users.len(), 1);
+    assert_eq!(users[0].user_id.as_str(), p.alice_id);
     p.finish().await;
 }
 
