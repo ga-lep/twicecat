@@ -177,6 +177,7 @@ fn card<'a>(app: &'a App, panel: &'a MembersPanel, window_height: f32) -> Elemen
     let can_invite = details.is_some_and(|d| d.permissions.can_invite);
 
     let search = text_input("Search by name or user ID", &app.rooms_ui.member_search)
+        .style(crate::ui::kit::text_input_style)
         .id(SEARCH_ID)
         .on_input(|s| msg(RoomsMessage::MemberSearch(MessageText::from(s))))
         .padding(tokens::S);
@@ -208,6 +209,7 @@ fn card<'a>(app: &'a App, panel: &'a MembersPanel, window_height: f32) -> Elemen
     };
     let invite = row![
         text_input("Invite by user ID, @name:server", &panel.invite)
+            .style(crate::ui::kit::text_input_style)
             .id(INVITE_ID)
             .on_input_maybe(
                 can_invite

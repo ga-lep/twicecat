@@ -397,6 +397,47 @@ pub struct AudioSettings {
     /// direct call rings (`CoreEvent::IncomingCall { ring: true }`). Missing
     /// from files written before it existed, which read as `true`.
     pub ringtone: bool,
+    /// The short cues played when you join or leave a call and when others
+    /// join it. Missing from files written before they existed, which read
+    /// as the defaults.
+    pub call_sounds: CallSounds,
+}
+
+/// The cues played in a call, on the call's own output device, mixed into
+/// the call's playback (so the echo canceller hears them as it hears any
+/// remote voice). They play whatever the microphone state: muted,
+/// push-to-talk and deafened do not silence them.
+///
+/// Echo: the cues are never sent to the room, but with "Echo cancellation"
+/// off, speakers (not headphones) let the microphone pick a cue up and send
+/// it, as they would send other people's voices. With echo cancellation on,
+/// a faint trace of the join cue can leak at the very start of a call, before
+/// the canceller has converged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CallSounds {
+    /// Master switch. On its own it gives the cue when this device joins
+    /// (or starts) a call; when off, no cue plays.
+    pub enabled: bool,
+    /// Also play a soft cue when another person joins the call.
+    pub others_joining: bool,
+    /// Also play a cue when you leave the call.
+    pub leaving: bool,
+    /// Cue volume, percent (0..=100, [`limits::CALL_SOUNDS_VOLUME_PERCENT`]),
+    /// on top of the master volume. A higher value is clamped to 100: the
+    /// mixer plays a cue at 100 at most.
+    pub volume_percent: u16,
+}
+
+impl Default for CallSounds {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            others_joining: true,
+            leaving: true,
+            volume_percent: 60,
+        }
+    }
 }
 
 impl Default for AudioSettings {
@@ -420,6 +461,7 @@ impl Default for AudioSettings {
             user_cleaning: BTreeMap::new(),
             announce_cleaning: CleaningAnnouncement::default(),
             ringtone: true,
+            call_sounds: CallSounds::default(),
         }
     }
 }
@@ -434,6 +476,8 @@ pub mod limits {
     pub const PTT_RELEASE_DELAY_MS: u32 = 2000;
     /// Every volume percentage.
     pub const VOLUME_PERCENT: u16 = 200;
+    /// `CallSounds::volume_percent` (the mixer plays a cue at 100 at most).
+    pub const CALL_SOUNDS_VOLUME_PERCENT: u16 = 100;
     /// `voice_bitrate_kbps` (Opus range for 48 kHz voice).
     pub const VOICE_BITRATE_KBPS: (u16, u16) = (16, 510);
     /// `AudioProcessing::auto_gain_max_db` (AGC2 needs more than 0).
@@ -478,6 +522,10 @@ impl AudioSettings {
             defaults.input_gain_db,
         );
         self.output_volume_percent = self.output_volume_percent.min(limits::VOLUME_PERCENT);
+        self.call_sounds.volume_percent = self
+            .call_sounds
+            .volume_percent
+            .min(limits::CALL_SOUNDS_VOLUME_PERCENT);
         let (lo, hi) = limits::VOICE_BITRATE_KBPS;
         self.voice_bitrate_kbps = self.voice_bitrate_kbps.clamp(lo, hi);
         for volumes in [&mut self.user_volumes, &mut self.user_share_volumes] {
@@ -635,6 +683,10 @@ mod tests {
         let s = AudioSettings {
             input_gain_db: -99.0,
             output_volume_percent: 500,
+            call_sounds: CallSounds {
+                volume_percent: 500,
+                ..CallSounds::default()
+            },
             voice_bitrate_kbps: 2,
             user_volumes,
             user_share_volumes,
@@ -662,6 +714,10 @@ mod tests {
         assert_eq!(s.input_gain_db, -20.0);
         assert_eq!(s.processing.auto_gain_max_db, 1.0, "AGC2 refuses 0");
         assert_eq!(s.output_volume_percent, 200);
+        assert_eq!(
+            s.call_sounds.volume_percent, 100,
+            "a cue never plays above 100"
+        );
         assert_eq!(s.voice_bitrate_kbps, 16);
         assert_eq!(s.user_volume(&UserId::from("@loud:x")), 200);
         assert!(!s.user_volumes.contains_key(&UserId::from("@same:x")));
@@ -691,6 +747,42 @@ mod tests {
                 attenuation_limit_db: 100.0,
                 gpu: true,
             }
+        );
+    }
+
+    #[test]
+    fn call_sounds_default_to_all_on_at_60_percent() {
+        let sounds = CallSounds::default();
+        assert!(sounds.enabled && sounds.others_joining && sounds.leaving);
+        assert_eq!(sounds.volume_percent, 60);
+        assert_eq!(AudioSettings::default().call_sounds, sounds);
+    }
+
+    #[test]
+    fn call_sounds_missing_or_partial_read_as_the_defaults() {
+        let s: AudioSettings = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(s.call_sounds, CallSounds::default());
+        let s: AudioSettings =
+            serde_json::from_value(serde_json::json!({ "call_sounds": { "leaving": false } }))
+                .unwrap();
+        assert!(!s.call_sounds.leaving);
+        assert!(s.call_sounds.enabled && s.call_sounds.others_joining);
+        assert_eq!(s.call_sounds.volume_percent, 60);
+    }
+
+    #[test]
+    fn the_call_sounds_volume_is_clamped() {
+        let s = AudioSettings {
+            call_sounds: CallSounds {
+                volume_percent: 900,
+                ..CallSounds::default()
+            },
+            ..AudioSettings::default()
+        }
+        .validated();
+        assert_eq!(
+            s.call_sounds.volume_percent,
+            limits::CALL_SOUNDS_VOLUME_PERCENT
         );
     }
 
@@ -836,6 +928,12 @@ mod tests {
                 "user_cleaning": {},
                 "announce_cleaning": { "enabled": true, "cleaned_outside": false },
                 "ringtone": true,
+                "call_sounds": {
+                    "enabled": true,
+                    "others_joining": true,
+                    "leaving": true,
+                    "volume_percent": 60
+                },
             })
         );
     }

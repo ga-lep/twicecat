@@ -25,9 +25,12 @@ use serde_json::Value;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
-use super::membership::CALL_MEMBER_EVENT;
+use super::membership::{CALL_MEMBER_EVENT, Membership};
 use super::ringing::{self, Callee, DECLINE_EVENT, NOTIFICATION_EVENT, SLOT_EVENT, SLOT_ID};
-use crate::api::{CoreEvent, RoomId, UserId};
+use crate::api::{CallMemberView, CoreEvent, MAX_CALL_MEMBERS, RoomId, UserId};
+use crate::notifications::clean_line;
+use crate::room_list::pick_avatar;
+use crate::rooms::MAX_NAME_CHARS;
 
 /// How often rings are checked for expiry and calls for stale memberships.
 const RECHECK: Duration = Duration::from_secs(2);
@@ -78,8 +81,8 @@ struct WatchState {
     /// room's latest events again, and a ring answered or declined must not
     /// come back.
     handled: HashMap<String, u64>,
-    /// Devices in each room's call, as last reported.
-    counts: HashMap<String, u32>,
+    /// Each room's call (devices and people), as last reported.
+    calls: HashMap<String, Seen>,
     /// Our own notifications, by room, to tell their declines.
     sent: HashMap<String, String>,
     /// Events waiting for their room keys, oldest first.
@@ -225,6 +228,68 @@ impl CallWatch {
             let _ = task.await;
         }
     }
+}
+
+/// What was last reported for a room's call.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Seen {
+    count: u32,
+    users: Vec<String>,
+}
+
+/// The distinct users of `active` (oldest first), at most
+/// [`MAX_CALL_MEMBERS`].
+fn distinct_users(active: &[Membership]) -> Vec<String> {
+    let mut users: Vec<String> = Vec::new();
+    for m in active {
+        if users.len() >= MAX_CALL_MEMBERS {
+            break;
+        }
+        if !users.contains(&m.user_id) {
+            users.push(m.user_id.clone());
+        }
+    }
+    users
+}
+
+/// A member as the room list shows them: the name on one clean line (none if
+/// nothing is left of it), the avatar only if it is a valid MXC URI.
+fn member_view(user: &str, name: Option<&str>, avatar: Option<&str>) -> CallMemberView {
+    CallMemberView {
+        user_id: UserId::from(user),
+        display_name: name
+            .map(|n| clean_line(n, MAX_NAME_CHARS))
+            .filter(|n| !n.is_empty()),
+        avatar: pick_avatar(avatar, false, &[]),
+    }
+}
+
+/// Whether a room's call changed since `seen`: its device count or its people.
+fn changed(seen: Option<&Seen>, now: &Seen) -> bool {
+    match seen {
+        Some(seen) => seen != now,
+        None => *now != Seen::default(),
+    }
+}
+
+/// The members of `users` from the room's member store.
+async fn member_views(room: &Room, users: &[String]) -> Vec<CallMemberView> {
+    let mut out = Vec::with_capacity(users.len());
+    for user in users {
+        let member = match matrix_sdk::ruma::UserId::parse(user) {
+            Ok(uid) => room.get_member_no_sync(&uid).await.ok().flatten(),
+            Err(_) => None,
+        };
+        out.push(member_view(
+            user,
+            member.as_ref().and_then(|m| m.display_name()),
+            member
+                .as_ref()
+                .and_then(|m| m.avatar_url())
+                .map(|u| u.as_str()),
+        ));
+    }
+    out
 }
 
 fn now_ms() -> u64 {
@@ -534,11 +599,17 @@ async fn on_members(room: &Room, own: &str, state: &State, events: &mpsc::Sender
     let room_id = room.room_id().as_str();
     let joined = active.iter().any(|m| m.user_id == own);
     let stop_ring = active.is_empty() || joined;
-    let (count_changed, ring_stopped, now_ringing) = {
+    let now = Seen {
+        count,
+        users: distinct_users(&active),
+    };
+    let (call_changed, ring_stopped, now_ringing) = {
         let mut st = state.lock().expect("call watch lock");
-        let previous = st.counts.insert(room_id.to_owned(), count).unwrap_or(0);
+        let call_changed = changed(st.calls.get(room_id), &now);
         if count == 0 {
-            st.counts.remove(room_id);
+            st.calls.remove(room_id);
+        } else {
+            st.calls.insert(room_id.to_owned(), now.clone());
         }
         let ring_stopped = stop_ring && st.remove_ring(room_id).is_some();
         // A waiting notification rings once its sender is in the call (not
@@ -549,14 +620,16 @@ async fn on_members(room: &Room, own: &str, state: &State, events: &mpsc::Sender
             .then(|| st.waiting.remove(room_id))
             .flatten()
             .filter(|w| !joined && w.incoming.expires_ms > now_ms());
-        (previous != count, ring_stopped, now_ringing)
+        (call_changed, ring_stopped, now_ringing)
     };
-    if count_changed {
-        tracing::debug!(room = %room_id, user = own, count, "call participants");
+    if call_changed {
+        tracing::debug!(room = %room_id, user = own, count, members = now.users.len(), "call participants");
+        let members = member_views(room, &now.users).await;
         let _ = events
             .send(CoreEvent::ActiveCall {
                 room_id: RoomId::from(room_id),
                 participants: count,
+                members,
             })
             .await;
     }
@@ -594,7 +667,7 @@ async fn recheck(client: Client, own: String, state: State, events: mpsc::Sender
                 .retain(|h| now.saturating_sub(h.held_at_ms) < HELD_FOR_MS);
             st.waiting.retain(|_, w| w.incoming.expires_ms > now);
             st.handled.retain(|_, expires_ms| *expires_ms > now);
-            (expired, st.counts.keys().cloned().collect())
+            (expired, st.calls.keys().cloned().collect())
         };
         for room_id in expired {
             let _ = events
@@ -630,6 +703,78 @@ mod tests {
     fn add(st: &mut WatchState, room: &str, loud: bool) {
         st.rings.insert(room.into(), ring(loud));
         st.sync_loud();
+    }
+
+    fn membership(user: &str, device: &str, joined_ms: u64) -> Membership {
+        Membership {
+            user_id: user.into(),
+            device_id: device.into(),
+            member_id: format!("{user}:{device}"),
+            backend_identity: format!("{user}:{device}"),
+            livekit_service_url: None,
+            focus: None,
+            joined_ms,
+            expires_ms: u64::MAX / 2,
+        }
+    }
+
+    #[test]
+    fn a_user_on_two_devices_is_one_member_and_two_participants() {
+        let active = vec![
+            membership("@a:x", "D1", 1),
+            membership("@b:x", "D1", 2),
+            membership("@a:x", "D2", 3),
+        ];
+        assert_eq!(distinct_users(&active), ["@a:x", "@b:x"], "join order");
+        assert_eq!(active.len(), 3, "participants stays the device count");
+    }
+
+    #[test]
+    fn thirty_users_give_twenty_five_members() {
+        let active: Vec<Membership> = (0..30)
+            .map(|i| membership(&format!("@u{i}:x"), "D", i))
+            .collect();
+        let users = distinct_users(&active);
+        assert_eq!(users.len(), 25);
+        assert_eq!(users[0], "@u0:x");
+        assert_eq!(users[24], "@u24:x");
+    }
+
+    #[test]
+    fn a_member_name_is_cleaned_to_one_line() {
+        let m = member_view("@a:x", Some("Al\u{202E}ice\nBob"), None);
+        assert_eq!(m.display_name.as_deref(), Some("Alice Bob"));
+        let m = member_view("@a:x", Some("\u{202E}\n"), None);
+        assert_eq!(m.display_name, None, "nothing left of it");
+    }
+
+    #[test]
+    fn an_invalid_avatar_is_dropped() {
+        assert_eq!(member_view("@a:x", None, Some("not an mxc")).avatar, None);
+        assert_eq!(
+            member_view("@a:x", None, Some("mxc://x/abc"))
+                .avatar
+                .as_ref()
+                .map(|a| a.as_str()),
+            Some("mxc://x/abc")
+        );
+    }
+
+    #[test]
+    fn a_new_set_of_people_with_the_same_count_is_a_change() {
+        let one = |u: &str| Seen {
+            count: 1,
+            users: vec![u.into()],
+        };
+        assert!(changed(None, &one("@a:x")), "first sight of a call");
+        assert!(!changed(Some(&one("@a:x")), &one("@a:x")));
+        assert!(changed(Some(&one("@a:x")), &one("@b:x")));
+        let two_devices = Seen {
+            count: 2,
+            users: vec!["@a:x".into()],
+        };
+        assert!(changed(Some(&one("@a:x")), &two_devices), "count alone");
+        assert!(!changed(None, &Seen::default()), "no call, nothing to say");
     }
 
     #[test]

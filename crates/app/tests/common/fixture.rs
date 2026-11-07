@@ -238,6 +238,7 @@ fn main_no_room() -> App {
                 avatar: None,
                 level: 0,
                 children: 4,
+                rooms: Vec::new(),
             },
             SpaceView {
                 id: room("space-work"),
@@ -245,6 +246,7 @@ fn main_no_room() -> App {
                 avatar: None,
                 level: 0,
                 children: 6,
+                rooms: Vec::new(),
             },
         ]),
     );
@@ -260,8 +262,553 @@ fn main_no_room() -> App {
         CoreEvent::ActiveCall {
             room_id: room("hangout"),
             participants: 2,
+            members: Vec::new(),
         },
     );
+    app
+}
+
+// ---- The spaces rail ----------------------------------------------------
+
+/// The ID of a space of the rail scenario.
+pub fn rail_space(name: &str) -> RoomId {
+    room(&format!("rail-{name}"))
+}
+
+/// The rail with every state side by side: default, hover, unread, mentions
+/// and selected spaces, Home with a count, a collapsed folder (2 x 2
+/// preview) and an open one with a mention inside.
+fn rail_states() -> App {
+    use twicecat_app::sidebar_store::{SidebarAnswer, SidebarLoad};
+    use twicecat_app::spaces::{RailKey, SpacesMessage};
+    use twicecat_core::api::{
+        FolderLayout, RailEntry, SidebarLabel, SidebarLayout, SpaceUnreadView, UnreadCountsView,
+    };
+
+    let mut app = main_no_room();
+    let names = [
+        ("default", "Homelab"),
+        ("hover", "Hover Hall"),
+        ("unread", "Quiet Lab"),
+        ("mention", "Boredlabs"),
+        ("selected", "Selected Hub"),
+        ("fa", "Rust"),
+        ("fb", "Vue"),
+        ("fc", "Go"),
+        ("fd", "Zig"),
+        ("ga", "Garden"),
+        ("gb", "Kitchen"),
+    ];
+    let spaces = names
+        .iter()
+        .map(|(id, name)| SpaceView {
+            id: rail_space(id),
+            name: (*name).to_owned(),
+            avatar: None,
+            level: 0,
+            children: 3,
+            rooms: Vec::new(),
+        })
+        .collect();
+    feed(&mut app, CoreEvent::Spaces(spaces));
+    let counts = |notifications, highlights, unread| UnreadCountsView {
+        notifications,
+        highlights,
+        unread,
+    };
+    feed(
+        &mut app,
+        CoreEvent::SpaceUnread {
+            spaces: vec![
+                SpaceUnreadView {
+                    space: rail_space("unread"),
+                    counts: counts(0, 0, true),
+                },
+                SpaceUnreadView {
+                    space: rail_space("mention"),
+                    counts: counts(12, 3, true),
+                },
+                SpaceUnreadView {
+                    space: rail_space("fb"),
+                    counts: counts(130, 0, true),
+                },
+                SpaceUnreadView {
+                    space: rail_space("gb"),
+                    counts: counts(4, 1, true),
+                },
+            ],
+            outside: counts(7, 0, true),
+        },
+    );
+    let mut layout = SidebarLayout::new(user("me"));
+    layout.rail = vec![
+        RailEntry::Space(rail_space("default")),
+        RailEntry::Space(rail_space("hover")),
+        RailEntry::Space(rail_space("unread")),
+        RailEntry::Space(rail_space("mention")),
+        RailEntry::Space(rail_space("selected")),
+        RailEntry::Folder(FolderLayout {
+            id: 1,
+            name: Some(SidebarLabel::try_from("Languages").expect("a valid name")),
+            open: false,
+            spaces: ["fa", "fb", "fc", "fd"].map(rail_space).to_vec(),
+        }),
+        RailEntry::Folder(FolderLayout {
+            id: 2,
+            name: None,
+            open: true,
+            spaces: ["ga", "gb"].map(rail_space).to_vec(),
+        }),
+    ];
+    press(
+        &mut app,
+        Message::SidebarLoaded(SidebarAnswer::new(user("me"), SidebarLoad::Layout(layout))),
+    );
+    press(
+        &mut app,
+        Message::Spaces(SpacesMessage::Select(Some(rail_space("selected")))),
+    );
+    press(
+        &mut app,
+        Message::Spaces(SpacesMessage::Enter(RailKey::Space(rail_space("hover")))),
+    );
+    app
+}
+
+/// A drag of a space in progress on the rail, with the pointer over `over`
+/// in `zone`.
+fn rail_drag_over(over: &str, zone: twicecat_app::drag::Zone) -> App {
+    use twicecat_app::spaces::{RailKey, SpacesMessage};
+
+    let mut app = rail_states();
+    let key = |id: &str| RailKey::Space(rail_space(id));
+    for message in [
+        SpacesMessage::Press(key("default")),
+        SpacesMessage::PointerMoved(iced::Point::new(30.0, 30.0)),
+        SpacesMessage::PointerMoved(iced::Point::new(40.0, 90.0)),
+        SpacesMessage::Over(key(over), zone),
+    ] {
+        press(&mut app, Message::Spaces(message));
+    }
+    app
+}
+
+/// A space dragged to just before another one: the line shows above it.
+fn rail_dragging() -> App {
+    rail_drag_over("mention", twicecat_app::drag::Zone::Before)
+}
+
+/// A space dragged onto the middle of another: the ring shows (a folder
+/// would be made).
+fn rail_dragging_into() -> App {
+    rail_drag_over("unread", twicecat_app::drag::Zone::Into)
+}
+
+/// The options card open on a space of the rail (right-click).
+fn rail_menu() -> App {
+    use twicecat_app::sidebar_menu::SidebarMenuMessage;
+    use twicecat_app::spaces::RailKey;
+
+    let mut app = rail_states();
+    press(
+        &mut app,
+        Message::SidebarMenu(SidebarMenuMessage::Open(RailKey::Space(rail_space(
+            "mention",
+        )))),
+    );
+    app
+}
+
+/// The name dialog of "New folder" after a name that is too long was
+/// submitted: the error line shows.
+fn rail_folder_name() -> App {
+    use twicecat_app::sidebar_menu::{FolderPick, SidebarMenuMessage};
+
+    let mut app = rail_menu();
+    for message in [
+        SidebarMenuMessage::Folder(FolderPick::New),
+        SidebarMenuMessage::NameInput("w".repeat(33)),
+        SidebarMenuMessage::NameSubmit,
+    ] {
+        press(&mut app, Message::SidebarMenu(message));
+    }
+    app
+}
+
+// ---- Sections inside a space ---------------------------------------------
+
+/// The ID of a space of the sections scenarios.
+fn sec_space(name: &str) -> RoomId {
+    room(&format!("sec-{name}"))
+}
+
+/// A room of the sections scenarios, with a line of preview.
+fn sec_room(name: &str, title: &str, minutes_ago: u64) -> RoomSummary {
+    let mut room = summary(&format!("sec-r-{name}"), title);
+    room.last_message = Some(preview(
+        "bea",
+        "Bea Example",
+        "Sounds good to me",
+        minutes_ago,
+    ));
+    room
+}
+
+/// The "Twicecat HQ" space with a Tech, a Hobbies and a Voice sub-space, and
+/// its rooms: `collapsed` has Tech (a mention) and Hobbies (a count) shut.
+fn space_sections(collapsed: bool) -> App {
+    use twicecat_app::sidebar_store::{SidebarAnswer, SidebarLoad};
+    use twicecat_app::spaces::SpacesMessage;
+    use twicecat_core::api::{SectionKey, SidebarLayout, SpaceLayout};
+
+    let mut app = logged_in_loading();
+    let rid = |name: &str| room(&format!("sec-r-{name}"));
+    let mut roadmap = sec_room("roadmap", "Roadmap", 3);
+    roadmap.unread_messages = 1;
+    let mut general = sec_room("general", "General", 8);
+    general.unread_messages = 3;
+    general.unread_notifications = 3;
+    let random = sec_room("random", "Random", 90);
+    let announcements = sec_room("news", "Announcements", 600);
+    let mut rust = sec_room("rust", "Rust help", 12);
+    rust.unread_messages = 7;
+    rust.unread_notifications = 5;
+    rust.highlights = 2;
+    let mut devops = sec_room("devops", "DevOps", 40);
+    devops.unread_messages = 3;
+    devops.unread_notifications = 3;
+    let asyncs = sec_room("async", "Async questions", 55);
+    let mut boards = sec_room("boards", "Board games", 25);
+    boards.unread_messages = 4;
+    boards.unread_notifications = 4;
+    let mut cooking = sec_room("cooking", "Cooking", 70);
+    cooking.unread_messages = 7;
+    cooking.unread_notifications = 7;
+    let mut lounge = sec_room("lounge", "Lounge", 130);
+    lounge.is_call_room = true;
+    let mut pair = sec_room("pair", "Pair programming", 200);
+    pair.is_call_room = true;
+    let mut alice = sec_room("alice", "Alice Example", 5);
+    alice.is_dm = true;
+    alice.dm_peer = Some(user("alice"));
+    alice.unread_messages = 1;
+    let mut rows = vec![
+        roadmap,
+        general,
+        rust,
+        alice,
+        boards,
+        devops,
+        random,
+        cooking,
+        asyncs,
+        lounge,
+        pair,
+        announcements,
+    ];
+    for (id, title) in [
+        ("tech", "Tech"),
+        ("hobbies", "Hobbies"),
+        ("voice", "Voice"),
+        ("rustlang", "Rust"),
+    ] {
+        let mut row = RoomSummary::new(sec_space(id), title.to_owned());
+        row.is_space = true;
+        rows.push(row);
+    }
+    let total = u32::try_from(rows.len()).expect("a few rooms");
+    feed(
+        &mut app,
+        CoreEvent::RoomListChanged(vec![ListDiff::Reset { values: rows }]),
+    );
+    feed(
+        &mut app,
+        CoreEvent::RoomListLoaded {
+            total_rooms: Some(total),
+        },
+    );
+    let view = |id: &str, name: &str, level: u32, rooms: Vec<RoomId>| SpaceView {
+        id: sec_space(id),
+        name: name.to_owned(),
+        avatar: None,
+        level,
+        children: rooms.len() as u64,
+        rooms,
+    };
+    let all = |names: &[&str]| names.iter().map(|n| rid(n)).collect::<Vec<_>>();
+    feed(
+        &mut app,
+        CoreEvent::Spaces(vec![
+            view(
+                "hq",
+                "Twicecat HQ",
+                0,
+                [
+                    all(&["roadmap", "general", "random", "news", "alice"]),
+                    vec![sec_space("tech"), sec_space("hobbies"), sec_space("voice")],
+                ]
+                .concat(),
+            ),
+            view(
+                "tech",
+                "Tech",
+                1,
+                [
+                    all(&["rust", "devops", "async"]),
+                    vec![sec_space("rustlang"), sec_space("tech")],
+                ]
+                .concat(),
+            ),
+            view(
+                "hobbies",
+                "Hobbies",
+                1,
+                [all(&["boards", "cooking"]), vec![sec_space("hobbies")]].concat(),
+            ),
+            view(
+                "voice",
+                "Voice",
+                1,
+                [all(&["lounge", "pair"]), vec![sec_space("voice")]].concat(),
+            ),
+        ]),
+    );
+    let mut stored = SpaceLayout::new(sec_space("hq"));
+    stored.starred = vec![rid("roadmap")];
+    if collapsed {
+        stored.collapsed = vec![
+            SectionKey::SubSpace(sec_space("tech")),
+            SectionKey::SubSpace(sec_space("hobbies")),
+        ];
+    }
+    let mut layout = SidebarLayout::new(user("me"));
+    layout.spaces = vec![stored];
+    press(
+        &mut app,
+        Message::SidebarLoaded(SidebarAnswer::new(user("me"), SidebarLoad::Layout(layout))),
+    );
+    press(
+        &mut app,
+        Message::Spaces(SpacesMessage::Select(Some(sec_space("hq")))),
+    );
+    press(&mut app, Message::SelectRoom(rid("general")));
+    app
+}
+
+fn space_sections_expanded() -> App {
+    space_sections(false)
+}
+
+/// The sections space with two sections of the user's own: "Reading list",
+/// holding two rooms, and "Later", empty (it shows its hint). Both were moved
+/// up, with the options card, to sit right after Channels, so they show in the
+/// first screen of the list.
+fn space_sections_custom() -> App {
+    use twicecat_app::sidebar::Op;
+    use twicecat_app::sidebar_menu::{Entry, SidebarMenuMessage};
+    use twicecat_core::api::{SectionKey, SidebarLabel};
+
+    let mut app = space_sections(false);
+    let hq = sec_space("hq");
+    let label = |text: &str| SidebarLabel::try_from(text).expect("a name");
+    let rid = |name: &str| room(&format!("sec-r-{name}"));
+    for op in [
+        Op::NewSection {
+            space: hq.clone(),
+            name: label("Reading list"),
+            room: Some(rid("random")),
+        },
+        Op::MoveRoomToSection {
+            space: hq.clone(),
+            room: rid("news"),
+            section: 0,
+        },
+        Op::NewSection {
+            space: hq,
+            name: label("Later"),
+            room: None,
+        },
+    ] {
+        assert!(app.apply_sidebar(op).is_ok(), "the fixture's layout fits");
+    }
+    // Reading list up past Voice, Hobbies and Tech; then Later the same way.
+    for id in [0, 1] {
+        for _ in 0..3 {
+            for message in [
+                SidebarMenuMessage::OpenSection(SectionKey::Custom(id)),
+                SidebarMenuMessage::Entry(Entry::MoveUp),
+            ] {
+                press(&mut app, Message::SidebarMenu(message));
+            }
+        }
+    }
+    app
+}
+
+/// A drag in the sectioned list in progress: `item` pressed and moved, with
+/// the pointer then put `over` a row or header in `zone`.
+fn list_drag_over(
+    item: twicecat_app::list_drop::ListKey,
+    over: twicecat_app::list_drop::ListKey,
+    zone: twicecat_app::drag::Zone,
+) -> App {
+    use twicecat_app::spaces::SpacesMessage;
+
+    let mut app = space_sections_custom();
+    for message in [
+        SpacesMessage::ListEnter(item.clone()),
+        SpacesMessage::ListPress(item),
+        SpacesMessage::PointerMoved(iced::Point::new(30.0, 30.0)),
+        SpacesMessage::PointerMoved(iced::Point::new(60.0, 90.0)),
+        SpacesMessage::ListOver(over, zone),
+    ] {
+        press(&mut app, Message::Spaces(message));
+    }
+    app
+}
+
+fn list_room(name: &str) -> twicecat_app::list_drop::ListKey {
+    twicecat_app::list_drop::ListKey::Room(room(&format!("sec-r-{name}")))
+}
+
+fn list_head(key: twicecat_core::api::SectionKey) -> twicecat_app::list_drop::ListKey {
+    twicecat_app::list_drop::ListKey::Header(key)
+}
+
+/// A room dragged onto the header of "Reading list": the ring shows (it would
+/// go to the end of the section).
+fn space_sections_dragging() -> App {
+    use twicecat_core::api::SectionKey;
+    list_drag_over(
+        list_room("general"),
+        list_head(SectionKey::Custom(0)),
+        twicecat_app::drag::Zone::Into,
+    )
+}
+
+/// A room dragged over the upper half of a row of "Reading list": the line
+/// shows above that row.
+fn space_sections_dragging_line() -> App {
+    list_drag_over(
+        list_room("rust"),
+        list_room("news"),
+        twicecat_app::drag::Zone::Before,
+    )
+}
+
+/// A room of Channels dragged onto the Tech header: it may only go back to
+/// its own default section, so the header is drawn as not allowed.
+fn space_sections_dragging_refused() -> App {
+    use twicecat_core::api::SectionKey;
+    list_drag_over(
+        list_room("general"),
+        list_head(SectionKey::SubSpace(sec_space("tech"))),
+        twicecat_app::drag::Zone::Into,
+    )
+}
+
+/// A section header dragged over the lower half of another: the line shows
+/// under it.
+fn space_sections_dragging_header() -> App {
+    use twicecat_core::api::SectionKey;
+    list_drag_over(
+        list_head(SectionKey::Custom(1)),
+        list_head(SectionKey::Custom(0)),
+        twicecat_app::drag::Zone::Before,
+    )
+}
+
+/// The options card of a room that sits in a section of the user's own.
+fn section_menu() -> App {
+    use twicecat_app::sidebar_menu::SidebarMenuMessage;
+
+    let mut app = space_sections_custom();
+    press(
+        &mut app,
+        Message::SidebarMenu(SidebarMenuMessage::OpenRoom(room("sec-r-random"))),
+    );
+    app
+}
+
+fn space_sections_collapsed() -> App {
+    space_sections(true)
+}
+
+/// Board 6: the Voice section with "vocal" (three people: one speaking, one
+/// muted, this device among them in the call) and "coworking" (one person
+/// whose name is unknown, so the localpart shows, and no marks: this device
+/// is not in that call).
+fn voice_channel() -> App {
+    use twicecat_app::spaces::SpacesMessage;
+    use twicecat_core::api::CallMemberView;
+    use twicecat_core::api::SectionKey;
+    let mut app = space_sections(false);
+    // The sections above Voice are shut, so the Voice section is in the
+    // first screen of the list.
+    for key in [
+        SectionKey::Starred,
+        SectionKey::Channels,
+        SectionKey::SubSpace(sec_space("tech")),
+        SectionKey::SubSpace(sec_space("hobbies")),
+    ] {
+        press(&mut app, Message::Spaces(SpacesMessage::ToggleSection(key)));
+    }
+    let (vocal, coworking) = (room("sec-r-lounge"), room("sec-r-pair"));
+    for r in &mut app.rooms {
+        if r.id == vocal {
+            r.name = "vocal".to_owned();
+        } else if r.id == coworking {
+            r.name = "coworking".to_owned();
+        }
+    }
+    let member = |name: &str, shown: Option<&str>| CallMemberView {
+        user_id: user(name),
+        display_name: shown.map(str::to_owned),
+        avatar: None,
+    };
+    feed(
+        &mut app,
+        CoreEvent::ActiveCall {
+            room_id: vocal.clone(),
+            participants: 3,
+            members: vec![
+                member("rhaenyra", Some("Rhaenyra")),
+                member("septimus", Some("Septimus")),
+                member("galep", Some("galep")),
+            ],
+        },
+    );
+    feed(
+        &mut app,
+        CoreEvent::ActiveCall {
+            room_id: coworking,
+            participants: 1,
+            members: vec![member("corin", None)],
+        },
+    );
+    call_events(
+        &mut app,
+        CallState::Connected {
+            room_id: vocal.clone(),
+            encrypted: true,
+        },
+    );
+    let mut people = vec![
+        person("galep", true, false, false, CleaningStatus::Off),
+        person("rhaenyra", false, false, true, CleaningStatus::Off),
+        person("septimus", false, true, false, CleaningStatus::Off),
+    ];
+    for p in &mut people {
+        p.display_name = None;
+    }
+    feed(
+        &mut app,
+        CoreEvent::CallParticipants {
+            room_id: vocal.clone(),
+            diffs: vec![ListDiff::Reset { values: people }],
+        },
+    );
+    press(&mut app, Message::SelectRoom(vocal));
     app
 }
 
@@ -688,6 +1235,7 @@ pub fn crowded_room_list(body: &str) -> App {
         CoreEvent::ActiveCall {
             room_id: room("counted"),
             participants: 12,
+            members: Vec::new(),
         },
     );
     app
@@ -1466,6 +2014,12 @@ fn voice_others() -> App {
     })
 }
 
+fn voice_ringtone_sounds_off() -> App {
+    voice_page_with(AudioPage::Ringtone, true, gpu_found(), |settings, _| {
+        settings.call_sounds.enabled = false;
+    })
+}
+
 fn voice_diagnostics() -> App {
     let mut app = voice_page(AudioPage::Diagnostics);
     press(&mut app, Message::Audio(AudioMessage::Diagnostics));
@@ -1530,6 +2084,112 @@ fn settings_appearance() -> App {
 
 fn settings_notifications() -> App {
     settings_page(SettingsPage::Notifications)
+}
+
+/// Appearance with the account's sidebar layout answered: `load` is what the
+/// local file held.
+fn settings_appearance_sidebar_with(load: twicecat_app::sidebar_store::SidebarLoad) -> App {
+    use twicecat_app::sidebar_store::SidebarAnswer;
+    let mut app = settings_appearance();
+    press(
+        &mut app,
+        Message::SidebarLoaded(SidebarAnswer::new(user("me"), load)),
+    );
+    app
+}
+
+/// A layout the account arranged: Reset sidebar layout is on.
+fn settings_appearance_sidebar() -> App {
+    use twicecat_app::sidebar_store::SidebarLoad;
+    use twicecat_core::api::{FolderLayout, RailEntry, SidebarLayout};
+    let mut layout = SidebarLayout::new(user("me"));
+    layout.rail = vec![RailEntry::Folder(FolderLayout {
+        id: 1,
+        name: None,
+        open: false,
+        spaces: vec![room("fa"), room("fb")],
+    })];
+    settings_appearance_sidebar_with(SidebarLoad::Layout(layout))
+}
+
+/// The question after pressing Reset sidebar layout.
+fn settings_appearance_sidebar_ask() -> App {
+    let mut app = settings_appearance_sidebar();
+    press(
+        &mut app,
+        Message::Settings(SettingsMessage::ResetSidebarAsk),
+    );
+    app
+}
+
+/// The stored file was made by a newer Twicecat: Reset is off, with a note.
+fn settings_appearance_sidebar_newer() -> App {
+    settings_appearance_sidebar_with(twicecat_app::sidebar_store::SidebarLoad::Newer)
+}
+
+/// The stored file belongs to another account: Reset is off, with a note.
+fn settings_appearance_sidebar_other() -> App {
+    settings_appearance_sidebar_with(twicecat_app::sidebar_store::SidebarLoad::OtherAccount)
+}
+
+/// The themes folder the tests share: Daylight, the Duo pair, Faint and Paper.
+fn theme_fixtures() -> twicecat_app::themes::Loaded {
+    twicecat_app::themes::load_dir(std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/themes"
+    )))
+}
+
+/// A report line for a file that was refused.
+fn refused_line(name: &str) -> twicecat_app::themes::ReportLine {
+    use twicecat_app::theme::Refusal;
+    use twicecat_app::themes::{FileProblem, Note, ReportLine};
+    ReportLine {
+        name: Some(name.to_owned()),
+        note: Note::Problem(FileProblem::Refused(Refusal::MixedBackgrounds)),
+    }
+}
+
+/// The Appearance page with the fixture themes read and `selected` stored.
+fn themes_page(selected: Option<&str>, mode: iced::theme::Mode) -> App {
+    let mut app = settings_appearance();
+    let mut settings = app.ui_settings;
+    settings.theme_name =
+        selected.map(|n| twicecat_core::api::ThemeName::try_from(n).expect("a valid name"));
+    app.set_ui_settings(settings);
+    press(&mut app, Message::ThemeMode(mode));
+    let mut loaded = theme_fixtures();
+    loaded.report.push(refused_line("Mixed"));
+    app.set_themes(loaded);
+    app
+}
+
+/// Daylight selected; the menu lists the four themes; the report has an
+/// adjusted file and a refused one.
+fn settings_appearance_themes() -> App {
+    themes_page(Some("Daylight"), iced::theme::Mode::Dark)
+}
+
+/// Duo selected with the stored choice System, the system in light mode.
+fn settings_appearance_pair() -> App {
+    themes_page(Some("Duo"), iced::theme::Mode::Light)
+}
+
+/// The same pair, the system in dark mode.
+fn settings_appearance_pair_dark() -> App {
+    themes_page(Some("Duo"), iced::theme::Mode::Dark)
+}
+
+/// The selected theme was refused: Twicecat is shown, with the reason.
+fn settings_appearance_fallback() -> App {
+    themes_page(Some("Mixed"), iced::theme::Mode::Dark)
+}
+
+/// A read of the themes folder is running.
+fn settings_appearance_loading() -> App {
+    let mut app = themes_page(Some("Daylight"), iced::theme::Mode::Dark);
+    press(&mut app, Message::Settings(SettingsMessage::ReloadThemes));
+    app
 }
 
 /// Keywords that are long and have no break point, and a save that failed.
@@ -2502,6 +3162,7 @@ fn switcher_long() -> App {
         CoreEvent::ActiveCall {
             room_id: room("design"),
             participants: 3,
+            members: Vec::new(),
         },
     );
     press(
@@ -3135,6 +3796,117 @@ pub fn scenarios() -> Vec<Scenario> {
         s("stopped", false, stopped, |a| {
             a.screen == Screen::Disconnected
         }),
+        s("rail-states", true, rail_states, |a| {
+            in_main(a)
+                && a.spaces.entries().len() == 11
+                && a.rail_hover.is_some()
+                && a.query.space.is_some()
+                && a.sidebar.layout().is_some()
+        }),
+        s("rail-dragging", true, rail_dragging, |a| {
+            in_main(a)
+                && a.rail_drag.is_dragging()
+                && a.rail_drag.target().map(|t| t.zone) == Some(twicecat_app::drag::Zone::Before)
+        }),
+        s("rail-dragging-into", true, rail_dragging_into, |a| {
+            in_main(a)
+                && a.rail_drag.is_dragging()
+                && a.rail_drag.target().map(|t| t.zone) == Some(twicecat_app::drag::Zone::Into)
+        }),
+        s("rail-menu", true, rail_menu, |a| {
+            in_main(a)
+                && matches!(
+                    a.sidebar_menu,
+                    Some(twicecat_app::sidebar_menu::SidebarMenu::Card { .. })
+                )
+        }),
+        s("rail-folder-name", true, rail_folder_name, |a| {
+            in_main(a)
+                && matches!(
+                    &a.sidebar_menu,
+                    Some(twicecat_app::sidebar_menu::SidebarMenu::Name(d))
+                        if d.error.is_some() && d.text.chars().count() == 33
+                )
+        }),
+        s("space-sections", true, space_sections_expanded, |a| {
+            in_main(a) && a.sections_shown() && a.selected.is_some()
+        }),
+        s(
+            "space-sections-collapsed",
+            true,
+            space_sections_collapsed,
+            |a| in_main(a) && a.sections_shown() && a.selected.is_some(),
+        ),
+        s("voice-channel", true, voice_channel, |a| {
+            in_main(a)
+                && a.sections_shown()
+                && a.selected.is_some()
+                && a.calls.call.is_some()
+                && a.section_lines().is_some_and(|lines| {
+                    lines.iter().any(
+                        |l| matches!(l, twicecat_app::sections::Line::Participant(p) if p.speaking),
+                    ) && lines.iter().any(
+                        |l| matches!(l, twicecat_app::sections::Line::Participant(p) if p.muted),
+                    )
+                })
+        }),
+        s("space-sections-custom", true, space_sections_custom, |a| {
+            in_main(a)
+                && a.sections_shown()
+                && a.selected.is_some()
+                && a.sidebar
+                    .layout()
+                    .is_some_and(|l| l.spaces.iter().any(|s| s.custom.len() == 2))
+        }),
+        s(
+            "space-sections-dragging",
+            true,
+            space_sections_dragging,
+            |a| {
+                in_main(a)
+                    && a.sections_shown()
+                    && a.list_drag.target().map(|t| t.zone) == Some(twicecat_app::drag::Zone::Into)
+            },
+        ),
+        s(
+            "space-sections-dragging-line",
+            true,
+            space_sections_dragging_line,
+            |a| {
+                in_main(a)
+                    && a.list_drag.target().map(|t| t.zone)
+                        == Some(twicecat_app::drag::Zone::Before)
+            },
+        ),
+        s(
+            "space-sections-dragging-refused",
+            true,
+            space_sections_dragging_refused,
+            |a| in_main(a) && a.list_drag.target().is_none() && a.list_drag.refused().is_some(),
+        ),
+        s(
+            "space-sections-dragging-header",
+            true,
+            space_sections_dragging_header,
+            |a| {
+                in_main(a)
+                    && matches!(
+                        a.list_drag.dragged(),
+                        Some(twicecat_app::list_drop::ListKey::Header(_))
+                    )
+                    && a.list_drag.target().is_some()
+            },
+        ),
+        s("section-menu", true, section_menu, |a| {
+            in_main(a)
+                && matches!(
+                    &a.sidebar_menu,
+                    Some(twicecat_app::sidebar_menu::SidebarMenu::Card {
+                        target: twicecat_app::sidebar_menu::Target::Room { .. },
+                        ..
+                    })
+                )
+        }),
         s("main-no-room", true, main_no_room, |a| {
             in_main(a) && a.selected.is_none() && a.rooms.len() > 10
         }),
@@ -3333,6 +4105,18 @@ pub fn scenarios() -> Vec<Scenario> {
             || voice_page(AudioPage::Ringtone),
             |a| a.audio_ui.page == AudioPage::Ringtone,
         ),
+        s(
+            "audio-ringtone-sounds-off",
+            false,
+            voice_ringtone_sounds_off,
+            |a| {
+                a.audio_ui.page == AudioPage::Ringtone
+                    && a.calls
+                        .settings
+                        .as_ref()
+                        .is_some_and(|s| !s.call_sounds.enabled)
+            },
+        ),
         s("audio-other-voices", false, voice_others, |a| {
             a.audio_ui.page == AudioPage::OtherVoices
                 && a.calls
@@ -3378,6 +4162,64 @@ pub fn scenarios() -> Vec<Scenario> {
         s("settings-appearance", false, settings_appearance, |a| {
             a.settings_ui.open && a.settings_ui.page == SettingsPage::Appearance
         }),
+        s(
+            "settings-appearance-themes",
+            false,
+            settings_appearance_themes,
+            |a| a.settings_ui.page == SettingsPage::Appearance && a.theme_fallback().is_none(),
+        ),
+        s(
+            "settings-appearance-pair",
+            false,
+            settings_appearance_pair,
+            |a| a.selected_is_paired(),
+        ),
+        s(
+            "settings-appearance-pair-dark",
+            false,
+            settings_appearance_pair_dark,
+            |a| a.selected_is_paired(),
+        ),
+        s(
+            "settings-appearance-fallback",
+            false,
+            settings_appearance_fallback,
+            |a| a.theme_fallback().is_some(),
+        ),
+        s(
+            "settings-appearance-loading",
+            false,
+            settings_appearance_loading,
+            |a| a.themes_loading,
+        ),
+        s(
+            "settings-appearance-sidebar",
+            false,
+            settings_appearance_sidebar,
+            |a| {
+                a.settings_ui.page == SettingsPage::Appearance
+                    && a.sidebar.state() == twicecat_app::sidebar::SidebarState::Loaded
+                    && !a.settings_ui.reset_sidebar_ask
+            },
+        ),
+        s(
+            "settings-appearance-sidebar-ask",
+            false,
+            settings_appearance_sidebar_ask,
+            |a| a.settings_ui.reset_sidebar_ask,
+        ),
+        s(
+            "settings-appearance-sidebar-newer",
+            false,
+            settings_appearance_sidebar_newer,
+            |a| a.sidebar.state() == twicecat_app::sidebar::SidebarState::Newer,
+        ),
+        s(
+            "settings-appearance-sidebar-other",
+            false,
+            settings_appearance_sidebar_other,
+            |a| a.sidebar.state() == twicecat_app::sidebar::SidebarState::OtherAccount,
+        ),
         s(
             "settings-notifications",
             false,

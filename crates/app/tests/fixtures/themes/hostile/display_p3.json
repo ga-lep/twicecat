@@ -1,0 +1,52 @@
+{
+ "color": {
+  "void": {
+   "$value": "#0a0812"
+  },
+  "surface": {
+   "$value": "#110e1c"
+  },
+  "surface-raised": {
+   "$value": "#181428"
+  },
+  "surface-overlay": {
+   "$value": "#211b36"
+  },
+  "accent-wash": {
+   "$value": "#241a45"
+  },
+  "line-strong": {
+   "$value": "#6b6194"
+  },
+  "ink": {
+   "$value": "#efebfa"
+  },
+  "ink-muted": {
+   "$value": "#a69fc4"
+  },
+  "accent": {
+   "$value": {
+    "colorSpace": "display-p3",
+    "hex": "#ff0000"
+   }
+  },
+  "on-accent": {
+   "$value": "#0a0812"
+  },
+  "accent-bright": {
+   "$value": "#b794ff"
+  },
+  "focus": {
+   "$value": "#c9aeff"
+  },
+  "live": {
+   "$value": "#ff6b86"
+  },
+  "ok": {
+   "$value": "#5ee0c8"
+  },
+  "warn": {
+   "$value": "#ffb547"
+  }
+ }
+}

@@ -90,6 +90,7 @@ fn composer(panel: &ThreadPanel) -> Element<'_, Message> {
         Some(Message::Threads(ThreadsMessage::Attach)),
     );
     let field = text_input("Reply in thread", &panel.draft)
+        .style(kit::text_input_style)
         .id(THREAD_INPUT_ID)
         .on_input(|text| Message::Threads(ThreadsMessage::Draft(MessageText::from(text))))
         .on_submit(Message::Threads(ThreadsMessage::Submit));

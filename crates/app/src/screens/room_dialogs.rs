@@ -134,6 +134,7 @@ fn input<'a>(
     submit: RoomsMessage,
 ) -> iced::widget::TextInput<'a, Message> {
     text_input(placeholder, value)
+        .style(crate::ui::kit::text_input_style)
         .on_input_maybe(editable.then_some(move |s: String| msg(on(MessageText::from(s)))))
         .on_submit_maybe(editable.then(|| msg(submit)))
         .padding(tokens::S)
@@ -187,6 +188,7 @@ fn create_dialog(dialog: &CreateDialog, window_height: f32) -> Element<'_, Messa
         .push(field("Topic (optional)", topic))
         .push(
             checkbox(form.encrypted)
+                .style(crate::ui::kit::checkbox_style)
                 .label("Encrypted")
                 .on_toggle_maybe(editable.then_some(|on| msg(RoomsMessage::CreateEncrypted(on)))),
         )
@@ -203,6 +205,7 @@ fn create_dialog(dialog: &CreateDialog, window_height: f32) -> Element<'_, Messa
         )
         .push(
             checkbox(form.public)
+                .style(crate::ui::kit::checkbox_style)
                 .label("Public (anyone can find and join it)")
                 .on_toggle_maybe(editable.then_some(|on| msg(RoomsMessage::CreatePublic(on)))),
         )

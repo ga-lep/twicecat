@@ -93,11 +93,15 @@ pub enum Icon {
     Pin,
     /// Video, as a settings page.
     Video,
+    /// A section of the room list, collapsed.
+    SectionClosed,
+    /// A section of the room list, open.
+    SectionOpen,
 }
 
 impl Icon {
     /// Every icon, in declaration order.
-    pub const ALL: [Self; 41] = [
+    pub const ALL: [Self; 43] = [
         Self::Lock,
         Self::LockOpen,
         Self::Call,
@@ -139,6 +143,8 @@ impl Icon {
         Self::Fullscreen,
         Self::Pin,
         Self::Video,
+        Self::SectionClosed,
+        Self::SectionOpen,
     ];
 
     /// The Unicode text that draws the icon today.
@@ -185,6 +191,8 @@ impl Icon {
             Self::Fullscreen => "\u{26F6}",
             Self::Pin => "\u{1F4CC}",
             Self::Video => "\u{1F3A5}",
+            Self::SectionClosed => "\u{25B8}",
+            Self::SectionOpen => "\u{25BE}",
         }
     }
 
@@ -232,6 +240,8 @@ impl Icon {
             Self::Fullscreen => "Full screen",
             Self::Pin => "Pin",
             Self::Video => "Video",
+            Self::SectionClosed => "Collapsed",
+            Self::SectionOpen => "Expanded",
         }
     }
 }
@@ -298,7 +308,7 @@ mod tests {
             assert!(!icon.label().trim().is_empty(), "{icon:?}");
             assert!(seen.insert(icon.glyph()), "{icon:?} repeats a glyph");
         }
-        assert_eq!(Icon::ALL.len(), 41);
+        assert_eq!(Icon::ALL.len(), 43);
         assert_eq!(Icon::Home.label(), "Home");
         assert_eq!(Icon::Members.label(), "Members");
     }

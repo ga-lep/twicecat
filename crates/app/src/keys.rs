@@ -631,7 +631,12 @@ impl App {
         if self.screen != Screen::Main || self.any_overlay_open() {
             return Task::none();
         }
-        match room_after(&self.rooms, self.selected.as_ref(), forward, only_unread) {
+        match room_after(
+            &self.rooms_as_drawn(),
+            self.selected.as_ref(),
+            forward,
+            only_unread,
+        ) {
             Some(id) if self.selected.as_ref() != Some(&id) => self.update(Message::SelectRoom(id)),
             _ => Task::none(),
         }

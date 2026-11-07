@@ -12,19 +12,20 @@ mod diff;
 mod media;
 mod rooms;
 mod security;
+pub mod sidebar;
 mod types;
 mod updates;
 mod video;
 
 pub use audio::{
     AUDIO_FRAME_LEN, AudioBackend, AudioDevice, AudioDeviceId, AudioDevices, AudioProcessing,
-    AudioSettings, AudioStats, CleaningAnnouncement, EnhancerBackend, GpuBackend, GpuEnhancement,
-    InputLevel, InputMode, NoiseSuppression, NsLevel, PushToTalkBindings, RemoteCleaning,
-    SkipCleaned, VirtualAudio, VoiceCleaning, limits,
+    AudioSettings, AudioStats, CallSounds, CleaningAnnouncement, EnhancerBackend, GpuBackend,
+    GpuEnhancement, InputLevel, InputMode, NoiseSuppression, NsLevel, PushToTalkBindings,
+    RemoteCleaning, SkipCleaned, VirtualAudio, VoiceCleaning, limits,
 };
 pub use call::{
-    CallEndReason, CallIntent, CallState, CleaningStatus, Participant, ParticipantId, SkipReason,
-    SoundSource,
+    CallEndReason, CallIntent, CallMemberView, CallState, CleaningStatus, MAX_CALL_MEMBERS,
+    Participant, ParticipantId, SkipReason, SoundSource,
 };
 pub use diff::ListDiff;
 pub use media::{
@@ -32,15 +33,20 @@ pub use media::{
     UploadProgress, UploadThumbnail,
 };
 pub use rooms::{
-    CreateRoomRequest, DensityChoice, MembershipView, NotificationKind, NotificationSettingsView,
-    NotificationView, OwnProfileView, PaletteChoice, PowerLevelView, Role, RoomDetailsView,
-    RoomListChoice, RoomMemberView, RoomNotificationModeView, RoomPermissions, RoomVisibility,
-    SpaceView, ThemeChoice, ThreadSummaryView, UiSettings, UpdateCheckChoice,
+    CreateRoomRequest, DensityChoice, MAX_SPACE_ROOMS, MembershipView, NotificationKind,
+    NotificationSettingsView, NotificationView, OwnProfileView, PowerLevelView, Role,
+    RoomDetailsView, RoomListChoice, RoomMemberView, RoomNotificationModeView, RoomPermissions,
+    RoomVisibility, SpaceUnreadView, SpaceView, ThemeChoice, ThemeName, ThemeNameError,
+    ThreadSummaryView, UiSettings, UnreadCountsView, UpdateCheckChoice,
 };
 pub use security::{
     CancelReason, CrossSigning, DeviceSummary, DeviceTrust, DeviceVerification, QrImage,
     ReauthAction, RecoveryKey, RecoveryProgress, RecoveryStatus, SasEmoji, SecurityStatus, Shield,
     ShieldCode, UserTrust, UtdReason, VerificationId, VerificationPeer, VerificationPhase,
+};
+pub use sidebar::{
+    CustomSection, FolderLayout, RailEntry, SectionKey, SidebarLabel, SidebarLabelError,
+    SidebarLayout, SidebarRead, SpaceLayout,
 };
 pub use types::{
     ActionKind, AuthUrl, AvatarId, AvatarImage, Block, CoreError, DeviceId, Draft, EventId, Inline,
@@ -1133,6 +1139,15 @@ pub enum CoreEvent {
         /// Unread highlights.
         highlights: u64,
     },
+    /// Unread counts per space and for the rooms in no space (the Home
+    /// badge), over all joined rooms, muted ones left out. Sent by the
+    /// rules of `UnreadTotals`: at most once a second, only on a change.
+    SpaceUnread {
+        /// One entry per known space (top-level and sub-space), by ID.
+        spaces: Vec<SpaceUnreadView>,
+        /// Rooms in no space, direct messages included.
+        outside: UnreadCountsView,
+    },
     /// A room was created.
     RoomCreated {
         /// The new room.
@@ -1190,13 +1205,18 @@ pub enum CoreEvent {
         /// Changes, in order.
         diffs: Vec<ListDiff<Participant>>,
     },
-    /// How many devices are in a room's call; sent when it changes, for the
-    /// room list (voice rooms). Zero means the call ended.
+    /// Who is in a room's call; sent when the device count or the set of
+    /// people changes, for the room list (voice rooms). Zero means the call
+    /// ended.
     ActiveCall {
         /// Room.
         room_id: RoomId,
         /// Devices in the call.
         participants: u32,
+        /// The distinct users in the call, in join order, at most
+        /// [`MAX_CALL_MEMBERS`]. Not who speaks or is muted: that is known
+        /// only for the call this device is in ([`CoreEvent::CallParticipants`]).
+        members: Vec<CallMemberView>,
     },
     /// Someone rings this user, or (with `ring: false`) lets them know a
     /// call started in a group room.
@@ -1384,6 +1404,22 @@ mod tests {
             image: Some(img),
         };
         assert!(format!("{ev:?}").contains("mxc://x/y"));
+    }
+
+    #[test]
+    fn active_call_debug_shows_user_ids_but_not_names() {
+        let ev = CoreEvent::ActiveCall {
+            room_id: RoomId::from("!r:x"),
+            participants: 1,
+            members: vec![CallMemberView {
+                user_id: UserId::from("@bob:x"),
+                display_name: Some("Secret Bob".into()),
+                avatar: None,
+            }],
+        };
+        let dbg = format!("{ev:?}");
+        assert!(dbg.contains("@bob:x"), "{dbg}");
+        assert!(!dbg.contains("Secret"), "{dbg}");
     }
 
     #[test]
@@ -1885,6 +1921,7 @@ mod tests {
                 avatar: None,
                 level: 0,
                 children: 3,
+                rooms: Vec::new(),
             }]),
         ];
         for ev in events {

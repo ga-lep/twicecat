@@ -2,6 +2,7 @@
 //! a task that reports levels and statistics. Used by the mic test now and
 //! by calls (Phase 6 Task 8).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -155,6 +156,9 @@ pub(crate) struct AudioSession {
     enhancer: Arc<Mutex<EnhancerState>>,
     remote_cleaning: CleaningBackend,
     events: mpsc::Sender<CoreEvent>,
+    /// Set when the session lingers only to finish a cue: the reporting
+    /// task then sends no levels or stats.
+    closing: Arc<AtomicBool>,
     stop: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<()>>,
 }
@@ -203,13 +207,14 @@ impl AudioSession {
         let (stop_tx, stop_rx) = oneshot::channel();
         let enhancer = Arc::new(Mutex::new(EnhancerState::default()));
         let remote_cleaning = CleaningBackend::default();
+        let closing = Arc::new(AtomicBool::new(false));
         let task = tokio::spawn(report(
             io,
             drain,
             control.clone(),
             (enhancer.clone(), remote_cleaning.clone()),
             events.clone(),
-            stop_rx,
+            (stop_rx, closing.clone()),
         ));
         let session = Self {
             control,
@@ -218,6 +223,7 @@ impl AudioSession {
             enhancer,
             remote_cleaning,
             events,
+            closing,
             stop: Some(stop_tx),
             task: Some(task),
         };
@@ -361,9 +367,23 @@ impl AudioSession {
         voice_control(&self.control).set_muted(muted);
     }
 
+    /// Prepares for closing after the leave cue. The devices stay open for
+    /// the cue, but the microphone is muted (nothing is sent) and no more
+    /// levels or stats are reported, so nothing shows as transmitting.
+    pub(crate) fn begin_closing(&self) {
+        self.set_muted(true);
+        self.closing.store(true, Ordering::Release);
+    }
+
     /// Play nothing.
     pub(crate) fn set_deafened(&self, deafened: bool) {
         voice_control(&self.control).set_deafened(deafened);
+    }
+
+    /// Plays a call cue once, mixed into the call's playback (also while
+    /// deafened). Returns false when the voice engine's queue is full.
+    pub(crate) fn play_cue(&self, samples: &'static [f32], volume_percent: u16) -> bool {
+        voice_control(&self.control).play_cue(samples, volume_percent)
     }
 
     /// The control handle, for the media layer's sources.
@@ -408,7 +428,7 @@ async fn report(
     control: Voice,
     (enhancer, remote_cleaning): (Arc<Mutex<EnhancerState>>, CleaningBackend),
     events: mpsc::Sender<CoreEvent>,
-    mut stop: oneshot::Receiver<()>,
+    (mut stop, closing): (oneshot::Receiver<()>, Arc<AtomicBool>),
 ) {
     let mut last_running = None;
     let mut ticker = tokio::time::interval(LEVEL_INTERVAL);
@@ -423,6 +443,9 @@ async fn report(
         }
         if let Some(outgoing) = drain.as_mut() {
             while outgoing.pop_frame(&mut scratch) {}
+        }
+        if closing.load(Ordering::Acquire) {
+            continue;
         }
         while let Some(event) = io.try_event() {
             let error = match event {

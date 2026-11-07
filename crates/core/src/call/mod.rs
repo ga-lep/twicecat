@@ -21,6 +21,7 @@
 
 mod capture;
 mod cleaning;
+mod cue;
 mod e2ee;
 mod encoder;
 mod jwt;
@@ -54,6 +55,7 @@ pub(crate) use self::capture::{Capture, CaptureSink, PreviewSink, PusherSlot, ne
 pub(crate) use self::capture::{CaptureEnded, CaptureSerial, Captured};
 use self::cleaning::Cleaning;
 pub(crate) use self::cleaning::announcement;
+pub(crate) use self::cue::CueHandle;
 use self::e2ee::KeyPlanner;
 pub(crate) use self::e2ee::SECRET_LOG_TARGETS;
 pub(crate) use self::encoder::{Available as VideoEncodersAvailable, Sending, tuned};
@@ -68,8 +70,9 @@ use self::participants::{Ours, watch_participants};
 use self::sfus::{Expected, Remotes, SfuManager, manage_sfus};
 use self::video::Videos;
 use crate::api::{
-    AudioSettings, CallIntent, CoreError, CoreEvent, EncoderBackend, LocalVideo, RemoteCleaning,
-    RoomId, SoundSource, UserId, VideoKind, VideoQuality, VideoTrackId, VoiceCleaning,
+    AudioSettings, CallIntent, CallSounds, CoreError, CoreEvent, EncoderBackend, LocalVideo,
+    RemoteCleaning, RoomId, SoundSource, UserId, VideoKind, VideoQuality, VideoTrackId,
+    VoiceCleaning,
 };
 
 pub(crate) fn now_ms() -> u64 {
@@ -119,6 +122,8 @@ pub(crate) struct CallSession {
     videos: Videos,
     /// What our SFU connection announces about our microphone's cleaning.
     announce: watch::Sender<Option<&'static str>>,
+    /// The live call-sound settings, read by the call's [`CueHandle`].
+    sounds: watch::Sender<CallSounds>,
     own_identity: String,
     /// Media is end-to-end encrypted (the room is).
     pub encrypted: bool,
@@ -134,6 +139,8 @@ pub(crate) struct CallSession {
 /// The audio side handed to a call.
 pub(crate) struct CallAudio {
     pub voice: Option<crate::audio_session::Voice>,
+    /// The call-sound settings when the call starts.
+    pub sounds: CallSounds,
     pub outgoing: Option<twicecat_audio::Outgoing>,
     pub bitrate_kbps: u16,
     /// Cleaning other people's voices, and the per-user choices.
@@ -241,6 +248,8 @@ impl CallSession {
             audio.cleaning_backend.clone(),
         );
         let (announce, announce_rx) = watch::channel(audio.announce);
+        let (sounds, sounds_rx) = watch::channel(audio.sounds);
+        let cues = CueHandle::new(audio.voice.clone(), sounds_rx);
         let (to_engine, notices) = mpsc::channel(8);
         let (notices_all, from_connections) = mpsc::channel(16);
         let own_identity = membership::member_id(&user_id, &device_id);
@@ -257,6 +266,7 @@ impl CallSession {
             cleaning: cleaning.clone(),
             videos: videos.clone(),
             announce,
+            sounds,
             own_identity: own_identity.clone(),
             encrypted,
             key_handler: None,
@@ -389,6 +399,7 @@ impl CallSession {
                 expected: expected_tx,
                 recipients,
                 gone: own_gone,
+                cues,
             },
         )));
         session.tasks.push(tokio::spawn(manage_sfus(
@@ -443,6 +454,17 @@ impl CallSession {
             let now = announcement(settings);
             let changed = *announced != now;
             *announced = now;
+            changed
+        });
+    }
+
+    /// Applies new call-sound settings to the running call, at once.
+    pub(crate) fn set_sounds(&self, sounds: &CallSounds) {
+        self.sounds.send_if_modified(|current| {
+            let changed = current != sounds;
+            if changed {
+                *current = *sounds;
+            }
             changed
         });
     }

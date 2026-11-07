@@ -353,12 +353,9 @@ pub fn to_span(model: &SpanModel, theme: &Theme) -> Span<'static, LinkTarget> {
         let (background, border) = pill(weak, 3.0);
         span = span.background(background).border(border);
     }
-    // A sender's colour, made readable; links and pills set their own below.
+    // A sender's colour, made readable on every surface; links and pills set their own below.
     if let Some([r, g, b]) = model.style.color {
-        span = span.color(theme::readable_on(
-            iced::Color::from_rgb8(r, g, b),
-            theme.palette().background,
-        ));
+        span = span.color(theme::sender_colour(iced::Color::from_rgb8(r, g, b), theme));
     }
     match model.look {
         Look::Plain => {}
@@ -827,10 +824,7 @@ mod tests {
 
     #[test]
     fn no_span_can_look_like_the_muted_time_of_a_header() {
-        for theme in [
-            theme::theme_for(iced::theme::Mode::Light),
-            theme::theme_for(iced::theme::Mode::Dark),
-        ] {
+        for theme in theme::test_themes() {
             let muted = theme::semantic(&theme).muted;
             for model in every_look() {
                 let span = to_span(&model, &theme);
@@ -842,105 +836,113 @@ mod tests {
 
     #[test]
     fn links_and_pills_are_coloured_and_plain_text_is_not() {
-        let theme = theme::theme_for(iced::theme::Mode::Light);
-        let models = every_look();
-        let by = |look: Look| {
-            models
-                .iter()
-                .find(|m| m.look == look)
-                .expect("look present")
-        };
-        assert_eq!(to_span(by(Look::Plain), &theme).color, None);
-        let link = to_span(by(Look::Link), &theme);
-        assert!(link.underline && link.color.is_some() && link.link.is_some());
-        assert!(
-            to_span(by(Look::Mention { own: true }), &theme)
-                .highlight
-                .is_some()
-        );
-        let own = to_span(by(Look::Mention { own: true }), &theme);
-        let other = SpanModel {
-            look: Look::Mention { own: false },
-            ..by(Look::Mention { own: true }).clone()
-        };
-        assert_ne!(own.highlight, to_span(&other, &theme).highlight);
-        assert!(to_span(by(Look::SpoilerPill), &theme).highlight.is_some());
+        for theme in theme::test_themes() {
+            let models = every_look();
+            let by = |look: Look| {
+                models
+                    .iter()
+                    .find(|m| m.look == look)
+                    .expect("look present")
+            };
+            assert_eq!(to_span(by(Look::Plain), &theme).color, None);
+            let link = to_span(by(Look::Link), &theme);
+            assert!(link.underline && link.color.is_some() && link.link.is_some());
+            assert!(
+                to_span(by(Look::Mention { own: true }), &theme)
+                    .highlight
+                    .is_some()
+            );
+            let own = to_span(by(Look::Mention { own: true }), &theme);
+            let other = SpanModel {
+                look: Look::Mention { own: false },
+                ..by(Look::Mention { own: true }).clone()
+            };
+            assert_ne!(own.highlight, to_span(&other, &theme).highlight);
+            assert!(to_span(by(Look::SpoilerPill), &theme).highlight.is_some());
+        }
     }
 
     #[test]
     fn sender_colours_are_drawn_readably_but_not_on_links_or_pills() {
-        let theme = theme::theme_for(iced::theme::Mode::Dark);
-        let navy = SpanModel {
-            text: "x".into(),
-            style: TextStyle {
-                color: Some([0x00, 0x00, 0x80]),
-                ..TextStyle::default()
-            },
-            look: Look::Plain,
-            link: None,
-        };
-        let shown = to_span(&navy, &theme).color.expect("a colour");
-        assert!(theme::contrast(shown, theme.palette().background) >= 4.5);
-        let link = SpanModel {
-            look: Look::Link,
-            ..navy.clone()
-        };
-        assert_eq!(to_span(&link, &theme).color, Some(theme.palette().primary));
+        for theme in theme::test_themes() {
+            let navy = SpanModel {
+                text: "x".into(),
+                style: TextStyle {
+                    color: Some([0x00, 0x00, 0x80]),
+                    ..TextStyle::default()
+                },
+                look: Look::Plain,
+                link: None,
+            };
+            let shown = to_span(&navy, &theme).color.expect("a colour");
+            let sem = theme::semantic(&theme);
+            let weak = theme.extended_palette().background.weak.color;
+            for bg in theme::sender_surfaces(&theme.palette(), &sem, weak) {
+                assert!(theme::contrast(shown, bg) >= 4.5, "{shown:?} on {bg:?}");
+            }
+            let link = SpanModel {
+                look: Look::Link,
+                ..navy.clone()
+            };
+            assert_eq!(to_span(&link, &theme).color, Some(theme.palette().primary));
+        }
     }
 
     #[test]
     fn pills_take_their_margins_in_the_text_so_neighbours_are_not_covered() {
         // iced span padding only grows the background, not the layout, so a
         // padded pill painted over the ":" Element puts after a mention.
-        let theme = theme::theme_for(iced::theme::Mode::Light);
-        for look in [
-            Look::Mention { own: false },
-            Look::Mention { own: true },
-            Look::SpoilerPill,
-        ] {
-            let model = SpanModel {
+        for theme in theme::test_themes() {
+            for look in [
+                Look::Mention { own: false },
+                Look::Mention { own: true },
+                Look::SpoilerPill,
+            ] {
+                let model = SpanModel {
+                    text: "bob".into(),
+                    style: TextStyle::default(),
+                    look,
+                    link: None,
+                };
+                let span = to_span(&model, &theme);
+                assert_eq!(span.padding, iced::Padding::ZERO, "{look:?}");
+                assert_eq!(span.text, "\u{202F}bob\u{202F}", "{look:?}");
+            }
+            let plain = SpanModel {
                 text: "bob".into(),
                 style: TextStyle::default(),
-                look,
+                look: Look::Plain,
                 link: None,
             };
-            let span = to_span(&model, &theme);
-            assert_eq!(span.padding, iced::Padding::ZERO, "{look:?}");
-            assert_eq!(span.text, "\u{202F}bob\u{202F}", "{look:?}");
+            assert_eq!(to_span(&plain, &theme).text, "bob");
         }
-        let plain = SpanModel {
-            text: "bob".into(),
-            style: TextStyle::default(),
-            look: Look::Plain,
-            link: None,
-        };
-        assert_eq!(to_span(&plain, &theme).text, "bob");
     }
 
     #[test]
     fn code_is_monospace_and_styles_map_to_fonts() {
-        let theme = theme::theme_for(iced::theme::Mode::Light);
-        let models = every_look();
-        let code = models.iter().find(|m| m.style.code).expect("code span");
-        let span = to_span(code, &theme);
-        let font = span.font.expect("code has a font");
-        assert_eq!(font.family, crate::ui::fonts::MONO.family);
-        assert_eq!(font.weight, Weight::Bold);
-        assert!(span.highlight.is_some());
-        let italic = SpanModel {
-            text: "i".into(),
-            style: TextStyle {
-                italic: true,
-                strike: true,
-                underline: true,
-                ..TextStyle::default()
-            },
-            look: Look::Plain,
-            link: None,
-        };
-        let span = to_span(&italic, &theme);
-        assert_eq!(span.font.expect("font").style, FontStyle::Italic);
-        assert!(span.strikethrough && span.underline);
+        for theme in theme::test_themes() {
+            let models = every_look();
+            let code = models.iter().find(|m| m.style.code).expect("code span");
+            let span = to_span(code, &theme);
+            let font = span.font.expect("code has a font");
+            assert_eq!(font.family, crate::ui::fonts::MONO.family);
+            assert_eq!(font.weight, Weight::Bold);
+            assert!(span.highlight.is_some());
+            let italic = SpanModel {
+                text: "i".into(),
+                style: TextStyle {
+                    italic: true,
+                    strike: true,
+                    underline: true,
+                    ..TextStyle::default()
+                },
+                look: Look::Plain,
+                link: None,
+            };
+            let span = to_span(&italic, &theme);
+            assert_eq!(span.font.expect("font").style, FontStyle::Italic);
+            assert!(span.strikethrough && span.underline);
+        }
     }
 
     #[test]
@@ -990,27 +992,28 @@ mod tests {
 
     #[test]
     fn every_block_kind_builds_and_deep_nesting_is_cut() {
-        let theme = theme::theme_for(iced::theme::Mode::Dark);
-        let revealed = Revealed::new();
-        let c = ctx(&revealed, None);
-        let all = RichText {
-            blocks: vec![
-                Block::Heading {
-                    level: 1,
-                    inlines: vec![plain("h")],
-                },
-                Block::Paragraph(vec![plain("p")]),
-                Block::Code {
-                    text: "fn main() {}\n".repeat(10),
-                },
-                Block::Rule,
-                Block::Paragraph(vec![]),
-            ],
-        };
-        drop(blocks_view(&all, &c, &theme));
-        // Far beyond the core's own cap of 32; the view must stop at MAX_DEPTH.
-        drop(blocks_view(&quote_of(200), &c, &theme));
-        drop(blocks_view(&RichText::default(), &c, &theme));
+        for theme in theme::test_themes() {
+            let revealed = Revealed::new();
+            let c = ctx(&revealed, None);
+            let all = RichText {
+                blocks: vec![
+                    Block::Heading {
+                        level: 1,
+                        inlines: vec![plain("h")],
+                    },
+                    Block::Paragraph(vec![plain("p")]),
+                    Block::Code {
+                        text: "fn main() {}\n".repeat(10),
+                    },
+                    Block::Rule,
+                    Block::Paragraph(vec![]),
+                ],
+            };
+            drop(blocks_view(&all, &c, &theme));
+            // Far beyond the core's own cap of 32; the view must stop at MAX_DEPTH.
+            drop(blocks_view(&quote_of(200), &c, &theme));
+            drop(blocks_view(&RichText::default(), &c, &theme));
+        }
     }
 
     #[test]

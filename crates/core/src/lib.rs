@@ -11,6 +11,7 @@ mod audio_session;
 mod avatars;
 mod call;
 mod call_settings;
+mod call_sounds;
 mod client;
 mod cpu_level;
 mod drafts;

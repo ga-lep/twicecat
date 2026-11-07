@@ -861,19 +861,28 @@ const SHIELD_SIZE: f32 = 16.0;
 /// does not depend on the fonts installed.
 fn shield_view<'a>(shield: Shield) -> Element<'a, Message> {
     let (look, label) = shield_text(shield);
-    let mark = container(text("!").size(11).color(Color::WHITE))
-        .width(SHIELD_SIZE)
-        .height(SHIELD_SIZE)
-        .center_x(SHIELD_SIZE)
-        .center_y(SHIELD_SIZE)
-        .style(move |theme: &Theme| container::Style {
-            background: Some(Background::Color(match look {
-                Look::Red => theme.palette().danger,
-                Look::Grey => theme::semantic(theme).badge,
-            })),
-            border: iced::border::rounded(SHIELD_SIZE / 4.0),
-            ..container::Style::default()
-        });
+    // The colours are the theme's (`Semantic::shield_*`): the red one is the
+    // danger colour, the grey one a neutral of its own, both with a glyph
+    // that reaches 4.5:1 on its fill (tests in `theme.rs`).
+    let colours = move |theme: &Theme| {
+        let sem = theme::semantic(theme);
+        match look {
+            Look::Red => (sem.shield_red, sem.shield_red_glyph),
+            Look::Grey => (sem.shield_grey, sem.shield_grey_glyph),
+        }
+    };
+    let mark = container(text("!").size(11).style(move |theme: &Theme| text::Style {
+        color: Some(colours(theme).1),
+    }))
+    .width(SHIELD_SIZE)
+    .height(SHIELD_SIZE)
+    .center_x(SHIELD_SIZE)
+    .center_y(SHIELD_SIZE)
+    .style(move |theme: &Theme| container::Style {
+        background: Some(Background::Color(colours(theme).0)),
+        border: iced::border::rounded(SHIELD_SIZE / 4.0),
+        ..container::Style::default()
+    });
     tooltip(
         mark,
         container(text(label).size(tokens::CAPTION))
@@ -1733,7 +1742,7 @@ mod tests {
 
     #[test]
     fn a_hovered_row_gets_the_hover_background_and_a_mention_keeps_its_own() {
-        let sem = theme::LIGHT_SEMANTIC;
+        let sem = theme::semantic(&theme::built_in());
         let bg = |highlighted, hovered| {
             row_background(
                 &sem,
@@ -1752,7 +1761,7 @@ mod tests {
 
     #[test]
     fn a_flashed_row_wins_over_the_mention_and_the_hover() {
-        let sem = theme::LIGHT_SEMANTIC;
+        let sem = theme::semantic(&theme::built_in());
         let look = RowLook {
             highlighted: true,
             hovered: true,
@@ -1973,7 +1982,7 @@ mod tests {
     }
 
     fn theme() -> Theme {
-        crate::theme::theme_for(iced::theme::Mode::Light)
+        crate::theme::built_in()
     }
 
     fn env<'a>(theme: &'a Theme, revealed: &'a Revealed) -> RichEnv<'a> {
@@ -2108,10 +2117,8 @@ mod tests {
                 item("c", RichText::default()),
             ],
         }]);
-        for mode in [iced::theme::Mode::Light, iced::theme::Mode::Dark] {
-            let (theme, revealed) = (crate::theme::theme_for(mode), Revealed::new());
-            assert_eq!(built_by_with(&timeline, env(&theme, &revealed)), 3);
-        }
+        let (theme, revealed) = (crate::theme::built_in(), Revealed::new());
+        assert_eq!(built_by_with(&timeline, env(&theme, &revealed)), 3);
     }
 
     #[test]

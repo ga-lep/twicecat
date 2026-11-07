@@ -177,6 +177,25 @@ fn is_combining_mark(c: char) -> bool {
     )
 }
 
+/// Whether `clean` (the result of [`one_line`]) has a character a reader can
+/// see: not a blank, not the [`REPLACEMENT`] mark that stands for a bidi
+/// control or filler, and not a [`LINE_BREAK_MARK`]. A name made only of
+/// those says nothing, so callers fall back to something else.
+///
+/// ```
+/// use twicecat_app::text_safety::{has_visible_char, one_line};
+/// assert!(has_visible_char(&one_line("Sam")));
+/// assert!(!has_visible_char(&one_line("\u{202E}\u{3164}")));
+/// ```
+pub fn has_visible_char(clean: &str) -> bool {
+    clean.chars().any(|c| {
+        !matches!(
+            c,
+            ' ' | '\u{00A0}' | '\u{2000}'..='\u{200A}' | '\u{3000}' | REPLACEMENT | LINE_BREAK_MARK
+        )
+    })
+}
+
 /// [`one_line_capped`], or [`NAME_PLACEHOLDER`] when the result is empty or
 /// only blanks (space, U+00A0, U+2000 to U+200A, U+3000), which would
 /// otherwise draw as nothing at all.

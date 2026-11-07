@@ -267,6 +267,7 @@ fn screen_section<'a>(app: &'a App, settings: &'a VideoSettings) -> Element<'a, 
             ),
             note(quality_note(settings.screen_quality, VideoKind::Screen)),
             checkbox(settings.remember_screen_choice)
+                .style(kit::checkbox_style)
                 .label("Remember the screen or window I pick")
                 .text_wrapping(WRAP)
                 .on_toggle(|on| msg(VideoSettingsMessage::RememberScreen(on))),
@@ -317,6 +318,7 @@ fn encoding_section<'a>(app: &'a App, settings: &'a VideoSettings) -> Element<'a
         column![
             subheading("Encoding"),
             checkbox(hardware_on)
+                .style(kit::checkbox_style)
                 .label("Use the graphics card to encode video when there is one")
                 .text_wrapping(WRAP)
                 .on_toggle(|on| msg(VideoSettingsMessage::Hardware(on))),
@@ -373,6 +375,7 @@ fn number_row<'a>(
             row![
                 space().width(Length::Fixed(LABEL_WIDTH)),
                 text_input(hint, &typed)
+                    .style(kit::text_input_style)
                     .on_input(move |t| msg(VideoSettingsMessage::Text(kind, field, t)))
                     .on_submit(msg(VideoSettingsMessage::Apply(kind, field)))
                     .padding(tokens::S),
@@ -692,6 +695,7 @@ fn network_section<'a>(app: &'a App, settings: &'a VideoSettings) -> Element<'a,
             row![
                 space().width(Length::Fixed(LABEL_WIDTH)),
                 text_input("Kilobits a second", &ui.cap_text)
+                    .style(kit::text_input_style)
                     .on_input(|t| msg(VideoSettingsMessage::CapText(t)))
                     .padding(tokens::S),
             ]
@@ -717,6 +721,7 @@ fn network_section<'a>(app: &'a App, settings: &'a VideoSettings) -> Element<'a,
         ))
         .push(
             checkbox(settings.prefer_integrated_gpu_on_battery)
+                .style(kit::checkbox_style)
                 .label("On battery, encode on the integrated graphics of a laptop with two")
                 .text_wrapping(WRAP)
                 .on_toggle(|on| msg(VideoSettingsMessage::PreferIntegrated(on))),

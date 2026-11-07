@@ -2,9 +2,12 @@
 //! it. None of them names an SDK or LiveKit type. The audio settings and
 //! statistics are in `audio`.
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
-use super::types::{DeviceId, RoomId, UserId, string_newtype};
+use super::rooms::hide_opt;
+use super::types::{AvatarId, DeviceId, RoomId, UserId, string_newtype};
 
 string_newtype!(
     /// One MatrixRTC participant: a user's device in a call. Opaque; stable
@@ -125,6 +128,32 @@ pub struct Participant {
     pub cleaning: CleaningStatus,
 }
 
+/// How many people [`CoreEvent::ActiveCall`](super::CoreEvent::ActiveCall) lists
+/// for one room's call.
+pub const MAX_CALL_MEMBERS: usize = 25;
+
+/// One person in a room's call, for the room list: a user once, however many
+/// devices they have in it. `Debug` hides the display name.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CallMemberView {
+    /// Account.
+    pub user_id: UserId,
+    /// Display name in the room, cleaned to one line, when known.
+    pub display_name: Option<String>,
+    /// Avatar, when set and valid.
+    pub avatar: Option<AvatarId>,
+}
+
+impl fmt::Debug for CallMemberView {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CallMemberView")
+            .field("user_id", &self.user_id)
+            .field("display_name", &hide_opt(&self.display_name))
+            .field("avatar", &self.avatar)
+            .finish()
+    }
+}
+
 /// Whether this device cleans a participant's voice with DeepFilterNet3.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CleaningStatus {
@@ -161,6 +190,18 @@ pub enum SkipReason {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_call_member_debug_hides_the_name_but_not_the_user() {
+        let m = CallMemberView {
+            user_id: UserId::from("@bob:x"),
+            display_name: Some("Secret Bob".into()),
+            avatar: None,
+        };
+        let text = format!("{m:?}");
+        assert!(text.contains("@bob:x"), "{text}");
+        assert!(!text.contains("Secret"), "{text}");
+    }
 
     #[test]
     fn intents_use_matrix_js_sdk_spelling() {

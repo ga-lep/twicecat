@@ -91,7 +91,7 @@ fn content_node_with(
     media: &twicecat_app::media::MediaModel,
     room: Option<&twicecat_core::api::RoomId>,
 ) -> Node {
-    let theme = twicecat_app::theme::theme_for(iced::theme::Mode::Light);
+    let theme = twicecat_app::theme::built_in();
     let revealed = Revealed::new();
     let actions = twicecat_app::actions::ActionState::default();
     let env = RichEnv {

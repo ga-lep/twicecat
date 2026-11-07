@@ -88,6 +88,7 @@ fn room_row<'a>(app: &'a App, room: &'a RoomSummary, selected: bool) -> Element<
 
 fn view(app: &App) -> Element<'_, Message> {
     let field = text_input("Go to a room\u{2026}", &app.switcher.query)
+        .style(kit::text_input_style)
         .id(INPUT_ID)
         .on_input(|text| msg(SwitcherMessage::Input(text)))
         .on_submit(msg(SwitcherMessage::Submit))

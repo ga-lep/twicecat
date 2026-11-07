@@ -18,8 +18,8 @@ use common::{
 use serde_json::Value;
 use twicecat_core::CoreHandle;
 use twicecat_core::api::{
-    AUDIO_FRAME_LEN, AudioBackend, CallIntent, CallState, Command, CoreEvent, ListDiff, RoomId,
-    RoomSummary, VirtualAudio,
+    AUDIO_FRAME_LEN, AudioBackend, AudioSettings, CallIntent, CallSounds, CallState, Command,
+    CoreEvent, ListDiff, RoomId, RoomSummary, VirtualAudio,
 };
 use twicecat_core::secrets::InMemorySecretStore;
 
@@ -171,7 +171,7 @@ fn is_stop_in(e: &CoreEvent, room_id: &str) -> bool {
 }
 
 fn is_count(e: &CoreEvent, room_id: &str, n: u32) -> bool {
-    matches!(e, CoreEvent::ActiveCall { room_id: r, participants } if r.as_str() == room_id && *participants == n)
+    matches!(e, CoreEvent::ActiveCall { room_id: r, participants, .. } if r.as_str() == room_id && *participants == n)
 }
 
 /// A DM call (encrypted, as the SDK creates DMs) rings the other member;
@@ -335,6 +335,50 @@ async fn a_group_call_notifies_quietly_until_it_ends() {
     }
 }
 
+/// Alice, who is not in the call, learns who is: carol appears in the
+/// members when she joins, and the set is empty when she leaves.
+#[tokio::test]
+#[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
+async fn the_room_list_learns_who_is_in_a_call() {
+    let env = TestEnv::load();
+    let alice_raw = raw_login(1).await;
+    let carol_raw = raw_login(3).await;
+    let room_id = create_room(&alice_raw, &unique_room_name(), Some(&env.user_id(3)))
+        .await
+        .to_string();
+    allow_calls(&alice_raw, &room_id).await;
+    carol_raw
+        .join_room_by_id(room_id.as_str().try_into().unwrap())
+        .await
+        .unwrap();
+    let (dir_a, dir_c) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let mut alice = logged_in(dir_a.path(), 1).await;
+    let mut carol = logged_in(dir_c.path(), 3).await;
+    wait_for_room(&mut alice, &room_id).await;
+    wait_for_room(&mut carol, &room_id).await;
+
+    join(&mut carol, &room_id).await;
+    let joined = expect_event(&mut alice, |e| is_count(e, &room_id, 1)).await;
+    match joined {
+        CoreEvent::ActiveCall { members, .. } => {
+            let ids: Vec<&str> = members.iter().map(|m| m.user_id.as_str()).collect();
+            assert_eq!(ids, [env.user_id(3)]);
+        }
+        other => panic!("{other:?}"),
+    }
+
+    carol.commands.send(Command::LeaveCall).await.unwrap();
+    let left = expect_event(&mut alice, |e| is_count(e, &room_id, 0)).await;
+    match left {
+        CoreEvent::ActiveCall { members, .. } => assert!(members.is_empty(), "{members:?}"),
+        other => panic!("{other:?}"),
+    }
+
+    for core in [&alice, &carol] {
+        core.commands.send(Command::Shutdown).await.unwrap();
+    }
+}
+
 /// An MSC3417 call room is marked in the room list, a voice room.
 #[tokio::test]
 #[ignore = "needs local homeserver: scripts/stack.sh up -d --wait"]
@@ -441,6 +485,20 @@ async fn answering_stops_the_ringtone() {
     let mut carol = carol_with(dir_c.path(), &speaker).await;
     wait_for_room(&mut alice, &room_id).await;
     wait_for_room(&mut carol, &room_id).await;
+    // The call's own join cue is audible on this speaker; this test is
+    // about the ringtone, so call sounds are off.
+    carol
+        .commands
+        .send(Command::UpdateAudioSettings(AudioSettings {
+            call_sounds: CallSounds {
+                enabled: false,
+                ..CallSounds::default()
+            },
+            ..AudioSettings::default()
+        }))
+        .await
+        .unwrap();
+    expect_event(&mut carol, |e| matches!(e, CoreEvent::AudioSettings(_))).await;
 
     join(&mut alice, &room_id).await;
     expect_event(&mut carol, |e| is_ring_in(e, &room_id)).await;

@@ -83,6 +83,7 @@ fn card<'a>(app: &'a App, panel: &'a SettingsPanel, window_height: f32) -> Eleme
             label,
             row![
                 text_input(label, value)
+                    .style(crate::ui::kit::text_input_style)
                     .on_input_maybe(
                         allowed.then_some(move |s: String| msg(input(MessageText::from(s)))),
                     )

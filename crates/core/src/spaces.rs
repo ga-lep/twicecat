@@ -13,13 +13,22 @@ use matrix_sdk_ui::eyeball_im::Vector;
 use matrix_sdk_ui::spaces::{SpaceFilter, SpaceService};
 use tokio::sync::{mpsc, watch};
 
-use crate::api::{CoreEvent, RoomId, SpaceView};
+use crate::api::{CoreEvent, MAX_SPACE_ROOMS, RoomId, SpaceView};
 use crate::notifications::clean_line;
 use crate::room_list::pick_avatar;
 use crate::rooms::MAX_NAME_CHARS;
 
 /// The room IDs inside each known space, by space ID.
 pub(crate) type SpaceChildren = Arc<HashMap<OwnedRoomId, Vec<OwnedRoomId>>>;
+
+/// The first [`MAX_SPACE_ROOMS`] of a space's descendants, as API IDs.
+fn room_ids(descendants: &[OwnedRoomId]) -> Vec<RoomId> {
+    descendants
+        .iter()
+        .take(MAX_SPACE_ROOMS)
+        .map(|id| RoomId::from(id.as_str()))
+        .collect()
+}
 
 /// The API form of a space filter. The name is cleaned to one line; the
 /// avatar is kept only when it is a valid MXC URI.
@@ -31,6 +40,7 @@ pub(crate) fn view_of(filter: &SpaceFilter) -> SpaceView {
         avatar: pick_avatar(room.avatar_url.as_deref().map(|u| u.as_str()), false, &[]),
         level: u32::from(filter.level),
         children: room.children_count,
+        rooms: room_ids(&filter.descendants),
     }
 }
 
@@ -140,5 +150,47 @@ mod tests {
         assert_eq!(map[&s].len(), 1);
         assert_eq!(map[&t].len(), 2);
         assert!(children_of(&[]).is_empty());
+    }
+
+    #[test]
+    fn rooms_are_the_descendants_in_order() {
+        let view = view_of(&filter("!s:x", "S", 0, &["!b:x", "!a:x", "!c:x"], None));
+        let ids: Vec<&str> = view.rooms.iter().map(RoomId::as_str).collect();
+        assert_eq!(ids, ["!b:x", "!a:x", "!c:x"]);
+        assert!(view_of(&filter("!s:x", "S", 1, &[], None)).rooms.is_empty());
+    }
+
+    #[test]
+    fn rooms_are_capped() {
+        let ids: Vec<String> = (0..MAX_SPACE_ROOMS + 5)
+            .map(|i| format!("!r{i}:x"))
+            .collect();
+        let kids: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let view = view_of(&filter("!s:x", "S", 1, &kids, None));
+        assert_eq!(view.rooms.len(), 2000);
+        assert_eq!(view.rooms[1999].as_str(), "!r1999:x");
+        assert_eq!(view.children, 2005);
+        let exact: Vec<&str> = kids[..MAX_SPACE_ROOMS].to_vec();
+        assert_eq!(
+            view_of(&filter("!s:x", "S", 1, &exact, None)).rooms.len(),
+            2000
+        );
+    }
+
+    #[test]
+    fn debug_shows_the_room_count_and_no_id() {
+        let view = view_of(&filter(
+            "!s:x",
+            "S",
+            0,
+            &["!secretroom:x", "!other:x"],
+            None,
+        ));
+        let text = format!("{view:?}");
+        assert!(text.contains("rooms: 2"), "{text}");
+        assert!(
+            !text.contains("secretroom") && !text.contains("other"),
+            "{text}"
+        );
     }
 }
